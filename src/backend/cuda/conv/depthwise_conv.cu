@@ -32,7 +32,7 @@
 /// Epilogue: activation fusion applied during output write-back, every route,
 /// both accumulate-before-epilogue and the add_to residual ordering.
 ///
-/// Supports f32 and f16. Workspace: not used.
+/// Supports f32, f16 and bf16. Workspace: not used.
 
 #include "../cuda_common.cuh"
 #include "nnops/ops/depthwise_conv.hpp"
@@ -807,6 +807,15 @@ Status depthwise_conv_cuda(
             depthwise_conv_cuda_3d_impl<__half>(attrs, output, inputs, ctx);
         } else {
             depthwise_conv_cuda_2d_impl<__half>(attrs, output, inputs, ctx);
+        }
+        return Status::ok;
+    case DataType::bf16:
+        if (last) {
+            depthwise_conv_last_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
+        } else if (srank == 3) {
+            depthwise_conv_cuda_3d_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
+        } else {
+            depthwise_conv_cuda_2d_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
         }
         return Status::ok;
     default:

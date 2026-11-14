@@ -23,7 +23,7 @@
 /// Any layout: the operator reads only the strides, so channel-last and a
 /// padded pitch are the same walk with different groups.
 ///
-/// f32 and f16 in, s64 out. Workspace: not used.
+/// f32, f16 and bf16 in, s64 out. Workspace: not used.
 
 #include "cuda_common.cuh"
 #include "nnops/ops/argminmax.hpp"
@@ -201,6 +201,8 @@ Status argmax_cuda(const ArgMinMaxAttributes& attrs, TensorView& output,
         return argminmax_entry<float>(attrs, output, inputs, ctx);
     case DataType::f16:
         return argminmax_entry<__half>(attrs, output, inputs, ctx);
+    case DataType::bf16:
+        return argminmax_entry<__nv_bfloat16>(attrs, output, inputs, ctx);
     default:
         return Status::unsupported;
     }

@@ -10,7 +10,7 @@
 ///
 /// Elementwise contract (mirrors the CPU kernels): C = activate(clamp(beta·C_old
 /// + bias + alpha·A·B)), bias indexed by the column and never scaled by alpha,
-/// clamp and activation both on the finished sum. f32 and f16 only; the integer
+/// clamp and activation both on the finished sum. f32, f16 and bf16; the integer
 /// pairs and the quantized-activation route return unsupported.
 
 #include "gemm_op.cuh"
@@ -27,7 +27,8 @@ Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
     const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
 
     const DataType dt = a.data_type();
-    if ((dt != DataType::f32 && dt != DataType::f16) || b.data_type() != dt) {
+    if ((dt != DataType::f32 && dt != DataType::f16 && dt != DataType::bf16) ||
+        b.data_type() != dt) {
         return Status::unsupported;
     }
     if (output.numel() == 0) { return Status::ok; }

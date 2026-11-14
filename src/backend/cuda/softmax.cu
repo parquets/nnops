@@ -20,13 +20,57 @@
 /// Channel-packed layouts are refused by the operator, so no location is
 /// `pack`-scaled: stride_elems() is the physical stride.
 ///
-/// Supports f32 and f16. Workspace: not used.
+/// Supports f32, f16 and bf16. Workspace: not used.
 
 #include "cuda_common.cuh"
 #include "nnops/ops/softmax.hpp"
 #include "nnops/detail/assert.hpp"
 
 namespace nnops::backend::cuda {
+
+// ============================================================
+// Block-wide reduction over the shared float array
+// ============================================================
+
+/// Folds the block's shared array down to slot 0. Each round merges the upper
+/// half of the live region into the lower one and, when the live count is odd,
+/// the last element into slot 0 too. Halving a *stride* instead (the usual s/2
+/// loop) never touches that last element, so a block whose size is not a power
+/// of two silently drops it — a 37-wide row gives a 37-thread block, and the
+/// element at index 36 never joins the max or the sum. The trailing barrier
+/// leaves the array free for the next pass.
+template <bool IsMax>
+__device__ inline float block_reduce(float* smem, float v)
+{
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;
+
+    smem[tid] = v;
+    __syncthreads();
+
+    for (int n = n_threads; n > 1; n >>= 1) {
+        const int half = n >> 1;
+        if (tid < half) {
+            if (IsMax) {
+                if (smem[tid + half] > smem[tid]) { smem[tid] = smem[tid + half]; }
+            } else {
+                smem[tid] += smem[tid + half];
+            }
+        }
+        if (tid == 0 && (n & 1) != 0) {
+            if (IsMax) {
+                if (smem[n - 1] > smem[0]) { smem[0] = smem[n - 1]; }
+            } else {
+                smem[0] += smem[n - 1];
+            }
+        }
+        __syncthreads();
+    }
+
+    const float result = smem[0];
+    __syncthreads();
+    return result;
+}
 
 // ============================================================
 // Softmax CUDA kernel — single block per row, contiguous tail
@@ -38,7 +82,8 @@ __global__ void softmax_kernel(
     T* __restrict__ output,
     int64_t num_rows,
     int64_t norm_size,
-    int64_t group_stride,     // elements between consecutive groups
+    int64_t in_group_stride,   // elements between consecutive input groups
+    int64_t out_group_stride,  // and between consecutive output groups
     bool log_softmax)
 {
     extern __shared__ float shared_buf[];
@@ -49,8 +94,8 @@ __global__ void softmax_kernel(
 
     if (row >= num_rows) return;
 
-    const T* x_row = input + row * group_stride;
-    T* y_row = output + row * group_stride;
+    const T* x_row = input + row * in_group_stride;
+    T* y_row = output + row * out_group_stride;
 
     // ============================================================
     // Pass 1 — Block-level max reduction
@@ -63,20 +108,9 @@ __global__ void softmax_kernel(
         if (x > max_val) max_val = x;
     }
 
-    smem[tid] = max_val;
-    __syncthreads();
-    max_val = smem[0];
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && smem[tid + s] > max_val) {
-            max_val = smem[tid + s];
-        }
-        smem[tid] = max_val;
-        __syncthreads();
-        max_val = smem[0];
-    }
+    max_val = block_reduce<true>(smem, max_val);
 
     const float neg_max = -max_val;
-    __syncthreads();
 
     // ============================================================
     // Pass 2 — Sum of exp(x - max)
@@ -95,19 +129,7 @@ __global__ void softmax_kernel(
         sum_exp += val;
     }
 
-    smem[tid] = sum_exp;
-    __syncthreads();
-    sum_exp = smem[0];
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sum_exp += smem[tid + s];
-        }
-        smem[tid] = sum_exp;
-        __syncthreads();
-        sum_exp = smem[0];
-    }
-
-    __syncthreads();
+    sum_exp = block_reduce<false>(smem, sum_exp);
 
     // ============================================================
     // Pass 3 — Normalize
@@ -145,10 +167,13 @@ __global__ void softmax_general_kernel(
     T* __restrict__ output,
     int64_t outer_size,
     int64_t D,
-    int64_t axis_stride,
+    int64_t in_axis_stride,
+    int64_t out_axis_stride,
     int64_t inner_total,
     const int64_t* __restrict__ outer_offsets,
     const int64_t* __restrict__ inner_offsets,
+    const int64_t* __restrict__ out_outer_offsets,
+    const int64_t* __restrict__ out_inner_offsets,
     bool log_softmax)
 {
     extern __shared__ float shared_buf[];
@@ -162,58 +187,42 @@ __global__ void softmax_general_kernel(
 
     const int64_t base = outer_offsets[outer];
     const int64_t inner_off = inner_offsets[inner_idx];
+    const int64_t y_base = out_outer_offsets[outer];
+    const int64_t y_inner_off = out_inner_offsets[inner_idx];
 
     // ---- Pass 1: find max ----
     float max_val = -1e30f;
     for (int k = tid; k < D; k += blockDim.x) {
-        float x = s_load(&input[base + inner_off + k * axis_stride]);
+        float x = s_load(&input[base + inner_off + k * in_axis_stride]);
         if (x > max_val) max_val = x;
     }
 
-    smem[tid] = max_val;
-    __syncthreads();
-    max_val = smem[0];
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && smem[tid + s] > max_val) {
-            max_val = smem[tid + s];
-        }
-        smem[tid] = max_val;
-        __syncthreads();
-        max_val = smem[0];
-    }
-    __syncthreads();
+    max_val = block_reduce<true>(smem, max_val);
 
     // ---- Pass 2: sum of exp(x - max) ----
     float sum_exp = 0.0f;
     for (int k = tid; k < D; k += blockDim.x) {
-        sum_exp += expf(s_load(&input[base + inner_off + k * axis_stride]) - max_val);
+        sum_exp += expf(s_load(&input[base + inner_off + k * in_axis_stride]) - max_val);
     }
 
-    smem[tid] = sum_exp;
-    __syncthreads();
-    sum_exp = smem[0];
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sum_exp += smem[tid + s];
-        smem[tid] = sum_exp;
-        __syncthreads();
-        sum_exp = smem[0];
-    }
-    __syncthreads();
+    sum_exp = block_reduce<false>(smem, sum_exp);
 
     // ---- Pass 3: normalize ----
     if (log_softmax) {
         float log_sum = logf(sum_exp);
         for (int k = tid; k < D; k += blockDim.x) {
-            int64_t off = base + inner_off + k * axis_stride;
+            int64_t off = base + inner_off + k * in_axis_stride;
+            int64_t y_off = y_base + y_inner_off + k * out_axis_stride;
             float val = s_load(&input[off]) - max_val - log_sum;
-            s_store(&output[off], val);
+            s_store(&output[y_off], val);
         }
     } else {
         float inv_sum = 1.0f / sum_exp;
         for (int k = tid; k < D; k += blockDim.x) {
-            int64_t off = base + inner_off + k * axis_stride;
+            int64_t off = base + inner_off + k * in_axis_stride;
+            int64_t y_off = y_base + y_inner_off + k * out_axis_stride;
             float val = expf(s_load(&input[off]) - max_val) * inv_sum;
-            s_store(&output[off], val);
+            s_store(&output[y_off], val);
         }
     }
 }
@@ -252,22 +261,28 @@ void softmax_cuda_impl(
     // ============================================================
 
     const bool channel_last = is_channel_last(X.layout()) && rank > 1;
-    int64_t group_stride = 0;
+    int64_t in_group_stride = 0;
+    int64_t out_group_stride = 0;
     bool contiguous_axis = false;
     if (rank == 1) {
         contiguous_axis = true;
-        group_stride = 1;
+        in_group_stride = out_group_stride = 1;
     } else if (channel_last) {
+        // The groups are the layout's own rows, so both sides share the shape's
+        // stride whatever their pitches are.
         if (axis == 1) {
             contiguous_axis = true;
-            group_stride = X.shape(1);
+            in_group_stride = out_group_stride = X.shape(1);
         } else if (axis == rank - 1 && X.shape(1) == 1) {
             contiguous_axis = true;
-            group_stride = X.shape(rank - 1);
+            in_group_stride = out_group_stride = X.shape(rank - 1);
         }
     } else if (axis == rank - 1) {
+        // Channel-first rows: each side walks its own pitch, which a caller may
+        // legitimately give the output differently from the input.
         contiguous_axis = true;
-        group_stride = X.row_stride_elems();
+        in_group_stride = X.row_stride_elems();
+        out_group_stride = output.row_stride_elems();
     }
 
     const int64_t norm_size = X.shape(axis);
@@ -280,7 +295,7 @@ void softmax_cuda_impl(
 
         softmax_kernel<<<num_rows, block_size, shared_bytes, stream>>>(
             x_ptr, y_ptr,
-            num_rows, norm_size, group_stride,
+            num_rows, norm_size, in_group_stride, out_group_stride,
             log_softmax);
         return;
     }
@@ -296,35 +311,46 @@ void softmax_cuda_impl(
 
         const int64_t D = norm_size;
         // No channel packing, so stride_elems() is the physical stride.
-        const int64_t axis_stride = X.stride_elems(axis);
+        const int64_t in_axis_stride = X.stride_elems(axis);
+        const int64_t out_axis_stride = output.stride_elems(axis);
 
         int64_t inner_total = 1;
         for (int64_t i = axis + 1; i < rank; ++i)
             inner_total *= X.shape(i);
 
-        // Precompute both position tables on host: one entry per outer position
-        // (the axis index left at 0) and one per inner position.
-        std::vector<int64_t> offsets(static_cast<size_t>(outer_size + inner_total));
+        // Precompute the position tables on host — one entry per outer position
+        // (the axis index left at 0) and one per inner position, for each side,
+        // since the output may carry a different pitch than the input.
+        const size_t table = static_cast<size_t>(outer_size + inner_total);
+        std::vector<int64_t> offsets(2 * table);
         int64_t* outer_offsets = offsets.data();
         int64_t* inner_offsets = offsets.data() + outer_size;
+        int64_t* y_outer_offsets = offsets.data() + table;
+        int64_t* y_inner_offsets = offsets.data() + table + outer_size;
 
         for (int64_t o = 0; o < outer_size; ++o) {
             int64_t off = 0, rem = o;
+            int64_t y_off = 0;
             for (int64_t d = axis - 1; d >= 0; --d) {
                 int64_t dim = X.shape(d);
                 off += (rem % dim) * X.stride_elems(d);
+                y_off += (rem % dim) * output.stride_elems(d);
                 rem /= dim;
             }
             outer_offsets[o] = off;
+            y_outer_offsets[o] = y_off;
         }
         for (int64_t s = 0; s < inner_total; ++s) {
             int64_t off = 0, rem = s;
+            int64_t y_off = 0;
             for (int64_t d = rank - 1; d > axis; --d) {
                 int64_t dim = X.shape(d);
                 off += (rem % dim) * X.stride_elems(d);
+                y_off += (rem % dim) * output.stride_elems(d);
                 rem /= dim;
             }
             inner_offsets[static_cast<size_t>(s)] = off;
+            y_inner_offsets[static_cast<size_t>(s)] = y_off;
         }
 
         int64_t* d_offsets = nullptr;
@@ -343,8 +369,9 @@ void softmax_cuda_impl(
 
         softmax_general_kernel<<<grid, block_size, shared_bytes, stream>>>(
             x_ptr, y_ptr,
-            outer_size, D, axis_stride, inner_total,
+            outer_size, D, in_axis_stride, out_axis_stride, inner_total,
             d_offsets, d_offsets + outer_size,
+            d_offsets + table, d_offsets + table + outer_size,
             log_softmax);
 
         CUDA_CHECK(cudaFree(d_offsets));
@@ -369,6 +396,9 @@ Status softmax_cuda(
         return Status::ok;
     case DataType::f16:
         softmax_cuda_impl<__half>(attrs, output, inputs, ctx);
+        return Status::ok;
+    case DataType::bf16:
+        softmax_cuda_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
     default:
         return Status::unsupported;

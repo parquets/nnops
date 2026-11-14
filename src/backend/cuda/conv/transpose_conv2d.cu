@@ -32,7 +32,7 @@
 /// depthwise_transpose_conv.cu, the same split the CPU backend makes. A grid
 /// too deep for blockIdx.z goes to an output-per-thread script instead.
 ///
-/// f32 and f16, channel-first and channel-last; the quantized route (an s8
+/// f32, f16 and bf16, channel-first and channel-last; the quantized route (an s8
 /// weight) returns unsupported.
 
 #include "../cuda_common.cuh"
@@ -265,12 +265,11 @@ struct ConvTileH
     static constexpr int threads = 32 * wm * wn;
 };
 
-template <bool ChannelsLast>
+template <class Elem, bool ChannelsLast>
 __global__ __launch_bounds__(ConvTileH::threads)
 void tconv_gemm_h_kernel(ConvParams pin)
 {
     using namespace cute;
-    using Elem = cute::half_t;
 
     constexpr int bM = ConvTileH::bM;
     constexpr int bN = ConvTileH::bN;
@@ -322,7 +321,7 @@ void tconv_gemm_h_kernel(ConvParams pin)
         sB_layout);
 
     TiledMMA mma = make_tiled_mma(
-        SM80_16x8x16_F32F16F16F32_TN{},
+        detail::gemm_mma_atom<Elem>{},
         Layout<Shape<Int<ConvTileH::wm>, Int<ConvTileH::wn>, _1>>{},
         cute::Tile<Int<ConvTileH::mmaM>, Int<ConvTileH::mmaN>, _16>{});
 
@@ -699,7 +698,7 @@ __global__ void tconv_plane_kernel(ConvParams p, int ow_tiles)
 // Launch
 // ============================================================
 
-template <bool ChannelsLast>
+template <class Elem, bool ChannelsLast>
 void launch_tconv_gemm_h(const ConvParams& p, int m_max, cudaStream_t stream)
 {
     using namespace cute;
@@ -708,9 +707,9 @@ void launch_tconv_gemm_h(const ConvParams& p, int m_max, cudaStream_t stream)
         Int<bM>{}, Int<bK>{}, Int<ConvTileH::stages>{});
     constexpr auto lb = detail::gemm_smem_layout<!ChannelsLast>(
         Int<bN>{}, Int<bK>{}, Int<ConvTileH::stages>{});
-    constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(half_t));
+    constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(Elem));
 
-    auto kernel = tconv_gemm_h_kernel<ChannelsLast>;
+    auto kernel = tconv_gemm_h_kernel<Elem, ChannelsLast>;
     static const cudaError_t cfg = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
@@ -759,8 +758,8 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
 
     const DataType dt = act.data_type();
-    if ((dt != DataType::f32 && dt != DataType::f16) || wgt.data_type() != dt ||
-        output.data_type() != dt) {
+    if ((dt != DataType::f32 && dt != DataType::f16 && dt != DataType::bf16) ||
+        wgt.data_type() != dt || output.data_type() != dt) {
         return Status::unsupported;
     }
     if (is_quantized_transpose_conv2d(wgt.data_type())) { return Status::unsupported; }
@@ -847,19 +846,23 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
 
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     if (gemm) {
-        if (esz == 2) {
-            if (last) { launch_tconv_gemm_h<true>(p, m_max, stream); }
-            else      { launch_tconv_gemm_h<false>(p, m_max, stream); }
+        if (dt == DataType::bf16) {
+            if (last) { launch_tconv_gemm_h<cute::bfloat16_t, true>(p, m_max, stream); }
+            else      { launch_tconv_gemm_h<cute::bfloat16_t, false>(p, m_max, stream); }
+        } else if (esz == 2) {
+            if (last) { launch_tconv_gemm_h<cute::half_t, true>(p, m_max, stream); }
+            else      { launch_tconv_gemm_h<cute::half_t, false>(p, m_max, stream); }
         } else {
             if (last) { launch_tconv_gemm_f<true>(p, m_max, stream); }
             else      { launch_tconv_gemm_f<false>(p, m_max, stream); }
         }
     } else if (tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last,
-                                                     esz == 2, stream)) {
+                                                     dt, stream)) {
         // launched by the depthwise route
     } else if (plane_ok) {
-        if (esz == 2) { launch_tconv_plane<cute::half_t>(p, stream); }
-        else          { launch_tconv_plane<float>(p, stream); }
+        if (dt == DataType::bf16) { launch_tconv_plane<cute::bfloat16_t>(p, stream); }
+        else if (esz == 2)        { launch_tconv_plane<cute::half_t>(p, stream); }
+        else                      { launch_tconv_plane<float>(p, stream); }
     } else {
         return Status::unsupported;
     }

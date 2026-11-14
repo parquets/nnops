@@ -5,7 +5,7 @@
 /// All 8 activation types supported: Relu, LeakyRelu, Sigmoid, Tanh,
 /// Gelu, Silu (Swish), HardSwish, Elu.
 ///
-/// Supports f32 and f16. Workspace: not used.
+/// Supports f32, f16 and bf16. Workspace: not used.
 
 #include "cuda_common.cuh"
 #include "nnops/ops/activation.hpp"
@@ -237,6 +237,9 @@ Status activation_cuda(
         return Status::ok;
     case DataType::f16:
         activation_cuda_impl<__half>(attrs, output, inputs, ctx);
+        return Status::ok;
+    case DataType::bf16:
+        activation_cuda_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
     default:
         return Status::unsupported;

@@ -2,7 +2,7 @@
 /// @brief CUDA implementation of the Reduce operator.
 ///
 /// Single-axis reduction using shared-memory block-level reductions.
-/// Supports Sum, Min, Max, Mean over f32 and f16 data types.
+/// Supports Sum, Min, Max, Mean over f32, f16 and bf16 data types.
 ///
 /// Two-kernel pattern (same as softmax/layer_norm/rms_norm):
 ///   - reduce_fast_kernel: contiguous tail (axis == rank-1), strided access.
@@ -254,6 +254,9 @@ Status reduce_cuda(const ReduceAttributes& attrs,
         return Status::ok;
     case DataType::f16:
         reduce_cuda_impl<__half>(attrs, output, input, axis, ctx);
+        return Status::ok;
+    case DataType::bf16:
+        reduce_cuda_impl<__nv_bfloat16>(attrs, output, input, axis, ctx);
         return Status::ok;
     default:
         return Status::unsupported;

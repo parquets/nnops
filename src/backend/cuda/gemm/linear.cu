@@ -6,7 +6,7 @@
 /// it as the post-activation residual rather than as beta·C_old: the residual is
 /// in place in the output buffer and each thread reads its element before
 /// overwriting it. There is no alpha or beta on this operator — the activation
-/// is everything the caller asked for. f32 and f16 only.
+/// is everything the caller asked for. f32, f16 and bf16.
 
 #include "gemm_op.cuh"
 #include "nnops/ops/linear.hpp"
@@ -24,7 +24,8 @@ Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
     // The SwiGLU combine has no CUDA route yet; the op is CPU-only in that form.
     if (attrs.gated) { return Status::unsupported; }
     const DataType dt = x.data_type();
-    if ((dt != DataType::f32 && dt != DataType::f16) || w.data_type() != dt) {
+    if ((dt != DataType::f32 && dt != DataType::f16 && dt != DataType::bf16) ||
+        w.data_type() != dt) {
         return Status::unsupported;
     }
     if (output.numel() == 0) { return Status::ok; }

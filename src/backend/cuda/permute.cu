@@ -14,7 +14,7 @@
 /// batch slice. The tile route needs both operands dense (it indexes slices as
 /// `m*k`), and falls back to the walk when they are not.
 ///
-/// f32 and f16 in, out at the same dtype.
+/// f32, f16 and bf16 in, out at the same dtype.
 
 #include "move_common.cuh"
 #include "nnops/ops/permute.hpp"
@@ -158,6 +158,8 @@ Status permute_cuda(const PermuteAttributes& attrs, TensorView& output,
         return permute_entry<float>(attrs, output, inputs[0], stream);
     case DataType::f16:
         return permute_entry<__half>(attrs, output, inputs[0], stream);
+    case DataType::bf16:
+        return permute_entry<__nv_bfloat16>(attrs, output, inputs[0], stream);
     default:
         return Status::unsupported;
     }

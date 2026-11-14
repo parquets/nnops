@@ -37,7 +37,7 @@
 /// of the work has to fit under 65535. Cubic is the 2D bicubic only, as on the
 /// CPU and in PyTorch.
 ///
-/// f32 and f16. Workspace: not used.
+/// f32, f16 and bf16. Workspace: not used.
 
 #include "cuda_common.cuh"
 #include "nnops/ops/resize.hpp"
@@ -268,7 +268,7 @@ template <class T, int Mode, int Vec, bool ThreeD>
 __global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__ out,
                                        ResizeGeom g, int c_blocks)
 {
-    using V = std::conditional_t<sizeof(T) == 2, half8, float4>;
+    using V = std::conditional_t<sizeof(T) == 2, pack8<T>, float4>;
     static_assert(Vec * sizeof(T) == 16, "the channel lane is one 128-bit vector");
 
     const int cb = int(blockIdx.x) % c_blocks;
@@ -720,6 +720,9 @@ Status resize_cuda(const ResizeAttributes& attrs, TensorView& output,
         return Status::ok;
     case DataType::f16:
         resize_impl<__half>(attrs, output, inputs, ctx);
+        return Status::ok;
+    case DataType::bf16:
+        resize_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
     default:
         return Status::unsupported;

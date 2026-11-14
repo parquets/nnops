@@ -18,7 +18,7 @@
 /// and the spatial walk come from the view, which covers channel-first and
 /// channel-last in the same kernel.
 ///
-/// f32 and f16 in, f32 compute. s8/u8 input stays on the CPU (its dequantize /
+/// f32, f16 and bf16 in, f32 compute. s8/u8 input stays on the CPU (its dequantize /
 /// requantize kernels live there), so a quantized X answers Status::unsupported.
 /// Workspace: not used.
 
@@ -564,6 +564,8 @@ Status norm_cuda(const NormAttributes& attrs, TensorView& output,
         return norm_entry<float>(attrs, output, inputs, stream);
     case DataType::f16:
         return norm_entry<__half>(attrs, output, inputs, stream);
+    case DataType::bf16:
+        return norm_entry<__nv_bfloat16>(attrs, output, inputs, stream);
     default:
         return Status::unsupported;
     }

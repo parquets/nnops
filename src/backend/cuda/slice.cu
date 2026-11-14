@@ -10,7 +10,7 @@
 /// A strided slice (st > 1) simply leaves the source run non-unit, so the copy
 /// falls to the scalar path; the destination stays contiguous.
 ///
-/// f32 and f16 in, out at the same dtype.
+/// f32, f16 and bf16 in, out at the same dtype.
 
 #include "move_common.cuh"
 #include "nnops/ops/slice.hpp"
@@ -72,6 +72,8 @@ Status slice_cuda(const SliceAttributes& attrs, TensorView& output,
         return slice_entry<float>(attrs, output, inputs[0], stream);
     case DataType::f16:
         return slice_entry<__half>(attrs, output, inputs[0], stream);
+    case DataType::bf16:
+        return slice_entry<__nv_bfloat16>(attrs, output, inputs[0], stream);
     default:
         return Status::unsupported;
     }

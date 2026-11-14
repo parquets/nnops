@@ -37,6 +37,20 @@ __device__ inline void scatter_none(T* dst, T v)
 
 __device__ inline void scatter_add(float* d, float v) { atomicAdd(d, v); }
 __device__ inline void scatter_add(__half* d, __half v) { atomicAdd(d, v); }
+__device__ inline void scatter_add(__nv_bfloat16* d, __nv_bfloat16 v)
+{
+    // bf16 has an atomicAdd from sm_80 on; a 16-bit CAS loop is the same
+    // read-modify-write on the widened value at every arch.
+    unsigned short* a = reinterpret_cast<unsigned short*>(d);
+    unsigned short assumed = *a;
+    unsigned short old;
+    do {
+        old = assumed;
+        const float sum = __bfloat162float(__ushort_as_bfloat16(old)) +
+                          __bfloat162float(v);
+        assumed = atomicCAS(a, old, __bfloat16_as_ushort(__float2bfloat16(sum)));
+    } while (assumed != old);
+}
 __device__ inline void scatter_add(int32_t* d, int32_t v) { atomicAdd(d, v); }
 __device__ inline void scatter_add(int64_t* d, int64_t v)
 {
@@ -62,6 +76,7 @@ template <class T>
 constexpr bool scatter_add_supported()
 {
     return std::is_same_v<T, float> || std::is_same_v<T, __half> ||
+           std::is_same_v<T, __nv_bfloat16> ||
            std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>;
 }
 
@@ -413,6 +428,9 @@ Status scatter_elements_cuda(const ScatterElementsAttributes& attrs,
     case DataType::f16:
         if (!reduction_supported<__half>(attrs.reduction)) { return Status::unsupported; }
         return scatter_elements_dispatch<__half>(attrs, output, data, indices, updates, stream);
+    case DataType::bf16:
+        if (!reduction_supported<__nv_bfloat16>(attrs.reduction)) { return Status::unsupported; }
+        return scatter_elements_dispatch<__nv_bfloat16>(attrs, output, data, indices, updates, stream);
     case DataType::s8:
         if (!reduction_supported<int8_t>(attrs.reduction)) { return Status::unsupported; }
         return scatter_elements_dispatch<int8_t>(attrs, output, data, indices, updates, stream);
@@ -445,6 +463,9 @@ Status scatter_nd_cuda(const ScatterNDAttributes& attrs, TensorView& output,
     case DataType::f16:
         if (!reduction_supported<__half>(attrs.reduction)) { return Status::unsupported; }
         return scatter_nd_dispatch<__half>(output, data, indices, updates, attrs.reduction, stream);
+    case DataType::bf16:
+        if (!reduction_supported<__nv_bfloat16>(attrs.reduction)) { return Status::unsupported; }
+        return scatter_nd_dispatch<__nv_bfloat16>(output, data, indices, updates, attrs.reduction, stream);
     case DataType::s8:
         if (!reduction_supported<int8_t>(attrs.reduction)) { return Status::unsupported; }
         return scatter_nd_dispatch<int8_t>(output, data, indices, updates, attrs.reduction, stream);

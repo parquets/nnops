@@ -30,7 +30,7 @@
 /// the epilogue once. That is what takes 14x14x256 k3 from 0.21 to 0.066 ms and
 /// the 7x7x512 tail from 0.059 to 0.023 ms.
 ///
-/// f32 and f16; a Winograd weight never reaches this kernel (the dispatch
+/// f32, f16 and bf16; a Winograd weight never reaches this kernel (the dispatch
 /// refuses it), a prepacked filter is opaque to it, and quantized weights
 /// return unsupported.
 
@@ -366,12 +366,11 @@ struct ConvTileH
     static constexpr int threads = 32 * wm * wn;
 };
 
-template <bool ChannelsLast>
+template <class Elem, bool ChannelsLast>
 __global__ __launch_bounds__(ConvTileH::threads)
 void conv_gemm_h_kernel(ConvParams p)
 {
     using namespace cute;
-    using Elem = cute::half_t;
 
     constexpr int bM = ConvTileH::bM;
     constexpr int bN = ConvTileH::bN;
@@ -425,11 +424,11 @@ void conv_gemm_h_kernel(ConvParams p)
         sB_layout);
 
     TiledMMA mma = make_tiled_mma(
-        SM80_16x8x16_F32F16F16F32_TN{},
+        detail::gemm_mma_atom<Elem>{},
         Layout<Shape<Int<ConvTileH::wm>, Int<ConvTileH::wn>, _1>>{},
         cute::Tile<Int<ConvTileH::mmaM>, Int<ConvTileH::mmaN>, _16>{});
 
-    TiledCopy copy_b = detail::gemm_copy_half<ConvTileH::threads, bN, bK, !ChannelsLast>();
+    TiledCopy copy_b = detail::gemm_copy_half<Elem, ConvTileH::threads, bN, bK, !ChannelsLast>();
 
     ThrCopy thr_copy_b = copy_b.get_slice(threadIdx.x);
     Tensor tBgB = thr_copy_b.partition_S(gB);
@@ -921,7 +920,7 @@ inline void conv_reduce(ConvParams& p, detail::GemmWorkspace ws,
     detail::gemm_workspace_free(ws, stream);
 }
 
-template <bool ChannelsLast>
+template <class Elem, bool ChannelsLast>
 void launch_conv_h(ConvParams& p, cudaStream_t stream)
 {
     using namespace cute;
@@ -930,21 +929,21 @@ void launch_conv_h(ConvParams& p, cudaStream_t stream)
         Int<bM>{}, Int<bK>{}, Int<ConvTileH::stages>{});
     constexpr auto lb = detail::gemm_smem_layout<!ChannelsLast>(
         Int<bN>{}, Int<bK>{}, Int<ConvTileH::stages>{});
-    constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(half_t));
+    constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(Elem));
 
-    auto kernel = conv_gemm_h_kernel<ChannelsLast>;
+    auto kernel = conv_gemm_h_kernel<Elem, ChannelsLast>;
     static const cudaError_t cfg = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
-    // Quarter wave: the f16 block is 2.3x shorter than the f32 one, so its
+    // Quarter wave: the 2-byte block is 2.3x shorter than the f32 one, so its
     // shallow cuts need a deeper grid to cover the same fixed cost.
     const detail::GemmWorkspace ws = conv_split_workspace(
         p, bM, bN, bK, smem, 4, stream);
     dim3 grid(ceil_div(p.oh * p.ow, bM), ceil_div(p.ocg, bN),
               p.batch * p.groups * p.k_splits);
     kernel<<<grid, ConvTileH::threads, smem, stream>>>(p);
-    if (p.k_splits > 1) { conv_reduce<half_t>(p, ws, stream); }
+    if (p.k_splits > 1) { conv_reduce<Elem>(p, ws, stream); }
 }
 
 template <bool ChannelsLast>
@@ -979,8 +978,8 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
     const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
 
     const DataType dt = act.data_type();
-    if ((dt != DataType::f32 && dt != DataType::f16) || wgt.data_type() != dt ||
-        output.data_type() != dt) {
+    if ((dt != DataType::f32 && dt != DataType::f16 && dt != DataType::bf16) ||
+        wgt.data_type() != dt || output.data_type() != dt) {
         return Status::unsupported;
     }
     if (output.numel() == 0) { return Status::ok; }
@@ -1084,9 +1083,12 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
     }
 
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
-    if (esz == 2) {
-        if (last) { launch_conv_h<true>(p, stream); }
-        else      { launch_conv_h<false>(p, stream); }
+    if (dt == DataType::bf16) {
+        if (last) { launch_conv_h<cute::bfloat16_t, true>(p, stream); }
+        else      { launch_conv_h<cute::bfloat16_t, false>(p, stream); }
+    } else if (esz == 2) {
+        if (last) { launch_conv_h<cute::half_t, true>(p, stream); }
+        else      { launch_conv_h<cute::half_t, false>(p, stream); }
     } else {
         if (last) { launch_conv_f<true>(p, stream); }
         else      { launch_conv_f<false>(p, stream); }

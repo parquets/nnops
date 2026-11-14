@@ -18,7 +18,7 @@
 /// pitch is the same kernel with a different offset group. The operator itself
 /// is channel-first only, which the op layer checks.
 ///
-/// f32 and f16 in; values out at X's dtype, indices s64, both written densely —
+/// f32, f16 and bf16 in; values out at X's dtype, indices s64, both written densely —
 /// which is what their descriptors specify. Workspace: not used.
 
 #include "cuda_common.cuh"
@@ -202,6 +202,8 @@ Status topk_cuda(const TopKAttributes& attrs, TensorView& values,
         return topk_entry<float>(attrs, values, indices, inputs, stream);
     case DataType::f16:
         return topk_entry<__half>(attrs, values, indices, inputs, stream);
+    case DataType::bf16:
+        return topk_entry<__nv_bfloat16>(attrs, values, indices, inputs, stream);
     default:
         return Status::unsupported;
     }

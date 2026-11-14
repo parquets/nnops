@@ -63,19 +63,24 @@ inline bool gemm_vectorizable(const GemmParams& p, int64_t elem_size)
            (p.lda % vec == 0) && (p.ldb % vec == 0);
 }
 
-/// Launch a fully configured dense GEMM; f32/f16 only.
+/// Launch a fully configured dense GEMM; f32, f16 and bf16 only.
 inline Status dense_gemm_status(const GemmParams& p, DataType dtype,
                                 bool transpose_a, bool transpose_b,
                                 cudaStream_t stream)
 {
-    if (dtype != DataType::f32 && dtype != DataType::f16) {
+    const GemmElem elem = dtype == DataType::f32  ? GemmElem::F32
+                          : dtype == DataType::f16 ? GemmElem::F16
+                          : dtype == DataType::bf16 ? GemmElem::BF16
+                                                    : GemmElem::F32;
+    if (dtype != DataType::f32 && dtype != DataType::f16 &&
+        dtype != DataType::bf16) {
         return Status::unsupported;
     }
     if (p.m <= 0 || p.n <= 0 || p.k <= 0) { return Status::unsupported; }
     if (p.n > 65535) { return Status::unsupported; }
 
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
-    if (!dense_gemm_launch(p, static_cast<int>(elem_size), transpose_a,
+    if (!dense_gemm_launch(p, elem, transpose_a,
                            transpose_b, gemm_vectorizable(p, elem_size),
                            stream)) {
         return Status::unsupported;

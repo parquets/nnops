@@ -188,6 +188,15 @@ inline std::vector<float> to_floats(const void* data, DataType dt, size_t count)
             std::memcpy(&f, &bits, 4);
             out[i] = f;
         }
+    } else if (dt == DataType::bf16) {
+        // bf16 is the upper half of the f32 pattern, so widening is a shift.
+        const uint16_t* src = static_cast<const uint16_t*>(data);
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t bits = uint32_t(src[i]) << 16;
+            float f;
+            std::memcpy(&f, &bits, 4);
+            out[i] = f;
+        }
     } else {
         const float* src = static_cast<const float*>(data);
         for (size_t i = 0; i < count; ++i) { out[i] = src[i]; }
@@ -263,6 +272,11 @@ inline HostTensor make_host_random(std::span<const int64_t> shape, DataType dt,
     XorShift128 rng(seed);
     if (dt == DataType::f16) {
         auto* p = reinterpret_cast<nnops::backend::cpu::half*>(t.bytes.data());
+        for (size_t i = 0; i < t.bytes.size() / sizeof(*p); ++i) {
+            simd::s_store(&p[i], rng.next_float(lo, hi));
+        }
+    } else if (dt == DataType::bf16) {
+        auto* p = reinterpret_cast<nnops::backend::cpu::bfloat16*>(t.bytes.data());
         for (size_t i = 0; i < t.bytes.size() / sizeof(*p); ++i) {
             simd::s_store(&p[i], rng.next_float(lo, hi));
         }
@@ -420,7 +434,9 @@ void run_op_both(Factory make, std::span<const HostTensor> ins, const char* what
 
     auto op_cpu = make(Backend::CPU);
     const std::vector<TensorDesc> odescs = op_cpu->getOutputTensorDesc(descs);
-    if (odescs.empty()) { throw std::runtime_error(std::string(what) + ": no output desc"); }
+    if (odescs.empty()) {
+        throw std::runtime_error(std::string(what) + ": no output desc");
+    }
 
     std::vector<HostTensor> ref;
     std::vector<HostTensor> got;
@@ -466,6 +482,188 @@ void run_op_both(Factory make, std::span<const HostTensor> ins, const char* what
     for (size_t i = 0; i < douts.size(); ++i) {
         from_device(douts[i], got[i]);
         expect_same_bytes(got[i], ref[i], what);
+    }
+}
+
+// ============================================================
+// bf16
+// ============================================================
+
+/// Every element of an f32 tensor rounded to bf16 and kept in f32 storage: the
+/// CPU oracle's input, so it sees exactly the numbers the device holds.
+inline HostTensor bf16_rounded_host(const HostTensor& src)
+{
+    HostTensor t = src;
+    auto* p = reinterpret_cast<float*>(t.bytes.data());
+    for (size_t i = 0; i < t.bytes.size() / sizeof(float); ++i) {
+        const nnops::backend::cpu::bfloat16 b(p[i]);
+        p[i] = static_cast<float>(b);
+    }
+    // A HostTensor's view points into its own `bytes`, and the copy above left it
+    // pointing at `src`'s storage — which `t` has just rounded a *copy* of. Re-aim
+    // it, or the oracle reads the unrounded values.
+    t.view = TensorView(t.view.shape_span(), t.view.data_type(), t.bytes.data(),
+                        t.view.pitch(), t.view.layout());
+    return t;
+}
+
+/// The same values in bf16 storage. A pitched source keeps the 32 B row rule
+/// for the new width; a channel-last one stays dense.
+inline HostTensor to_bf16_host(const HostTensor& src, bool padded)
+{
+    const TensorView& s = src.view;
+    const int64_t rows = s.rank() >= 2 ? s.total_rows() : 1;
+    const int64_t cols = rows > 0 ? s.numel() / rows : 0;
+
+    HostTensor t;
+    const TensorView probe(s.shape_span(), DataType::bf16, nullptr, s.layout());
+    t.bytes.assign(padded ? probe.desc().storage_bytes(32) : probe.storage_bytes(),
+                   std::byte{0});
+    t.view = padded ? TensorView(s.shape_span(), DataType::bf16, t.bytes.data(),
+                                 probe.desc().row_pitch(32), s.layout())
+                    : TensorView(s.shape_span(), DataType::bf16, t.bytes.data(),
+                                 s.layout());
+
+    for (int64_t r = 0; r < rows; ++r) {
+        const auto* sp =
+            reinterpret_cast<const float*>(src.bytes.data() + r * s.pitch());
+        auto* dp = reinterpret_cast<nnops::backend::cpu::bfloat16*>(
+            t.bytes.data() + r * t.view.pitch());
+        for (int64_t c = 0; c < cols; ++c) { dp[c] = nnops::backend::cpu::bfloat16(sp[c]); }
+    }
+    return t;
+}
+
+/// True when the caller gave the view a row pitch beyond its dense width.
+inline bool is_pitched(const HostTensor& t)
+{
+    const TensorView dense(t.view.shape_span(), t.view.data_type(), nullptr,
+                           t.view.layout());
+    return t.view.rank() >= 2 && t.view.pitch() != dense.pitch();
+}
+
+/// True when `d` describes the same shape and layout as `in`.
+inline bool same_shape(const TensorDesc& d, const TensorDesc& in)
+{
+    if (d.rank != in.rank || d.layout != in.layout) { return false; }
+    for (int64_t i = 0; i < d.rank; ++i) {
+        if (d.dims[static_cast<size_t>(i)] != in.dims[static_cast<size_t>(i)]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Run `make` on the CPU over bf16-rounded f32 inputs and on the device over the
+/// same values as bf16, then compare every output.
+///
+/// Off AArch64 the CPU has no bf16 route, so it cannot be the oracle over a bf16
+/// tensor: rounding the inputs on the host first makes the values identical on
+/// both sides — the CPU runs f32, the device runs bf16 — and comparing the
+/// outputs as bf16 (the device rounds its accumulator at the store, the oracle is
+/// rounded the same way) leaves accumulation order as the only difference.
+/// Non-f32 inputs are indices and pass through untouched, so an index-driven
+/// operator sees the same indices on both sides. Every input keeps the pitch it
+/// was built with; a same-shape output takes that pitch and any other output is
+/// dense.
+template <class Factory>
+void run_op_bf16(Factory make, std::span<const HostTensor> ins, float tol_abs,
+                 float tol_rel, const char* what)
+{
+    std::vector<HostTensor> cpu_src;
+    std::vector<HostTensor> dev_src;
+    cpu_src.reserve(ins.size());
+    dev_src.reserve(ins.size());
+
+    std::vector<TensorDesc> cpu_descs;
+    std::vector<TensorDesc> dev_descs;
+    cpu_descs.reserve(ins.size());
+    dev_descs.reserve(ins.size());
+    for (const HostTensor& t : ins) {
+        if (t.view.data_type() == DataType::f32) {
+            cpu_src.push_back(bf16_rounded_host(t));
+            dev_src.push_back(to_bf16_host(t, is_pitched(t)));
+        } else {
+            cpu_src.push_back(t);
+            dev_src.push_back(t);
+        }
+        cpu_descs.push_back(cpu_src.back().view.desc());
+        dev_descs.push_back(dev_src.back().view.desc());
+    }
+
+    std::vector<TensorView> cpu_views;
+    cpu_views.reserve(cpu_src.size());
+    for (HostTensor& t : cpu_src) { cpu_views.push_back(t.view); }
+
+    auto op_cpu = make(Backend::CPU);
+    const std::vector<TensorDesc> odescs = op_cpu->getOutputTensorDesc(cpu_descs);
+    if (odescs.empty()) {
+        throw std::runtime_error(std::string(what) + ": no output desc");
+    }
+
+    // A same-shape output inherits its input's row pitch. The shape-preserving
+    // kernels (softmax, the norm family, cumsum) walk the output with the input's
+    // stride, and their descriptors carry no stride of their own, so the pitch
+    // the caller allocated for the input is the one they assume for the output.
+    // A shape-changing output has no such twin and is dense.
+    std::vector<HostTensor> ref;
+    ref.reserve(odescs.size());
+    for (const TensorDesc& d : odescs) {
+        const bool pitched = is_pitched(cpu_src[0]) && same_shape(d, cpu_descs[0]);
+        ref.push_back(make_host_zeroed(d.dims, d.dtype, pitched, d.layout));
+    }
+    std::vector<TensorView> rv;
+    for (HostTensor& t : ref) { rv.push_back(t.view); }
+    if (op_cpu->compute(rv, cpu_views, cpu_context(), nullptr) != Status::ok) {
+        throw std::runtime_error(std::string(what) + ": cpu compute failed");
+    }
+
+    std::vector<DeviceTensor> dins;
+    dins.reserve(dev_src.size());
+    for (const HostTensor& t : dev_src) { dins.push_back(to_device(t)); }
+    std::vector<TensorView> dviews;
+    dviews.reserve(dins.size());
+    for (DeviceTensor& d : dins) { dviews.push_back(d.view); }
+
+    auto op_dev = make(Backend::CUDA);
+    const std::vector<TensorDesc> dodescs = op_dev->getOutputTensorDesc(dev_descs);
+    if (dodescs.size() != odescs.size()) {
+        throw std::runtime_error(std::string(what) + ": output count mismatch");
+    }
+
+    std::vector<HostTensor> got;
+    std::vector<DeviceTensor> douts;
+    got.reserve(dodescs.size());
+    douts.reserve(dodescs.size());
+    for (const TensorDesc& d : dodescs) {
+        const bool pitched = is_pitched(dev_src[0]) && same_shape(d, dev_descs[0]);
+        got.push_back(make_host_zeroed(d.dims, d.dtype, pitched, d.layout));
+    }
+    for (size_t i = 0; i < dodescs.size(); ++i) {
+        douts.push_back(alloc_like(got[i].view, got[i]));
+    }
+    std::vector<TensorView> dv;
+    dv.reserve(douts.size());
+    for (DeviceTensor& d : douts) { dv.push_back(d.view); }
+
+    const Status st = op_dev->compute(dv, dviews, cuda_context(), nullptr);
+    if (st != Status::ok) {
+        throw std::runtime_error(std::string(what) + ": cuda compute returned " +
+                                 to_string(st));
+    }
+    CudaBuffer::sync();
+
+    for (size_t i = 0; i < douts.size(); ++i) {
+        from_device(douts[i], got[i]);
+        const DataType dt = got[i].view.data_type();
+        if (dt == DataType::f32) {
+            expect_same(got[i], ref[i], tol_abs, tol_rel, what);
+        } else if (dt == DataType::bf16) {
+            expect_same(got[i], to_bf16_host(ref[i], is_pitched(got[i])), tol_abs,
+                        tol_rel, what);
+        } else {
+            expect_same_bytes(got[i], ref[i], what);
+        }
     }
 }
 

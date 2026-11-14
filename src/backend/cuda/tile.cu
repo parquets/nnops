@@ -146,6 +146,7 @@ Status tile_cuda(const TileAttributes& /*attrs*/, TensorView& output,
     switch (inputs[0].data_type()) {
     case DataType::f32:  return tile_entry<float>(output, inputs[0], stream);
     case DataType::f16:  return tile_entry<__half>(output, inputs[0], stream);
+    case DataType::bf16: return tile_entry<__nv_bfloat16>(output, inputs[0], stream);
     case DataType::s8:   return tile_entry<int8_t>(output, inputs[0], stream);
     case DataType::u8:   return tile_entry<uint8_t>(output, inputs[0], stream);
     case DataType::s32:  return tile_entry<int32_t>(output, inputs[0], stream);
@@ -162,6 +163,7 @@ Status expand_cuda(const ExpandAttributes& /*attrs*/, TensorView& output,
     switch (inputs[0].data_type()) {
     case DataType::f32:  return expand_entry<float>(inputs[0], output, stream);
     case DataType::f16:  return expand_entry<__half>(inputs[0], output, stream);
+    case DataType::bf16: return expand_entry<__nv_bfloat16>(inputs[0], output, stream);
     case DataType::s8:   return expand_entry<int8_t>(inputs[0], output, stream);
     case DataType::u8:   return expand_entry<uint8_t>(inputs[0], output, stream);
     case DataType::s32:  return expand_entry<int32_t>(inputs[0], output, stream);

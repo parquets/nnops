@@ -13,8 +13,10 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <cfloat>
+#include <cstdint>
 #include <type_traits>
 
 namespace nnops::backend::cuda {
@@ -48,27 +50,65 @@ __host__ __device__ inline __half float_to_half(float f) noexcept {
 }
 
 // ============================================================
-// s_load / s_store — scalar load/store with f16↔f32 conversion
+// Element type ↔ float — the one conversion surface a kernel templated
+// over the element type needs
+// ============================================================
+// bf16 is the same widening contract as f16: a 2-byte float that every kernel
+// carries through float arithmetic and narrows once per store. Both NVIDIA
+// narrows round to nearest even, which is what the CPU's float_to_bf16 does.
+
+// Both directions are `__host__ __device__`: a launcher converts a scalar (a
+// pad constant, a clamp bound) before it hands the value to a kernel.
+template <typename T>
+__host__ __device__ inline float elem_to_float(T x) noexcept {
+    if constexpr (std::is_same_v<T, float>) {
+        return x;
+    } else if constexpr (std::is_same_v<T, __half>) {
+        return __half2float(x);
+    } else {
+        return __bfloat162float(x);
+    }
+}
+
+template <typename T>
+__host__ __device__ inline T float_to_elem(float x) noexcept {
+    if constexpr (std::is_same_v<T, float>) {
+        return x;
+    } else if constexpr (std::is_same_v<T, __half>) {
+        return __float2half(x);
+    } else {
+        return __float2bfloat16(x);
+    }
+}
+
+// ============================================================
+// s_load / s_store — scalar load/store with 2-byte ↔ f32 conversion
 // Mirrors the CPU SIMD s_load/s_store API for kernel portability.
 // ============================================================
 
 __device__ inline float s_load(const float* ptr) noexcept { return *ptr; }
 __device__ inline float s_load(const __half* ptr) noexcept { return __half2float(*ptr); }
+__device__ inline float s_load(const __nv_bfloat16* ptr) noexcept { return __bfloat162float(*ptr); }
 __device__ inline void s_store(float* ptr, float val) noexcept { *ptr = val; }
 __device__ inline void s_store(__half* ptr, float val) noexcept { *ptr = __float2half(val); }
+__device__ inline void s_store(__nv_bfloat16* ptr, float val) noexcept { *ptr = __float2bfloat16(val); }
 
 // ============================================================
 // 128-bit vectorized load/store helpers
 // ============================================================
 // f32: float4 = 128 bits = 4 floats
-// f16: half8  = 128 bits = 8 halfs (via aligned struct)
+// 2-byte: pack8<T> = 128 bits = 8 elements (via aligned struct)
 //
 // These generate a single 128-bit LDG/STG instruction, reducing
-// memory transactions by 4× (f32) or 8× (f16) vs scalar s_load.
+// memory transactions by 4× (f32) or 8× (2-byte) vs scalar s_load.
 
-struct alignas(16) half8 {
-    __half data[8];
+template <typename T>
+struct alignas(16) pack8 {
+    T data[8];
 };
+
+using half8 = pack8<__half>;
+using bf8   = pack8<__nv_bfloat16>;
 
 __device__ inline float4 v4_load(const float* ptr) noexcept {
     return *reinterpret_cast<const float4*>(ptr);
@@ -84,34 +124,60 @@ __device__ inline void v4_store(__half* ptr, half8 val) noexcept {
     *reinterpret_cast<half8*>(ptr) = val;
 }
 
-// f16 128-bit helpers: pack 8 float results into half8, and accumulate
-// onto an existing half8 (for add_to mode).  Reduces per-op boilerplate.
-__device__ inline half8 half8_set(
+__device__ inline bf8 v4_load(const __nv_bfloat16* ptr) noexcept {
+    return *reinterpret_cast<const bf8*>(ptr);
+}
+__device__ inline void v4_store(__nv_bfloat16* ptr, bf8 val) noexcept {
+    *reinterpret_cast<bf8*>(ptr) = val;
+}
+
+/// The 128-bit helpers above fault on a misaligned address, so a kernel that
+/// walks rows has to know whether its row bases landed on one. A dense row of a
+/// 2-byte dtype is 2·last_dim bytes and a 4-byte one 4·last_dim, so an odd last
+/// dim leaves alternate rows unaligned; such a row drops to its scalar loop.
+__device__ inline bool aligned16(const void* a) noexcept {
+    return (reinterpret_cast<uintptr_t>(a) & 15u) == 0;
+}
+__device__ inline bool aligned16(const void* a, const void* b) noexcept {
+    return ((reinterpret_cast<uintptr_t>(a) |
+             reinterpret_cast<uintptr_t>(b)) & 15u) == 0;
+}
+__device__ inline bool aligned16(const void* a, const void* b,
+                                 const void* c) noexcept {
+    return ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b) |
+             reinterpret_cast<uintptr_t>(c)) & 15u) == 0;
+}
+
+// 2-byte 128-bit helpers: pack 8 float results into a pack8<T>, and accumulate
+// onto an existing one (for add_to mode).  Reduces per-op boilerplate.
+template <typename T>
+__device__ inline pack8<T> pack8_set(
     float r0, float r1, float r2, float r3,
     float r4, float r5, float r6, float r7) noexcept
 {
-    half8 r;
-    r.data[0] = __float2half(r0); r.data[1] = __float2half(r1);
-    r.data[2] = __float2half(r2); r.data[3] = __float2half(r3);
-    r.data[4] = __float2half(r4); r.data[5] = __float2half(r5);
-    r.data[6] = __float2half(r6); r.data[7] = __float2half(r7);
+    pack8<T> r;
+    r.data[0] = float_to_elem<T>(r0); r.data[1] = float_to_elem<T>(r1);
+    r.data[2] = float_to_elem<T>(r2); r.data[3] = float_to_elem<T>(r3);
+    r.data[4] = float_to_elem<T>(r4); r.data[5] = float_to_elem<T>(r5);
+    r.data[6] = float_to_elem<T>(r6); r.data[7] = float_to_elem<T>(r7);
     return r;
 }
 
-__device__ inline half8 half8_add(
-    half8 base,
+template <typename T>
+__device__ inline pack8<T> pack8_add(
+    pack8<T> base,
     float r0, float r1, float r2, float r3,
     float r4, float r5, float r6, float r7) noexcept
 {
-    half8 r;
-    r.data[0] = __float2half(__half2float(base.data[0]) + r0);
-    r.data[1] = __float2half(__half2float(base.data[1]) + r1);
-    r.data[2] = __float2half(__half2float(base.data[2]) + r2);
-    r.data[3] = __float2half(__half2float(base.data[3]) + r3);
-    r.data[4] = __float2half(__half2float(base.data[4]) + r4);
-    r.data[5] = __float2half(__half2float(base.data[5]) + r5);
-    r.data[6] = __float2half(__half2float(base.data[6]) + r6);
-    r.data[7] = __float2half(__half2float(base.data[7]) + r7);
+    pack8<T> r;
+    r.data[0] = float_to_elem<T>(elem_to_float(base.data[0]) + r0);
+    r.data[1] = float_to_elem<T>(elem_to_float(base.data[1]) + r1);
+    r.data[2] = float_to_elem<T>(elem_to_float(base.data[2]) + r2);
+    r.data[3] = float_to_elem<T>(elem_to_float(base.data[3]) + r3);
+    r.data[4] = float_to_elem<T>(elem_to_float(base.data[4]) + r4);
+    r.data[5] = float_to_elem<T>(elem_to_float(base.data[5]) + r5);
+    r.data[6] = float_to_elem<T>(elem_to_float(base.data[6]) + r6);
+    r.data[7] = float_to_elem<T>(elem_to_float(base.data[7]) + r7);
     return r;
 }
 
@@ -119,9 +185,9 @@ __device__ inline half8 half8_add(
 // Channel-lane vectors — the loads a channel-last kernel wants
 // ============================================================
 // The channel axis is contiguous there, so a thread owns one 16 B vector of it:
-// `Vec` is 4 for f32 and 8 for f16, or 1 for the scalar script that a channel
-// tail or an unaligned lane takes. Both widen through float, which is what every
-// accumulating kernel works in.
+// `Vec` is 4 for f32 and 8 for a 2-byte type, or 1 for the scalar script that a
+// channel tail or an unaligned lane takes. Every one widens through float, which
+// is what every accumulating kernel works in.
 
 template <typename T, int Vec>
 __device__ inline void load_channels(const T* ptr, float (&v)[Vec]) noexcept
@@ -135,9 +201,9 @@ __device__ inline void load_channels(const T* ptr, float (&v)[Vec]) noexcept
         v[2] = r.z;
         v[3] = r.w;
     } else {
-        const half8 r = v4_load(ptr);
+        const pack8<T> r = v4_load(ptr);
         #pragma unroll
-        for (int i = 0; i < Vec; ++i) { v[i] = __half2float(r.data[i]); }
+        for (int i = 0; i < Vec; ++i) { v[i] = elem_to_float(r.data[i]); }
     }
 }
 
@@ -149,9 +215,9 @@ __device__ inline void store_channels(T* ptr, const float (&v)[Vec]) noexcept
     } else if constexpr (std::is_same_v<T, float>) {
         v4_store(ptr, make_float4(v[0], v[1], v[2], v[3]));
     } else {
-        half8 r;
+        pack8<T> r;
         #pragma unroll
-        for (int i = 0; i < Vec; ++i) { r.data[i] = __float2half(v[i]); }
+        for (int i = 0; i < Vec; ++i) { r.data[i] = float_to_elem<T>(v[i]); }
         v4_store(ptr, r);
     }
 }

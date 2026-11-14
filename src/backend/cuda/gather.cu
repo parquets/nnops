@@ -384,6 +384,7 @@ Status gather_cuda(const GatherAttributes& attrs, TensorView& output,
     switch (data.data_type()) {
     case DataType::f32: return gather_dispatch<float>(data, indices, output, axis, false, stream);
     case DataType::f16: return gather_dispatch<__half>(data, indices, output, axis, false, stream);
+    case DataType::bf16: return gather_dispatch<__nv_bfloat16>(data, indices, output, axis, false, stream);
     case DataType::s8:  return gather_dispatch<int8_t>(data, indices, output, axis, false, stream);
     case DataType::u8:  return gather_dispatch<uint8_t>(data, indices, output, axis, false, stream);
     case DataType::s32: return gather_dispatch<int32_t>(data, indices, output, axis, false, stream);
@@ -404,6 +405,7 @@ Status gather_elements_cuda(const GatherElementsAttributes& attrs,
     switch (data.data_type()) {
     case DataType::f32: return gather_dispatch<float>(data, indices, output, axis, true, stream);
     case DataType::f16: return gather_dispatch<__half>(data, indices, output, axis, true, stream);
+    case DataType::bf16: return gather_dispatch<__nv_bfloat16>(data, indices, output, axis, true, stream);
     case DataType::s8:  return gather_dispatch<int8_t>(data, indices, output, axis, true, stream);
     case DataType::u8:  return gather_dispatch<uint8_t>(data, indices, output, axis, true, stream);
     case DataType::s32: return gather_dispatch<int32_t>(data, indices, output, axis, true, stream);
@@ -423,6 +425,7 @@ Status gather_nd_cuda(const GatherNDAttributes& attrs, TensorView& output,
     switch (data.data_type()) {
     case DataType::f32: return gather_nd_dispatch<float>(data, indices, output, batch, stream);
     case DataType::f16: return gather_nd_dispatch<__half>(data, indices, output, batch, stream);
+    case DataType::bf16: return gather_nd_dispatch<__nv_bfloat16>(data, indices, output, batch, stream);
     case DataType::s8:  return gather_nd_dispatch<int8_t>(data, indices, output, batch, stream);
     case DataType::u8:  return gather_nd_dispatch<uint8_t>(data, indices, output, batch, stream);
     case DataType::s32: return gather_nd_dispatch<int32_t>(data, indices, output, batch, stream);

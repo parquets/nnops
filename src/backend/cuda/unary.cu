@@ -5,7 +5,7 @@
 /// plus a row-by-row kernel for multi-dimensional pitch-aware tensors.
 /// All 9 operations: Exp, Log, Sin, Cos, Tan, Tanh, Abs, Neg, Sqrt.
 ///
-/// Supports f32 and f16. Workspace: not used.
+/// Supports f32, f16 and bf16. Workspace: not used.
 
 #include "cuda_common.cuh"
 #include "nnops/ops/unary.hpp"
@@ -110,7 +110,9 @@ __global__ void unary_kernel(
     const T* in_row  = input  + row * in_row_stride;
     T*       out_row = output + row * out_row_stride;
 
-    const int64_t vec_end = (last_dim / VEC) * VEC;
+    // An unaligned row walks the scalar loop instead of the 16 B one.
+    const int64_t vec_end =
+        aligned16(in_row, out_row) ? (last_dim / VEC) * VEC : 0;
 
     // 128-bit vectorized loop: VEC elements per iteration
     if constexpr (sizeof(T) == 4) {
@@ -127,22 +129,22 @@ __global__ void unary_kernel(
             }
         }
     } else {
-        // f16 path: half8 = 8 halfs
+        // 2-byte path: pack8<T> = 8 elements
         for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
-            half8 vin = v4_load(&in_row[i]);
-            float r0 = fn(__half2float(vin.data[0]));
-            float r1 = fn(__half2float(vin.data[1]));
-            float r2 = fn(__half2float(vin.data[2]));
-            float r3 = fn(__half2float(vin.data[3]));
-            float r4 = fn(__half2float(vin.data[4]));
-            float r5 = fn(__half2float(vin.data[5]));
-            float r6 = fn(__half2float(vin.data[6]));
-            float r7 = fn(__half2float(vin.data[7]));
+            pack8<T> vin = v4_load(&in_row[i]);
+            float r0 = fn(elem_to_float(vin.data[0]));
+            float r1 = fn(elem_to_float(vin.data[1]));
+            float r2 = fn(elem_to_float(vin.data[2]));
+            float r3 = fn(elem_to_float(vin.data[3]));
+            float r4 = fn(elem_to_float(vin.data[4]));
+            float r5 = fn(elem_to_float(vin.data[5]));
+            float r6 = fn(elem_to_float(vin.data[6]));
+            float r7 = fn(elem_to_float(vin.data[7]));
             if (add_to) {
-                v4_store(&out_row[i], half8_add(v4_load(&out_row[i]),
+                v4_store(&out_row[i], pack8_add<T>(v4_load(&out_row[i]),
                     r0, r1, r2, r3, r4, r5, r6, r7));
             } else {
-                v4_store(&out_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                v4_store(&out_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
             }
         }
     }
@@ -176,7 +178,8 @@ __global__ void unary_flat_kernel(
 
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
-    const int64_t vec_end = (total / VEC) * VEC;
+    const int64_t vec_end =
+        aligned16(input, output) ? (total / VEC) * VEC : 0;
 
     // 128-bit vectorized grid-stride loop
     if constexpr (sizeof(T) == 4) {
@@ -193,22 +196,22 @@ __global__ void unary_flat_kernel(
             }
         }
     } else {
-        // f16 path: half8 = 8 halfs
+        // 2-byte path: pack8<T> = 8 elements
         for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
-            half8 vin = v4_load(&input[i]);
-            float r0 = fn(__half2float(vin.data[0]));
-            float r1 = fn(__half2float(vin.data[1]));
-            float r2 = fn(__half2float(vin.data[2]));
-            float r3 = fn(__half2float(vin.data[3]));
-            float r4 = fn(__half2float(vin.data[4]));
-            float r5 = fn(__half2float(vin.data[5]));
-            float r6 = fn(__half2float(vin.data[6]));
-            float r7 = fn(__half2float(vin.data[7]));
+            pack8<T> vin = v4_load(&input[i]);
+            float r0 = fn(elem_to_float(vin.data[0]));
+            float r1 = fn(elem_to_float(vin.data[1]));
+            float r2 = fn(elem_to_float(vin.data[2]));
+            float r3 = fn(elem_to_float(vin.data[3]));
+            float r4 = fn(elem_to_float(vin.data[4]));
+            float r5 = fn(elem_to_float(vin.data[5]));
+            float r6 = fn(elem_to_float(vin.data[6]));
+            float r7 = fn(elem_to_float(vin.data[7]));
             if (add_to) {
-                v4_store(&output[i], half8_add(v4_load(&output[i]),
+                v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
                     r0, r1, r2, r3, r4, r5, r6, r7));
             } else {
-                v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
             }
         }
     }
@@ -289,6 +292,9 @@ Status unary_cuda(
         return Status::ok;
     case DataType::f16:
         unary_cuda_impl<__half>(attrs, output, inputs, ctx);
+        return Status::ok;
+    case DataType::bf16:
+        unary_cuda_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
     default:
         return Status::unsupported;

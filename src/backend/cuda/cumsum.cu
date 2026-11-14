@@ -13,7 +13,7 @@
 ///
 /// Modes: exclusive/inclusive, forward/reverse.
 ///
-/// Supports f32 and f16. Workspace: not used.
+/// Supports f32, f16 and bf16. Workspace: not used.
 
 #include "cuda_common.cuh"
 #include "nnops/ops/cumsum.hpp"
@@ -36,52 +36,55 @@ __global__ void cumsum_kernel(
     bool reverse)
 {
     // Each block: one outer slice
-    // Each thread: one lower-dim position
+    // Each thread: one lower-dim position, walking the slice in block strides
+    // where the tail is wider than the block.
     const int outer = blockIdx.x;
-    const int lower = threadIdx.x;
 
-    if (lower >= lower_dim_size) return;
+    // The slice spans `dim` axis steps, each `axis_stride` elements apart, so its
+    // start steps by dim × the axis stride — not by the lower-dim width, which is
+    // the same only for a dense row.
+    const int64_t slice_start = outer * dim * axis_stride;
 
-    const int64_t slice_start = outer * dim * lower_dim_size;
-
-    if (!reverse) {
-        // ---- Forward cumulative sum ----
-        if (exclusive) {
-            // output[0] = 0, output[i] += input[i-1], running sum tracks input
-            float running = 0.0f;
-            for (int64_t k = 0; k < dim; ++k) {
-                int64_t idx = slice_start + k * axis_stride + lower;
-                float val = running;  // exclusive: does not include current element
-                s_store(&output[idx], val);
-                running += s_load(&input[idx]);  // add current to running sum
+    for (int64_t lower = threadIdx.x; lower < lower_dim_size; lower += blockDim.x) {
+        if (!reverse) {
+            // ---- Forward cumulative sum ----
+            if (exclusive) {
+                // output[0] = 0, output[i] += input[i-1], running sum tracks input
+                float running = 0.0f;
+                for (int64_t k = 0; k < dim; ++k) {
+                    int64_t idx = slice_start + k * axis_stride + lower;
+                    float val = running;  // exclusive: does not include current element
+                    s_store(&output[idx], val);
+                    running += s_load(&input[idx]);  // add current to running sum
+                }
+            } else {
+                // output[i] = sum(input[0..i])
+                float running = 0.0f;
+                for (int64_t k = 0; k < dim; ++k) {
+                    int64_t idx = slice_start + k * axis_stride + lower;
+                    running += s_load(&input[idx]);
+                    s_store(&output[idx], running);
+                }
             }
         } else {
-            // output[i] = sum(input[0..i])
-            float running = 0.0f;
-            for (int64_t k = 0; k < dim; ++k) {
-                int64_t idx = slice_start + k * axis_stride + lower;
-                running += s_load(&input[idx]);
-                s_store(&output[idx], running);
-            }
-        }
-    } else {
-        // ---- Reverse cumulative sum ----
-        if (exclusive) {
-            // output[dim-1] = 0, output[i] += input[i+1], running sum tracks input
-            float running = 0.0f;
-            for (int64_t k = dim - 1; k >= 0; --k) {
-                int64_t idx = slice_start + k * axis_stride + lower;
-                float val = running;  // exclusive: does not include current element
-                s_store(&output[idx], val);
-                running += s_load(&input[idx]);  // add current to running sum
-            }
-        } else {
-            // output[i] = sum(input[i..dim-1])
-            float running = 0.0f;
-            for (int64_t k = dim - 1; k >= 0; --k) {
-                int64_t idx = slice_start + k * axis_stride + lower;
-                running += s_load(&input[idx]);
-                s_store(&output[idx], running);
+            // ---- Reverse cumulative sum ----
+            if (exclusive) {
+                // output[dim-1] = 0, output[i] += input[i+1], running sum tracks input
+                float running = 0.0f;
+                for (int64_t k = dim - 1; k >= 0; --k) {
+                    int64_t idx = slice_start + k * axis_stride + lower;
+                    float val = running;  // exclusive: does not include current element
+                    s_store(&output[idx], val);
+                    running += s_load(&input[idx]);  // add current to running sum
+                }
+            } else {
+                // output[i] = sum(input[i..dim-1])
+                float running = 0.0f;
+                for (int64_t k = dim - 1; k >= 0; --k) {
+                    int64_t idx = slice_start + k * axis_stride + lower;
+                    running += s_load(&input[idx]);
+                    s_store(&output[idx], running);
+                }
             }
         }
     }
@@ -151,6 +154,9 @@ Status cumsum_cuda(
         return Status::ok;
     case DataType::f16:
         cumsum_cuda_impl<__half>(attrs, output, inputs, ctx);
+        return Status::ok;
+    case DataType::bf16:
+        cumsum_cuda_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
     default:
         return Status::unsupported;

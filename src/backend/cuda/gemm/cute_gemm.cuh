@@ -49,8 +49,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <type_traits>
 
 namespace nnops::backend::cuda {
+
+/// The dense GEMM's element formats: the f32 SIMT tile, or one of the two
+/// 2-byte tensor-core formats (same MMA shape, different operand format).
+enum class GemmElem { F32, F16, BF16 };
 
 /// Everything a dense GEMM needs besides the element type and the two
 /// transpose flags (which are template parameters, since they pick the copy
@@ -260,7 +265,7 @@ namespace detail {
 /// contiguous, and the passes run over the other axis. A tiling whose thread
 /// count does not divide the panel walks off its end -- into the next stage's
 /// buffer rather than into a fault -- so the shape is checked here instead.
-template <int Threads, int Rows, int Cols, bool ContigCols>
+template <class Elem, int Threads, int Rows, int Cols, bool ContigCols>
 constexpr auto gemm_copy_half()
 {
     if constexpr (ContigCols) {
@@ -271,7 +276,7 @@ constexpr auto gemm_copy_half()
                       "the copy tiling overshoots the panel");
         return cute::make_tiled_copy(
             cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
-                            cute::half_t>{},
+                            Elem>{},
             cute::Layout<cute::Shape<cute::Int<t_o>, cute::Int<t_c>>>{},
             cute::Layout<cute::Shape<cute::_1, cute::_8>>{});
     } else {
@@ -282,21 +287,28 @@ constexpr auto gemm_copy_half()
                       "the copy tiling overshoots the panel");
         return cute::make_tiled_copy(
             cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
-                            cute::half_t>{},
+                            Elem>{},
             cute::Layout<cute::Shape<cute::Int<t_r>, cute::Int<t_c>>>{},
             cute::Layout<cute::Shape<cute::_8, cute::_1>>{});
     }
 }
 
+/// The 16x8x16 tensor-core atom for a 2-byte float. f16 and bf16 have the same
+/// MMA shape; only the operand format differs.
+template <class Elem>
+using gemm_mma_atom = std::conditional_t<std::is_same_v<Elem, cute::bfloat16_t>,
+                                         cute::SM80_16x8x16_F32BF16BF16F32_TN,
+                                         cute::SM80_16x8x16_F32F16F16F32_TN>;
+
 }  // namespace detail
 
-template <class Tile, bool TransA, bool TransB, bool Vectorized>
+template <class Tile, class Elem, bool TransA, bool TransB, bool Vectorized>
 __global__ __launch_bounds__(Tile::threads)
 void dense_gemm_h_kernel(GemmParams p)
 {
     using namespace cute;
-    using In = cute::half_t;
-    using Out = cute::half_t;
+    using In = Elem;
+    using Out = Elem;
 
     constexpr int bM = Tile::bM;
     constexpr int bN = Tile::bN;
@@ -379,12 +391,12 @@ void dense_gemm_h_kernel(GemmParams p)
     Tensor sB = make_tensor(make_smem_ptr(reinterpret_cast<In*>(gemm_smem + kSmemA * 2)),
                             sB_layout);
 
-    TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
+    TiledMMA mma = make_tiled_mma(detail::gemm_mma_atom<Elem>{},
                                   Layout<Shape<Int<Tile::wm>, Int<Tile::wn>, _1>>{},
                                   cute::Tile<Int<Tile::mmaM>, Int<Tile::mmaN>, _16>{});
 
-    auto copy_a = detail::gemm_copy_half<Tile::threads, bM, bK, !TransA>();
-    auto copy_b = detail::gemm_copy_half<Tile::threads, bN, bK, TransB>();
+    auto copy_a = detail::gemm_copy_half<Elem, Tile::threads, bM, bK, !TransA>();
+    auto copy_b = detail::gemm_copy_half<Elem, Tile::threads, bN, bK, TransB>();
 
     ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
     Tensor tAgA = thr_copy_a.partition_S(gA);
@@ -1077,17 +1089,17 @@ inline int device_sm_count()
     return count;
 }
 
-template <class Tile, bool TransA, bool TransB, bool Vectorized>
+template <class Tile, class Elem, bool TransA, bool TransB, bool Vectorized>
 inline void launch_dense_h(const GemmParams& p, cudaStream_t stream)
 {
     using namespace cute;
     constexpr int bM = Tile::bM, bN = Tile::bN, bK = Tile::bK;
     constexpr auto la = gemm_smem_layout<!TransA>(Int<bM>{}, Int<bK>{}, Int<Tile::stages>{});
     constexpr auto lb = gemm_smem_layout<TransB>(Int<bN>{}, Int<bK>{}, Int<Tile::stages>{});
-    constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(half_t));
+    constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(Elem));
     static_assert(smem <= kSmemPerSm, "one block has to fit");
 
-    auto kernel = dense_gemm_h_kernel<Tile, TransA, TransB, Vectorized>;
+    auto kernel = dense_gemm_h_kernel<Tile, Elem, TransA, TransB, Vectorized>;
     static const cudaError_t cfg = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
@@ -1263,19 +1275,20 @@ inline void launch_splitk_reduce(const GemmParams& p, cudaStream_t stream)
 /// than the tile wants, and reducing the planes afterwards. Falls back to the
 /// single-pass launch whenever a split cannot help or its scratch cannot be
 /// carved.
-template <bool Half, class Tile, bool TransA, bool TransB, bool Vectorized>
+template <class Elem, class Tile, bool TransA, bool TransB, bool Vectorized>
 inline void launch_dense_split(const GemmParams& p, cudaStream_t stream)
 {
+    constexpr bool Half = !std::is_same_v<Elem, float>;
     auto launch_one = [&](const GemmParams& q) {
         if constexpr (Half) {
-            launch_dense_h<Tile, TransA, TransB, Vectorized>(q, stream);
+            launch_dense_h<Tile, Elem, TransA, TransB, Vectorized>(q, stream);
         } else {
             launch_dense_f<Tile, TransA, TransB, Vectorized>(q, stream);
         }
     };
 
     constexpr int blocks_per_sm = [] {
-        if constexpr (Half) { return 3; }  // the 32 KB f16 tile
+        if constexpr (Half) { return 3; }  // the 32 KB 2-byte tile
         else { return Tile::blocks; }
     }();
     const int elem_size = Half ? 2 : 4;
@@ -1302,7 +1315,7 @@ inline void launch_dense_split(const GemmParams& p, cudaStream_t stream)
     q.partial = static_cast<float*>(ws.ptr);
     launch_one(q);
     if constexpr (Half) {
-        launch_splitk_reduce<cute::half_t>(q, stream);
+        launch_splitk_reduce<Elem>(q, stream);
     } else {
         launch_splitk_reduce<float>(q, stream);
     }
@@ -1343,12 +1356,12 @@ inline void dense_gemm_f32_tile(const GemmParams& p, cudaStream_t stream)
 template <class Tile, bool TransA, bool TransB, bool Vectorized = true>
 inline void dense_gemm_f16_tile(const GemmParams& p, cudaStream_t stream)
 {
-    detail::launch_dense_h<Tile, TransA, TransB, Vectorized>(p, stream);
+    detail::launch_dense_h<Tile, cute::half_t, TransA, TransB, Vectorized>(p, stream);
 }
 
 /// Dense C = alpha*A*B + beta*C + bias, epilogue applied, optional residual.
 /// Returns false when the request has no kernel (bad extents).
-inline bool dense_gemm_launch(const GemmParams& p, int elem_size,
+inline bool dense_gemm_launch(const GemmParams& p, GemmElem elem,
                               bool trans_a, bool trans_b, bool vectorized,
                               cudaStream_t stream)
 {
@@ -1368,18 +1381,24 @@ inline bool dense_gemm_launch(const GemmParams& p, int elem_size,
     detail::dispatch_dense(
         p, trans_a, trans_b, vectorized,
         [&]<bool TA, bool TB, bool V>() {
-            if (elem_size == 2) {
+            if (elem == GemmElem::F16) {
                 if (wide_h) {
-                    detail::launch_dense_h<kF16Wide, TA, TB, V>(p, stream);
+                    detail::launch_dense_h<kF16Wide, cute::half_t, TA, TB, V>(p, stream);
                 } else {
                     // The wide gate needs 16·SM blocks, so a narrow tile always
                     // has room for split-K to fill the machine.
-                    detail::launch_dense_split<true, kF16Narrow, TA, TB, V>(p, stream);
+                    detail::launch_dense_split<cute::half_t, kF16Narrow, TA, TB, V>(p, stream);
+                }
+            } else if (elem == GemmElem::BF16) {
+                if (wide_h) {
+                    detail::launch_dense_h<kF16Wide, cute::bfloat16_t, TA, TB, V>(p, stream);
+                } else {
+                    detail::launch_dense_split<cute::bfloat16_t, kF16Narrow, TA, TB, V>(p, stream);
                 }
             } else if (wide) {
                 detail::launch_dense_f<kF32Wide, TA, TB, V>(p, stream);
             } else {
-                detail::launch_dense_split<false, kF32Narrow, TA, TB, V>(p, stream);
+                detail::launch_dense_split<float, kF32Narrow, TA, TB, V>(p, stream);
             }
         });
     return true;

@@ -62,8 +62,8 @@ inline T pad_constant(float v)
 {
     if constexpr (std::is_same_v<T, float>) {
         return v;
-    } else if constexpr (std::is_same_v<T, __half>) {
-        return __float2half(v);
+    } else if constexpr (sizeof(T) == 2) {   // f16 or bf16
+        return float_to_elem<T>(v);
     } else {
         const double r = std::nearbyint(static_cast<double>(v));
         return static_cast<T>(std::clamp<double>(
@@ -166,6 +166,7 @@ Status pad_cuda(const PadAttributes& attrs, TensorView& output,
     switch (inputs[0].data_type()) {
     case DataType::f32: return pad_entry<float>(attrs, output, inputs[0], stream);
     case DataType::f16: return pad_entry<__half>(attrs, output, inputs[0], stream);
+    case DataType::bf16: return pad_entry<__nv_bfloat16>(attrs, output, inputs[0], stream);
     case DataType::s8:  return pad_entry<int8_t>(attrs, output, inputs[0], stream);
     case DataType::u8:  return pad_entry<uint8_t>(attrs, output, inputs[0], stream);
     case DataType::s32: return pad_entry<int32_t>(attrs, output, inputs[0], stream);

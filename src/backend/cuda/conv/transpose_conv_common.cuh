@@ -24,6 +24,7 @@
 
 #include "../cuda_common.cuh"
 #include "../gemm/cute_gemm.cuh"
+#include "nnops/core/data_type.hpp"
 
 #include <limits>
 
@@ -171,7 +172,7 @@ __device__ inline void tconv_store(const ConvParams& p, Elem* dst, float v, int 
 /// Depthwise route, in depthwise_transpose_conv.cu. Returns false when the
 /// geometry or the grid does not fit that route, and the caller falls back.
 bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max,
-                                     bool channel_last, bool half_elem,
+                                     bool channel_last, DataType dtype,
                                      cudaStream_t stream);
 
 }  // namespace nnops::backend::cuda::tconv

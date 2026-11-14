@@ -36,7 +36,7 @@
 /// the CPU's is. It is a fallback, not a route: nothing picks it on a shape the
 /// lane can already do.
 ///
-/// f32 and f16. The operator entry at the bottom of the file is what wires all
+/// f32, f16 and bf16. The operator entry at the bottom of the file is what wires all
 /// of this to DepthwiseTransposeConv2D.
 
 #include "transpose_conv_common.cuh"
@@ -354,17 +354,22 @@ void launch_last_scalar(const ConvParams& p, cudaStream_t stream)
 }  // namespace
 
 bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max,
-                                     bool channel_last, bool half_elem,
+                                     bool channel_last, DataType dtype,
                                      cudaStream_t stream)
 {
     if (p.icg != 1 || p.ocg != 1) { return false; }
     if (p.batch <= 0 || th_max <= 0 || tw_max <= 0) { return false; }
-    if (half_elem) {
+    switch (dtype) {
+    case DataType::f16:
         return channel_last ? run_last<cute::half_t>(p, th_max, tw_max, stream)
                             : run_first<cute::half_t>(p, th_max, tw_max, stream);
+    case DataType::bf16:
+        return channel_last ? run_last<cute::bfloat16_t>(p, th_max, tw_max, stream)
+                            : run_first<cute::bfloat16_t>(p, th_max, tw_max, stream);
+    default:
+        return channel_last ? run_last<float>(p, th_max, tw_max, stream)
+                            : run_first<float>(p, th_max, tw_max, stream);
     }
-    return channel_last ? run_last<float>(p, th_max, tw_max, stream)
-                        : run_first<float>(p, th_max, tw_max, stream);
 }
 
 }  // namespace nnops::backend::cuda::tconv
@@ -382,8 +387,8 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
 
     const DataType dt = act.data_type();
-    if ((dt != DataType::f32 && dt != DataType::f16) || wgt.data_type() != dt ||
-        output.data_type() != dt) {
+    if ((dt != DataType::f32 && dt != DataType::f16 && dt != DataType::bf16) ||
+        wgt.data_type() != dt || output.data_type() != dt) {
         return Status::unsupported;   // the quantized route is CPU-only
     }
     if (output.numel() == 0) { return Status::ok; }
@@ -456,16 +461,18 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
 
     const int th_max = (p.oh + p.sh - 1) / p.sh;
     const int tw_max = (p.ow + p.sw - 1) / p.sw;
-    const bool half_elem = (dt == DataType::f16);
+    const bool half_elem = (dt != DataType::f32);
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
-    if (!tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last,
-                                                half_elem, stream)) {
+    if (!tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last, dt,
+                                                stream)) {
         // The class view declines a geometry or a grid it cannot hold; on the
         // channel-last side the scalar script still covers it, and channel-first
         // has no such residue.
         if (!last) { return Status::unsupported; }
-        if (half_elem) {
+        if (dt == DataType::bf16) {
+            tconv::launch_last_scalar<cute::bfloat16_t>(p, stream);
+        } else if (half_elem) {
             tconv::launch_last_scalar<cute::half_t>(p, stream);
         } else {
             tconv::launch_last_scalar<float>(p, stream);

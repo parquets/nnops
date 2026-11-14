@@ -5,7 +5,7 @@
 /// row-by-row pitch-aware kernel for rank >= 2 (supports packed layouts).
 /// All 4 operations: Add, Sub, Mul, Div.
 ///
-/// Supports f32 and f16. Workspace: not used.
+/// Supports f32, f16 and bf16. Workspace: not used.
 
 #include "cuda_common.cuh"
 #include "nnops/ops/eltwise.hpp"
@@ -41,7 +41,9 @@ __global__ void eltwise_kernel(
     const T* b_row = b + row * b_row_stride;
     T* o_row = output + row * o_row_stride;
 
-    const int64_t vec_end = (last_dim / VEC) * VEC;
+    // An unaligned row walks the scalar loops instead of the 16 B ones.
+    const int64_t vec_end =
+        aligned16(a_row, b_row, o_row) ? (last_dim / VEC) * VEC : 0;
 
     switch (op_type) {
     // ================================================================
@@ -65,21 +67,21 @@ __global__ void eltwise_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
-                half8 va = v4_load(&a_row[i]);
-                half8 vb = v4_load(&b_row[i]);
-                float r0 = __half2float(va.data[0]) + __half2float(vb.data[0]);
-                float r1 = __half2float(va.data[1]) + __half2float(vb.data[1]);
-                float r2 = __half2float(va.data[2]) + __half2float(vb.data[2]);
-                float r3 = __half2float(va.data[3]) + __half2float(vb.data[3]);
-                float r4 = __half2float(va.data[4]) + __half2float(vb.data[4]);
-                float r5 = __half2float(va.data[5]) + __half2float(vb.data[5]);
-                float r6 = __half2float(va.data[6]) + __half2float(vb.data[6]);
-                float r7 = __half2float(va.data[7]) + __half2float(vb.data[7]);
+                pack8<T> va = v4_load(&a_row[i]);
+                pack8<T> vb = v4_load(&b_row[i]);
+                float r0 = elem_to_float(va.data[0]) + elem_to_float(vb.data[0]);
+                float r1 = elem_to_float(va.data[1]) + elem_to_float(vb.data[1]);
+                float r2 = elem_to_float(va.data[2]) + elem_to_float(vb.data[2]);
+                float r3 = elem_to_float(va.data[3]) + elem_to_float(vb.data[3]);
+                float r4 = elem_to_float(va.data[4]) + elem_to_float(vb.data[4]);
+                float r5 = elem_to_float(va.data[5]) + elem_to_float(vb.data[5]);
+                float r6 = elem_to_float(va.data[6]) + elem_to_float(vb.data[6]);
+                float r7 = elem_to_float(va.data[7]) + elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -114,21 +116,21 @@ __global__ void eltwise_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
-                half8 va = v4_load(&a_row[i]);
-                half8 vb = v4_load(&b_row[i]);
-                float r0 = __half2float(va.data[0]) - __half2float(vb.data[0]);
-                float r1 = __half2float(va.data[1]) - __half2float(vb.data[1]);
-                float r2 = __half2float(va.data[2]) - __half2float(vb.data[2]);
-                float r3 = __half2float(va.data[3]) - __half2float(vb.data[3]);
-                float r4 = __half2float(va.data[4]) - __half2float(vb.data[4]);
-                float r5 = __half2float(va.data[5]) - __half2float(vb.data[5]);
-                float r6 = __half2float(va.data[6]) - __half2float(vb.data[6]);
-                float r7 = __half2float(va.data[7]) - __half2float(vb.data[7]);
+                pack8<T> va = v4_load(&a_row[i]);
+                pack8<T> vb = v4_load(&b_row[i]);
+                float r0 = elem_to_float(va.data[0]) - elem_to_float(vb.data[0]);
+                float r1 = elem_to_float(va.data[1]) - elem_to_float(vb.data[1]);
+                float r2 = elem_to_float(va.data[2]) - elem_to_float(vb.data[2]);
+                float r3 = elem_to_float(va.data[3]) - elem_to_float(vb.data[3]);
+                float r4 = elem_to_float(va.data[4]) - elem_to_float(vb.data[4]);
+                float r5 = elem_to_float(va.data[5]) - elem_to_float(vb.data[5]);
+                float r6 = elem_to_float(va.data[6]) - elem_to_float(vb.data[6]);
+                float r7 = elem_to_float(va.data[7]) - elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -163,21 +165,21 @@ __global__ void eltwise_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
-                half8 va = v4_load(&a_row[i]);
-                half8 vb = v4_load(&b_row[i]);
-                float r0 = __half2float(va.data[0]) * __half2float(vb.data[0]);
-                float r1 = __half2float(va.data[1]) * __half2float(vb.data[1]);
-                float r2 = __half2float(va.data[2]) * __half2float(vb.data[2]);
-                float r3 = __half2float(va.data[3]) * __half2float(vb.data[3]);
-                float r4 = __half2float(va.data[4]) * __half2float(vb.data[4]);
-                float r5 = __half2float(va.data[5]) * __half2float(vb.data[5]);
-                float r6 = __half2float(va.data[6]) * __half2float(vb.data[6]);
-                float r7 = __half2float(va.data[7]) * __half2float(vb.data[7]);
+                pack8<T> va = v4_load(&a_row[i]);
+                pack8<T> vb = v4_load(&b_row[i]);
+                float r0 = elem_to_float(va.data[0]) * elem_to_float(vb.data[0]);
+                float r1 = elem_to_float(va.data[1]) * elem_to_float(vb.data[1]);
+                float r2 = elem_to_float(va.data[2]) * elem_to_float(vb.data[2]);
+                float r3 = elem_to_float(va.data[3]) * elem_to_float(vb.data[3]);
+                float r4 = elem_to_float(va.data[4]) * elem_to_float(vb.data[4]);
+                float r5 = elem_to_float(va.data[5]) * elem_to_float(vb.data[5]);
+                float r6 = elem_to_float(va.data[6]) * elem_to_float(vb.data[6]);
+                float r7 = elem_to_float(va.data[7]) * elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -212,21 +214,21 @@ __global__ void eltwise_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
-                half8 va = v4_load(&a_row[i]);
-                half8 vb = v4_load(&b_row[i]);
-                float r0 = __half2float(va.data[0]) / __half2float(vb.data[0]);
-                float r1 = __half2float(va.data[1]) / __half2float(vb.data[1]);
-                float r2 = __half2float(va.data[2]) / __half2float(vb.data[2]);
-                float r3 = __half2float(va.data[3]) / __half2float(vb.data[3]);
-                float r4 = __half2float(va.data[4]) / __half2float(vb.data[4]);
-                float r5 = __half2float(va.data[5]) / __half2float(vb.data[5]);
-                float r6 = __half2float(va.data[6]) / __half2float(vb.data[6]);
-                float r7 = __half2float(va.data[7]) / __half2float(vb.data[7]);
+                pack8<T> va = v4_load(&a_row[i]);
+                pack8<T> vb = v4_load(&b_row[i]);
+                float r0 = elem_to_float(va.data[0]) / elem_to_float(vb.data[0]);
+                float r1 = elem_to_float(va.data[1]) / elem_to_float(vb.data[1]);
+                float r2 = elem_to_float(va.data[2]) / elem_to_float(vb.data[2]);
+                float r3 = elem_to_float(va.data[3]) / elem_to_float(vb.data[3]);
+                float r4 = elem_to_float(va.data[4]) / elem_to_float(vb.data[4]);
+                float r5 = elem_to_float(va.data[5]) / elem_to_float(vb.data[5]);
+                float r6 = elem_to_float(va.data[6]) / elem_to_float(vb.data[6]);
+                float r7 = elem_to_float(va.data[7]) / elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -262,21 +264,21 @@ __global__ void eltwise_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
-                half8 va = v4_load(&a_row[i]);
-                half8 vb = v4_load(&b_row[i]);
-                float r0 = fminf(__half2float(va.data[0]), __half2float(vb.data[0]));
-                float r1 = fminf(__half2float(va.data[1]), __half2float(vb.data[1]));
-                float r2 = fminf(__half2float(va.data[2]), __half2float(vb.data[2]));
-                float r3 = fminf(__half2float(va.data[3]), __half2float(vb.data[3]));
-                float r4 = fminf(__half2float(va.data[4]), __half2float(vb.data[4]));
-                float r5 = fminf(__half2float(va.data[5]), __half2float(vb.data[5]));
-                float r6 = fminf(__half2float(va.data[6]), __half2float(vb.data[6]));
-                float r7 = fminf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                pack8<T> va = v4_load(&a_row[i]);
+                pack8<T> vb = v4_load(&b_row[i]);
+                float r0 = fminf(elem_to_float(va.data[0]), elem_to_float(vb.data[0]));
+                float r1 = fminf(elem_to_float(va.data[1]), elem_to_float(vb.data[1]));
+                float r2 = fminf(elem_to_float(va.data[2]), elem_to_float(vb.data[2]));
+                float r3 = fminf(elem_to_float(va.data[3]), elem_to_float(vb.data[3]));
+                float r4 = fminf(elem_to_float(va.data[4]), elem_to_float(vb.data[4]));
+                float r5 = fminf(elem_to_float(va.data[5]), elem_to_float(vb.data[5]));
+                float r6 = fminf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
+                float r7 = fminf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -314,21 +316,21 @@ __global__ void eltwise_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
-                half8 va = v4_load(&a_row[i]);
-                half8 vb = v4_load(&b_row[i]);
-                float r0 = fmaxf(__half2float(va.data[0]), __half2float(vb.data[0]));
-                float r1 = fmaxf(__half2float(va.data[1]), __half2float(vb.data[1]));
-                float r2 = fmaxf(__half2float(va.data[2]), __half2float(vb.data[2]));
-                float r3 = fmaxf(__half2float(va.data[3]), __half2float(vb.data[3]));
-                float r4 = fmaxf(__half2float(va.data[4]), __half2float(vb.data[4]));
-                float r5 = fmaxf(__half2float(va.data[5]), __half2float(vb.data[5]));
-                float r6 = fmaxf(__half2float(va.data[6]), __half2float(vb.data[6]));
-                float r7 = fmaxf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                pack8<T> va = v4_load(&a_row[i]);
+                pack8<T> vb = v4_load(&b_row[i]);
+                float r0 = fmaxf(elem_to_float(va.data[0]), elem_to_float(vb.data[0]));
+                float r1 = fmaxf(elem_to_float(va.data[1]), elem_to_float(vb.data[1]));
+                float r2 = fmaxf(elem_to_float(va.data[2]), elem_to_float(vb.data[2]));
+                float r3 = fmaxf(elem_to_float(va.data[3]), elem_to_float(vb.data[3]));
+                float r4 = fmaxf(elem_to_float(va.data[4]), elem_to_float(vb.data[4]));
+                float r5 = fmaxf(elem_to_float(va.data[5]), elem_to_float(vb.data[5]));
+                float r6 = fmaxf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
+                float r7 = fmaxf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -366,21 +368,21 @@ __global__ void eltwise_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
-                half8 va = v4_load(&a_row[i]);
-                half8 vb = v4_load(&b_row[i]);
-                float r0 = powf(__half2float(va.data[0]), __half2float(vb.data[0]));
-                float r1 = powf(__half2float(va.data[1]), __half2float(vb.data[1]));
-                float r2 = powf(__half2float(va.data[2]), __half2float(vb.data[2]));
-                float r3 = powf(__half2float(va.data[3]), __half2float(vb.data[3]));
-                float r4 = powf(__half2float(va.data[4]), __half2float(vb.data[4]));
-                float r5 = powf(__half2float(va.data[5]), __half2float(vb.data[5]));
-                float r6 = powf(__half2float(va.data[6]), __half2float(vb.data[6]));
-                float r7 = powf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                pack8<T> va = v4_load(&a_row[i]);
+                pack8<T> vb = v4_load(&b_row[i]);
+                float r0 = powf(elem_to_float(va.data[0]), elem_to_float(vb.data[0]));
+                float r1 = powf(elem_to_float(va.data[1]), elem_to_float(vb.data[1]));
+                float r2 = powf(elem_to_float(va.data[2]), elem_to_float(vb.data[2]));
+                float r3 = powf(elem_to_float(va.data[3]), elem_to_float(vb.data[3]));
+                float r4 = powf(elem_to_float(va.data[4]), elem_to_float(vb.data[4]));
+                float r5 = powf(elem_to_float(va.data[5]), elem_to_float(vb.data[5]));
+                float r6 = powf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
+                float r7 = powf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -438,21 +440,21 @@ __global__ void eltwise_flat_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
-                half8 va = v4_load(&a[i]);
-                half8 vb = v4_load(&b[i]);
-                float r0 = __half2float(va.data[0]) + __half2float(vb.data[0]);
-                float r1 = __half2float(va.data[1]) + __half2float(vb.data[1]);
-                float r2 = __half2float(va.data[2]) + __half2float(vb.data[2]);
-                float r3 = __half2float(va.data[3]) + __half2float(vb.data[3]);
-                float r4 = __half2float(va.data[4]) + __half2float(vb.data[4]);
-                float r5 = __half2float(va.data[5]) + __half2float(vb.data[5]);
-                float r6 = __half2float(va.data[6]) + __half2float(vb.data[6]);
-                float r7 = __half2float(va.data[7]) + __half2float(vb.data[7]);
+                pack8<T> va = v4_load(&a[i]);
+                pack8<T> vb = v4_load(&b[i]);
+                float r0 = elem_to_float(va.data[0]) + elem_to_float(vb.data[0]);
+                float r1 = elem_to_float(va.data[1]) + elem_to_float(vb.data[1]);
+                float r2 = elem_to_float(va.data[2]) + elem_to_float(vb.data[2]);
+                float r3 = elem_to_float(va.data[3]) + elem_to_float(vb.data[3]);
+                float r4 = elem_to_float(va.data[4]) + elem_to_float(vb.data[4]);
+                float r5 = elem_to_float(va.data[5]) + elem_to_float(vb.data[5]);
+                float r6 = elem_to_float(va.data[6]) + elem_to_float(vb.data[6]);
+                float r7 = elem_to_float(va.data[7]) + elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -487,21 +489,21 @@ __global__ void eltwise_flat_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
-                half8 va = v4_load(&a[i]);
-                half8 vb = v4_load(&b[i]);
-                float r0 = __half2float(va.data[0]) - __half2float(vb.data[0]);
-                float r1 = __half2float(va.data[1]) - __half2float(vb.data[1]);
-                float r2 = __half2float(va.data[2]) - __half2float(vb.data[2]);
-                float r3 = __half2float(va.data[3]) - __half2float(vb.data[3]);
-                float r4 = __half2float(va.data[4]) - __half2float(vb.data[4]);
-                float r5 = __half2float(va.data[5]) - __half2float(vb.data[5]);
-                float r6 = __half2float(va.data[6]) - __half2float(vb.data[6]);
-                float r7 = __half2float(va.data[7]) - __half2float(vb.data[7]);
+                pack8<T> va = v4_load(&a[i]);
+                pack8<T> vb = v4_load(&b[i]);
+                float r0 = elem_to_float(va.data[0]) - elem_to_float(vb.data[0]);
+                float r1 = elem_to_float(va.data[1]) - elem_to_float(vb.data[1]);
+                float r2 = elem_to_float(va.data[2]) - elem_to_float(vb.data[2]);
+                float r3 = elem_to_float(va.data[3]) - elem_to_float(vb.data[3]);
+                float r4 = elem_to_float(va.data[4]) - elem_to_float(vb.data[4]);
+                float r5 = elem_to_float(va.data[5]) - elem_to_float(vb.data[5]);
+                float r6 = elem_to_float(va.data[6]) - elem_to_float(vb.data[6]);
+                float r7 = elem_to_float(va.data[7]) - elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -536,21 +538,21 @@ __global__ void eltwise_flat_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
-                half8 va = v4_load(&a[i]);
-                half8 vb = v4_load(&b[i]);
-                float r0 = __half2float(va.data[0]) * __half2float(vb.data[0]);
-                float r1 = __half2float(va.data[1]) * __half2float(vb.data[1]);
-                float r2 = __half2float(va.data[2]) * __half2float(vb.data[2]);
-                float r3 = __half2float(va.data[3]) * __half2float(vb.data[3]);
-                float r4 = __half2float(va.data[4]) * __half2float(vb.data[4]);
-                float r5 = __half2float(va.data[5]) * __half2float(vb.data[5]);
-                float r6 = __half2float(va.data[6]) * __half2float(vb.data[6]);
-                float r7 = __half2float(va.data[7]) * __half2float(vb.data[7]);
+                pack8<T> va = v4_load(&a[i]);
+                pack8<T> vb = v4_load(&b[i]);
+                float r0 = elem_to_float(va.data[0]) * elem_to_float(vb.data[0]);
+                float r1 = elem_to_float(va.data[1]) * elem_to_float(vb.data[1]);
+                float r2 = elem_to_float(va.data[2]) * elem_to_float(vb.data[2]);
+                float r3 = elem_to_float(va.data[3]) * elem_to_float(vb.data[3]);
+                float r4 = elem_to_float(va.data[4]) * elem_to_float(vb.data[4]);
+                float r5 = elem_to_float(va.data[5]) * elem_to_float(vb.data[5]);
+                float r6 = elem_to_float(va.data[6]) * elem_to_float(vb.data[6]);
+                float r7 = elem_to_float(va.data[7]) * elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -585,21 +587,21 @@ __global__ void eltwise_flat_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
-                half8 va = v4_load(&a[i]);
-                half8 vb = v4_load(&b[i]);
-                float r0 = __half2float(va.data[0]) / __half2float(vb.data[0]);
-                float r1 = __half2float(va.data[1]) / __half2float(vb.data[1]);
-                float r2 = __half2float(va.data[2]) / __half2float(vb.data[2]);
-                float r3 = __half2float(va.data[3]) / __half2float(vb.data[3]);
-                float r4 = __half2float(va.data[4]) / __half2float(vb.data[4]);
-                float r5 = __half2float(va.data[5]) / __half2float(vb.data[5]);
-                float r6 = __half2float(va.data[6]) / __half2float(vb.data[6]);
-                float r7 = __half2float(va.data[7]) / __half2float(vb.data[7]);
+                pack8<T> va = v4_load(&a[i]);
+                pack8<T> vb = v4_load(&b[i]);
+                float r0 = elem_to_float(va.data[0]) / elem_to_float(vb.data[0]);
+                float r1 = elem_to_float(va.data[1]) / elem_to_float(vb.data[1]);
+                float r2 = elem_to_float(va.data[2]) / elem_to_float(vb.data[2]);
+                float r3 = elem_to_float(va.data[3]) / elem_to_float(vb.data[3]);
+                float r4 = elem_to_float(va.data[4]) / elem_to_float(vb.data[4]);
+                float r5 = elem_to_float(va.data[5]) / elem_to_float(vb.data[5]);
+                float r6 = elem_to_float(va.data[6]) / elem_to_float(vb.data[6]);
+                float r7 = elem_to_float(va.data[7]) / elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -635,21 +637,21 @@ __global__ void eltwise_flat_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
-                half8 va = v4_load(&a[i]);
-                half8 vb = v4_load(&b[i]);
-                float r0 = fminf(__half2float(va.data[0]), __half2float(vb.data[0]));
-                float r1 = fminf(__half2float(va.data[1]), __half2float(vb.data[1]));
-                float r2 = fminf(__half2float(va.data[2]), __half2float(vb.data[2]));
-                float r3 = fminf(__half2float(va.data[3]), __half2float(vb.data[3]));
-                float r4 = fminf(__half2float(va.data[4]), __half2float(vb.data[4]));
-                float r5 = fminf(__half2float(va.data[5]), __half2float(vb.data[5]));
-                float r6 = fminf(__half2float(va.data[6]), __half2float(vb.data[6]));
-                float r7 = fminf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                pack8<T> va = v4_load(&a[i]);
+                pack8<T> vb = v4_load(&b[i]);
+                float r0 = fminf(elem_to_float(va.data[0]), elem_to_float(vb.data[0]));
+                float r1 = fminf(elem_to_float(va.data[1]), elem_to_float(vb.data[1]));
+                float r2 = fminf(elem_to_float(va.data[2]), elem_to_float(vb.data[2]));
+                float r3 = fminf(elem_to_float(va.data[3]), elem_to_float(vb.data[3]));
+                float r4 = fminf(elem_to_float(va.data[4]), elem_to_float(vb.data[4]));
+                float r5 = fminf(elem_to_float(va.data[5]), elem_to_float(vb.data[5]));
+                float r6 = fminf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
+                float r7 = fminf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -687,21 +689,21 @@ __global__ void eltwise_flat_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
-                half8 va = v4_load(&a[i]);
-                half8 vb = v4_load(&b[i]);
-                float r0 = fmaxf(__half2float(va.data[0]), __half2float(vb.data[0]));
-                float r1 = fmaxf(__half2float(va.data[1]), __half2float(vb.data[1]));
-                float r2 = fmaxf(__half2float(va.data[2]), __half2float(vb.data[2]));
-                float r3 = fmaxf(__half2float(va.data[3]), __half2float(vb.data[3]));
-                float r4 = fmaxf(__half2float(va.data[4]), __half2float(vb.data[4]));
-                float r5 = fmaxf(__half2float(va.data[5]), __half2float(vb.data[5]));
-                float r6 = fmaxf(__half2float(va.data[6]), __half2float(vb.data[6]));
-                float r7 = fmaxf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                pack8<T> va = v4_load(&a[i]);
+                pack8<T> vb = v4_load(&b[i]);
+                float r0 = fmaxf(elem_to_float(va.data[0]), elem_to_float(vb.data[0]));
+                float r1 = fmaxf(elem_to_float(va.data[1]), elem_to_float(vb.data[1]));
+                float r2 = fmaxf(elem_to_float(va.data[2]), elem_to_float(vb.data[2]));
+                float r3 = fmaxf(elem_to_float(va.data[3]), elem_to_float(vb.data[3]));
+                float r4 = fmaxf(elem_to_float(va.data[4]), elem_to_float(vb.data[4]));
+                float r5 = fmaxf(elem_to_float(va.data[5]), elem_to_float(vb.data[5]));
+                float r6 = fmaxf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
+                float r7 = fmaxf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -739,21 +741,21 @@ __global__ void eltwise_flat_kernel(
             }
         } else {
             for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
-                half8 va = v4_load(&a[i]);
-                half8 vb = v4_load(&b[i]);
-                float r0 = powf(__half2float(va.data[0]), __half2float(vb.data[0]));
-                float r1 = powf(__half2float(va.data[1]), __half2float(vb.data[1]));
-                float r2 = powf(__half2float(va.data[2]), __half2float(vb.data[2]));
-                float r3 = powf(__half2float(va.data[3]), __half2float(vb.data[3]));
-                float r4 = powf(__half2float(va.data[4]), __half2float(vb.data[4]));
-                float r5 = powf(__half2float(va.data[5]), __half2float(vb.data[5]));
-                float r6 = powf(__half2float(va.data[6]), __half2float(vb.data[6]));
-                float r7 = powf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                pack8<T> va = v4_load(&a[i]);
+                pack8<T> vb = v4_load(&b[i]);
+                float r0 = powf(elem_to_float(va.data[0]), elem_to_float(vb.data[0]));
+                float r1 = powf(elem_to_float(va.data[1]), elem_to_float(vb.data[1]));
+                float r2 = powf(elem_to_float(va.data[2]), elem_to_float(vb.data[2]));
+                float r3 = powf(elem_to_float(va.data[3]), elem_to_float(vb.data[3]));
+                float r4 = powf(elem_to_float(va.data[4]), elem_to_float(vb.data[4]));
+                float r5 = powf(elem_to_float(va.data[5]), elem_to_float(vb.data[5]));
+                float r6 = powf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
+                float r7 = powf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
                         r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
-                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
             }
         }
@@ -838,6 +840,9 @@ Status eltwise_cuda(
         return Status::ok;
     case DataType::f16:
         eltwise_cuda_impl<__half>(attrs, output, inputs, ctx);
+        return Status::ok;
+    case DataType::bf16:
+        eltwise_cuda_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
     default:
         return Status::unsupported;

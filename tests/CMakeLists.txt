@@ -129,6 +129,7 @@ if(NNOPS_BUILD_CUDA)
         test_cuda_topk.cpp
         test_cuda_move.cpp
         test_cuda_gather_scatter.cpp
+        test_cuda_bf16.cpp
     )
 endif()
 

@@ -30,7 +30,7 @@
 /// the machine: the lanes of a warp still hold one pixel's channel vectors,
 /// which keeps the loads coalesced while the rows are walked in parallel.
 ///
-/// Supports f32 and f16. Workspace: not used.
+/// Supports f32, f16 and bf16. Workspace: not used.
 
 #include "../cuda_common.cuh"
 #include "nnops/ops/pooling.hpp"
@@ -969,6 +969,9 @@ Status pooling_cuda(
         return Status::ok;
     case DataType::f16:
         pooling_dispatch<__half>(attrs, output, inputs, ctx);
+        return Status::ok;
+    case DataType::bf16:
+        pooling_dispatch<__nv_bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
     default:
         return Status::unsupported;
