@@ -129,6 +129,7 @@ if(NNOPS_BUILD_CUDA)
         test_cuda_topk.cpp
         test_cuda_move.cpp
         test_cuda_gather_scatter.cpp
+        test_cuda_elementwise.cpp
         test_cuda_bf16.cpp
     )
 endif()
@@ -194,6 +195,7 @@ if(NNOPS_BUILD_BENCHMARKS)
             bench_cuda_transpose_conv2d.cpp
             bench_cuda_pooling.cpp
             bench_cuda_resize.cpp
+            bench_cuda_elementwise.cpp
         )
     endif()
 
@@ -210,7 +212,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         # needs the CuTe path the library target is given.
         add_executable(bench_cuda_tiles bench_cuda_tiles.cu common/bench_harness.cpp)
         target_link_libraries(bench_cuda_tiles PRIVATE nnops_cpu nnops_test_reference
-                                                     CUDA::cudart)
+                                                     CUDA::cudart CUDA::cublas)
         # CuTe's path is only resolved inside src/, so it is taken from the
         # library's own include list rather than repeated here.
         target_include_directories(bench_cuda_tiles PRIVATE

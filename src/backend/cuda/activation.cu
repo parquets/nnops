@@ -5,6 +5,12 @@
 /// All 8 activation types supported: Relu, LeakyRelu, Sigmoid, Tanh,
 /// Gelu, Silu (Swish), HardSwish, Elu.
 ///
+/// The op moves two elements per unit of work and does one scalar function on
+/// each, so it is a bandwidth kernel and the loads are 128-bit lanes: a 2-byte
+/// dtype fills a warp's 128 B transaction with 8 per thread, a 4-byte one with
+/// 4. The row base has to sit on the 16 B bound for that, so a row that does not
+/// — and the tail of one that does — walks the scalar loop.
+///
 /// Supports f32, f16 and bf16. Workspace: not used.
 
 #include "cuda_common.cuh"
@@ -107,6 +113,9 @@ __device__ ActivationFn get_activation_fn(ActivationType type) {
 // Main activation CUDA kernel — row-by-row, pitch-aware
 // ============================================================
 
+/// One 128-bit lane per thread step. An unaligned row (a 2-byte dtype with an
+/// odd last dim leaves alternate rows off the 16 B bound) drops to the scalar
+/// loop instead, and so does the tail.
 template <typename T>
 __global__ void activation_kernel(
     const T* __restrict__ input,
@@ -120,6 +129,7 @@ __global__ void activation_kernel(
     float beta,
     bool add_to)
 {
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
     const ActivationFn fn = get_activation_fn(type);
 
     const int tid = threadIdx.x;
@@ -130,7 +140,23 @@ __global__ void activation_kernel(
     const T* in_row  = input  + row * in_row_stride;
     T*       out_row = output + row * out_row_stride;
 
-    for (int i = tid; i < last_dim; i += blockDim.x) {
+    const int64_t vec_end = aligned16(in_row, out_row) ? (last_dim / VEC) * VEC : 0;
+    for (int64_t i = tid * VEC; i < vec_end; i += int64_t(blockDim.x) * VEC) {
+        float v[VEC];
+        load_channels<T, VEC>(&in_row[i], v);
+        float r[VEC];
+        #pragma unroll
+        for (int k = 0; k < VEC; ++k) { r[k] = fn(v[k], alpha, beta); }
+        if (add_to) {
+            float o[VEC];
+            load_channels<T, VEC>(&out_row[i], o);
+            #pragma unroll
+            for (int k = 0; k < VEC; ++k) { r[k] += o[k]; }
+        }
+        store_channels<T, VEC>(&out_row[i], r);
+    }
+
+    for (int64_t i = vec_end + tid; i < last_dim; i += blockDim.x) {
         float x = s_load(&in_row[i]);
         float rv = fn(x, alpha, beta);
         if (add_to) {
@@ -155,12 +181,29 @@ __global__ void activation_flat_kernel(
     float beta,
     bool add_to)
 {
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
     const ActivationFn fn = get_activation_fn(type);
 
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = gridDim.x * blockDim.x;
+    const int64_t lane = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t step = int64_t(gridDim.x) * blockDim.x;
 
-    for (int i = tid; i < total; i += stride) {
+    const int64_t vec_end = aligned16(input, output) ? (total / VEC) * VEC : 0;
+    for (int64_t i = lane * VEC; i < vec_end; i += step * VEC) {
+        float v[VEC];
+        load_channels<T, VEC>(&input[i], v);
+        float r[VEC];
+        #pragma unroll
+        for (int k = 0; k < VEC; ++k) { r[k] = fn(v[k], alpha, beta); }
+        if (add_to) {
+            float o[VEC];
+            load_channels<T, VEC>(&output[i], o);
+            #pragma unroll
+            for (int k = 0; k < VEC; ++k) { r[k] += o[k]; }
+        }
+        store_channels<T, VEC>(&output[i], r);
+    }
+
+    for (int64_t i = vec_end + lane; i < total; i += step) {
         float x = s_load(&input[i]);
         float rv = fn(x, alpha, beta);
         if (add_to) {
@@ -190,9 +233,14 @@ void activation_cuda_impl(
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
     if (rank <= 1) {
-        // Flat tensor — use flat kernel with grid-stride loop
+        // Flat tensor — use flat kernel with grid-stride loop. The grid is sized
+        // in lanes, not elements: a block covers block_size × VEC of them, and
+        // sizing it per element would launch 4× (f32) or 8× (2-byte) the blocks
+        // the tensor needs and leave most of them empty.
+        constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
         const int block_size = kCudaBlockSize;
-        const int grid_size = std::min(static_cast<int>(ceil_div(total, static_cast<int64_t>(block_size))),
+        const int64_t lane = static_cast<int64_t>(block_size) * VEC;
+        const int grid_size = std::min(static_cast<int>(ceil_div(total, lane)),
                                        65535);
         activation_flat_kernel<<<grid_size, block_size, 0, stream>>>(
             input.ptr<T>(), output.ptr<T>(), total,

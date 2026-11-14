@@ -245,6 +245,22 @@ NNOPS_TEST(cuda_layer_norm_residual) {
     run_case(c, "cuda_layer_norm_residual_add_to");
 }
 
+NNOPS_TEST(cuda_layer_norm_row_span) {
+    // The row kernel keeps a row in shared memory when it fits beside the block's
+    // scratch (a 32 KB row does) and re-reads it from global memory when it does
+    // not (80 KB does not), so both scripts run here. Every other case in this
+    // file has a row of a few dozen elements, which is always the resident one.
+    NormCase c;
+    c.dense = true;
+    c.shape = {2, 8000};
+    c.bias = true;
+    run_case(c, "cuda_layer_norm_row_resident");
+    c.shape = {2, 20000};
+    run_case(c, "cuda_layer_norm_row_over_budget");
+    c.residual = true;
+    run_case(c, "cuda_layer_norm_row_over_budget_residual");
+}
+
 NNOPS_TEST(cuda_layer_norm_channel_last) {
     NormCase c;
     c.shape = {2, 6, 5};

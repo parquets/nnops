@@ -416,12 +416,13 @@ inline void expect_same_bytes(const HostTensor& got, const HostTensor& want,
     }
 }
 
-/// Run `make(backend)` on both backends over the same bytes and compare every
-/// output byte for byte. The factory keeps a case down to one line — the
-/// operator, its attributes and its input list are the whole test — and the CPU
-/// route is the oracle.
+/// The body of `run_op_both`. `exact` compares every output byte, which a kernel
+/// that reproduces the CPU's arithmetic bit for bit earns; a reduction whose
+/// summation order differs — softmax's block tree against the CPU's row loop —
+/// takes the tolerance form instead.
 template <class Factory>
-void run_op_both(Factory make, std::span<const HostTensor> ins, const char* what)
+void run_op_both_impl(Factory make, std::span<const HostTensor> ins,
+                      const char* what, bool exact, float tol_abs, float tol_rel)
 {
     std::vector<TensorDesc> descs;
     std::vector<TensorView> views;
@@ -481,8 +482,30 @@ void run_op_both(Factory make, std::span<const HostTensor> ins, const char* what
 
     for (size_t i = 0; i < douts.size(); ++i) {
         from_device(douts[i], got[i]);
-        expect_same_bytes(got[i], ref[i], what);
+        if (exact) {
+            expect_same_bytes(got[i], ref[i], what);
+        } else {
+            expect_same(got[i], ref[i], tol_abs, tol_rel, what);
+        }
     }
+}
+
+/// Run `make(backend)` on both backends over the same bytes and compare every
+/// output byte for byte. The factory keeps a case down to one line — the
+/// operator, its attributes and its input list are the whole test — and the CPU
+/// route is the oracle.
+template <class Factory>
+void run_op_both(Factory make, std::span<const HostTensor> ins, const char* what)
+{
+    run_op_both_impl(make, ins, what, true, 0.0f, 0.0f);
+}
+
+/// The same run, compared to a per-element budget of `tol_abs + tol_rel·|ref|`.
+template <class Factory>
+void run_op_close(Factory make, std::span<const HostTensor> ins, float tol_abs,
+                  float tol_rel, const char* what)
+{
+    run_op_both_impl(make, ins, what, false, tol_abs, tol_rel);
 }
 
 // ============================================================

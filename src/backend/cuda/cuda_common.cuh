@@ -28,6 +28,28 @@ namespace nnops::backend::cuda {
 constexpr int kCudaBlockSize = 256;
 constexpr int kCudaWarpSize  = 32;
 
+/// Dynamic shared memory a kernel may ask for without opting in to the larger
+/// carveout and without dropping the occupancy that keeps a row's blocks in
+/// flight. A kernel that keeps its whole row resident has to fit under it.
+constexpr int kCudaSmemBudget = 48 * 1024;
+
+/// Whether a row is worth keeping in shared memory for a kernel that walks it
+/// more than once. Two bounds, and the second is not obvious: the row buffer is
+/// float-per-element whatever the dtype (the passes work in float), so it has to
+/// fit under the budget beside the block's reduction scratch — but a row small
+/// enough to have stayed in L1 between the passes only pays for the round trip.
+/// Measured on an RTX 3060 Ti, softmax: a 2048-element f16 row (4 KB of storage)
+/// runs 7% slower resident, an 8192-element f16 row (16 KB) 34% faster and the
+/// same-length f32 row (32 KB) 2.2x faster; the same shapes win 9-27% under
+/// LayerNorm/RMSNorm. Hence `esz` — the storage width — decides whether the
+/// second read would have come from cache, and `sizeof(float)` sizes the buffer.
+__host__ __device__ inline bool row_resident_worth(int64_t size, int64_t esz,
+                                                   int64_t scratch_bytes) noexcept
+{
+    const int64_t row_bytes = size * static_cast<int64_t>(sizeof(float));
+    return row_bytes + scratch_bytes <= kCudaSmemBudget && size * esz >= 8192;
+}
+
 // ============================================================
 // ceil_div
 // ============================================================
