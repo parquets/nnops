@@ -15,7 +15,8 @@
 /// Inputs, channel-first only (the layout onnxruntime's latent PagedAttention reads):
 ///   [0] Q  [B, Sq, H·Dkv]     or [B, H,    Sq, Dkv]
 ///   [1] KV [B, Sk, H_kv·Dkv]  or [B, H_kv, Sk, Dkv]
-///   [2] optional additive mask, flat [Sq, Sk], shared by every batch and head.
+///   [2] optional additive mask, flat [Sq, Sk] shared by every batch and head,
+///       or a per-head bias [B, H, Sq, Sk].
 /// with Dkv = kv_lora_rank + qk_rope_head_dim, H_kv = kv_num_heads (1 for the
 /// DeepSeek models — one latent head shared by every query head).
 ///
@@ -24,6 +25,19 @@
 /// outside the operator: this returns attention over the latent, so the caller
 /// applies the absorbed value side exactly as it applied the absorbed query
 /// side.
+///
+/// `absorbed = false` is the un-absorbed form (MiniCPM3, and DeepSeek's own
+/// per-layer spelling when the caller keeps the up-projections): the talkers
+/// are not folded in, so Q and K are the full per-head width
+/// Dqk = qk_nope_head_dim + qk_rope_head_dim and V is a third tensor of
+/// v_head_dim. The slots then match GroupQueryAttention's:
+///   [0] Q [B, Sq, H·Dqk]    or [B, H,    Sq, Dqk]
+///   [1] K [B, Sk, H_kv·Dqk] or [B, H_kv, Sk, Dqk]
+///   [2] V [B, Sk, H_kv·vd]  or [B, H_kv, Sk, vd]
+///   [3] optional mask / per-head bias, [4]/[5] optional past K/V,
+///   [6] optional seqlens_k, [7]/[8] optional cu_seqlens_q / cu_seqlens_k.
+/// `kv_lora_rank` only supplies the default v_head_dim here; the latent width is
+/// positional, it is checked against the tensor shapes.
 ///
 /// `scale` is *not* inferred from the latent width: MLA keeps the non-absorbed
 /// scale, 1/sqrt(qk_nope_head_dim + qk_rope_head_dim), so the default here uses
@@ -49,6 +63,11 @@
 /// takes the per-batch bottom-right q0 = seqlens_k[b] - Sq unless
 /// position_offset (a scalar for every batch) is given. Absent, every batch
 /// runs to the full Sk.
+///
+/// inputs[5]/[6] (absorbed) or [7]/[8] (non-absorbed) are the optional int32
+/// [segments + 1] `cu_seqlens_q` / `cu_seqlens_k` of a packed varlen batch; see
+/// GroupQueryAttention. Exclusive with the mask, a past segment, seqlens_k and
+/// position_offset.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -61,6 +80,10 @@
 namespace nnops {
 
 struct MultiLatentAttentionAttributes {
+    /// Absorbed form: two inputs, value read from the latent row's prefix.
+    /// false selects the un-absorbed three-input form; see the file header.
+    bool absorbed = true;
+
     /// Query heads (H). DeepSeek-V2: 128.
     int64_t num_heads = 16;
 

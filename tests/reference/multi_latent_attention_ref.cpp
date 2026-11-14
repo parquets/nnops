@@ -25,7 +25,7 @@ void multi_latent_attention_ref(const MultiLatentAttentionAttributes& attrs,
         : 1.0f / std::sqrt(static_cast<float>(attrs.qk_nope_head_dim +
                                                attrs.qk_rope_head_dim));
     detail::attention_ref_generic(attrs.num_heads, attrs.kv_num_heads, vd,
-                                  scale, attrs.causal, /*v_is_k=*/true,
+                                  scale, attrs.causal, attrs.absorbed,
                                   attrs.position_offset, output, inputs, ctx);
 }
 

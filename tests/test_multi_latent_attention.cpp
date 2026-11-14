@@ -437,3 +437,205 @@ NNOPS_TEST(mla_f16_matches_ref) {
         }
     }
 }
+
+// ============================================================
+// Non-absorbed form (absorbed = false)
+// ============================================================
+
+namespace {
+
+/// The un-absorbed MiniCPM3 layout: Q and K at the full qk width, V its own
+/// tensor at v_head_dim, with the GQA slot order (Q, K, V [, mask]).
+bool mla_na_vs_ref(const std::vector<int64_t>& qshape,
+                   const std::vector<int64_t>& kshape,
+                   const std::vector<int64_t>& vshape,
+                   MultiLatentAttentionAttributes attrs,
+                   int route = -1, bool with_mask = false)
+{
+    auto [q_vec, q] = test::make_random_tensor(qshape, -1.0f, 1.0f, 200);
+    auto [k_vec, k] = test::make_random_tensor(kshape, -1.0f, 1.0f, 201);
+    auto [v_vec, v] = test::make_random_tensor(vshape, -1.0f, 1.0f, 202);
+    (void)q_vec; (void)k_vec; (void)v_vec;
+
+    const int64_t sq = qshape.size() == 3 ? qshape[1] : qshape[2];
+    const int64_t sk = kshape.size() == 3 ? kshape[1] : kshape[2];
+    const int64_t vd = attrs.v_head_dim > 0 ? attrs.v_head_dim : attrs.kv_lora_rank;
+
+    std::vector<float> m_vec;
+    TensorView mask;
+    if (with_mask) {
+        auto [mv, m] = test::make_random_tensor({sq, sk}, -2.0f, 2.0f, 203);
+        m_vec = std::move(mv);
+        mask = m;
+    }
+
+    auto op = MultiLatentAttention::create(attrs, Backend::CPU);
+
+    std::vector<TensorView> ins = {q, k, v};
+    std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
+    if (with_mask) {
+        ins.push_back(mask);
+        descs.push_back(mask.desc());
+    }
+    auto out_descs = op->getOutputTensorDesc(descs);
+    if (op->validate(descs, out_descs) != Status::ok) {
+        std::printf("        non-absorbed validate rejected the call\n");
+        return false;
+    }
+
+    cpu::AttentionConfig cfg;
+    cfg.num_heads = attrs.num_heads;
+    cfg.num_kv_heads = attrs.kv_num_heads;
+    cfg.v_head_dim = vd;
+    cfg.v_is_k = false;
+    cfg.causal = attrs.causal;
+    const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs);
+    if (route >= 0) {
+        const int got = plan.use_decode ? 2 : (plan.use_flash ? 1 : 0);
+        if (got != route) {
+            std::printf("        route mismatch: want %d, got %d\n", route, got);
+            return false;
+        }
+    }
+
+    const int64_t n = out_descs[0].numel();
+    std::vector<float> fast_buf(static_cast<size_t>(n));
+    auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
+    if (op->compute(fast_out, ins) != Status::ok) {
+        std::printf("        non-absorbed compute failed\n");
+        return false;
+    }
+
+    std::vector<float> ref_buf(static_cast<size_t>(n));
+    auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::multi_latent_attention_ref(attrs, ref_out, ins,
+                                                               {}, nullptr);
+
+    for (int64_t i = 0; i < n; ++i) {
+        const float diff = std::abs(fast_buf[static_cast<size_t>(i)] -
+                                    ref_buf[static_cast<size_t>(i)]);
+        const float thr  = 1e-4f + 1e-3f * std::max(std::abs(fast_buf[static_cast<size_t>(i)]),
+                                                    std::abs(ref_buf[static_cast<size_t>(i)]));
+        if (diff > thr) {
+            std::printf("        mismatch at %lld: fast %.6f vs ref %.6f\n",
+                        (long long)i, (double)fast_buf[static_cast<size_t>(i)],
+                        (double)ref_buf[static_cast<size_t>(i)]);
+            return false;
+        }
+    }
+    return true;
+}
+
+MultiLatentAttentionAttributes na_attrs(int64_t heads, int64_t kv_heads, int64_t nope,
+                                        int64_t rope, int64_t vdim, bool causal = true)
+{
+    MultiLatentAttentionAttributes a;
+    a.num_heads = heads;
+    a.kv_num_heads = kv_heads;
+    a.qk_nope_head_dim = nope;
+    a.qk_rope_head_dim = rope;
+    a.v_head_dim = vdim;
+    a.absorbed = false;
+    a.causal = causal;
+    return a;
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(mla_non_absorbed_matches_ref) {
+    // Q [B, Sq, H*Dqk], K [B, Sk, H_kv*Dqk], V [B, Sk, H_kv*vd]: the key keeps
+    // the full qk width, so there is no latent projection to reuse and the
+    // value is simply narrower than the key.
+    struct NA {
+        std::vector<int64_t> qs, ks, vs;
+        int64_t heads, kv_heads, nope, rope, vdim;
+        bool causal = true;
+        bool mask = false;
+        int route = -1;
+    };
+    const NA cases[] = {
+        // GQA ratio, value narrower than the key.
+        {{1, 6, 4 * 40},  {1, 9, 2 * 40},  {1, 9, 2 * 16},  4, 2, 32, 8, 16},
+        // MQA with the value as wide as the key.
+        {{1, 5, 4 * 40},  {1, 7, 1 * 40},  {1, 7, 1 * 40},  4, 1, 32, 8, 40},
+        // Non-causal with an additive mask.
+        {{1, 5, 2 * 24},  {1, 7, 1 * 24},  {1, 7, 1 * 8},   2, 1, 16, 8, 8,
+         false, true},
+        // Explicit [B, H, S, D] layout on all three inputs.
+        {{2, 4, 5, 40},   {2, 2, 5, 40},   {2, 2, 5, 16},   4, 2, 32, 8, 16},
+        // v_head_dim unset: the value falls back to kv_lora_rank.
+        {{1, 4, 2 * 40},  {1, 4, 1 * 40},  {1, 4, 1 * 16},   2, 1, 32, 8, 0},
+        // Decode shape down the GEMV route.
+        {{1, 1, 8 * 40},  {1, 300, 1 * 40}, {1, 300, 1 * 16}, 8, 1, 32, 8, 16,
+         true, false, 2},
+        // Flash route.
+        {{1, 256, 4 * 72}, {1, 300, 2 * 72}, {1, 300, 2 * 32}, 4, 2, 64, 8, 32,
+         true, false, 1},
+    };
+
+    for (const auto& c : cases) {
+        MultiLatentAttentionAttributes a =
+            na_attrs(c.heads, c.kv_heads, c.nope, c.rope, c.vdim, c.causal);
+        a.kv_lora_rank = c.vdim > 0 ? c.vdim : 16;
+        NNOPS_EXPECT_TRUE(mla_na_vs_ref(c.qs, c.ks, c.vs, a, c.route, c.mask));
+    }
+}
+
+NNOPS_TEST(mla_non_absorbed_validation) {
+    // Three inputs are required, V is its own tensor, and the key keeps the full
+    // query/key width.
+    const auto a = na_attrs(4, 2, 32, 8, 16);
+    auto op = MultiLatentAttention::create(a, Backend::CPU);
+
+    const TensorDesc q = td({1, 6, 4 * 40});
+    const TensorDesc k = td({1, 9, 2 * 40});
+    const TensorDesc v = td({1, 9, 2 * 16});
+    const TensorDesc out = td({1, 6, 4 * 16});
+
+    {
+        const TensorDesc ins[] = {q, k, v};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::ok);
+    }
+    {
+        // The absorbed form's two-input call is a different geometry.
+        const TensorDesc ins[] = {q, k};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // K must be at the full qk width.
+        const TensorDesc k_bad = td({1, 9, 2 * 16});
+        const TensorDesc ins[] = {q, k_bad, v};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // V's width is v_head_dim, not the key width.
+        const TensorDesc v_bad = td({1, 9, 2 * 40});
+        const TensorDesc ins[] = {q, k, v_bad};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // V's key axis has to match K's.
+        const TensorDesc v_bad = td({1, 8, 2 * 16});
+        const TensorDesc ins[] = {q, k, v_bad};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // V's head count is the kv head count, not the query head count.
+        const TensorDesc v_bad = td({1, 9, 4 * 16});
+        const TensorDesc ins[] = {q, k, v_bad};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // The output is Q's shape at the value width.
+        const TensorDesc out_bad = td({1, 6, 4 * 40});
+        const TensorDesc ins[] = {q, k, v};
+        const TensorDesc outs[] = {out_bad};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+}
