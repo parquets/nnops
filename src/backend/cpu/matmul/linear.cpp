@@ -34,6 +34,7 @@
 #include "backend/cpu/common/memory_pool.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
 #include "backend/cpu/simd_kernel/tiled_map.hpp"
+#include "backend/cpu/common/gate_combine.hpp"
 #include "nnops/detail/validate.hpp"
 
 #include <algorithm>
@@ -67,10 +68,47 @@ void* view_data(const TensorView& t) noexcept {
 }
 
 /// The gated form: one MatMul over the [2N, K] weight into a pooled [rows, 2N]
-/// tile, then the SwiGLU combine into the caller's [rows, N] output. Both
-/// halves must exist before the combine, so the gate cannot ride MatMul's
-/// epilogue — but the whole path is one GEMM plus one output pass, where a
-/// graph would otherwise run the GEMM, a split, a Silu and a multiply.
+/// tile, then the gated combine into the caller's [rows, N] output. Both halves
+/// must exist before the combine, so the gate cannot ride MatMul's epilogue —
+/// but the whole path is one GEMM plus one output pass, where a graph would
+/// otherwise run the GEMM, a split, an activation and a multiply.
+///
+/// The activation comes from `gate_activation`: Silu is SwiGLU, Gelu (tanh) is
+/// GeGLU — the form Gemma's FFN needs. The combine itself is the shared
+/// gate_combine helper, so MoE's experts and this path evaluate one formula.
+template <EpilogueActivateType Act, typename T>
+void gated_combine_act(const T* base, int64_t n2, int64_t n,
+                       T* out, int64_t out_pitch, int64_t rows, bool add_to,
+                       const Epilogue& ep, float alpha, float beta, float limit)
+{
+    const auto tag = base;
+    const auto vlim = simd::v_set1(tag, limit);
+    const auto vnlim = simd::v_neg(vlim);
+    const auto vbeta = simd::v_set1(tag, beta);
+    const bool clamp = std::isfinite(limit);
+
+    // act(gate) · (value + beta), both halves clamped to ±limit when finite.
+    auto vec = [=](auto g, auto v) {
+        if (clamp) {
+            g = simd::v_max(simd::v_min(g, vlim), vnlim);
+            v = simd::v_max(simd::v_min(v, vlim), vnlim);
+        }
+        return apply_epilogue_vec(
+            ep, tag, simd::v_mul(gate_act_vec<Act>(g, tag, alpha),
+                                 simd::v_add(v, vbeta)));
+    };
+    auto scalar = [=](float g, float v) {
+        if (clamp) {
+            g = std::max(std::min(g, limit), -limit);
+            v = std::max(std::min(v, limit), -limit);
+        }
+        return apply_epilogue(ep, gate_act_scalar<Act>(g, alpha) * (v + beta));
+    };
+
+    kernel::tiled_map_simd<T, 2>({base, base + n}, {n2, n2},
+                                 out, out_pitch, rows, n, add_to, vec, scalar);
+}
+
 template <typename T>
 Status linear_gated_impl(const LinearAttributes& attrs, TensorView& output,
                          std::span<const TensorView> inputs, int64_t rows,
@@ -89,46 +127,47 @@ Status linear_gated_impl(const LinearAttributes& attrs, TensorView& output,
     ma.epilogue = Epilogue{};   // the combine applies Linear's
     NNOPS_TRY(matmul_cpu(ma, mt, inputs, ctx, workspace));
 
-    const float alpha = attrs.gate_alpha;
-    const float beta = attrs.gate_beta;
-    const float limit = attrs.gate_limit;
-    const bool clamp = std::isfinite(limit);
+    T* base = mt.ptr<T>();
+    T* out = output.ptr<T>();
+    const int64_t out_pitch = output.row_stride_elems();
     const Epilogue ep = attrs.epilogue;
     const bool add_to = attrs.add_to;
-    const T* tag = output.ptr<T>();
 
-    // gate · sigmoid(alpha·gate) · (value + beta), both halves clamped to
-    // ±limit when finite — the MoE operator's combine, applied to one GEMM's
-    // two column halves.
-    auto vec = [=](auto g, auto v) {
-        if (clamp) {
-            const auto vlim = simd::v_set1(tag, limit);
-            const auto vnlim = simd::v_neg(vlim);
-            g = simd::v_max(simd::v_min(g, vlim), vnlim);
-            v = simd::v_max(simd::v_min(v, vlim), vnlim);
-        }
-        const auto one = simd::v_set1(tag, 1.0f);
-        const auto sig = simd::v_div(
-            one, simd::v_add(one, simd::v_exp(
-                                      simd::v_neg(simd::v_mul(g, simd::v_set1(tag, alpha))))));
-        const auto r = simd::v_mul(simd::v_mul(g, sig),
-                                   simd::v_add(v, simd::v_set1(tag, beta)));
-        return apply_epilogue_vec(ep, tag, r);
-    };
-    auto scalar = [=](float g, float v) {
-        if (clamp) {
-            g = std::max(std::min(g, limit), -limit);
-            v = std::max(std::min(v, limit), -limit);
-        }
-        const float sig = 1.0f / (1.0f + std::exp(-alpha * g));
-        return apply_epilogue(ep, g * sig * (v + beta));
-    };
-
-    T* base = mt.ptr<T>();
-    kernel::tiled_map_simd<T, 2>({base, base + n}, {n2, n2},
-                                 output.ptr<T>(), output.row_stride_elems(),
-                                 rows, n, add_to, vec, scalar);
-    return Status::ok;
+    switch (attrs.gate_activation) {
+    case EpilogueActivateType::Silu:
+        gated_combine_act<EpilogueActivateType::Silu>(
+            base, n2, n, out, out_pitch, rows, add_to, ep,
+            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        return Status::ok;
+    case EpilogueActivateType::Gelu:
+        gated_combine_act<EpilogueActivateType::Gelu>(
+            base, n2, n, out, out_pitch, rows, add_to, ep,
+            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        return Status::ok;
+    case EpilogueActivateType::Relu:
+        gated_combine_act<EpilogueActivateType::Relu>(
+            base, n2, n, out, out_pitch, rows, add_to, ep,
+            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        return Status::ok;
+    case EpilogueActivateType::Sigmoid:
+        gated_combine_act<EpilogueActivateType::Sigmoid>(
+            base, n2, n, out, out_pitch, rows, add_to, ep,
+            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        return Status::ok;
+    case EpilogueActivateType::Tanh:
+        gated_combine_act<EpilogueActivateType::Tanh>(
+            base, n2, n, out, out_pitch, rows, add_to, ep,
+            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        return Status::ok;
+    case EpilogueActivateType::None:
+        gated_combine_act<EpilogueActivateType::None>(
+            base, n2, n, out, out_pitch, rows, add_to, ep,
+            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        return Status::ok;
+    default:
+        break;
+    }
+    return Status::unsupported;
 }
 
 /// out += src over every row; MatMul already put bias and activation through

@@ -24,7 +24,8 @@
 /// top-K > 1 a token belongs to K *different* experts, which run on different
 /// workers.
 ///
-/// SwiGLU weights come in three layouts. Separate keeps the gate and the value
+/// Gated weights — SwiGLU and GeGLU differ only in the gate half's activation —
+/// come in three layouts. Separate keeps the gate and the value
 /// in two matrices (two GEMMs, two buffers). Interleaved (GPT-OSS) and Block
 /// (Llama/Gemma) pack both into FC1, twice as wide: one GEMM over a span of
 /// pairs, then the gate×value combine. Block leaves the combined row in the
@@ -45,8 +46,7 @@
 #include "nnops/detail/simd/simd.hpp"
 
 #include "backend/cpu/matmul/matmul.h"
-#include "backend/cpu/simd_kernel/activation_kernels.hpp"
-#include "backend/cpu/simd_kernel/tiled_map.hpp"
+#include "backend/cpu/common/gate_combine.hpp"
 #include "backend/cpu/common/memory_pool.hpp"
 
 #include <algorithm>
@@ -87,7 +87,7 @@ inline float gating_sqrt_softplus(float x) noexcept
 }
 
 /// The expert activation as a MatMul epilogue. GELU is the same tanh
-/// approximation on both sides; SwiGLU has no epilogue form because it needs
+/// approximation on both sides; the gated forms have none because they need
 /// the value half too, and the combine runs as its own pass.
 inline EpilogueActivateType epilogue_of(MoEActivation act) noexcept
 {
@@ -96,91 +96,20 @@ inline EpilogueActivateType epilogue_of(MoEActivation act) noexcept
     case MoEActivation::Gelu: return EpilogueActivateType::Gelu;
     case MoEActivation::Silu: return EpilogueActivateType::Silu;
     case MoEActivation::Identity:
-    case MoEActivation::SwiGLU: break;
+    case MoEActivation::SwiGLU:
+    case MoEActivation::GeGLU:
+        break;
     }
     return EpilogueActivateType::None;
 }
 
-inline float swiglu_combine(float gate, float value, float alpha, float beta,
-                            float limit) noexcept
+/// The gate half's activation inside the combine pass: SwiGLU is Silu (with
+/// activation_alpha), GeGLU is Gelu — the shared gate_combine formula in both
+/// cases.
+inline EpilogueActivateType gate_act_of(MoEActivation act) noexcept
 {
-    if (std::isfinite(limit)) {
-        gate  = gate  < -limit ? -limit : (gate  > limit ? limit : gate);
-        value = value < -limit ? -limit : (value > limit ? limit : value);
-    }
-    const float sig = 1.0f / (1.0f + std::exp(-alpha * gate));
-    return gate * sig * (value + beta);
-}
-
-/// gate · silu(alpha·gate) · (value + beta) as an m×n tile — the same
-/// `tiled_map_simd` two-input loop the elementwise ops use, so the per-row
-/// scalar tail and the add-to handling are shared. `out` may alias `gate`: the
-/// tile loads both vectors before it stores.
-template <typename T>
-void swiglu_combine_tile(const T* gate, const T* value, T* out,
-                         int64_t m, int64_t n,
-                         int64_t gate_pitch, int64_t value_pitch, int64_t out_pitch,
-                         float alpha, float beta, float limit)
-{
-    const auto vone   = simd::v_set1(gate, 1.0f);
-    const auto valpha = simd::v_set1(gate, alpha);
-    const auto vbeta  = simd::v_set1(gate, beta);
-    const auto vlim   = simd::v_set1(gate, limit);
-    const auto vnlim  = simd::v_neg(vlim);
-    const bool clamp  = std::isfinite(limit);
-
-    auto vec = [=](auto g, auto v) {
-        if (clamp) {
-            g = simd::v_max(simd::v_min(g, vlim), vnlim);
-            v = simd::v_max(simd::v_min(v, vlim), vnlim);
-        }
-        return simd::v_mul(kernel::v_quick_gelu(g, vone, valpha), simd::v_add(v, vbeta));
-    };
-    auto scalar = [=](float g, float v) {
-        return swiglu_combine(g, v, alpha, beta, limit);
-    };
-    kernel::tiled_map_simd<T, 2>({gate, value}, {gate_pitch, value_pitch},
-                                 out, out_pitch, m, n, false, vec, scalar);
-}
-
-/// The Interleaved layout's combine: `pairs` holds (gate_0, value_0, gate_1,
-/// value_1, ...), so the two inputs are the even and odd lanes of one row and
-/// the result is written compact. That shape is a stride-2 gather, which
-/// `tiled_map_simd` cannot express, so the loop lives here.
-template <typename T>
-void swiglu_combine_pairs(const T* pairs, T* out, int64_t m, int64_t n,
-                          int64_t pairs_pitch, int64_t out_pitch,
-                          float alpha, float beta, float limit)
-{
-    using V = kernel::simd_vec_t<T>;
-    constexpr int64_t L = simd::simd_lane_for<T>;
-    const V vone   = simd::v_set1(out, 1.0f);
-    const V valpha = simd::v_set1(out, alpha);
-    const V vbeta  = simd::v_set1(out, beta);
-    const V vlim   = simd::v_set1(out, limit);
-    const V vnlim  = simd::v_neg(vlim);
-    const bool clamp = std::isfinite(limit);
-
-    for (int64_t r = 0; r < m; ++r) {
-        const T* pr = pairs + r * pairs_pitch;
-        T* orow = out + r * out_pitch;
-        int64_t c = 0;
-        for (; c + L <= n; c += L) {
-            auto g = simd::v_load_even(pr + 2 * c);
-            auto v = simd::v_load_odd(pr + 2 * c);
-            if (clamp) {
-                g = simd::v_max(simd::v_min(g, vlim), vnlim);
-                v = simd::v_max(simd::v_min(v, vlim), vnlim);
-            }
-            simd::v_store(orow + c,
-                          simd::v_mul(kernel::v_quick_gelu(g, vone, valpha),
-                                      simd::v_add(v, vbeta)));
-        }
-        for (; c < n; ++c) {
-            stf(orow + c, swiglu_combine(ldf(pr + 2 * c), ldf(pr + 2 * c + 1),
-                                         alpha, beta, limit));
-        }
-    }
+    return act == MoEActivation::GeGLU ? EpilogueActivateType::Gelu
+                                       : EpilogueActivateType::Silu;
 }
 
 /// Run one `[M,K] x [N,K]^T -> [M,N]` GEMM into @p out, whose rows are @p ld
@@ -251,10 +180,14 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     const int64_t fc1_out = fc1_w.shape(1);
     const int64_t k = attrs.k;
 
-    const bool is_swiglu = (attrs.activation == MoEActivation::SwiGLU);
-    const bool swi_separate    = is_swiglu && attrs.swiglu_layout == SwiGLULayout::Separate;
-    const bool swi_interleaved = is_swiglu && attrs.swiglu_layout == SwiGLULayout::Interleaved;
-    const bool swi_block       = is_swiglu && attrs.swiglu_layout == SwiGLULayout::Block;
+    // Both gated forms — SwiGLU and GeGLU — share the layout machinery and the
+    // combine pass; they differ only in the gate half's activation.
+    const bool gated = (attrs.activation == MoEActivation::SwiGLU ||
+                        attrs.activation == MoEActivation::GeGLU);
+    const bool swi_separate    = gated && attrs.swiglu_layout == SwiGLULayout::Separate;
+    const bool swi_interleaved = gated && attrs.swiglu_layout == SwiGLULayout::Interleaved;
+    const bool swi_block       = gated && attrs.swiglu_layout == SwiGLULayout::Block;
+    const EpilogueActivateType gate_act = gate_act_of(attrs.activation);
 
     NNOPS_ASSERT(!attrs.use_sparse_mixer);
     NNOPS_ASSERT(k >= 1 && k <= E);
@@ -267,11 +200,11 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         NNOPS_ASSERT(fc1_w.shape(1) == I);
         NNOPS_ASSERT(inputs[6].shape(0) == E && inputs[6].shape(1) == I &&
                      inputs[6].shape(2) == H);
-    } else if (is_swiglu) {
+    } else if (gated) {
         // The fused layouts pack gate and value into fc1 (fc1_out == 2 * I)
         // and carry no fc3.
         NNOPS_ASSERT_MSG(fc1_w.shape(1) == 2 * I,
-                         "moe_cpu: the fused SwiGLU layouts expect an fc1 width "
+                         "moe_cpu: the fused gated layouts expect an fc1 width "
                          "of 2 * inter_size");
         NNOPS_ASSERT(!has_fc3_w);
     } else {
@@ -441,7 +374,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     // leaving the result in the gate half, and Interleaved — whose pair halves
     // are adjacent, unaddressable as a K-contiguous FC2 row — combines into a
     // compact I-wide row.
-    const int64_t fc1_width = (is_swiglu && !swi_separate) ? 2 * I : I;
+    const int64_t fc1_width = (gated && !swi_separate) ? 2 * I : I;
 
     PoolPtr gates_owner;
     PoolPtr values_owner;
@@ -457,7 +390,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         values_owner = PoolPtr(static_cast<size_t>(total) * static_cast<size_t>(I) * sizeof(T));
         values = values_owner.as<T>();
     }
-    if (is_swiglu && !swi_separate) {
+    if (gated && !swi_separate) {
         gv_owner = PoolPtr(static_cast<size_t>(total) * static_cast<size_t>(2 * I) * sizeof(T));
         gv = gv_owner.as<T>();
     }
@@ -503,14 +436,14 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     // inside the outer team.
     const ComputeContext serial_ctx;
 
-    // FC1's bias and activation fold into the GEMM's output pass; the SwiGLU
+    // FC1's bias and activation fold into the GEMM's output pass; the gated
     // halves take neither, since the combine pass reads the gate raw.
     Epilogue act_ep{};
-    act_ep.type = is_swiglu ? EpilogueActivateType::None
-                            : epilogue_of(attrs.activation);
+    act_ep.type = gated ? EpilogueActivateType::None
+                        : epilogue_of(attrs.activation);
 
     // Stage 1: FC1 (and the value half) on one output-channel slice, then —
-    // for SwiGLU — the gate×value combine over the same cells.
+    // when gated — the gate×value combine over the same cells.
     ctx.cpu.run(0, E * ib, [&](int64_t task) {
         const int64_t e = task / ib;
         const int64_t nblk = task % ib;
@@ -533,10 +466,10 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                            fc1_base + (eoff + 2 * n0) * fc1_row_bytes, 2 * w, fc1_dt,
                            fc1b_ptr ? fc1b_ptr + eoff + 2 * n0 : nullptr, Epilogue{},
                            gv + begin * 2 * I + 2 * n0, 2 * I, dt, serial_ctx);
-            swiglu_combine_pairs(gv + begin * 2 * I + 2 * n0, gates + begin * I + n0,
-                                 rows, w, 2 * I, I,
-                                 attrs.activation_alpha, attrs.activation_beta,
-                                 attrs.swiglu_limit);
+            gate_combine_pairs_dispatch<T>(
+                gate_act, gv + begin * 2 * I + 2 * n0, gates + begin * I + n0,
+                rows, w, 2 * I, I, attrs.activation_alpha, attrs.activation_beta,
+                attrs.swiglu_limit);
         } else if (swi_block) {
             // fc1 holds [Gate_0..Gate_{I-1} | Value_0..Value_{I-1}]: two
             // column slices of one expert matrix, combined in place into the
@@ -549,9 +482,9 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                            fc1b_ptr ? fc1b_ptr + eoff + I + n0 : nullptr, Epilogue{},
                            gv + begin * 2 * I + I + n0, 2 * I, dt, serial_ctx);
             T* gvb = gv + begin * 2 * I + n0;
-            swiglu_combine_tile(gvb, gvb + I, gvb, rows, w, 2 * I, 2 * I, 2 * I,
-                                attrs.activation_alpha, attrs.activation_beta,
-                                attrs.swiglu_limit);
+            gate_combine_tile_dispatch<T>(
+                gate_act, gvb, gvb + I, gvb, rows, w, 2 * I, 2 * I, 2 * I,
+                attrs.activation_alpha, attrs.activation_beta, attrs.swiglu_limit);
         } else {
             T* gate = gates + begin * I + n0;
             // FC1: [rows, H] x [w, H]^T -> [rows, w] (the gate half).
@@ -566,9 +499,10 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                                fc3_base + (e * I + n0) * fc3_row_bytes, w, fc3_dt,
                                fc3b_ptr ? fc3b_ptr + e * I + n0 : nullptr, Epilogue{},
                                value, I, dt, serial_ctx);
-                swiglu_combine_tile(gate, value, gate, rows, w, I, I, I,
-                                    attrs.activation_alpha, attrs.activation_beta,
-                                    attrs.swiglu_limit);
+                gate_combine_tile_dispatch<T>(
+                    gate_act, gate, value, gate, rows, w, I, I, I,
+                    attrs.activation_alpha, attrs.activation_beta,
+                    attrs.swiglu_limit);
             }
         }
     });

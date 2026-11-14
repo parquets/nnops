@@ -62,18 +62,25 @@ struct LinearAttributes {
     /// An integer output takes its bias as int32; see MatMulAttributes.
     DataType output_dtype = DataType::f32;
 
-    // ---- gated (SwiGLU) form ---------------------------------------------
+    // ---- gated (SwiGLU / GeGLU) form -------------------------------------
     // The weight is [2N, K] and the bias [2N]: rows [0, N) are the gate, rows
     // [N, 2N) the value, and the output is [..., N]:
     //
-    //   y = epilogue( gate · sigmoid(alpha·gate) · (value + beta) )
+    //   y = epilogue( act(gate) · (value + beta) )
     //
-    // with both halves clamped to ±limit when limit is finite. alpha 1, beta 0,
-    // limit +inf is standard SwiGLU; GPT-OSS uses 1.702 / 1.0 / 7.0. This is
-    // the same combine the MoE operator applies inside an expert, so a dense
-    // FFN's gate/up pair costs one GEMM and one output pass instead of a GEMM,
-    // a split and two elementwise passes. fp operands only.
+    // with both halves clamped to ±limit when limit is finite. act is
+    // gate_activation: Silu gives gate·sigmoid(alpha·gate), so alpha 1, beta 0,
+    // limit +inf is standard SwiGLU and GPT-OSS uses 1.702 / 1.0 / 7.0; Gelu
+    // (tanh approximation) gives GeGLU, the Gemma FFN. This is the same combine
+    // the MoE operator applies inside an expert, so a dense FFN's gate/up pair
+    // costs one GEMM and one output pass instead of a GEMM, a split and two
+    // elementwise passes. fp operands only.
     bool gated = false;
+
+    /// Gate activation of the gated form: Silu (SwiGLU, default), Gelu
+    /// (GeGLU), Relu, Sigmoid, Tanh or None. alpha applies to Silu only; any
+    /// other type is refused with Status::unsupported.
+    EpilogueActivateType gate_activation = EpilogueActivateType::Silu;
     float gate_alpha = 1.0f;
     float gate_beta = 0.0f;
     float gate_limit = std::numeric_limits<float>::infinity();

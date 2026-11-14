@@ -67,6 +67,20 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
 
     if (!attrs_.gated) { return Status::ok; }
 
+    // The gated combine implements Silu (SwiGLU), Gelu (GeGLU) and the plain
+    // activations; anything else has no kernel.
+    switch (attrs_.gate_activation) {
+    case EpilogueActivateType::Silu:
+    case EpilogueActivateType::Gelu:
+    case EpilogueActivateType::Relu:
+    case EpilogueActivateType::Sigmoid:
+    case EpilogueActivateType::Tanh:
+    case EpilogueActivateType::None:
+        break;
+    default:
+        return Status::unsupported;
+    }
+
     const TensorDesc& x = inputs[0];
     const TensorDesc& w = inputs[1];
     if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, x.dtype) || w.dtype != x.dtype) {

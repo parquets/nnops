@@ -7,10 +7,10 @@
 /// lower expert index), optionally renormalize and scale the selected weights,
 /// then run the selected experts' FFNs and accumulate `w * expert_out` in f32.
 ///
-/// Scope matches the kernel: f32/f16, Relu/Gelu/Silu/Identity, and SwiGLU in
-/// all three layouts (Separate reads a second fc3 matrix; Interleaved and Block
-/// both read the gate/value pairs out of the 2*inter_size-wide fc1). Everything
-/// else is rejected.
+/// Scope matches the kernel: f32/f16, Relu/Gelu/Silu/Identity, and the gated
+/// SwiGLU / GeGLU forms in all three layouts (Separate reads a second fc3
+/// matrix; Interleaved and Block both read the gate/value pairs out of the
+/// 2*inter_size-wide fc1). Everything else is rejected.
 ///
 /// Sqrt-softplus guards at 20: above it `log1p(exp(x))` already equals x in
 /// f32, and `exp(x)` overflows near 88.
@@ -49,6 +49,7 @@ inline float apply_activation(MoEActivation act, float x, float alpha, float bet
     case MoEActivation::Relu:
         return x > 0.0f ? x : 0.0f;
     case MoEActivation::Gelu:
+    case MoEActivation::GeGLU:
         // tanh approximation, same constants as simd_activation's v_gelu.
         return 0.5f * x * (1.0f + std::tanh(0.7978845608028654f *
                                             (x + 0.044715f * x * x * x)));
@@ -75,16 +76,19 @@ inline float gating_sqrt_softplus(float x) noexcept
     return std::sqrt(x > 20.0f ? x : std::log1p(std::exp(x)));
 }
 
-/// SwiGLU value/gate combine, per the formula in moe.hpp.
-inline float swiglu_combine(float gate, float value, float alpha, float beta,
-                            float limit) noexcept
+/// Gated value/gate combine, per the formula in moe.hpp: the gate half runs
+/// through SwiGLU's alpha-scaled Silu or GeGLU's Gelu, then meets (value+beta).
+inline float gated_combine(MoEActivation act, float gate, float value,
+                           float alpha, float beta, float limit) noexcept
 {
     if (std::isfinite(limit)) {
         gate  = gate  < -limit ? -limit : (gate  > limit ? limit : gate);
         value = value < -limit ? -limit : (value > limit ? limit : value);
     }
-    const float sig = 1.0f / (1.0f + std::exp(-alpha * gate));
-    return gate * sig * (value + beta);
+    const float g = (act == MoEActivation::SwiGLU)
+                        ? gate / (1.0f + std::exp(-alpha * gate))
+                        : apply_activation(act, gate, alpha, beta);
+    return g * (value + beta);
 }
 
 template <typename T>
@@ -108,9 +112,11 @@ void moe_ref_impl(const MoEAttributes& attrs,
     const int64_t E = router_probs.shape(1);
     const int64_t I = fc2_w.shape(2);
 
-    const bool is_swiglu = (attrs.activation == MoEActivation::SwiGLU);
-    const bool swi_separate = is_swiglu && attrs.swiglu_layout == SwiGLULayout::Separate;
-    if (is_swiglu) {
+    // SwiGLU and GeGLU share the layouts; only the gate activation differs.
+    const bool gated = (attrs.activation == MoEActivation::SwiGLU ||
+                        attrs.activation == MoEActivation::GeGLU);
+    const bool swi_separate = gated && attrs.swiglu_layout == SwiGLULayout::Separate;
+    if (gated) {
         if (swi_separate) {
             NNOPS_ASSERT(has_fc3_w);
         } else {
@@ -144,7 +150,7 @@ void moe_ref_impl(const MoEAttributes& attrs,
     std::vector<int64_t> ids(static_cast<size_t>(k));
     std::vector<float> weights(static_cast<size_t>(k));
     std::vector<float> gate(static_cast<size_t>(fc1_out));
-    std::vector<float> value(static_cast<size_t>(is_swiglu ? I : 0));
+    std::vector<float> value(static_cast<size_t>(gated ? I : 0));
     std::vector<char> used(static_cast<size_t>(E));
 
     for (int64_t t = 0; t < num_tokens; ++t) {
@@ -245,11 +251,11 @@ void moe_ref_impl(const MoEAttributes& attrs,
             if (swi_separate) {
                 // Separate layout: fc1_out == I, so gate and value align.
                 for (int64_t i = 0; i < I; ++i) {
-                    gate[static_cast<size_t>(i)] = swiglu_combine(
+                    gate[static_cast<size_t>(i)] = gated_combine(attrs.activation,
                         gate[static_cast<size_t>(i)], value[static_cast<size_t>(i)],
                         attrs.activation_alpha, attrs.activation_beta, attrs.swiglu_limit);
                 }
-            } else if (is_swiglu) {
+            } else if (gated) {
                 // Fused: pair i reads its two rows of the 2I-wide fc1 output —
                 // adjacent for Interleaved, the two halves for Block — and
                 // leaves the combined value in the pair's compact slot. The
@@ -259,7 +265,7 @@ void moe_ref_impl(const MoEAttributes& attrs,
                 for (int64_t i = 0; i < I; ++i) {
                     const int64_t gi = interleaved ? 2 * i : i;
                     const int64_t vi = interleaved ? 2 * i + 1 : I + i;
-                    gate[static_cast<size_t>(i)] = swiglu_combine(
+                    gate[static_cast<size_t>(i)] = gated_combine(attrs.activation,
                         gate[static_cast<size_t>(gi)], gate[static_cast<size_t>(vi)],
                         attrs.activation_alpha, attrs.activation_beta, attrs.swiglu_limit);
                 }

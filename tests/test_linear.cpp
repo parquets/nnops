@@ -320,6 +320,56 @@ NNOPS_TEST(linear_gated_swiglu) {
     }
 }
 
+NNOPS_TEST(linear_gated_geglu) {
+    // gate_activation selects the gate half's activation: Gelu is GeGLU (the
+    // Gemma FFN), and the plain activations are the same combine with a
+    // different act. alpha only enters Silu, so the GeGLU case leaves it at a
+    // non-default value the reference must ignore.
+    const int64_t M = 5, K = 23, N = 13;
+    const int64_t n2 = 2 * N;
+    auto [xv, x] = test::make_random_tensor({M, K}, -1.0f, 1.0f, 21);
+    auto [wv, w] = test::make_random_tensor({n2, K}, -1.0f, 1.0f, 22);
+    auto [bv, b] = test::make_random_tensor({n2}, -0.5f, 0.5f, 23);
+
+    LinearAttributes gelu;
+    gelu.gated = true;
+    gelu.gate_activation = EpilogueActivateType::Gelu;
+    gelu.gate_alpha = 1.702f;   // ignored by GeGLU
+    check_linear<float>(gelu, {x, w, b});
+    check_linear<float>(gelu, {x, w});
+
+    // beta and the clamp apply to both gated forms.
+    LinearAttributes clamped = gelu;
+    clamped.gate_beta = 0.5f;
+    clamped.gate_limit = 2.0f;
+    check_linear<float>(clamped, {x, w, b});
+
+    // f16 storage.
+    {
+        auto x16 = test::f32_to_f16(xv);
+        auto w16 = test::f32_to_f16(wv);
+        auto b16 = test::f32_to_f16(bv);
+        const int64_t xs[] = {M, K};
+        const int64_t ws[] = {n2, K};
+        const int64_t bs[] = {n2};
+        TensorView xf(xs, DataType::f16, x16.data());
+        TensorView wf(ws, DataType::f16, w16.data());
+        TensorView bf(bs, DataType::f16, b16.data());
+        check_linear<half>(gelu, {xf, wf, bf}, 2e-2f);
+    }
+
+    // A type outside the gate menu is refused, not silently treated as Silu.
+    LinearAttributes bad = gelu;
+    bad.gate_activation = EpilogueActivateType::LeakyRelu;
+    auto op = Linear::create(bad, Backend::CPU);
+    const TensorView ins[] = {x, w};
+    std::vector<float> obuf(static_cast<size_t>(M * N), 0.0f);
+    const int64_t os[] = {M, N};
+    TensorView out(os, DataType::f32, obuf.data());
+    TensorView outs[] = {out};
+    NNOPS_EXPECT_TRUE(op->compute(outs, ins) == Status::unsupported);
+}
+
 NNOPS_TEST(linear_gated_shape_and_reject) {
     const int64_t ishape[] = {2, 8};
     const int64_t wshape[] = {11, 8};   // odd row count

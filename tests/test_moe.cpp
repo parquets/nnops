@@ -893,6 +893,52 @@ NNOPS_TEST(moe_swiglu_fused_f16_q4_1)
     }
 }
 
+// GeGLU: the same three layouts and combine, with GeLU standing in for the
+// alpha-scaled SiLU on the gate half — the Gemma FFN.
+NNOPS_TEST(moe_geglu)
+{
+    {
+        MoEProblem p;
+        p.T = 12; p.H = 16; p.E = 4; p.I = 24;
+        p.build(/*seed=*/221, /*with_fc3=*/true);
+
+        MoEAttributes attrs;
+        attrs.k = 2;
+        attrs.activation = MoEActivation::GeGLU;
+        attrs.swiglu_layout = SwiGLULayout::Separate;
+        expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe geglu separate");
+
+        // beta and the clamp apply to the gated forms alike, while alpha is
+        // SiLU's alone: changing it must leave a GeGLU result untouched.
+        MoEAttributes tuned = attrs;
+        tuned.activation_beta = 0.5f;
+        tuned.swiglu_limit = 7.0f;
+        tuned.activation_alpha = 1.702f;
+        expect_matches_ref(p, tuned, {}, 1e-4f, 1e-5f, "moe geglu beta+clamp");
+
+        MoEAttributes other_alpha = tuned;
+        other_alpha.activation_alpha = 0.5f;
+        NNOPS_EXPECT_TRUE(max_abs_diff(run_kernel(p, tuned),
+                                       run_kernel(p, other_alpha)) == 0.0f);
+    }
+
+    const SwiGLULayout layouts[] = {SwiGLULayout::Interleaved, SwiGLULayout::Block};
+    const char* names[] = {"moe geglu interleaved", "moe geglu block"};
+    for (int i = 0; i < 2; ++i) {
+        MoEProblem p;
+        p.T = 12; p.H = 16; p.E = 4; p.I = 24;
+        p.build(/*seed=*/222);
+        p.fuse_swiglu(/*seed=*/222);
+
+        MoEAttributes attrs;
+        attrs.k = 2;
+        attrs.activation = MoEActivation::GeGLU;
+        attrs.swiglu_layout = layouts[i];
+        attrs.normalize_routing_weights = true;
+        expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, names[i]);
+    }
+}
+
 // Every token routed to one expert, leaving the others with n_e == 0. The
 // empty-expert path must skip its GEMMs rather than launch zero-sized ones.
 NNOPS_TEST(moe_skewed_routing_empty_experts)

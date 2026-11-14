@@ -22,11 +22,11 @@
 /// per-expert GEMMs drive the library's MatMul (transpose_b).
 ///
 /// Implemented today (CPU): f32/f16, all three router_gating functions,
-/// routed_scaling_factor, the Relu/Gelu/Silu/Identity activations, and SwiGLU
-/// in all three layouts — `Separate` (two matrices), and the fused
-/// `Interleaved`/`Block` ones, where fc1 holds both halves and one GEMM covers
-/// them. use_sparse_mixer exists in the interface but is rejected by an
-/// assertion.
+/// routed_scaling_factor, the Relu/Gelu/Silu/Identity activations, and the
+/// gated forms SwiGLU / GeGLU in all three layouts — `Separate` (two
+/// matrices), and the fused `Interleaved`/`Block` ones, where fc1 holds both
+/// halves and one GEMM covers them. use_sparse_mixer exists in the interface
+/// but is rejected by an assertion.
 ///
 /// Inputs (an optional one is omitted by passing an empty TensorView):
 ///   [0] input                  [num_tokens, hidden_size]     f32/f16
@@ -35,14 +35,14 @@
 ///   [3] fc1_experts_bias       [E, fc1_out]                  optional
 ///   [4] fc2_experts_weights    [E, hidden_size, inter_size]  down-projection
 ///   [5] fc2_experts_bias       [E, hidden_size]              optional
-///   [6] fc3_experts_weights    [E, inter_size, hidden_size]  optional; SwiGLU
+///   [6] fc3_experts_weights    [E, inter_size, hidden_size]  optional; gated
 ///                                                            Separate value half
 ///   [7] fc3_experts_bias       [E, inter_size]               optional
 ///   [8] router_weights         [num_tokens, num_experts]     optional; separate
 ///                                                            mixing weights
 ///
-/// E = num_experts; fc1_out = inter_size on Separate / non-SwiGLU, and
-/// 2 * inter_size on Interleaved / Block SwiGLU. Output is
+/// E = num_experts; fc1_out = inter_size on Separate / non-gated, and
+/// 2 * inter_size on Interleaved / Block gated. Output is
 /// [num_tokens, hidden_size], ChannelFirstOnly (GEMM weights are channel-first),
 /// consistent with Linear/MatMul/Attention.
 ///
@@ -63,13 +63,14 @@ namespace nnops {
 
 /// Expert-FFN activation (the non-linearity between GEMM 1 and GEMM 2), separate
 /// from the element-wise `ActivationType` because it also covers the fused
-/// gate×value `SwiGLU` and `Identity`.
+/// gate×value `SwiGLU`/`GeGLU` and `Identity`.
 enum class MoEActivation : uint8_t {
     Relu     = 0,  ///< h = max(0, x)
     Gelu     = 1,  ///< h ≈ x * Phi(x), tanh approximation
     Silu     = 2,  ///< h = x * sigmoid(x)  (Swish; Mixtral/Gemma default)
     Identity = 3,  ///< h = x (linear expert, no activation)
     SwiGLU   = 4,  ///< h = gate * sigmoid(alpha*gate) * (value + beta)  (see below)
+    GeGLU    = 5,  ///< h = gelu(gate) * (value + beta)  (Gemma FFN)
 };
 
 /// Router scoring: how the gate logits become the scores top-K selects from.
@@ -84,9 +85,9 @@ enum class MoERouterGating : uint8_t {
     SqrtSoftplus = 2,  ///< p = sqrt(softplus(logits))   (llama.cpp)
 };
 
-/// Where the two `inter_size`-wide projections of a SwiGLU expert
-/// (`SiLU(gate) * value`) come from in the weight tensors; only meaningful when
-/// `activation == SwiGLU`.
+/// Where the two `inter_size`-wide projections of a gated expert
+/// (`act(gate) * (value + beta)`) come from in the weight tensors; only
+/// meaningful when `activation` is `SwiGLU` or `GeGLU`.
 enum class SwiGLULayout : uint8_t {
     /// Separate weight tensors: gate from fc1, value from fc3 (three GEMMs).
     /// fc1_out = fc3_out = inter_size.
@@ -135,16 +136,18 @@ struct MoEAttributes {
     /// Sparse-mixer routing variant (requires k == 2). Not implemented.
     bool use_sparse_mixer = false;
 
-    /// Gate/Value weight layout when `activation == SwiGLU`.
+    /// Gate/Value weight layout when `activation` is `SwiGLU` or `GeGLU`.
     SwiGLULayout swiglu_layout = SwiGLULayout::Separate;
 
-    /// SwiGLU gate scaling; 1.0 is standard SwiGLU, GPT-OSS uses 1.702.
+    /// Gate scaling of the SwiGLU form; 1.0 is standard SwiGLU, GPT-OSS uses
+    /// 1.702. Ignored by GeGLU and by the plain activations.
     float activation_alpha = 1.0f;
 
-    /// SwiGLU value offset; 0.0 is standard SwiGLU, GPT-OSS uses 1.0.
+    /// Value offset of both gated forms; 0.0 is standard, GPT-OSS uses 1.0.
     float activation_beta = 0.0f;
 
-    /// SwiGLU clamp on gate/value; +inf (default) disables it, GPT-OSS uses 7.0.
+    /// Clamp on gate/value of both gated forms; +inf (default) disables it,
+    /// GPT-OSS uses 7.0.
     float swiglu_limit = std::numeric_limits<float>::infinity();
 };
 

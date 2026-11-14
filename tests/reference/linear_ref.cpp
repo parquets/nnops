@@ -59,6 +59,28 @@ inline float scale_at(const QuantParams& q, int64_t idx) noexcept {
     return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
 }
 
+/// The gated form's gate-half activation: Silu (alpha scaled) or Gelu's tanh
+/// approximation, the two the operator documents; everything else is refused
+/// before it reaches the kernel.
+inline float gate_act_ref(EpilogueActivateType act, float g, float alpha) noexcept
+{
+    switch (act) {
+    case EpilogueActivateType::Gelu:
+        return 0.5f * g * (1.0f + std::tanh(0.7978845608028654f
+                                           * (g + 0.044715f * g * g * g)));
+    case EpilogueActivateType::Relu:
+        return g > 0.0f ? g : 0.0f;
+    case EpilogueActivateType::Sigmoid:
+        return 1.0f / (1.0f + std::exp(-g));
+    case EpilogueActivateType::Tanh:
+        return std::tanh(g);
+    case EpilogueActivateType::None:
+        return g;
+    default:
+        return g / (1.0f + std::exp(-alpha * g));   // Silu
+    }
+}
+
 /// XT/WT: input/weight element type; CT: output element type.
 template <class XT, class WT, class CT>
 void linear_ref_impl(const LinearAttributes& attrs,
@@ -153,8 +175,9 @@ void linear_ref_impl(const LinearAttributes& attrs,
                 f = static_cast<float>(acc) *
                     (scale_at(qx, row) * scale_at(qw, n));
             } else if (attrs.gated) {
-                // gate · sigmoid(alpha·gate) · (value + beta), both halves
-                // clamped to ±limit when finite — the MoE combine's formula.
+                // act(gate) · (value + beta), both halves clamped to ±limit when
+                // finite — the MoE combine's formula, with act from
+                // gate_activation.
                 const WT* vr = w.ptr<WT>(static_cast<size_t>(n + N));
                 float gate = 0.0f, value = 0.0f;
                 for (int64_t k = 0; k < K; ++k) {
@@ -171,8 +194,8 @@ void linear_ref_impl(const LinearAttributes& attrs,
                     gate = std::max(std::min(gate, limit), -limit);
                     value = std::max(std::min(value, limit), -limit);
                 }
-                const float sig = 1.0f / (1.0f + std::exp(-attrs.gate_alpha * gate));
-                f = gate * sig * (value + attrs.gate_beta);
+                f = gate_act_ref(attrs.gate_activation, gate, attrs.gate_alpha)
+                    * (value + attrs.gate_beta);
             } else {
                 float sum = 0.0f;
                 for (int64_t k = 0; k < K; ++k) {
