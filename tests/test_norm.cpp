@@ -717,6 +717,567 @@ NNOPS_TEST(norm_rmsnorm_random_f16) {
 }
 
 // ============================================================
+// 1-centered weight (one_plus_weight) — Gemma's zero-centered norms
+// ============================================================
+
+NNOPS_TEST(norm_one_plus_weight_rmsnorm_hand) {
+    // y = x / rms(x) * (1 + w), with w the stored *offset* rather than the
+    // scale. Written out by hand, and the same weight without the attribute is
+    // run alongside so a kernel that ignored the flag could not pass both.
+    const int64_t shape[]  = {2, 4};
+    const int64_t sshape[] = {4};
+    const float x_data[] = {1.0f, 2.0f, 3.0f, 4.0f,
+                            0.5f, -1.5f, 2.5f, -0.5f};
+    const float w_data[] = {0.5f, -0.25f, 0.0f, 2.0f};
+
+    TensorView x(shape, DataType::f32, const_cast<float*>(x_data));
+    TensorView w(sshape, DataType::f32, const_cast<float*>(w_data));
+
+    const TensorDesc desc_arr[] = {x.desc(), w.desc()};
+
+    NormAttributes attrs;
+    attrs.type = NormType::RMSNorm;
+    attrs.one_plus_weight = true;
+    auto op = Norm::create(attrs, Backend::CPU);
+
+    auto outs = op->getOutputTensorDesc(desc_arr);
+    std::vector<float> got(static_cast<size_t>(outs[0].numel()), 0.0f);
+    auto y = test::make_channel_first(outs[0], got.data());
+
+    const TensorView ins[] = {x, w};
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+    for (int row = 0; row < 2; ++row) {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            const float v = x_data[4 * row + i];
+            sum_sq += v * v;
+        }
+        const float inv_rms = 1.0f / std::sqrt(sum_sq / 4.0f + 1e-5f);
+        for (int i = 0; i < 4; ++i) {
+            const float want = x_data[4 * row + i] * inv_rms * (w_data[i] + 1.0f);
+            NNOPS_EXPECT_NEAR(got[static_cast<size_t>(4 * row + i)], want, 1e-5f);
+        }
+    }
+
+    // Same weight, plain attributes: the scale is w itself.
+    NormAttributes plain;
+    plain.type = NormType::RMSNorm;
+    auto op_plain = Norm::create(plain, Backend::CPU);
+    std::vector<float> plain_buf(static_cast<size_t>(outs[0].numel()), 0.0f);
+    auto y_plain = test::make_channel_first(outs[0], plain_buf.data());
+    NNOPS_EXPECT_TRUE(op_plain->compute(y_plain, ins) == Status::ok);
+
+    // The flag has to be observable: every input is non-zero, so no column can
+    // come out the same (w = 0 scales the plain form to zero).
+    for (int i = 0; i < 8; ++i) {
+        NNOPS_EXPECT_TRUE(std::abs(got[static_cast<size_t>(i)] -
+                                   plain_buf[static_cast<size_t>(i)]) > 1e-4f);
+    }
+}
+
+NNOPS_TEST(norm_one_plus_weight_layernorm_with_bias) {
+    // The +1 touches the scale only; the bias is added afterwards.
+    const int64_t shape[]  = {1, 3};
+    const int64_t sshape[] = {3};
+    const float x_data[] = {1.0f, 2.0f, 6.0f};
+    const float w_data[] = {0.25f, -0.5f, 1.0f};
+    const float b_data[] = {0.1f, 0.2f, -0.3f};
+
+    TensorView x(shape, DataType::f32, const_cast<float*>(x_data));
+    TensorView w(sshape, DataType::f32, const_cast<float*>(w_data));
+    TensorView b(sshape, DataType::f32, const_cast<float*>(b_data));
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    attrs.one_plus_weight = true;
+    auto op = Norm::create(attrs, Backend::CPU);
+
+    const TensorDesc desc_arr[] = {x.desc(), w.desc(), b.desc()};
+    auto outs = op->getOutputTensorDesc(desc_arr);
+    std::vector<float> got(static_cast<size_t>(outs[0].numel()), 0.0f);
+    auto y = test::make_channel_first(outs[0], got.data());
+
+    const TensorView ins[] = {x, w, b};
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+    const float mean = 3.0f;
+    const float var = (4.0f + 1.0f + 9.0f) / 3.0f;
+    const float inv_std = 1.0f / std::sqrt(var + 1e-5f);
+    for (int i = 0; i < 3; ++i) {
+        const float want = (x_data[i] - mean) * inv_std * (w_data[i] + 1.0f) + b_data[i];
+        NNOPS_EXPECT_NEAR(got[static_cast<size_t>(i)], want, 1e-5f);
+    }
+}
+
+NNOPS_TEST(norm_one_plus_weight_matches_shifted_weight) {
+    // The attribute is exactly a stored `w + 1`, so both forms agree — over the
+    // SIMD row, a scalar weight (the broadcast branch), the pre-add residual,
+    // and the strided general path the row kernel does not cover.
+    constexpr float kEpsF32 = 1e-3f;
+    auto [x_vec, x] = test::make_random_tensor({3, 40}, -2.0f, 2.0f, 800);
+    auto [w_vec, w] = test::make_random_tensor({40}, -0.4f, 0.4f, 801);
+    auto [r_vec, r] = test::make_random_tensor({3, 40}, -0.5f, 0.5f, 802);
+    auto [b_vec, b] = test::make_random_tensor({40}, -0.2f, 0.2f, 803);
+    (void)x_vec; (void)r_vec;
+    std::vector<float> w_shifted(w_vec);
+    for (auto& v : w_shifted) { v += 1.0f; }
+
+    const int64_t wshape[] = {40};
+    TensorView w1(wshape, DataType::f32, w_shifted.data());
+
+    // Scalar weight: the broadcast branch, one element of storage. Scale and
+    // bias broadcast together, so the scalar form takes a scalar bias too.
+    const int64_t one_shape[] = {1};
+    const float scalar_w = 0.125f;
+    const float scalar_w1 = 1.125f;
+    const float scalar_b = 0.05f;
+    TensorView w_scalar(one_shape, DataType::f32, const_cast<float*>(&scalar_w));
+    TensorView w1_scalar(one_shape, DataType::f32, const_cast<float*>(&scalar_w1));
+    TensorView b_scalar(one_shape, DataType::f32, const_cast<float*>(&scalar_b));
+
+    for (NormType type : {NormType::LayerNorm, NormType::RMSNorm}) {
+        for (int residual = 0; residual < 2; ++residual) {
+            for (int scalar = 0; scalar < 2; ++scalar) {
+                const TensorView& wa = scalar ? w_scalar : w;
+                const TensorView& wb = scalar ? w1_scalar : w1;
+
+                NormAttributes on;
+                on.type = type;
+                on.one_plus_weight = true;
+                on.add_residual = (residual != 0);
+                NormAttributes off = on;
+                off.one_plus_weight = false;
+
+                // LayerNorm's residual form keeps the bias slot, so it is a
+                // four-input call; RMSNorm has no bias.
+                std::vector<TensorView> ins_on = {x, wa};
+                std::vector<TensorView> ins_off = {x, wb};
+                if (type == NormType::LayerNorm) {
+                    const TensorView& bias = scalar ? b_scalar : b;
+                    ins_on.push_back(bias);
+                    ins_off.push_back(bias);
+                }
+                if (residual) {
+                    ins_on.push_back(r);
+                    ins_off.push_back(r);
+                }
+
+                std::vector<TensorDesc> d_on;
+                std::vector<TensorDesc> d_off;
+                for (const auto& t : ins_on) { d_on.push_back(t.desc()); }
+                for (const auto& t : ins_off) { d_off.push_back(t.desc()); }
+
+                auto op_on = Norm::create(on, Backend::CPU);
+                auto op_off = Norm::create(off, Backend::CPU);
+                auto out_on = op_on->getOutputTensorDesc(d_on);
+                auto out_off = op_off->getOutputTensorDesc(d_off);
+
+                std::vector<float> buf_on(static_cast<size_t>(out_on[0].numel()), 0.0f);
+                std::vector<float> buf_off(static_cast<size_t>(out_off[0].numel()), 0.0f);
+                auto y_on = test::make_channel_first(out_on[0], buf_on.data());
+                auto y_off = test::make_channel_first(out_off[0], buf_off.data());
+
+                NNOPS_EXPECT_TRUE(op_on->compute(y_on, ins_on) == Status::ok);
+                NNOPS_EXPECT_TRUE(op_off->compute(y_off, ins_off) == Status::ok);
+                NNOPS_EXPECT_TRUE(test::allclose(y_on, y_off, kEpsF32, kEpsF32));
+            }
+        }
+    }
+
+    // Strided: axis 0 makes the normalized span the whole tensor, which the
+    // general (offset-walking) path handles; one_plus is still the scale.
+    {
+        const int64_t flat_w_shape[] = {120};
+        std::vector<float> w_flat(120, 0.05f);
+        std::vector<float> w1_flat(120, 1.05f);
+        TensorView wa(flat_w_shape, DataType::f32, w_flat.data());
+        TensorView wb(flat_w_shape, DataType::f32, w1_flat.data());
+
+        NormAttributes on;
+        on.type = NormType::LayerNorm;
+        on.axis = 0;
+        on.one_plus_weight = true;
+        NormAttributes off = on;
+        off.one_plus_weight = false;
+
+        auto op_on = Norm::create(on, Backend::CPU);
+        auto op_off = Norm::create(off, Backend::CPU);
+        const TensorDesc d_on[] = {x.desc(), wa.desc()};
+        const TensorDesc d_off[] = {x.desc(), wb.desc()};
+        auto out_on = op_on->getOutputTensorDesc(d_on);
+        auto out_off = op_off->getOutputTensorDesc(d_off);
+
+        std::vector<float> buf_on(static_cast<size_t>(out_on[0].numel()), 0.0f);
+        std::vector<float> buf_off(static_cast<size_t>(out_off[0].numel()), 0.0f);
+        auto y_on = test::make_channel_first(out_on[0], buf_on.data());
+        auto y_off = test::make_channel_first(out_off[0], buf_off.data());
+
+        const TensorView ins_on[] = {x, wa};
+        const TensorView ins_off[] = {x, wb};
+        NNOPS_EXPECT_TRUE(op_on->compute(y_on, ins_on) == Status::ok);
+        NNOPS_EXPECT_TRUE(op_off->compute(y_off, ins_off) == Status::ok);
+        NNOPS_EXPECT_TRUE(test::allclose(y_on, y_off, kEpsF32, kEpsF32));
+    }
+}
+
+NNOPS_TEST(norm_one_plus_weight_f16) {
+    // The stored offset is what makes this usable in f16: w = 0.02 is exactly
+    // representable, 1 + w rounds — so the kernel must add the one per element
+    // rather than fold it into a weight.
+    auto [x_vec, _x] = test::make_random_tensor({2, 32}, -1.0f, 1.0f, 810);
+    auto [w_vec, _w] = test::make_random_tensor({32}, -0.1f, 0.1f, 811);
+    (void)_x; (void)_w;
+
+    auto x_f16 = test::f32_to_f16(x_vec);
+    auto w_f16 = test::f32_to_f16(w_vec);
+
+    const int64_t x_shape[] = {2, 32};
+    const int64_t w_shape[] = {32};
+    TensorView x(x_shape, DataType::f16, x_f16.data());
+    TensorView w(w_shape, DataType::f16, w_f16.data());
+
+    NormAttributes attrs;
+    attrs.type = NormType::RMSNorm;
+    attrs.one_plus_weight = true;
+    auto op = Norm::create(attrs, Backend::CPU);
+
+    const TensorDesc desc_arr[] = {x.desc(), w.desc()};
+    auto outs = op->getOutputTensorDesc(desc_arr);
+    NNOPS_EXPECT_EQ(static_cast<int>(outs[0].dtype), static_cast<int>(DataType::f16));
+
+    std::vector<nnops::backend::cpu::half> got(static_cast<size_t>(outs[0].numel()));
+    auto y = test::make_channel_first(outs[0], got.data());
+    const TensorView ins[] = {x, w};
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+    // Golden from the f16 values widened to f32.
+    for (int row = 0; row < 2; ++row) {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const float v = simd::s_load(&x_f16[static_cast<size_t>(32 * row + i)]);
+            sum_sq += v * v;
+        }
+        const float inv_rms = 1.0f / std::sqrt(sum_sq / 32.0f + 1e-5f);
+        for (int i = 0; i < 32; ++i) {
+            const float xv = simd::s_load(&x_f16[static_cast<size_t>(32 * row + i)]);
+            const float wv = simd::s_load(&w_f16[static_cast<size_t>(i)]);
+            const float want = xv * inv_rms * (wv + 1.0f);
+            NNOPS_EXPECT_NEAR(simd::s_load(&got[static_cast<size_t>(32 * row + i)]),
+                              want, 5e-3f);
+        }
+    }
+}
+
+NNOPS_TEST(norm_one_plus_weight_rejected_types) {
+    // Only the two row-kernel scale types read `scale` element-wise; BatchNorm
+    // folds ns/nb, GroupNorm broadcasts one pair, L2Norm has no scale.
+    const int64_t shape[] = {1, 4, 1, 1};
+    const int64_t cshape[] = {4};
+
+    std::vector<float> x_buf(4, 1.0f);
+    std::vector<float> c_buf(4, 1.0f);
+    TensorView x(shape, DataType::f32, x_buf.data());
+    TensorView c(cshape, DataType::f32, c_buf.data());
+    TensorView one(cshape, DataType::f32, c_buf.data());
+
+    const TensorDesc out_desc[] = {x.desc()};
+
+    auto expect_unsupported = [&](NormType type, std::span<const TensorDesc> ins) {
+        NormAttributes attrs;
+        attrs.type = type;
+        attrs.one_plus_weight = true;
+        auto op = Norm::create(attrs, Backend::CPU);
+        NNOPS_EXPECT_TRUE(op->validate(ins, std::span<const TensorDesc>(out_desc, 1)) ==
+                          Status::unsupported);
+    };
+
+    const TensorDesc bn_desc[] = {x.desc(), c.desc(), c.desc(), c.desc(), c.desc()};
+    const TensorDesc xb_desc[] = {x.desc(), c.desc()};
+    const TensorDesc x_desc[]  = {x.desc()};
+    expect_unsupported(NormType::BatchNorm, std::span<const TensorDesc>(bn_desc, 5));
+    expect_unsupported(NormType::GroupNorm, std::span<const TensorDesc>(xb_desc, 2));
+    expect_unsupported(NormType::L2Norm,    std::span<const TensorDesc>(x_desc, 1));
+
+    // The two that do read it validate clean.
+    for (NormType type : {NormType::LayerNorm, NormType::RMSNorm}) {
+        NormAttributes attrs;
+        attrs.type = type;
+        attrs.one_plus_weight = true;
+        auto op = Norm::create(attrs, Backend::CPU);
+        const TensorDesc desc[] = {x.desc(), one.desc()};
+        NNOPS_EXPECT_TRUE(op->validate(std::span<const TensorDesc>(desc, 2),
+                                       std::span<const TensorDesc>(out_desc, 1)) ==
+                          Status::ok);
+    }
+}
+
+// ============================================================
+// RMSNormGated — `rms_norm(x) * act(gate)` (GatedDeltaNet)
+// ============================================================
+
+namespace {
+
+/// Scalar act(g) the gated form multiplies by.
+float gated_act(EpilogueActivateType a, float g) {
+    switch (a) {
+    case EpilogueActivateType::Silu:    return g / (1.0f + std::exp(-g));
+    case EpilogueActivateType::Gelu:    return 0.5f * g *
+        (1.0f + std::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g)));
+    case EpilogueActivateType::Relu:    return g > 0.0f ? g : 0.0f;
+    case EpilogueActivateType::Sigmoid: return 1.0f / (1.0f + std::exp(-g));
+    case EpilogueActivateType::Tanh:    return std::tanh(g);
+    default:                            return g;
+    }
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(norm_rmsnorm_gated_hand) {
+    // y = x / rms(x) * (1 + w) * silu(g): written out by hand, over a row pair,
+    // so a kernel that dropped the gate (or applied it to x) cannot match.
+    const int64_t shape[]  = {2, 4};
+    const int64_t sshape[] = {4};
+    const float x_data[] = {1.0f, 2.0f, 3.0f, 4.0f,
+                            0.5f, -1.5f, 2.5f, -0.5f};
+    const float w_data[] = {0.1f, -0.2f, 0.0f, 0.4f};
+    const float g_data[] = {0.5f, -1.0f, 2.0f, -0.25f,
+                            1.5f, 0.0f, -2.0f, 0.75f};
+
+    TensorView x(shape, DataType::f32, const_cast<float*>(x_data));
+    TensorView w(sshape, DataType::f32, const_cast<float*>(w_data));
+    TensorView g(shape, DataType::f32, const_cast<float*>(g_data));
+
+    NormAttributes attrs;
+    attrs.type = NormType::RMSNorm;
+    attrs.one_plus_weight = true;
+    attrs.gate_activation = EpilogueActivateType::Silu;
+    auto op = Norm::create(attrs, Backend::CPU);
+
+    const TensorDesc desc_arr[] = {x.desc(), w.desc(), g.desc()};
+    auto outs = op->getOutputTensorDesc(desc_arr);
+    std::vector<float> got(static_cast<size_t>(outs[0].numel()), 0.0f);
+    auto y = test::make_channel_first(outs[0], got.data());
+
+    const TensorView ins[] = {x, w, g};
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+    for (int row = 0; row < 2; ++row) {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            const float v = x_data[4 * row + i];
+            sum_sq += v * v;
+        }
+        const float inv_rms = 1.0f / std::sqrt(sum_sq / 4.0f + 1e-5f);
+        for (int i = 0; i < 4; ++i) {
+            const int idx = 4 * row + i;
+            const float s = w_data[i] + 1.0f;
+            const float silu = g_data[idx] / (1.0f + std::exp(-g_data[idx]));
+            const float want = x_data[idx] * inv_rms * s * silu;
+            NNOPS_EXPECT_NEAR(got[static_cast<size_t>(idx)], want, 1e-5f);
+        }
+    }
+}
+
+NNOPS_TEST(norm_rmsnorm_gated_activations) {
+    // Every activation the gated form admits, over the same row: the expected
+    // value is a scalar evaluation of act() against the same normalized row.
+    auto [x_vec, x] = test::make_random_tensor({3, 16}, -1.5f, 1.5f, 820);
+    auto [w_vec, w] = test::make_random_tensor({16}, -0.3f, 0.3f, 821);
+    auto [g_vec, g] = test::make_random_tensor({3, 16}, -2.0f, 2.0f, 822);
+
+    for (EpilogueActivateType act : {EpilogueActivateType::Silu,
+                                     EpilogueActivateType::Gelu,
+                                     EpilogueActivateType::Relu,
+                                     EpilogueActivateType::Sigmoid,
+                                     EpilogueActivateType::Tanh}) {
+        NormAttributes attrs;
+        attrs.type = NormType::RMSNorm;
+        attrs.gate_activation = act;
+        auto op = Norm::create(attrs, Backend::CPU);
+
+        const TensorDesc desc_arr[] = {x.desc(), w.desc(), g.desc()};
+        auto outs = op->getOutputTensorDesc(desc_arr);
+        std::vector<float> got(static_cast<size_t>(outs[0].numel()), 0.0f);
+        auto y = test::make_channel_first(outs[0], got.data());
+
+        const TensorView ins[] = {x, w, g};
+        NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+        for (int row = 0; row < 3; ++row) {
+            float sum_sq = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                const float v = x_vec[static_cast<size_t>(16 * row + i)];
+                sum_sq += v * v;
+            }
+            const float inv_rms = 1.0f / std::sqrt(sum_sq / 16.0f + 1e-5f);
+            for (int i = 0; i < 16; ++i) {
+                const size_t idx = static_cast<size_t>(16 * row + i);
+                const float want = x_vec[idx] * inv_rms * w_vec[idx % 16] *
+                                   gated_act(act, g_vec[idx]);
+                NNOPS_EXPECT_NEAR(got[idx], want, 1e-4f);
+            }
+        }
+    }
+}
+
+NNOPS_TEST(norm_rmsnorm_gated_residual) {
+    // `norm(x + r) * act(g)`: the residual feeds the reduction and the gate is
+    // applied last, so the slot order [X, scale, residual, gate] matters.
+    const int64_t shape[]  = {1, 4};
+    const int64_t sshape[] = {4};
+    const float x_data[] = {1.0f, -1.0f, 0.5f, 2.0f};
+    const float w_data[] = {1.0f, 0.5f, 1.5f, 0.0f};
+    const float r_data[] = {0.5f, 0.5f, -0.5f, -1.0f};
+    const float g_data[] = {1.0f, -1.0f, 0.25f, -0.25f};
+
+    TensorView x(shape, DataType::f32, const_cast<float*>(x_data));
+    TensorView w(sshape, DataType::f32, const_cast<float*>(w_data));
+    TensorView r(shape, DataType::f32, const_cast<float*>(r_data));
+    TensorView g(shape, DataType::f32, const_cast<float*>(g_data));
+
+    NormAttributes attrs;
+    attrs.type = NormType::RMSNorm;
+    attrs.add_residual = true;
+    attrs.gate_activation = EpilogueActivateType::Silu;
+    auto op = Norm::create(attrs, Backend::CPU);
+
+    const TensorDesc desc_arr[] = {x.desc(), w.desc(), r.desc(), g.desc()};
+    auto outs = op->getOutputTensorDesc(desc_arr);
+    std::vector<float> got(static_cast<size_t>(outs[0].numel()), 0.0f);
+    auto y = test::make_channel_first(outs[0], got.data());
+
+    const TensorView ins[] = {x, w, r, g};
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+    float sum_sq = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        const float v = x_data[i] + r_data[i];
+        sum_sq += v * v;
+    }
+    const float inv_rms = 1.0f / std::sqrt(sum_sq / 4.0f + 1e-5f);
+    for (int i = 0; i < 4; ++i) {
+        const float silu = g_data[i] / (1.0f + std::exp(-g_data[i]));
+        const float want = (x_data[i] + r_data[i]) * inv_rms * w_data[i] * silu;
+        NNOPS_EXPECT_NEAR(got[static_cast<size_t>(i)], want, 1e-5f);
+    }
+}
+
+NNOPS_TEST(norm_rmsnorm_gated_f16) {
+    // The gate row is read in the same dtype as the activation and applied to
+    // the f16 row, so the whole path stays f16-resident.
+    auto [x_vec, _x] = test::make_random_tensor({2, 32}, -1.0f, 1.0f, 830);
+    auto [w_vec, _w] = test::make_random_tensor({32}, -0.2f, 0.2f, 831);
+    auto [g_vec, _g] = test::make_random_tensor({2, 32}, -1.0f, 1.0f, 832);
+    (void)_x; (void)_w; (void)_g;
+
+    auto x_f16 = test::f32_to_f16(x_vec);
+    auto w_f16 = test::f32_to_f16(w_vec);
+    auto g_f16 = test::f32_to_f16(g_vec);
+
+    const int64_t shape[] = {2, 32};
+    const int64_t sshape[] = {32};
+    TensorView x(shape, DataType::f16, x_f16.data());
+    TensorView w(sshape, DataType::f16, w_f16.data());
+    TensorView g(shape, DataType::f16, g_f16.data());
+
+    NormAttributes attrs;
+    attrs.type = NormType::RMSNorm;
+    attrs.gate_activation = EpilogueActivateType::Silu;
+    auto op = Norm::create(attrs, Backend::CPU);
+
+    const TensorDesc desc_arr[] = {x.desc(), w.desc(), g.desc()};
+    auto outs = op->getOutputTensorDesc(desc_arr);
+    NNOPS_EXPECT_EQ(static_cast<int>(outs[0].dtype), static_cast<int>(DataType::f16));
+
+    std::vector<nnops::backend::cpu::half> got(static_cast<size_t>(outs[0].numel()));
+    auto y = test::make_channel_first(outs[0], got.data());
+    const TensorView ins[] = {x, w, g};
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+    for (int row = 0; row < 2; ++row) {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const float v = simd::s_load(&x_f16[static_cast<size_t>(32 * row + i)]);
+            sum_sq += v * v;
+        }
+        const float inv_rms = 1.0f / std::sqrt(sum_sq / 32.0f + 1e-5f);
+        for (int i = 0; i < 32; ++i) {
+            const size_t idx = static_cast<size_t>(32 * row + i);
+            const float xv = simd::s_load(&x_f16[idx]);
+            const float wv = simd::s_load(&w_f16[static_cast<size_t>(i)]);
+            const float gv = simd::s_load(&g_f16[idx]);
+            const float want = xv * inv_rms * wv * gated_act(EpilogueActivateType::Silu, gv);
+            NNOPS_EXPECT_NEAR(simd::s_load(&got[idx]), want, 5e-3f);
+        }
+    }
+}
+
+NNOPS_TEST(norm_gated_validate_rules) {
+    const int64_t shape[] = {2, 4};
+    const int64_t sshape[] = {4};
+    std::vector<float> buf(8, 1.0f);
+    TensorView x(shape, DataType::f32, buf.data());
+    TensorView s(sshape, DataType::f32, buf.data());
+    TensorView g(shape, DataType::f32, buf.data());
+    const TensorDesc out_desc[] = {x.desc()};
+    const auto outs = std::span<const TensorDesc>(out_desc, 1);
+
+    auto make = [](NormType type, EpilogueActivateType act, int64_t axis = -1) {
+        NormAttributes attrs;
+        attrs.type = type;
+        attrs.gate_activation = act;
+        attrs.axis = axis;
+        return Norm::create(attrs, Backend::CPU);
+    };
+
+    // RMSNorm is the one gated form.
+    {
+        const TensorDesc ins[] = {x.desc(), s.desc(), g.desc()};
+        NNOPS_EXPECT_TRUE(make(NormType::RMSNorm, EpilogueActivateType::Silu)
+                              ->validate(std::span<const TensorDesc>(ins, 3), outs) ==
+                          Status::ok);
+        // Without the gate the third slot would be read as nothing at all.
+        NNOPS_EXPECT_TRUE(make(NormType::RMSNorm, EpilogueActivateType::Silu)
+                              ->validate(std::span<const TensorDesc>(ins, 2), outs) ==
+                          Status::invalid_argument);
+        // Only the contiguous tail has a per-element gate row.
+        NNOPS_EXPECT_TRUE(make(NormType::RMSNorm, EpilogueActivateType::Silu, 0)
+                              ->validate(std::span<const TensorDesc>(ins, 3), outs) ==
+                          Status::unsupported);
+        // A gate element per X element is what the row kernel reads.
+        const int64_t narrow[] = {2, 2};
+        TensorView g_narrow(narrow, DataType::f32, buf.data());
+        const TensorDesc bad[] = {x.desc(), s.desc(), g_narrow.desc()};
+        NNOPS_EXPECT_TRUE(make(NormType::RMSNorm, EpilogueActivateType::Silu)
+                              ->validate(std::span<const TensorDesc>(bad, 3), outs) ==
+                          Status::invalid_argument);
+        // The gated form has no quantized route.
+        TensorView x_q(shape, DataType::s8, buf.data());
+        const TensorDesc q[] = {x_q.desc(), s.desc(), g.desc()};
+        NNOPS_EXPECT_TRUE(make(NormType::RMSNorm, EpilogueActivateType::Silu)
+                              ->validate(std::span<const TensorDesc>(q, 3), outs) ==
+                          Status::unsupported);
+        // LeakyRelu is not in the row kernel's set.
+        NNOPS_EXPECT_TRUE(make(NormType::RMSNorm, EpilogueActivateType::LeakyRelu)
+                              ->validate(std::span<const TensorDesc>(ins, 3), outs) ==
+                          Status::unsupported);
+    }
+
+    // The other types have no gated consumer.
+    {
+        const TensorDesc ln[] = {x.desc(), s.desc(), g.desc()};
+        NNOPS_EXPECT_TRUE(make(NormType::LayerNorm, EpilogueActivateType::Silu)
+                              ->validate(std::span<const TensorDesc>(ln, 3), outs) ==
+                          Status::unsupported);
+        const TensorDesc l2[] = {x.desc(), g.desc()};
+        NNOPS_EXPECT_TRUE(make(NormType::L2Norm, EpilogueActivateType::Silu)
+                              ->validate(std::span<const TensorDesc>(l2, 2), outs) ==
+                          Status::unsupported);
+    }
+}
+
+// ============================================================
 // L2Norm
 // ============================================================
 
@@ -1747,6 +2308,34 @@ NNOPS_TEST(norm_quant_u8_input) {
 
     expect_quant_norm(attrs, x_q, std::span<const TensorView>(), QuantParams{},
                       kRows, 1e-3f);
+}
+
+NNOPS_TEST(norm_quant_one_plus_weight) {
+    // The quantized route funnels into the same f32 row kernel, so the
+    // 1-centered weight has to survive dequantize -> normalize -> write back.
+    constexpr int64_t kRows = 4;
+    constexpr int64_t kDim  = 12;
+    const int64_t shape[] = {kRows, kDim};
+
+    auto [x_data, _x] = test::make_random_tensor({kRows, kDim}, -1.0f, 1.0f, 930);
+    auto [w_data, w_view] = test::make_random_tensor({kDim}, -0.3f, 0.3f, 931);
+    (void)_x; (void)w_data;
+
+    const QuantParams x_qp = per_tensor(1.0f / 127.0f, 0);
+    std::vector<uint8_t> x_bytes =
+        quantize_rows(x_data.data(), kRows, kDim, x_qp, DataType::s8);
+    TensorView x_q = make_q(shape, DataType::s8, x_bytes.data(), x_qp);
+
+    for (NormType type : {NormType::LayerNorm, NormType::RMSNorm}) {
+        NormAttributes attrs;
+        attrs.type = type;
+        attrs.axis = -1;
+        attrs.one_plus_weight = true;
+        attrs.output_dtype = DataType::f32;
+        const TensorView extras[] = {w_view};
+        expect_quant_norm(attrs, x_q, std::span<const TensorView>(extras, 1),
+                          QuantParams{}, kRows, 1e-3f);
+    }
 }
 
 NNOPS_TEST(norm_quant_output_desc_follows_output_dtype) {

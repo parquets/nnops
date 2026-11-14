@@ -31,6 +31,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_norm.hpp"
+#include "common/gate_combine.hpp"
 #include "common/index.hpp"
 #include "common/dtype_dispatch.hpp"
 #include "common/memory_pool.hpp"
@@ -218,7 +219,7 @@ void layer_norm_general_scalar(
     int64_t num_rows, int64_t norm_size,
     int64_t axis, const TensorView& X, const TensorView& Y,
     const TensorView& scale,
-    float epsilon, bool add_to, bool has_bias,
+    float epsilon, bool add_to, bool has_bias, bool one_plus,
     const ComputeContext& ctx)
 {
     const auto inner_offsets = compute_inner_offsets(X, axis, norm_size);
@@ -245,7 +246,7 @@ void layer_norm_general_scalar(
             const int64_t x_off = x_base + inner_offsets[static_cast<size_t>(i)];
             const int64_t y_off = y_base + y_inner_offsets[static_cast<size_t>(i)];
             int64_t s_idx = scale_is_scalar ? 0 : i;
-            float s = s_load(&s_ptr[s_idx]);
+            float s = s_load(&s_ptr[s_idx]) + (one_plus ? 1.0f : 0.0f);
             float b = (has_bias && b_ptr) ? s_load(&b_ptr[s_idx]) : 0.0f;
             float val = (s_load(&x_ptr[x_off]) - mean_val) * inv_std * s + b;
             s_store_add(&y_ptr[y_off], val, add_to);
@@ -285,7 +286,7 @@ void layer_norm_impl(const NormAttributes& attrs,
         layer_norm_general_scalar<T>(
             x_ptr, s_ptr, b_ptr, y_ptr,
             dims.num_rows, dims.norm_size, dims.axis, X, output, scale,
-            epsilon, add_to, has_bias, ctx);
+            epsilon, add_to, has_bias, attrs.one_plus_weight, ctx);
         return;
     }
 
@@ -293,6 +294,7 @@ void layer_norm_impl(const NormAttributes& attrs,
     const int64_t y_row_stride = output.row_stride_elems();
     const int64_t r_row_stride = has_res ? inputs[3].row_stride_elems() : 0;
     const bool scale_is_scalar = (scale.numel() == 1);
+    const bool one_plus = attrs.one_plus_weight;
 
     const auto process_row = [&](int64_t row) {
         const int64_t x_off = row * x_row_stride;
@@ -311,22 +313,24 @@ void layer_norm_impl(const NormAttributes& attrs,
 
         if (has_res) {
             if (b_ptr) {
-                kernel::norm_apply_row_add<T, true, true, true>(
+                kernel::norm_apply_row_add_dispatch<T, true, true, true>(
                     x_ptr + x_off, r_ptr + r_off, y_ptr + y_off, dims.norm_size,
-                    mean_val, inv_std, s_ptr, b_ptr, scale_is_scalar, add_to);
+                    mean_val, inv_std, s_ptr, b_ptr, scale_is_scalar, add_to,
+                    one_plus);
             } else {
-                kernel::norm_apply_row_add<T, true, true, false>(
+                kernel::norm_apply_row_add_dispatch<T, true, true, false>(
                     x_ptr + x_off, r_ptr + r_off, y_ptr + y_off, dims.norm_size,
-                    mean_val, inv_std, s_ptr, nullptr, scale_is_scalar, add_to);
+                    mean_val, inv_std, s_ptr, nullptr, scale_is_scalar, add_to,
+                    one_plus);
             }
         } else if (b_ptr) {
-            kernel::norm_apply_row<T, true, true, true>(
+            kernel::norm_apply_row_dispatch<T, true, true, true>(
                 x_ptr + x_off, y_ptr + y_off, dims.norm_size,
-                mean_val, inv_std, s_ptr, b_ptr, scale_is_scalar, add_to);
+                mean_val, inv_std, s_ptr, b_ptr, scale_is_scalar, add_to, one_plus);
         } else {
-            kernel::norm_apply_row<T, true, true, false>(
+            kernel::norm_apply_row_dispatch<T, true, true, false>(
                 x_ptr + x_off, y_ptr + y_off, dims.norm_size,
-                mean_val, inv_std, s_ptr, nullptr, scale_is_scalar, add_to);
+                mean_val, inv_std, s_ptr, nullptr, scale_is_scalar, add_to, one_plus);
         }
     };
 
@@ -344,7 +348,7 @@ void rms_norm_general_scalar(
     int64_t num_rows, int64_t norm_size,
     int64_t axis, const TensorView& X, const TensorView& Y,
     const TensorView& scale,
-    float epsilon, bool add_to,
+    float epsilon, bool add_to, bool one_plus,
     const ComputeContext& ctx)
 {
     const auto inner_offsets = compute_inner_offsets(X, axis, norm_size);
@@ -368,7 +372,7 @@ void rms_norm_general_scalar(
             const int64_t x_off = x_base + inner_offsets[static_cast<size_t>(i)];
             const int64_t y_off = y_base + y_inner_offsets[static_cast<size_t>(i)];
             int64_t s_idx = scale_is_scalar ? 0 : i;
-            float s = s_load(&s_ptr[s_idx]);
+            float s = s_load(&s_ptr[s_idx]) + (one_plus ? 1.0f : 0.0f);
             float val = s_load(&x_ptr[x_off]) * inv_rms * s;
             s_store_add(&y_ptr[y_off], val, add_to);
         }
@@ -392,10 +396,16 @@ void rms_norm_impl(const NormAttributes& attrs,
     const auto* s_ptr = scale.ptr<T>();
     auto* y_ptr = output.ptr<T>();
 
-    // RMSNorm has no bias, so the residual is the third input.
-    const bool has_res = attrs.add_residual && inputs.size() >= 3 &&
-                         !inputs[2].is_empty();
-    const auto* r_ptr  = has_res ? inputs[2].ptr<T>() : nullptr;
+    // The gate is the trailing slot; the residual, when present, sits before
+    // it. With neither, the third input would be the gate, not a residual —
+    // so the residual slot is counted back from the end rather than assumed.
+    const bool has_gate = attrs.gate_activation != EpilogueActivateType::None;
+    const int64_t res_idx =
+        static_cast<int64_t>(inputs.size()) - 1 - (has_gate ? 1 : 0);
+    const bool has_res = attrs.add_residual && res_idx >= 2 &&
+                         !inputs[static_cast<size_t>(res_idx)].is_empty();
+    const auto* r_ptr  = has_res ? inputs[static_cast<size_t>(res_idx)].ptr<T>() : nullptr;
+    const auto* g_ptr  = has_gate ? inputs.back().ptr<T>() : nullptr;
 
     const bool add_to = attrs.add_to;
     const auto dims = compute_norm_dims(X, attrs.axis);
@@ -405,14 +415,18 @@ void rms_norm_impl(const NormAttributes& attrs,
         rms_norm_general_scalar<T>(
             x_ptr, s_ptr, y_ptr,
             dims.num_rows, dims.norm_size, dims.axis, X, output, scale,
-            epsilon, add_to, ctx);
+            epsilon, add_to, attrs.one_plus_weight, ctx);
         return;
     }
 
     const int64_t x_row_stride = X.row_stride_elems();
     const int64_t y_row_stride = output.row_stride_elems();
-    const int64_t r_row_stride = has_res ? inputs[2].row_stride_elems() : 0;
+    const int64_t r_row_stride =
+        has_res ? inputs[static_cast<size_t>(res_idx)].row_stride_elems() : 0;
+    const int64_t g_row_stride = has_gate ? inputs.back().row_stride_elems() : 0;
     const bool scale_is_scalar = (scale.numel() == 1);
+    const bool one_plus = attrs.one_plus_weight;
+    const EpilogueActivateType gate_act = attrs.gate_activation;
 
     const auto process_row = [&](int64_t row) {
         const int64_t x_off = row * x_row_stride;
@@ -425,13 +439,17 @@ void rms_norm_impl(const NormAttributes& attrs,
         (void)sum;
         const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(dims.norm_size) + epsilon);
         if (has_res) {
-            kernel::norm_apply_row_add<T, false, true, false>(
+            kernel::norm_apply_row_add_dispatch<T, false, true, false>(
                 x_ptr + x_off, r_ptr + r_off, y_ptr + y_off, dims.norm_size,
-                0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to);
+                0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to, one_plus);
         } else {
-            kernel::norm_apply_row<T, false, true, false>(
+            kernel::norm_apply_row_dispatch<T, false, true, false>(
                 x_ptr + x_off, y_ptr + y_off, dims.norm_size,
-                0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to);
+                0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to, one_plus);
+        }
+        if (has_gate) {
+            gate_scale_row_dispatch(gate_act, y_ptr + y_off,
+                                    g_ptr + row * g_row_stride, dims.norm_size);
         }
     };
 
@@ -731,6 +749,7 @@ void norm_quant_rows(const NormAttributes& attrs,
     NNOPS_ASSERT(dims.is_contiguous_tail);
 
     const int64_t n = dims.norm_size;
+    const bool one_plus = attrs.one_plus_weight;
 
     const auto* b_ptr = (has_bias && !inputs[2].is_empty()) ? inputs[2].ptr<float>() : nullptr;
 
@@ -774,11 +793,13 @@ void norm_quant_rows(const NormAttributes& attrs,
         // In place: rowbuf is source and destination; add_to is rejected here.
         if constexpr (HasScale) {
             if (b_ptr != nullptr) {
-                kernel::norm_apply_row<float, HasMean, true, true>(
-                    rowbuf, rowbuf, n, mean_val, inv_norm, s_ptr, b_ptr, scale_is_scalar, false);
+                kernel::norm_apply_row_dispatch<float, HasMean, true, true>(
+                    rowbuf, rowbuf, n, mean_val, inv_norm, s_ptr, b_ptr,
+                    scale_is_scalar, false, one_plus);
             } else {
-                kernel::norm_apply_row<float, HasMean, true, false>(
-                    rowbuf, rowbuf, n, mean_val, inv_norm, s_ptr, nullptr, scale_is_scalar, false);
+                kernel::norm_apply_row_dispatch<float, HasMean, true, false>(
+                    rowbuf, rowbuf, n, mean_val, inv_norm, s_ptr, nullptr,
+                    scale_is_scalar, false, one_plus);
             }
         } else {
             kernel::norm_apply_row<float, HasMean, false, false>(

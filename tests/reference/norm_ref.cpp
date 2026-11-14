@@ -34,6 +34,20 @@ int64_t outer_base(const TensorView& t, int64_t row, int64_t axis) {
     return flat_offset(t, 0, axis, row);
 }
 
+/// Scalar activation for the gated form (RMSNormGated): act(gate).
+float ref_gate_act(EpilogueActivateType a, float g) {
+    constexpr float kSqrt2OverPi = 0.7978845608028654f;
+    switch (a) {
+    case EpilogueActivateType::Silu:    return g / (1.0f + std::exp(-g));
+    case EpilogueActivateType::Gelu:    return 0.5f * g *
+        (1.0f + std::tanh(kSqrt2OverPi * (g + 0.044715f * g * g * g)));
+    case EpilogueActivateType::Relu:    return g > 0.0f ? g : 0.0f;
+    case EpilogueActivateType::Sigmoid: return 1.0f / (1.0f + std::exp(-g));
+    case EpilogueActivateType::Tanh:    return std::tanh(g);
+    default:                            return g;
+    }
+}
+
 // ============================================================
 // BatchNorm
 // ============================================================
@@ -162,7 +176,7 @@ void layer_norm_ref_impl(const NormAttributes& attrs,
         for (int64_t i = 0; i < norm_size; ++i) {
             const int64_t xi = x_base + x_inner[static_cast<size_t>(i)];
             const int64_t yi = y_base + y_inner[static_cast<size_t>(i)];
-            float s = s_ptr[i];
+            float s = s_ptr[i] + (attrs.one_plus_weight ? 1.0f : 0.0f);
             float b = b_ptr ? b_ptr[i] : 0.0f;
             float val = (x_ptr[xi] - mean_val) * inv_std * s + b;
             y_ptr[yi] = attrs.add_to ? y_ptr[yi] + val : val;
@@ -204,11 +218,21 @@ void rms_norm_ref_impl(const NormAttributes& attrs,
     const auto* s_ptr = scale.ptr<float>();
     auto* y_ptr = output.ptr<float>();
 
+    // The gate is the trailing input (RMSNormGated); a residual, when present,
+    // sits before it.
+    const bool gated = attrs.gate_activation != EpilogueActivateType::None;
+    const TensorView* gate = gated ? &inputs.back() : nullptr;
+    const auto* g_ptr = gated ? gate->ptr<float>() : nullptr;
+
     std::vector<int64_t> x_inner(static_cast<size_t>(norm_size));
     std::vector<int64_t> y_inner(static_cast<size_t>(norm_size));
+    std::vector<int64_t> g_inner(static_cast<size_t>(norm_size));
     for (int64_t i = 0; i < norm_size; ++i) {
         x_inner[static_cast<size_t>(i)] = flat_offset(X, axis, rank, i);
         y_inner[static_cast<size_t>(i)] = flat_offset(output, axis, rank, i);
+        if (gated) {
+            g_inner[static_cast<size_t>(i)] = flat_offset(*gate, axis, rank, i);
+        }
     }
 
     const bool scale_is_scalar = (scale.numel() == 1);
@@ -216,6 +240,7 @@ void rms_norm_ref_impl(const NormAttributes& attrs,
     const auto process_row = [&](int64_t row) {
         const int64_t x_base = outer_base(X, row, axis);
         const int64_t y_base = outer_base(output, row, axis);
+        const int64_t g_base = gated ? outer_base(*gate, row, axis) : 0;
 
         float sum_sq = 0.0f;
         for (int64_t i = 0; i < norm_size; ++i) {
@@ -229,7 +254,13 @@ void rms_norm_ref_impl(const NormAttributes& attrs,
             const int64_t xi = x_base + x_inner[static_cast<size_t>(i)];
             const int64_t yi = y_base + y_inner[static_cast<size_t>(i)];
             float s = scale_is_scalar ? s_ptr[0] : s_ptr[i];
+            if (attrs.one_plus_weight) { s += 1.0f; }
             float val = x_ptr[xi] * inv_rms * s;
+            if (gated) {
+                val *= ref_gate_act(
+                    attrs.gate_activation,
+                    g_ptr[g_base + g_inner[static_cast<size_t>(i)]]);
+            }
             y_ptr[yi] = attrs.add_to ? y_ptr[yi] + val : val;
         }
     };

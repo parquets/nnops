@@ -107,7 +107,8 @@ inline void norm_apply_affine_row(const T* x, T* y, int64_t n,
 
 /// norm_apply_row over the pre-added row (x + r) — the write side of the fused
 /// `norm(x + r)`.
-template <typename T, bool HasMean, bool HasScale, bool HasBias>
+template <typename T, bool HasMean, bool HasScale, bool HasBias,
+          bool ScaleOnePlus = false>
 inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
                                float mean_val, float inv_std,
                                const T* scale, const T* bias,
@@ -118,6 +119,7 @@ inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
 
     const auto v_mean    = v_set1(x, mean_val);
     const auto v_inv_std = v_set1(x, inv_std);
+    const auto v_one     = v_set1(x, 1.0f);
 
     for (; i + L <= n; i += L) {
         auto rv = v_add(v_load(x + i), v_load(r + i));
@@ -129,6 +131,9 @@ inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
             // A scalar scale is one element of storage: broadcast it instead
             // of loading a full lane from past the end of the buffer.
             auto vs = scale_is_scalar ? v_set1(x, s_load(scale)) : v_load(scale + i);
+            if constexpr (ScaleOnePlus) {
+                vs = v_add(vs, v_one);
+            }
             rv = v_mul(rv, vs);
         }
         if constexpr (HasBias) {
@@ -145,7 +150,7 @@ inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
         rv *= inv_std;
         if constexpr (HasScale) {
             int64_t s_idx = scale_is_scalar ? 0 : i;
-            rv *= s_load(&scale[s_idx]);
+            rv *= s_load(&scale[s_idx]) + (ScaleOnePlus ? 1.0f : 0.0f);
         }
         if constexpr (HasBias) {
             int64_t b_idx = scale_is_scalar ? 0 : i;
@@ -156,8 +161,12 @@ inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
 }
 
 /// ((x - mean?) * inv_std) * scale? + bias? — the HasMean/HasScale/HasBias
-/// bools compile out the missing terms.
-template <typename T, bool HasMean, bool HasScale, bool HasBias>
+/// bools compile out the missing terms. ScaleOnePlus makes the stored weight
+/// 1-centered: the effective scale is (1 + w), as Gemma's zero-centered norms
+/// and Qwen3-Next/4's need. Folding the +1 in here keeps it out of the stored
+/// weight, which in bf16 would otherwise lose the small-|w| correction.
+template <typename T, bool HasMean, bool HasScale, bool HasBias,
+          bool ScaleOnePlus = false>
 inline void norm_apply_row(const T* x, T* y, int64_t n,
                             float mean_val, float inv_std,
                             const T* scale, const T* bias,
@@ -168,6 +177,7 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
 
     const auto v_mean    = v_set1(x, mean_val);
     const auto v_inv_std = v_set1(x, inv_std);
+    const auto v_one     = v_set1(x, 1.0f);
 
     for (; i + L <= n; i += L) {
         auto xv = v_load(x + i);
@@ -180,6 +190,9 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
             // A scalar scale is one element of storage: broadcast it instead
             // of loading a full lane from past the end of the buffer.
             auto vs = scale_is_scalar ? v_set1(x, s_load(scale)) : v_load(scale + i);
+            if constexpr (ScaleOnePlus) {
+                vs = v_add(vs, v_one);
+            }
             rv = v_mul(rv, vs);
         }
         if constexpr (HasBias) {
@@ -197,7 +210,7 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
         rv *= inv_std;
         if constexpr (HasScale) {
             int64_t s_idx = scale_is_scalar ? 0 : i;
-            rv *= s_load(&scale[s_idx]);
+            rv *= s_load(&scale[s_idx]) + (ScaleOnePlus ? 1.0f : 0.0f);
         }
         if constexpr (HasBias) {
             int64_t b_idx = scale_is_scalar ? 0 : i;
@@ -205,6 +218,45 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
         }
         s_store_add(&y[i], rv, add_to);
     }
+}
+
+/// Runtime dispatch over ScaleOnePlus for norm_apply_row, so the operators keep
+/// one call per (HasMean, HasScale, HasBias) shape.
+template <typename T, bool HasMean, bool HasScale, bool HasBias>
+inline void norm_apply_row_dispatch(const T* x, T* y, int64_t n,
+                                    float mean_val, float inv_std,
+                                    const T* scale, const T* bias,
+                                    bool scale_is_scalar, bool add_to,
+                                    bool one_plus_weight)
+{
+    if constexpr (HasScale) {
+        if (one_plus_weight) {
+            norm_apply_row<T, HasMean, HasScale, HasBias, true>(
+                x, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to);
+            return;
+        }
+    }
+    norm_apply_row<T, HasMean, HasScale, HasBias, false>(
+        x, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to);
+}
+
+/// Runtime dispatch over ScaleOnePlus for norm_apply_row_add.
+template <typename T, bool HasMean, bool HasScale, bool HasBias>
+inline void norm_apply_row_add_dispatch(const T* x, const T* r, T* y, int64_t n,
+                                        float mean_val, float inv_std,
+                                        const T* scale, const T* bias,
+                                        bool scale_is_scalar, bool add_to,
+                                        bool one_plus_weight)
+{
+    if constexpr (HasScale) {
+        if (one_plus_weight) {
+            norm_apply_row_add<T, HasMean, HasScale, HasBias, true>(
+                x, r, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to);
+            return;
+        }
+    }
+    norm_apply_row_add<T, HasMean, HasScale, HasBias, false>(
+        x, r, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to);
 }
 
 /// Channel-first layout: 4-wide unrolled SIMD fmadd per row.
