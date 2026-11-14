@@ -71,7 +71,7 @@ Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
     }
 
     const DataType dt = inputs[0].dtype;
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(dt)) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, dt)) {
         return Status::unsupported;
     }
     if (inputs[1].dtype != dt || outputs[0].dtype != dt) {

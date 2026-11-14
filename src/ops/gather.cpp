@@ -27,14 +27,15 @@ NNOPS_OP_BOILERPLATE(GatherND, GatherNDAttributes,
 
 namespace {
 
-Status check_gather_dtypes(const TensorDesc& data, const TensorDesc& indices)
+Status check_gather_dtypes(Backend be, const TensorDesc& data,
+                           const TensorDesc& indices)
 {
     if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
-                          DataType::u8, DataType::s32, DataType::s64>(data.dtype)) {
+                          DataType::u8, DataType::s32, DataType::s64>(be, data.dtype)) {
         return Status::unsupported;
     }
     return detail::require(
-        detail::dtype_in<DataType::s64, DataType::s32>(indices.dtype));
+        detail::dtype_in<DataType::s64, DataType::s32>(be, indices.dtype));
 }
 
 Status check_gather_layouts(const TensorDesc& data, const TensorDesc& indices)
@@ -77,7 +78,7 @@ Status Gather::validate(std::span<const TensorDesc> inputs,
                         std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 2, 1));
-    NNOPS_TRY(check_gather_dtypes(inputs[0], inputs[1]));
+    NNOPS_TRY(check_gather_dtypes(backend_, inputs[0], inputs[1]));
     NNOPS_TRY(check_gather_layouts(inputs[0], inputs[1]));
     const auto& data = inputs[0];
     if (data.rank < 1) { return Status::invalid_argument; }
@@ -91,7 +92,7 @@ Status Gather::compute(std::span<TensorView> outputs,
                        const ComputeContext& ctx,
                        void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 2, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
@@ -114,7 +115,7 @@ Status GatherElements::validate(std::span<const TensorDesc> inputs,
                                 std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 2, 1));
-    NNOPS_TRY(check_gather_dtypes(inputs[0], inputs[1]));
+    NNOPS_TRY(check_gather_dtypes(backend_, inputs[0], inputs[1]));
     NNOPS_TRY(check_gather_layouts(inputs[0], inputs[1]));
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
@@ -138,7 +139,7 @@ Status GatherElements::compute(std::span<TensorView> outputs,
                                const ComputeContext& ctx,
                                void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 2, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
@@ -174,7 +175,7 @@ Status GatherND::validate(std::span<const TensorDesc> inputs,
                           std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 2, 1));
-    NNOPS_TRY(check_gather_dtypes(inputs[0], inputs[1]));
+    NNOPS_TRY(check_gather_dtypes(backend_, inputs[0], inputs[1]));
     NNOPS_TRY(check_gather_layouts(inputs[0], inputs[1]));
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
@@ -200,7 +201,7 @@ Status GatherND::compute(std::span<TensorView> outputs,
                          const ComputeContext& ctx,
                          void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 2, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

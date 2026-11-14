@@ -1169,7 +1169,7 @@ Status check_packed_b(const MatMulAttributes& attrs, const TensorView& a,
     if (!int8_blob) {
         const bool float_blob = dt_a == b.data_type() &&
                                 (dt_a == DataType::f32 || dt_a == DataType::f16 ||
-                                 (nnops::detail::bf16_enabled && dt_a == DataType::bf16));
+                                 (nnops::detail::bf16_cpu_enabled && dt_a == DataType::bf16));
         if (!float_blob) { return Status::unsupported; }
         if (attrs.alpha != 1.0f) { return Status::unsupported; }
     }
@@ -1227,7 +1227,7 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
     const DataType dt_a = a.data_type();
     const DataType dt_b = b.data_type();
     const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16 ||
-                         (nnops::detail::bf16_enabled && dt_a == DataType::bf16);
+                         (nnops::detail::bf16_cpu_enabled && dt_a == DataType::bf16);
     const bool block_b = is_block_packed_dtype(dt_b);
     const bool same_type = dt_b == dt_a;
     // A bf16 B has one packed form, but a Q4_1 B decodes into bf16 on aarch64

@@ -31,7 +31,7 @@ Status Slice::validate(std::span<const TensorDesc> inputs,
     const auto& out = outputs[0];
 
     NNOPS_TRY(detail::check_rank(in.rank, 1, TensorDesc::kMaxRank));
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(in.dtype) || out.dtype != in.dtype) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) || out.dtype != in.dtype) {
         return Status::invalid_argument;
     }
     if (!is_layout_supported(in.layout, LayoutSupport::ChannelFirstOnly) ||
@@ -62,7 +62,7 @@ Status Slice::compute(std::span<TensorView> outputs,
                       const ComputeContext& ctx,
                       void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

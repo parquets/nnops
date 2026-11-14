@@ -116,7 +116,7 @@ inline bool recurrent_activation_ok(RnnActivation a) noexcept {
 /// Descriptor-only twin of recurrent_run's checks: every rule the ONNX schema
 /// states about the shapes, plus the ones this library adds (channel-first layout,
 /// peepholes unsupported). An absent optional is a rank-0 descriptor.
-inline Status recurrent_check(const RecurrentSpec& s,
+inline Status recurrent_check(Backend be, const RecurrentSpec& s,
                               std::span<const TensorDesc> inputs,
                               std::span<const TensorDesc> outputs,
                               bool with_cell)
@@ -137,8 +137,8 @@ inline Status recurrent_check(const RecurrentSpec& s,
     NNOPS_TRY(check_rank(w.rank, w_packed ? 1 : 3));
     NNOPS_TRY(check_rank(r.rank, 3));
 
-    if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(x.dtype) ||
-        !dtype_in<DataType::f32, DataType::f16, DataType::s8>(w.dtype)) {
+    if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(be, x.dtype) ||
+        !dtype_in<DataType::f32, DataType::f16, DataType::s8>(be, w.dtype)) {
         return Status::unsupported;
     }
     const int64_t G = recurrent_gates(s.mode);
@@ -282,7 +282,7 @@ inline void recurrent_prepack(Backend backend, const RecurrentSpec& s,
     const auto& r = inputs[2];
     if (w.is_empty() || r.is_empty() || is_packed_recurrent(w.layout())) { return; }
     const DataType dt = w.data_type();
-    if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(dt)) { return; }
+    if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(backend, dt)) { return; }
     if (w.rank() != 3 || r.rank() != 3 ||
         r.data_type() != (recurrent_is_quantized(dt) ? DataType::s8 : dt)) {
         return;
@@ -334,7 +334,7 @@ inline void recurrent_prepack(Backend backend, const RecurrentSpec& s,
 /// non-zero zero point would need the three-term correction the kernel does not
 /// carry (per-row weight sums, per-step activation row sums, a column term), so
 /// it is refused rather than silently dropped.
-inline Status recurrent_q8_check(std::span<TensorView> outputs,
+inline Status recurrent_q8_check(Backend be, std::span<TensorView> outputs,
                                  std::span<const TensorView> inputs,
                                  int64_t directions)
 {
@@ -345,7 +345,7 @@ inline Status recurrent_q8_check(std::span<TensorView> outputs,
     const DataType cdtype = recurrent_compute_dtype(
         x.data_type(), w_packed ? DataType::s8 : w.data_type());
 
-    if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(x.data_type())) {
+    if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(be, x.data_type())) {
         return Status::unsupported;
     }
     if (!w_packed) {
@@ -377,7 +377,7 @@ inline Status recurrent_q8_check(std::span<TensorView> outputs,
 /// Compute-side entry: the optional views may be absent, so this checks the
 /// required three by hand (check_views would reject an empty optional), then
 /// hands the resolved numbers to the backend kernel.
-inline Status recurrent_run(const RecurrentSpec& s, RecurrentKernelFn fn,
+inline Status recurrent_run(Backend be, const RecurrentSpec& s, RecurrentKernelFn fn,
                             std::span<TensorView> outputs,
                             std::span<const TensorView> inputs,
                             const ComputeContext& ctx)
@@ -395,7 +395,7 @@ inline Status recurrent_run(const RecurrentSpec& s, RecurrentKernelFn fn,
     const auto& w = inputs[1];
     const auto& r = inputs[2];
     if (recurrent_is_quantized(w.data_type())) {
-        NNOPS_TRY(recurrent_q8_check(outputs, inputs, s.directions));
+        NNOPS_TRY(recurrent_q8_check(be, outputs, inputs, s.directions));
     }
 
     auto p = recurrent_params(s, x.shape(0), x.shape(1), x.shape(2),

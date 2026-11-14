@@ -22,16 +22,16 @@ NNOPS_OP_BOILERPLATE(ScatterND, ScatterNDAttributes,
 
 namespace {
 
-Status check_scatter_dtypes(const TensorDesc& data, const TensorDesc& indices,
-                            const TensorDesc& updates)
+Status check_scatter_dtypes(Backend be, const TensorDesc& data,
+                            const TensorDesc& indices, const TensorDesc& updates)
 {
     if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
-                          DataType::u8, DataType::s32, DataType::s64>(data.dtype)) {
+                          DataType::u8, DataType::s32, DataType::s64>(be, data.dtype)) {
         return Status::unsupported;
     }
     if (updates.dtype != data.dtype) { return Status::invalid_argument; }
     return detail::require(
-        detail::dtype_in<DataType::s64, DataType::s32>(indices.dtype));
+        detail::dtype_in<DataType::s64, DataType::s32>(be, indices.dtype));
 }
 
 Status check_scatter_layouts(const TensorDesc& data, const TensorDesc& indices,
@@ -62,7 +62,7 @@ Status ScatterElements::validate(std::span<const TensorDesc> inputs,
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
     const auto& updates = inputs[2];
-    NNOPS_TRY(check_scatter_dtypes(data, indices, updates));
+    NNOPS_TRY(check_scatter_dtypes(backend_, data, indices, updates));
     NNOPS_TRY(check_scatter_layouts(data, indices, updates));
 
     if (data.rank < 1 || indices.rank != data.rank ||
@@ -88,7 +88,7 @@ Status ScatterElements::compute(std::span<TensorView> outputs,
                                 const ComputeContext& ctx,
                                 void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 3, 3, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 3, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
@@ -111,7 +111,7 @@ Status ScatterND::validate(std::span<const TensorDesc> inputs,
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
     const auto& updates = inputs[2];
-    NNOPS_TRY(check_scatter_dtypes(data, indices, updates));
+    NNOPS_TRY(check_scatter_dtypes(backend_, data, indices, updates));
     NNOPS_TRY(check_scatter_layouts(data, indices, updates));
 
     if (indices.rank < 1) { return Status::invalid_argument; }
@@ -142,7 +142,7 @@ Status ScatterND::compute(std::span<TensorView> outputs,
                           const ComputeContext& ctx,
                           void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 3, 3, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 3, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

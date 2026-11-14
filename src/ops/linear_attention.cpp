@@ -102,7 +102,7 @@ Status LinearAttention::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 4, 6, 2));
 
     const DataType dt = inputs[0].dtype;
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(dt)) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, dt)) {
         return Status::unsupported;
     }
     for (size_t i = 1; i < 4; ++i) {

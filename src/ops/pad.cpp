@@ -37,7 +37,7 @@ Status Pad::validate(std::span<const TensorDesc> inputs,
         return Status::unsupported;
     }
     if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
-                          DataType::u8, DataType::s32, DataType::s64>(in.dtype)) {
+                          DataType::u8, DataType::s32, DataType::s64>(backend_, in.dtype)) {
         return Status::unsupported;
     }
     if (attrs_.pads.size() != static_cast<size_t>(2 * in.rank)) {
@@ -75,7 +75,7 @@ Status Pad::compute(std::span<TensorView> outputs,
                     const ComputeContext& ctx,
                     void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

@@ -50,7 +50,7 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
         }
         return detail::require(
             detail::dtype_in<DataType::f32, DataType::f16,
-                             DataType::s8, DataType::u8>(in.dtype));
+                             DataType::s8, DataType::u8>(backend_, in.dtype));
     }
     // Channel-first reads the raw [C, 1, KH, KW] filter one channel plane at a time,
     // f32/f16 only.
@@ -58,7 +58,7 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
         return Status::unsupported;
     }
     return detail::require(
-        detail::dtype_in<DataType::f32, DataType::f16>(in.dtype) &&
+        detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) &&
             is_channel_first_spatial(inputs[1].layout),
         Status::unsupported);
 }
@@ -68,7 +68,7 @@ Status DepthwiseConv::compute(std::span<TensorView> outputs,
                               const ComputeContext& ctx,
                               void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 3, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

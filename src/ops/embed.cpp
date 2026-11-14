@@ -36,7 +36,7 @@ Status Embed::validate(std::span<const TensorDesc> inputs,
     const auto& indices = inputs[1];
     const auto& out = outputs[0];
 
-    if (!detail::dtype_in<DataType::s64, DataType::s32>(indices.dtype)) {
+    if (!detail::dtype_in<DataType::s64, DataType::s32>(backend_, indices.dtype)) {
         return Status::invalid_argument;
     }
     if (weight.rank < 2) { return Status::invalid_argument; }
@@ -45,14 +45,14 @@ Status Embed::validate(std::span<const TensorDesc> inputs,
         return Status::invalid_argument;
     }
 
-    if (detail::dtype_in<DataType::f32, DataType::f16>(weight.dtype)) {
+    if (detail::dtype_in<DataType::f32, DataType::f16>(backend_, weight.dtype)) {
         return detail::require(out.dtype == weight.dtype);
     }
-    if (detail::dtype_in<DataType::s8, DataType::u8>(weight.dtype)) {
+    if (detail::dtype_in<DataType::s8, DataType::u8>(backend_, weight.dtype)) {
         // The output of a quantized weight is always float; the dequant params
         // themselves live on the view and are checked in compute().
         return detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16>(out.dtype));
+            detail::dtype_in<DataType::f32, DataType::f16>(backend_, out.dtype));
     }
     return Status::unsupported;
 }
@@ -62,10 +62,10 @@ Status Embed::compute(std::span<TensorView> outputs,
                       const ComputeContext& ctx,
                       void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 2, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     // An int8 weight must carry its dequantization parameters.
-    if (detail::dtype_in<DataType::s8, DataType::u8>(inputs[0].data_type()) &&
+    if (detail::dtype_in<DataType::s8, DataType::u8>(backend_, inputs[0].data_type()) &&
         !inputs[0].is_quantized()) {
         return Status::invalid_argument;
     }

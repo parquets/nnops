@@ -52,7 +52,7 @@ Status MoE::compute(std::span<TensorView> outputs,
         if (inputs[i].is_empty()) { return Status::invalid_argument; }
     }
     const DataType dt0 = inputs[0].data_type();
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(dt0)) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, dt0)) {
         return Status::unsupported;
     }
     // The three expert weights (fc1, fc2, fc3) may be block-packed — Q4_1 is

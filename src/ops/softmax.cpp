@@ -51,7 +51,7 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
 
     if (is_quantized_dtype(inputs[0].dtype)) {
         // A quantized input is dequantized first, so the output must be float.
-        if (!detail::dtype_in<DataType::f32, DataType::f16>(outputs[0].dtype)) {
+        if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, outputs[0].dtype)) {
             return Status::invalid_argument;
         }
         // And the dequantizing walk is only defined over channel-first layouts.
@@ -67,7 +67,7 @@ Status Softmax::compute(std::span<TensorView> outputs,
                         const ComputeContext& ctx,
                         void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

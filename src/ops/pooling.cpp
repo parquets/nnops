@@ -65,19 +65,19 @@ Status Pooling::validate(std::span<const TensorDesc> inputs,
 
     if (is_channel_first_spatial(in.layout)) {
         return detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16>(in.dtype),
+            detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype),
             Status::unsupported);
     }
     // Adaptive pooling walks the window per output position; the quantized
     // channel-lane kernel has no such form, so it stays float.
     if (attrs_.adaptive() &&
-        detail::dtype_in<DataType::s8, DataType::u8>(in.dtype)) {
+        detail::dtype_in<DataType::s8, DataType::u8>(backend_, in.dtype)) {
         return Status::unsupported;
     }
     if (is_channel_last(in.layout)) {
         return detail::require(
             detail::dtype_in<DataType::f32, DataType::f16,
-                             DataType::s8, DataType::u8>(in.dtype));
+                             DataType::s8, DataType::u8>(backend_, in.dtype));
     }
     return Status::unsupported;
 }
@@ -88,7 +88,7 @@ Status Pooling::compute(std::span<TensorView> outputs,
                         void* workspace)
 {
     (void)workspace;
-    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     auto& output = outputs[0];
     auto& input = inputs[0];

@@ -25,7 +25,7 @@ Status CumSum::validate(std::span<const TensorDesc> inputs,
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
     // The running sum is a float recurrence; there is no integer route.
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(inputs[0].dtype)) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, inputs[0].dtype)) {
         return Status::unsupported;
     }
     if (outputs[0].dtype != inputs[0].dtype) { return Status::invalid_argument; }
@@ -38,7 +38,7 @@ Status CumSum::compute(std::span<TensorView> outputs,
                        const ComputeContext& ctx,
                        void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

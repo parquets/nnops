@@ -88,7 +88,7 @@ Status QuantizeLinear::compute(std::span<TensorView> outputs,
                                 const ComputeContext& ctx,
                                 void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 3, 3, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 3, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
@@ -152,7 +152,7 @@ Status DequantizeLinear::compute(std::span<TensorView> outputs,
                                  const ComputeContext& ctx,
                                  void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 3, 3, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 3, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

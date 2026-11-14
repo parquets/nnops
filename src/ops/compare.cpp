@@ -56,7 +56,7 @@ Status Compare::validate(std::span<const TensorDesc> inputs,
 
     if (a.dtype != b.dtype) { return Status::invalid_argument; }
     if (!detail::dtype_in<DataType::f32, DataType::f16,
-                          DataType::s32, DataType::s64>(a.dtype)) {
+                          DataType::s32, DataType::s64>(backend_, a.dtype)) {
         return Status::unsupported;
     }
     if (outputs[0].dtype != DataType::u8) { return Status::invalid_argument; }
@@ -72,7 +72,7 @@ Status Compare::compute(std::span<TensorView> outputs,
                         const ComputeContext& ctx,
                         void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 2, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
@@ -103,7 +103,7 @@ Status Logical::validate(std::span<const TensorDesc> inputs,
 
     for (size_t i = 0; i < n_in; ++i) {
         if (!detail::dtype_in<DataType::s8, DataType::u8,
-                              DataType::s32, DataType::s64>(inputs[i].dtype)) {
+                              DataType::s32, DataType::s64>(backend_, inputs[i].dtype)) {
             return Status::unsupported;
         }
         if (i > 0 && inputs[i].dtype != inputs[0].dtype) {
@@ -130,7 +130,7 @@ Status Logical::compute(std::span<TensorView> outputs,
                         void* workspace)
 {
     const size_t n_in = (attrs_.type == LogicalType::Not) ? 1 : 2;
-    NNOPS_TRY(detail::check_views(outputs, inputs, n_in, n_in, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, n_in, n_in, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

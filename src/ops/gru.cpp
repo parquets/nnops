@@ -81,7 +81,7 @@ Status Gru::validate(std::span<const TensorDesc> inputs,
                      std::span<const TensorDesc> outputs) const
 {
     if (attrs_.layout != 0) { return Status::unsupported; }
-    return detail::recurrent_check(gru_spec(attrs_), inputs, outputs,
+    return detail::recurrent_check(backend_, gru_spec(attrs_), inputs, outputs,
                                    /*with_cell=*/false);
 }
 
@@ -92,7 +92,7 @@ Status Gru::compute(std::span<TensorView> outputs,
 {
     (void)workspace;
     NNOPS_TRY(validate_views(outputs, inputs));
-    return detail::recurrent_run(gru_spec(attrs_), impl_->kernel_fn, outputs,
+    return detail::recurrent_run(backend_, gru_spec(attrs_), impl_->kernel_fn, outputs,
                                  inputs, ctx);
 }
 

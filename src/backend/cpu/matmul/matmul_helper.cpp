@@ -1155,7 +1155,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     // type. bf16 joins on aarch64, where it decodes into the BFMMLA layout.
     const bool block_rhs = is_block_packed_dtype(dt_b) &&
                            (dt_a == DataType::f32 || dt_a == DataType::f16 ||
-                            (nnops::detail::bf16_enabled && dt_a == DataType::bf16));
+                            (nnops::detail::bf16_cpu_enabled && dt_a == DataType::bf16));
     const bool int8_pair = is_int8_matmul(dt_a, dt_b);
     if (dt_a != dt_b && !block_rhs && !int8_pair) {
         return plan;
@@ -1185,7 +1185,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const bool packed_i8 = packed_b && dt_a == DataType::s8 && dt_b == DataType::s8;
     if (packed_b && !packed_i8 &&
         !(dt_a == DataType::f32 || dt_a == DataType::f16 ||
-          (nnops::detail::bf16_enabled && dt_a == DataType::bf16))) {
+          (nnops::detail::bf16_cpu_enabled && dt_a == DataType::bf16))) {
         return plan;
     }
 

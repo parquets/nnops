@@ -69,7 +69,7 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
 
     const TensorDesc& x = inputs[0];
     const TensorDesc& w = inputs[1];
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(x.dtype) || w.dtype != x.dtype) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, x.dtype) || w.dtype != x.dtype) {
         return Status::unsupported;
     }
     if (w.rank != 2 || w.dims[0] <= 0 || (w.dims[0] % 2) != 0) {
@@ -94,7 +94,7 @@ Status Linear::compute(std::span<TensorView> outputs,
                        const ComputeContext& ctx,
                        void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 3, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

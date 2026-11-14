@@ -96,7 +96,7 @@ Status LayoutConvert::compute(std::span<TensorView> outputs,
                               void* workspace)
 {
     (void) workspace;
-    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(outputs[0], inputs, attrs_, ctx);

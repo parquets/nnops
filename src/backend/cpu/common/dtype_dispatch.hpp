@@ -53,7 +53,7 @@ void dispatch_f32_f16(DataType dt, const char* op_name, Fn&& fn)
         fn(std::type_identity<half>{});
         return;
     case DataType::bf16:
-        if constexpr (nnops::detail::bf16_enabled) {
+        if constexpr (nnops::detail::bf16_cpu_enabled) {
             fn(std::type_identity<bfloat16>{});
             return;
         }

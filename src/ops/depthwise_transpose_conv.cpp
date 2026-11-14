@@ -69,7 +69,7 @@ Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
         // integer destination and the output dtype otherwise.
         NNOPS_TRY(detail::require(
             detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
-                             DataType::u8>(in.dtype),
+                             DataType::u8>(backend_, in.dtype),
             Status::unsupported));
         if (inputs.size() > 2) {
             const DataType odt = outputs[0].dtype;
@@ -80,7 +80,7 @@ Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
         }
     } else {
         NNOPS_TRY(detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16>(in.dtype) &&
+            detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) &&
             weight.dtype == in.dtype,
             Status::unsupported));
         if (inputs.size() > 2 && inputs[2].dtype != in.dtype) {
@@ -119,7 +119,7 @@ Status DepthwiseTransposeConv2D::compute(std::span<TensorView> outputs,
                                          const ComputeContext& ctx,
                                          void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 3, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

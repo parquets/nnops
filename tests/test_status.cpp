@@ -103,8 +103,8 @@ NNOPS_TEST(status_helpers) {
 
     // The extra parentheses keep the template's comma out of the macro's
     // argument list.
-    NNOPS_EXPECT_TRUE((detail::dtype_in<DataType::f32, DataType::f16>(DataType::f16)));
-    NNOPS_EXPECT_TRUE((!detail::dtype_in<DataType::f32, DataType::f16>(DataType::s8)));
+    NNOPS_EXPECT_TRUE((detail::dtype_in<DataType::f32, DataType::f16>(Backend::CPU, DataType::f16)));
+    NNOPS_EXPECT_TRUE((!detail::dtype_in<DataType::f32, DataType::f16>(Backend::CPU, DataType::s8)));
 
     NNOPS_EXPECT_TRUE(is_ok(detail::require(true)));
     NNOPS_EXPECT_TRUE(detail::require(false) == Status::invalid_argument);
@@ -120,13 +120,13 @@ NNOPS_TEST(status_helpers) {
     const TensorView two_live[2] = {live, live};
     const TensorView one_live[1] = {live};
     const TensorView one_empty[1] = {empty};
-    NNOPS_EXPECT_TRUE(is_ok(check_views(outs, one_live, 1, 1, 1)));
-    NNOPS_EXPECT_TRUE(check_views(outs, one_empty, 1, 1, 1) ==
+    NNOPS_EXPECT_TRUE(is_ok(check_views(Backend::CPU, outs, one_live, 1, 1, 1)));
+    NNOPS_EXPECT_TRUE(check_views(Backend::CPU, outs, one_empty, 1, 1, 1) ==
                       Status::invalid_argument);
-    NNOPS_EXPECT_TRUE(check_views(outs, two_live, 1, 1, 1) ==
+    NNOPS_EXPECT_TRUE(check_views(Backend::CPU, outs, two_live, 1, 1, 1) ==
                       Status::invalid_argument);
     TensorView empty_outs[1] = {empty};
-    NNOPS_EXPECT_TRUE(check_views(empty_outs, one_live, 1, 1, 1) ==
+    NNOPS_EXPECT_TRUE(check_views(Backend::CPU, empty_outs, one_live, 1, 1, 1) ==
                       Status::invalid_argument);
 }
 

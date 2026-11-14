@@ -35,7 +35,7 @@ Status Activation::validate(std::span<const TensorDesc> inputs,
     if (slope.dims[0] != c && slope.dims[0] != 1) {
         return Status::invalid_argument;
     }
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(x.dtype) ||
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, x.dtype) ||
         slope.dtype != x.dtype) {
         return Status::unsupported;
     }
@@ -48,7 +48,7 @@ Status Activation::compute(std::span<TensorView> outputs,
                            void* workspace)
 {
     const size_t n_in = attrs_.type == ActivationType::PRelu ? 2 : 1;
-    NNOPS_TRY(detail::check_views(outputs, inputs, n_in, n_in, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, n_in, n_in, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

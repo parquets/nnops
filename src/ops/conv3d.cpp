@@ -35,7 +35,7 @@ Status Conv3D::compute(std::span<TensorView> outputs,
                        const ComputeContext& ctx,
                        void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 3, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     auto& output = outputs[0];
 

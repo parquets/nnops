@@ -17,15 +17,26 @@
 
 namespace nnops {
 
-/// Only the AArch64 CPU backend carries bf16 kernels; elsewhere a bf16
-/// descriptor is rejected at validation, so an operator returns
-/// Status::unsupported rather than dispatching to a kernel that does not exist.
+/// Which backend carries bf16 kernels: the CPU on AArch64 (its bf16 SIMD path),
+/// the CUDA backend on any build that has it. The two flags stay apart because
+/// the admission is per backend — a CUDA build on x86-64 admits bf16 for
+/// Backend::CUDA and still refuses it for Backend::CPU, where no kernel exists
+/// and validation returns Status::unsupported instead.
 namespace detail {
 #if defined(NNOPS_ARCH_AARCH64)
-inline constexpr bool bf16_enabled = true;
+inline constexpr bool bf16_cpu_enabled = true;
 #else
-inline constexpr bool bf16_enabled = false;
+inline constexpr bool bf16_cpu_enabled = false;
 #endif
+
+#if defined(NNOPS_HAS_CUDA)
+inline constexpr bool bf16_cuda_enabled = true;
+#else
+inline constexpr bool bf16_cuda_enabled = false;
+#endif
+
+/// Some backend in this build carries bf16, so the dtype exists at all.
+inline constexpr bool bf16_enabled = bf16_cpu_enabled || bf16_cuda_enabled;
 }  // namespace detail
 
 /// Convert bfloat16 (stored as uint16_t) to float32.

@@ -23,10 +23,10 @@ NNOPS_OP_BOILERPLATE(Expand, ExpandAttributes,
 
 namespace {
 
-Status check_repeat_dtype(const TensorDesc& in)
+Status check_repeat_dtype(Backend be, const TensorDesc& in)
 {
     if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
-                          DataType::u8, DataType::s32, DataType::s64>(in.dtype)) {
+                          DataType::u8, DataType::s32, DataType::s64>(be, in.dtype)) {
         return Status::unsupported;
     }
     return detail::require(
@@ -58,7 +58,7 @@ Status Tile::validate(std::span<const TensorDesc> inputs,
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
     const auto& in = inputs[0];
-    NNOPS_TRY(check_repeat_dtype(in));
+    NNOPS_TRY(check_repeat_dtype(backend_, in));
     if (static_cast<int64_t>(attrs_.repeats.size()) != in.rank) {
         return Status::invalid_argument;
     }
@@ -73,7 +73,7 @@ Status Tile::compute(std::span<TensorView> outputs,
                      const ComputeContext& ctx,
                      void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
@@ -114,7 +114,7 @@ Status Expand::validate(std::span<const TensorDesc> inputs,
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
     const auto& in = inputs[0];
-    NNOPS_TRY(check_repeat_dtype(in));
+    NNOPS_TRY(check_repeat_dtype(backend_, in));
 
     const auto desc = getOutputTensorDesc(inputs);
     const auto& want = desc[0];
@@ -136,7 +136,7 @@ Status Expand::compute(std::span<TensorView> outputs,
                        const ComputeContext& ctx,
                        void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);

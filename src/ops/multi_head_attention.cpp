@@ -44,7 +44,7 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
     }
 
     const DataType dt = inputs[0].dtype;
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(dt)) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, dt)) {
         return Status::unsupported;
     }
     for (size_t i = 1; i <= 2; ++i) {

@@ -42,14 +42,14 @@ Status Where::validate(std::span<const TensorDesc> inputs,
     const auto& x = inputs[1];
     const auto& y = inputs[2];
 
-    if (!detail::dtype_in<DataType::u8, DataType::s8>(cond.dtype)) {
+    if (!detail::dtype_in<DataType::u8, DataType::s8>(backend_, cond.dtype)) {
         return Status::unsupported;
     }
     if (x.dtype != y.dtype || outputs[0].dtype != x.dtype) {
         return Status::invalid_argument;
     }
     if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
-                          DataType::u8, DataType::s32, DataType::s64>(x.dtype)) {
+                          DataType::u8, DataType::s32, DataType::s64>(backend_, x.dtype)) {
         return Status::unsupported;
     }
     if (!is_layout_supported(cond.layout, LayoutSupport::ChannelFirstOnly) ||
@@ -71,7 +71,7 @@ Status Where::compute(std::span<TensorView> outputs,
                       const ComputeContext& ctx,
                       void* workspace)
 {
-    NNOPS_TRY(detail::check_views(outputs, inputs, 3, 3, 1));
+    NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 3, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
     if (!impl_->kernel_fn) { return Status::unsupported; }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
