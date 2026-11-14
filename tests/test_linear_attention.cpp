@@ -1036,6 +1036,31 @@ NNOPS_TEST(linear_attention_chunked_tail_matches_reference) {
     expect_kernel_matches_reference(p, {}, "chunked tail", 1e-5f);
 }
 
+NNOPS_TEST(linear_attention_chunked_partial_block) {
+    // 76 = four full chunks plus a 12-token tail. The products inside a chunk
+    // are blocked eight rows at a time, so this tail runs one blocked block
+    // and then four rows through the row-wise path — the seam the full-chunk
+    // cases never touch.
+    LinearAttentionAttributes a;
+    a.head_dim = 16; a.num_heads = 2; a.num_kv_heads = 2;
+    Problem p = make_problem(a, /*B=*/1, /*H=*/2, /*H_kv=*/2, /*S=*/76, /*D=*/16,
+                             /*CK=*/0, /*has_beta=*/false, /*gate_lo=*/-1.0f,
+                             /*gate_hi=*/0.0f, /*seed=*/23);
+    expect_kernel_matches_reference(p, {}, "chunked partial block", 1e-5f);
+}
+
+NNOPS_TEST(linear_attention_token_route_group_decomposition) {
+    // Gqq = 3, so the fused decode sweep runs a group of two query heads and a
+    // group of one; Dv = 4 is below one SIMD lane, so the whole product is the
+    // scalar tail. Both are paths the wider test shapes skip.
+    LinearAttentionAttributes a;
+    a.head_dim = 12; a.num_heads = 3; a.num_kv_heads = 1;
+    Problem p = make_problem(a, /*B=*/1, /*H=*/3, /*H_kv=*/1, /*S=*/32, /*D=*/12,
+                             /*CK=*/0, /*has_beta=*/false, /*gate_lo=*/-1.0f,
+                             /*gate_hi=*/0.0f, /*seed=*/29, /*H_v=*/1, /*D_v=*/4);
+    expect_kernel_matches_reference(p, {}, "token groups 2+1, Dv 4", 1e-5f);
+}
+
 NNOPS_TEST(linear_attention_chunked_matches_token_route) {
     // Both routes over one problem, at a key width that is not a multiple of
     // the SIMD lane count and a value width that is neither.
