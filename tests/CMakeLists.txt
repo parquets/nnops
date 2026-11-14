@@ -20,6 +20,7 @@ set(TEST_SOURCES
     test_group_query_attention.cpp
     test_multi_latent_attention.cpp
     test_clamp.cpp
+    test_cast.cpp
     test_softmax.cpp
     test_cumsum.cpp
     test_norm.cpp

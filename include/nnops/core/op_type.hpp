@@ -69,6 +69,7 @@ enum class OpType : uint8_t {
     Conv1D          = 54,
     Pool1D          = 56,
     TransposeConv3D = 57,
+    Cast            = 58,
 };
 
 }  // namespace nnops

@@ -6,6 +6,7 @@ target_link_libraries(nnops_cpu PUBLIC nnops)
 set(NNOPS_CPU_SOURCES
     # Operator dispatch layer
     ops/clamp.cpp
+    ops/cast.cpp
     ops/conv2d.cpp
     ops/activation.cpp
     ops/pooling.cpp
@@ -64,6 +65,7 @@ set(NNOPS_CPU_SOURCES
     # CPU optimized kernels (SIMD-accelerated)
     backend/cpu/activation.cpp
     backend/cpu/clamp.cpp
+    backend/cpu/cast.cpp
     backend/cpu/norm.cpp
     backend/cpu/softmax.cpp
     backend/cpu/eltwise.cpp
