@@ -76,6 +76,72 @@ inline int64_t outer_base(const TensorView& t, int64_t row, int64_t axis)
     return decompose_flat_offset(row, t, 0, axis - 1);
 }
 
+// ============================================================
+// RMSNormGated's fused post step
+// ============================================================
+
+/// The normalized value is multiplied by act(gate) in the same row pass, so
+/// the hidden is written once: the unfused form stored the row, then read it
+/// back to scale it and stored it again.
+template <EpilogueActivateType Act, typename T>
+struct GatePost {
+    const T* gate;
+    template <class V>
+    V vec(const V& v, int64_t i) const
+    {
+        return v_mul(v, gate_act_vec<Act>(v_load(gate + i), gate, 1.0f));
+    }
+    float scalar(float v, int64_t i) const
+    {
+        return v * gate_act_scalar<Act>(s_load(gate + i), 1.0f);
+    }
+};
+
+/// Runtime activation -> the compile-time row kernel. RMSNormGated is the only
+/// gated form (validation), so the shape is fixed: no mean, a scale, no bias.
+template <typename T, bool WithResidual, EpilogueActivateType Act>
+inline void rms_norm_apply_gated_act(const T* x, const T* r, const T* g, T* y,
+                                     int64_t n, float inv_rms, const T* scale,
+                                     bool scale_is_scalar, bool add_to,
+                                     bool one_plus)
+{
+    GatePost<Act, T> post{g};
+    if constexpr (WithResidual) {
+        kernel::norm_apply_row_add_post_dispatch<T, false, true, false>(
+            x, r, y, n, 0.0f, inv_rms, scale, nullptr, scale_is_scalar, add_to,
+            one_plus, post);
+    } else {
+        kernel::norm_apply_row_post_dispatch<T, false, true, false>(
+            x, y, n, 0.0f, inv_rms, scale, nullptr, scale_is_scalar, add_to,
+            one_plus, post);
+    }
+}
+
+template <typename T, bool WithResidual>
+inline void rms_norm_apply_gated(EpilogueActivateType act, const T* x, const T* r,
+                                 const T* g, T* y, int64_t n, float inv_rms,
+                                 const T* scale, bool scale_is_scalar,
+                                 bool add_to, bool one_plus)
+{
+#define NNOPS_NORM_GATE_CASE(name)                                            \
+    case EpilogueActivateType::name:                                          \
+        rms_norm_apply_gated_act<T, WithResidual, EpilogueActivateType::name>(\
+            x, r, g, y, n, inv_rms, scale, scale_is_scalar, add_to, one_plus);\
+        return
+    switch (act) {
+    NNOPS_NORM_GATE_CASE(Silu);
+    NNOPS_NORM_GATE_CASE(Gelu);
+    NNOPS_NORM_GATE_CASE(Relu);
+    NNOPS_NORM_GATE_CASE(Sigmoid);
+    NNOPS_NORM_GATE_CASE(Tanh);
+    default:
+        rms_norm_apply_gated_act<T, WithResidual, EpilogueActivateType::None>(
+            x, r, g, y, n, inv_rms, scale, scale_is_scalar, add_to, one_plus);
+        return;
+    }
+#undef NNOPS_NORM_GATE_CASE
+}
+
 /// Normalized axis dimensions for row-wise norm dispatch.
 struct NormDims {
     int64_t axis;               ///< Normalized axis (0 <= axis < rank)
@@ -438,6 +504,20 @@ void rms_norm_impl(const NormAttributes& attrs,
                     : kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
         (void)sum;
         const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(dims.norm_size) + epsilon);
+        if (has_gate) {
+            // act(gate) multiplies the normalized value inside the row kernel.
+            const T* g_row = g_ptr + row * g_row_stride;
+            if (has_res) {
+                rms_norm_apply_gated<T, true>(
+                    gate_act, x_ptr + x_off, r_ptr + r_off, g_row, y_ptr + y_off,
+                    dims.norm_size, inv_rms, s_ptr, scale_is_scalar, add_to, one_plus);
+            } else {
+                rms_norm_apply_gated<T, false>(
+                    gate_act, x_ptr + x_off, nullptr, g_row, y_ptr + y_off,
+                    dims.norm_size, inv_rms, s_ptr, scale_is_scalar, add_to, one_plus);
+            }
+            return;
+        }
         if (has_res) {
             kernel::norm_apply_row_add_dispatch<T, false, true, false>(
                 x_ptr + x_off, r_ptr + r_off, y_ptr + y_off, dims.norm_size,
@@ -446,10 +526,6 @@ void rms_norm_impl(const NormAttributes& attrs,
             kernel::norm_apply_row_dispatch<T, false, true, false>(
                 x_ptr + x_off, y_ptr + y_off, dims.norm_size,
                 0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to, one_plus);
-        }
-        if (has_gate) {
-            gate_scale_row_dispatch(gate_act, y_ptr + y_off,
-                                    g_ptr + row * g_row_stride, dims.norm_size);
         }
     };
 

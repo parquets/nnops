@@ -10,6 +10,7 @@
 /// is folded in. `NNOPS_BENCH_THREADS=1,4` pins the ladder, as in the others.
 
 #include "nnops/ops/norm.hpp"
+#include "nnops/ops/activation.hpp"
 #include "nnops/ops/eltwise.hpp"
 #include "common/bench_harness.hpp"
 #include "common/cpu_pool.hpp"
@@ -185,4 +186,102 @@ NNOPS_BENCH(norm_pre_add_residual) {
         run_shape(s, DataType::f32, threads);
     }
     run_shape({16, 4096}, DataType::f16, threads);
+}
+
+// ---------------------------------------------------------------------------
+// RMSNormGated: the fused gate against the three-op graph chain it replaces.
+// ---------------------------------------------------------------------------
+
+void run_gated_shape(const Shape& s, DataType dt, const std::vector<int>& threads)
+{
+    const int64_t elems = s.M * s.H;
+    auto [xb, x0] = test::make_random_tensor({s.M, s.H}, -1.0f, 1.0f, 41);
+    auto [gb, g0] = test::make_random_tensor({s.M, s.H}, -2.0f, 2.0f, 42);
+    auto [sb, s0] = test::make_random_tensor({s.H}, 0.5f, 1.5f, 43);
+    (void)x0; (void)g0; (void)s0;
+
+    std::vector<nnops::backend::cpu::half> xh, gh, sh;
+    if (dt == DataType::f16) {
+        xh = test::f32_to_f16(xb);
+        gh = test::f32_to_f16(gb);
+        sh = test::f32_to_f16(sb);
+    }
+    void* xp = dt == DataType::f16 ? static_cast<void*>(xh.data()) : xb.data();
+    void* gp = dt == DataType::f16 ? static_cast<void*>(gh.data()) : gb.data();
+    void* sp = dt == DataType::f16 ? static_cast<void*>(sh.data()) : sb.data();
+
+    std::vector<float> ob(static_cast<size_t>(elems)), tb(static_cast<size_t>(elems)),
+                       ab(static_cast<size_t>(elems));
+    std::vector<nnops::backend::cpu::half> oh(static_cast<size_t>(elems)),
+                                           th(static_cast<size_t>(elems)),
+                                           ah(static_cast<size_t>(elems));
+    void* op = dt == DataType::f16 ? static_cast<void*>(oh.data()) : ob.data();
+    void* tp = dt == DataType::f16 ? static_cast<void*>(th.data()) : tb.data();
+    void* ap = dt == DataType::f16 ? static_cast<void*>(ah.data()) : ab.data();
+
+    const int64_t shape[] = {s.M, s.H};
+    const int64_t sshape[] = {s.H};
+    TensorView x(std::span<const int64_t>(shape, 2), dt, xp);
+    TensorView g(std::span<const int64_t>(shape, 2), dt, gp);
+    TensorView sc(std::span<const int64_t>(sshape, 1), dt, sp);
+    TensorView out(std::span<const int64_t>(shape, 2), dt, op);
+    TensorView tmp(std::span<const int64_t>(shape, 2), dt, tp);
+    TensorView act(std::span<const int64_t>(shape, 2), dt, ap);
+
+    NormAttributes nattrs;
+    nattrs.type = NormType::RMSNorm;
+    auto norm = Norm::create(nattrs, Backend::CPU);
+    NormAttributes gattrs = nattrs;
+    gattrs.gate_activation = EpilogueActivateType::Silu;
+    auto gnorm = Norm::create(gattrs, Backend::CPU);
+    ActivationAttributes aattrs;
+    aattrs.type = ActivationType::Silu;
+    auto silu = Activation::create(aattrs, Backend::CPU);
+    EltwiseAttributes eattrs;
+    eattrs.type = EltwiseType::Mul;
+    auto mul = Eltwise::create(eattrs, Backend::CPU);
+
+    const TensorView norm_in[] = {x, sc};
+    const TensorView gate_in[] = {x, sc, g};
+    const TensorView act_in[] = {g};
+    const TensorView mul_in[] = {tmp, act};
+
+    const int iters = elems <= (int64_t{1} << 16) ? 50
+                    : elems <= (int64_t{1} << 20) ? 10 : 3;
+
+    std::printf("    %4lldx%-6lld %s |", (long long)s.M, (long long)s.H,
+                dt == DataType::f16 ? "f16" : "f32");
+    for (int nt : threads) {
+        BenchPool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+        std::vector<double> chain, fused;
+        for (int round = 0; round < 3; ++round) {
+            chain.push_back(time_ms([&] {
+                norm->compute(tmp, norm_in, use_ctx, nullptr);
+                silu->compute(act, act_in, use_ctx, nullptr);
+                mul->compute(out, mul_in, use_ctx, nullptr);
+            }, iters));
+            fused.push_back(time_ms([&] {
+                gnorm->compute(out, gate_in, use_ctx, nullptr);
+            }, iters));
+        }
+        const double tc = median_of(chain), tf = median_of(fused);
+        std::printf("  %2dT chain %8.3f fused %8.3f = %.2fx |", nt, tc, tf, tc / tf);
+    }
+    std::printf("\n");
+}
+
+NNOPS_BENCH(norm_gated) {
+    std::printf("  RMSNormGated fused against RMSNorm -> Silu -> Mul\n");
+    const std::vector<int> threads = bench_threads();
+    const Shape shapes[] = {{1, 4096}, {16, 4096}, {512, 4096}, {16, 11008}};
+    for (const Shape& s : shapes) {
+        run_gated_shape(s, DataType::f32, threads);
+    }
+    run_gated_shape({16, 4096}, DataType::f16, threads);
+    run_gated_shape({512, 4096}, DataType::f16, threads);
+    run_gated_shape({16, 11008}, DataType::f16, threads);
 }

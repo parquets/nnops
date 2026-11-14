@@ -105,14 +105,24 @@ inline void norm_apply_affine_row(const T* x, T* y, int64_t n,
     }
 }
 
+/// The post step a row kernel applies to the finished value before its store.
+/// Identity for the plain forms; RMSNormGated passes one that multiplies by
+/// act(gate), which folds the gate into the same pass that writes the row.
+struct IdentityPost {
+    template <class V>
+    V vec(const V& v, int64_t) const noexcept { return v; }
+    float scalar(float v, int64_t) const noexcept { return v; }
+};
+
 /// norm_apply_row over the pre-added row (x + r) — the write side of the fused
-/// `norm(x + r)`.
+/// `norm(x + r)`. `post` runs after the norm's scale/bias and before the store.
 template <typename T, bool HasMean, bool HasScale, bool HasBias,
-          bool ScaleOnePlus = false>
+          bool ScaleOnePlus = false, class Post = IdentityPost>
 inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
                                float mean_val, float inv_std,
                                const T* scale, const T* bias,
-                               bool scale_is_scalar, bool add_to)
+                               bool scale_is_scalar, bool add_to,
+                               Post post = Post{})
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
@@ -140,7 +150,7 @@ inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
             auto vb = scale_is_scalar ? v_set1(x, s_load(bias)) : v_load(bias + i);
             rv = v_add(rv, vb);
         }
-        v_store_add(y + i, rv, add_to);
+        v_store_add(y + i, post.vec(rv, i), add_to);
     }
     for (; i < n; ++i) {
         float rv = s_load(&x[i]) + s_load(&r[i]);
@@ -156,7 +166,7 @@ inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
             int64_t b_idx = scale_is_scalar ? 0 : i;
             rv += s_load(&bias[b_idx]);
         }
-        s_store_add(&y[i], rv, add_to);
+        s_store_add(&y[i], post.scalar(rv, i), add_to);
     }
 }
 
@@ -166,11 +176,12 @@ inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
 /// and Qwen3-Next/4's need. Folding the +1 in here keeps it out of the stored
 /// weight, which in bf16 would otherwise lose the small-|w| correction.
 template <typename T, bool HasMean, bool HasScale, bool HasBias,
-          bool ScaleOnePlus = false>
+          bool ScaleOnePlus = false, class Post = IdentityPost>
 inline void norm_apply_row(const T* x, T* y, int64_t n,
                             float mean_val, float inv_std,
                             const T* scale, const T* bias,
-                            bool scale_is_scalar, bool add_to)
+                            bool scale_is_scalar, bool add_to,
+                            Post post = Post{})
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
@@ -199,7 +210,7 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
             auto vb = scale_is_scalar ? v_set1(x, s_load(bias)) : v_load(bias + i);
             rv = v_add(rv, vb);
         }
-        v_store_add(y + i, rv, add_to);
+        v_store_add(y + i, post.vec(rv, i), add_to);
     }
     for (; i < n; ++i) {
         float xv = s_load(&x[i]);
@@ -216,7 +227,7 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
             int64_t b_idx = scale_is_scalar ? 0 : i;
             rv += s_load(&bias[b_idx]);
         }
-        s_store_add(&y[i], rv, add_to);
+        s_store_add(&y[i], post.scalar(rv, i), add_to);
     }
 }
 
@@ -257,6 +268,43 @@ inline void norm_apply_row_add_dispatch(const T* x, const T* r, T* y, int64_t n,
     }
     norm_apply_row_add<T, HasMean, HasScale, HasBias, false>(
         x, r, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to);
+}
+
+/// ScaleOnePlus dispatch with a post step (the gated forms).
+template <typename T, bool HasMean, bool HasScale, bool HasBias, class Post>
+inline void norm_apply_row_post_dispatch(const T* x, T* y, int64_t n,
+                                         float mean_val, float inv_std,
+                                         const T* scale, const T* bias,
+                                         bool scale_is_scalar, bool add_to,
+                                         bool one_plus_weight, Post post)
+{
+    if constexpr (HasScale) {
+        if (one_plus_weight) {
+            norm_apply_row<T, HasMean, HasScale, HasBias, true>(
+                x, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to, post);
+            return;
+        }
+    }
+    norm_apply_row<T, HasMean, HasScale, HasBias, false>(
+        x, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to, post);
+}
+
+template <typename T, bool HasMean, bool HasScale, bool HasBias, class Post>
+inline void norm_apply_row_add_post_dispatch(const T* x, const T* r, T* y, int64_t n,
+                                             float mean_val, float inv_std,
+                                             const T* scale, const T* bias,
+                                             bool scale_is_scalar, bool add_to,
+                                             bool one_plus_weight, Post post)
+{
+    if constexpr (HasScale) {
+        if (one_plus_weight) {
+            norm_apply_row_add<T, HasMean, HasScale, HasBias, true>(
+                x, r, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to, post);
+            return;
+        }
+    }
+    norm_apply_row_add<T, HasMean, HasScale, HasBias, false>(
+        x, r, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to, post);
 }
 
 /// Channel-first layout: 4-wide unrolled SIMD fmadd per row.
