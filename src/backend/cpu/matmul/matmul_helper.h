@@ -310,7 +310,10 @@ inline int64_t geom_ldd_i8_a(int64_t kc) noexcept {
         mma_pack_align(static_cast<size_t>(MR_MAX_I8) *
                        static_cast<size_t>(i8_k_round64(kc))));
 }
-constexpr int64_t geom_ldd_i8_b(int64_t kc) noexcept { return int8_panel_stride(kc); }
+// `inline`, not `constexpr`: the slot depends on the runtime i8mm choice, so
+// this can never be constant-evaluated (its sibling `geom_ldd_i8_a` is inline
+// for the same reason, and GEOM_I8 below is a plain `const`).
+inline int64_t geom_ldd_i8_b(int64_t kc) noexcept { return int8_panel_stride(kc); }
 
 inline constexpr MatmulGeom GEOM_F32 = {
     MR_MAX_F32, NR_MAX_F32, static_cast<int>(sizeof(float)), KC_CAP_F32,
