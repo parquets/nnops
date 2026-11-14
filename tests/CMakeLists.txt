@@ -187,6 +187,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_rope.cpp
         bench_norm.cpp
         bench_linear_attention.cpp
+        bench_cast.cpp
     )
 
     if(NNOPS_BUILD_CUDA)
