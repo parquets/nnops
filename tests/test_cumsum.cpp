@@ -173,3 +173,40 @@ NNOPS_TEST(cumsum_random) {
         }
     }
 }
+
+/// A rank-3 scan over the middle axis: the lower dims are independent lanes, so
+/// each carries its own running sum. A single shared sum walks the row instead
+/// and only agrees when the axis is the last one.
+NNOPS_TEST(cumsum_3d_axis_1) {
+    auto [in_vec, input] = test::make_random_tensor({2, 4, 3}, -1.0f, 1.0f);
+
+    for (bool reverse : {false, true}) {
+        CumSumAttributes attrs;
+        attrs.axis = 1;
+        attrs.reverse = reverse;
+        auto op = CumSum::create(attrs, Backend::CPU);
+
+        auto d = input.desc();
+        const TensorDesc desc_arr[] = {d};
+        auto descs = op->getOutputTensorDesc(desc_arr);
+
+        std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+        auto out = test::make_channel_first(descs[0], out_buf.data());
+
+        const TensorView ins[] = {input};
+        op->compute(out, ins);
+
+        for (int n = 0; n < 2; ++n) {
+            for (int s = 0; s < 3; ++s) {
+                const int k_first = reverse ? 3 : 0;
+                const int k_step = reverse ? -1 : 1;
+                float running = 0.0f;
+                for (int k = k_first; k >= 0 && k < 4; k += k_step) {
+                    running += in_vec[static_cast<size_t>((n * 4 + k) * 3 + s)];
+                    NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>((n * 4 + k) * 3 + s)],
+                                      running, 1e-5f);
+                }
+            }
+        }
+    }
+}

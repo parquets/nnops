@@ -84,7 +84,7 @@ bool axis_is_innermost(const TensorView& x, int64_t axis, int64_t& unit_stride)
 /// One normalization group, scalar: D elements `stride` apart.
 template <typename T>
 void softmax_group_scalar(const T* x, T* y, int64_t D, int64_t stride,
-                          bool log_softmax, float inv_T)
+                          int64_t stride_y, bool log_softmax, float inv_T)
 {
     float max_val = -std::numeric_limits<float>::infinity();
     for (int64_t k = 0; k < D; ++k) {
@@ -101,13 +101,13 @@ void softmax_group_scalar(const T* x, T* y, int64_t D, int64_t stride,
         const float log_sum = std::log(sum_exp);
         for (int64_t k = 0; k < D; ++k) {
             const float v = (s_load(&x[k * stride]) - max_val) * inv_T - log_sum;
-            s_store(&y[k * stride], v);
+            s_store(&y[k * stride_y], v);
         }
     } else {
         const float inv_sum = 1.0f / sum_exp;
         for (int64_t k = 0; k < D; ++k) {
             const float v = std::exp((s_load(&x[k * stride]) - max_val) * inv_T) * inv_sum;
-            s_store(&y[k * stride], v);
+            s_store(&y[k * stride_y], v);
         }
     }
 }
@@ -143,13 +143,14 @@ struct PositionWalk {
 
 template <typename T>
 void softmax_strided_axis(const T* x_ptr, T* y_ptr, const TensorView& X,
-                          int64_t axis, bool log_softmax, float inv_T,
-                          const ComputeContext& ctx)
+                          const TensorView& Y, int64_t axis, bool log_softmax,
+                          float inv_T, const ComputeContext& ctx)
 {
     constexpr int64_t L = simd_lane_for<T>;
     const int64_t rank = X.rank();
     const int64_t D = X.shape(axis);
     const int64_t axis_stride = X.stride_elems(axis);
+    const int64_t axis_stride_y = Y.stride_elems(axis);
 
     // Lanes: the channels of a channel-last tensor are one vector, and so are
     // the dims below a channel-first axis when the pitch leaves them contiguous.
@@ -165,30 +166,35 @@ void softmax_strided_axis(const T* x_ptr, T* y_ptr, const TensorView& X,
         for (int64_t d = axis + 1; d < rank; ++d) { nlanes *= X.shape(d); }
     }
 
+    // Both sides walk the same positions, each over its own strides: the output
+    // may be pitched differently from the input.
     PositionWalk pos;
+    PositionWalk pos_y;
     for (int64_t d = 0; d < rank; ++d) {
         if (d == axis) { continue; }
         if (nlanes > 1) {
             if (lanes_are_channels ? (d == 1) : (d > axis)) { continue; }
         }
         pos.add(X, d);
+        pos_y.add(Y, d);
     }
 
     const int64_t lane_blocks = (nlanes + L - 1) / L;
 
     ctx.cpu.run(0, pos.count * lane_blocks, [&](int64_t task) {
         const int64_t base = pos.offset_of(task / lane_blocks);
+        const int64_t base_y = pos_y.offset_of(task / lane_blocks);
         const int64_t lane0 = (task % lane_blocks) * L;
 
         if (lane0 + L <= nlanes) {
             kernel::softmax_per_lane<T>(
-                x_ptr + base + lane0, y_ptr + base + lane0,
-                D, axis_stride, log_softmax, inv_T);
+                x_ptr + base + lane0, y_ptr + base_y + lane0,
+                D, axis_stride, log_softmax, inv_T, axis_stride_y);
         } else {
             for (int64_t lane = lane0; lane < nlanes; ++lane) {
                 softmax_group_scalar<T>(
-                    x_ptr + base + lane, y_ptr + base + lane,
-                    D, axis_stride, log_softmax, inv_T);
+                    x_ptr + base + lane, y_ptr + base_y + lane,
+                    D, axis_stride, axis_stride_y, log_softmax, inv_T);
             }
         }
     });
@@ -201,6 +207,7 @@ void softmax_strided_axis(const T* x_ptr, T* y_ptr, const TensorView& X,
 template <typename T>
 void softmax_contiguous_axis(const T* x_ptr, T* y_ptr, const TensorView& X,
                              int64_t axis, int64_t unit_stride,
+                             int64_t unit_stride_y,
                              bool log_softmax, float inv_T,
                              const ComputeContext& ctx)
 {
@@ -209,7 +216,7 @@ void softmax_contiguous_axis(const T* x_ptr, T* y_ptr, const TensorView& X,
 
     ctx.cpu.run(0, units, [&](int64_t u) {
         kernel::softmax_process_standard_row<T>(
-            x_ptr + u * unit_stride, y_ptr + u * unit_stride,
+            x_ptr + u * unit_stride, y_ptr + u * unit_stride_y,
             D, log_softmax, inv_T);
     });
 }
@@ -243,12 +250,17 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
     int64_t unit_stride = 0;
     if (axis_is_innermost(X, axis, unit_stride)) {
+        // Same shape on both sides, so the output answers the same question over
+        // its own pitch — which a caller is free to give it differently.
+        int64_t unit_stride_y = 0;
+        (void)axis_is_innermost(output, axis, unit_stride_y);
         softmax_contiguous_axis<T>(x_ptr, y_ptr, X, axis, unit_stride,
-                                   log_softmax, inv_T, ctx);
+                                   unit_stride_y, log_softmax, inv_T, ctx);
         return;
     }
 
-    softmax_strided_axis<T>(x_ptr, y_ptr, X, axis, log_softmax, inv_T, ctx);
+    softmax_strided_axis<T>(x_ptr, y_ptr, X, output, axis, log_softmax, inv_T,
+                            ctx);
 }
 
 // ---- Quantized input (s8/u8) → float output (f32/f16) ----

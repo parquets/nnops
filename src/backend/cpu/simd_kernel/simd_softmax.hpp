@@ -5,7 +5,7 @@
 /// softmax_per_lane is the unified 3-pass kernel — max, then exp((x-max)/T) plus
 /// its sum, then normalize — over D elements strided by `stride`, one
 /// normalization group per lane. Every strided-axis case is this kernel and
-/// differs only in the stride.
+/// differs only in the stride; `stride_y` lets the output walk its own pitch.
 ///
 /// softmax_process_standard_row is structurally different: horizontal
 /// v_reduce_max / v_reduce_sum over one contiguous row. HasMask fuses an
@@ -32,8 +32,11 @@ template <typename T>
 inline void softmax_per_lane(
     const T* x, T* y,
     int64_t D, int64_t stride,
-    bool log_softmax, float inv_T)
+    bool log_softmax, float inv_T, int64_t stride_y = -1)
 {
+    // The output may be laid out differently from the input; -1 keeps the input's.
+    if (stride_y < 0) { stride_y = stride; }
+
     auto v_inv_T = v_set1(x, inv_T);
 
     auto v_max_vec = v_set1(x, -std::numeric_limits<float>::infinity());
@@ -49,20 +52,20 @@ inline void softmax_per_lane(
             v = v_mul(v, v_inv_T);
         }
         v = v_exp(v);
-        if (!log_softmax) { v_store(y + k * stride, v); }
+        if (!log_softmax) { v_store(y + k * stride_y, v); }
         v_sum_vec = v_add(v_sum_vec, v);
     }
 
     if (log_softmax) {
         auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
         for (int64_t k = 0; k < D; ++k) {
-            v_store(y + k * stride,
+            v_store(y + k * stride_y,
                     v_add(v_mul(v_load(x + k * stride), v_inv_T), v_bias));
         }
     } else {
         auto v_inv = v_div(v_set1(x, 1.0f), v_sum_vec);
         for (int64_t k = 0; k < D; ++k) {
-            v_store(y + k * stride, v_mul(v_load(y + k * stride), v_inv));
+            v_store(y + k * stride_y, v_mul(v_load(y + k * stride_y), v_inv));
         }
     }
 }

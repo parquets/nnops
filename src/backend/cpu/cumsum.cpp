@@ -49,26 +49,22 @@ Status cumsum_impl(const CumSumAttributes& attrs,
     // Pitch-aware: the axis step can exceed lower_dim_size.
     const int64_t axis_stride = input.stride_elems(axis);
 
+    // One scan per lower-dim position: the lower dims are lanes that each carry
+    // their own running sum. Sharing one sum across them scans the row instead of
+    // the axis, which only agrees with this when the axis is the last one.
     if (!attrs.reverse) {
         const auto process_slice = [&](int64_t outer) {
-            const int64_t slice_start = outer * dim * lower_dim_size;
+            const int64_t slice_start = outer * dim * axis_stride;
 
-            if (attrs.exclusive) {
+            for (int64_t s = 0; s < lower_dim_size; ++s) {
                 float running = 0.0f;
                 for (int64_t k = 0; k < dim; ++k) {
-                    for (int64_t s = 0; s < lower_dim_size; ++s) {
-                        int64_t idx = slice_start + k * axis_stride + s;
-                        float val = running;
-                        simd::s_store(out_ptr + idx, val);
-                        running += simd::s_load(in_ptr + idx);
+                    const int64_t idx = slice_start + k * axis_stride + s;
+                    if (attrs.exclusive) {
+                        simd::s_store(out_ptr + idx, running);
                     }
-                }
-            } else {
-                float running = 0.0f;
-                for (int64_t k = 0; k < dim; ++k) {
-                    for (int64_t s = 0; s < lower_dim_size; ++s) {
-                        int64_t idx = slice_start + k * axis_stride + s;
-                        running += simd::s_load(in_ptr + idx);
+                    running += simd::s_load(in_ptr + idx);
+                    if (!attrs.exclusive) {
                         simd::s_store(out_ptr + idx, running);
                     }
                 }
@@ -78,24 +74,17 @@ Status cumsum_impl(const CumSumAttributes& attrs,
         ctx.cpu.run(0, upper_dim_count, process_slice);
     } else {
         const auto process_slice = [&](int64_t outer) {
-            const int64_t slice_start = outer * dim * lower_dim_size;
+            const int64_t slice_start = outer * dim * axis_stride;
 
-            if (attrs.exclusive) {
+            for (int64_t s = 0; s < lower_dim_size; ++s) {
                 float running = 0.0f;
                 for (int64_t k = dim - 1; k >= 0; --k) {
-                    for (int64_t s = 0; s < lower_dim_size; ++s) {
-                        int64_t idx = slice_start + k * axis_stride + s;
-                        float val = running;
-                        simd::s_store(out_ptr + idx, val);
-                        running += simd::s_load(in_ptr + idx);
+                    const int64_t idx = slice_start + k * axis_stride + s;
+                    if (attrs.exclusive) {
+                        simd::s_store(out_ptr + idx, running);
                     }
-                }
-            } else {
-                float running = 0.0f;
-                for (int64_t k = dim - 1; k >= 0; --k) {
-                    for (int64_t s = 0; s < lower_dim_size; ++s) {
-                        int64_t idx = slice_start + k * axis_stride + s;
-                        running += simd::s_load(in_ptr + idx);
+                    running += simd::s_load(in_ptr + idx);
+                    if (!attrs.exclusive) {
                         simd::s_store(out_ptr + idx, running);
                     }
                 }
