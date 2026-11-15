@@ -20,7 +20,8 @@
 /// stores through a scalar tail. Channel-first runs one output row per call — the
 /// channel path's R-row blocking shares input rows, which a width-vectorized
 /// kernel does not need. Global pooling scans contiguous memory with four
-/// accumulators and widens f16 to f32 on load so the sum never runs in f16. A
+/// accumulators. f16 AvgPool keeps half lanes — the same accumulation the window
+/// kernels do — while MaxPool widens to f32 (its result does not round). A
 /// contiguous plane is one flat run, so even a small plane — a 7x7 global pool,
 /// the shape the model runners see — vectorizes instead of falling into the tail.
 
@@ -335,8 +336,8 @@ inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p
 
 // --- Global pooling: the window is the whole extent, so a contiguous plane is one scan ---
 
-template <bool IsMax>
-inline v_f32x8 global_op(const v_f32x8& a, const v_f32x8& b)
+template <bool IsMax, class V>
+inline V global_op(const V& a, const V& b)
 {
     if constexpr (IsMax) { return v_max(a, b); }
     return v_add(a, b);
@@ -369,6 +370,45 @@ inline v_f32x8 global_load_lanes(const T* p, int64_t lanes)
     return global_load(tmp);
 }
 
+/// The lanes the global scan accumulates in. f16 AvgPool stays in half lanes —
+/// the same accumulation the window kernels do — while MaxPool (whose result
+/// does not round) and every other storage type use f32.
+template <typename T, bool IsMax>
+using GlobalAcc = std::conditional_t<std::is_same_v<T, half> && !IsMax,
+                                     v_f16x8, v_f32x8>;
+
+template <typename T, bool IsMax>
+inline GlobalAcc<T, IsMax> global_acc_init(const T* tag)
+{
+    using V = GlobalAcc<T, IsMax>;
+    if constexpr (std::is_same_v<V, v_f16x8>) {
+        return v_zero(tag);
+    } else {
+        return IsMax ? v_set1_f32x8(-std::numeric_limits<float>::infinity())
+                     : v_zero_f32x8();
+    }
+}
+
+template <typename T, bool IsMax>
+inline GlobalAcc<T, IsMax> global_acc_load(const T* p)
+{
+    using V = GlobalAcc<T, IsMax>;
+    if constexpr (std::is_same_v<V, v_f16x8>) { return v_load(p); }
+    else { return global_load(p); }
+}
+
+template <typename T, bool IsMax>
+inline GlobalAcc<T, IsMax> global_acc_load_lanes(const T* p, int64_t lanes)
+{
+    using V = GlobalAcc<T, IsMax>;
+    if constexpr (std::is_same_v<V, v_f16x8>) { return load_lanes(p, lanes); }
+    else { return global_load_lanes(p, lanes); }
+}
+
+/// The accumulation lanes back to f32 for the final fold and store.
+inline v_f32x8 global_acc_to_f32(const v_f32x8& v) { return v; }
+inline v_f32x8 global_acc_to_f32(const v_f16x8& v) { return v_cvt_f16_to_f32(v); }
+
 /// One reduced vector → one scalar (max or sum, matching IsMax).
 inline float global_fold(const v_f32x8& v, bool is_max)
 {
@@ -381,20 +421,28 @@ inline float global_fold(const v_f32x8& v, bool is_max)
     return r;
 }
 
+inline float global_fold(const v_f16x8& v, bool is_max)
+{
+    return global_fold(v_cvt_f16_to_f32(v), is_max);
+}
+
 /// Fold @p n contiguous elements into the four accumulators and the scalar tail.
 template <bool IsMax, typename T>
-inline void global_accumulate(v_f32x8& acc0, v_f32x8& acc1, v_f32x8& acc2,
-                              v_f32x8& acc3, float& tail, const T* p, int64_t n)
+inline void global_accumulate(GlobalAcc<T, IsMax>& acc0,
+                              GlobalAcc<T, IsMax>& acc1,
+                              GlobalAcc<T, IsMax>& acc2,
+                              GlobalAcc<T, IsMax>& acc3, float& tail,
+                              const T* p, int64_t n)
 {
     int64_t i = 0;
     for (; i + 32 <= n; i += 32) {
-        acc0 = global_op<IsMax>(acc0, global_load(p + i));
-        acc1 = global_op<IsMax>(acc1, global_load(p + i + 8));
-        acc2 = global_op<IsMax>(acc2, global_load(p + i + 16));
-        acc3 = global_op<IsMax>(acc3, global_load(p + i + 24));
+        acc0 = global_op<IsMax>(acc0, global_acc_load<T, IsMax>(p + i));
+        acc1 = global_op<IsMax>(acc1, global_acc_load<T, IsMax>(p + i + 8));
+        acc2 = global_op<IsMax>(acc2, global_acc_load<T, IsMax>(p + i + 16));
+        acc3 = global_op<IsMax>(acc3, global_acc_load<T, IsMax>(p + i + 24));
     }
     for (; i + 8 <= n; i += 8) {
-        acc0 = global_op<IsMax>(acc0, global_load(p + i));
+        acc0 = global_op<IsMax>(acc0, global_acc_load<T, IsMax>(p + i));
     }
     for (; i < n; ++i) {
         tail = global_op<IsMax>(tail, s_load(p + i));
@@ -406,9 +454,9 @@ inline void global_accumulate(v_f32x8& acc0, v_f32x8& acc1, v_f32x8& acc2,
 template <bool IsMax, typename T>
 inline float global_channel_first(const T* in, const PoolingKernelParams& p, float scale)
 {
-    const v_f32x8 init = IsMax ? v_set1_f32x8(-std::numeric_limits<float>::infinity())
-                               : v_zero_f32x8();
-    v_f32x8 acc0 = init, acc1 = init, acc2 = init, acc3 = init;
+    using V = GlobalAcc<T, IsMax>;
+    const V init = global_acc_init<T, IsMax>(in);
+    V acc0 = init, acc1 = init, acc2 = init, acc3 = init;
     float tail = IsMax ? -std::numeric_limits<float>::infinity() : 0.0f;
 
     const bool flat = (p.in_row_stride == p.IW) &&
@@ -443,9 +491,9 @@ inline void global_channel_vec(T* out, const T* in, const PoolingKernelParams& p
                                float scale, bool add_to, int64_t lanes)
 {
     constexpr int64_t kVec = kChannelLanes;
-    const v_f32x8 init = IsMax ? v_set1_f32x8(-std::numeric_limits<float>::infinity())
-                               : v_zero_f32x8();
-    v_f32x8 acc[NV][U];
+    using V = GlobalAcc<T, IsMax>;
+    const V init = global_acc_init<T, IsMax>(in);
+    V acc[NV][U];
     for (int k = 0; k < NV; ++k) {
         for (int u = 0; u < U; ++u) { acc[k][u] = init; }
     }
@@ -459,10 +507,11 @@ inline void global_channel_vec(T* out, const T* in, const PoolingKernelParams& p
     // per-load lane test.
     const auto load = [&](const T* px, int k) {
         if constexpr (Full) {
-            return global_load(px);
+            return global_acc_load<T, IsMax>(px);
         } else {
             const int64_t l = live(k);
-            return (l >= kVec) ? global_load(px) : global_load_lanes(px, l);
+            return (l >= kVec) ? global_acc_load<T, IsMax>(px)
+                               : global_acc_load_lanes<T, IsMax>(px, l);
         }
     };
 
@@ -490,10 +539,11 @@ inline void global_channel_vec(T* out, const T* in, const PoolingKernelParams& p
     }
 
     for (int k = 0; k < NV; ++k) {
-        v_f32x8 v = acc[k][0];
+        V v = acc[k][0];
         for (int u = 1; u < U; ++u) { v = global_op<IsMax>(v, acc[k][u]); }
-        if constexpr (!IsMax) { v = v_mul(v, v_set1_f32x8(scale)); }
-        global_store_lanes(out + k * kVec, v, add_to, live(k));
+        v_f32x8 f = global_acc_to_f32(v);
+        if constexpr (!IsMax) { f = v_mul(f, v_set1_f32x8(scale)); }
+        global_store_lanes(out + k * kVec, f, add_to, live(k));
     }
 }
 
@@ -503,12 +553,13 @@ inline v_f32x8 global_channel(const T* in, const PoolingKernelParams& p, float s
                               int64_t lanes)
 {
     constexpr int64_t kVec = kChannelLanes;
-    const v_f32x8 init = IsMax ? v_set1_f32x8(-std::numeric_limits<float>::infinity())
-                               : v_zero_f32x8();
-    v_f32x8 acc0 = init, acc1 = init, acc2 = init, acc3 = init;
+    using V = GlobalAcc<T, IsMax>;
+    const V init = global_acc_init<T, IsMax>(in);
+    V acc0 = init, acc1 = init, acc2 = init, acc3 = init;
 
     const auto load = [&](const T* px) {
-        return (lanes >= kVec) ? global_load(px) : global_load_lanes(px, lanes);
+        return (lanes >= kVec) ? global_acc_load<T, IsMax>(px)
+                               : global_acc_load_lanes<T, IsMax>(px, lanes);
     };
 
     for (int64_t d = 0; d < p.ID; ++d) {
@@ -528,9 +579,10 @@ inline v_f32x8 global_channel(const T* in, const PoolingKernelParams& p, float s
         }
     }
 
-    const v_f32x8 v = global_op<IsMax>(global_op<IsMax>(acc0, acc1),
-                                       global_op<IsMax>(acc2, acc3));
-    return IsMax ? v : v_mul(v, v_set1_f32x8(scale));
+    const V v = global_op<IsMax>(global_op<IsMax>(acc0, acc1),
+                                 global_op<IsMax>(acc2, acc3));
+    const v_f32x8 f = global_acc_to_f32(v);
+    return IsMax ? f : v_mul(f, v_set1_f32x8(scale));
 }
 
 /// Store a reduced channel vector, narrowing for f16.

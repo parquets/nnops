@@ -415,21 +415,30 @@ void pooling_adaptive_channel_first_impl(const PoolingAttributes& attrs,
                     const int64_t w1 = adaptive_end(ow, IW, OW);
                     const T* base = in_plane + d0 * in_d + h0 * in_h + w0 * in_w;
 
-                    float acc = IsMax ? low : 0.0f;
+                    // f16 AvgPool accumulates in half lanes, matching the
+                    // window and global kernels; MaxPool keeps f32 (no rounding).
+                    using AccT = std::conditional_t<
+                        std::is_same_v<T, half> && !IsMax, half, float>;
+                    AccT acc = IsMax ? static_cast<AccT>(low) : AccT{};
                     for (int64_t d = d0; d < d1; ++d) {
                         for (int64_t h = h0; h < h1; ++h) {
                             const T* row = base + (d - d0) * in_d + (h - h0) * in_h;
                             for (int64_t w = w0; w < w1; ++w) {
                                 const float v = s_load(row + (w - w0) * in_w);
-                                acc = IsMax ? std::max(acc, v) : acc + v;
+                                if constexpr (std::is_same_v<AccT, half>) {
+                                    acc = float_to_half(half_to_float(acc) + v);
+                                } else {
+                                    acc = IsMax ? std::max(acc, v) : acc + v;
+                                }
                             }
                         }
                     }
+                    float result = s_load(&acc);
                     if (!IsMax) {
-                        acc /= static_cast<float>((d1 - d0) * (h1 - h0) * (w1 - w0));
+                        result /= static_cast<float>((d1 - d0) * (h1 - h0) * (w1 - w0));
                     }
                     s_store_add(out_plane + od * out_d + oh * out_h + ow * out_w,
-                                acc, attrs.add_to);
+                                result, attrs.add_to);
                 }
             }
         }
@@ -511,18 +520,25 @@ void pooling_adaptive_last_impl(const PoolingAttributes& attrs,
                 v_store_add(dst + c, acc, attrs.add_to);
             }
             for (; c < C; ++c) {
-                float acc = IsMax ? low : 0.0f;
+                using AccT = std::conditional_t<
+                    std::is_same_v<T, half> && !IsMax, half, float>;
+                AccT acc = IsMax ? static_cast<AccT>(low) : AccT{};
                 for (int64_t d = d0; d < d1; ++d) {
                     for (int64_t h = h0; h < h1; ++h) {
                         const T* row = win + (d - d0) * in_d + (h - h0) * in_h;
                         for (int64_t w = w0; w < w1; ++w) {
                             const float v = s_load(row + (w - w0) * in_pix + c);
-                            acc = IsMax ? std::max(acc, v) : acc + v;
+                            if constexpr (std::is_same_v<AccT, half>) {
+                                acc = float_to_half(half_to_float(acc) + v);
+                            } else {
+                                acc = IsMax ? std::max(acc, v) : acc + v;
+                            }
                         }
                     }
                 }
-                if (!IsMax) { acc *= inv; }
-                s_store_add(dst + c, acc, attrs.add_to);
+                float result = s_load(&acc);
+                if (!IsMax) { result *= inv; }
+                s_store_add(dst + c, result, attrs.add_to);
             }
         }
     });
