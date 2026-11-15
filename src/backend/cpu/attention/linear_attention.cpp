@@ -83,14 +83,13 @@
 
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/bench_knobs.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
 #include "backend/cpu/common/memory_pool.hpp"
 
 #include <cmath>
-#include <cstdlib>
-#include <cstring>
 #include <span>
 #include <type_traits>
 
@@ -119,15 +118,12 @@ constexpr int64_t kChunkMinSeq = 64;
 constexpr float kChunkSafeLog = 80.0f;
 
 /// Route override for A/B measurement and for tests that run one problem
-/// through both routes: NNOPS_LINEAR_ATTENTION_ROUTE=token|chunk. Unset (or
-/// any other value) is the automatic choice, chunked from kChunkMinSeq up.
+/// through both routes. `detail::linear_attention_route` is 0 (automatic,
+/// chunked from kChunkMinSeq up), -1 (force per-token) or 1 (force chunked); a
+/// test or bench stores to it directly.
 inline int route_override()
 {
-    const char* e = std::getenv("NNOPS_LINEAR_ATTENTION_ROUTE");
-    if (!e) { return 0; }
-    if (std::strcmp(e, "token") == 0) { return -1; }
-    if (std::strcmp(e, "chunk") == 0) { return 1; }
-    return 0;
+    return ::nnops::detail::linear_attention_route.load(std::memory_order_relaxed);
 }
 
 /// Widen L consecutive T elements to an f32 vector (f16 and bf16 widen, f32 is

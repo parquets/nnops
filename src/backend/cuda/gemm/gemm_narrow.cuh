@@ -212,7 +212,7 @@ inline bool small_m_applies(const GemmParams& p, GemmElem elem, bool trans_a,
 /// queried size. The dtype does not enter: the planes are f32 whichever the
 /// operands are.
 ///
-/// `NNOPS_CUDA_SPLITK` overrides it, on the same terms as the tiled path.
+/// `detail::cuda_splitk` overrides it, on the same terms as the tiled path.
 inline int small_m_splits(const GemmParams& p)
 {
     const int forced = splitk_env();
@@ -471,7 +471,7 @@ inline bool small_nt_applies(const GemmParams& p, GemmElem elem, bool trans_a,
 /// quarter of the splits. A half split per 512 k, capped at eight, then capped
 /// so the f32 planes stay inside the cache: six and eight measured within 1% of
 /// each other at 16x4096x4096, four is the best at 16x8192x2048, and doubling
-/// past eight costs 8-16%. `NNOPS_CUDA_SPLITK` still overrides.
+/// past eight costs 8-16%. `detail::cuda_splitk` still overrides.
 inline int small_nt_splits(const GemmParams& p)
 {
     const int forced = splitk_env();

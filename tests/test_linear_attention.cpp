@@ -21,6 +21,7 @@
 /// past order 1 therefore needs a looser atol.
 
 #include "nnops/ops/linear_attention.hpp"
+#include "nnops/detail/bench_knobs.hpp"
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"
@@ -29,6 +30,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <span>
 #include <string>
 #include <thread>
@@ -987,12 +989,12 @@ NNOPS_TEST(linear_attention_validate_value_geometry) {
 namespace {
 
 void set_route(const char* value) {
-#ifdef _WIN32
-    _putenv_s("NNOPS_LINEAR_ATTENTION_ROUTE", value ? value : "");
-#else
-    if (value) { setenv("NNOPS_LINEAR_ATTENTION_ROUTE", value, 1); }
-    else { unsetenv("NNOPS_LINEAR_ATTENTION_ROUTE"); }
-#endif
+    int route = 0;
+    if (value != nullptr) {
+        if (std::strcmp(value, "token") == 0) { route = -1; }
+        else if (std::strcmp(value, "chunk") == 0) { route = 1; }
+    }
+    ::nnops::detail::linear_attention_route.store(route, std::memory_order_relaxed);
 }
 
 /// The kernel under a forced route; `nullptr` restores the automatic choice.

@@ -24,14 +24,19 @@
 /// kernels do — while MaxPool widens to f32 (its result does not round). A
 /// contiguous plane is one flat run, so even a small plane — a 7x7 global pool,
 /// the shape the model runners see — vectorizes instead of falling into the tail.
+///
+/// Naming: every route carries its lane in the name — `_channel_first` puts the
+/// lane on the output width, `_channel_last` on the channels — followed by the
+/// route/variant (`_rows`, `_rows_3x3`, `_quant`, `_global_*`). The two window
+/// entry points are `pool_channel_first<IsMax,T>` and
+/// `pool_channel_last<IsMax,T>`; both take the same params, scale and add_to.
 
+#include "nnops/detail/bench_knobs.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_access.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -74,7 +79,7 @@ inline bool pooling_counts_taps(const PoolingKernelParams& p, bool is_max)
 }
 
 template <int R, int NV, bool IsMax, bool COUNT, typename Src, typename Dst>
-inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
+inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale,
                       const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
     using V = decltype(srcs[0].zero());
@@ -487,7 +492,7 @@ inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t la
 /// @c pix_stride-th vector on a channel-last tensor. NV vectors per pass; a
 /// short last block takes masked loads and stores only its live lanes.
 template <bool IsMax, typename T, int NV, int U = 4, bool Full = true>
-inline void global_channel_vec(T* out, const T* in, const PoolingKernelParams& p,
+inline void global_channel_last_vec(T* out, const T* in, const PoolingKernelParams& p,
                                float scale, bool add_to, int64_t lanes)
 {
     constexpr int64_t kVec = kChannelLanes;
@@ -549,7 +554,7 @@ inline void global_channel_vec(T* out, const T* in, const PoolingKernelParams& p
 
 /// Single-vector form for the short last block of a channel-last task.
 template <bool IsMax, typename T>
-inline v_f32x8 global_channel(const T* in, const PoolingKernelParams& p, float scale,
+inline v_f32x8 global_channel_last(const T* in, const PoolingKernelParams& p, float scale,
                               int64_t lanes)
 {
     constexpr int64_t kVec = kChannelLanes;
@@ -599,7 +604,7 @@ inline void global_store(T* out, const v_f32x8& v, bool add_to)
 // --- MaxPool raw-integer fast path (input and output share scale + zero_point) ---
 
 template <int R, typename T>
-inline void maxpool_fast(T* output, const T* input,
+inline void maxpool_channel_last_quant_fast(T* output, const T* input,
                          const PoolingKernelParams& p, float out_zero)
 {
     constexpr T min_val = std::numeric_limits<T>::lowest();
@@ -663,7 +668,7 @@ inline void maxpool_fast(T* output, const T* input,
 // --- Channel-last wrappers ---
 
 template <bool IsMax, typename T>
-inline void pool_last(T* output, const T* input, const PoolingKernelParams& p,
+inline void pool_channel_last(T* output, const T* input, const PoolingKernelParams& p,
                       float scale, bool add_to, int64_t lanes)
 {
     if (lanes > kChannelLanes) {
@@ -675,19 +680,19 @@ inline void pool_last(T* output, const T* input, const PoolingKernelParams& p,
                            kChannelLanes},
             FpDst<T, true>{output + kChannelLanes, p.out_row_stride, add_to,
                            p.pix_stride, kChannelLanes}};
-        pool_rows_counted<2, IsMax>(p, scale, src, dst);
+        pool_channel_last_rows_counted<2, IsMax>(p, scale, src, dst);
         return;
     }
     if (lanes == kChannelLanes) {
         const FpSrc<T, true> src[1] = {FpSrc<T, true>{input, lanes}};
         const FpDst<T, true> dst[1] = {
             FpDst<T, true>{output, p.out_row_stride, add_to, p.pix_stride, lanes}};
-        pool_rows_counted<1, IsMax>(p, scale, src, dst);
+        pool_channel_last_rows_counted<1, IsMax>(p, scale, src, dst);
     } else {
         const FpSrc<T, false> src[1] = {FpSrc<T, false>{input, lanes}};
         const FpDst<T, false> dst[1] = {
             FpDst<T, false>{output, p.out_row_stride, add_to, p.pix_stride, lanes}};
-        pool_rows_counted<1, IsMax>(p, scale, src, dst);
+        pool_channel_last_rows_counted<1, IsMax>(p, scale, src, dst);
     }
 }
 
@@ -704,7 +709,7 @@ inline void pool_last(T* output, const T* input, const PoolingKernelParams& p,
 /// Splitting per row also lets a group that touches the padding still run its
 /// interior rows straight-line.
 template <int R, int NV, bool IsMax, int S, typename Src, typename Dst>
-inline void pool_rows_3x3(const PoolingKernelParams& p, float avg_scale,
+inline void pool_channel_last_rows_3x3(const PoolingKernelParams& p, float avg_scale,
                           const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
     using V = decltype(srcs[0].zero());
@@ -794,7 +799,7 @@ inline void pool_rows_3x3(const PoolingKernelParams& p, float avg_scale,
 }
 
 template <int NV, bool IsMax, typename Src, typename Dst>
-inline bool pool_try_3x3(const PoolingKernelParams& p, float scale,
+inline bool pool_channel_last_try_3x3(const PoolingKernelParams& p, float scale,
                          const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
     if constexpr (!Src::full) { return false; }
@@ -803,49 +808,43 @@ inline bool pool_try_3x3(const PoolingKernelParams& p, float scale,
         return false;
     }
     if (p.SH == 1) {
-        pool_rows_3x3<4, NV, IsMax, 1>(p, scale, srcs, dsts);
+        pool_channel_last_rows_3x3<4, NV, IsMax, 1>(p, scale, srcs, dsts);
         return true;
     }
     if (p.SH == 2) {
-        pool_rows_3x3<4, NV, IsMax, 2>(p, scale, srcs, dsts);
+        pool_channel_last_rows_3x3<4, NV, IsMax, 2>(p, scale, srcs, dsts);
         return true;
     }
     return false;
 }
 
-/// Route override for A/B measurement: a nonzero store forces the rolled walk
-/// and skips the straight-line 3x3 path. The environment seeds it once at
-/// start-up (NNOPS_POOLING_ROUTE=roll); a bench flips the atomic in-process, so
-/// both routes are timed over the same buffers. The hot check is one relaxed
-/// load — a per-call getenv costs microseconds on Windows and would swamp a
-/// small plane.
-inline std::atomic<int> pool_route_roll{[] {
-    const char* e = std::getenv("NNOPS_POOLING_ROUTE");
-    return (e != nullptr && std::strcmp(e, "roll") == 0) ? 1 : 0;
-}()};
-
+/// Route override for A/B measurement: a nonzero store in
+/// `detail::pooling_3x3_roll` forces the rolled walk and skips the straight-line
+/// 3x3 path, so a bench times both routes over the same buffers. The hot check
+/// is one relaxed load; no environment is consulted (a per-call getenv costs
+/// microseconds on Windows and would swamp a small plane).
 inline bool pool_3x3_route_enabled()
 {
-    return pool_route_roll.load(std::memory_order_relaxed) == 0;
+    return ::nnops::detail::pooling_3x3_roll.load(std::memory_order_relaxed) == 0;
 }
 
 template <int NV, bool IsMax, typename Src, typename Dst>
-inline void pool_rows_counted(const PoolingKernelParams& p, float scale,
+inline void pool_channel_last_rows_counted(const PoolingKernelParams& p, float scale,
                               const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
     if (pool_3x3_route_enabled() &&
-        pool_try_3x3<NV, IsMax>(p, scale, srcs, dsts)) {
+        pool_channel_last_try_3x3<NV, IsMax>(p, scale, srcs, dsts)) {
         return;
     }
     if (pooling_counts_taps(p, IsMax)) {
-        pool_rows<4, NV, IsMax, true>(p, scale, srcs, dsts);
+        pool_channel_last_rows<4, NV, IsMax, true>(p, scale, srcs, dsts);
     } else {
-        pool_rows<4, NV, IsMax, false>(p, scale, srcs, dsts);
+        pool_channel_last_rows<4, NV, IsMax, false>(p, scale, srcs, dsts);
     }
 }
 
 template <bool IsMax, typename InT, typename OutT>
-inline void pool_last_quant(OutT* output, const InT* input,
+inline void pool_channel_last_quant(OutT* output, const InT* input,
                             const PoolingKernelParams& p, float scale,
                             float in_scale, float in_zero,
                             float out_scale, float out_zero,
@@ -862,7 +861,7 @@ inline void pool_last_quant(OutT* output, const InT* input,
             QuantDst<OutT, true>{output + kChannelLanes, p.out_row_stride,
                                  out_scale, out_zero, add_to, p.pix_stride,
                                  kChannelLanes}};
-        pool_rows_counted<2, IsMax>(p, scale, src, dst);
+        pool_channel_last_rows_counted<2, IsMax>(p, scale, src, dst);
         return;
     }
     if (lanes == kChannelLanes) {
@@ -871,14 +870,14 @@ inline void pool_last_quant(OutT* output, const InT* input,
         const QuantDst<OutT, true> dst[1] = {
             QuantDst<OutT, true>{output, p.out_row_stride, out_scale, out_zero,
                                  add_to, p.pix_stride, lanes}};
-        pool_rows_counted<1, IsMax>(p, scale, src, dst);
+        pool_channel_last_rows_counted<1, IsMax>(p, scale, src, dst);
     } else {
         const QuantSrc<InT, false> src[1] = {
             QuantSrc<InT, false>{input, in_scale, in_zero, lanes}};
         const QuantDst<OutT, false> dst[1] = {
             QuantDst<OutT, false>{output, p.out_row_stride, out_scale, out_zero,
                                   add_to, p.pix_stride, lanes}};
-        pool_rows_counted<1, IsMax>(p, scale, src, dst);
+        pool_channel_last_rows_counted<1, IsMax>(p, scale, src, dst);
     }
 }
 
@@ -895,22 +894,6 @@ inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t la
     for (int64_t l = 0; l < lanes; ++l) {
         s_store_add(out + l, s_load(tmp + l), add_to);
     }
-}
-
-// --- channel-first entry points ---
-
-template <typename T>
-inline void maxpool_channel_first(T* output, const T* input, const PoolingKernelParams& p,
-                           float, bool add_to)
-{
-    pool_channel_first<true>(output, input, p, 0.0f, add_to);
-}
-
-template <typename T>
-inline void avgpool_channel_first(T* output, const T* input, const PoolingKernelParams& p,
-                           float scale, bool add_to)
-{
-    pool_channel_first<false>(output, input, p, scale, add_to);
 }
 
 }  // namespace nnops::kernel

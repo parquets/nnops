@@ -13,13 +13,14 @@
 /// tiles split — the wide-tile gates already require a grid that fills the
 /// machine — and the scratch is stream-ordered from a private, retained memory
 /// pool (the default pool releases on every free, which measured at 1.45 ms a
-/// pair on WDDM). NNOPS_CUDA_SPLITK forces or disables it for a bench; unset
+/// pair on WDDM). `detail::cuda_splitk` forces or disables it for a bench; -1
 /// means the heuristic.
 
 #pragma once
 
 #include "gemm_tile_h.cuh"
 #include "gemm_tile_f.cuh"
+#include "nnops/detail/bench_knobs.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -77,15 +78,12 @@ namespace detail {
 
 // ---- split-K --------------------------------------------------------------
 
-/// Bench knob: NNOPS_CUDA_SPLITK=0 disables split-K, N > 1 forces N splits
-/// (clamped like the auto choice); unset keeps the heuristic.
+/// Bench knob: `detail::cuda_splitk` is 0 to disable split-K, N > 1 to force N
+/// splits (clamped like the auto choice), -1 to keep the heuristic. A test or
+/// benchmark stores to it directly; no environment is read.
 inline int splitk_env()
 {
-    static const int v = [] {
-        const char* s = std::getenv("NNOPS_CUDA_SPLITK");
-        return s != nullptr ? std::atoi(s) : -1;
-    }();
-    return v;
+    return ::nnops::detail::cuda_splitk.load(std::memory_order_relaxed);
 }
 
 /// A split needs enough k tiles for the pipeline prologue to disappear into

@@ -15,8 +15,8 @@
 /// already even.
 
 #include "nnops/detail/simd/cpu_features.hpp"
+#include "nnops/detail/bench_knobs.hpp"
 
-#include <cstdlib>
 #include <vector>
 
 #if defined(NNOPS_ARCH_X86_64)
@@ -317,14 +317,13 @@ void CpuFeatures::detect() {
     }
 #endif
 
-    // NNOPS_I8MM=0 forces the SDOT route even when the hardware has SMMLA:
-    // the escape hatch for a measured regression, and the arm the int8
+    // `detail::disable_i8mm` forces the SDOT route even when the hardware has
+    // SMMLA: the escape hatch for a measured regression, and the arm the int8
     // benchmarks compare against. Only the disabling direction is honoured —
-    // forcing it on would hand SMMLA to a core that cannot execute it.
-    if (const char* env = std::getenv("NNOPS_I8MM")) {
-        if (env[0] == '0' && env[1] == '\0') {
-            features_ &= ~static_cast<uint32_t>(CpuIsa::NEON_I8MM);
-        }
+    // forcing it on would hand SMMLA to a core that cannot execute it. The scan
+    // runs once, so an experiment sets the knob before the first feature query.
+    if (::nnops::detail::disable_i8mm.load(std::memory_order_relaxed) != 0) {
+        features_ &= ~static_cast<uint32_t>(CpuIsa::NEON_I8MM);
     }
 
     // The macOS L1D is read in its own sysctl block below.

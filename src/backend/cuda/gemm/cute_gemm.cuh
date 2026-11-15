@@ -36,7 +36,7 @@
 /// tiles split — the wide-tile gates already require a grid that fills the
 /// machine — and the scratch is stream-ordered from a private, retained memory
 /// pool (the default pool releases on every free, which measured at 1.45 ms a
-/// pair on WDDM). NNOPS_CUDA_SPLITK forces or disables it for a bench; unset
+/// pair on WDDM). detail::cuda_splitk forces or disables it for a bench; unset
 /// means the heuristic.
 
 #pragma once

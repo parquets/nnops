@@ -380,7 +380,7 @@ NNOPS_BENCH(cuda_matmul_cublas) {
     }
 }
 
-/// The decode product alone, so `NNOPS_CUDA_SPLITK` can sweep its narrow-m
+/// The decode product alone, so `detail::cuda_splitk` can sweep its narrow-m
 /// split count without the squares in the same run also seeing the knob. The
 /// `tb` rows are the same products as `Linear` asks for them, with the weight
 /// stored `[n][k]`.

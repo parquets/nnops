@@ -19,6 +19,7 @@
 /// calls, median across rounds. `NNOPS_BENCH_THREADS=1,4` pins the ladder.
 
 #include "nnops/ops/linear_attention.hpp"
+#include "nnops/detail/bench_knobs.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "common/bench_harness.hpp"
@@ -30,6 +31,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -79,15 +81,15 @@ struct BenchPool {
     inline static thread_local int current_thread_id_ = 0;
 };
 
-/// NNOPS_LINEAR_ATTENTION_ROUTE, re-read by the kernel on every call, so this
+/// Flips `detail::linear_attention_route`, read by the kernel on every call, so
 /// one process can time both routes over the same buffers.
 void set_route(const char* value) {
-#ifdef _WIN32
-    _putenv_s("NNOPS_LINEAR_ATTENTION_ROUTE", value ? value : "");
-#else
-    if (value) { setenv("NNOPS_LINEAR_ATTENTION_ROUTE", value, 1); }
-    else { unsetenv("NNOPS_LINEAR_ATTENTION_ROUTE"); }
-#endif
+    int route = 0;
+    if (value != nullptr) {
+        if (std::strcmp(value, "token") == 0) { route = -1; }
+        else if (std::strcmp(value, "chunk") == 0) { route = 1; }
+    }
+    ::nnops::detail::linear_attention_route.store(route, std::memory_order_relaxed);
 }
 
 template <class Fn>

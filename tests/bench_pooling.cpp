@@ -21,9 +21,8 @@
 /// stride-2 max — and a null re-run of channel-first reports instrument drift.
 ///
 /// The window bench isolates the channel-last 3x3 route: the straight-line
-/// `pool_rows_3x3` against the rolled `pool_rows` walk, over the same buffers,
-/// by flipping the kernel's cached route flag (`pool_route_roll`; the internal
-/// header is included for that one hook). Max/avg, stride 1/2, one-block and
+/// `pool_channel_last_rows_3x3` against the rolled `pool_channel_last_rows` walk, over the same buffers,
+/// by flipping `detail::pooling_3x3_roll`. Max/avg, stride 1/2, one-block and
 /// multi-block shapes, so a per-call or per-block cost shows up separately
 /// from the tap work.
 ///
@@ -31,7 +30,7 @@
 
 #include "nnops/ops/layout_convert.hpp"
 #include "nnops/ops/pooling.hpp"
-#include "backend/cpu/simd_kernel/simd_pooling.hpp"   // pool_route_roll (bench hook)
+#include "nnops/detail/bench_knobs.hpp"
 #include "nnops/ops/reduce.hpp"
 #include "common/bench_harness.hpp"
 #include "common/channel_last.hpp"
@@ -456,12 +455,11 @@ struct WindowCase {
     bool f16 = false;
 };
 
-/// Flips the kernel's cached route flag, so one process times both routes over
-/// the same buffers. (The environment seeds the flag at start-up; it is not
-/// re-read per call — a getenv there costs microseconds.)
+/// Flips `detail::pooling_3x3_roll`, so one process times both routes over the
+/// same buffers.
 void set_pool_route(bool roll)
 {
-    nnops::kernel::pool_route_roll.store(roll ? 1 : 0, std::memory_order_relaxed);
+    ::nnops::detail::pooling_3x3_roll.store(roll ? 1 : 0, std::memory_order_relaxed);
 }
 
 template <typename T>

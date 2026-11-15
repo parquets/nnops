@@ -21,6 +21,12 @@
 /// interleave, and four rows are four independent chains. A KD of 1 — the 2D
 /// case — degenerates the depth loop, and padding is bounds-checked in-kernel.
 ///
+/// Naming: `dwconv_channel_first*` and `dwconv_channel_last*` mirror each other
+/// — the lane is the output width vs. the channels — with the channel-last 3x3
+/// route adding `_3x3`, `_3x3_16` and `_3x3_16x4` for its vector count and row
+/// blocking. The two entry points take the same bias/epilogue/flags arguments;
+/// only the lane count and the channel-last weight layout differ.
+///
 /// Everything that depends only on the tap is hoisted out of the tap loops: a row
 /// pointer per (kd, kh, r), left-pad-biased on the channel-last path, and an
 /// interior span of output positions whose every tap is inside the row, where the
@@ -47,7 +53,7 @@
 /// cannot back a whole-vector read.
 ///
 /// The channel-last 3x3 kernels hold the nine taps in registers —
-/// `dwconv_last3x3` for one channel vector, `dwconv_last3x3_16` for two, which
+/// `dwconv_channel_last_3x3` for one channel vector, `dwconv_channel_last_3x3_16` for two, which
 /// cannot hoist eighteen tap vectors and reloads one per column to feed four rows
 /// and both halves. Sixteen channels is what the driver asks for: a pixel's 16
 /// f32 is one 64-byte line, so a sweep touches every line once, where an
@@ -491,11 +497,11 @@ inline void dwconv_channel_first(T* out, const T* in, const T* w, float bias,
 // out_rows and in_img are the bases advanced by the channel block, w_tap0 the
 // block's first channel of the tap-major weight, and lanes how many channels the
 // call covers — up to 16, a whole 64-byte line of f32. A 3x3 takes
-// dwconv_last3x3 at one vector and dwconv_last3x3_16 at two.
+// dwconv_channel_last_3x3 at one vector and dwconv_channel_last_3x3_16 at two.
 
 /// One depth plane, 3x3, no dilation, vertical stride 1 or 2 — a larger one would
 /// still fit one row table but is not common enough to instantiate.
-inline bool dwconv_last3x3_ok(const DwConvParams& p)
+inline bool dwconv_channel_last_3x3_ok(const DwConvParams& p)
 {
     return p.KD == 1 && p.KH == 3 && p.KW == 3 && p.DH == 1 && p.DW == 1 &&
            (p.SH == 1 || p.SH == 2);
@@ -510,7 +516,7 @@ inline bool dwconv_last3x3_ok(const DwConvParams& p)
 /// `oh*SH + r*SH + kh - PH`, so there are R*SH + 2 entries and a tap's row is
 /// `row[r*SH + kh]` — compile-time indices. The horizontal stride stays runtime.
 template <int R, int SH, typename T>
-inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
+inline void dwconv_channel_last_3x3(T* out_rows, const T* in_img, const T* w_tap0,
                            const T* bias_vec, const DwConvParams& p,
                            const Epilogue& epilogue, bool add_to, bool pre_act)
 {
@@ -596,7 +602,7 @@ inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
 /// both ends of every plane that is exactly one row: skipping its tap at
 /// compile time is what puts those groups back on the unchecked loop.
 template <int R, int SH, bool TOP_OK, bool BOT_OK, typename T>
-inline void dwconv_last3x3_16_masked(T* out_rows, const T* in_img,
+inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
                                      const T* w_tap0, const T* bias_vec,
                                      const DwConvParams& p,
                                      const Epilogue& epilogue, bool add_to,
@@ -773,7 +779,7 @@ inline void dwconv_last3x3_16_masked(T* out_rows, const T* in_img,
 /// allocator the eight accumulators; the two plain arms keep the store
 /// straight-line, so the register file the store-only path had survives.
 template <int SH, bool TOP_OK, bool BOT_OK, int ACT, typename T>
-inline void dwconv_last3x3_16x4(T* out_rows, const T* in_img, const T* w_tap0,
+inline void dwconv_channel_last_3x3_16x4(T* out_rows, const T* in_img, const T* w_tap0,
                                 const T* bias_vec, const DwConvParams& p,
                                 const Epilogue& epilogue, bool add_to, bool pre_act)
 {
@@ -913,7 +919,7 @@ inline void dwconv_last3x3_16x4(T* out_rows, const T* in_img, const T* w_tap0,
 /// weight load then feeds four rows and both halves, so a tap is ten loads for
 /// eight FMAs.
 template <int R, int SH, typename T>
-inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
+inline void dwconv_channel_last_3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
                               const T* bias_vec, const DwConvParams& p,
                               const Epilogue& epilogue, bool add_to, bool pre_act)
 {
@@ -940,20 +946,20 @@ inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
             do {                                                               \
                 if (top_ok) {                                                  \
                     if (bot_ok) {                                              \
-                        dwconv_last3x3_16x4<SH, true, true, A>(                \
+                        dwconv_channel_last_3x3_16x4<SH, true, true, A>(                \
                             out_rows, in_img, w_tap0, bias_vec, p, epilogue,   \
                             add_to, pre_act);                                  \
                     } else {                                                   \
-                        dwconv_last3x3_16x4<SH, true, false, A>(               \
+                        dwconv_channel_last_3x3_16x4<SH, true, false, A>(               \
                             out_rows, in_img, w_tap0, bias_vec, p, epilogue,   \
                             add_to, pre_act);                                  \
                     }                                                          \
                 } else if (bot_ok) {                                           \
-                    dwconv_last3x3_16x4<SH, false, true, A>(                   \
+                    dwconv_channel_last_3x3_16x4<SH, false, true, A>(                   \
                         out_rows, in_img, w_tap0, bias_vec, p, epilogue,       \
                         add_to, pre_act);                                      \
                 } else {                                                       \
-                    dwconv_last3x3_16x4<SH, false, false, A>(                  \
+                    dwconv_channel_last_3x3_16x4<SH, false, false, A>(                  \
                         out_rows, in_img, w_tap0, bias_vec, p, epilogue,       \
                         add_to, pre_act);                                      \
                 }                                                              \
@@ -969,17 +975,17 @@ inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
         }
         if (top_ok) {
             if (bot_ok) {
-                dwconv_last3x3_16_masked<R, SH, true, true>(
+                dwconv_channel_last_3x3_16_masked<R, SH, true, true>(
                     out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
             } else {
-                dwconv_last3x3_16_masked<R, SH, true, false>(
+                dwconv_channel_last_3x3_16_masked<R, SH, true, false>(
                     out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
             }
         } else if (bot_ok) {
-            dwconv_last3x3_16_masked<R, SH, false, true>(
+            dwconv_channel_last_3x3_16_masked<R, SH, false, true>(
                 out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
         } else {
-            dwconv_last3x3_16_masked<R, SH, false, false>(
+            dwconv_channel_last_3x3_16_masked<R, SH, false, false>(
                 out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
         }
         return;
@@ -1068,16 +1074,16 @@ inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
 
 /// The 8-channel call: pick the kernel for the shape, then the vertical stride.
 template <int R, typename T>
-inline void dwconv_last8(T* out_rows, const T* in_img, const T* w_tap0,
+inline void dwconv_channel_last_8(T* out_rows, const T* in_img, const T* w_tap0,
                          const T* bias_vec, const DwConvParams& p,
                          const Epilogue& epilogue, bool add_to, bool pre_act)
 {
-    if (dwconv_last3x3_ok(p)) {
+    if (dwconv_channel_last_3x3_ok(p)) {
         if (p.SH == 1) {
-            dwconv_last3x3<R, 1>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
+            dwconv_channel_last_3x3<R, 1>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
                                  add_to, pre_act);
         } else {
-            dwconv_last3x3<R, 2>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
+            dwconv_channel_last_3x3<R, 2>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
                                  add_to, pre_act);
         }
         return;
@@ -1092,18 +1098,18 @@ inline void dwconv_last8(T* out_rows, const T* in_img, const T* w_tap0,
 }
 
 template <int R, typename T>
-inline void dwconv_last(T* out_rows, const T* in_img, const T* w_tap0,
+inline void dwconv_channel_last(T* out_rows, const T* in_img, const T* w_tap0,
                         const T* bias_vec, const DwConvParams& p,
                         const Epilogue& epilogue, bool add_to, bool pre_act,
                         int64_t lanes)
 {
     if (lanes > kChannelLanes) {
-        if (lanes == 2 * kChannelLanes && dwconv_last3x3_ok(p)) {
+        if (lanes == 2 * kChannelLanes && dwconv_channel_last_3x3_ok(p)) {
             if (p.SH == 1) {
-                dwconv_last3x3_16<R, 1>(out_rows, in_img, w_tap0, bias_vec, p,
+                dwconv_channel_last_3x3_16<R, 1>(out_rows, in_img, w_tap0, bias_vec, p,
                                         epilogue, add_to, pre_act);
             } else {
-                dwconv_last3x3_16<R, 2>(out_rows, in_img, w_tap0, bias_vec, p,
+                dwconv_channel_last_3x3_16<R, 2>(out_rows, in_img, w_tap0, bias_vec, p,
                                         epilogue, add_to, pre_act);
             }
             return;
@@ -1125,7 +1131,7 @@ inline void dwconv_last(T* out_rows, const T* in_img, const T* w_tap0,
     const auto vb = bias_vec ? load_lanes(bias_vec, lanes) : v_zero(out_rows);
     const decltype(vb) vbias[1] = {vb};
     if (lanes == kChannelLanes) {
-        dwconv_last8<R>(out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+        dwconv_channel_last_8<R>(out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
                         pre_act);
     } else {
         const FpSrc<T, false> src[1] = {FpSrc<T, false>{in_img, lanes}};
@@ -1140,7 +1146,7 @@ constexpr int64_t kMaxLastQuantTaps = 9 * 9 * 9;  // 729
 /// Dequantize this block's taps once per call into a staging block, then run the
 /// f32 kernel. Pad lanes get scale 0.
 template <int R, typename InT, typename OutT>
-inline void dwconv_last_quant(OutT* out_rows, const InT* in_img, const InT* w_tap0,
+inline void dwconv_channel_last_quant(OutT* out_rows, const InT* in_img, const InT* w_tap0,
                               const float* w_scale, const int32_t* w_zero,
                               const float* bias_vec, const DwConvParams& p,
                               const Epilogue& epilogue, bool add_to, bool pre_act,
