@@ -326,6 +326,61 @@ void run_unroll_case(const DepthwiseCase& c, int iters, int rounds) {
                 (median_of(a2) / t1 - 1.0) * 100.0);
 }
 
+/// Flips `detail::depthwise_3x3_roll`, so one process times the straight-line
+/// 3x3 interior against the rolled tap loop over the same buffers. A/B/A per
+/// round, with A the same arm twice: an A2/A1 gap is drift and nothing else.
+void run_cf_route_case(const DepthwiseCase& c, int iters, int rounds) {
+    const int64_t ishape[] = {1, c.C, c.IH, c.IW};
+    const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
+    const int64_t bshape[] = {c.C};
+
+    auto [in_vec, in_channel_first] = test::make_random_tensor(ishape, -1.0f, 1.0f, 51);
+    auto [w_vec, w_channel_first]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 52);
+    auto [b_vec, b_channel_first]   = test::make_random_tensor(bshape, -0.5f, 0.5f, 53);
+
+    const int64_t OH = (c.IH + 2 * c.PH - c.KH) / c.SH + 1;
+    const int64_t OW = (c.IW + 2 * c.PW - c.KW) / c.SW + 1;
+
+    std::vector<float> out3(static_cast<size_t>(c.C * OH * OW));
+    std::vector<float> outr(out3.size());
+
+    const float* in = in_channel_first.ptr<float>();
+    const float* w  = w_channel_first.ptr<float>();
+    const float* b  = b_channel_first.ptr<float>();
+
+    const auto flat = [&] {
+        ::nnops::detail::depthwise_3x3_roll.store(0, std::memory_order_relaxed);
+    };
+    const auto rolled = [&] {
+        ::nnops::detail::depthwise_3x3_roll.store(1, std::memory_order_relaxed);
+    };
+    const auto run3 = [&] { channel_first_kernel(in, out3.data(), w, b, c, OH, OW, true); };
+    const auto runr = [&] { channel_first_kernel(in, outr.data(), w, b, c, OH, OW, true); };
+
+    flat();   run3();
+    rolled(); runr();
+    flat();
+    const double d = max_abs_diff(out3.data(), outr.data(),
+                                  static_cast<int64_t>(out3.size()));
+
+    const double flops = 2.0 * static_cast<double>(c.C) * OH * OW * c.KH * c.KW;
+    std::printf("  %s\n", c.name);
+    std::printf("    out[1,%lld,%lld,%lld]  |3x3 - rolled| = %.2e\n",
+                (long long)c.C, (long long)OH, (long long)OW, d);
+
+    std::vector<double> t3, tr, t3b;
+    for (int r = 0; r < rounds; ++r) {
+        flat();   t3.push_back(time_us(run3, iters));
+        rolled(); tr.push_back(time_us(runr, iters));
+        flat();   t3b.push_back(time_us(run3, iters));
+    }
+    const double a = median_of(t3), bb = median_of(tr);
+    std::printf("    3x3 %8.1f us (%5.1f GFLOPS) | rolled %8.1f us (%5.1f GFLOPS)"
+                " | %5.2fx  (null %+4.1f%%)\n",
+                a, flops / (a * 1e3), bb, flops / (bb * 1e3), bb / a,
+                (median_of(t3b) / a - 1.0) * 100.0);
+}
+
 }  // namespace
 
 NNOPS_BENCH(depthwise_channel_first_vs_channel_last) {
@@ -424,6 +479,35 @@ NNOPS_BENCH(depthwise_channel_first_unroll) {
 // The seventeen stages as the model runs them, each a separate operator call.
 // The sum is what the model's `depthwise_fused` row should read if the kernel
 // rate holds at these shapes; the difference is per-call cost.
+
+// ============================================================
+// The 3x3 interior: literal taps against the rolled tap loop
+// ============================================================
+//
+// Same buffers, one variable: whether the interior body unrolls the three
+// horizontal taps into literal offsets or drives them off `p.KW`.
+
+NNOPS_BENCH(depthwise_channel_first_3x3_route) {
+    const int iters = 20;
+    const int rounds = 5;
+
+    std::printf("depthwise channel-first: straight-line 3x3 interior against the rolled loop\n");
+
+    const DepthwiseCase cases[] = {
+        {"dw 3x3 C=32  @112 s1",   32, 112, 112},
+        {"dw 3x3 C=96  @112 s2",   96, 112, 112, 3, 3, 2, 2},
+        {"dw 3x3 C=144 @56  s1",  144,  56,  56},
+        {"dw 3x3 C=240 @28  s1",  240,  28,  28},
+        {"dw 3x3 C=576 @14  s1",  576,  14,  14},
+        {"dw 3x3 C=960 @7   s1",  960,   7,   7},
+        {"dw 3x3 C=256 @200x300", 256, 200, 300},
+        {"dw 3x3 C=256 @60x80",   256,  60,  80},
+    };
+
+    for (const auto& c : cases) {
+        run_cf_route_case(c, iters, rounds);
+    }
+}
 
 NNOPS_BENCH(depthwise_channel_first_mobilenet) {
     const std::vector<int> threads = bench_threads();

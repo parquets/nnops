@@ -31,7 +31,9 @@
 /// pointer per (kd, kh, r), left-pad-biased on the channel-last path, and an
 /// interior span of output positions whose every tap is inside the row, where the
 /// tap loop takes no bounds test and no null test — one branch per position instead
-/// of one per tap.
+/// of one per tap. The channel-first interior gives a 2D 3x3 literal tap offsets
+/// (`dwconv_channel_first_rows`'s `K3`), so its three horizontal taps cost neither
+/// a loop counter nor a multiply by the runtime `KW`/`DW`.
 /// The null test (does this input row exist) can only be skipped when every row of
 /// the group does, so a group whose window reaches past the plane keeps the
 /// checked path.
@@ -63,6 +65,7 @@
 /// staging block (9 vectors for a 3x3 against the group's thousands of FMAs), then
 /// runs `dwconv_rows` on the f32 weights; a pad lane gets scale 0.
 
+#include "nnops/detail/bench_knobs.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/core/epilogue.hpp"
 #include "simd_epilogue.hpp"
@@ -293,8 +296,9 @@ inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
 
 /// R output rows per call, one width-vector accumulate per row. @p SW is the width
 /// stride when the caller knows it (1 or 2) and 0 when it does not, so the choice
-/// stays out of the tap loop.
-template <int R, int SW, typename T>
+/// stays out of the tap loop. @p K3 says the filter is a 2D 3x3 with unit
+/// dilation, so the interior body can fold its taps into literal offsets.
+template <int R, int SW, typename T, bool K3 = false>
 inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bias,
                                const DwConvParams& p, const Epilogue& epilogue,
                                bool add_to, bool pre_act,
@@ -383,11 +387,26 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
                 const T* w_row = w + (kd * p.KH + kh) * p.KW;
 
                 if (interior) {
-                    for (int64_t kw = 0; kw < p.KW; ++kw) {
-                        const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
-                        const auto vk = v_set1(out, s_load(&w_row[kw]));
+                    if constexpr (K3) {
+                        // A 3x3 with unit dilation: the tap loop is three literal
+                        // offsets, so the column index never reaches the tap
+                        // addresses and the body carries no tap counter.
+                        const int64_t iw0 = ow * sw - p.PW;
+                        const auto vk0 = v_set1(out, s_load(&w_row[0]));
+                        const auto vk1 = v_set1(out, s_load(&w_row[1]));
+                        const auto vk2 = v_set1(out, s_load(&w_row[2]));
                         for (int r = 0; r < R; ++r) {
-                            acc[r] = v_fmadd(load_row(row[r] + iw0), vk, acc[r]);
+                            acc[r] = v_fmadd(load_row(row[r] + iw0), vk0, acc[r]);
+                            acc[r] = v_fmadd(load_row(row[r] + iw0 + 1), vk1, acc[r]);
+                            acc[r] = v_fmadd(load_row(row[r] + iw0 + 2), vk2, acc[r]);
+                        }
+                    } else {
+                        for (int64_t kw = 0; kw < p.KW; ++kw) {
+                            const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
+                            const auto vk = v_set1(out, s_load(&w_row[kw]));
+                            for (int r = 0; r < R; ++r) {
+                                acc[r] = v_fmadd(load_row(row[r] + iw0), vk, acc[r]);
+                            }
                         }
                     }
                     continue;
@@ -465,16 +484,55 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
 // Public kernels
 // ============================================================
 
+/// A 2D 3x3 with unit dilation, the shape the straight-line interior body takes.
+inline bool dwconv_channel_first_3x3_ok(const DwConvParams& p)
+{
+    return p.KD == 1 && p.KH == 3 && p.KW == 3 && p.DH == 1 && p.DW == 1;
+}
+
+/// Route override for A/B measurement: a nonzero store in
+/// `detail::depthwise_3x3_roll` forces the rolled tap loop. The hot check is one
+/// relaxed load (no environment read on the call path).
+inline bool dwconv_3x3_route_enabled()
+{
+    return ::nnops::detail::depthwise_3x3_roll.load(std::memory_order_relaxed) == 0;
+}
+
+#define NNOPS_DWCF_DISPATCH(R, S, K3, ...)                                     \
+    dwconv_channel_first_rows<R, S, T, K3>(__VA_ARGS__)
+
+template <int R, typename T>
+inline void dwconv_channel_first_dispatch(T* out, const T* in, const T* w, float bias,
+                                          const DwConvParams& p,
+                                          const Epilogue& epilogue, bool add_to,
+                                          bool pre_act, const DwChannelFirstEdges& edges)
+{
+    const bool k3 = dwconv_channel_first_3x3_ok(p) && dwconv_3x3_route_enabled();
+#define NNOPS_DWCF_ROUTE(S)                                                    \
+    do {                                                                       \
+        if (k3) {                                                              \
+            NNOPS_DWCF_DISPATCH(R, S, true, out, in, w, bias, p, epilogue,      \
+                                add_to, pre_act, edges);                       \
+        } else {                                                               \
+            NNOPS_DWCF_DISPATCH(R, S, false, out, in, w, bias, p, epilogue,     \
+                                add_to, pre_act, edges);                       \
+        }                                                                      \
+    } while (0)
+    switch (p.SW) {
+        case 1: NNOPS_DWCF_ROUTE(1); break;
+        case 2: NNOPS_DWCF_ROUTE(2); break;
+        default: NNOPS_DWCF_ROUTE(0); break;
+    }
+#undef NNOPS_DWCF_ROUTE
+}
+#undef NNOPS_DWCF_DISPATCH
+
 template <typename T>
 inline void dwconv_channel_first_h4(T* out, const T* in, const T* w, float bias,
                              const DwConvParams& p, const Epilogue& epilogue,
                              bool add_to, bool pre_act, const DwChannelFirstEdges& edges)
 {
-    switch (p.SW) {
-        case 1:  dwconv_channel_first_rows<4, 1>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
-        case 2:  dwconv_channel_first_rows<4, 2>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
-        default: dwconv_channel_first_rows<4, 0>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
-    }
+    dwconv_channel_first_dispatch<4>(out, in, w, bias, p, epilogue, add_to, pre_act, edges);
 }
 
 /// One row — the tail of an h4 loop, and the whole kernel for a single-row call.
@@ -483,11 +541,7 @@ inline void dwconv_channel_first(T* out, const T* in, const T* w, float bias,
                           const DwConvParams& p, const Epilogue& epilogue,
                           bool add_to, bool pre_act, const DwChannelFirstEdges& edges)
 {
-    switch (p.SW) {
-        case 1:  dwconv_channel_first_rows<1, 1>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
-        case 2:  dwconv_channel_first_rows<1, 2>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
-        default: dwconv_channel_first_rows<1, 0>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
-    }
+    dwconv_channel_first_dispatch<1>(out, in, w, bias, p, epilogue, add_to, pre_act, edges);
 }
 
 // ============================================================

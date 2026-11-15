@@ -21,6 +21,10 @@ inline std::atomic<int> linear_attention_route{0};
 /// eligible), 1 force the rolled window walk.
 inline std::atomic<int> pooling_3x3_roll{0};
 
+/// Channel-first depthwise: 0 automatic (the straight-line 3x3 interior when it
+/// is eligible), 1 force the rolled tap loop.
+inline std::atomic<int> depthwise_3x3_roll{0};
+
 /// CUDA GEMM split-K: -1 automatic, 0 disable, N > 1 force N splits (clamped by
 /// the same rules as the auto choice).
 inline std::atomic<int> cuda_splitk{-1};

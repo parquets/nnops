@@ -696,18 +696,154 @@ inline void pool_channel_last(T* output, const T* input, const PoolingKernelPara
     }
 }
 
+// A tap of the four-row straight-line body: one `srcs[0]` vector, and one
+// `srcs[1]` vector when NV == 2, added to each output row's accumulator. `KH` is
+// the filter row and `OFF` the walking column offset, both literals at the call
+// site, so a tap's source addresses are literal displacements of pointers the
+// allocator holds in registers. The two output rows a group can reach past the
+// plane are compile-time guards (`TOP_OK` / `BOT_OK`), so a masked tap costs no
+// branch. Token-pasted row names are the point: an indexed `acc[r][k]` array is
+// what the per-row kernel spills.
+#define NNOPS_POOL3X3X4_ROW(R, KH, OFF)                                       \
+    if constexpr ((TOP_OK || (R) != 0 || (KH) != 0) &&                        \
+                  (BOT_OK || (R) != 3 || (KH) != 2)) {                        \
+        {                                                                     \
+            const V x0 = srcs[0].load_ptr(row[(R) * S + (KH)] + (OFF));       \
+            a##R##0 = IsMax ? v_max(a##R##0, x0) : v_add(a##R##0, x0);        \
+        }                                                                     \
+        if constexpr (NV == 2) {                                              \
+            const V x1 = srcs[1].load_ptr(row[(R) * S + (KH)] + (OFF) + kL);  \
+            a##R##1 = IsMax ? v_max(a##R##1, x1) : v_add(a##R##1, x1);        \
+        }                                                                     \
+    }
+
+#define NNOPS_POOL3X3X4_TAP(KH, OFF)                                          \
+    NNOPS_POOL3X3X4_ROW(0, KH, OFF)                                           \
+    NNOPS_POOL3X3X4_ROW(1, KH, OFF)                                           \
+    NNOPS_POOL3X3X4_ROW(2, KH, OFF)                                           \
+    NNOPS_POOL3X3X4_ROW(3, KH, OFF)
+
+#define NNOPS_POOL3X3X4_STORE(OW)                                             \
+    do {                                                                      \
+        if constexpr (!IsMax) {                                               \
+            a00 = v_mul(a00, vs); a01 = v_mul(a01, vs);                       \
+            a10 = v_mul(a10, vs); a11 = v_mul(a11, vs);                       \
+            a20 = v_mul(a20, vs); a21 = v_mul(a21, vs);                       \
+            a30 = v_mul(a30, vs); a31 = v_mul(a31, vs);                       \
+        }                                                                     \
+        dsts[0].store(0, (OW), a00);                                          \
+        dsts[0].store(1, (OW), a10);                                          \
+        dsts[0].store(2, (OW), a20);                                          \
+        dsts[0].store(3, (OW), a30);                                          \
+        if constexpr (NV == 2) {                                              \
+            dsts[1].store(0, (OW), a01);                                      \
+            dsts[1].store(1, (OW), a11);                                      \
+            dsts[1].store(2, (OW), a21);                                      \
+            dsts[1].store(3, (OW), a31);                                      \
+        }                                                                     \
+    } while (0)
+
+/// Four output rows at once, straight-line. Every row of the group gets its own
+/// named accumulator — four chains at NV = 1, eight with the second vector — so
+/// the nine-tap add chain of one row is covered by the other rows' work instead
+/// of running alone. One row at a time leaves the two vectors of a pair as the
+/// only independent chains, and the adds issue at half the port rate.
+///
+/// The horizontal edge columns keep a rolled pass: they are two columns per
+/// strip, and folding their validity test into the straight-line body would put
+/// a branch on every tap. `row[]` is indexed by literals, so it stays in
+/// general-purpose registers, where the per-row kernel's `rp0` recomputation
+/// put it in memory.
+template <int NV, bool IsMax, int S, bool TOP_OK, bool BOT_OK, typename Src,
+          typename Dst>
+inline void pool_channel_last_3x3x4(const PoolingKernelParams& p, float avg_scale,
+                                    const Src (&srcs)[NV], const Dst (&dsts)[NV])
+{
+    using V = decltype(srcs[0].zero());
+    using InPtr = const typename Src::elem*;
+    constexpr int64_t kL = kChannelLanes;
+    constexpr int kRows = 3 * S + 3;
+    const V vinit = IsMax ? srcs[0].set1(-std::numeric_limits<float>::infinity())
+                          : srcs[0].zero();
+    const V vs = srcs[0].set1(avg_scale);
+    const int64_t pix = p.pix_stride;
+    const int64_t rs = p.in_row_stride;
+    const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
+
+    // One pointer per distinct input row of the group, biased by the left pad so
+    // a tap's address is `row + (ow*SW + kw)*pix`. A masked-out row never
+    // reaches a load, so it holds a pointer that is valid to form.
+    const InPtr img = srcs[0].ptr_at(0);
+    const int64_t ihb = p.oh * S - p.PH;
+    InPtr row[kRows];
+    for (int i = 0; i < kRows; ++i) {
+        const bool live = (TOP_OK || i != 0) && (BOT_OK || i != kRows - 1);
+        row[i] = live ? img + (ihb + i) * rs - p.PW * pix : img;
+    }
+
+    const int64_t ow_lo = (p.PW + S - 1) / S;
+    const int64_t last_hi = p.IW - 1 + p.PW - 2;
+    const int64_t ow_hi = (last_hi >= 0) ? last_hi / S : -1;
+    const int64_t off_ok_lo = p.PW;
+    const int64_t off_ok_hi = p.IW + p.PW;
+
+    const auto masked_col = [&](int64_t ow) {
+        V a00 = vinit, a01 = vinit, a10 = vinit, a11 = vinit;
+        V a20 = vinit, a21 = vinit, a30 = vinit, a31 = vinit;
+        const int64_t ow_off = ow * S;
+        for (int64_t kw = 0; kw < 3; ++kw) {
+            const int64_t off = ow_off + kw;
+            if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+            const int64_t at = off * pix;
+            NNOPS_POOL3X3X4_TAP(0, at)
+            NNOPS_POOL3X3X4_TAP(1, at)
+            NNOPS_POOL3X3X4_TAP(2, at)
+        }
+        NNOPS_POOL3X3X4_STORE(ow);
+    };
+
+    const int64_t iw_lo = (ow_lo > p.ow0) ? ow_lo : p.ow0;
+    const int64_t iw_hi = (ow_hi + 1 < ow_end) ? ow_hi + 1 : ow_end;
+    for (int64_t ow = p.ow0; ow < iw_lo; ++ow) { masked_col(ow); }
+
+    // Three walking source offsets, one per `kw`, so the column index disappears
+    // from the tap addresses and no tap costs an address multiply.
+    const int64_t step = S * pix;
+    int64_t o0 = iw_lo * step;
+    int64_t o1 = o0 + pix;
+    int64_t o2 = o1 + pix;
+    for (int64_t ow = iw_lo; ow < iw_hi;
+         ++ow, o0 += step, o1 += step, o2 += step) {
+        V a00 = vinit, a01 = vinit, a10 = vinit, a11 = vinit;
+        V a20 = vinit, a21 = vinit, a30 = vinit, a31 = vinit;
+        NNOPS_POOL3X3X4_TAP(0, o0) NNOPS_POOL3X3X4_TAP(0, o1)
+        NNOPS_POOL3X3X4_TAP(0, o2) NNOPS_POOL3X3X4_TAP(1, o0)
+        NNOPS_POOL3X3X4_TAP(1, o1) NNOPS_POOL3X3X4_TAP(1, o2)
+        NNOPS_POOL3X3X4_TAP(2, o0) NNOPS_POOL3X3X4_TAP(2, o1)
+        NNOPS_POOL3X3X4_TAP(2, o2)
+        NNOPS_POOL3X3X4_STORE(ow);
+    }
+
+    const int64_t iw_tail = (iw_hi > iw_lo) ? iw_hi : iw_lo;
+    for (int64_t ow = iw_tail; ow < ow_end; ++ow) { masked_col(ow); }
+}
+
+#undef NNOPS_POOL3X3X4_ROW
+#undef NNOPS_POOL3X3X4_TAP
+#undef NNOPS_POOL3X3X4_STORE
+
 /// Straight-line 3x3 window on the channel lane: KD=1, DH=DW=1 and square
 /// strides, folds the nine taps into literal offsets and walks the column
 /// offsets, so the body carries no tap counter and no per-tap address
 /// multiply. Only the count-free case; a window that can be all padding keeps
 /// the rolled kernel that counts taps.
 ///
-/// One output row at a time: its accumulators are one or two vectors, which the
-/// allocator keeps in registers. A group's `V acc[R][NV]` array went to the
-/// stack on x86-64 (the array's address is taken by the row loop), so every tap
-/// was a load-store round trip on both the straight-line and the masked path.
-/// Splitting per row also lets a group that touches the padding still run its
-/// interior rows straight-line.
+/// A complete four-row group whose window reaches at most one row past the plane
+/// at either end takes `pool_channel_last_3x3x4`, which interleaves the rows'
+/// chains. This per-row walk still carries the groups that do not: the bottom
+/// group of a plane whose height is not a multiple of four, and any group that
+/// reaches further than one row past the plane. Splitting per row is also what
+/// gives it the fallback path's masked pass.
 template <int R, int NV, bool IsMax, int S, typename Src, typename Dst>
 inline void pool_channel_last_rows_3x3(const PoolingKernelParams& p, float avg_scale,
                           const Src (&srcs)[NV], const Dst (&dsts)[NV])
@@ -719,6 +855,35 @@ inline void pool_channel_last_rows_3x3(const PoolingKernelParams& p, float avg_s
                           : srcs[0].zero();
     const int64_t pix = p.pix_stride;
     const int64_t rs = p.in_row_stride;
+
+    // The grouped body needs all four output rows live and every input row it
+    // reads inside the plane, except the two the compile-time guards drop: the
+    // top row of the first output row and the bottom row of the last.
+    if constexpr (R == 4) {
+        constexpr int64_t kRows = 3 * S + 3;
+        const int64_t ihb = p.oh * S - p.PH;
+        const int64_t ih_max = ihb + kRows - 1;
+        if (p.OH - p.oh >= 4 && ihb >= -1 && ih_max <= p.IH) {
+            const bool top_ok = ihb >= 0;
+            const bool bot_ok = ih_max < p.IH;
+            if (top_ok) {
+                if (bot_ok) {
+                    pool_channel_last_3x3x4<NV, IsMax, S, true, true>(
+                        p, avg_scale, srcs, dsts);
+                } else {
+                    pool_channel_last_3x3x4<NV, IsMax, S, true, false>(
+                        p, avg_scale, srcs, dsts);
+                }
+            } else if (bot_ok) {
+                pool_channel_last_3x3x4<NV, IsMax, S, false, true>(
+                    p, avg_scale, srcs, dsts);
+            } else {
+                pool_channel_last_3x3x4<NV, IsMax, S, false, false>(
+                    p, avg_scale, srcs, dsts);
+            }
+            return;
+        }
+    }
 
     const InPtr img = srcs[0].ptr_at(0);
     const int64_t ow_lo = (p.PW + S - 1) / S;
