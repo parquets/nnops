@@ -28,7 +28,9 @@
 #include "simd_access.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -642,6 +644,13 @@ inline void pool_last(T* output, const T* input, const PoolingKernelParams& p,
 /// offsets, so the body carries no tap counter and no per-tap address
 /// multiply. Only the count-free case; a window that can be all padding keeps
 /// the rolled kernel that counts taps.
+///
+/// One output row at a time: its accumulators are one or two vectors, which the
+/// allocator keeps in registers. A group's `V acc[R][NV]` array went to the
+/// stack on x86-64 (the array's address is taken by the row loop), so every tap
+/// was a load-store round trip on both the straight-line and the masked path.
+/// Splitting per row also lets a group that touches the padding still run its
+/// interior rows straight-line.
 template <int R, int NV, bool IsMax, int S, typename Src, typename Dst>
 inline void pool_rows_3x3(const PoolingKernelParams& p, float avg_scale,
                           const Src (&srcs)[NV], const Dst (&dsts)[NV])
@@ -649,81 +658,85 @@ inline void pool_rows_3x3(const PoolingKernelParams& p, float avg_scale,
     using V = decltype(srcs[0].zero());
     using InPtr = const typename Src::elem*;
     constexpr int64_t kL = kChannelLanes;
-    constexpr int64_t kRows = (R - 1) * S + 3;
-    const V vzero = srcs[0].zero();
     const V vinit = IsMax ? srcs[0].set1(-std::numeric_limits<float>::infinity())
-                          : vzero;
+                          : srcs[0].zero();
     const int64_t pix = p.pix_stride;
+    const int64_t rs = p.in_row_stride;
 
     const InPtr img = srcs[0].ptr_at(0);
-    InPtr row[kRows];
-    bool all_rows = true;
-    for (int64_t i = 0; i < kRows; ++i) {
-        const int64_t ih = p.oh * S + i - p.PH;
-        const bool ok = ih >= 0 && ih < p.IH;
-        row[i] = ok ? img + ih * p.in_row_stride : nullptr;
-        all_rows = all_rows && ok;
-    }
-
     const int64_t ow_lo = (p.PW + S - 1) / S;
     const int64_t last_hi = p.IW - 1 + p.PW - 2;
     const int64_t ow_hi = (last_hi >= 0) ? last_hi / S : -1;
-    const int64_t off_lo = 0;
-    const int64_t off_hi = p.IW;
     const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
 
-    for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
-        V acc[R][NV];
-        for (int r = 0; r < R; ++r) {
-            for (int k = 0; k < NV; ++k) { acc[r][k] = vinit; }
-        }
+    // One input row's three horizontally adjacent taps into `acc`.
+    const auto tap3 = [&](const Src& src, const InPtr rp, int64_t o0,
+                          int64_t o1, int64_t o2, V& acc) {
+        const V a = src.load_ptr(rp + o0);
+        const V b = src.load_ptr(rp + o1);
+        const V c = src.load_ptr(rp + o2);
+        if constexpr (IsMax) { acc = v_max(v_max(v_max(acc, a), b), c); }
+        else { acc = v_add(v_add(v_add(acc, a), b), c); }
+    };
 
-        if (all_rows && ow >= ow_lo && ow <= ow_hi) {
-            const int64_t o0 = (ow * S - p.PW) * pix;
+    // Row outer: its valid tap range and base pointer are fixed for the whole
+    // width sweep, which is the whole cost of the boundary path on a small
+    // plane (a 7x7 output is four columns wide, so the old column-outer order
+    // rebuilt that setup once per output pixel).
+    for (int r = 0; r < R; ++r) {
+        const int64_t oh_r = p.oh + r;
+        if (oh_r >= p.OH) { continue; }
+        const int64_t ihb = oh_r * S - p.PH;
+        const int64_t kh_lo = ihb >= 0 ? 0 : -ihb;
+        const int64_t kh_hi = std::min<int64_t>(3, p.IH - ihb);
+        const InPtr rp0 = img + (ihb + kh_lo) * rs;
+        const V vs = IsMax ? vinit : srcs[0].set1(avg_scale);
+
+        for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
+            const bool col_ok = (ow >= ow_lo && ow <= ow_hi);
+            const int64_t col0 = ow * S - p.PW;
+            const int64_t o0 = col0 * pix;
             const int64_t o1 = o0 + pix;
             const int64_t o2 = o1 + pix;
-            for (int kh = 0; kh < 3; ++kh) {
-                for (int r = 0; r < R; ++r) {
-                    const InPtr rp = row[r * S + kh];
-                    for (int k = 0; k < NV; ++k) {
-                        const InPtr q = rp + k * kL;
-                        const V a = srcs[k].load_ptr(q + o0);
-                        const V b = srcs[k].load_ptr(q + o1);
-                        const V c = srcs[k].load_ptr(q + o2);
-                        if constexpr (IsMax) {
-                            acc[r][k] = v_max(v_max(v_max(acc[r][k], a), b), c);
-                        } else {
-                            acc[r][k] = v_add(v_add(v_add(acc[r][k], a), b), c);
-                        }
-                    }
-                }
-            }
-        } else {
-            for (int kh = 0; kh < 3; ++kh) {
-                for (int kw = 0; kw < 3; ++kw) {
-                    const int64_t off = ow * S + kw - p.PW;
-                    if (off < off_lo || off >= off_hi) { continue; }
-                    const int64_t at = off * pix;
-                    for (int r = 0; r < R; ++r) {
-                        const InPtr rp = row[r * S + kh];
-                        if (rp == nullptr) { continue; }
-                        for (int k = 0; k < NV; ++k) {
-                            const V a = srcs[k].load_ptr(rp + at + k * kL);
-                            if constexpr (IsMax) { acc[r][k] = v_max(acc[r][k], a); }
-                            else { acc[r][k] = v_add(acc[r][k], a); }
-                        }
-                    }
-                }
-            }
-        }
 
-        for (int r = 0; r < R; ++r) {
-            if (p.oh + r >= p.OH) { continue; }
-            for (int k = 0; k < NV; ++k) {
-                V v = acc[r][k];
-                if constexpr (!IsMax) { v = v_mul(v, srcs[k].set1(avg_scale)); }
-                dsts[k].store(r, ow, v);
+            V a0 = vinit;
+            V a1 = vinit;
+
+            if (col_ok && kh_lo == 0 && kh_hi == 3) {
+                const InPtr rp = img + ihb * rs;
+                tap3(srcs[0], rp, o0, o1, o2, a0);
+                tap3(srcs[0], rp + rs, o0, o1, o2, a0);
+                tap3(srcs[0], rp + 2 * rs, o0, o1, o2, a0);
+                if constexpr (NV == 2) {
+                    tap3(srcs[1], rp + kL, o0, o1, o2, a1);
+                    tap3(srcs[1], rp + rs + kL, o0, o1, o2, a1);
+                    tap3(srcs[1], rp + 2 * rs + kL, o0, o1, o2, a1);
+                }
+            } else {
+                // Only the in-range taps of the window are visited, so the
+                // boundary is a shorter loop rather than a bounds test per tap.
+                const int64_t kw_lo = col0 >= 0 ? 0 : -col0;
+                const int64_t kw_hi = std::min<int64_t>(3, p.IW - col0);
+                for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
+                    const InPtr rp = rp0 + (kh - kh_lo) * rs;
+                    for (int64_t kw = kw_lo; kw < kw_hi; ++kw) {
+                        const int64_t at = (col0 + kw) * pix;
+                        const V x0 = srcs[0].load_ptr(rp + at);
+                        a0 = IsMax ? v_max(a0, x0) : v_add(a0, x0);
+                        if constexpr (NV == 2) {
+                            const V x1 = srcs[1].load_ptr(rp + at + kL);
+                            a1 = IsMax ? v_max(a1, x1) : v_add(a1, x1);
+                        }
+                    }
+                }
             }
+
+            if constexpr (!IsMax) {
+                a0 = v_mul(a0, vs);
+                if constexpr (NV == 2) { a1 = v_mul(a1, vs); }
+            }
+            dsts[0].store(r, ow, a0);
+            if constexpr (NV == 2) { dsts[1].store(r, ow, a1); }
         }
     }
 }
@@ -748,11 +761,30 @@ inline bool pool_try_3x3(const PoolingKernelParams& p, float scale,
     return false;
 }
 
+/// Route override for A/B measurement: a nonzero store forces the rolled walk
+/// and skips the straight-line 3x3 path. The environment seeds it once at
+/// start-up (NNOPS_POOLING_ROUTE=roll); a bench flips the atomic in-process, so
+/// both routes are timed over the same buffers. The hot check is one relaxed
+/// load — a per-call getenv costs microseconds on Windows and would swamp a
+/// small plane.
+inline std::atomic<int> pool_route_roll{[] {
+    const char* e = std::getenv("NNOPS_POOLING_ROUTE");
+    return (e != nullptr && std::strcmp(e, "roll") == 0) ? 1 : 0;
+}()};
+
+inline bool pool_3x3_route_enabled()
+{
+    return pool_route_roll.load(std::memory_order_relaxed) == 0;
+}
+
 template <int NV, bool IsMax, typename Src, typename Dst>
 inline void pool_rows_counted(const PoolingKernelParams& p, float scale,
                               const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
-    if (pool_try_3x3<NV, IsMax>(p, scale, srcs, dsts)) { return; }
+    if (pool_3x3_route_enabled() &&
+        pool_try_3x3<NV, IsMax>(p, scale, srcs, dsts)) {
+        return;
+    }
     if (pooling_counts_taps(p, IsMax)) {
         pool_rows<4, NV, IsMax, true>(p, scale, srcs, dsts);
     } else {

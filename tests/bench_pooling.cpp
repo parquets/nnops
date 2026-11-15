@@ -20,10 +20,18 @@
 /// It times the same two modes in each layout — the global mean and a 3x3
 /// stride-2 max — and a null re-run of channel-first reports instrument drift.
 ///
+/// The window bench isolates the channel-last 3x3 route: the straight-line
+/// `pool_rows_3x3` against the rolled `pool_rows` walk, over the same buffers,
+/// by flipping the kernel's cached route flag (`pool_route_roll`; the internal
+/// header is included for that one hook). Max/avg, stride 1/2, one-block and
+/// multi-block shapes, so a per-call or per-block cost shows up separately
+/// from the tap work.
+///
 /// `NNOPS_BENCH_THREADS=1` (or "1,4") pins the ladder, as in the other benches.
 
 #include "nnops/ops/layout_convert.hpp"
 #include "nnops/ops/pooling.hpp"
+#include "backend/cpu/simd_kernel/simd_pooling.hpp"   // pool_route_roll (bench hook)
 #include "nnops/ops/reduce.hpp"
 #include "common/bench_harness.hpp"
 #include "common/channel_last.hpp"
@@ -438,6 +446,123 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
     }
 }
 
+// ============================================================
+// Window 3x3: the straight-line route against the rolled walk
+// ============================================================
+
+struct WindowCase {
+    const char* name;
+    int64_t C, H, W;
+    bool f16 = false;
+};
+
+/// Flips the kernel's cached route flag, so one process times both routes over
+/// the same buffers. (The environment seeds the flag at start-up; it is not
+/// re-read per call — a getenv there costs microseconds.)
+void set_pool_route(bool roll)
+{
+    nnops::kernel::pool_route_roll.store(roll ? 1 : 0, std::memory_order_relaxed);
+}
+
+template <typename T>
+void run_window_case(const WindowCase& c, const std::vector<int>& threads,
+                     int rounds, int iters)
+{
+    constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    const int64_t shape[] = {1, c.C, c.H, c.W};
+    auto [in_vec, in_cf] = make_random<T>(shape, 31);
+    (void)in_cf;
+    auto cl_vec = test::to_channel_last<T>(
+        std::span<const T>(in_vec.data(), in_vec.size()), 1, c.C, c.H * c.W);
+    TensorView in_cl(shape, dt, cl_vec.data(), TensorLayout::NHWC);
+
+    struct Mode {
+        const char* name;
+        PoolingType type;
+        int64_t stride;
+    };
+    const Mode modes[] = {
+        {"max 3x3 s2", PoolingType::Max, 2},
+        {"avg 3x3 s2", PoolingType::Average, 2},
+        {"max 3x3 s1", PoolingType::Max, 1},
+        {"avg 3x3 s1", PoolingType::Average, 1},
+    };
+    const double in_bytes = static_cast<double>(c.C) * c.H * c.W *
+                            (c.f16 ? 2.0 : 4.0);
+
+    std::printf("  %-26s [1,%lld,%lld,%lld] %s\n", c.name, (long long)c.C,
+                (long long)c.H, (long long)c.W, c.f16 ? "f16" : "f32");
+
+    for (const Mode& m : modes) {
+        PoolingAttributes attrs;
+        attrs.type = m.type;
+        attrs.kernel_shape = {1, 3, 3};
+        attrs.stride = {1, m.stride, m.stride};
+        attrs.padding = {0, 1, 1};
+        auto op = Pooling::create(attrs, Backend::CPU);
+        const TensorDesc d = in_cl.desc();
+        const TensorDesc ad[] = {d};
+        auto od = op->getOutputTensorDesc(ad);
+        const int64_t elems = std::max<int64_t>(
+            od[0].numel(), static_cast<int64_t>(od[0].storage_bytes() / sizeof(T)));
+        std::vector<T> a_buf(static_cast<size_t>(elems)), b_buf(static_cast<size_t>(elems));
+        auto a_out = test::make_channel_first(od[0], a_buf.data());
+        auto b_out = test::make_channel_first(od[0], b_buf.data());
+
+        const TensorView x[] = {in_cl};
+        TensorView oa[] = {a_out};
+        TensorView ob[] = {b_out};
+
+        std::printf("    %-10s", m.name);
+        for (int nt : threads) {
+            BenchPool pool(nt);
+            ComputeContext ctx;
+            ctx.cpu = pool.cpu;
+            const ComputeContext& use = (nt > 1) ? ctx : ComputeContext{};
+
+            set_pool_route(false);
+            const Status sa = op->compute(oa, x, use, nullptr);
+            set_pool_route(true);
+            const Status sb = op->compute(ob, x, use, nullptr);
+            set_pool_route(false);
+
+            if (!is_ok(sa) || !is_ok(sb)) {
+                std::printf("  %2dT unsupported", nt);
+                continue;
+            }
+
+            // Max is exact between the routes; avg reassociates the taps.
+            if (nt == threads.front()) {
+                const double tol = (m.type == PoolingType::Max)
+                                       ? 0.0 : (c.f16 ? 2e-3 : 1e-5);
+                double worst = 0.0;
+                for (int64_t i = 0; i < elems; ++i) {
+                    const double d0 = std::abs(
+                        static_cast<double>(simd::s_load(&a_buf[static_cast<size_t>(i)])) -
+                        static_cast<double>(simd::s_load(&b_buf[static_cast<size_t>(i)])));
+                    worst = std::max(worst, d0);
+                }
+                if (worst > tol) {
+                    std::printf(" [routes differ %.3g]", worst);
+                }
+            }
+
+            std::vector<double> ta, tb;
+            for (int r = 0; r < rounds; ++r) {
+                set_pool_route(false);
+                ta.push_back(time_us(iters, [&] { op->compute(oa, x, use, nullptr); }));
+                set_pool_route(true);
+                tb.push_back(time_us(iters, [&] { op->compute(ob, x, use, nullptr); }));
+            }
+            set_pool_route(false);
+            const double tn = median(ta), tr = median(tb);
+            std::printf("  %2dT 3x3 %8.2f us | rolled %8.2f us | %5.2fx | %6.1f GB/s",
+                        nt, tn, tr, tr / tn, in_bytes / tn / 1e3);
+        }
+        std::printf("\n");
+    }
+}
+
 }  // namespace
 
 NNOPS_BENCH(pooling_global) {
@@ -453,6 +578,7 @@ NNOPS_BENCH(pooling_global) {
     }
 
     const GlobalCase cases[] = {
+        {"tiny 16@7x7",            1,   16, 7, 7},
         {"resnet18 avgpool",        1,  512, 7, 7},
         {"mobilenetv2 avgpool",     1, 1280, 7, 7},
         {"backbone plane 56x56",    1,  256, 56, 56},
@@ -495,3 +621,36 @@ NNOPS_BENCH(pooling_layouts) {
         }
     }
 }
+
+NNOPS_BENCH(pooling_window_3x3) {
+    const std::vector<int> threads = bench_threads();
+    const int rounds = 3;
+    const int iters = 200;  // the 56x56 plane is ~100 us a call, still ~0.1 s a round
+
+    std::printf("pooling window 3x3: the straight-line route against the rolled walk\n");
+    std::printf("  pool=%s threads=", nnops::test::bench_pool_name());
+    for (size_t i = 0; i < threads.size(); ++i) {
+        std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
+    }
+
+    const WindowCase cases[] = {
+        {"one block 7x7",         16,  7,  7},
+        {"two blocks 7x7",        32,  7,  7},
+        {"one block 56x56",       16, 56, 56},
+        {"resnet18 pool 7x7",    512,  7,  7},
+        {"narrow 100 @14x14",    100, 14, 14},
+        {"backbone 256 @56x56",  256, 56, 56},
+        {"resnet18 pool 7x7 f16", 512, 7, 7, true},
+        {"backbone 256 f16",     256, 56, 56, true},
+    };
+
+    for (const auto& c : cases) {
+        if (c.f16) {
+            run_window_case<half>(c, threads, rounds, iters);
+        } else {
+            run_window_case<float>(c, threads, rounds, iters);
+        }
+    }
+}
+
+
