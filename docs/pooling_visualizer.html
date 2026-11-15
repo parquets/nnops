@@ -1,0 +1,986 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nnops CPU Pooling — 切分与内核执行可视化</title>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --card: #ffffff;
+    --ink: #1c2733;
+    --muted: #64748b;
+    --line: #dbe2ea;
+    --blue: #2b6cb0;
+    --blue-soft: #e8f1fb;
+    --green: #2f855a;
+    --green-soft: #e6f4ec;
+    --amber: #b7791f;
+    --amber-soft: #fdf3e3;
+    --orange: #dd6b20;
+    --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    padding: 22px 28px 10px;
+  }
+  header h1 { margin: 0 0 4px; font-size: 21px; letter-spacing: .2px; }
+  header p { margin: 0; color: var(--muted); }
+  main { padding: 8px 28px 40px; display: grid; gap: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  }
+  .card h2 {
+    margin: 0 0 10px; font-size: 14px; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--muted); font-weight: 600;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 14px 20px; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 11px; color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
+  .field input, .field select {
+    width: 76px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px;
+    font: 13px var(--mono); background: #fff; color: var(--ink);
+  }
+  .field select { width: auto; }
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; }
+  button {
+    border: 1px solid var(--line); background: #fff; color: var(--ink);
+    padding: 6px 11px; border-radius: 7px; font-size: 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--blue); color: var(--blue); }
+  button.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
+  button.primary:hover { filter: brightness(1.06); color: #fff; }
+  .grid2 { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; }
+  .grid3 { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .95fr) minmax(0, .9fr); gap: 16px; }
+  @media (max-width: 1100px) {
+    .grid2, .grid3 { grid-template-columns: 1fr; }
+  }
+  canvas { display: block; width: 100%; border-radius: 8px; background: #fbfcfe; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; color: var(--muted); font-size: 12px; }
+  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; border: 1px solid rgba(0,0,0,.12); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 14px; margin-top: 12px; }
+  .stat { background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .stat .v { font: 15px var(--mono); }
+  .route { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+  .route li { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+  .route .ok { color: var(--green); font-weight: 700; }
+  .route .no { color: var(--amber); font-weight: 700; }
+  .route code { font-family: var(--mono); font-size: 12px; color: #334155; }
+  .verdict {
+    margin-top: 10px; padding: 10px 12px; border-radius: 8px;
+    background: var(--green-soft); border: 1px solid #b7dfc8; color: #1d4d33;
+  }
+  .verdict b { font-family: var(--mono); }
+  .steps { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 13px; }
+  .steps code { font-family: var(--mono); font-size: 12px; color: #334155; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .chinfo { font-size: 12.5px; color: #334155; margin-top: 10px; display: grid; gap: 4px; }
+  .chinfo code { font-family: var(--mono); font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  td.num { font-family: var(--mono); }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-family: var(--mono); background: var(--blue-soft); color: var(--blue); }
+  .tag.amber { background: var(--amber-soft); color: var(--amber); }
+  .tag.green { background: var(--green-soft); color: var(--green); }
+  .anim { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .anim .count { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>CPU Pooling — 切分 / lane / 内核执行</h1>
+  <p>对应 <code>pooling_channel_last_impl</code>（channel-last 驱动）、<code>pool_last → pool_channel_last_rows_counted → pool_channel_last_rows_3x3 / pool_channel_last_rows</code>、
+     <code>pooling_channel_first_impl → pool_channel_first</code>（channel-first）。数字/条件取自当前源码。</p>
+</header>
+
+<main>
+  <!-- ---------------- controls ---------------- -->
+  <section class="card">
+    <div class="controls">
+      <div class="field"><label>N</label><input id="inN" type="number" min="1" max="8" value="1"></div>
+      <div class="field"><label>C</label><input id="inC" type="number" min="1" max="2048" step="1" value="512"></div>
+      <div class="field"><label>H</label><input id="inH" type="number" min="1" max="128" value="7"></div>
+      <div class="field"><label>W</label><input id="inW" type="number" min="1" max="128" value="7"></div>
+      <div class="field"><label>KH</label><input id="inKH" type="number" min="1" max="7" value="3"></div>
+      <div class="field"><label>KW</label><input id="inKW" type="number" min="1" max="7" value="3"></div>
+      <div class="field"><label>SH</label><input id="inSH" type="number" min="1" max="4" value="2"></div>
+      <div class="field"><label>SW</label><input id="inSW" type="number" min="1" max="4" value="2"></div>
+      <div class="field"><label>PH</label><input id="inPH" type="number" min="0" max="4" value="1"></div>
+      <div class="field"><label>PW</label><input id="inPW" type="number" min="0" max="4" value="1"></div>
+      <div class="field"><label>dtype</label>
+        <select id="inDtype"><option value="f32">f32</option><option value="f16">f16</option></select>
+      </div>
+      <div class="field"><label>pool</label>
+        <select id="inType"><option value="max">max</option><option value="avg">avg</option></select>
+      </div>
+      <div class="field"><label>layout</label>
+        <select id="inLayout"><option value="last">channel-last</option><option value="first">channel-first</option></select>
+      </div>
+      <div class="field"><label>route</label>
+        <select id="inRoute"><option value="auto">auto</option><option value="roll">forced rolled</option></select>
+      </div>
+      <div class="field"><label>threads</label>
+        <select id="inThreads"><option>1</option><option>2</option><option>4</option><option>8</option><option selected>20</option></select>
+      </div>
+      <div class="field" style="min-width:220px">
+        <label>presets</label>
+        <div class="presets">
+          <button data-preset="resnet">ResNet 512@7x7 s2</button>
+          <button data-preset="narrow">100@14x14 s2</button>
+          <button data-preset="backbone">256@56x56 s2</button>
+          <button data-preset="block">one 16@7x7</button>
+          <button data-preset="s1">512@7x7 s1</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------- task map + driver summary ---------------- -->
+  <section class="grid2">
+    <div class="card">
+      <h2>1 · 驱动切分 / 任务网格</h2>
+      <canvas id="taskCanvas"></canvas>
+      <div class="legend">
+        <span><i class="swatch" style="background:#e8f1fb"></i>4 行组（hgroup）</span>
+        <span><i class="swatch" style="background:#fdf3e3"></i>奇数 hgroup</span>
+        <span><i class="swatch" style="background:#2f855a"></i>选中任务</span>
+        <span><i class="swatch" style="background:#dd6b20"></i>选中输出像素</span>
+        <span><i class="swatch" style="background:#e2e8f0"></i>strip 边界</span>
+      </div>
+      <div class="stats" id="stats"></div>
+    </div>
+
+    <div class="card">
+      <h2>2 · 路由判定</h2>
+      <ul class="route" id="routeList"></ul>
+      <div class="verdict" id="verdict"></div>
+      <div class="note" id="routeNote"></div>
+    </div>
+  </section>
+
+  <!-- ---------------- window + channels ---------------- -->
+  <section class="grid2">
+    <div class="card">
+      <h2>3 · 输入窗口 / tap 顺序</h2>
+      <canvas id="winCanvas"></canvas>
+      <div class="anim">
+        <button class="primary" id="playBtn">播放 tap 顺序</button>
+        <span class="count" id="tapCount"></span>
+      </div>
+      <div class="chinfo" id="winInfo"></div>
+      <div class="legend">
+        <span><i class="swatch" style="background:#2b6cb0"></i>有效 tap</span>
+        <span><i class="swatch" style="background:#fdf3e3;border-color:#b7791f"></i>越界（跳过）</span>
+        <span><i class="swatch" style="background:#ffffff;border-style:dashed"></i>padding 区域</span>
+        <span><i class="swatch" style="background:#dd6b20"></i>当前 tap</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>4 · 通道块 / lane</h2>
+      <canvas id="chCanvas"></canvas>
+      <div class="chinfo" id="chInfo"></div>
+    </div>
+  </section>
+
+  <!-- ---------------- execution + measurements ---------------- -->
+  <section class="grid2">
+    <div class="card">
+      <h2>5 · 内核执行路径</h2>
+      <ol class="steps" id="steps"></ol>
+      <div class="note" id="execNote"></div>
+    </div>
+
+    <div class="card">
+      <h2>6 · 实测（bench_pooling，1T f32，本机一次运行）</h2>
+      <table>
+        <thead><tr><th>形状</th><th>3x3 直线</th><th>rolled</th><th>比值</th></tr></thead>
+        <tbody>
+          <tr><td>512@7x7 max s2</td><td class="num">2.44 µs</td><td class="num">5.19 µs</td><td class="num">2.13x</td></tr>
+          <tr><td>512@7x7 max s1</td><td class="num">6.68 µs</td><td class="num">16.23 µs</td><td class="num">2.43x</td></tr>
+          <tr><td>100@14x14 max s2</td><td class="num">3.90 µs</td><td class="num">5.76 µs</td><td class="num">1.48x</td></tr>
+          <tr><td>256@56x56 max s2</td><td class="num">93.7 µs</td><td class="num">142.7 µs</td><td class="num">1.52x</td></tr>
+          <tr><td>one block 16@7x7 s2</td><td class="num">0.19 µs</td><td class="num">0.21 µs</td><td class="num">1.15x</td></tr>
+        </tbody>
+      </table>
+      <div class="note">
+        累计类型：channel-last/channel-first 的窗口路径与 global/adaptive 的 <b>AvgPool</b> 都用 f16 lane 累加；
+        global <b>MaxPool</b> 仍 widen 到 f32。f16 在 x86 上是 cvt→op→cvt 模拟，AArch64 为原生。
+      </div>
+      <div class="note">
+        global/adaptive 不走本页的窗口驱动：global 是平面扫描（channel-first 连续段，channel-last 按通道向量），
+        adaptive 是标量/通道向量窗口；两者没有 4 行组、strip、16 通道块这套切分。
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// state
+// ---------------------------------------------------------------------------
+const state = {
+  N: 1, C: 512, H: 7, W: 7,
+  KH: 3, KW: 3, SH: 2, SW: 2, PH: 1, PW: 1,
+  dtype: "f32", type: "max", layout: "last",
+  route: "auto", threads: 20,
+  selOh: 0, selOw: 0, selBlock: 0, selChannel: 0,
+  tapStep: -1,
+};
+
+const el = id => document.getElementById(id);
+const elemSize = () => state.dtype === "f16" ? 2 : 4;
+
+// ---------------------------------------------------------------------------
+// derive: the driver's numbers, transcribed from pooling.cpp
+// ---------------------------------------------------------------------------
+function derive() {
+  const s = state;
+  const elem = elemSize();
+  const isMax = s.type === "max";
+  const OH = Math.max(0, Math.floor((s.H + 2 * s.PH - (s.KH - 1) - 1) / s.SH) + 1);
+  const OW = Math.max(0, Math.floor((s.W + 2 * s.PW - (s.KW - 1) - 1) / s.SW) + 1);
+
+  // --- channel-last driver ---
+  const nblocks = Math.ceil(s.C / 16);
+  const hgroups = Math.ceil(OH / 4);
+  const in_rows = 4 * s.SH + (s.KH - 1);
+  const kStripBytes = 128 * 1024;
+  const per_col = in_rows * s.C * elem;
+  const cols = per_col > 0 ? Math.floor(kStripBytes / per_col) : OW;
+  let strip = OW;
+  if (OW > 0 && cols < s.SW * OW) {
+    const w = Math.floor((cols - (s.KW - 1)) / s.SW);
+    // pooling.cpp: std::clamp(w & ~15, 16, OW). For OW < 16 that violates
+    // clamp's lo <= hi precondition; MSVC/libstdc++ evaluate it as
+    // min(max(v,16), OW), which this mirrors.
+    strip = Math.min(OW, Math.max(16, w & ~15));
+  }
+  strip = Math.max(1, strip);
+  const strips = Math.max(1, Math.ceil(OW / strip));
+  const groups = s.N * hgroups * strips;
+
+  let cchunks = 1;
+  if (groups < s.threads && nblocks > 1) {
+    let best = 0;
+    for (let c = 1; c <= nblocks; c++) {
+      const bp = Math.ceil(nblocks / c);
+      const waves = Math.ceil(groups * c / s.threads);
+      const cost = waves * bp;
+      if (best === 0 || cost < best) { best = cost; cchunks = c; }
+    }
+  }
+  const blocks_per = Math.ceil(nblocks / cchunks);
+  const clTasks = groups * cchunks;
+  const tasks = s.layout === "first" ? s.N * s.C : clTasks;
+
+  // --- route predicates (per selected block: the route is a call decision) ---
+  const countsTaps = isMax
+    ? (s.PH > (s.KH - 1) || s.PW > (s.KW - 1) ||
+       (OH > 0 && (OH - 1) * s.SH - s.PH >= s.H) ||
+       (OW > 0 && (OW - 1) * s.SW - s.PW >= s.W))
+    : false;  // exclude_pad is not exposed; the UI uses the default (false)
+
+  const shape3x3 = s.KH === 3 && s.KW === 3 && s.SH === s.SW;
+
+  // --- selected task / pixel ---
+  const oh = Math.min(s.selOh, Math.max(0, OH - 1));
+  const ow = Math.min(s.selOw, Math.max(0, OW - 1));
+  const hg = Math.floor(oh / 4);
+  const st = Math.floor(ow / strip);
+  const selBlock = Math.min(s.selBlock, Math.max(0, nblocks - 1));
+  const cc = Math.floor(selBlock / blocks_per);
+
+  // --- per-block lane segments (the driver's last-block rule) ---
+  const segments = segmentPlan(s.C - selBlock * 16);
+  const segFull = segments.every(seg => seg.lanes >= 8);
+  const can3x3 = s.layout === "last" && segFull && shape3x3 && !countsTaps;
+  const use3x3 = can3x3 && s.route !== "roll";
+
+  // --- 3x3 tap geometry for the selected pixel ---
+  const ihb = oh * s.SH - s.PH;
+  const kh_lo = ihb >= 0 ? 0 : -ihb;
+  const kh_hi = Math.min(s.KH, s.H - ihb);
+  const col0 = ow * s.SW - s.PW;
+  const kw_lo = col0 >= 0 ? 0 : -col0;
+  const kw_hi = Math.min(s.KW, s.W - col0);
+  const ow_lo = Math.ceil(s.PW / s.SW);
+  const ow_hi = Math.floor((s.W - 1 + s.PW - (s.KW - 1)) / s.SW);
+  const colOk = ow >= ow_lo && ow <= ow_hi;
+  const fast = colOk && kh_lo === 0 && kh_hi === s.KH;
+
+  // rolled path's group-wide conditions
+  let allRows = true;
+  for (let r = 0; r < 4; r++) {
+    const ohr = hg * 4 + r;
+    for (let kh = 0; kh < s.KH; kh++) {
+      const ih = ohr * s.SH + kh - s.PH;
+      if (ohr >= OH || ih < 0 || ih >= s.H) allRows = false;
+    }
+  }
+  const rolledInterior = allRows && colOk;
+
+  // flat/global counts
+  const inPerCol = in_rows * s.C * elem;
+  const waves = Math.ceil(tasks / s.threads);
+
+  return {
+    elem, isMax, OH, OW, nblocks, hgroups, in_rows, per_col, cols, strip, strips,
+    groups, cchunks, blocks_per, tasks, countsTaps, shape3x3, segFull,
+    can3x3, use3x3, oh, ow, hg, st, selBlock, cc, segments,
+    ihb, kh_lo, kh_hi, col0, kw_lo, kw_hi, ow_lo, ow_hi, colOk, fast,
+    allRows, rolledInterior, inPerCol, waves,
+  };
+}
+
+// The driver's lane split for a block with `remaining` channels.
+function segmentPlan(remaining) {
+  const out = [];
+  if (remaining > 16) {
+    out.push({ lanes: 16, off: 0 });
+  } else if (remaining > 8) {
+    out.push({ lanes: 8, off: 0 });
+    out.push({ lanes: remaining - 8, off: 8 });
+  } else {
+    out.push({ lanes: remaining, off: 0 });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// canvas helpers
+// ---------------------------------------------------------------------------
+function fit(canvas, cssH) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = Math.max(240, canvas.parentElement.clientWidth - 36);
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  return { ctx, w: cssW, h: cssH };
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function label(ctx, text, x, y, color = "#64748b", size = 11, align = "left") {
+  ctx.fillStyle = color;
+  ctx.font = `${size}px ${getComputedStyle(document.body).getPropertyValue("--mono") || "monospace"}`;
+  ctx.textAlign = align;
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, x, y);
+}
+
+// ---------------------------------------------------------------------------
+// 1 · task map
+// ---------------------------------------------------------------------------
+let taskHit = null;
+
+function drawTaskMap(D) {
+  const cv = el("taskCanvas");
+  const isLast = state.layout === "last";
+  const cssH = isLast ? Math.min(560, Math.max(300, D.OH * 11 + 130)) : 320;
+  const { ctx, w, h } = fit(cv, cssH);
+
+  if (D.OH === 0 || D.OW === 0) {
+    label(ctx, "当前 kernel/stride/padding 下输出为空，没有任务。", 20, 30, "#b7791f", 13);
+    taskHit = null;
+    return;
+  }
+
+  if (isLast) {
+    const pad = 18;
+    const legendH = 70;
+    const cell = Math.max(3, Math.min(26,
+      Math.floor((w - 2 * pad) / Math.max(1, D.OW)),
+      Math.floor((h - 2 * pad - legendH) / Math.max(1, D.OH))));
+    const gw = cell * D.OW, gh = cell * D.OH;
+    const ox = Math.floor((w - gw) / 2), oy = pad + Math.max(0, Math.floor((h - 2 * pad - legendH - gh) / 2));
+    taskHit = { ox, oy, cell, D };
+
+    // hgroup bands
+    for (let oh = 0; oh < D.OH; oh++) {
+      for (let ow = 0; ow < D.OW; ow++) {
+        const hg = Math.floor(oh / 4);
+        const st = Math.floor(ow / D.strip);
+        const inSelGroup = hg === D.hg && st === D.st;
+        ctx.fillStyle = (hg % 2 === 0) ? "#e8f1fb" : "#fdf3e3";
+        if (!inSelGroup) ctx.globalAlpha = 0.55;
+        ctx.fillRect(ox + ow * cell, oy + oh * cell, cell - 1, cell - 1);
+        ctx.globalAlpha = 1;
+      }
+    }
+    // strip separators
+    ctx.strokeStyle = "#94a3b8";
+    ctx.lineWidth = 1;
+    for (let st = 1; st < D.strips; st++) {
+      const x = ox + st * D.strip * cell - 0.5;
+      ctx.beginPath(); ctx.moveTo(x, oy); ctx.lineTo(x, oy + gh); ctx.stroke();
+    }
+    // selected group outline
+    const gx = ox + D.st * D.strip * cell;
+    const gy = oy + D.hg * 4 * cell;
+    const gRows = Math.min(4, D.OH - D.hg * 4);
+    ctx.strokeStyle = "#2f855a";
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(gx + 1, gy + 1, Math.min(D.strip, D.OW - D.st * D.strip) * cell - 2,
+                   gRows * cell - 2);
+    // selected pixel
+    ctx.strokeStyle = "#dd6b20";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(ox + D.ow * cell + 1, oy + D.oh * cell + 1, cell - 2, cell - 2);
+
+    // channel chunk bar
+    const by = oy + gh + 18;
+    const bx = ox, bw = gw, bh = 16;
+    const segW = bw / Math.max(1, D.nblocks);
+    for (let b = 0; b < D.nblocks; b++) {
+      const chunk = Math.floor(b / D.blocks_per);
+      ctx.fillStyle = (chunk === D.cc) ? "#bfe3cd" : "#e2e8f0";
+      ctx.fillRect(bx + b * segW, by, Math.max(1, segW - 1), bh);
+    }
+    ctx.strokeStyle = "#dd6b20"; ctx.lineWidth = 2;
+    ctx.strokeRect(bx + D.selBlock * segW, by - 1, Math.max(2, segW + 1), bh + 2);
+    label(ctx, `channel blocks (16 ch each)  ·  cchunks=${D.cchunks}, blocks_per=${D.blocks_per}  ·  green = selected task's cc chunk`, bx, by + bh + 12, "#64748b", 11);
+
+    // axes ticks
+    label(ctx, "ow →", ox + gw / 2, oy - 8, "#94a3b8", 10, "center");
+    ctx.save();
+    ctx.translate(ox - 10, oy + gh / 2);
+    ctx.rotate(-Math.PI / 2);
+    label(ctx, "oh →", 0, 0, "#94a3b8", 10, "center");
+    ctx.restore();
+  } else {
+    // channel-first: one task per channel plane
+    const cols = Math.min(state.C, 32);
+    const rows = Math.ceil(state.C / cols);
+    const pad = 20, top = 34;
+    const cell = Math.max(4, Math.min(30,
+      Math.floor((w - 2 * pad) / cols), Math.floor((h - top - pad) / Math.max(1, rows))));
+    const gw = cell * cols, gh = cell * rows;
+    const ox = Math.floor((w - gw) / 2), oy = top;
+    taskHit = { ox, oy, cell, D, cols };
+    label(ctx, `channel-first: ${D.tasks} 个任务（N×C = ${state.N}×${state.C}），每个任务一个通道平面`, ox, 16, "#64748b", 11);
+    const selC = Math.min(state.selChannel, state.C - 1);
+    for (let c = 0; c < state.C; c++) {
+      const r = Math.floor(c / cols), q = c % cols;
+      const sel = c === selC;
+      ctx.fillStyle = sel ? "#2f855a" : ((Math.floor(c / 8) % 2 === 0) ? "#e8f1fb" : "#fdf3e3");
+      ctx.fillRect(ox + q * cell, oy + r * cell, cell - 1, cell - 1);
+    }
+    label(ctx, "点击一个通道 = 选中该平面的任务（lane 在输出宽度上，一次一个输出行）",
+          ox, oy + gh + 14, "#64748b", 11);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3 · input window and tap order
+// ---------------------------------------------------------------------------
+function tapList(D) {
+  // The tap order the kernel actually visits for the selected output pixel.
+  if (state.layout === "first") {
+    // channel-first: kd, kh, kw (one output column's taps; lanes are columns)
+    const out = [];
+    for (let kh = 0; kh < state.KH; kh++) {
+      for (let kw = 0; kw < state.KW; kw++) {
+        const ih = D.oh * state.SH + kh - state.PH;
+        const iw = D.ow * state.SW + kw - state.PW;
+        out.push({ kh, kw, ih, iw, valid: ih >= 0 && ih < state.H && iw >= 0 && iw < state.W });
+      }
+    }
+    return out;
+  }
+  const out = [];
+  const klo = D.use3x3 ? D.kh_lo : 0;
+  const khi = D.use3x3 ? D.kh_hi : state.KH;
+  const wlo = D.use3x3 ? D.kw_lo : 0;
+  const whi = D.use3x3 ? D.kw_hi : state.KW;
+  if (D.use3x3) {
+    for (let kh = klo; kh < khi; kh++) {
+      for (let kw = wlo; kw < whi; kw++) {
+        out.push({ kh, kw, ih: D.oh * state.SH + kh - state.PH, iw: D.ow * state.SW + kw - state.PW, valid: true });
+      }
+    }
+    return out;
+  }
+  // rolled: kh, kw; invalid taps are still "visited" but skipped by the checks
+  for (let kh = 0; kh < state.KH; kh++) {
+    for (let kw = 0; kw < state.KW; kw++) {
+      const ih = D.oh * state.SH + kh - state.PH;
+      const iw = D.ow * state.SW + kw - state.PW;
+      out.push({ kh, kw, ih, iw, valid: ih >= 0 && ih < state.H && iw >= 0 && iw < state.W });
+    }
+  }
+  return out;
+}
+
+function drawWindow(D) {
+  const cv = el("winCanvas");
+  const taps = tapList(D);
+  const valid = taps.filter(t => t.valid);
+
+  // draw region: include one cell of context around the window's rows/cols
+  let r0 = Infinity, r1 = -Infinity, c0 = Infinity, c1 = -Infinity;
+  for (const t of taps) { r0 = Math.min(r0, t.ih); r1 = Math.max(r1, t.ih); c0 = Math.min(c0, t.iw); c1 = Math.max(c1, t.iw); }
+  if (!isFinite(r0)) { r0 = 0; r1 = 0; c0 = 0; c1 = 0; }
+  r0 -= 1; r1 += 1; c0 -= 1; c1 += 1;
+  // keep the view bounded and clip to the plane +/- one pad cell
+  const maxCells = 12;
+  if (r1 - r0 + 1 > maxCells) { r1 = r0 + maxCells - 1; }
+  if (c1 - c0 + 1 > maxCells) { c1 = c0 + maxCells - 1; }
+
+  const step = state.layout === "first" ? 26 : 26;
+  const rows = r1 - r0 + 1, cols = c1 - c0 + 1;
+  const cssH = Math.max(220, rows * step + 92);
+  const { ctx, w, h } = fit(cv, cssH);
+
+  const gw = cols * step, gh = rows * step;
+  const ox = Math.floor((w - gw) / 2);
+  const oy = 44;
+  const cellAt = (r, c) => ({ x: ox + (c - c0) * step, y: oy + (r - r0) * step });
+
+  label(ctx, `输入窗口  (oh=${D.oh}, ow=${D.ow})`, ox, 18, "#334155", 12);
+  label(ctx, `ihb=${D.ihb}, kh=[${D.kh_lo},${D.kh_hi})  ·  col0=${D.col0}, kw=[${D.kw_lo},${D.kw_hi})`,
+        ox, 33, "#94a3b8", 11);
+
+  // image cells
+  for (let r = r0; r <= r1; r++) {
+    for (let c = c0; c <= c1; c++) {
+      const { x, y } = cellAt(r, c);
+      const inImg = r >= 0 && r < state.H && c >= 0 && c < state.W;
+      if (inImg) {
+        ctx.fillStyle = "#ffffff";
+        ctx.strokeStyle = "#dbe2ea";
+      } else {
+        ctx.fillStyle = "#f8fafc";
+        ctx.strokeStyle = "#cbd5e1";
+      }
+      ctx.lineWidth = 1;
+      ctx.setLineDash(inImg ? [] : [3, 3]);
+      ctx.fillRect(x + 1, y + 1, step - 2, step - 2);
+      ctx.strokeRect(x + 1.5, y + 1.5, step - 3, step - 3);
+      ctx.setLineDash([]);
+      label(ctx, inImg ? `${r},${c}` : "pad", x + step / 2, y + step / 2 + 7,
+            inImg ? "#94a3b8" : "#b7791f", 8, "center");
+    }
+  }
+
+  // window outline, clipped to the drawn view
+  const wr0 = D.oh * state.SH - state.PH;
+  const wc0 = D.ow * state.SW - state.PW;
+  const wr1 = wr0 + (state.KH - 1) * state.SH;
+  const wc1 = wc0 + (state.KW - 1) * state.SW;
+  const vr0 = Math.max(r0, wr0), vr1 = Math.min(r1, wr1);
+  const vc0 = Math.max(c0, wc0), vc1 = Math.min(c1, wc1);
+  if (vr1 >= vr0 && vc1 >= vc0) {
+    const p0 = cellAt(vr0, vc0);
+    ctx.strokeStyle = "rgba(43,108,176,.45)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(p0.x + 2, p0.y + 2, (vc1 - vc0 + 1) * step - 4,
+                   (vr1 - vr0 + 1) * step - 4);
+  }
+
+  // taps, in the kernel's order; the current one during playback
+  taps.forEach((t, i) => {
+    const { x, y } = cellAt(t.ih, t.iw);
+    if (t.valid) {
+      ctx.fillStyle = "rgba(43,108,176,.14)";
+      ctx.fillRect(x + 2, y + 2, step - 4, step - 4);
+      ctx.strokeStyle = "#2b6cb0"; ctx.lineWidth = 1.5;
+      ctx.strokeRect(x + 2.5, y + 2.5, step - 5, step - 5);
+    } else {
+      ctx.strokeStyle = "#b7791f"; ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 3]);
+      ctx.strokeRect(x + 2.5, y + 2.5, step - 5, step - 5);
+      ctx.setLineDash([]);
+    }
+    label(ctx, String(i + 1), x + step - 8, y + 9, t.valid ? "#2b6cb0" : "#b7791f", 9, "center");
+    if (i === state.tapStep && state.tapStep >= 0) {
+      ctx.strokeStyle = "#dd6b20"; ctx.lineWidth = 3.5;
+      ctx.strokeRect(x + 1, y + 1, step - 2, step - 2);
+    }
+  });
+
+  // info line
+  const fast = D.use3x3 ? (D.fast ? "fast 路径（直线 tap3）" : "边界路径（有效区间循环）") : "rolled 路径";
+  const order = state.layout === "first"
+    ? "kh → kw（每个 tap 加载 8 个输出列的 lane）"
+    : (D.use3x3 ? "行内 kh → kw（每行 3 个 tap3）" : "kh → kw");
+  label(ctx, `${valid.length} 个有效 tap，顺序按 kernel：${order}  ·  ${fast}`,
+        ox, oy + gh + 18, "#334155", 11.5);
+
+  el("tapCount").textContent = state.tapStep >= 0 && state.tapStep < taps.length
+    ? `tap ${state.tapStep + 1} / ${taps.length}` : `${taps.length} taps`;
+
+  el("winInfo").innerHTML = `
+    <div>路径：<code>${state.layout === "first" ? "pool_channel_first" : (D.use3x3 ? "pool_channel_last_rows_3x3" : "pool_channel_last_rows")}</code>
+      · ${state.layout === "first" ? "lane = 输出宽度（channel-first）" : "lane = 通道向量（channel-last）"}</div>
+    <div>有效 tap：<b>${valid.length}</b> · 越界跳过：<b>${taps.length - valid.length}</b>${state.layout === "first" ? "" :
+      ` · 3x3 fast：<b>${D.use3x3 ? (D.fast ? "是" : "否") : "—"}</b>
+       · rolled interior：<b>${D.rolledInterior ? "是" : "否"}</b>`}</div>
+    <div>可视区域已裁剪为窗口 ±1 格；padding 用虚线格表示，越界 tap 用琥珀色虚线框表示（不会读取）。</div>
+  `;
+}
+
+// ---------------------------------------------------------------------------
+// 4 · channels / lanes
+// ---------------------------------------------------------------------------
+function drawChannels(D) {
+  const cv = el("chCanvas");
+  const cssH = 230;
+  const { ctx, w, h } = fit(cv, cssH);
+
+  if (state.layout === "first") {
+    // channel-first lane = output width: draw output columns as 8-lane vectors
+    const L = 8;
+    const pad = 22;
+    const cols = Math.min(D.OW, 64);
+    const cw = Math.max(10, Math.min(34, Math.floor((w - 2 * pad) / Math.max(1, cols))));
+    const ox = Math.floor((w - cols * cw) / 2), oy = 44;
+    label(ctx, `channel-first：lane = 输出列（${state.dtype === "f16" ? "v_f16x8" : "v_f32x8"}，8 lane）`,
+          ox, 18, "#334155", 12);
+    label(ctx, `一次 pool_channel_first 调用 = 一个输出行；每 ${L} 列一个向量，尾部 lane 用 fill 填 identity，短尾标量写回`,
+          ox, 33, "#94a3b8", 11);
+    for (let c = 0; c < cols; c++) {
+      const lane = c % L, vec = Math.floor(c / L);
+      const sel = c === D.ow;
+      ctx.fillStyle = sel ? "#dd6b20" : (lane % 2 ? "#e8f1fb" : "#dbeafe");
+      ctx.fillRect(ox + c * cw, oy, cw - 1, 34);
+      label(ctx, String(lane), ox + c * cw + cw / 2, oy + 17, sel ? "#fff" : "#2b6cb0", 9, "center");
+    }
+    const padLanes = (L - (D.OW % L)) % L;
+    if (padLanes) {
+      for (let k = 0; k < padLanes; k++) {
+        const c = D.OW + k;
+        if (c * cw > w - pad) break;
+        ctx.setLineDash([3, 3]); ctx.strokeStyle = "#b7791f";
+        ctx.strokeRect(ox + c * cw + 1, oy + 1, cw - 3, 32);
+        ctx.setLineDash([]);
+      }
+    }
+    el("chInfo").innerHTML = `
+      <div><code>pool_channel_first&lt;IsMax,T&gt;</code>：任务是 <code>N×C = ${state.N}×${state.C}</code> 个通道平面，
+        每个任务逐输出行调用一次。</div>
+      <div>lane 数 = 8；尾部缺的 lane 用 <code>pooling_fill</code>（max 的 -inf / avg 的 0）填充，
+        最后一个不足 8 列的输出块用标量写回。</div>
+      <div>f16 时整个累加都在 <code>v_f16x8</code> 里（AArch64 原生，x86 cvt 模拟）。</div>`;
+    return;
+  }
+
+  // channel-last: 16-channel blocks, each two 8-lane vectors
+  const pad = 20;
+  const barW = w - 2 * pad;
+  const ox = pad, oy = 44;
+  const segW = Math.max(3, barW / Math.max(1, D.nblocks));
+  label(ctx, `channel-last：一个像素 = C=${state.C} 个通道；每 16 通道一个块 = ${state.dtype === "f16" ? "32" : "64"} B`,
+        ox, 18, "#334155", 12);
+  label(ctx, `nblocks=ceil(C/16)=${D.nblocks}；块内 NV=2（两个 8-lane 向量），尾部可能只有 8 或更少`,
+        ox, 33, "#94a3b8", 11);
+
+  for (let b = 0; b < D.nblocks; b++) {
+    const x = ox + b * segW;
+    const chunk = Math.floor(b / D.blocks_per);
+    const inChunk = chunk === D.cc;
+    const sel = b === D.selBlock;
+    const remaining = Math.min(16, state.C - b * 16);
+    ctx.fillStyle = sel ? "#dd6b20" : inChunk ? "#bfe3cd" : "#e2e8f0";
+    ctx.fillRect(x, oy, Math.max(1, segW - 1), 34);
+    // two 8-lane halves
+    ctx.strokeStyle = "rgba(255,255,255,.8)"; ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x + (segW - 1) / 2, oy);
+    ctx.lineTo(x + (segW - 1) / 2, oy + 34);
+    ctx.stroke();
+    if (remaining < 16) {
+      const frac = remaining / 16;
+      ctx.fillStyle = "rgba(255,255,255,.55)";
+      ctx.fillRect(x + (segW - 1) * frac, oy, (segW - 1) * (1 - frac), 34);
+    }
+  }
+  label(ctx, `绿色 = 选中任务的 cc chunk（blocks ${D.cc * D.blocks_per}..${Math.min(D.nblocks, (D.cc + 1) * D.blocks_per) - 1}）；橙色 = 选中块`,
+        ox, oy + 48, "#64748b", 11);
+
+  // enlarged lanes of the selected block
+  const ly = 116;
+  label(ctx, `选中块 channel [${D.selBlock * 16}, ${D.selBlock * 16 + Math.min(16, state.C - D.selBlock * 16)}) 的 lane`,
+        ox, ly - 12, "#334155", 11.5);
+  const nl = Math.min(16, state.C - D.selBlock * 16);
+  const laneW = Math.max(18, Math.min(38, Math.floor((barW - 40) / 16)));
+  for (let i = 0; i < 16; i++) {
+    const x = ox + i * laneW;
+    const live = i < nl;
+    ctx.fillStyle = live ? (i < 8 ? "#dbeafe" : "#e8f1fb") : "#f8fafc";
+    ctx.strokeStyle = live ? "#93c5fd" : "#cbd5e1";
+    ctx.setLineDash(live ? [] : [3, 3]);
+    ctx.fillRect(x, ly, laneW - 2, 30);
+    ctx.strokeRect(x + .5, ly + .5, laneW - 3, 29);
+    ctx.setLineDash([]);
+    label(ctx, live ? String(i) : "—", x + (laneW - 2) / 2, ly + 15, live ? "#1e3a8a" : "#b7791f", 9, "center");
+    if (i === 7) {
+      ctx.strokeStyle = "#2b6cb0"; ctx.lineWidth = 2;
+      ctx.strokeRect(x + .5, ly - 2, laneW - 3, 34);
+    }
+  }
+  label(ctx, "vector 0（lane 0-7）", ox + laneW * 4, ly + 42, "#2b6cb0", 10, "center");
+  if (nl > 8) label(ctx, "vector 1（lane 8-15）", ox + laneW * 12, ly + 42, "#2b6cb0", 10, "center");
+
+  const calls = D.segments.map(s => `${s.lanes} lane${s.lanes >= 8 ? "（NV=" + (s.lanes > 8 ? 2 : 1) + "）" : "（短 lane，标量尾）"}`).join(" + ");
+  el("chInfo").innerHTML = `
+    <div>驱动对每个 16 通道块的调用：<code>${calls}</code>
+      ${D.segments.length > 1 ? ' <span class="tag amber">剩余正好 16 时也拆成 8+8</span>' : ""}</div>
+    <div>每块像素字节：<code>16 × ${D.elem} B = ${16 * D.elem} B</code>${state.dtype === "f32" ? "（正好一条 64B cache line）" : ""}；
+      lane 宽固定 8 个元素（<code>kChannelLanes = 8</code>）。</div>
+    <div>选中块由 <code>cc = ${D.cc}</code> 的任务处理（blocks ${D.cc * D.blocks_per}..${Math.min(D.nblocks, (D.cc + 1) * D.blocks_per) - 1}）。</div>`;
+}
+
+// ---------------------------------------------------------------------------
+// 2 · route decision
+// ---------------------------------------------------------------------------
+function drawRoute(D) {
+  const list = el("routeList");
+  const s = state;
+  const items = [];
+  const add = (ok, text) => items.push(`<li><span class="${ok ? "ok" : "no"}">${ok ? "✓" : "✗"}</span><span>${text}</span></li>`);
+
+  if (s.layout === "first") {
+    add(true, `<code>channel-first</code>：没有 4 行组 / strip / 16 通道块；任务 = <code>N×C</code>，lane = 输出宽度`);
+    add(true, `每输出行一次 <code>pool_channel_first</code>；padding lane 用 identity 填充，短尾标量写回`);
+  } else {
+    add(D.segFull, `lane 完整（选中块的 segments：${D.segments.map(x => x.lanes).join("+")}）`);
+    add(s.KH === 3 && s.KW === 3, `kernel = ${s.KH}×${s.KW}（3×3 路由要求 3×3）`);
+    add(s.SH === s.SW, `stride = ${s.SH}×${s.SW}（3×3 路由要求 SH == SW）`);
+    add(!D.countsTaps, `count-free：${D.isMax ? "MaxPool 无全 pad 窗口" : "AvgPool exclude_pad=false"}（COUNT 可编译掉）`);
+    add(s.route !== "roll", `路由开关：<code>${s.route === "roll" ? "NNOPS_POOLING_ROUTE=roll（强制回滚路径）" : "auto"}</code>`);
+  }
+  list.innerHTML = items.join("");
+
+  const name = s.layout === "first" ? "pool_channel_first"
+    : D.use3x3 ? "pool_channel_last_rows_3x3（直线路径）" : "pool_channel_last_rows（rolled 路径）";
+  el("verdict").innerHTML = `当前判断：<b>${name}</b>` +
+    (s.layout === "last" && !D.use3x3 && D.can3x3 ? "（被 route=roll 强制）" : "");
+  el("routeNote").textContent = s.layout === "first"
+    ? "channel-first 的 lane 是输出宽度，所以没有 3x3 的通道向量直线路径；输入/输出给的是 planar 平面。"
+    : (D.use3x3
+      ? "3x3 路由：行外层 + 每行 V a0/a1 寄存器累加；内部列走 tap3 字面量偏移，边界列按 kw_lo..kw_hi、kh_lo..kh_hi 只走有效 tap。"
+      : "rolled 路由：4 输出行一组，预计算 row_base[(kd,kh,r)]，interior 列不判断边界；累加器是 V acc[R][NV]。");
+}
+
+// ---------------------------------------------------------------------------
+// 5 · execution steps
+// ---------------------------------------------------------------------------
+function drawSteps(D) {
+  const s = state;
+  const steps = [];
+  if (s.layout === "first") {
+    steps.push(`<code>compute → pooling_fp → pooling_channel_first_impl</code>：任务 = <code>N×blocks = ${s.N}×${s.C} = ${D.tasks}</code>。`);
+    steps.push(`每个任务对一个通道平面；<code>for od, oh</code> 调 <code>${D.isMax ? "pool_channel_first<true>" : "pool_channel_first<false>"}</code>。`);
+    steps.push(`内核：<code>for ow += 8</code>，lane = 8 个输出列；每个 kd/kh/kw 用 <code>channel_first_load</code> 取数，越界 lane 填 identity。`);
+    steps.push(`计数：${D.countsTaps ? "逐列 tap 数 / 或 exclude_pad 的 1/count" : "统一 avg_scale（或 max 不需计数）"}；短尾标量写回。`);
+  } else {
+    steps.push(`<code>pooling_channel_last_impl</code>：<code>nblocks=ceil(C/16)=${D.nblocks}</code>，<code>hgroups=ceil(OH/4)=${D.hgroups}</code>，<code>strips=${D.strips}</code>（strip=${D.strip}），<code>cchunks=${D.cchunks}</code>。`);
+    steps.push(`任务网格 = <code>groups×cchunks = ${D.groups}×${D.cchunks} = ${D.tasks}</code>，约 ${D.waves} 波（threads=${s.threads}）。`);
+    steps.push(`选中任务：n=${0}，hg=${D.hg}（输出行 ${D.hg * 4}..${Math.min(D.OH - 1, D.hg * 4 + 3)}），st=${D.st}（列 ${D.st * D.strip}..${Math.min(D.OW - 1, (D.st + 1) * D.strip - 1)}），cc=${D.cc}（blocks ${D.cc * D.blocks_per}..${Math.min(D.nblocks, (D.cc + 1) * D.blocks_per) - 1}）。`);
+    steps.push(`每个块 <code>c0=blk*16</code>，调用段：<code>${D.segments.map(x => x.lanes).join(" + ")}</code> lane。`);
+    if (D.use3x3) {
+      steps.push(`<code>pool_channel_last_rows_3x3</code>：行外层；每行算 <code>kh_lo=${D.kh_lo}, kh_hi=${D.kh_hi}</code> 与行基址，宽度扫描复用。`);
+      steps.push(`列：<code>col_ok=${D.colOk}</code>；${D.fast ? "内部列 → 3 次 tap3（字面量 o0/o1/o2）" : "边界列 → kw_lo..kw_hi 只走有效 tap"}；累加器 <code>V a0, a1</code>。`);
+    } else {
+      steps.push(`<code>pool_channel_last_rows</code>：4 行一组，<code>all_rows=${D.allRows}</code>，<code>interior=${D.rolledInterior}</code>；interior 列不做边界判断，否则逐 tap 检查 off + 空行。`);
+    }
+    steps.push(`写回：<code>dsts[k].store(r, ow, v)</code>，max 全 pad 时写 0，avg 乘 <code>avg_scale</code> 或 <code>1/count</code>。`);
+  }
+  el("steps").innerHTML = steps.map(x => `<li>${x}</li>`).join("");
+  el("execNote").textContent = s.layout === "last"
+    ? `选中像素在组内行 r=${D.oh - D.hg * 4}；越界 tap 不会被读取（3x3 用 kh/kw 区间，rolled 用 off/空行检查）。`
+    : `channel-first 的短尾 lane 用标量写回；输入 plane 是连续的，所以一次调用只处理一个输出行。`;
+}
+
+// ---------------------------------------------------------------------------
+// stats
+// ---------------------------------------------------------------------------
+function drawStats(D) {
+  if (state.layout === "first") {
+    el("stats").innerHTML = `
+      <div class="stat"><div class="k">tasks</div><div class="v">${D.tasks}</div></div>
+      <div class="stat"><div class="k">输出</div><div class="v">${D.OH} × ${D.OW}</div></div>
+      <div class="stat"><div class="k">lane</div><div class="v">输出宽度 · 8</div></div>
+      <div class="stat"><div class="k">每任务</div><div class="v">1 个通道平面</div></div>`;
+    return;
+  }
+  el("stats").innerHTML = `
+    <div class="stat"><div class="k">输出 OH×OW</div><div class="v">${D.OH} × ${D.OW}</div></div>
+    <div class="stat"><div class="k">nblocks (16 ch)</div><div class="v">${D.nblocks}</div></div>
+    <div class="stat"><div class="k">hgroups × strips</div><div class="v">${D.hgroups} × ${D.strips}</div></div>
+    <div class="stat"><div class="k">strip 宽</div><div class="v">${D.strip}</div></div>
+    <div class="stat"><div class="k">groups</div><div class="v">${D.groups}</div></div>
+    <div class="stat"><div class="k">cchunks / blocks_per</div><div class="v">${D.cchunks} / ${D.blocks_per}</div></div>
+    <div class="stat"><div class="k">tasks</div><div class="v">${D.tasks}</div></div>
+    <div class="stat"><div class="k">waves @ ${state.threads}T</div><div class="v">${D.waves}</div></div>
+    <div class="stat"><div class="k">窗口输入行</div><div class="v">${D.in_rows}</div></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// interaction
+// ---------------------------------------------------------------------------
+function readControls() {
+  state.N = clampInt(el("inN").value, 1, 8, 1);
+  state.C = clampInt(el("inC").value, 1, 2048, 512);
+  state.H = clampInt(el("inH").value, 1, 128, 7);
+  state.W = clampInt(el("inW").value, 1, 128, 7);
+  state.KH = clampInt(el("inKH").value, 1, 7, 3);
+  state.KW = clampInt(el("inKW").value, 1, 7, 3);
+  state.SH = clampInt(el("inSH").value, 1, 4, 2);
+  state.SW = clampInt(el("inSW").value, 1, 4, 2);
+  state.PH = clampInt(el("inPH").value, 0, 4, 1);
+  state.PW = clampInt(el("inPW").value, 0, 4, 1);
+  state.dtype = el("inDtype").value;
+  state.type = el("inType").value;
+  state.layout = el("inLayout").value;
+  state.route = el("inRoute").value;
+  state.threads = parseInt(el("inThreads").value, 10);
+}
+function clampInt(v, lo, hi, dflt) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function drawAll() {
+  readControls();
+  const D = derive();
+  // clamp selection into the new shape
+  state.selOh = Math.min(state.selOh, Math.max(0, D.OH - 1));
+  state.selOw = Math.min(state.selOw, Math.max(0, D.OW - 1));
+  if (state.layout === "last") {
+    state.selBlock = Math.min(state.selBlock, Math.max(0, D.nblocks - 1));
+  } else {
+    state.selChannel = Math.min(state.selChannel, Math.max(0, state.C - 1));
+  }
+  state.tapStep = -1;
+  const D2 = derive();
+  drawStats(D2);
+  drawTaskMap(D2);
+  drawRoute(D2);
+  drawWindow(D2);
+  drawChannels(D2);
+  drawSteps(D2);
+}
+
+el("taskCanvas").addEventListener("click", ev => {
+  const D = derive();
+  if (!taskHit) return;
+  const rect = el("taskCanvas").getBoundingClientRect();
+  const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+  if (state.layout === "last") {
+    const { ox, oy, cell } = taskHit;
+    const ow = Math.floor((x - ox) / cell), oh = Math.floor((y - oy) / cell);
+    if (ow >= 0 && ow < D.OW && oh >= 0 && oh < D.OH) {
+      state.selOh = oh; state.selOw = ow;
+      drawAll();
+    }
+  } else {
+    const { ox, oy, cell, cols } = taskHit;
+    const q = Math.floor((x - ox) / cell), r = Math.floor((y - oy) / cell);
+    const c = r * cols + q;
+    if (q >= 0 && q < cols && c >= 0 && c < state.C) {
+      state.selChannel = c;
+      drawAll();
+    }
+  }
+});
+
+el("chCanvas").addEventListener("click", ev => {
+  if (state.layout !== "last") return;
+  const D = derive();
+  const rect = el("chCanvas").getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const pad = 20, barW = rect.width - 2 * pad;
+  const segW = Math.max(3, barW / Math.max(1, D.nblocks));
+  const b = Math.floor((x - pad) / segW);
+  if (b >= 0 && b < D.nblocks) {
+    state.selBlock = b;
+    drawAll();
+  }
+});
+
+// tap playback
+let timer = null;
+el("playBtn").addEventListener("click", () => {
+  const D = derive();
+  const taps = tapList(D);
+  if (state.tapStep < 0 || state.tapStep >= taps.length - 1) state.tapStep = 0;
+  const start = state.tapStep;
+  if (timer) clearInterval(timer);
+  timer = setInterval(() => {
+    state.tapStep++;
+    const Dn = derive();
+    drawWindow(Dn);
+    if (state.tapStep >= tapList(Dn).length) {
+      clearInterval(timer); timer = null;
+    }
+  }, 420);
+  drawWindow(D);
+});
+
+// presets
+document.querySelectorAll("[data-preset]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const p = btn.getAttribute("data-preset");
+    if (p === "resnet") { state.N = 1; state.C = 512; state.H = 7; state.W = 7; state.KH = 3; state.KW = 3; state.SH = 2; state.SW = 2; state.PH = 1; state.PW = 1; state.dtype = "f32"; state.type = "max"; state.layout = "last"; }
+    if (p === "narrow") { state.N = 1; state.C = 100; state.H = 14; state.W = 14; state.KH = 3; state.KW = 3; state.SH = 2; state.SW = 2; state.PH = 1; state.PW = 1; state.dtype = "f32"; state.type = "max"; state.layout = "last"; }
+    if (p === "backbone") { state.N = 1; state.C = 256; state.H = 56; state.W = 56; state.KH = 3; state.KW = 3; state.SH = 2; state.SW = 2; state.PH = 1; state.PW = 1; state.dtype = "f32"; state.type = "max"; state.layout = "last"; }
+    if (p === "block") { state.N = 1; state.C = 16; state.H = 7; state.W = 7; state.KH = 3; state.KW = 3; state.SH = 2; state.SW = 2; state.PH = 1; state.PW = 1; state.dtype = "f32"; state.type = "max"; state.layout = "last"; }
+    if (p === "s1") { state.N = 1; state.C = 512; state.H = 7; state.W = 7; state.KH = 3; state.KW = 3; state.SH = 1; state.SW = 1; state.PH = 1; state.PW = 1; state.dtype = "f32"; state.type = "max"; state.layout = "last"; }
+    syncControls();
+    state.selOh = Math.min(1, Math.max(0, derive().OH - 1));
+    state.selOw = Math.min(1, Math.max(0, derive().OW - 1));
+    state.selBlock = 0;
+    drawAll();
+  });
+});
+
+function syncControls() {
+  el("inN").value = state.N; el("inC").value = state.C;
+  el("inH").value = state.H; el("inW").value = state.W;
+  el("inKH").value = state.KH; el("inKW").value = state.KW;
+  el("inSH").value = state.SH; el("inSW").value = state.SW;
+  el("inPH").value = state.PH; el("inPW").value = state.PW;
+  el("inDtype").value = state.dtype; el("inType").value = state.type;
+  el("inLayout").value = state.layout; el("inRoute").value = state.route;
+  el("inThreads").value = String(state.threads);
+}
+
+document.querySelectorAll("input, select").forEach(node => {
+  node.addEventListener("input", () => { state.tapStep = -1; drawAll(); });
+});
+
+window.addEventListener("resize", () => drawAll());
+
+// initial view: an interior pixel of the default shape
+syncControls();
+state.selOh = 1; state.selOw = 1; state.selBlock = 0;
+drawAll();
+</script>
+</body>
+</html>
