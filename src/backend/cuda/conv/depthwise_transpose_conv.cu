@@ -10,19 +10,13 @@
 /// flipped, cropped filter (see the header) — and nothing is left to do but
 /// multiply-accumulate.
 ///
-/// Two layouts, two walks of the class's compressed grid:
-///
-///   * channel-last lanes the channel inside a 16 B vector, so a tap is one
-///     activation vector against one strided weight vector. The weight is the
-///     scalar side — the filter is [C][1][KH][KW], so a channel step is w_ic
-///     elements — and one output per thread is what measured fastest here: a
-///     window over rows hoists `Vec` weights into a register array that ptxas
-///     then keeps in local memory (a 32-128 byte stack frame on every windowed
-///     instantiation), which costs more than the loads it saves.
-///   * channel-first lanes the class's columns, so a tap is one broadcast weight
-///     against a coalesced run of activations. There the weight is a single
-///     scalar, VW columns per thread amortize it, and the block's column span is
-///     fitted to ceil(tw / VW) so a narrow class grid does not launch idle lanes.
+/// The channel-last walk lanes the channel inside a 16 B vector, so a tap is
+/// one activation vector against one strided weight vector. The weight is the
+/// scalar side — the filter is [C][1][KH][KW], so a channel step is w_ic
+/// elements — and one output per thread is what measured fastest here: a window
+/// over rows hoists `Vec` weights into a register array that ptxas then keeps in
+/// local memory (a 32-128 byte stack frame on every windowed instantiation),
+/// which costs more than the loads it saves.
 ///
 /// The other lever the CPU route has is not here: the filter is read in place.
 /// Its [C][1][KH][KW] order costs a strided load per tap, but a per-call
@@ -30,7 +24,7 @@
 /// short.
 ///
 /// A channel-last geometry the 16 B lane cannot take — a channel count the
-/// vector does not divide, or a row it cannot align to — falls to a third
+/// vector does not divide, or a row it cannot align to — falls to a second
 /// script, one output element per thread with the channel innermost (which is
 /// the coalesced order on that layout) and the tap search written out the way
 /// the CPU's is. It is a fallback, not a route: nothing picks it on a shape the
@@ -142,89 +136,9 @@ __global__ void dw_last_kernel(ConvParams pin, int th_max, int col_blocks)
     }
 }
 
-/// Depthwise on one class, channel-first: `VW` class columns per thread, lanes on
-/// the columns, so consecutive threads read consecutive activations and a tap is
-/// one broadcast weight against a coalesced run.
-template <class Elem, int VW>
-__global__ void dw_first_kernel(ConvParams pin, int th_max, int col_blocks)
-{
-    const int cls = int(blockIdx.z) / col_blocks;
-    const TClass tc = tconv_class(pin, cls);
-    if (tc.empty) {
-        return;
-    }
-
-    const ConvParams p = tc.q;
-    const int KH = p.kh, KW = p.kw, DH = p.dh, DW = p.dw, PH = p.ph, PW = p.pw;
-    const int IH = p.ih, IW = p.iw, IN_H = p.in_h, IN_W = p.in_w;
-    const int W_KH = p.w_kh, W_KW = p.w_kw;
-    const int ow0 =
-        (int(blockIdx.z) - cls * col_blocks) * int(blockDim.x) * VW + int(threadIdx.x) * VW;
-    const int row_i = int(blockIdx.y) * int(blockDim.y) + int(threadIdx.y);
-    const int img = row_i / th_max;
-    const int th = row_i - img * th_max;
-    const int c = int(blockIdx.x);
-    if (img >= p.batch || th >= p.oh || ow0 >= p.ow) {
-        return;
-    }
-    const int cols = (p.ow - ow0 < VW) ? p.ow - ow0 : VW;
-
-    const Elem* in =
-        static_cast<const Elem*>(p.input) + int64_t(img) * p.in_batch + int64_t(c) * p.in_c;
-    // The class starts at tap k0 of the original kernel, on both axes.
-    const Elem* w = static_cast<const Elem*>(p.weight) + int64_t(c) * p.w_ic + tc.w_off;
-
-    float acc[VW] = {};
-    for (int kh = 0; kh < KH; ++kh) {
-        const int ih = th - PH + kh * DH;
-        if (unsigned(ih) >= unsigned(IH)) {
-            continue;
-        }
-        const Elem* wp = w + int64_t(kh) * W_KH;
-        int iw = ow0 - PW;
-        for (int kw = 0; kw < KW; ++kw) {
-            const float wv = float(*wp);
-            const Elem* xp = in + int64_t(ih) * IN_H + int64_t(iw) * IN_W;
-            CUTE_UNROLL
-            for (int v = 0; v < VW; ++v) {
-                if (unsigned(iw + v) < unsigned(IW)) {
-                    acc[v] = fmaf(wv, float(*xp), acc[v]);
-                }
-                xp += IN_W;
-            }
-            wp += W_KW;
-            iw += DW;
-        }
-    }
-
-    Elem* dst = static_cast<Elem*>(p.output) + int64_t(img) * p.out_batch + int64_t(c) * p.out_c +
-                tc.out_off + int64_t(th) * p.out_h + int64_t(ow0) * p.out_w;
-    const Elem* bias = static_cast<const Elem*>(p.bias);
-    for (int v = 0; v < cols; ++v) {
-        tconv_store<Elem>(p, dst, acc[v], c, bias);
-        dst += p.out_w;
-    }
-}
-
 // ============================================================
 // Launch
 // ============================================================
-
-/// The channel-first column window: the weight is one scalar per tap, so `VW`
-/// columns per thread amortize it. Below a few thousand lanes the launch itself
-/// dominates and the narrowest window is fine; the class grid also has to be
-/// wide enough that the block keeps at least two lanes on the columns, or the
-/// warp degenerates into one row per lane and the tap loads stop coalescing.
-int col_window_first(int64_t lanes, int tw_max)
-{
-    if (tw_max < 2 || lanes < 4096) {
-        return 1;
-    }
-    if (tw_max < 4 || lanes < 16384) {
-        return 2;
-    }
-    return 4;
-}
 
 template <class Elem>
 void launch_last(const ConvParams& p, int th_max, int col_blocks, int by, cudaStream_t stream)
@@ -235,65 +149,6 @@ void launch_last(const ConvParams& p, int th_max, int col_blocks, int by, cudaSt
     dim3 grid(unsigned(p.batch * th_max), unsigned((chunks + bx - 1) / bx),
               unsigned(p.classes * col_blocks));
     dw_last_kernel<Elem, Vec><<<grid, dim3(bx, by), 0, stream>>>(p, th_max, col_blocks);
-}
-
-template <class Elem, int VW>
-void launch_first(const ConvParams& p, int th_max, int col_blocks, int bx, cudaStream_t stream)
-{
-    const int by = kCudaBlockSize / bx;
-    const int rows = p.batch * th_max;
-    dim3 grid(unsigned(p.oc), unsigned((rows + by - 1) / by), unsigned(p.classes * col_blocks));
-    dw_first_kernel<Elem, VW><<<grid, dim3(bx, by), 0, stream>>>(p, th_max, col_blocks);
-}
-
-template <class Elem>
-void dispatch_first(const ConvParams& p, int th_max, int col_blocks, int bx, int vw,
-                    cudaStream_t stream)
-{
-    switch (vw) {
-    case 4:
-        launch_first<Elem, 4>(p, th_max, col_blocks, bx, stream);
-        break;
-    case 2:
-        launch_first<Elem, 2>(p, th_max, col_blocks, bx, stream);
-        break;
-    default:
-        launch_first<Elem, 1>(p, th_max, col_blocks, bx, stream);
-        break;
-    }
-}
-
-template <class Elem>
-bool run_first(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
-{
-    if (p.oc > 65535) {
-        return false;
-    }
-    const int64_t rows = int64_t(p.batch) * th_max;
-    if (rows > 0x7fffffff) {
-        return false;
-    }
-
-    const int64_t lanes = rows * tw_max * p.oc;
-    int vw = col_window_first(lanes, tw_max);
-    // A window wider than the class row leaves one lane per row, and a warp then
-    // walks 32 separate rows instead of one contiguous run.
-    while (vw > 1 && (tw_max + vw - 1) / vw < 2) {
-        vw >>= 1;
-    }
-    const int want = (tw_max + vw - 1) / vw;
-    const int bx = want < 32 ? want : 32;
-    const int by = kCudaBlockSize / bx;
-    if ((rows + by - 1) / by > 65535) {
-        return false;
-    }
-    const int col_blocks = (tw_max + bx * vw - 1) / (bx * vw);
-    if (int64_t(p.classes) * col_blocks > 65535) {
-        return false;
-    }
-
-    dispatch_first<Elem>(p, th_max, col_blocks, bx, vw, stream);
-    return true;
 }
 
 template <class Elem>
@@ -483,8 +338,8 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     p.bias = bias != nullptr ? bias->ptr<void>() : nullptr;
 
     // The kernels address the filter by these three strides alone, so both
-    // accepted forms are read in place — [C][1][KH][KW] on either activation
-    // order, and the per-tap [KH][KW][C] a channel-last activation may carry.
+    // accepted forms are read in place — [C][1][KH][KW], and the per-tap
+    // [KH][KW][C] a channel-last activation may carry.
     if (wgt.rank() == 3) {
         p.w_kh = wgt.stride_elems(0);
         p.w_kw = wgt.stride_elems(1);
@@ -502,7 +357,6 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     p.max_clip = attrs.epilogue.max_clip;
     p.add_to = attrs.add_to;
     p.pre_act = attrs.add_to && attrs.residual_pre_activation;
-    p.channels_last = true;
     p.classes = p.sh * p.sw;
 
     const int th_max = (p.oh + p.sh - 1) / p.sh;

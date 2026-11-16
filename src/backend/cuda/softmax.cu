@@ -23,11 +23,10 @@
 /// `exp(x/T - max/T)`, so the two agree past the last bit.
 ///
 /// Two paths, chosen by where the normalization axis sits in memory (mirrors
-/// the CPU backend), over channel-first and channel-last
-/// layouts:
-///   - The axis is the innermost axis of the storage (channel-first's last dim,
-///     channel-last's C): every group is D contiguous elements, one block per
-///     group (softmax_kernel).
+/// the CPU backend), over channel-last layouts:
+///   - The axis is the innermost axis of the storage (channel-last's C, or the
+///     only dim of a rank-1 tensor): every group is D contiguous elements, one
+///     block per group (softmax_kernel).
 ///   - Every other axis: reference-style outer/D/inner decomposition with
 ///     strided access (softmax_general_kernel).
 ///
@@ -396,12 +395,6 @@ void softmax_cuda_impl(const SoftmaxAttributes& attrs, TensorView& output,
             contiguous_axis = true;
             in_group_stride = out_group_stride = X.shape(rank - 1);
         }
-    } else if (axis == rank - 1) {
-        // Channel-first rows: each side walks its own pitch, which a caller may
-        // legitimately give the output differently from the input.
-        contiguous_axis = true;
-        in_group_stride = X.row_stride_elems();
-        out_group_stride = output.row_stride_elems();
     }
 
     const int64_t norm_size = X.shape(axis);

@@ -57,7 +57,6 @@ struct ConvParams {
     float max_clip = std::numeric_limits<float>::infinity();
     bool add_to = false;
     bool pre_act = false;
-    bool channels_last = false;
     bool fill_vec = false;
 
     /// SH·SW residue classes, the class axis blockIdx.z walks fastest.

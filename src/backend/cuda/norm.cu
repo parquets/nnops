@@ -22,8 +22,8 @@
 /// BatchNorm is one block per (sample, channel) plane — or one thread per plane
 /// when the plane is a handful of elements — with the per-channel factors folded
 /// once per block. GroupNorm is one block per (sample, group); the channel step
-/// and the spatial walk come from the view, which covers channel-first and
-/// channel-last in the same kernel.
+/// and the spatial walk come from the view, which covers channel-last and dense
+/// in the same kernel.
 ///
 /// f32, f16 and bf16 in, f32 compute. s8/u8 input stays on the CPU (its dequantize /
 /// requantize kernels live there), so a quantized X answers Status::unsupported.

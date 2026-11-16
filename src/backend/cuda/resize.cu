@@ -1,6 +1,5 @@
 /// @file resize.cu
-/// @brief CUDA Resize — nearest / linear / bicubic, channel-first and
-///        channel-last.
+/// @brief CUDA Resize — nearest / linear / bicubic, channel-last.
 ///
 /// The CPU route builds per-axis coordinate tables once per call and walks them.
 /// A launch cannot: the tables live in device memory behind their own allocation
@@ -13,24 +12,12 @@
 /// and nearest rounds with `roundf`, which is the half-away-from-zero the CPU
 /// uses.
 ///
-/// Channel-first keeps the lane on output width, the contiguous axis there. Each
-/// thread owns VW consecutive columns, so the index math around the tap — the
-/// plane and row decode, the four strides, the bounds test — is paid once per VW
-/// outputs instead of once per output. A row only has ow/VW lanes, which for the
-/// 32- and 64-column planes of a decoder is a fraction of a block, so the block's
-/// thread.y axis takes consecutive rows and the block coordinates carry the row
-/// block and the plane (the depth plane too for a rank-5 input). The window
-/// widens to eight columns while neighbouring output columns still share their
-/// source taps — always going up, and always for a nearest pass, which reads one
-/// tap a column; a bilinear downsample puts each column on its own pair, and
-/// there the window stops at four so the block keeps its lanes.
-///
-/// Channel-last puts the lane on the channel: one thread owns one 16 B vector of
-/// one output pixel (four f32 or eight f16 taps through a single 128-bit load),
-/// adjacent threads take adjacent channel vectors, and the block's thread.y axis
-/// takes consecutive pixels, so a warp reads and writes one contiguous run. A
-/// channel count that is not a vector multiple, or a tensor whose base is not
-/// 16 B aligned, falls to a scalar-per-pixel script; so does a channel count too
+/// The lane is on the channel: one thread owns one 16 B vector of one output
+/// pixel (four f32 or eight f16 taps through a single 128-bit load), adjacent
+/// threads take adjacent channel vectors, and the block's thread.y axis takes
+/// consecutive pixels, so a warp reads and writes one contiguous run. A channel
+/// count that is not a vector multiple, or a tensor whose base is not 16 B
+/// aligned, falls to a scalar-per-pixel script; so does a channel count too
 /// narrow to fill a warp's worth of vectors.
 ///
 /// Every kernel walks the row and plane axes with a grid stride, so no dimension
@@ -59,8 +46,8 @@ struct ResizeGeom {
     int64_t n, c;
     int64_t crop_off; // crop origin, in elements
 
-    int64_t in_n, in_c, in_d, in_row, in_pix;
-    int64_t out_n, out_c, out_d, out_row, out_pix;
+    int64_t in_n, in_d, in_row, in_pix;
+    int64_t out_n, out_d, out_row, out_pix;
 
     int coord_mode; // 0 half pixel, 1 align corners, 2 asymmetric
     float cubic_a;
@@ -156,105 +143,6 @@ template <class T> __device__ inline void rsz_store(T* dst, float v, bool add_to
         v += s_load(dst);
     }
     s_store(dst, v);
-}
-
-// ============================================================
-// Channel-first — lanes on output width
-// ============================================================
-
-/// One output run of VW columns per thread, threadIdx.y carrying consecutive
-/// output rows so a narrow plane still fills its block. The row block and the
-/// (n, c) plane walk with a grid stride, so the launch never has to fit a
-/// dimension under 65535 and a thread pays the decode once per row iteration
-/// rather than once per element.
-template <class T, int Mode, int VW, bool ThreeD>
-__global__ void resize_first_kernel(const T* __restrict__ in, T* __restrict__ out, ResizeGeom g)
-{
-    const int64_t ow0 = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) * VW;
-    if (ow0 >= g.ow) {
-        return;
-    }
-    const int cols = int(g.ow - ow0 < int64_t(VW) ? g.ow - ow0 : int64_t(VW));
-
-    for (int64_t nc = blockIdx.z; nc < g.n * g.c; nc += gridDim.z) {
-        const int64_t bn = nc / g.c;
-        const int64_t bc = nc - bn * g.c;
-        const int64_t in_plane = bn * g.in_n + bc * g.in_c + g.crop_off;
-        const int64_t out_plane = bn * g.out_n + bc * g.out_c;
-
-        const int64_t r0 = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
-        const int64_t rstep = int64_t(gridDim.y) * blockDim.y;
-        for (int64_t r = r0; r < g.od * g.oh; r += rstep) {
-            const int64_t od = ThreeD ? r / g.oh : 0;
-            const int64_t oh = ThreeD ? r - od * g.oh : r;
-            T* orow = out + out_plane + od * g.out_d + oh * g.out_row + ow0;
-
-            if constexpr (Mode == 0) {
-                int64_t iz = 0;
-                if constexpr (ThreeD) {
-                    iz = rsz_nearest(od, g.id, g.od, g.coord_mode);
-                }
-                const int64_t iy = rsz_nearest(oh, g.ih, g.oh, g.coord_mode);
-                const T* row = in + in_plane + iz * g.in_d + iy * g.in_row;
-                for (int v = 0; v < cols; ++v) {
-                    const int64_t ix = rsz_nearest(ow0 + v, g.iw, g.ow, g.coord_mode);
-                    rsz_store(&orow[v], s_load(&row[ix]), g.add_to);
-                }
-            } else if constexpr (Mode == 1) {
-                const LinearTap ty = rsz_linear_tap(oh, g.ih, g.oh, g.coord_mode);
-                if constexpr (!ThreeD) {
-                    const T* r0 = in + in_plane + ty.i0 * g.in_row;
-                    const T* r1 = in + in_plane + ty.i1 * g.in_row;
-                    for (int v = 0; v < cols; ++v) {
-                        const LinearTap tx = rsz_linear_tap(ow0 + v, g.iw, g.ow, g.coord_mode);
-                        const float wx0 = 1.0f - tx.w;
-                        const float top = wx0 * s_load(&r0[tx.i0]) + tx.w * s_load(&r0[tx.i1]);
-                        const float bot = wx0 * s_load(&r1[tx.i0]) + tx.w * s_load(&r1[tx.i1]);
-                        rsz_store(&orow[v], (1.0f - ty.w) * top + ty.w * bot, g.add_to);
-                    }
-                } else {
-                    const LinearTap tz = rsz_linear_tap(od, g.id, g.od, g.coord_mode);
-                    const T* d0 = in + in_plane + tz.i0 * g.in_d;
-                    const T* d1 = in + in_plane + tz.i1 * g.in_d;
-                    const float wz0 = 1.0f - tz.w;
-                    for (int v = 0; v < cols; ++v) {
-                        const LinearTap tx = rsz_linear_tap(ow0 + v, g.iw, g.ow, g.coord_mode);
-                        const float wx0 = 1.0f - tx.w;
-                        const float y0t = wx0 * s_load(&d0[ty.i0 * g.in_row + tx.i0]) +
-                                          tx.w * s_load(&d0[ty.i0 * g.in_row + tx.i1]);
-                        const float y0b = wx0 * s_load(&d0[ty.i1 * g.in_row + tx.i0]) +
-                                          tx.w * s_load(&d0[ty.i1 * g.in_row + tx.i1]);
-                        const float y1t = wx0 * s_load(&d1[ty.i0 * g.in_row + tx.i0]) +
-                                          tx.w * s_load(&d1[ty.i0 * g.in_row + tx.i1]);
-                        const float y1b = wx0 * s_load(&d1[ty.i1 * g.in_row + tx.i0]) +
-                                          tx.w * s_load(&d1[ty.i1 * g.in_row + tx.i1]);
-                        const float y0 = (1.0f - ty.w) * y0t + ty.w * y0b;
-                        const float y1 = (1.0f - ty.w) * y1t + ty.w * y1b;
-                        rsz_store(&orow[v], wz0 * y0 + tz.w * y1, g.add_to);
-                    }
-                }
-            } else {
-                const CubicTap ty = rsz_cubic_tap(oh, g.ih, g.oh, g.coord_mode, g.cubic_a);
-                const T* rows[4];
-                for (int j = 0; j < 4; ++j) {
-                    rows[j] = in + in_plane + ty.idx[j] * g.in_row;
-                }
-                for (int v = 0; v < cols; ++v) {
-                    const CubicTap tx = rsz_cubic_tap(ow0 + v, g.iw, g.ow, g.coord_mode, g.cubic_a);
-                    float acc = 0.0f;
-                    for (int j = 0; j < 4; ++j) {
-                        const T* r = rows[j];
-                        float h = tx.w[0] * s_load(&r[tx.idx[0]]);
-                        h += tx.w[1] * s_load(&r[tx.idx[1]]);
-                        h += tx.w[2] * s_load(&r[tx.idx[2]]);
-                        h += tx.w[3] * s_load(&r[tx.idx[3]]);
-                        acc += ty.w[j] * h;
-                    }
-                    rsz_store(&orow[v], acc, g.add_to);
-                }
-            }
-        }
-    }
 }
 
 // ============================================================
@@ -530,22 +418,6 @@ __global__ void resize_last_scalar_kernel(const T* __restrict__ in, T* __restric
 // ============================================================
 // Launch
 // ============================================================
-
-template <class T, int Mode, int VW, bool ThreeD>
-void launch_first(const ResizeGeom& g, const T* in, T* out, cudaStream_t stream)
-{
-    // The column lanes of a row are fixed by VW, so the block is filled with
-    // rows instead: a 64-column plane leaves 16 live lanes out of 128, and at
-    // one row per block the plane's 512 images cost 32k mostly-idle blocks.
-    constexpr int kThreads = 256;
-    const int lanes = static_cast<int>(std::min<int64_t>(ceil_div(g.ow, VW), kThreads));
-    const int by = std::max(1, kThreads / lanes);
-    const dim3 block(static_cast<unsigned>(lanes), static_cast<unsigned>(by), 1);
-    const dim3 grid(static_cast<unsigned>(ceil_div(g.ow, int64_t(lanes) * VW)),
-                    static_cast<unsigned>(std::min<int64_t>(ceil_div(g.od * g.oh, by), 65535)),
-                    static_cast<unsigned>(std::min<int64_t>(g.n * g.c, 65535)));
-    resize_first_kernel<T, Mode, VW, ThreeD><<<grid, block, 0, stream>>>(in, out, g);
-}
 
 template <class T, int Mode, int Vec, bool ThreeD>
 void launch_last_vec(const ResizeGeom& g, const T* in, T* out, int bx, int by, cudaStream_t stream)

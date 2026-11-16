@@ -15,8 +15,8 @@
 /// an order. The values agree exactly either way.
 ///
 /// The axis is read through the view's strides (see axis_walk.hpp), so a padded
-/// pitch is the same kernel with a different offset group. The operator itself
-/// is channel-first only, which the op layer checks.
+/// pitch is the same kernel with a different offset group. The operator is
+/// layout-agnostic: there is no channel-axis claim to honour.
 ///
 /// f32, f16 and bf16 in; values out at X's dtype, indices s64, both written densely —
 /// which is what their descriptors specify. Workspace: not used.

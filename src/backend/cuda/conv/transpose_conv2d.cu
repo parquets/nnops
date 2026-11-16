@@ -20,11 +20,11 @@
 /// and reuses its tile shapes: the exact MAC count, no padding ring, and a
 /// block grid SH·SW times deeper than the undivided one.
 ///
-/// The filter is [IC, OC/G, KH, KW] in both memory orders — the output channel
-/// sits *inside* the reduction — so no k-flattening of it is contiguous and B
-/// is always gathered element by element; only the activation keeps the 16 B
-/// lane, and only channel-last has a channel axis dense enough to use it. That
-/// also rules out the dense-filter copy atom Conv2D's B side has.
+/// The filter is [IC, OC/G, KH, KW] — the output channel sits *inside* the
+/// reduction — so no k-flattening of it is contiguous and B is always gathered
+/// element by element; only the activation keeps the 16 B lane, and a
+/// channel-last activation has a channel axis dense enough to use it. That also
+/// rules out the dense-filter copy atom Conv2D's B side has.
 ///
 /// Two geometries do not reach the GEMM. A group one channel wide on both sides
 /// — a depthwise transposed convolution, where a 64-wide n tile would run
@@ -32,8 +32,8 @@
 /// depthwise_transpose_conv.cu, the same split the CPU backend makes. A grid
 /// too deep for blockIdx.z goes to an output-per-thread script instead.
 ///
-/// f32, f16 and bf16, channel-first and channel-last; the quantized route (an s8
-/// weight) returns unsupported.
+/// f32, f16 and bf16, channel-last; the quantized route (an s8 weight) returns
+/// unsupported.
 
 #include "../cuda_common.cuh"
 #include "../matmul/cute_gemm.cuh"
@@ -52,20 +52,12 @@ namespace {
 constexpr int kThreads = detail::kGemmThreads;
 
 /// Element (n, k) of one group's filter, walked through its own strides. The k
-/// flattening follows the memory order: tap-fastest inside an input channel for
-/// channel-first, channel-fastest inside a tap for channel-last.
-template <class Elem, bool ChannelsLast>
+/// flattening is channel-fastest inside a tap.
+template <class Elem>
 __device__ inline Elem tconv_weight(const ConvParams& p, const Elem* base, int n, int k)
 {
-    const int karea = p.kh * p.kw;
-    int ic, tap;
-    if constexpr (ChannelsLast) {
-        tap = k / p.icg;
-        ic = k - tap * p.icg;
-    } else {
-        ic = k / karea;
-        tap = k - ic * karea;
-    }
+    const int tap = k / p.icg;
+    const int ic = k - tap * p.icg;
     const int kh = tap / p.kw;
     const int kw = tap - kh * p.kw;
     return base[int64_t(n) * p.w_n + int64_t(ic) * p.w_ic + int64_t(kh) * p.w_kh +
@@ -161,83 +153,47 @@ __device__ inline void conv_fill_a_vec(const ConvParams& p, SmemA sA, int stage,
 
 /// Fill one shared-memory A tile with the gathered activation. Threads spread
 /// over the k axis in the channel-last order (consecutive threads read
-/// consecutive channels) and over the pixel axis in the channel-first one
-/// (consecutive threads read consecutive columns of a row).
+/// consecutive channels).
 ///
 /// Every address is a 32-bit offset from the block's already-shifted input
-/// pointer, and both walks decode their starting index once and then step it: a
+/// pointer, and the walk decodes its starting index once and then steps it: a
 /// division by a runtime value is a ~20-instruction sequence on this ISA, and
 /// the element-at-a-time form spent two of them on every element of the tile.
-template <class Elem, bool ChannelsLast, int Threads, int bM, int bK, class SmemA>
+template <class Elem, int Threads, int bM, int bK, class SmemA>
 __device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage, const Elem* in,
                                    int pixel0, int k0)
 {
     const int M = p.oh * p.ow;
     const int K = p.icg * p.kh * p.kw;
-    const int karea = p.kh * p.kw;
     const int tid = int(threadIdx.x);
     // Narrow, so the address arithmetic below stays 32-bit IMAD.
     const int inc = int(p.in_c), inh = int(p.in_h), inw = int(p.in_w);
 
-    if constexpr (ChannelsLast) {
-        static_assert(Threads % bK == 0, "a thread has to own one k column");
-        constexpr int per = Threads / bK; // pixels per round
-        const int col = tid % bK;
-        const int k = k0 + col;
-        const int tap = k / p.icg;
-        int ic = k - tap * p.icg;
-        int kh = tap / p.kw;
-        int kw = tap - kh * p.kw;
-        int pixel = pixel0 + tid / bK;
-        int oh = pixel / p.ow;
-        int ow = pixel - oh * p.ow;
-        for (int row = tid / bK; row < bM; row += per) {
-            const int ih = oh * p.sh - p.ph + kh * p.dh;
-            const int iw = ow * p.sw - p.pw + kw * p.dw;
-            Elem val = Elem(0);
-            if (pixel < M && k < K && unsigned(ih) < unsigned(p.ih) &&
-                unsigned(iw) < unsigned(p.iw)) {
-                val = in[ic * inc + ih * inh + iw * inw];
-            }
-            sA(row, col, stage) = val;
-            pixel += per;
-            ow += per;
-            while (ow >= p.ow) {
-                ow -= p.ow;
-                ++oh;
-            }
+    static_assert(Threads % bK == 0, "a thread has to own one k column");
+    constexpr int per = Threads / bK; // pixels per round
+    const int col = tid % bK;
+    const int k = k0 + col;
+    const int tap = k / p.icg;
+    int ic = k - tap * p.icg;
+    int kh = tap / p.kw;
+    int kw = tap - kh * p.kw;
+    int pixel = pixel0 + tid / bK;
+    int oh = pixel / p.ow;
+    int ow = pixel - oh * p.ow;
+    for (int row = tid / bK; row < bM; row += per) {
+        const int ih = oh * p.sh - p.ph + kh * p.dh;
+        const int iw = ow * p.sw - p.pw + kw * p.dw;
+        Elem val = Elem(0);
+        if (pixel < M && k < K && unsigned(ih) < unsigned(p.ih) &&
+            unsigned(iw) < unsigned(p.iw)) {
+            val = in[ic * inc + ih * inh + iw * inw];
         }
-    } else {
-        static_assert(Threads % bM == 0 && bK % (Threads / bM) == 0,
-                      "the k column walk has to divide the tile");
-        constexpr int per = Threads / bM; // k columns per thread
-        const int row = tid % bM;
-        const int pixel = pixel0 + row;
-        const bool m_ok = pixel < M;
-        const int oh = pixel / p.ow;
-        const int ow = pixel - oh * p.ow;
-        const int col0 = (tid / bM) * (bK / per);
-        int k = k0 + col0;
-        int ic = k / karea;
-        int tap = k - ic * karea;
-        int kh = tap / p.kw;
-        int kw = tap - kh * p.kw;
-        for (int j = 0; j < bK / per; ++j) {
-            const int ih = oh * p.sh - p.ph + kh * p.dh;
-            const int iw = ow * p.sw - p.pw + kw * p.dw;
-            Elem val = Elem(0);
-            if (m_ok && k < K && unsigned(ih) < unsigned(p.ih) && unsigned(iw) < unsigned(p.iw)) {
-                val = in[ic * inc + ih * inh + iw * inw];
-            }
-            sA(row, col0 + j, stage) = val;
-            ++k;
-            if (++kw == p.kw) {
-                kw = 0;
-                if (++kh == p.kh) {
-                    kh = 0;
-                    ++ic;
-                }
-            }
+        sA(row, col, stage) = val;
+        pixel += per;
+        ow += per;
+        while (ow >= p.ow) {
+            ow -= p.ow;
+            ++oh;
         }
     }
 }
@@ -271,7 +227,7 @@ struct ConvTileH {
     static constexpr int threads = 32 * wm * wn;
 };
 
-template <class Elem, bool ChannelsLast>
+template <class Elem>
 __global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvParams pin)
 {
     using namespace cute;
@@ -317,7 +273,7 @@ __global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvPa
 
     constexpr auto sA_layout = detail::gemm_smem_layout<true>(Int<bM>{}, Int<bK>{}, Int<kStages>{});
     constexpr auto sB_layout =
-        detail::gemm_smem_layout<!ChannelsLast>(Int<bN>{}, Int<bK>{}, Int<kStages>{});
+        detail::gemm_smem_layout<false>(Int<bN>{}, Int<bK>{}, Int<kStages>{});
     constexpr int kSmemA = int(cosize(sA_layout));
 
     extern __shared__ char gemm_smem[];
@@ -330,13 +286,11 @@ __global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvPa
                                   cute::Tile<Int<ConvTileH::mmaM>, Int<ConvTileH::mmaN>, _16>{});
 
     auto load_a = [&](int kt, int stage) {
-        if constexpr (ChannelsLast) {
-            if (p.fill_vec) {
-                conv_fill_a_vec<Elem, bK>(p, sA, stage, in, rows, kt * bK);
-                return;
-            }
+        if (p.fill_vec) {
+            conv_fill_a_vec<Elem, bK>(p, sA, stage, in, rows, kt * bK);
+            return;
         }
-        conv_fill_a<Elem, ChannelsLast, ConvTileH::threads, bM, bK>(p, sA, stage, in, m0, kt * bK);
+        conv_fill_a<Elem, ConvTileH::threads, bM, bK>(p, sA, stage, in, m0, kt * bK);
     };
     // One column of B per thread, so the tap is decoded once and the row walk is
     // a stride. The filter's k axis is never contiguous here (the output channel
@@ -345,15 +299,8 @@ __global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvPa
         constexpr int per = ConvTileH::threads / bK; // rows per round
         const int col = int(threadIdx.x) % bK;
         const int k = kt * bK + col;
-        const int karea = p.kh * p.kw;
-        int ic, tap;
-        if constexpr (ChannelsLast) {
-            tap = k / p.icg;
-            ic = k - tap * p.icg;
-        } else {
-            ic = k / karea;
-            tap = k - ic * karea;
-        }
+        const int tap = k / p.icg;
+        const int ic = k - tap * p.icg;
         const int kh = tap / p.kw;
         const int kw = tap - kh * p.kw;
         const bool k_ok = k < K;
@@ -392,13 +339,7 @@ __global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvPa
     clear(tCrC);
 
     Copy_Atom<SM75_U32x4_LDSM_N, Elem> s2r_atom_a;
-    auto s2r_atom_b = [&] {
-        if constexpr (ChannelsLast) {
-            return Copy_Atom<SM75_U16x8_LDSM_T, Elem>{};
-        } else {
-            return Copy_Atom<SM75_U32x4_LDSM_N, Elem>{};
-        }
-    }();
+    Copy_Atom<SM75_U16x8_LDSM_T, Elem> s2r_atom_b;
 
     TiledCopy s2r_copy_a = make_tiled_copy_A(s2r_atom_a, mma);
     ThrCopy s2r_thr_copy_a = s2r_copy_a.get_slice(threadIdx.x);
@@ -469,7 +410,6 @@ __global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvPa
 // f32 SIMT kernel
 // ============================================================
 
-template <bool ChannelsLast>
 __global__ __launch_bounds__(kThreads) void tconv_gemm_f_kernel(ConvParams pin)
 {
     using namespace cute;
@@ -518,15 +458,9 @@ __global__ __launch_bounds__(kThreads) void tconv_gemm_f_kernel(ConvParams pin)
     constexpr auto sA_layout =
         make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
                     make_stride(Int<bK + kPad>{}, Int<1>{}, Int<(bK + kPad) * bM>{}));
-    constexpr auto sB_layout = [&] {
-        if constexpr (ChannelsLast) {
-            return make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
-                               make_stride(Int<1>{}, Int<bN + kPad>{}, Int<(bN + kPad) * bK>{}));
-        } else {
-            return make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
-                               make_stride(Int<bK + kPad>{}, Int<1>{}, Int<(bK + kPad) * bN>{}));
-        }
-    }();
+    constexpr auto sB_layout =
+        make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
+                    make_stride(Int<1>{}, Int<bN + kPad>{}, Int<(bN + kPad) * bK>{}));
     constexpr int kSmemA = int(cosize(sA_layout));
 
     extern __shared__ char gemm_smem[];
@@ -541,27 +475,18 @@ __global__ __launch_bounds__(kThreads) void tconv_gemm_f_kernel(ConvParams pin)
                                   Tile<_64, _64, _1>{});
 
     auto load_a = [&](int kt, int stage) {
-        if constexpr (ChannelsLast) {
-            if (p.fill_vec) {
-                conv_fill_a_vec<Elem, bK>(p, sA, stage, in, rows, kt * bK);
-                return;
-            }
+        if (p.fill_vec) {
+            conv_fill_a_vec<Elem, bK>(p, sA, stage, in, rows, kt * bK);
+            return;
         }
-        conv_fill_a<Elem, ChannelsLast, kThreads, bM, bK>(p, sA, stage, in, m0, kt * bK);
+        conv_fill_a<Elem, kThreads, bM, bK>(p, sA, stage, in, m0, kt * bK);
     };
     auto load_b = [&](int kt, int stage) {
         constexpr int per = kThreads / bK; // rows per round
         const int col = int(threadIdx.x) % bK;
         const int k = kt * bK + col;
-        const int karea = p.kh * p.kw;
-        int ic, tap;
-        if constexpr (ChannelsLast) {
-            tap = k / p.icg;
-            ic = k - tap * p.icg;
-        } else {
-            ic = k / karea;
-            tap = k - ic * karea;
-        }
+        const int tap = k / p.icg;
+        const int ic = k - tap * p.icg;
         const int kh = tap / p.kw;
         const int kw = tap - kh * p.kw;
         const bool k_ok = k < K;
@@ -711,7 +636,7 @@ template <class Elem> __global__ void tconv_plane_kernel(ConvParams p, int ow_ti
 // Launch
 // ============================================================
 
-template <class Elem, bool ChannelsLast>
+template <class Elem>
 void launch_tconv_gemm_h(const ConvParams& p, int m_max, cudaStream_t stream)
 {
     using namespace cute;
@@ -719,10 +644,10 @@ void launch_tconv_gemm_h(const ConvParams& p, int m_max, cudaStream_t stream)
     constexpr auto la =
         detail::gemm_smem_layout<true>(Int<bM>{}, Int<bK>{}, Int<ConvTileH::stages>{});
     constexpr auto lb =
-        detail::gemm_smem_layout<!ChannelsLast>(Int<bN>{}, Int<bK>{}, Int<ConvTileH::stages>{});
+        detail::gemm_smem_layout<false>(Int<bN>{}, Int<bK>{}, Int<ConvTileH::stages>{});
     constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(Elem));
 
-    auto kernel = tconv_gemm_h_kernel<Elem, ChannelsLast>;
+    auto kernel = tconv_gemm_h_kernel<Elem>;
     static const cudaError_t cfg =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
@@ -731,14 +656,13 @@ void launch_tconv_gemm_h(const ConvParams& p, int m_max, cudaStream_t stream)
     kernel<<<grid, ConvTileH::threads, smem, stream>>>(p);
 }
 
-template <bool ChannelsLast>
-void launch_tconv_gemm_f(const ConvParams& p, int m_max, cudaStream_t stream)
+inline void launch_tconv_gemm_f(const ConvParams& p, int m_max, cudaStream_t stream)
 {
     using namespace cute; // ceil_div
     constexpr int bM = 64, bN = 64, bK = 16, kStages = 3, kPad = 4;
     constexpr int smem = (bM * (bK + kPad) + bN * (bK + kPad)) * kStages * int(sizeof(float));
 
-    auto kernel = tconv_gemm_f_kernel<ChannelsLast>;
+    auto kernel = tconv_gemm_f_kernel;
     static const cudaError_t cfg =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
@@ -779,11 +703,6 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     if (wgt.rank() != 4) {
         return Status::unsupported;
     }
-    const bool last = is_channel_last(act.layout());
-    if (last != is_channel_last(output.layout())) {
-        return Status::unsupported;
-    }
-
     ConvParams p;
     p.batch = static_cast<int>(act.shape(0));
     p.ic = static_cast<int>(act.shape(1));
@@ -826,9 +745,8 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     p.max_clip = attrs.epilogue.max_clip;
     p.add_to = attrs.add_to;
     p.pre_act = attrs.add_to && attrs.residual_pre_activation;
-    p.channels_last = last;
 
-    // The filter is [IC][OC/G][KH][KW] in both memory orders.
+    // The filter is [IC][OC/G][KH][KW].
     p.w_ic = wgt.stride_elems(0);
     p.w_n = wgt.stride_elems(1);
     p.w_kh = wgt.stride_elems(2);
@@ -840,7 +758,7 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     // channel stride is what has to be 16 B aligned.
     const int64_t esz = static_cast<int64_t>(data_type_size(dt));
     const int kGroup = esz == 2 ? 8 : 4;
-    p.fill_vec = last && p.in_c == 1 && p.icg % kGroup == 0 && (p.in_w * esz) % 16 == 0 &&
+    p.fill_vec = p.in_c == 1 && p.icg % kGroup == 0 && (p.in_w * esz) % 16 == 0 &&
                  (reinterpret_cast<uintptr_t>(p.input) % 16 == 0);
 
     p.classes = p.sh * p.sw;
@@ -862,23 +780,11 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     if (gemm) {
         if (dt == DataType::bf16) {
-            if (last) {
-                launch_tconv_gemm_h<cute::bfloat16_t, true>(p, m_max, stream);
-            } else {
-                launch_tconv_gemm_h<cute::bfloat16_t, false>(p, m_max, stream);
-            }
+            launch_tconv_gemm_h<cute::bfloat16_t>(p, m_max, stream);
         } else if (esz == 2) {
-            if (last) {
-                launch_tconv_gemm_h<cute::half_t, true>(p, m_max, stream);
-            } else {
-                launch_tconv_gemm_h<cute::half_t, false>(p, m_max, stream);
-            }
+            launch_tconv_gemm_h<cute::half_t>(p, m_max, stream);
         } else {
-            if (last) {
-                launch_tconv_gemm_f<true>(p, m_max, stream);
-            } else {
-                launch_tconv_gemm_f<false>(p, m_max, stream);
-            }
+            launch_tconv_gemm_f(p, m_max, stream);
         }
     } else if (tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, dt, stream)) {
         // launched by the depthwise route
