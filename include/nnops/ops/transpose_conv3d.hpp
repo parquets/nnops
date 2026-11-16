@@ -3,11 +3,10 @@
 /// @brief TransposeConv3D — transposed 3D convolution (deconvolution).
 ///
 /// The 3-D form of TransposeConv2D, in ONNX's ConvTranspose convention: the
-/// image is [N, IC, ID, IH, IW], logical channels first and stored channel-first
-/// (NCDHW) or channel-last (NDHWC); the weight is channel-first
+/// image is [N, IC, ID, IH, IW] stored channel-last (NDHWC); the weight is
 /// [IC, OC/G, KD, KH, KW] — input channel outermost, the opposite of Conv3D's
-/// weight — in both layouts; and the output is [N, OC, OD, OH, OW] in the input's
-/// layout, bias [OC] optional. Grouped, dilated and strided, with output_padding
+/// weight; and the output is [N, OC, OD, OH, OW] in the input's layout, bias
+/// [OC] optional. Grouped, dilated and strided, with output_padding
 /// resolving the output size when the stride does not:
 ///   OD = (ID - 1)·SD - 2·PD + DD·(KD - 1) + output_padding[0] + 1.
 ///
@@ -87,7 +86,7 @@ public:
     OpType  getOpType()  const override { return OpType::TransposeConv3D; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOrChannelLast;
+        return LayoutSupport::ChannelLastOnly;
     }
 
     const TransposeConv3DAttributes& attributes() const noexcept { return attrs_; }

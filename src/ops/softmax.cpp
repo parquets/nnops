@@ -16,22 +16,7 @@ NNOPS_OP_BOILERPLATE(Softmax, SoftmaxAttributes, backend::cpu::softmax_cpu,
 
 std::vector<TensorDesc> Softmax::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
-    auto out = identity_output_shape(inputs);
-    // Quantized input (s8/u8): softmax output is dequantized float (default f32),
-    // not re-quantized int.
-    if (is_quantized_dtype(inputs[0].dtype)) {
-        out[0].dtype = DataType::f32;
-    }
-    return out;
-}
-
-size_t Softmax::getWorkspaceSize(std::span<const TensorDesc> inputs,
-                                 std::span<const TensorDesc> outputs) const
-{
-    (void)inputs;
-    (void)outputs;
-    // Quantized dequantization scratch is pooled internally by the CPU kernel.
-    return 0;
+    return identity_output_shape(inputs);
 }
 
 Status Softmax::validate(std::span<const TensorDesc> inputs,
@@ -44,21 +29,13 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
     }
 
     // The axis walk reads the tensor through stride_elems(), which describes the
-    // two regular image layouts; the opaque weight tags have no axis semantics
-    // here.
-    if (!is_channel_first_spatial(inputs[0].layout) && !is_channel_last(inputs[0].layout)) {
+    // regular image layouts; the opaque weight tags have no axis semantics here.
+    if (!is_channel_last(inputs[0].layout)) {
         return Status::unsupported;
     }
-
+    // A quantized input needed the channel-first dequantizing walk, which is gone.
     if (is_quantized_dtype(inputs[0].dtype)) {
-        // A quantized input is dequantized first, so the output must be float.
-        if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, outputs[0].dtype)) {
-            return Status::invalid_argument;
-        }
-        // And the dequantizing walk is only defined over channel-first layouts.
-        return detail::require(
-            is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly),
-            Status::unsupported);
+        return Status::unsupported;
     }
     return Status::ok;
 }

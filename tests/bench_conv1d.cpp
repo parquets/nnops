@@ -245,40 +245,18 @@ struct ConvShape {
     const char* name;
     int64_t N, IC, L, OC, K;
     int64_t S = 1, P = 0, D = 1, G = 1;
-    bool cl = false;   ///< channel-last activation + HWIO filter
 };
 
-/// Audio front ends and sequence backbones, then the awkward geometries. The
-/// `cl` variants are the same layer in the other layout — a different 2D route,
-/// held to the same rule.
+/// Audio front ends and sequence backbones, then the awkward geometries — all
+/// channel-last.
 const std::vector<ConvShape>& conv_sweep() {
     static const std::vector<ConvShape> s = {
-        // ---- wav2vec2's feature extractor: five strided convs on raw audio -----
-        {"cf wav2vec fe c1  1x1x16000  -> 512 k10 s5", 1,   1, 16000, 512, 10, 5, 4},
-        {"cf wav2vec fe c2  1x512x3199 -> 512 k3 s2",  1, 512,  3199, 512,  3, 2, 1},
-        {"cf wav2vec fe c3  1x512x1600 -> 512 k3 s2",  1, 512,  1600, 512,  3, 2, 1},
-        // ---- squeeze-excite / conformer blocks ---------------------------------
-        {"cf se conv 1x64x400 k3 p1",                   1,  64,   400,  64,  3, 1, 1},
-        {"cf se pointwise 1x64x400 k1",                 1,  64,   400,  64,  1},
-        {"cf tcn dilated 1x128x1000 k3 d4 p4",          1, 128,  1000, 128,  3, 1, 4, 4},
-        // ---- the awkward cases --------------------------------------------------
-        {"cf depthwise 1x256x4000 k5 g256",             1, 256,  4000, 256,  5, 1, 2, 1, 256},
-        {"cf grouped 1x256x1000 k3 g4",                 1, 256,  1000, 256,  3, 1, 1, 1, 4},
-        {"cf big k 1x32x2000 k15",                      1,  32,  2000,  32, 15, 1, 7},
-        {"cf batch 8x64x500 k3 p1",                     8,  64,   500,  64,  3, 1, 1},
-        // ---- the same layers channel-last --------------------------------------
-        {"cl wav2vec fe c2  1x512x3199 -> 512 k3 s2",  1, 512,  3199, 512,  3, 2, 1, 1,
-         true},
-        {"cl se conv 1x64x400 k3 p1",                   1,  64,   400,  64,  3, 1, 1, 1,
-         true},
-        {"cl tcn dilated 1x128x1000 k3 d4 p4",          1, 128,  1000, 128,  3, 1, 4, 4,
-         true},
-        {"cl grouped 1x256x1000 k3 g4",                 1, 256,  1000, 256,  3, 1, 1, 1, 4,
-         true},
-        {"cl depthwise 1x256x4000 k5 g256",             1, 256,  4000, 256,  5, 1, 2, 1, 256,
-         true},
-        {"cl big k 1x32x2000 k15",                      1,  32,  2000,  32, 15, 1, 7, 1,
-         true},
+        {"cl wav2vec fe c2  1x512x3199 -> 512 k3 s2",  1, 512,  3199, 512,  3, 2, 1, 1},
+        {"cl se conv 1x64x400 k3 p1",                   1,  64,   400,  64,  3, 1, 1, 1},
+        {"cl tcn dilated 1x128x1000 k3 d4 p4",          1, 128,  1000, 128,  3, 1, 4, 4},
+        {"cl grouped 1x256x1000 k3 g4",                 1, 256,  1000, 256,  3, 1, 1, 1, 4},
+        {"cl depthwise 1x256x4000 k5 g256",             1, 256,  4000, 256,  5, 1, 2, 1, 256},
+        {"cl big k 1x32x2000 k15",                      1,  32,  2000,  32, 15, 1, 7, 1},
     };
     return s;
 }
@@ -298,25 +276,16 @@ struct Conv1DPair {
         constexpr DataType dt = dtype_of<T>();
 
         in_buf = random_vec<T>(std::span<const int64_t>(ish, 3), 1);
-        if (c.cl) {
-            in_layout = TensorLayout::NHWC;
-            in_buf = test::to_channel_last<T>(
-                std::span<const T>(in_buf.data(), in_buf.size()), c.N, c.IC, c.L);
-        }
+        in_layout = TensorLayout::NHWC;
+        in_buf = test::to_channel_last<T>(
+            std::span<const T>(in_buf.data(), in_buf.size()), c.N, c.IC, c.L);
 
-        // The filter is written once and stored as OIHW or HWIO: the same
-        // numbers, in the order the layout wants.
+        // The filter is written once and stored HWIO.
         const std::vector<T> w_oihw = random_vec<T>(
             std::span<const int64_t>(std::array<int64_t, 3>{c.OC, icg, c.K}.data(), 3), 2);
-        if (c.cl) {
-            w_buf = test::oihw_to_hwio<T>(w_oihw, c.OC, icg, 1, c.K);
-            w_dims = {c.K, icg, c.OC};
-            w_layout = TensorLayout::HWIO;
-        } else {
-            w_buf = w_oihw;
-            w_dims = {c.OC, icg, c.K};
-            w_layout = TensorLayout::NCHW;
-        }
+        w_buf = test::oihw_to_hwio<T>(w_oihw, c.OC, icg, 1, c.K);
+        w_dims = {c.K, icg, c.OC};
+        w_layout = TensorLayout::HWIO;
         b_buf = random_vec<T>(std::span<const int64_t>(&c.OC, 1), 3, 0.05f);
 
         in = TensorView(std::span<const int64_t>(ish, 3), dt, in_buf.data(),
@@ -324,7 +293,7 @@ struct Conv1DPair {
         w  = TensorView(std::span<const int64_t>(w_dims.data(), 3), dt,
                         w_buf.data(), w_layout);
         b  = TensorView(std::span<const int64_t>(&c.OC, 1), dt, b_buf.data(),
-                        TensorLayout::NCHW);
+                        TensorLayout::Dense);
 
         Conv1DAttributes a1{};
         a1.kernel_size = c.K;
@@ -338,8 +307,7 @@ struct Conv1DPair {
         const auto od = op1d->getOutputTensorDesc(d1);
         OL = od[0].dims[2];
         out_buf.assign(static_cast<size_t>(od[0].numel()), T{});
-        out = TensorView(od[0].dims, dt, out_buf.data(),
-                         c.cl ? TensorLayout::NHWC : TensorLayout::NCHW);
+        out = TensorView(od[0].dims, dt, out_buf.data(), TensorLayout::NHWC);
         ins1d = {in, w, b};
 
         // The control arm: the operator's own lift, handed straight to Conv2D.
@@ -366,8 +334,8 @@ struct Conv1DPair {
     Status run_2d(const ComputeContext& ctx) { return op2d->compute(out4, ins2d, ctx, nullptr); }
 
     ConvShape s;
-    TensorLayout in_layout = TensorLayout::NCHW;
-    TensorLayout w_layout = TensorLayout::NCHW;
+    TensorLayout in_layout = TensorLayout::NHWC;
+    TensorLayout w_layout = TensorLayout::HWIO;
     std::array<int64_t, 3> w_dims{};
     std::vector<T> in_buf, w_buf, b_buf, out_buf;
     TensorView in, w, b, out, out4;
@@ -409,17 +377,11 @@ struct I8Conv1DPair {
                 w_s[static_cast<size_t>(oc)] = 0.01f * static_cast<float>(1 + oc % 5);
             }
         }
-        if (c.cl) {
-            in_buf = test::to_channel_last<uint8_t>(
-                std::span<const uint8_t>(in_buf.data(), in_buf.size()), c.N, c.IC, c.L);
-            w_buf = test::oihw_to_hwio<int8_t>(w_oihw, c.OC, icg, 1, c.K);
-            w_dims = {c.K, icg, c.OC};
-            w_layout = TensorLayout::HWIO;
-        } else {
-            w_buf = w_oihw;
-            w_dims = {c.OC, icg, c.K};
-            w_layout = TensorLayout::NCHW;
-        }
+        in_buf = test::to_channel_last<uint8_t>(
+            std::span<const uint8_t>(in_buf.data(), in_buf.size()), c.N, c.IC, c.L);
+        w_buf = test::oihw_to_hwio<int8_t>(w_oihw, c.OC, icg, 1, c.K);
+        w_dims = {c.K, icg, c.OC};
+        w_layout = TensorLayout::HWIO;
         b_buf = random_vec<float>(std::span<const int64_t>(&c.OC, 1), 3, 0.05f);
 
         const int64_t ish[] = {c.N, c.IC, c.L};
@@ -427,12 +389,11 @@ struct I8Conv1DPair {
         const QuantParams qw = q_per_channel(w_s.data(), w_zp.data(), c.OC);
 
         in = TensorView(std::span<const int64_t>(ish, 3), DataType::u8,
-                        in_buf.data(), c.cl ? TensorLayout::NHWC : TensorLayout::NCHW,
-                        qa);
+                        in_buf.data(), TensorLayout::NHWC, qa);
         w  = TensorView(std::span<const int64_t>(w_dims.data(), 3), DataType::s8,
                         w_buf.data(), w_layout, qw);
         b  = TensorView(std::span<const int64_t>(&c.OC, 1), DataType::f32,
-                        b_buf.data(), TensorLayout::NCHW);
+                        b_buf.data(), TensorLayout::Dense);
 
         Conv1DAttributes a1{};
         a1.kernel_size  = c.K;
@@ -448,7 +409,7 @@ struct I8Conv1DPair {
         OL = od[0].dims[2];
         out_buf.assign(static_cast<size_t>(od[0].numel()), 0.0f);
         out = TensorView(od[0].dims, DataType::f32, out_buf.data(),
-                         c.cl ? TensorLayout::NHWC : TensorLayout::NCHW);
+                         TensorLayout::NHWC);
         ins1d = {in, w, b};
 
         TensorView in4 = cpu::lift_wide(in);
@@ -473,7 +434,7 @@ struct I8Conv1DPair {
     Status run_2d(const ComputeContext& ctx) { return op2d->compute(out4, ins2d, ctx, nullptr); }
 
     ConvShape s;
-    TensorLayout w_layout = TensorLayout::NCHW;
+    TensorLayout w_layout = TensorLayout::HWIO;
     std::array<int64_t, 3> w_dims{};
     std::vector<uint8_t> in_buf;
     std::vector<int8_t> w_buf;

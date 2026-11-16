@@ -1,48 +1,33 @@
 /// @file test_conv2d_winograd.cpp
-/// @brief Unit tests for the Winograd Conv2D path (k3s1), F(2×2,3×3) and
-///        F(4×4,3×3).
+/// @brief Unit tests for the channel-last Winograd Conv2D path (k3s1),
+///        F(2×2,3×3) and F(4×4,3×3).
 ///
-/// The transforms are checked against naive scalar references written longhand
-/// from each order's definition; then the prepack contract (query metadata,
-/// explicit pitch) and the plan's admission and filter-row split; then
-/// end-to-end Winograd vs conv2d_ref on the *raw* weight, f32 and f16, plus
-/// winograd_applicable's policy and a serial-vs-pooled run.
+/// The weight transform is checked against a naive scalar reference written
+/// longhand from each order's definition; the F(4,3) input and output
+/// transforms are checked on channel-last planes. The order policy is pinned at
+/// its fences: winograd_applicable's admission and wino_pick_order's F(2,3) /
+/// F(4,3) decision.
+///
+/// The end-to-end Winograd-vs-reference cases live in
+/// test_conv2d_channel_last, where the activation, the HWIO filter and the
+/// prepacked U are all channel-last.
 ///
 /// Winograd and direct convolution are algebraically equal but not bit-identical
-/// (the transform reorders the sums and, at f16, adds a rounding step), so every
-/// comparison against conv2d_ref is tolerance-based. The serial-vs-pooled check
-/// is exact instead: same per-element operation order, different task split.
+/// (the transform reorders the sums and, at f16, adds a rounding step), so those
+/// comparisons are tolerance-based.
 
 #include "nnops/ops/conv2d.hpp"
 #include "backend/cpu/conv/conv2d_winograd.h"
-#include "backend/cpu/matmul/matmul_helper.h"   // NR_MAX_F32/MR_MAX_F32 — the plan's panels
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
 #include "common/test_harness.hpp"
-#include "common/cpu_pool.hpp"
-#include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
-#include "common/compare.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <atomic>
-#include <cstring>
-#include <thread>
 #include <vector>
 
 using namespace nnops;
-using nnops::backend::cpu::half;
-
-// Reference kernel, test-local as in test_conv2d.cpp / test_matmul.cpp (it is
-// not exported through a header).
-namespace nnops::backend::cpu::reference {
-void conv2d_ref(const Conv2DAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx,
-                void* workspace);
-}
 
 // ============================================================
 // Transform matrices, restated independently of the kernel
@@ -50,45 +35,6 @@ void conv2d_ref(const Conv2DAttributes& attrs,
 //
 // Bᵀ is applied as (d·B) then (Bᵀ·e); Aᵀ as (Aᵀ·m) then (·A); G as written.
 // Longhand, so a typo in simd_winograd.hpp cannot hide behind a shared helper.
-
-static void naive_btdb(const float d[4][4], float v[4][4]) {
-    static const float Bt[4][4] = {
-        {1, 0, -1, 0}, {0, 1, 1, 0}, {0, -1, 1, 0}, {0, 1, 0, -1}};
-    float e[4][4];
-    for (int i = 0; i < 4; ++i) {
-        for (int j = 0; j < 4; ++j) {
-            float s = 0.0f;
-            for (int k = 0; k < 4; ++k) { s += d[i][k] * Bt[j][k]; }  // d·B
-            e[i][j] = s;
-        }
-    }
-    for (int i = 0; i < 4; ++i) {
-        for (int j = 0; j < 4; ++j) {
-            float s = 0.0f;
-            for (int k = 0; k < 4; ++k) { s += Bt[i][k] * e[k][j]; }
-            v[i][j] = s;
-        }
-    }
-}
-
-static void naive_atma(const float m[4][4], float y[2][2]) {
-    static const float At[2][4] = {{1, 1, 1, 0}, {0, 1, -1, -1}};
-    float t[2][4];
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 4; ++j) {
-            float s = 0.0f;
-            for (int k = 0; k < 4; ++k) { s += At[i][k] * m[k][j]; }
-            t[i][j] = s;
-        }
-    }
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            float s = 0.0f;
-            for (int k = 0; k < 4; ++k) { s += t[i][k] * At[j][k]; }
-            y[i][j] = s;
-        }
-    }
-}
 
 static void naive_gggt(const float g[3][3], float u[4][4]) {
     static const float G[4][3] = {
@@ -226,95 +172,8 @@ NNOPS_TEST(wino_weight_transform_plane_strides) {
     }
 }
 
-NNOPS_TEST(wino_input_transform_matches_naive) {
-    // 34 columns = the minimum halo width for TW_pad = 16 (the offset-2 loads
-    // touch 2·(TW_pad−8) + 17 = 33).
-    constexpr int kHaloW = 34;
-    constexpr int kHaloH = 8;
-    constexpr int kTiles = 8;
-    std::vector<float> halo(kHaloW * kHaloH);
-    test::XorShift128 rng(7);
-    for (auto& x : halo) { x = rng.next_float(-3.0f, 3.0f); }
-
-    // Two column groups, tw0 = 0 and 8 (pw0 = 0 and 16); the second one's loads
-    // reach the end of the padded row.
-    for (int tw0 : {0, 8}) {
-        std::vector<float> v(16 * kTiles, -99.0f);
-        nnops::kernel::winograd_input_tile8<float>(halo.data(), kHaloW,
-                                                   2, 2 * tw0, v.data(), kTiles);
-        for (int t = 0; t < kTiles; ++t) {
-            float d[4][4];
-            for (int r = 0; r < 4; ++r) {
-                for (int c = 0; c < 4; ++c) {
-                    d[r][c] = halo[(2 + r) * kHaloW + (2 * tw0 + 2 * t + c)];
-                }
-            }
-            float want[4][4];
-            naive_btdb(d, want);
-            for (int i = 0; i < 4; ++i) {
-                for (int j = 0; j < 4; ++j) {
-                    NNOPS_EXPECT_NEAR(v[(i * 4 + j) * kTiles + t], want[i][j], 1e-4f);
-                }
-            }
-        }
-    }
-}
-
-NNOPS_TEST(wino_output_transform_matches_naive) {
-    constexpr int kOcn = 2;
-    constexpr int kTb = 8;
-    constexpr int kOutW = 32;
-
-    std::vector<float> m(16 * kOcn * kTb);
-    test::XorShift128 rng(11);
-    for (auto& x : m) { x = rng.next_float(-2.0f, 2.0f); }
-
-    std::vector<float> out0(kOutW, -1.0f), out1(kOutW, -1.0f);
-    const int oc = 1;
-    const Epilogue ep{};
-    nnops::kernel::winograd_output_tile8<float>(m.data(), kOcn * kTb, kTb, oc, 0,
-                                                out0.data(), out1.data(),
-                                                0, kOutW, true, ep, 0.0f, false);
-
-    for (int t = 0; t < kTb; ++t) {
-        float mm[4][4];
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                mm[i][j] = m[(i * 4 + j) * kOcn * kTb + oc * kTb + t];
-            }
-        }
-        float want[2][2];
-        naive_atma(mm, want);
-        for (int r = 0; r < 2; ++r) {
-            for (int c = 0; c < 2; ++c) {
-                const float got = (r == 0 ? out0 : out1)[2 * t + c];
-                NNOPS_EXPECT_NEAR(got, want[r][c], 1e-4f);
-            }
-        }
-    }
-}
-
-NNOPS_TEST(wino_output_transform_applies_bias_and_masks) {
-    constexpr int kOcn = 1;
-    constexpr int kTb = 8;
-    constexpr int kOutW = 10;  // < 2·kTb: the tail of the last group must be masked
-
-    std::vector<float> m(16 * kOcn * kTb, 0.0f);
-    std::vector<float> out0(kOutW, 5.0f), out1(kOutW, 5.0f);
-    const Epilogue ep{};
-    nnops::kernel::winograd_output_tile8<float>(m.data(), kOcn * kTb, kTb, 0, 0,
-                                                out0.data(), out1.data(),
-                                                0, kOutW, /*row1_ok=*/false,
-                                                ep, 2.0f, /*add_to=*/false);
-
-    // row1_ok=false leaves out1 untouched (5.0); out0 takes the bias on every
-    // column below OW and nothing past it.
-    for (int i = 0; i < kOutW; ++i) { NNOPS_EXPECT_NEAR(out0[i], 2.0f, 1e-6f); }
-    for (int i = 0; i < kOutW; ++i) { NNOPS_EXPECT_NEAR(out1[i], 5.0f, 1e-6f); }
-}
-
 // ============================================================
-// F(4,3) transforms (channel-last route only)
+// F(4,3) transforms (channel-last route)
 // ============================================================
 
 NNOPS_TEST(wino43_weight_transform_matches_naive) {
@@ -416,351 +275,8 @@ NNOPS_TEST(wino43_output_transform_matches_naive) {
 }
 
 // ============================================================
-// Prepack contract
+// Selection policy and the Auto algorithm
 // ============================================================
-
-NNOPS_TEST(wino_prepack_query) {
-    const int64_t wshape[] = {5, 3, 3, 3};  // OC=5, IC/G=3, 3×3
-    std::vector<float> w_buf(5 * 3 * 9, 0.25f);
-    TensorView weight(wshape, DataType::f32, w_buf.data());
-
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.algorithm = ConvAlgorithm::Winograd;
-    auto op = Conv2D::create(attrs, Backend::CPU);
-
-    TensorView empty;
-    TensorView packed;
-    {
-        const TensorView w_arr[] = {weight};
-        TensorView out_arr[] = {empty};
-        op->prepackWeights(w_arr, out_arr);
-        packed = out_arr[0];
-    }
-
-    NNOPS_EXPECT_EQ(packed.rank(), 3);
-    NNOPS_EXPECT_EQ(packed.shape(0), 16);
-    NNOPS_EXPECT_EQ(packed.shape(1), 5);
-    NNOPS_EXPECT_EQ(packed.shape(2), 3);
-    NNOPS_EXPECT_EQ(packed.data_type(), DataType::f32);
-    NNOPS_EXPECT_EQ(static_cast<int64_t>(packed.layout()),
-                    static_cast<int64_t>(TensorLayout::PackedWinoWeight));
-    // Explicit pitch — the packed weight is *not* channel-packed, so the
-    // default 32 B row alignment would not be IC/G × elem_size.
-    NNOPS_EXPECT_EQ(packed.pitch(), 3 * static_cast<int64_t>(sizeof(float)));
-}
-
-NNOPS_TEST(wino_prepack_order_bakes_the_opt_in) {
-    // The order is baked into U at prepack and read back off the blob — 36
-    // positions for F(4,3), 16 otherwise. The plane hint is what the policy
-    // weighs, so a 56x56 plane at one worker takes F(4,3) on its own while a
-    // 14x14 one stays below the floor; winograd_order still overrides both.
-    const int64_t wshape[] = {64, 64, 3, 3};
-    std::vector<float> w_buf(64 * 64 * 9, 0.25f);
-    TensorView weight(wshape, DataType::f32, w_buf.data());
-
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    attrs.algorithm = ConvAlgorithm::Winograd;
-    auto op = Conv2D::create(attrs, Backend::CPU);
-
-    const auto query = [&](int64_t h, int64_t w, bool hint) {
-        std::vector<float> x_buf(static_cast<size_t>(64 * h * w), 0.0f);
-        const int64_t xshape[] = {1, 64, h, w};
-        TensorView x(xshape, DataType::f32, x_buf.data());
-        TensorView empty;
-        const TensorView in[] = {weight, x};
-        TensorView out[] = {empty};
-        const std::span<const TensorView> ins =
-            hint ? std::span<const TensorView>(in, 2)
-                 : std::span<const TensorView>(in, 1);
-        op->prepackWeights(ins, out);
-        return out[0].shape(0);
-    };
-
-    NNOPS_EXPECT_EQ(query(56, 56, true), int64_t{36});
-    NNOPS_EXPECT_EQ(query(14, 14, true), int64_t{16});
-    // No plane hint: the policy cannot weigh the plane and takes the safe order.
-    NNOPS_EXPECT_EQ(query(56, 56, false), int64_t{16});
-
-    attrs.winograd_order = 4;
-    op = Conv2D::create(attrs, Backend::CPU);
-    NNOPS_EXPECT_EQ(query(14, 14, true), int64_t{36});
-
-    attrs.winograd_order = 2;
-    op = Conv2D::create(attrs, Backend::CPU);
-    NNOPS_EXPECT_EQ(query(56, 56, true), int64_t{16});
-}
-
-NNOPS_TEST(wino_plan_gates_on_geometry) {
-    // The plan is the single gate for "is this a Winograd configuration": a
-    // zeroed plan (workspace_size 0) means there is nothing to run. That is the
-    // Release-build observable — the NNOPS_ASSERTs compile out under NDEBUG.
-    const int64_t ishape[] = {1, 4, 8, 8};
-    const int64_t oshape[] = {1, 6, 6, 6};
-    const int64_t ushape[] = {16, 6, 4};
-    std::vector<float> in_buf(1 * 4 * 8 * 8, 0.0f);
-    std::vector<float> out_buf(1 * 6 * 6 * 6, 0.0f);
-    std::vector<float> u_buf(16 * 6 * 4, 0.0f);
-    TensorView input(ishape, DataType::f32, in_buf.data());
-    TensorView output(oshape, DataType::f32, out_buf.data());
-    TensorView u(ushape, DataType::f32, u_buf.data(), 4 * static_cast<int64_t>(sizeof(float)),
-                 TensorLayout::PackedWinoWeight);
-
-    const TensorDesc ins[] = {input.desc(), u.desc()};
-    const TensorDesc outs[] = {output.desc()};
-
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-
-    NNOPS_EXPECT_TRUE(nnops::backend::cpu::get_conv2d_winograd_plan(
-                          attrs, ins, outs, 1, false).workspace_size > 0);
-
-    Conv2DAttributes k5 = attrs;
-    k5.kernel_size = {5, 5};
-    NNOPS_EXPECT_EQ(nnops::backend::cpu::get_conv2d_winograd_plan(
-                        k5, ins, outs, 1, false).workspace_size, 0u);
-
-    Conv2DAttributes s2 = attrs;
-    s2.stride = {2, 2};
-    NNOPS_EXPECT_EQ(nnops::backend::cpu::get_conv2d_winograd_plan(
-                        s2, ins, outs, 1, false).workspace_size, 0u);
-
-    Conv2DAttributes d2 = attrs;
-    d2.dilation = {2, 2};
-    NNOPS_EXPECT_EQ(nnops::backend::cpu::get_conv2d_winograd_plan(
-                        d2, ins, outs, 1, false).workspace_size, 0u);
-}
-
-NNOPS_TEST(wino_plan_splits_the_filter_rows) {
-    // A 14x14 plane is 7 tile rows and one 8-wide tile block — 7 tasks, and the
-    // tile axis has nothing left to give. The plan grows a second axis on the
-    // filter rows: the nearest whole number of chunks to nt/plane_tasks, floored
-    // at two M-panels of work each so the repeated halo + input transform stays
-    // amortized.
-    std::vector<float> in_buf(256 * 14 * 14, 0.0f);
-    std::vector<float> out_buf(256 * 14 * 14, 0.0f);
-    std::vector<float> u_buf(16 * 256 * 256, 0.0f);
-    const int64_t ishape[] = {1, 256, 14, 14};
-    const int64_t oshape[] = {1, 256, 14, 14};
-    const int64_t ushape[] = {16, 256, 256};
-    TensorView input(ishape, DataType::f32, in_buf.data());
-    TensorView output(oshape, DataType::f32, out_buf.data());
-    TensorView u(ushape, DataType::f32, u_buf.data(),
-                 256 * static_cast<int64_t>(sizeof(float)),
-                 TensorLayout::PackedWinoWeight);
-    const TensorDesc ins[] = {input.desc(), u.desc()};
-    const TensorDesc outs[] = {output.desc()};
-
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    const auto plan = [&](int nt) {
-        return nnops::backend::cpu::get_conv2d_winograd_plan(attrs, ins, outs, nt, true);
-    };
-
-    // TH 7 in tile rows of 8 columns. A task spans two tile rows when 14 tiles
-    // fill the f32 MMA panel better than 7 do — true at nr 16 (14 of 16 versus
-    // 7 of 16), not at nr 12, where both land on 58% and the plan keeps the one
-    // row and its smaller halo/V/M footprint. So the plane is 4 tasks on x86_64
-    // and 7 on aarch64. Rounding, not ceiling, on the chunk count: 16 threads
-    // want 4 chunks (16 tasks, one wave), and 5 would run a straggler.
-    const int64_t nr_max = nnops::backend::cpu::NR_MAX_F32;
-    const int64_t mr_max = nnops::backend::cpu::MR_MAX_F32;
-    const int64_t rows = (2 * 7 <= nr_max) ? 2 : 1;
-    const int64_t plane_tasks = (7 + rows - 1) / rows;
-    const auto chunks_for = [&](int64_t nt) {
-        const int64_t want = (nt + plane_tasks / 2) / plane_tasks;
-        return std::clamp<int64_t>(want, 1, 256 / (2 * mr_max));
-    };
-    for (const int nt : {1, 4, 8, 12, 14, 16, 20, 28}) {
-        const auto p = plan(nt);
-        const int64_t chunks = chunks_for(nt);
-        NNOPS_EXPECT_EQ(p.tile_rows, rows);
-        NNOPS_EXPECT_EQ(p.oc_chunks, chunks);
-        NNOPS_EXPECT_EQ(p.num_tasks, plane_tasks * chunks);
-        NNOPS_EXPECT_EQ(p.num_slots, std::min<int64_t>(nt, p.num_tasks));
-        // Every task keeps at least two M-panels.
-        NNOPS_EXPECT_TRUE(256 / p.oc_chunks >= 2 * mr_max);
-    }
-
-    // A plane that already fills the pool keeps the single dispatch: 56 tasks.
-    std::vector<float> in56(64 * 56 * 56, 0.0f);
-    std::vector<float> out56(64 * 56 * 56, 0.0f);
-    std::vector<float> u56(16 * 64 * 64, 0.0f);
-    const int64_t i56[] = {1, 64, 56, 56};
-    const int64_t o56[] = {1, 64, 56, 56};
-    const int64_t u56s[] = {16, 64, 64};
-    TensorView in_v(i56, DataType::f32, in56.data());
-    TensorView out_v(o56, DataType::f32, out56.data());
-    TensorView u_v(u56s, DataType::f32, u56.data(),
-                   64 * static_cast<int64_t>(sizeof(float)),
-                   TensorLayout::PackedWinoWeight);
-    const TensorDesc ins56[] = {in_v.desc(), u_v.desc()};
-    const TensorDesc outs56[] = {out_v.desc()};
-    const auto wide = nnops::backend::cpu::get_conv2d_winograd_plan(
-        attrs, ins56, outs56, 20, true);
-    NNOPS_EXPECT_EQ(wide.tile_rows, int64_t{1});
-    NNOPS_EXPECT_EQ(wide.oc_chunks, int64_t{1});
-    NNOPS_EXPECT_EQ(wide.num_tasks, int64_t{56});
-
-    // And the floor stops it: 16 filter rows cannot be cut into two blocks of
-    // two M-panels, so the starved tile-only grid stays as it is.
-    std::vector<float> in16(16 * 14 * 14, 0.0f);
-    std::vector<float> out16(16 * 14 * 14, 0.0f);
-    std::vector<float> u16(16 * 16 * 16, 0.0f);
-    const int64_t i16[] = {1, 16, 14, 14};
-    const int64_t o16[] = {1, 16, 14, 14};
-    const int64_t u16s[] = {16, 16, 16};
-    TensorView i16v(i16, DataType::f32, in16.data());
-    TensorView o16v(o16, DataType::f32, out16.data());
-    TensorView u16v(u16s, DataType::f32, u16.data(),
-                    16 * static_cast<int64_t>(sizeof(float)),
-                    TensorLayout::PackedWinoWeight);
-    const TensorDesc ins16[] = {i16v.desc(), u16v.desc()};
-    const TensorDesc outs16[] = {o16v.desc()};
-    const auto narrow = nnops::backend::cpu::get_conv2d_winograd_plan(
-        attrs, ins16, outs16, 20, true);
-    NNOPS_EXPECT_EQ(narrow.oc_chunks, int64_t{1});
-    NNOPS_EXPECT_EQ(narrow.num_tasks, plane_tasks);
-}
-
-// ============================================================
-// End-to-end: Winograd vs conv2d_ref
-// ============================================================
-
-namespace {
-
-// Minimal fixed-size thread pool exposing a CpuBackend (as in test_conv2d.cpp).
-struct SimplePool {
-    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
-        // OpenMP when the build has it (common/cpu_pool.hpp).
-        if (nnops::test::bench_use_openmp()) {
-            cpu = nnops::openmp_backend(nthreads);
-            return;
-        }
-        cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
-            this->run(begin, end, body);
-        };
-        cpu.num_threads = [this]() { return nthreads_; };
-        cpu.thread_id = []() { return current_thread_id_; };
-    }
-
-    void run(int64_t begin, int64_t end, const ParallelForBody& body) {
-        std::atomic<int64_t> next{begin};
-        std::vector<std::thread> workers;
-        workers.reserve(static_cast<size_t>(nthreads_));
-        for (int t = 0; t < nthreads_; ++t) {
-            workers.emplace_back([&, t]() {
-                current_thread_id_ = t;
-                for (;;) {
-                    int64_t i = next.fetch_add(1, std::memory_order_relaxed);
-                    if (i >= end) { break; }
-                    body(i);
-                }
-            });
-        }
-        for (auto& w : workers) { w.join(); }
-    }
-
-    int nthreads_;
-    CpuBackend cpu;
-    inline static thread_local int current_thread_id_ = 0;
-};
-
-int64_t desc_numel(const TensorDesc& d) {
-    int64_t n = 1;
-    for (int64_t i = 0; i < d.rank; ++i) { n *= d.dims[static_cast<size_t>(i)]; }
-    return n;
-}
-
-/// Run the Winograd path (prepacking U from the raw weight) and conv2d_ref on
-/// that same raw weight; require agreement within (rtol, atol).
-///
-/// f32 only — f16 has its own check below.
-void wino_vs_ref_f32(std::initializer_list<int64_t> in_shape,
-                     std::initializer_list<int64_t> w_shape,
-                     Conv2DAttributes attrs, bool has_bias,
-                     float fill_out = 0.0f,
-                     const ComputeContext* ctx = nullptr,
-                     float rtol = 1e-4f, float atol = 1e-4f,
-                     ConvAlgorithm algorithm = ConvAlgorithm::Winograd)
-{
-    auto [in_buf, in_view] = test::make_random_tensor(
-        std::span<const int64_t>(in_shape.begin(), in_shape.size()), -1.0f, 1.0f, 101);
-    auto [w_buf, w_view] = test::make_random_tensor(
-        std::span<const int64_t>(w_shape.begin(), w_shape.size()), -0.5f, 0.5f, 202);
-
-    std::vector<float> b_buf;
-    TensorView bias_view;
-    if (has_bias) {
-        b_buf.resize(static_cast<size_t>(w_shape.begin()[0]));
-        test::XorShift128 rng(303);
-        for (auto& x : b_buf) { x = rng.next_float(-0.5f, 0.5f); }
-        const int64_t bshape[] = {static_cast<int64_t>(b_buf.size())};
-        bias_view = TensorView(bshape, DataType::f32, b_buf.data());
-    }
-
-    std::vector<TensorDesc> descs = {in_view.desc(), w_view.desc()};
-    if (has_bias) { descs.push_back(bias_view.desc()); }
-
-    attrs.algorithm = algorithm;
-    auto op = Conv2D::create(attrs, Backend::CPU);
-    const auto outs = op->getOutputTensorDesc(descs);
-    const int64_t on = desc_numel(outs[0]);
-
-    std::vector<float> out_wino(static_cast<size_t>(on), fill_out);
-    auto out_view = test::make_channel_first(outs[0], out_wino.data());
-
-    // Two-step prepack: query the shape with an empty view, then fill it.
-    std::vector<float> u_buf;
-    TensorView u_view;
-    {
-        TensorView empty;
-        const TensorView w_in[] = {w_view};
-        TensorView o[] = {empty};
-        op->prepackWeights(w_in, o);
-        const TensorView q = o[0];
-        u_buf.assign(static_cast<size_t>(q.storage_bytes() / sizeof(float)), 0.0f);
-        u_view = TensorView(q.shape_span(), DataType::f32, u_buf.data(),
-                            q.pitch(), TensorLayout::PackedWinoWeight);
-        const TensorView w_in2[] = {w_view};
-        TensorView o2[] = {u_view};
-        op->prepackWeights(w_in2, o2);
-    }
-
-    std::vector<TensorView> ins = {in_view, u_view};
-    if (has_bias) { ins.push_back(bias_view); }
-    const ComputeContext default_ctx{};
-    op->compute(out_view, ins, ctx ? *ctx : default_ctx);
-
-    // Reference: conv2d_ref on the raw weight.
-    std::vector<float> out_ref(static_cast<size_t>(on), fill_out);
-    auto ref_view = test::make_channel_first(outs[0], out_ref.data());
-    std::vector<TensorView> rins = {in_view, w_view};
-    if (has_bias) { rins.push_back(bias_view); }
-    nnops::backend::cpu::reference::conv2d_ref(attrs, ref_view, rins,
-                                               ctx ? *ctx : default_ctx, nullptr);
-
-    for (int64_t i = 0; i < on; ++i) {
-        const float a = out_wino[static_cast<size_t>(i)];
-        const float b = out_ref[static_cast<size_t>(i)];
-        const float tol = atol + rtol * std::max(std::abs(a), std::abs(b));
-        if (std::abs(a - b) > tol) {
-            NNOPS_EXPECT_NEAR(a, b, tol);
-        }
-    }
-}
-
-}  // anonymous namespace
-
-// ---- selection policy and the Auto algorithm ------------------------------
 
 NNOPS_TEST(wino_applicable_thresholds) {
     Conv2DAttributes a;
@@ -772,16 +288,15 @@ NNOPS_TEST(wino_applicable_thresholds) {
     NNOPS_EXPECT_TRUE(winograd_applicable(a, 512, 56, 56));
 
     NNOPS_EXPECT_FALSE(winograd_applicable(a, 31, 14, 14));  // too few channels
-    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 13, 14));  // too short
-    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 14, 13));  // too narrow
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 6, 14));   // too short
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 14, 6));   // too narrow
 
-    // The plane floor is the layout's: channel-first packs 4 tile columns to 8
-    // and loses below 14, channel-last flattens its tiles and keeps winning.
-    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 7, 7));
-    NNOPS_EXPECT_TRUE(winograd_applicable(a, 64, 7, 7, true));
-    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 6, 7, true));
-    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 7, 6, true));
-    NNOPS_EXPECT_TRUE(winograd_applicable(a, 512, 14, 14, true));
+    // The channel-last plane floor is 7x7: it flattens its tiles and keeps
+    // winning down to one tile row.
+    NNOPS_EXPECT_TRUE(winograd_applicable(a, 64, 7, 7));
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 6, 7));
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 7, 6));
+    NNOPS_EXPECT_TRUE(winograd_applicable(a, 512, 14, 14));
 
     Conv2DAttributes k1 = a;
     k1.kernel_size = {1, 1};
@@ -801,433 +316,54 @@ NNOPS_TEST(wino_applicable_thresholds) {
     NNOPS_EXPECT_FALSE(winograd_applicable(off, 64, 28, 28));
 }
 
-NNOPS_TEST(wino_auto_follows_the_weight) {
-    // Auto is the default: handing it the prepacked U is what selects Winograd.
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    NNOPS_EXPECT_TRUE(attrs.algorithm == ConvAlgorithm::Auto);
-    wino_vs_ref_f32({1, 4, 8, 8}, {6, 4, 3, 3}, attrs, /*has_bias=*/false,
-                    0.0f, nullptr, 1e-4f, 1e-4f, ConvAlgorithm::Auto);
-}
-
-NNOPS_TEST(wino_matches_ref_plain) {
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
-    wino_vs_ref_f32({1, 4, 8, 8}, {6, 4, 3, 3}, attrs, /*has_bias=*/false);
-}
-
-NNOPS_TEST(wino_matches_ref_pad1) {
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    wino_vs_ref_f32({1, 3, 9, 7}, {5, 3, 3, 3}, attrs, /*has_bias=*/false);
-}
-
-NNOPS_TEST(wino_matches_ref_wide) {
-    // 14x18 output: 7 tile rows over a 16-wide tile block (two column groups),
-    // with bias.
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    wino_vs_ref_f32({1, 16, 14, 18}, {20, 16, 3, 3}, attrs, /*has_bias=*/true);
-}
-
-NNOPS_TEST(wino_matches_ref_wide_two_blocks) {
-    // 14x58 output: 29 tile columns pad to 32, so a single-row task owns one
-    // 16-wide block of two and must transform nc tiles, not TW_pad — reading a
-    // whole padded row out of a halo strip that only holds its own block.
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    wino_vs_ref_f32({1, 16, 14, 58}, {20, 16, 3, 3}, attrs, /*has_bias=*/true);
-}
-
-NNOPS_TEST(wino_matches_ref_groups) {
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    attrs.groups = 2;
-    wino_vs_ref_f32({1, 6, 7, 7}, {8, 3, 3, 3}, attrs, /*has_bias=*/true);
-}
-
-NNOPS_TEST(wino_matches_ref_odd_output) {
-    // OH and OW both odd: the last tile row's second output row and the last
-    // tile's second column are out of range.
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
-    wino_vs_ref_f32({1, 4, 9, 9}, {4, 4, 3, 3}, attrs, /*has_bias=*/false);
-}
-
-NNOPS_TEST(wino_matches_ref_epilogue) {
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    attrs.epilogue.type = EpilogueActivateType::Relu6;
-    wino_vs_ref_f32({1, 5, 8, 8}, {7, 5, 3, 3}, attrs, /*has_bias=*/true);
-}
-
-NNOPS_TEST(wino_matches_ref_add_to) {
-    // add_to with a non-identity epilogue: the residual is the pre-filled
-    // output, added *after* the activation, so fill_out is part of the answer.
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    attrs.add_to = true;
-    attrs.epilogue.type = EpilogueActivateType::Relu;
-    wino_vs_ref_f32({1, 4, 6, 6}, {6, 4, 3, 3}, attrs, /*has_bias=*/false,
-                    /*fill_out=*/0.75f);
-}
-
-NNOPS_TEST(wino_matches_ref_add_to_identity) {
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    attrs.add_to = true;
-    wino_vs_ref_f32({1, 4, 6, 6}, {6, 4, 3, 3}, attrs, /*has_bias=*/true,
-                    /*fill_out=*/-0.3f);
-}
-
-NNOPS_TEST(wino_matches_ref_batch) {
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    wino_vs_ref_f32({3, 4, 6, 6}, {6, 4, 3, 3}, attrs, /*has_bias=*/false);
-}
-
-NNOPS_TEST(wino_matches_ref_threaded) {
-    // Through a 4-thread pool — exercises the per-thread slot indexing
-    // (thread_slot_count() > 0) and the disjointness of tile rows and blocks.
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    SimplePool pool(4);
-    ComputeContext ctx;
-    ctx.cpu = pool.cpu;
-    wino_vs_ref_f32({1, 8, 12, 12}, {8, 8, 3, 3}, attrs, /*has_bias=*/true,
-                    /*fill_out=*/0.0f, &ctx);
-}
-
-NNOPS_TEST(wino_oc_split_matches_ref) {
-    // A 6x6 output plane is 3 tile rows and one tile block, so a 6-thread pool
-    // splits the filter rows in two and the tasks write disjoint oc ranges —
-    // the shape that catches a mis-sliced range (an `ocnc` clipped to one block
-    // shows up as the back half of the filter never being applied).
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    SimplePool pool(6);
-    ComputeContext ctx;
-    ctx.cpu = pool.cpu;
-    wino_vs_ref_f32({1, 64, 6, 6}, {64, 64, 3, 3}, attrs, /*has_bias=*/true,
-                    /*fill_out=*/0.0f, &ctx);
-
-    // Same shape through 12 threads: the chunk count moves (2 -> 4), the answer
-    // does not.
-    SimplePool pool12(12);
-    ComputeContext ctx12;
-    ctx12.cpu = pool12.cpu;
-    wino_vs_ref_f32({1, 64, 6, 6}, {64, 64, 3, 3}, attrs, /*has_bias=*/true,
-                    /*fill_out=*/0.0f, &ctx12);
-}
-
-NNOPS_TEST(wino_threads_bit_identical_batch_groups) {
-    // Batch and group are both part of the task grid, and the pooled cases above
-    // keep them at 1 — here tasks of *different* (batch, group) run at the same
-    // time, so a shared scratch buffer would show up. Each element keeps its
-    // operation order, so the two results must be bit-identical.
-    auto [in_buf, in_view] = test::make_random_tensor({2, 8, 14, 16}, -1.0f, 1.0f, 71);
-    auto [w_buf, w_view] = test::make_random_tensor({8, 4, 3, 3}, -0.5f, 0.5f, 72);
-    auto [b_buf, b_view] = test::make_random_tensor({8}, -0.5f, 0.5f, 73);
-
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    attrs.groups = 2;
-    attrs.algorithm = ConvAlgorithm::Winograd;
-
-    auto op = Conv2D::create(attrs, Backend::CPU);
-    const TensorDesc descs[] = {in_view.desc(), w_view.desc(), b_view.desc()};
-    const auto outs = op->getOutputTensorDesc(descs);
-    const int64_t on = desc_numel(outs[0]);
-
-    // Prepack U once; both runs read the same transformed weight.
-    std::vector<float> u_buf;
-    TensorView u_view;
-    {
-        TensorView empty;
-        const TensorView w_in[] = {w_view};
-        TensorView o[] = {empty};
-        op->prepackWeights(w_in, o);
-        const TensorView q = o[0];
-        u_buf.assign(static_cast<size_t>(q.storage_bytes() / sizeof(float)), 0.0f);
-        u_view = TensorView(q.shape_span(), DataType::f32, u_buf.data(),
-                            q.pitch(), TensorLayout::PackedWinoWeight);
-        const TensorView w_in2[] = {w_view};
-        TensorView o2[] = {u_view};
-        op->prepackWeights(w_in2, o2);
-    }
-
-    const std::vector<TensorView> ins = {in_view, u_view, b_view};
-
-    std::vector<float> out_serial(static_cast<size_t>(on), 0.0f);
-    auto serial_view = test::make_channel_first(outs[0], out_serial.data());
-    op->compute(serial_view, ins, ComputeContext{});
-
-    SimplePool pool(4);
-    ComputeContext ctx;
-    ctx.cpu = pool.cpu;
-    std::vector<float> out_pool(static_cast<size_t>(on), 0.0f);
-    auto pool_view = test::make_channel_first(outs[0], out_pool.data());
-    op->compute(pool_view, ins, ctx);
-
-    // 2 batches · 2 groups · 7 tile rows = 28 tasks over 4 workers, so the pool
-    // path really does run (and shares slots between) several (batch, group)
-    // pairs.
-    int64_t mismatches = 0;
-    for (int64_t i = 0; i < on; ++i) {
-        const float a = out_serial[static_cast<size_t>(i)];
-        const float b = out_pool[static_cast<size_t>(i)];
-        if (std::memcmp(&a, &b, sizeof(float)) != 0) { ++mismatches; }
-    }
-    NNOPS_EXPECT_EQ(mismatches, int64_t{0});
-}
-
-// ============================================================
-// f16
-// ============================================================
-
-NNOPS_TEST(wino_f16_matches_ref) {
-    auto [in_f16, in_view] = test::make_random_f16_tensor({1, 8, 8, 8}, -1.0f, 1.0f, 11);
-    auto [w_f16, w_view] = test::make_random_f16_tensor({8, 8, 3, 3}, -0.5f, 0.5f, 12);
-
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    attrs.algorithm = ConvAlgorithm::Winograd;
-
-    auto op = Conv2D::create(attrs, Backend::CPU);
-
-    const TensorDesc descs[] = {in_view.desc(), w_view.desc()};
-    auto outs = op->getOutputTensorDesc(descs);
-    const int64_t on = desc_numel(outs[0]);
-
-    std::vector<half> out_wino(static_cast<size_t>(on), half(0.0f));
-    auto out_view = test::make_channel_first(outs[0], out_wino.data());
-
-    std::vector<half> u_buf;
-    TensorView u_view;
-    {
-        TensorView empty;
-        const TensorView w_in[] = {w_view};
-        TensorView o[] = {empty};
-        op->prepackWeights(w_in, o);
-        const TensorView q = o[0];
-        u_buf.assign(static_cast<size_t>(q.storage_bytes() / sizeof(half)), half(0.0f));
-        u_view = TensorView(q.shape_span(), DataType::f16, u_buf.data(),
-                            q.pitch(), TensorLayout::PackedWinoWeight);
-        const TensorView w_in2[] = {w_view};
-        TensorView o2[] = {u_view};
-        op->prepackWeights(w_in2, o2);
-    }
-
-    const TensorView ins[] = {in_view, u_view};
-    op->compute(out_view, ins);
-
-    // conv2d_ref is f32-only, so widen the (already f16-quantized) operands and
-    // run the reference convolution in f32 on exactly the values Winograd saw.
-    auto in_f32 = test::f16_to_f32(in_f16);
-    auto w_f32 = test::f16_to_f32(w_f16);
-    const int64_t ishape[] = {1, 8, 8, 8};
-    const int64_t wshape[] = {8, 8, 3, 3};
-    TensorView in_ref(ishape, DataType::f32, in_f32.data());
-    TensorView w_ref(wshape, DataType::f32, w_f32.data());
-    std::vector<float> ref2(on, 0.0f);
-    auto ref2_view = test::make_channel_first(outs[0], ref2.data());
-    const TensorView rins[] = {in_ref, w_ref};
-    nnops::backend::cpu::reference::conv2d_ref(attrs, ref2_view, rins,
-                                               ComputeContext{}, nullptr);
-
-    const auto got = test::f16_to_f32(out_wino);
-    float max_diff = 0.0f;
-    for (int64_t i = 0; i < on; ++i) {
-        max_diff = std::max(max_diff,
-                            std::abs(got[static_cast<size_t>(i)] - ref2[static_cast<size_t>(i)]));
-    }
-    NNOPS_EXPECT_TRUE(max_diff < test::kF16AccumTol);
-}
-
-// ---- F(4,3) on the channel-first route ------------------------------------------
-
-NNOPS_TEST(wino43_channel_first_matches_ref) {
-    // The order follows the filter's channel count, so 64 channels is what asks
-    // for F(4,3) — 36 positions per tile, 4x4 outputs. The tolerance is the
-    // Channel-last route's, for the same reason: Bᵀ scales a window by 5 and
-    // Aᵀ by 8, so an f32 round is wider than F(2,3)'s even in f32.
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-    // Odd extents: the last tile row and column are short on both axes.
-    wino_vs_ref_f32({1, 64, 15, 17}, {64, 64, 3, 3}, attrs, /*has_bias=*/true,
-                    0.0f, nullptr, 1e-4f, 1e-3f);
-
-    Conv2DAttributes pad0 = attrs;
-    pad0.padding = {0, 0};
-    wino_vs_ref_f32({2, 64, 16, 16}, {128, 64, 3, 3}, pad0, /*has_bias=*/false,
-                    0.0f, nullptr, 1e-4f, 1e-3f);
-
-    // Two k passes: 512 channels against the channel-first k-block, tiles past one
-    // 8-wide group on both axes.
-    wino_vs_ref_f32({1, 512, 9, 9}, {512, 512, 3, 3}, attrs, /*has_bias=*/false,
-                    0.0f, nullptr, 1e-4f, 1e-3f);
-}
-
-NNOPS_TEST(wino43_channel_first_reads_the_order_off_the_u) {
-    // Both end-to-end routes take the transform order from the U's leading
-    // dimension — 16 positions is F(2,3), 36 is F(4,3) — and tile the output
-    // accordingly. Anything else is not a U this plan can index.
-    const int64_t ishape[] = {1, 64, 16, 16};
-    const int64_t oshape[] = {1, 64, 16, 16};
-    std::vector<float> in_buf(64 * 16 * 16, 0.0f);
-    std::vector<float> out_buf(64 * 16 * 16, 0.0f);
-    TensorView input(ishape, DataType::f32, in_buf.data());
-    TensorView output(oshape, DataType::f32, out_buf.data());
-    const TensorDesc outs[] = {output.desc()};
-
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
-
-    const int64_t pitch = 64 * static_cast<int64_t>(sizeof(float));
-    for (const int64_t pos : {int64_t{16}, int64_t{36}}) {
-        const int64_t ushape[] = {pos, 64, 64};
-        std::vector<float> u_buf(static_cast<size_t>(pos * 64 * 64), 0.0f);
-        TensorView u(ushape, DataType::f32, u_buf.data(), pitch,
-                     TensorLayout::PackedWinoWeight);
-        const TensorDesc ins[] = {input.desc(), u.desc()};
-
-        const auto plan = nnops::backend::cpu::get_conv2d_winograd_plan(
-            attrs, ins, outs, 1, false);
-        const auto order = (pos == 36) ? nnops::backend::cpu::WinoOrder::F43
-                                       : nnops::backend::cpu::WinoOrder::F23;
-        NNOPS_EXPECT_EQ(plan.order, order);
-        NNOPS_EXPECT_EQ(plan.num_tile_rows, pos == 36 ? 4 : 8);   // ceil(16 / tile)
-        NNOPS_EXPECT_EQ(plan.num_tile_cols, pos == 36 ? 4 : 8);
-        NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
-    }
-
-    // A leading dimension that is neither: no route can index it.
-    const int64_t bad_shape[] = {20, 64, 64};
-    std::vector<float> bad_buf(20 * 64 * 64, 0.0f);
-    TensorView bad(bad_shape, DataType::f32, bad_buf.data(), pitch,
-                   TensorLayout::PackedWinoWeight);
-    const TensorDesc bad_ins[] = {input.desc(), bad.desc()};
-    NNOPS_EXPECT_EQ(nnops::backend::cpu::get_conv2d_winograd_plan(
-                        attrs, bad_ins, outs, 1, false).workspace_size, 0u);
-}
-
 NNOPS_TEST(wino_pick_order_fences) {
     using nnops::backend::cpu::WinoOrder;
     using nnops::backend::cpu::wino_pick_order;
-    constexpr bool cl = true;    // Channel-last
-    constexpr bool pl = false;   // Channel-first
-    // f16 keeps F(2,3) at every width and plane, on both routes.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56, cl) ==
+    // f16 keeps F(2,3) at every width and plane.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56, pl) ==
-                      WinoOrder::F23);
-    // Channel-first's plane floor moves with the team, because what it amortizes is a
-    // halo strip per *task*: on a small team the tile axes fill the pool on
-    // their own (28x28 is 0.71-0.81x of F(2,3)), past four workers the grid is
-    // short and the oc-chunk split rebuilds that strip per chunk (1.04x at six
-    // on 28x28), and past eight even 112x112 is a wash.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, pl, 1) ==
+    // The channel-last floor moves with the team: a 14x14 plane is one
+    // whole-plane block on a small pool (1.47x of F(2,3) at 1 thread on
+    // 256->256), and past four workers that block stops filling the pool
+    // (0.60x at 20).
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, 20) ==
                       WinoOrder::F43);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56, pl, 4) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, 1) ==
                       WinoOrder::F43);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, pl, 5) ==
-                      WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56, pl, 6) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 14, 14, 1) ==
                       WinoOrder::F43);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 28, 28, pl, 6) ==
-                      WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 56, 56, pl, 9) ==
-                      WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 111, 200, pl, 9) ==
-                      WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 112, 112, pl, 9) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 14, 14, 4) ==
                       WinoOrder::F43);
-    // Below 28x28 the grid is a handful of tiles on any team.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 14, 14, pl, 1) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 14, 14, 20) ==
                       WinoOrder::F23);
-    // The channel-last floor moves with the team too, but only by one step: a
-    // 14x14 plane is one whole-plane block on a small pool (1.47x of F(2,3) at
-    // 1 thread on 256->256), and past four workers that block stops filling the
-    // pool (0.60x at 20).
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, cl, 20) ==
+    // F(4,3) from a 28x28 plane up ...
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28) ==
                       WinoOrder::F43);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, cl, 1) ==
-                      WinoOrder::F43);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 14, 14, cl, 1) ==
-                      WinoOrder::F43);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 14, 14, cl, 4) ==
-                      WinoOrder::F43);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 14, 14, cl, 20) ==
-                      WinoOrder::F23);
-    // ... and under the same channel floor and U fence as the channel-last one:
-    // 32 channels per group never pays for the 4.5x transform, and a 512x512
-    // filter is 37.7 MB of U.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 32, 32, 224, 224, pl) ==
-                      WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 224, 224, pl) ==
-                      WinoOrder::F23);
-    // Channel-last: F(4,3) from a 28x28 plane up ...
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, cl) ==
-                      WinoOrder::F43);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56) ==
                       WinoOrder::F43);
     // ... and down to 14, where a single whole-plane block still pays. Under
     // that floor it does not: 7x7 is a 4-tile grid and F(4,3) measured 1.6x
     // F(2,3) there.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 64, 27, 56, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 64, 27, 56) ==
                       WinoOrder::F43);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 64, 13, 56, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 64, 13, 56) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 7, 7, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 7, 7) ==
                       WinoOrder::F23);
     // An unknown plane takes the safe order.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 0, 0, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 0, 0) ==
                       WinoOrder::F23);
     // The U fence: 36 positions x IC x OC x 4 B under 16 MB. 512x512 is 37.7 MB
-    // and loses on both routes; 256x256 is 9.4 MB and wins.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 56, 56, cl) ==
+    // and loses; 256x256 is 9.4 MB and wins.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 56, 56) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 28, 28, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 28, 28) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 28, 28, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 28, 28) ==
                       WinoOrder::F43);
     // 18.9 MB is over the line, 9.4 MB is under it.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 256, 28, 28, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 256, 28, 28) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 128, 28, 28, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 128, 28, 28) ==
                       WinoOrder::F43);
 }

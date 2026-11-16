@@ -1,6 +1,6 @@
 /// @file bench_pool1d.cpp
 /// @brief Pool1D against Pooling on the identical lift — the acceptance bench
-///        for the 1D route, in both layouts and both quantized types.
+///        for the 1D route, channel-last, in both quantized types.
 ///
 /// Pool1D *is* 2D pooling on the [N, C, 1, L] lift with a {1, K} window, so the
 /// only thing to prove is that wrapping the 2D operator costs nothing. Each row
@@ -18,9 +18,8 @@
 /// measuring the barrier. Everything here is bandwidth as a result, and the
 /// tables print GB/s of activation read plus output written next to the time.
 ///
-/// Both layouts are timed because the 2D kernel has two routes — channel-first
-/// scans one contiguous plane, channel-last lanes the channel four rows at a
-/// time — and each must survive the wrap. The quantized route exists only
+/// The 2D kernel's channel-last route lanes the channel four rows at a time and
+/// must survive the wrap. The quantized route exists only
 /// channel-last (the SIMD lane is the channel) and has no adaptive form, which
 /// the unsupported rows say outright rather than timing a rejected call.
 ///
@@ -203,37 +202,20 @@ struct PoolShape {
     bool global = false;
     bool exclude_pad = false;
     int64_t adaptive = 0;
-    bool cl = false;
 };
 
-/// Audio-model pooling: the squeeze-excite global mean, the backbone max-pools,
-/// the adaptive head, and the awkward geometries — then two of the same layers
-/// channel-last, where the 2D kernel takes its other route.
+/// Audio-model pooling, channel-last: the squeeze-excite global mean, the
+/// backbone max-pools, and the adaptive head.
 const std::vector<PoolShape>& pool_sweep() {
     static const std::vector<PoolShape> s = {
-        {"cf se global avg 1x256x400",            1, 256,  400, Pool1DType::Average,
-         2, 2, 0, 1, /*global=*/true},
-        {"cf backbone max k2 s2 1x64x4000",       1,  64, 4000, Pool1DType::Max, 2, 2},
-        {"cf backbone max k3 s2 p1 1x128x1000",   1, 128, 1000, Pool1DType::Max, 3, 2, 1},
-        {"cf stem max k5 s4 p2 1x16x8000",        1,  16, 8000, Pool1DType::Max, 5, 4, 2},
-        {"cf avg k3 s1 p1 exclude_pad 1x128x200", 1, 128,  200, Pool1DType::Average,
-         3, 1, 1, 1, false, /*exclude_pad=*/true},
-        {"cf adaptive avg -> 16 1x128x512",       1, 128,  512, Pool1DType::Average,
-         2, 2, 0, 1, false, false, /*adaptive=*/16},
-        {"cf dilated max k3 d2 p2 1x64x2000",     1,  64, 2000, Pool1DType::Max, 3, 1, 2, 2},
-        // The one case where the 1D op does not forward the call unchanged:
-        // an adaptive pool to length 1 is answered by the global plane scan.
-        {"cf adaptive avg -> 1 1x256x400",        1, 256,  400, Pool1DType::Average,
-         2, 2, 0, 1, false, false, /*adaptive=*/1},
-        // ---- the same two routes channel-last ---------------------------------
         {"cl backbone max k2 s2 1x64x4000",       1,  64, 4000, Pool1DType::Max, 2, 2, 0, 1,
-         false, false, 0, /*cl=*/true},
+         false, false, 0},
         {"cl backbone max k3 s2 p1 1x128x1000",   1, 128, 1000, Pool1DType::Max, 3, 2, 1, 1,
-         false, false, 0, /*cl=*/true},
+         false, false, 0},
         {"cl se global avg 1x256x400",            1, 256,  400, Pool1DType::Average,
-         2, 2, 0, 1, /*global=*/true, false, 0, /*cl=*/true},
+         2, 2, 0, 1, /*global=*/true, false, 0},
         {"cl adaptive avg -> 16 1x128x512",       1, 128,  512, Pool1DType::Average,
-         2, 2, 0, 1, false, false, /*adaptive=*/16, /*cl=*/true},
+         2, 2, 0, 1, false, false, /*adaptive=*/16},
     };
     return s;
 }
@@ -321,10 +303,8 @@ struct PoolPair {
         } else {
             buf = random_vec<T>(numel, 5);
         }
-        if (c.cl) {
-            buf = test::to_channel_last<T>(
-                std::span<const T>(buf.data(), buf.size()), c.N, c.C, c.L);
-        }
+        buf = test::to_channel_last<T>(
+            std::span<const T>(buf.data(), buf.size()), c.N, c.C, c.L);
 
         QuantParams qp;
         qp.granularity = QuantGranularity::PerTensor;
@@ -332,7 +312,7 @@ struct PoolPair {
         qp.zero_point = std::is_same_v<T, uint8_t> ? 128 : 0;
 
         const int64_t sh[] = {c.N, c.C, c.L};
-        const TensorLayout lay = c.cl ? TensorLayout::NHWC : TensorLayout::NCHW;
+        const TensorLayout lay = TensorLayout::NHWC;
         in = TensorView(std::span<const int64_t>(sh, 3), dt, buf.data(), lay,
                         quant ? qp : QuantParams{});
 
@@ -386,8 +366,6 @@ void run_table(const char* tag, bool quant) {
 
     double sum_a = 0.0, sum_b = 0.0, sum_bytes = 0.0;
     for (const PoolShape& c : pool_sweep()) {
-        // Integer pooling is channel-last only; the float tables run both.
-        if (quant && !c.cl) { continue; }
         PoolPair<T> l(c, quant);
         const Status sa = l.run_1d(ComputeContext{});
         const Status sb = l.run_2d(ComputeContext{});

@@ -1,12 +1,9 @@
 /// @file bench_transpose_conv2d.cpp
-/// @brief TransposeConv2D — channel-first vs channel-last on the same values.
+/// @brief TransposeConv2D throughput, channel-last.
 ///
-/// One row per layer, two arms: `channel_first` runs the channel-first route
-/// (channel-first activation, [IC, OC/G, KH, KW] filter, scatter through a col
-/// matrix) and `channel_last` the channel-last one (channel-last activation, the
-/// same filter, output channels vectorised). Both are handed identical values —
-/// the channel-last input is converted once, outside every timer — so a row
-/// prices the layout and the kernel it selects, nothing else.
+/// One row per layer: a channel-last activation, the [IC, OC/G, KH, KW] filter,
+/// and the output channels vectorised. The activation is converted once,
+/// outside every timer, so a row prices the kernel, nothing else.
 ///
 /// The rows are the layers a decoder actually runs: stride-2 4x4 and 3x3
 /// upsamplers (DeepLab, GAN generators), stride-1 3x3 refinement passes
@@ -27,8 +24,8 @@
 /// geometry, so a regression can be read against OW, the tap count and the col
 /// size rather than against a single rate.
 ///
-/// Three more tables price the quantized route on the same layer list and the
-/// same two arms: s8 weight with per-channel scales against a per-tensor s8 or
+/// Three more tables price the quantized route on the same layer list:
+/// s8 weight with per-channel scales against a per-tensor s8 or
 /// u8 activation, to a dequantized f32 destination and to the s8 / u8 requant
 /// chains. No bias, so the rows price the accumulation and the store, not the
 /// epilogue add. The work count is the same MAC count, so the rates are GOP/s;
@@ -114,36 +111,6 @@ double median_of(std::vector<double> v) {
     return v[v.size() / 2];
 }
 
-/// One interleaved A/B measurement at @p nt threads, in per-call ms.
-struct AbResult {
-    double a_ms = 0.0, b_ms = 0.0;   ///< median over rounds of the per-round min
-    double null_pct = 0.0;           ///< median A2/A1 drift — the noise floor
-};
-
-template <class FA, class FB>
-AbResult measure_ab(int nt, FA&& a, FB&& b, int iters, int rounds) {
-    BenchPool pool(nt);
-    ComputeContext ctx;
-    ctx.cpu = pool.cpu;
-    const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
-
-    auto run_a = [&]() { a(use_ctx); };
-    auto run_b = [&]() { b(use_ctx); };
-    run_a(); run_b(); run_a(); run_b();   // warm-up / page faults
-
-    std::vector<double> a_ms, b_ms, null_pct;
-    for (int r = 0; r < rounds; ++r) {
-        const double a1 = time_ms(run_a, iters);
-        const double b1 = time_ms(run_b, iters);
-        const double a2 = time_ms(run_a, iters);   // null control
-        const double b2 = time_ms(run_b, iters);
-        a_ms.push_back(std::min(a1, a2));
-        b_ms.push_back(std::min(b1, b2));
-        null_pct.push_back(std::abs(a2 - a1) / std::min(a1, a2) * 100.0);
-    }
-    return {median_of(a_ms), median_of(b_ms), median_of(null_pct)};
-}
-
 std::vector<int> bench_threads() {
     std::vector<int> threads;
     if (const char* env = std::getenv("NNOPS_BENCH_THREADS")) {
@@ -197,7 +164,7 @@ const std::vector<Shape>& sweep() {
 }
 
 // ============================================================
-// One layer, both layouts, identical values
+// One layer, channel-last
 // ============================================================
 
 template <class T>
@@ -231,20 +198,18 @@ struct Layer {
         const int64_t bsh[] = {c.OC};
         constexpr DataType dt = dtype_of<T>();
 
-        in_channel_first_buf = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
+        const auto in_raw = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
         weight      = random_vec<T>(std::span<const int64_t>(wsh, 4), 2);
         bias        = random_vec<T>(std::span<const int64_t>(bsh, 1), 3);
         in_cl       = test::channel_first_to_channel_last<T>(
-            std::span<const T>(in_channel_first_buf.data(), in_channel_first_buf.size()), c.N, c.IC, c.IH, c.IW);
+            std::span<const T>(in_raw.data(), in_raw.size()), c.N, c.IC, c.IH, c.IW);
 
-        in_channel_first = TensorView(std::span<const int64_t>(ish, 4), dt, in_channel_first_buf.data(),
-                             TensorLayout::NCHW);
         in_channel_last = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
                              TensorLayout::NHWC);
         w       = TensorView(std::span<const int64_t>(wsh, 4), dt, weight.data(),
-                             TensorLayout::NCHW);
+                             TensorLayout::Dense);
         b       = TensorView(std::span<const int64_t>(bsh, 1), dt, bias.data(),
-                             TensorLayout::NCHW);
+                             TensorLayout::Dense);
 
         attrs.kernel_size = {c.KH, c.KW};
         attrs.stride      = {c.SH, c.SW};
@@ -254,17 +219,14 @@ struct Layer {
 
         op = TransposeConv2D::create(attrs, Backend::CPU);
 
-        const TensorDesc dn[] = {in_channel_first.desc(), w.desc(), b.desc()};
+        const TensorDesc dn[] = {in_channel_last.desc(), w.desc(), b.desc()};
         const auto od = op->getOutputTensorDesc(dn);
         OH = od[0].dims[2];
         OW = od[0].dims[3];
-        out_channel_first_buf.assign(static_cast<size_t>(od[0].numel()), T{});
         out_cl.assign(static_cast<size_t>(od[0].numel()), T{});
 
-        out_channel_first = TensorView(od[0].dims, dt, out_channel_first_buf.data(), TensorLayout::NCHW);
         out_channel_last = TensorView(od[0].dims, dt, out_cl.data(), TensorLayout::NHWC);
 
-        ins_channel_first = {in_channel_first, w, b};
         ins_channel_last = {in_channel_last, w, b};
         // Contributions, not output-taps: each input pixel runs its whole
         // kernel once, so a stride-2 layer costs a quarter, not a whole.
@@ -272,16 +234,15 @@ struct Layer {
                static_cast<double>(icg) * c.KH * c.KW;
     }
 
-    void run_channel_first(const ComputeContext& ctx) { op->compute(out_channel_first, ins_channel_first, ctx, nullptr); }
     void run_channel_last(const ComputeContext& ctx) { op->compute(out_channel_last, ins_channel_last, ctx, nullptr); }
 
     Shape s;
     TransposeConv2DAttributes attrs{};
     std::unique_ptr<TransposeConv2D> op;
-    std::vector<T> in_channel_first_buf, in_cl, weight, bias;
-    std::vector<T> out_channel_first_buf, out_cl;
-    TensorView in_channel_first, in_channel_last, w, b, out_channel_first, out_channel_last;
-    std::vector<TensorView> ins_channel_first, ins_channel_last;
+    std::vector<T> in_cl, weight, bias;
+    std::vector<T> out_cl;
+    TensorView in_channel_last, w, b, out_channel_last;
+    std::vector<TensorView> ins_channel_last;
     int64_t OH = 0, OW = 0;
     double work = 0.0;
 };
@@ -291,45 +252,48 @@ struct Layer {
 // ============================================================
 
 template <class T>
+double time_median_ms(int nt, Layer<T>& l, int iters, int rounds) {
+    BenchPool pool(nt);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+    l.run_channel_last(use_ctx);   // warm-up / page faults
+    std::vector<double> t;
+    for (int r = 0; r < rounds; ++r) {
+        t.push_back(time_ms([&] { l.run_channel_last(use_ctx); }, iters));
+    }
+    return median_of(t);
+}
+
+template <class T>
 void run_table(const char* tag) {
     const std::vector<int> threads = bench_threads();
     const int iters = 20, rounds = 5;
 
-    std::printf("  %s — channel_first/ms is the channel-first route, channel_last/ms the channel-last one\n", tag);
-    std::printf("    %-45s %6s %6s %6s | %8s %8s | %7s %7s | %6s %s\n",
-                "case", "OH", "OW", "taps", "channel_first ms", "channel_last ms",
-                "channel_first GF", "channel_last GF", "r", "null");
+    std::printf("  %s — channel-last\n", tag);
+    std::printf("    %-45s %6s %6s %6s | %8s | %7s\n",
+                "case", "OH", "OW", "taps", "channel_last ms", "GF");
 
-    double sum_channel_first = 0.0, sum_channel_last = 0.0, sum_work = 0.0;
+    double sum_ms = 0.0, sum_work = 0.0;
     for (const Shape& c : sweep()) {
         Layer<T> l(c);
         const double taps = static_cast<double>(c.KH * c.KW) /
                             static_cast<double>(c.SH * c.SW);
         for (int nt : threads) {
-            const AbResult r = measure_ab(nt,
-                [&](const ComputeContext& x) { l.run_channel_first(x); },
-                [&](const ComputeContext& x) { l.run_channel_last(x); },
-                iters, rounds);
-            const bool real = std::abs(r.a_ms - r.b_ms) / r.a_ms * 100.0 > r.null_pct;
-            std::printf("    %-45s %6lld %6lld %6.1f | %8.3f %8.3f | %7.1f %7.1f | %6.2f %4.1f%%%s\n",
+            const double ms = time_median_ms(nt, l, iters, rounds);
+            std::printf("    %-45s %6lld %6lld %6.1f | %8.3f | %7.1f\n",
                         (nt == threads.front()) ? c.name : "",
                         (long long)l.OH, (long long)l.OW, taps,
-                        r.a_ms, r.b_ms,
-                        l.work / r.a_ms / 1e6, l.work / r.b_ms / 1e6,
-                        r.a_ms / r.b_ms, r.null_pct,
-                        real ? "" : " (noise)");
+                        ms, l.work / ms / 1e6);
             if (nt == threads.front()) {
-                sum_channel_first += r.a_ms;
-                sum_channel_last += r.b_ms;
+                sum_ms += ms;
                 sum_work += l.work;
             }
         }
     }
-    std::printf("    %-45s %6s %6s %6s | %8.3f %8.3f | %7.1f %7.1f | %6.2f\n",
+    std::printf("    %-45s %6s %6s %6s | %8.3f | %7.1f\n",
                 "sum of the layers (1T)", "", "", "",
-                sum_channel_first, sum_channel_last,
-                sum_work / sum_channel_first / 1e6, sum_work / sum_channel_last / 1e6,
-                sum_channel_first / sum_channel_last);
+                sum_ms, sum_work / sum_ms / 1e6);
 }
 
 // ============================================================
@@ -376,8 +340,8 @@ std::vector<uint8_t> permute_to_channel_last(const Shape& s, const std::vector<u
     return dst;
 }
 
-/// The same layer list in its quantized form. The weight keeps the channel-first
-/// [IC, OC/G, KH, KW] form in both layouts, as the op contract says.
+/// The same layer list in its quantized form. The weight keeps the
+/// [IC, OC/G, KH, KW] form, as the op contract says.
 struct Int8Layer {
     Int8Layer(const Shape& sh, DataType a_dt, DataType o_dt)
         : s(sh), act_dt(a_dt), out_dt(o_dt) {
@@ -389,7 +353,7 @@ struct Int8Layer {
 
         // ---- activation: [-1, 1] quantized at 1/128, the scale the tests use ----
         const int64_t in_numel = s.N * s.IC * s.IH * s.IW;
-        in_cf_buf.assign(static_cast<size_t>(in_numel) * esz_in, 0);
+        in_raw_buf.assign(static_cast<size_t>(in_numel) * esz_in, 0);
         {
             test::XorShift128 rng(1);
             const int32_t qmin = (act_dt == DataType::u8) ? 0 : -128;
@@ -399,10 +363,10 @@ struct Int8Layer {
                 int32_t q = static_cast<int32_t>(
                     std::nearbyintf(std::fmaf(x, 128.0f, static_cast<float>(zp_x))));
                 q = std::min(std::max(q, qmin), qmax);
-                in_cf_buf[static_cast<size_t>(i)] = static_cast<uint8_t>(q);
+                in_raw_buf[static_cast<size_t>(i)] = static_cast<uint8_t>(q);
             }
         }
-        in_cl_buf = permute_to_channel_last(s, in_cf_buf, esz_in);
+        in_cl_buf = permute_to_channel_last(s, in_raw_buf, esz_in);
 
         // ---- weight + per-channel scales ----
         const int64_t wnumel = s.IC * (s.OC / s.groups) * s.KH * s.KW;
@@ -436,35 +400,25 @@ struct Int8Layer {
 
         const int64_t ish[] = {s.N, s.IC, s.IH, s.IW};
         const int64_t wsh[] = {s.IC, s.OC / s.groups, s.KH, s.KW};
-        in_cf = TensorView(std::span<const int64_t>(ish, 4), act_dt, in_cf_buf.data(),
-                           TensorLayout::NCHW, qa);
         in_cl = TensorView(std::span<const int64_t>(ish, 4), act_dt, in_cl_buf.data(),
                            TensorLayout::NHWC, qa);
         w = TensorView(std::span<const int64_t>(wsh, 4), DataType::s8, w_buf.data(),
-                       TensorLayout::NCHW, qw);
+                       TensorLayout::Dense, qw);
 
-        const TensorDesc dn[] = {in_cf.desc(), w.desc()};
-        const auto od_cf = op->getOutputTensorDesc(dn);
-        const TensorDesc dn_cl[] = {in_cl.desc(), w.desc()};
-        const auto od_cl = op->getOutputTensorDesc(dn_cl);
+        const TensorDesc dn[] = {in_cl.desc(), w.desc()};
+        const auto od = op->getOutputTensorDesc(dn);
 
-        out_cf_buf.assign(static_cast<size_t>(od_cf[0].numel()) * elem_bytes(out_dt), 0);
-        out_cl_buf.assign(static_cast<size_t>(od_cl[0].numel()) * elem_bytes(out_dt), 0);
-        out_cf = TensorView(od_cf[0].dims, out_dt, out_cf_buf.data(), TensorLayout::NCHW, qo);
-        out_cl = TensorView(od_cl[0].dims, out_dt, out_cl_buf.data(), TensorLayout::NHWC, qo);
-        OH = od_cf[0].dims[2];
-        OW = od_cf[0].dims[3];
+        out_cl_buf.assign(static_cast<size_t>(od[0].numel()) * elem_bytes(out_dt), 0);
+        out_cl = TensorView(od[0].dims, out_dt, out_cl_buf.data(), TensorLayout::NHWC, qo);
+        OH = od[0].dims[2];
+        OW = od[0].dims[3];
 
-        ins_cf = {in_cf, w};
         ins_cl = {in_cl, w};
         // Same contributions count as the fp arms, so the rates line up.
         work = 2.0 * static_cast<double>(s.N) * s.OC * s.IH * s.IW *
                static_cast<double>(s.IC / s.groups) * s.KH * s.KW;
     }
 
-    Status run_channel_first(const ComputeContext& ctx) {
-        return op->compute(out_cf, ins_cf, ctx, nullptr);
-    }
     Status run_channel_last(const ComputeContext& ctx) {
         return op->compute(out_cl, ins_cl, ctx, nullptr);
     }
@@ -473,13 +427,13 @@ struct Int8Layer {
     DataType act_dt, out_dt;
     TransposeConv2DAttributes attrs{};
     std::unique_ptr<TransposeConv2D> op;
-    std::vector<uint8_t> in_cf_buf, in_cl_buf, out_cf_buf, out_cl_buf;
+    std::vector<uint8_t> in_raw_buf, in_cl_buf, out_cl_buf;
     std::vector<int8_t>  w_buf;
     std::vector<float>   w_s;
     std::vector<int32_t> w_zp;
     QuantParams qa, qw, qo;
-    TensorView in_cf, in_cl, w, out_cf, out_cl;
-    std::vector<TensorView> ins_cf, ins_cl;
+    TensorView in_cl, w, out_cl;
+    std::vector<TensorView> ins_cl;
     int64_t OH = 0, OW = 0;
     double work = 0.0;
 };
@@ -489,14 +443,13 @@ void run_int8_table(DataType act_dt, DataType out_dt, const char* tag) {
     const int iters = 20, rounds = 5;
 
     std::printf("  %s — same columns as the fp tables, rates in int8 GOP/s\n", tag);
-    std::printf("    %-45s %6s %6s %6s | %8s %8s | %7s %7s | %6s %s\n",
-                "case", "OH", "OW", "taps", "channel_first ms", "channel_last ms",
-                "channel_first GOP", "channel_last GOP", "r", "null");
+    std::printf("    %-45s %6s %6s %6s | %8s | %7s\n",
+                "case", "OH", "OW", "taps", "channel_last ms", "GOP");
 
-    double sum_channel_first = 0.0, sum_channel_last = 0.0, sum_work = 0.0;
+    double sum_ms = 0.0, sum_work = 0.0;
     for (const Shape& c : sweep()) {
         Int8Layer l(c, act_dt, out_dt);
-        const Status probe = l.run_channel_first(ComputeContext{});
+        const Status probe = l.run_channel_last(ComputeContext{});
         if (probe != Status::ok) {
             std::printf("    %-45s int8: n/a (compute returned %d)\n", c.name,
                         static_cast<int>(probe));
@@ -505,30 +458,29 @@ void run_int8_table(DataType act_dt, DataType out_dt, const char* tag) {
         const double taps = static_cast<double>(c.KH * c.KW) /
                             static_cast<double>(c.SH * c.SW);
         for (int nt : threads) {
-            const AbResult r = measure_ab(nt,
-                [&](const ComputeContext& x) { l.run_channel_first(x); },
-                [&](const ComputeContext& x) { l.run_channel_last(x); },
-                iters, rounds);
-            const bool real = std::abs(r.a_ms - r.b_ms) / r.a_ms * 100.0 > r.null_pct;
-            std::printf("    %-45s %6lld %6lld %6.1f | %8.3f %8.3f | %7.1f %7.1f | %6.2f %4.1f%%%s\n",
+            BenchPool pool(nt);
+            ComputeContext ctx;
+            ctx.cpu = pool.cpu;
+            const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+            l.run_channel_last(use_ctx);
+            std::vector<double> t;
+            for (int r = 0; r < rounds; ++r) {
+                t.push_back(time_ms([&] { l.run_channel_last(use_ctx); }, iters));
+            }
+            const double ms = median_of(t);
+            std::printf("    %-45s %6lld %6lld %6.1f | %8.3f | %7.1f\n",
                         (nt == threads.front()) ? c.name : "",
                         (long long)l.OH, (long long)l.OW, taps,
-                        r.a_ms, r.b_ms,
-                        l.work / r.a_ms / 1e6, l.work / r.b_ms / 1e6,
-                        r.a_ms / r.b_ms, r.null_pct,
-                        real ? "" : " (noise)");
+                        ms, l.work / ms / 1e6);
             if (nt == threads.front()) {
-                sum_channel_first += r.a_ms;
-                sum_channel_last += r.b_ms;
+                sum_ms += ms;
                 sum_work += l.work;
             }
         }
     }
-    std::printf("    %-45s %6s %6s %6s | %8.3f %8.3f | %7.1f %7.1f | %6.2f\n",
+    std::printf("    %-45s %6s %6s %6s | %8.3f | %7.1f\n",
                 "sum of the layers (1T)", "", "", "",
-                sum_channel_first, sum_channel_last,
-                sum_work / sum_channel_first / 1e6, sum_work / sum_channel_last / 1e6,
-                sum_channel_first / sum_channel_last);
+                sum_ms, sum_work / sum_ms / 1e6);
 }
 
 }  // anonymous namespace

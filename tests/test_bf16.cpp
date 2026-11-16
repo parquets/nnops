@@ -13,8 +13,8 @@
 /// The sweep exists because validate() admits bf16 wherever it admits f16
 /// (dtype_in), so an op whose kernel never learned bf16 would either assert or
 /// silently take an f16 path. MatMul has its own numeric suite in test_matmul;
-/// this file covers the rest of the operator surface, including both Conv2D
-/// layouts, the transpose/depthwise variants, conv1d/conv3d, the normalization
+/// this file covers the rest of the operator surface, including the channel-last
+/// Conv2D/conv1d/depthwise/transpose variants, conv3d, the normalization
 /// and softmax kernels, embedding, pooling, the elementwise set and the
 /// movement ops.
 ///
@@ -36,7 +36,6 @@
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/ops/embed.hpp"
 #include "nnops/ops/gather.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "nnops/ops/group_query_attention.hpp"
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/linear_attention.hpp"
@@ -92,7 +91,7 @@ namespace {
 /// One operator input: its shape, layout, and how its values are drawn.
 struct InSpec {
     std::vector<int64_t> shape;
-    TensorLayout layout = TensorLayout::NCHW;
+    TensorLayout layout = TensorLayout::Dense;
     bool index = false;      ///< s32 index input (gather / embed); dtype-independent
     int64_t index_mod = 1;   ///< indices land in [0, index_mod)
     bool cond = false;       ///< u8 0/1 mask input (where)
@@ -346,7 +345,7 @@ void run_normalization()
     SoftmaxAttributes sa;
     sa.axis = -1;
     check_case("softmax", [sa] { return Softmax::create(sa, Backend::CPU); },
-               {{{2, 5, 7}}}, 3e-2f);
+               {{{2, 5, 7}, TensorLayout::NHWC}}, 3e-2f);
 
     {
         NormAttributes a;
@@ -367,7 +366,7 @@ void run_normalization()
         a.type = NormType::GroupNorm;
         a.num_groups = 4;
         check_case("groupnorm", [a] { return Norm::create(a, Backend::CPU); },
-                   {{{2, 8, 4, 4}}, {{8}}, {{8}}}, 3e-2f);
+                   {{{2, 8, 4, 4}, TensorLayout::NHWC}, {{8}}, {{8}}}, 3e-2f);
     }
 }
 
@@ -379,41 +378,18 @@ void run_conv()
         Conv2DAttributes a;
         a.kernel_size = {3, 3};
         a.padding = {1, 1};
-        check_case("conv2d_cf_3x3",
-                   [a] { return Conv2D::create(a, Backend::CPU); },
-                   {{{1, 4, 8, 8}}, {{6, 4, 3, 3}}}, 5e-2f);
-    }
-    {
-        // kdim = 3·9 = 27: the pack's k groups past a 4-multiple, the case the
-        // BFMMLA panel stride has to agree with the packer on.
-        Conv2DAttributes a;
-        a.kernel_size = {3, 3};
-        check_case("conv2d_cf_odd_k",
-                   [a] { return Conv2D::create(a, Backend::CPU); },
-                   {{{1, 3, 9, 9}}, {{5, 3, 3, 3}}}, 5e-2f);
-    }
-    {
-        Conv2DAttributes a;
-        a.kernel_size = {1, 1};
-        a.epilogue.type = EpilogueActivateType::Relu;
-        check_case("conv2d_cf_1x1_relu",
-                   [a] { return Conv2D::create(a, Backend::CPU); },
-                   {{{1, 4, 6, 6}}, {{6, 4, 1, 1}}, {{6}}}, 5e-2f);
-    }
-    {
-        Conv2DAttributes a;
-        a.kernel_size = {3, 3};
-        a.padding = {1, 1};
         check_case("conv2d_cl_3x3",
                    [a] { return Conv2D::create(a, Backend::CPU); },
-                   {{{1, 8, 8, 4}}, {{3, 3, 4, 6}}}, 5e-2f);
+                   {{{1, 4, 8, 8}, TensorLayout::NHWC},
+                    {{3, 3, 4, 6}, TensorLayout::HWIO}}, 5e-2f);
     }
     {
         Conv2DAttributes a;
         a.kernel_size = {1, 1};
         check_case("conv2d_cl_1x1",
                    [a] { return Conv2D::create(a, Backend::CPU); },
-                   {{{1, 6, 6, 4}}, {{1, 1, 4, 6}}, {{6}}}, 5e-2f);
+                   {{{1, 4, 6, 6}, TensorLayout::NHWC},
+                    {{1, 1, 4, 6}, TensorLayout::HWIO}, {{6}}}, 5e-2f);
     }
     {
         DepthwiseConvAttributes a;
@@ -421,7 +397,8 @@ void run_conv()
         a.padding = {0, 1, 1};
         check_case("depthwise",
                    [a] { return DepthwiseConv::create(a, Backend::CPU); },
-                   {{{1, 4, 8, 8}}, {{4, 1, 3, 3}}}, 5e-2f);
+                   {{{1, 4, 8, 8}, TensorLayout::NHWC},
+                    {{1, 3, 3, 4}, TensorLayout::HWCM}}, 5e-2f);
     }
     {
         DepthwiseTransposeConv2DAttributes a;
@@ -431,7 +408,7 @@ void run_conv()
         a.output_padding = {1, 1};
         check_case("depthwise_transpose",
                    [a] { return DepthwiseTransposeConv2D::create(a, Backend::CPU); },
-                   {{{1, 4, 6, 6}}, {{4, 1, 3, 3}}}, 5e-2f);
+                   {{{1, 4, 6, 6}, TensorLayout::NHWC}, {{4, 1, 3, 3}}}, 5e-2f);
     }
     {
         TransposeConv2DAttributes a;
@@ -441,7 +418,7 @@ void run_conv()
         a.output_padding = {1, 1};
         check_case("transpose_conv2d",
                    [a] { return TransposeConv2D::create(a, Backend::CPU); },
-                   {{{1, 3, 6, 6}}, {{3, 4, 3, 3}}}, 5e-2f);
+                   {{{1, 3, 6, 6}, TensorLayout::NHWC}, {{3, 4, 3, 3}}}, 5e-2f);
     }
     {
         Conv1DAttributes a;
@@ -449,7 +426,8 @@ void run_conv()
         a.padding = 1;
         check_case("conv1d",
                    [a] { return Conv1D::create(a, Backend::CPU); },
-                   {{{1, 4, 20}}, {{6, 4, 3}}}, 5e-2f);
+                   {{{1, 4, 20}, TensorLayout::NHWC},
+                    {{3, 4, 6}, TensorLayout::HWIO}}, 5e-2f);
     }
     {
         Conv3DAttributes a;
@@ -480,7 +458,7 @@ void run_matmul_family()
     {
         EmbedAttributes a;
         check_case("embed", [a] { return Embed::create(a, Backend::CPU); },
-                   {{{10, 8}}, {{3, 4}, TensorLayout::NCHW, true, 10}}, 2e-2f);
+                   {{{10, 8}}, {{3, 4}, TensorLayout::Dense, true, 10}}, 2e-2f);
     }
     {
         // One expert, top-1, identity activation: the MoE router + expert GEMM
@@ -573,7 +551,7 @@ void run_pooling_and_movement()
         a.stride = {1, 2, 2};
         a.padding = {0, 1, 1};
         check_case("pooling", [a] { return Pooling::create(a, Backend::CPU); },
-                   {{{1, 4, 8, 8}}}, 3e-2f);
+                   {{{1, 4, 8, 8}, TensorLayout::NHWC}}, 3e-2f);
     }
     {
         ConcatAttributes a;
@@ -613,13 +591,7 @@ void run_pooling_and_movement()
         GatherAttributes a;
         a.axis = 0;
         check_case("gather", [a] { return Gather::create(a, Backend::CPU); },
-                   {{{4, 5}}, {{6, 2}, TensorLayout::NCHW, true, 4}}, 2e-2f);
-    }
-    {
-        auto op = [] {
-            return LayoutConvert::create(TensorLayout::NHWC);
-        };
-        check_case("layout_convert", op, {{{2, 3, 4, 5}}}, 5e-3f);
+                   {{{4, 5}}, {{6, 2}, TensorLayout::Dense, true, 4}}, 2e-2f);
     }
 }
 
@@ -681,14 +653,14 @@ void run_misc_ops()
         a.stride = 2;
         a.padding = 1;
         check_case("pool1d", [a] { return Pool1D::create(a, Backend::CPU); },
-                   {{{1, 4, 9}}}, 3e-2f);
+                   {{{1, 4, 9}, TensorLayout::NHWC}}, 3e-2f);
     }
     {
         TransposeConv3DAttributes a;
         a.kernel_size = {2, 2, 2};
         check_case("transpose_conv3d",
                    [a] { return TransposeConv3D::create(a, Backend::CPU); },
-                   {{{1, 2, 3, 3, 3}}, {{2, 3, 2, 2, 2}}}, 5e-2f);
+                   {{{1, 2, 3, 3, 3}, TensorLayout::NDHWC}, {{2, 3, 2, 2, 2}}}, 5e-2f);
     }
     {
         // cond is u8; the two value operands decide the output dtype.

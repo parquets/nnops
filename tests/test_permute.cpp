@@ -467,7 +467,7 @@ NNOPS_TEST(permute_shape_inference) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], 3);
     NNOPS_EXPECT_EQ(descs[0].dims[3], 5);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 }
 
 NNOPS_TEST(permute_class_api) {

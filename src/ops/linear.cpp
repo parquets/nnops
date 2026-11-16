@@ -51,7 +51,7 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     NNOPS_TRY(
-        detail::require(is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)));
+        detail::require(is_layout_supported(inputs[0].layout, LayoutSupport::Any)));
 
     // The CUDA kernels carry four batch axes — the same rank-six ceiling as
     // MatMul's front end — while the CPU batch walk is unbounded.

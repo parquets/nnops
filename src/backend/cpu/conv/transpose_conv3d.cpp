@@ -1,34 +1,27 @@
 /// @file transpose_conv3d.cpp
-/// @brief CPU TransposeConv3D kernel (NCDHW and NDHWC) — the 2-D col routes
-///        with a third tap axis.
+/// @brief CPU TransposeConv3D kernel (NDHWC) — the 2-D col route with a third
+///        tap axis.
 ///
-/// Same gather formulation as TransposeConv2D, one dimension further out. Either
-/// layout runs a col GEMM per (n, group): the channel reduction over IC/G, then a
-/// scatter that folds the (oc, kd, kh, kw) rows back into the volume
-/// (simd_kernel/simd_col2im.hpp). The two layouts differ only in which operand is
-/// turned:
+/// Same gather formulation as TransposeConv2D, one dimension further out. A col
+/// GEMM per (n, group) does the channel reduction over IC/G, then a scatter
+/// folds the (oc, kd, kh, kw) rows back into the volume
+/// (simd_kernel/simd_col2im.hpp).
 ///
-///   channel-first — the filter is [OC/G·KD·KH·KW] × [IC/G] and the volume
-///     [IC/G] × [ID·IH·IW], so the GEMM is `transpose_a` and reads both operands
-///     where they lie. The scatter is per (oc, od, oh) row and class-major along
-///     W: the depth and height taps only select which input slice row a tap
-///     reads.
-///   channel-last — the volume is [ID·IH·IW] × [IC/G] voxels (one voxel stride of
-///     IC) and the filter is permuted to [IC/G] × [KD·KH·KW·nc], so the col comes
-///     out pixel-major and the scatter adds whole oc vectors. Depthwise, whose
-///     channels are the vector axis, takes the input volume as its own col and
-///     weights each tap instead.
+/// The volume is [ID·IH·IW] × [IC/G] voxels (one voxel stride of IC) and the
+/// filter is permuted to [IC/G] × [KD·KH·KW·nc], so the col comes out
+/// pixel-major and the scatter adds whole oc vectors. Depthwise, whose channels
+/// are the vector axis, takes the input volume as its own col and weights each
+/// tap instead.
 ///
-/// Both col routes chunk the M side on the same 8 MiB budget, which 3-D reaches
-/// sooner: the pixel axis is one dimension larger. The merge that ends a scatter
-/// is the only writer of an output element, which is what keeps add_to's original
-/// value.
+/// The col route chunks the M side on an 8 MiB budget, which 3-D reaches sooner:
+/// the pixel axis is one dimension larger. The merge that ends a scatter is the
+/// only writer of an output element, which is what keeps add_to's original value.
 ///
 /// The fallback is the plain output-driven gather, for the shapes the flat
 /// operand views cannot describe: a pitched volume or a kernel taller than the
-/// per-row tap list. It walks whichever layout it is given.
+/// per-row tap list.
 ///
-/// The weight stays channel-first [IC, OC/G, KD, KH, KW] in both cases.
+/// The weight stays channel-first [IC, OC/G, KD, KH, KW].
 
 #include "nnops/ops/transpose_conv3d.hpp"
 #include "backend/cpu/conv/tconv_cl.h"
@@ -65,139 +58,11 @@ struct Geom3 {
     }
 };
 
-/// The col route. Returns false when the operands cannot be read as flat
-/// matrices, leaving the caller its gather.
-template <typename T>
-bool tconv3d_gemm(const Geom3& gm, TensorView& output, std::span<const TensorView> inputs,
-                  const ComputeContext& ctx)
-{
-    const auto& input = inputs[0];
-    const auto& weight = inputs[1];
-    const bool has_bias = inputs.size() > 2;
-
-    if (weight.row_stride_elems() != gm.KW) {
-        return false;
-    }
-    if (input.row_stride_elems() != gm.IW) {
-        return false;
-    }
-    if (gm.KD > kMaxRowTaps || gm.KH > kMaxRowTaps) {
-        return false;
-    }
-
-    const int64_t karea = gm.KD * gm.KH * gm.KW;
-    const int64_t npix = gm.ID * gm.IH * gm.IW;
-    const int64_t icg = gm.IC_per_G;
-    const int64_t ocg = gm.OC_per_G;
-    if (npix <= 0 || karea <= 0 || icg <= 0) {
-        return false;
-    }
-    // The volume view is [IC/G] × [ID·IH·IW], so a channel has to be one whole
-    // contiguous volume.
-    if (input.stride_elems(1) != npix) {
-        return false;
-    }
-
-    const int64_t in_n_stride = input.stride_elems(0);
-    const int64_t out_n_stride = output.stride_elems(0);
-    const int64_t out_c_stride = output.stride_elems(1);
-    const int64_t out_d_stride = output.stride_elems(2);
-    const int64_t out_row_stride = output.row_stride_elems();
-
-    const Tconv3dColGeom cg = gm.col_geom();
-    const int64_t row_len = cg.w.row_len;
-    const int64_t slots = std::max(1, ctx.cpu.worker_count());
-
-    const int64_t elems_per_oc = karea * npix;
-    const int64_t cap = kColCapBytes / static_cast<int64_t>(sizeof(T));
-    const int64_t chunk =
-        std::max<int64_t>(1, std::min(ocg, cap / std::max<int64_t>(elems_per_oc, 1)));
-
-    PoolArray<T> col(static_cast<size_t>(chunk * elems_per_oc));
-    PoolArray<T> rows(static_cast<size_t>(slots * row_len));
-    if (!col || !rows) {
-        return false;
-    }
-
-    const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr = weight.ptr<T>();
-    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
-    auto* out_ptr = output.ptr<T>();
-    const DataType vdt = input.data_type();
-
-    MatMulAttributes mm{};
-    mm.transpose_a = true;
-
-    for (int64_t n = 0; n < gm.N; ++n) {
-        const T* in_n = in_ptr + n * in_n_stride;
-        T* out_n = out_ptr + n * out_n_stride;
-
-        for (int64_t g = 0; g < gm.G; ++g) {
-            const T* w_g = w_ptr + g * icg * (ocg * karea);
-            const T* b_g = b_ptr ? b_ptr + g * ocg : nullptr;
-
-            // B: the group's whole input volume, [IC/G] × [ID·IH·IW].
-            const int64_t bshape[] = {icg, npix};
-            TensorView bm(std::span<const int64_t>(bshape, 2), vdt,
-                          const_cast<T*>(in_n + g * icg * npix),
-                          static_cast<int64_t>(npix * sizeof(T)), TensorLayout::NCHW);
-
-            for (int64_t oc0 = 0; oc0 < ocg; oc0 += chunk) {
-                const int64_t cc = std::min(chunk, ocg - oc0);
-                const int64_t m = cc * karea;
-
-                // A: the filter rows of this oc slice, [IC/G] × [OC/G·KD·KH·KW],
-                // read through the group's own row stride.
-                const int64_t ashape[] = {icg, m};
-                TensorView am(std::span<const int64_t>(ashape, 2), vdt,
-                              const_cast<T*>(w_g + oc0 * karea),
-                              static_cast<int64_t>(ocg * karea * sizeof(T)), TensorLayout::NCHW);
-                const int64_t cshape[] = {m, npix};
-                TensorView cm(std::span<const int64_t>(cshape, 2), vdt, col.data(),
-                              static_cast<int64_t>(npix * sizeof(T)), TensorLayout::NCHW);
-
-                const TensorView mins[] = {am, bm};
-                matmul_cpu(mm, cm, mins, ctx, nullptr);
-
-                // One task per output row: the taps that land on it, then the
-                // residue walk along W, then the merge that owns the row.
-                ctx.cpu.run(0, cc * gm.OD * gm.OH, [&](int64_t task) {
-                    const int64_t oc_l = task / (gm.OD * gm.OH);
-                    const int64_t rest = task % (gm.OD * gm.OH);
-                    const int64_t od = rest / gm.OH;
-                    const int64_t oh = rest % gm.OH;
-                    T* row =
-                        rows.data() + static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
-
-                    row_fill(row, row_len, b_g ? s_load(&b_g[oc_l]) : 0.0f);
-
-                    tconv3d_col2im_channel_major<T>(
-                        cg, col.data() + oc_l * karea * npix, row, od, oh,
-                        [](T* dst, const T* src, int64_t len, int64_t) { row_add(dst, src, len); });
-
-                    const int64_t oc = g * ocg + oc0 + oc_l;
-                    T* orow = out_n + oc * out_c_stride + od * out_d_stride + oh * out_row_stride;
-                    for (int64_t r = 0; r < gm.SW && r < gm.OW; ++r) {
-                        const int64_t nr = (gm.OW - r + gm.SW - 1) / gm.SW;
-                        const T* rp = row + r * cg.w.mic;
-                        for (int64_t t = 0; t < nr; ++t) {
-                            const int64_t ow = r + t * gm.SW;
-                            apply_epilogue_store<T>(&orow[ow], s_load(&rp[t]), gm.epilogue, oc,
-                                                    gm.add_to, gm.pre_act);
-                        }
-                    }
-                });
-            }
-        }
-    }
-    return true;
-}
-
 // =========================================================================
 //  Channel-last (NDHWC)
 // =========================================================================
 //
-// The same col GEMM as the channel-first route, with the operands turned:
+// The 2-D channel-last col GEMM one axis deeper:
 // A is the volume as [ID·IH·IW] × [IC/G] voxels (a voxel's channels are
 // contiguous), B is the filter as [IC/G] × [KD·KH·KW·nc] taps, and the scatter
 // adds whole oc vectors out of the pixel-major col. It is the 2-D channel-last
@@ -320,10 +185,9 @@ void tconv3d_gather(const Geom3& gm, TensorView& output, std::span<const TensorV
     const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     auto* out_ptr = output.ptr<T>();
 
-    // One voxel step is one element channel-first and one channel channel-last;
-    // the row and slice strides already carry the rest of either layout.
-    const int64_t in_px = is_channel_last(input.layout()) ? gm.IC : 1;
-    const int64_t out_px = is_channel_last(output.layout()) ? gm.OC : 1;
+    // One voxel step is one channel; the row and slice strides carry the rest.
+    const int64_t in_px = gm.IC;
+    const int64_t out_px = gm.OC;
 
     const int64_t karea = gm.KD * gm.KH * gm.KW;
 
@@ -404,14 +268,10 @@ void tconv3d_impl(const Geom3& gm, TensorView& output, std::span<const TensorVie
     if (gm.N == 0 || gm.OC == 0 || gm.OD == 0 || gm.OH == 0 || gm.OW == 0) {
         return;
     }
-    if (is_channel_last(inputs[0].layout())) {
-        if (tconv3d_channel_last_depthwise<T>(gm, output, inputs, ctx)) {
-            return;
-        }
-        if (tconv3d_channel_last_gemm<T>(gm, output, inputs, ctx)) {
-            return;
-        }
-    } else if (tconv3d_gemm<T>(gm, output, inputs, ctx)) {
+    if (tconv3d_channel_last_depthwise<T>(gm, output, inputs, ctx)) {
+        return;
+    }
+    if (tconv3d_channel_last_gemm<T>(gm, output, inputs, ctx)) {
         return;
     }
     tconv3d_gather<T>(gm, output, inputs, ctx);

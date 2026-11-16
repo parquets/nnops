@@ -292,37 +292,6 @@ inline void norm_apply_row_add_post_dispatch(const T* x, const T* r, T* y, int64
                                                              bias, scale_is_scalar, add_to, post);
 }
 
-/// Channel-first layout: 4-wide unrolled SIMD fmadd per row.
-template <typename T>
-inline void batch_norm_process_channel_first_row(const T* x_row, T* y_row, int64_t last_dim,
-                                                 float ns, float nb, bool add_to)
-{
-    constexpr int L = simd_lane_for<T>;
-    int64_t i = 0;
-
-    const auto scale8 = v_set1(x_row, ns);
-    const auto bias8 = v_set1(x_row, nb);
-
-    for (; i + 4 * L <= last_dim; i += 4 * L) {
-        auto x0 = v_load(x_row + i);
-        auto x1 = v_load(x_row + i + L);
-        auto x2 = v_load(x_row + i + 2 * L);
-        auto x3 = v_load(x_row + i + 3 * L);
-        v_store_add(y_row + i, v_fmadd(scale8, x0, bias8), add_to);
-        v_store_add(y_row + i + L, v_fmadd(scale8, x1, bias8), add_to);
-        v_store_add(y_row + i + 2 * L, v_fmadd(scale8, x2, bias8), add_to);
-        v_store_add(y_row + i + 3 * L, v_fmadd(scale8, x3, bias8), add_to);
-    }
-    for (; i + L <= last_dim; i += L) {
-        auto rv = v_fmadd(scale8, v_load(x_row + i), bias8);
-        v_store_add(y_row + i, rv, add_to);
-    }
-    for (; i < last_dim; ++i) {
-        float rv = s_load(&x_row[i]) * ns + nb;
-        s_store_add(&y_row[i], rv, add_to);
-    }
-}
-
 /// Non-spatial mode: full per-element scale/bias/mean/var arrays.
 template <typename T>
 inline void batch_norm_process_nonspatial_block(const T* x, T* y, const T* scale, const T* bias,

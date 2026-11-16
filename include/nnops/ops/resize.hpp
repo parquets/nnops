@@ -1,11 +1,10 @@
 #pragma once
 /// @file resize.hpp
-/// @brief Resize operator — 2D/3D spatial interpolation, channel-first and
-/// channel-last.
+/// @brief Resize operator — 2D/3D spatial interpolation, channel-last.
 ///
 /// Per-axis arrays are [D, H, W]; a rank-4 (2D) input reads only H/W (index 0
-/// is ignored), a rank-5 input all three. Channel-first and channel-last are both
-/// supported; the output carries the input's layout.
+/// is ignored), a rank-5 input all three. The output carries the input's layout
+/// (NHWC/NDHWC).
 ///
 /// Nearest and linear are 2D/3D; cubic is the 2D bicubic only (a rank-5 input
 /// reports unsupported), the same split PyTorch and ONNX Runtime draw. Taps
@@ -92,7 +91,7 @@ public:
     OpType  getOpType()  const override { return OpType::Resize; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOrChannelLast;
+        return LayoutSupport::ChannelLastOnly;
     }
 
     const ResizeAttributes& attributes() const noexcept { return attrs_; }

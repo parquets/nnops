@@ -127,7 +127,7 @@ public:
             rows_.push_back(row);
             return;
         }
-        if (!dense_channel_first(actual) || !dense_channel_first(expected)) {
+        if (!dense_rows(actual) || !dense_rows(expected)) {
             row.shape_ok = false;
             if (verbose_) {
                 std::printf("  %-24s LAYOUT: expected dense channel-first, got packed "
@@ -203,12 +203,12 @@ private:
         return true;
     }
 
-    static bool dense_channel_first(const nnops::TensorView& v)
+    static bool dense_rows(const nnops::TensorView& v)
     {
         if (v.rank() < 2) { return true; }
         const int64_t elem = static_cast<int64_t>(
             nnops::data_type_size(v.data_type()));
-        return v.layout() == nnops::TensorLayout::NCHW &&
+        return v.layout() == nnops::TensorLayout::Dense &&
                v.pitch() == v.shape(v.rank() - 1) * elem;
     }
 

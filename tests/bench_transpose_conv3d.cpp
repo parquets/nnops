@@ -1,19 +1,11 @@
 /// @file bench_transpose_conv3d.cpp
-/// @brief TransposeConv3D — NCDHW against NDHWC on the same values, and both
-///        against the scalar scatter they replace.
+/// @brief TransposeConv3D throughput, channel-last.
 ///
-/// Three arms on identical values. `NCDHW` and `NDHWC` are the operator in its
-/// two layouts (each converted once, outside every timer, so a row prices the
-/// layout and the route it selects); `ref` is
-/// reference::transpose_conv3d_channel_first_ref, the input-driven scalar
-/// scatter from tests/reference. The ref arm is not a competitor's kernel — it
-/// is the shape of the code the col routes were built against, so the ratio
-/// says what the structure bought.
+/// One arm: the operator on an NDHWC activation, converted once outside every
+/// timer, so a row prices the kernel and the route it selects.
 ///
-/// Measurement rules follow the other benches: interleaved, with a repeated
-/// NCDHW pass as the null control, per-round min, median across rounds. The
-/// scatter is scalar and an order of magnitude slower, so it gets one call per
-/// timing pass where the operator gets three.
+/// Measurement rules follow the other benches: repeatedly timed calls, median
+/// across rounds.
 ///
 /// FLOPs are 2·N·OC·(IC/G)·ID·IH·IW·KD·KH·KW — the contributions, one full
 /// kernel per input voxel. Counting output-taps instead inflates a stride-2
@@ -41,14 +33,6 @@
 #include <vector>
 
 using namespace nnops;
-
-namespace nnops::backend::cpu::reference {
-    void transpose_conv3d_channel_first_ref(const TransposeConv3DAttributes& attrs,
-                                            TensorView& output,
-                                            std::span<const TensorView> inputs,
-                                            const ComputeContext& ctx,
-                                            void* workspace);
-}
 
 namespace {
 
@@ -156,24 +140,24 @@ void run_one(const Case& c, int nt, int rounds)
 
     auto [in_vec, in_view] = test::make_random_tensor(c.in_shape);
     auto [w_vec, w_view] = test::make_random_tensor(c.w_shape);
-
-    auto op = TransposeConv3D::create(c.attrs, Backend::CPU);
-    const TensorDesc d[] = {in_view.desc(), w_view.desc()};
-    const auto descs = op->getOutputTensorDesc(d);
-    const auto numel = static_cast<size_t>(descs[0].numel());
-    const auto out_dims = std::span<const int64_t>(
-        descs[0].dims.data(), static_cast<size_t>(descs[0].rank));
-
-    std::vector<float> out_buf(numel, 0.0f);
-    auto out_cf = test::make_channel_first(descs[0], out_buf.data());
+    (void)in_view;
+    (void)w_vec;
 
     // The same values in NDHWC, converted once, outside every timer.
     const int64_t IC = c.in_shape[1];
     const int64_t S_in = c.in_shape[2] * c.in_shape[3] * c.in_shape[4];
     const auto in_cl = test::to_channel_last<float>(in_vec, N, IC, S_in);
-    std::vector<float> out_cl_buf(numel, 0.0f);
     TensorView in_cl_view(c.in_shape, DataType::f32,
                           const_cast<float*>(in_cl.data()), TensorLayout::NDHWC);
+
+    auto op = TransposeConv3D::create(c.attrs, Backend::CPU);
+    const TensorDesc d[] = {in_cl_view.desc(), w_view.desc()};
+    const auto descs = op->getOutputTensorDesc(d);
+    const auto numel = static_cast<size_t>(descs[0].numel());
+    const auto out_dims = std::span<const int64_t>(
+        descs[0].dims.data(), static_cast<size_t>(descs[0].rank));
+
+    std::vector<float> out_cl_buf(numel, 0.0f);
     TensorView out_cl(out_dims, DataType::f32, out_cl_buf.data(),
                       TensorLayout::NDHWC);
 
@@ -182,41 +166,21 @@ void run_one(const Case& c, int nt, int rounds)
     ctx.cpu = pool.cpu;
     const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
-    const TensorView ins_cf[] = {in_view, w_view};
     const TensorView ins_cl[] = {in_cl_view, w_view};
-    TensorView outs_cf[] = {out_cf};
     TensorView outs_cl[] = {out_cl};
 
-    auto arm_cf = [&]() { op->compute(outs_cf, ins_cf, use_ctx); };
     auto arm_cl = [&]() { op->compute(outs_cl, ins_cl, use_ctx); };
-    auto arm_ref = [&]() {
-        backend::cpu::reference::transpose_conv3d_channel_first_ref(
-            c.attrs, out_cf, ins_cf, use_ctx, nullptr);
-    };
 
     const int op_iters = 3;
-    const int ref_iters = 1;
 
-    arm_cf();
     arm_cl();
-    arm_ref();
 
-    std::vector<double> cf_ms, cl_ms, ref_ms, null_pct;
+    std::vector<double> cl_ms;
     for (int r = 0; r < rounds; ++r) {
-        const double a1 = time_ms(arm_cf, op_iters);
-        const double b1 = time_ms(arm_cl, op_iters);
-        const double c1 = time_ms(arm_ref, ref_iters);
-        const double a2 = time_ms(arm_cf, op_iters);   // null control
-        cf_ms.push_back(std::min(a1, a2));
-        cl_ms.push_back(b1);
-        ref_ms.push_back(c1);
-        null_pct.push_back(std::abs(a2 - a1) / std::min(a1, a2) * 100.0);
+        cl_ms.push_back(time_ms(arm_cl, op_iters));
     }
 
-    const double cf = median_of(cf_ms);
     const double cl = median_of(cl_ms);
-    const double ref = median_of(ref_ms);
-    const double null_pct_med = median_of(null_pct);
 
     const double flops = 2.0 * static_cast<double>(N) * static_cast<double>(OC) *
                          static_cast<double>(IC_per_G) *
@@ -226,9 +190,8 @@ void run_one(const Case& c, int nt, int rounds)
                                              c.attrs.kernel_size[1] *
                                              c.attrs.kernel_size[2]);
 
-    std::printf("    %-34s | %8.3f %8.3f %9.3f | %7.1f %7.1f | %6.2f %6.1f%%\n",
-                c.name, cf, cl, ref, flops / (cf * 1e6), flops / (cl * 1e6),
-                cf / cl, null_pct_med);
+    std::printf("    %-34s | %8.3f | %7.1f\n",
+                c.name, cl, flops / (cl * 1e6));
 }
 
 }  // namespace
@@ -241,10 +204,8 @@ NNOPS_BENCH(tconv3d) {
         if (nth <= 0) { nth = 1; }
     }
 
-    std::printf("\n=== TransposeConv3D fp32, %dT — NCDHW vs NDHWC, and the scalar "
-                "scatter both replace ===\n", nth);
-    std::printf("    %-34s | %8s %8s %9s | %7s %7s | %6s %6s\n",
-                "case", "NCDHW ms", "NDHWC ms", "ref ms", "cf GF", "cl GF",
-                "cf/cl", "null");
+    std::printf("\n=== TransposeConv3D fp32, %dT — NDHWC ===\n", nth);
+    std::printf("    %-34s | %8s | %7s\n",
+                "case", "NDHWC ms", "GF");
     for (const auto& c : cases) { run_one(c, nth, 3); }
 }

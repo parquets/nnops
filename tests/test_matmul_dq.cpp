@@ -79,11 +79,11 @@ QuantParams per_channel(const float* scale, const int32_t* zp, int64_t n) {
 
 TensorView make_q(int64_t rows, int64_t cols, DataType dt, void* data, const QuantParams& qp) {
     const int64_t shape[] = {rows, cols};
-    return TensorView(shape, dt, data, TensorLayout::NCHW, qp);
+    return TensorView(shape, dt, data, TensorLayout::Dense, qp);
 }
 
 TensorView make_q_nd(std::span<const int64_t> shape, DataType dt, void* data, const QuantParams& qp) {
-    return TensorView(shape, dt, data, TensorLayout::NCHW, qp);
+    return TensorView(shape, dt, data, TensorLayout::Dense, qp);
 }
 
 std::span<const int64_t> desc_shape(const TensorDesc& d) {
@@ -616,7 +616,7 @@ NNOPS_TEST(matmul_dq_padded_a_pitch) {
     const int64_t ashape[] = {M, K};
     TensorView a(ashape, DataType::f32, padded.data(),
                  pitch_elems * static_cast<int64_t>(sizeof(float)),
-                 TensorLayout::NCHW, per_token(q.a_s.data(), q.a_zp.data(), M));
+                 TensorLayout::Dense, per_token(q.a_s.data(), q.a_zp.data(), M));
     TensorView b = make_q(K, N, DataType::s8, q.b.data(), per_channel(q.b_s.data(), q.b_zp.data(), N));
 
     MatMulAttributes attrs{};

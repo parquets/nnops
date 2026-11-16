@@ -45,7 +45,7 @@ public:
     OpType  getOpType()  const override { return OpType::Gather; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::Any;
     }
 
     struct Impl;
@@ -85,7 +85,7 @@ public:
     OpType  getOpType()  const override { return OpType::GatherElements; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::Any;
     }
 
     struct Impl;
@@ -125,7 +125,7 @@ public:
     OpType  getOpType()  const override { return OpType::GatherND; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::Any;
     }
 
     struct Impl;

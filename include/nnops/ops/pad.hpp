@@ -64,7 +64,7 @@ public:
     OpType  getOpType()  const override { return OpType::Pad; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::Any;
     }
 
     const PadAttributes& attributes() const noexcept { return attrs_; }

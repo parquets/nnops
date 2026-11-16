@@ -493,7 +493,7 @@ NNOPS_TEST(cuda_matmul_i8_rejects_unsupported) {
     qa.zero_point_data = a_zp.data();
     qa.num_scales = 4;
 
-    TensorView av(ashape, DataType::f32, a.data(), TensorLayout::NCHW, qa);
+    TensorView av(ashape, DataType::f32, a.data(), TensorLayout::Dense, qa);
     TensorView bv(bshape, DataType::s8, b.data());
     const int64_t cshape[] = {4, 4};
     std::vector<float> out(16, 0.0f);
@@ -522,7 +522,7 @@ TensorView view_of(const std::vector<int64_t>& shape, DataType dt, void* data,
                    const QuantParams& qp = {})
 {
     return TensorView(std::span<const int64_t>(shape.data(), shape.size()), dt,
-                      data, TensorLayout::NCHW, qp);
+                      data, TensorLayout::Dense, qp);
 }
 
 struct I8Case {

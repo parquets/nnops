@@ -1,21 +1,24 @@
 /// @file test_conv3d.cpp
-/// @brief Conv3D correctness tests — channel-first (NCDHW), f32 and f16.
+/// @brief Conv3D correctness tests — channel-last (NDHWC), f32 and f16.
 ///
 /// Two kinds of case: hand-computed small shapes that pin exact output values,
 /// and random cases against reference::conv3d_channel_first_ref
-/// (tests/reference), which accumulates input-driven and so shares no index
-/// arithmetic with the im2col gather the kernel takes. The pitched cases give
-/// the output or the filter a row stride wider than its row, which is what
-/// selects the staged write pass and the gather fallback respectively.
+/// (tests/reference). The golden is dense channel-first, so each case converts
+/// its activation to NDHWC for the operator and converts the operator's output
+/// back for the comparison. The pitched cases give the output or the filter a
+/// row stride wider than its row, which is what selects the staged write pass
+/// and the gather fallback respectively.
 ///
-/// Input:   [N, IC, ID, IH, IW]
-/// Weight:  [OC, IC/G, KD, KH, KW], channel-first
-/// Output:  [N, OC, OD, OH, OW]
+/// Input:   [N, IC, ID, IH, IW] stored NDHWC
+/// Weight:  [OC, IC/G, KD, KH, KW]
+/// Output:  [N, OC, OD, OH, OW] stored NDHWC
 
+#include "backend/cpu/simd_kernel/simd_im2col.hpp"
 #include "nnops/ops/conv3d.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
+#include "common/channel_last.hpp"
 #include "common/compare.hpp"
 #include "common/cpu_pool.hpp"
 
@@ -28,7 +31,7 @@
 
 using namespace nnops;
 
-// Defined in tests/reference/; the channel-first scalar golden.
+// Defined in tests/reference/; the dense channel-first scalar golden.
 namespace nnops::backend::cpu::reference {
     void conv3d_channel_first_ref(const Conv3DAttributes& attrs,
                                   TensorView& output,
@@ -37,8 +40,8 @@ namespace nnops::backend::cpu::reference {
                                   void* workspace);
 }
 
-/// Space @p v's logical rows back to back — what the reference writes and what
-/// the comparisons read, so a pitched view can be checked against it.
+/// Space @p v's logical rows back to back — what the comparison reads, so a
+/// pitched view can be checked against a dense one.
 static std::vector<float> depitch(const TensorView& v, int64_t row_len)
 {
     std::vector<float> out(static_cast<size_t>(v.numel()));
@@ -78,9 +81,12 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
                         bool pitch_w = false,
                         bool pitch_out = false)
 {
+    const int64_t N = in_shape[0];
+    const int64_t IC = in_shape[1];
+    const int64_t in_spatial = in_shape[2] * in_shape[3] * in_shape[4];
     const int64_t OC = w_shape[0];
 
-    auto [in_vec, in_view] = test::make_random_tensor(in_shape);
+    auto [in_vec, in_cf] = test::make_random_tensor(in_shape);
     auto [w_vec,  w_view]  = test::make_random_tensor(w_shape);
     std::vector<float> b_vec;
     TensorView b_view;
@@ -89,6 +95,10 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
         b_vec = std::move(p.first);
         b_view = p.second;
     }
+
+    auto in_cl = test::to_channel_last<float>(in_vec, N, IC, in_spatial);
+    const int64_t in_dims[] = {in_shape[0], in_shape[1], in_shape[2], in_shape[3], in_shape[4]};
+    TensorView in_view(in_dims, DataType::f32, in_cl.data(), TensorLayout::NDHWC);
 
     // A pitched filter: same values, rows pushed apart. The operator has to notice
     // it cannot read the filter as one flat matrix.
@@ -120,14 +130,20 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     }
 
     const auto numel = static_cast<size_t>(out_descs[0].numel());
+    const int64_t OD = out_descs[0].dims[2];
+    const int64_t OH = out_descs[0].dims[3];
     const int64_t OW = out_descs[0].dims[4];
+    const int64_t out_spatial = OD * OH * OW;
+    const int64_t out_row = OW * OC;
 
-    std::vector<float> seed;
+    std::vector<float> seed_cf;
+    std::vector<float> seed_cl;
     if (residual) {
-        seed = test::make_random_tensor(
-            std::span<const int64_t>(out_descs[0].dims.data(),
-                                     static_cast<size_t>(out_descs[0].rank)))
-                   .first;
+        seed_cf = test::make_random_tensor(
+                      std::span<const int64_t>(out_descs[0].dims.data(),
+                                               static_cast<size_t>(out_descs[0].rank)))
+                      .first;
+        seed_cl = test::to_channel_last<float>(seed_cf, N, OC, out_spatial);
     }
 
     // The operator's output: dense, or one row pitch wide.
@@ -135,12 +151,12 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     TensorView out = test::make_channel_first(out_descs[0], out_buf.data());
     if (pitch_out) {
         const int64_t pitch = out_descs[0].row_pitch(32) + 32;
-        out_buf.assign(static_cast<size_t>((numel / OW) * (pitch / 4)), 0.0f);
+        out_buf.assign(static_cast<size_t>((numel / out_row) * (pitch / 4)), 0.0f);
         out = TensorView(std::span<const int64_t>(out_descs[0].dims.data(),
                                                   static_cast<size_t>(out_descs[0].rank)),
-                         DataType::f32, out_buf.data(), pitch);
+                         DataType::f32, out_buf.data(), pitch, TensorLayout::NDHWC);
     }
-    init_rows(out, seed, OW);
+    init_rows(out, seed_cl, out_row);
     {
         TensorView outs[] = {out};
         ComputeContext ctx;
@@ -153,29 +169,26 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
         }
     }
 
-    std::vector<float> ref_buf = seed.empty() ? std::vector<float>(numel, 0.0f) : seed;
-    auto out_ref = test::make_channel_first(out_descs[0], ref_buf.data());
+    std::vector<float> ref_buf = seed_cf.empty() ? std::vector<float>(numel, 0.0f) : seed_cf;
+    TensorView out_ref(out_descs[0].dims, DataType::f32, ref_buf.data());
     {
         ComputeContext ctx;
         if (has_bias) {
-            const TensorView ins[] = {in_view, w_view, b_view};
+            const TensorView ins[] = {in_cf, w_view, b_view};
             backend::cpu::reference::conv3d_channel_first_ref(attrs, out_ref, ins, ctx,
                                                               nullptr);
         } else {
-            const TensorView ins[] = {in_view, w_view};
+            const TensorView ins[] = {in_cf, w_view};
             backend::cpu::reference::conv3d_channel_first_ref(attrs, out_ref, ins, ctx,
                                                               nullptr);
         }
     }
 
-    if (pitch_out) {
-        const auto got = depitch(out, OW);
-        TensorView got_view(out_descs[0].dims, DataType::f32,
-                            const_cast<float*>(got.data()), TensorLayout::NCDHW);
-        NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
-    } else {
-        NNOPS_EXPECT_TRUE(test::allclose(out, out_ref, 1e-4f, 1e-4f));
-    }
+    const std::vector<float> got_cl = pitch_out ? depitch(out, out_row) : out_buf;
+    const auto got_cf = test::to_channel_first<float>(got_cl, N, OC, out_spatial);
+    TensorView got_view(out_descs[0].dims, DataType::f32,
+                        const_cast<float*>(got_cf.data()));
+    NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
 }
 
 NNOPS_TEST(conv3d_kernel1x1_exact) {
@@ -188,7 +201,7 @@ NNOPS_TEST(conv3d_kernel1x1_exact) {
     std::vector<float> in_data(16, 3.0f);
     std::vector<float> w_data = {2.0f, 3.0f};
     std::vector<float> b_data = {1.0f};
-    TensorView in_view(ishape, DataType::f32, in_data.data(), TensorLayout::NCDHW);
+    TensorView in_view(ishape, DataType::f32, in_data.data(), TensorLayout::NDHWC);
     TensorView w_view(wshape, DataType::f32, w_data.data());
     TensorView b_view(bshape, DataType::f32, b_data.data());
 
@@ -222,8 +235,11 @@ NNOPS_TEST(conv3d_output_shape_formula) {
     attrs.padding     = {1, 1, 2};
 
     auto op = Conv3D::create(attrs, Backend::CPU);
-    auto [in_vec, in_view] = test::make_random_tensor({1, 4, 5, 6, 7});
-    auto [w_vec,  w_view]  = test::make_random_tensor({3, 4, 3, 4, 2});
+    auto [in_vec, in_dense] = test::make_random_tensor({1, 4, 5, 6, 7});
+    auto [w_vec,  w_view]   = test::make_random_tensor({3, 4, 3, 4, 2});
+    const int64_t ishape[] = {1, 4, 5, 6, 7};
+    TensorView in_view(ishape, DataType::f32, in_vec.data(), TensorLayout::NDHWC);
+    (void)in_dense;
     const TensorDesc d[] = {in_view.desc(), w_view.desc()};
     const auto descs = op->getOutputTensorDesc(d);
 
@@ -283,7 +299,7 @@ NNOPS_TEST(conv3d_dilated) {
 }
 
 NNOPS_TEST(conv3d_pointwise) {
-    // 1x1x1 stride 1: the input plane is the col, with no gather at all.
+    // 1x1x1 stride 1: the input plane is A, with no gather at all.
     Conv3DAttributes attrs;
 
     test_vs_ref({1, 16, 2, 3, 5}, {8, 16, 1, 1, 1}, attrs, /*has_bias=*/true);
@@ -328,7 +344,7 @@ NNOPS_TEST(conv3d_row_split) {
 }
 
 NNOPS_TEST(conv3d_pitched_output) {
-    // A row stride wider than OW: the GEMM cannot write the tile where it lands.
+    // A row stride wider than OW·OC: the GEMM cannot write the tile where it lands.
     Conv3DAttributes attrs;
     attrs.kernel_size = {3, 3, 3};
     attrs.padding     = {1, 1, 1};
@@ -356,6 +372,7 @@ NNOPS_TEST(conv3d_f16) {
 
     const std::vector<int64_t> in_shape = {1, 8, 3, 4, 4};
     const std::vector<int64_t> w_shape  = {16, 8, 3, 3, 3};
+    const int64_t in_spatial = in_shape[2] * in_shape[3] * in_shape[4];
 
     auto [in_vec, in_f32] = test::make_random_tensor(in_shape);
     auto [w_vec,  w_f32]  = test::make_random_tensor(w_shape);
@@ -365,15 +382,20 @@ NNOPS_TEST(conv3d_f16) {
     auto in_r = test::f16_to_f32(in16);
     auto w_r  = test::f16_to_f32(w16);
 
+    const int64_t in_dims[] = {in_shape[0], in_shape[1], in_shape[2], in_shape[3], in_shape[4]};
     auto op = Conv3D::create(attrs, Backend::CPU);
     const TensorDesc d[] = {in_f32.desc(), w_f32.desc()};
     const auto descs = op->getOutputTensorDesc(d);
     const auto numel = static_cast<size_t>(descs[0].numel());
+    const int64_t N = in_shape[0];
+    const int64_t IC = in_shape[1];
+    const int64_t OC = w_shape[0];
+    const int64_t out_spatial = descs[0].dims[2] * descs[0].dims[3] * descs[0].dims[4];
 
-    TensorView in_ref(in_shape, DataType::f32, in_r.data(), TensorLayout::NCDHW);
+    TensorView in_ref(in_dims, DataType::f32, in_r.data());
     TensorView w_ref(w_shape, DataType::f32, w_r.data());
     std::vector<float> ref_buf(numel, 0.0f);
-    auto out_ref = test::make_channel_first(descs[0], ref_buf.data());
+    TensorView out_ref(descs[0].dims, DataType::f32, ref_buf.data());
     {
         const TensorView ins[] = {in_ref, w_ref};
         ComputeContext ctx;
@@ -381,12 +403,12 @@ NNOPS_TEST(conv3d_f16) {
                                                           nullptr);
     }
 
-    TensorView in16_view(in_shape, DataType::f16,
-                         const_cast<half*>(in16.data()), TensorLayout::NCDHW);
+    auto in16_cl = test::to_channel_last<half>(in16, N, IC, in_spatial);
+    TensorView in16_view(in_dims, DataType::f16, in16_cl.data(), TensorLayout::NDHWC);
     TensorView w16_view(w_shape, DataType::f16, const_cast<half*>(w16.data()));
     std::vector<half> out16(numel);
     TensorView out16_view(descs[0].dims, DataType::f16, out16.data(),
-                          TensorLayout::NCDHW);
+                          TensorLayout::NDHWC);
     {
         TensorView outs[] = {out16_view};
         const TensorView ins[] = {in16_view, w16_view};
@@ -394,9 +416,9 @@ NNOPS_TEST(conv3d_f16) {
         NNOPS_EXPECT_EQ(op->compute(outs, ins, ctx), Status::ok);
     }
 
-    const auto got = test::f16_to_f32(out16);
-    TensorView got_view(descs[0].dims, DataType::f32, const_cast<float*>(got.data()),
-                        TensorLayout::NCDHW);
+    const auto got_cl = test::f16_to_f32(out16);
+    const auto got_cf = test::to_channel_first<float>(got_cl, N, OC, out_spatial);
+    TensorView got_view(descs[0].dims, DataType::f32, const_cast<float*>(got_cf.data()));
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, test::kF16AccumTol,
                                      test::kF16AccumTol));
 }
@@ -447,9 +469,17 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
     // order. The residual puts the staged write pass under the comparison.
     const std::vector<int64_t> in_shape = {2, 16, 4, 8, 8};
     const std::vector<int64_t> w_shape  = {32, 16, 3, 3, 3};
+    const int64_t N = in_shape[0];
+    const int64_t IC = in_shape[1];
+    const int64_t in_spatial = in_shape[2] * in_shape[3] * in_shape[4];
 
-    auto [in_vec, in_view] = test::make_random_tensor(in_shape);
-    auto [w_vec,  w_view]  = test::make_random_tensor(w_shape);
+    auto [in_vec, in_dense] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w_view]   = test::make_random_tensor(w_shape);
+    (void)in_dense;
+
+    auto in_cl = test::to_channel_last<float>(in_vec, N, IC, in_spatial);
+    const int64_t in_dims[] = {in_shape[0], in_shape[1], in_shape[2], in_shape[3], in_shape[4]};
+    TensorView in_view(in_dims, DataType::f32, in_cl.data(), TensorLayout::NDHWC);
 
     Conv3DAttributes attrs;
     attrs.kernel_size = {3, 3, 3};
@@ -460,15 +490,19 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
     const TensorDesc d[] = {in_view.desc(), w_view.desc()};
     const auto out_descs = op->getOutputTensorDesc(d);
     const auto numel = static_cast<size_t>(out_descs[0].numel());
+    const int64_t OC = out_descs[0].dims[1];
     const int64_t OW = out_descs[0].dims[4];
-    const auto seed = test::make_random_tensor(
-                          std::span<const int64_t>(out_descs[0].dims.data(),
-                                                   static_cast<size_t>(out_descs[0].rank)))
-                          .first;
+    const int64_t out_spatial = out_descs[0].dims[2] * out_descs[0].dims[3] * OW;
+    const int64_t out_row = OW * OC;
+    const auto seed_cf = test::make_random_tensor(
+                             std::span<const int64_t>(out_descs[0].dims.data(),
+                                                      static_cast<size_t>(out_descs[0].rank)))
+                             .first;
+    const auto seed = test::to_channel_last<float>(seed_cf, N, OC, out_spatial);
 
     std::vector<float> ref_buf = seed;
     TensorView ref = test::make_channel_first(out_descs[0], ref_buf.data());
-    init_rows(ref, seed, OW);
+    init_rows(ref, seed, out_row);
     {
         TensorView outs[] = {ref};
         const TensorView ins[] = {in_view, w_view};
@@ -478,7 +512,7 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
     for (int nt : {2, 4, 20}) {
         std::vector<float> out_buf = seed;
         TensorView out = test::make_channel_first(out_descs[0], out_buf.data());
-        init_rows(out, seed, OW);
+        init_rows(out, seed, out_row);
         SimplePool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
@@ -486,5 +520,73 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
         const TensorView ins[] = {in_view, w_view};
         NNOPS_EXPECT_EQ(op->compute(outs, ins, ctx), Status::ok);
         NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-5f, 1e-5f));
+    }
+}
+
+// ============================================================
+// tiled_im2col_3d kernel correctness (vs brute-force)
+// ============================================================
+NNOPS_TEST(conv3d_im2col_kernel_matches_ref) {
+    // tiled_im2col_3d vs a naive per-position gather, across stride / padding /
+    // dilation / block-origin.
+    struct Cfg { int ID, IH, IW, KD, KH, KW, SD, SH, SW, DD, DH, DW, PD, PH, PW;
+                 int rod, roh, row, rd, rh, rw; };
+    const Cfg cfgs[] = {
+        // full output, pad 1, stride 1, dilation 1, block at origin
+        {5, 5, 5, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1,  0, 0, 0, 5, 5, 5},
+        // no pad, stride 2
+        {6, 6, 6, 2, 2, 2, 2, 2, 2, 1, 1, 1, 0, 0, 0,  0, 0, 0, 3, 3, 3},
+        // dilation 2, pad 2
+        {7, 7, 7, 3, 3, 3, 1, 1, 1, 2, 2, 2, 2, 2, 2,  0, 0, 0, 7, 7, 7},
+        // sub-block at a non-zero origin (local vs global padding differ)
+        {6, 6, 6, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1,  1, 1, 0, 3, 4, 6},
+    };
+
+    for (const auto& c : cfgs) {
+        const int64_t ishape[] = {1, 1, c.ID, c.IH, c.IW};
+        auto [in_vec, input] = test::make_random_tensor(ishape, -1.0f, 1.0f, 55);
+        const float* in = input.ptr<float>();
+
+        const int id_step = c.IH * c.IW;
+        const int ih_step = c.IW;
+        const int icn_step = c.ID * id_step;
+
+        const int karea = c.KD * c.KH * c.KW;
+        const int roi_volume = c.rd * c.rh * c.rw;
+
+        std::vector<float> col(static_cast<size_t>(karea * roi_volume), -12345.0f);
+        nnops::kernel::tiled_im2col_3d<float>(
+            col.data(), in,
+            c.rod, c.roh, c.row, c.rd, c.rh, c.rw,
+            c.PD, c.PH, c.PW,   // same pad twice: no block starts inside the padded band
+            c.PD, c.PH, c.PW,
+            1, c.ID, c.IH, c.IW,
+            icn_step, id_step, ih_step,
+            c.KD, c.KH, c.KW, c.SD, c.SH, c.SW, c.DD, c.DH, c.DW);
+
+        bool ok = true;
+        for (int kd = 0; kd < c.KD && ok; ++kd) {
+            for (int kh = 0; kh < c.KH && ok; ++kh) {
+                for (int kw = 0; kw < c.KW && ok; ++kw) {
+                    const int row0 = (kd * c.KH + kh) * c.KW + kw;
+                    for (int od = 0; od < c.rd && ok; ++od) {
+                        for (int oh = 0; oh < c.rh && ok; ++oh) {
+                            for (int ow = 0; ow < c.rw; ++ow) {
+                                const int id = (c.rod + od) * c.SD + kd * c.DD - c.PD;
+                                const int ih = (c.roh + oh) * c.SH + kh * c.DH - c.PH;
+                                const int iw = (c.row + ow) * c.SW + kw * c.DW - c.PW;
+                                float expect = 0.0f;
+                                if (id >= 0 && id < c.ID && ih >= 0 && ih < c.IH && iw >= 0 && iw < c.IW) {
+                                    expect = in[id * id_step + ih * ih_step + iw];
+                                }
+                                const float got = col[row0 * roi_volume + (od * c.rh + oh) * c.rw + ow];
+                                if (got != expect) { ok = false; break; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        NNOPS_EXPECT_TRUE(ok);
     }
 }

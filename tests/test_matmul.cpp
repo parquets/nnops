@@ -127,7 +127,7 @@ NNOPS_TEST(matmul_basic_2d) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(4));
@@ -172,7 +172,7 @@ NNOPS_TEST(matmul_transpose_a) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));  // M = a.shape[1] = 2
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));  // N = b.shape[1] = 2
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -217,7 +217,7 @@ NNOPS_TEST(matmul_transpose_b) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));  // M
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));  // N = b.shape[0] = 2
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -263,7 +263,7 @@ NNOPS_TEST(matmul_transpose_both) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));  // M = a.shape[1] = 2
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));  // N = b.shape[0] = 2
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -309,7 +309,7 @@ NNOPS_TEST(matmul_batch_3d) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));  // M
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(2));  // N
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(8));
@@ -368,7 +368,7 @@ NNOPS_TEST(matmul_broadcast_a_2d_x_3d) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));  // M (from A)
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(3));  // N (from B)
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(18));
@@ -436,7 +436,7 @@ NNOPS_TEST(matmul_broadcast_b_3d_x_2d) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));  // M
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(2));  // N
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(12));
@@ -513,7 +513,7 @@ NNOPS_TEST(matmul_broadcast_multi_dim) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(3));   // M
     NNOPS_EXPECT_EQ(descs[0].dims[3], int64_t(2));   // N
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(2 * 4 * 3 * 2));
@@ -589,7 +589,7 @@ NNOPS_TEST(matmul_beta_add_to_output) {
     NNOPS_EXPECT_EQ(descs.size(), 1u);
     NNOPS_EXPECT_EQ(descs[0].rank, int64_t(2));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -631,7 +631,7 @@ NNOPS_TEST(matmul_beta_zero_overwrite) {
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -677,7 +677,7 @@ NNOPS_TEST(matmul_epilogue_relu) {
     NNOPS_EXPECT_EQ(descs.size(), 1u);
     NNOPS_EXPECT_EQ(descs[0].rank, int64_t(2));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -717,7 +717,7 @@ NNOPS_TEST(matmul_epilogue_relu_with_beta) {
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -753,7 +753,7 @@ QuantParams bias_per_tensor(float scale, int32_t zp) {
 TensorView quant_view(const int64_t* shape, int64_t rank, DataType dt, void* data,
                       const QuantParams& qp) {
     return TensorView(std::span<const int64_t>(shape, static_cast<size_t>(rank)),
-                      dt, data, TensorLayout::NCHW, qp);
+                      dt, data, TensorLayout::Dense, qp);
 }
 
 /// Run MatMul and matmul_ref on the same f32 operands; @p initial seeds C for beta.
@@ -1496,7 +1496,7 @@ NNOPS_TEST(matmul_1x1_dot) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(1));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(1));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -1534,7 +1534,7 @@ NNOPS_TEST(matmul_square) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(3));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(3));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -1572,7 +1572,7 @@ NNOPS_TEST(matmul_random) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(8));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(32));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(8 * 32));
@@ -1605,7 +1605,7 @@ NNOPS_TEST(matmul_random_batch) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(8));
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(32));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(4 * 8 * 32));
@@ -1638,7 +1638,7 @@ NNOPS_TEST(matmul_random_transpose_a) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(8));   // M
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(32));  // N
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
@@ -1670,7 +1670,7 @@ NNOPS_TEST(matmul_random_transpose_b) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(8));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(32));  // N = b.shape[0]
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);

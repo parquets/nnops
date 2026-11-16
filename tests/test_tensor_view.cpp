@@ -32,7 +32,7 @@ NNOPS_TEST(tensor_view_dense_construction) {
     NNOPS_EXPECT_FALSE(tv.is_empty());
     NNOPS_EXPECT_EQ(tv.ptr<void>(), static_cast<void*>(data));
     NNOPS_EXPECT_EQ(tv.data_type(), DataType::f32);
-    NNOPS_EXPECT_EQ(tv.layout(), TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(tv.layout(), TensorLayout::Dense);
 }
 
 NNOPS_TEST(tensor_view_explicit_pitch) {
@@ -122,7 +122,7 @@ NNOPS_TEST(channel_last_total_rows_and_storage) {
     NNOPS_EXPECT_EQ(tv.storage_bytes(), static_cast<size_t>(2 * 4 * 5 * 8 * 4));
 
     // Channel-first counts C among the rows: 2 * 8 * 4 = 64.
-    TensorView tv_channel_first(shape, DataType::f32, data, TensorLayout::NCHW);
+    TensorView tv_channel_first(shape, DataType::f32, data, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(tv_channel_first.total_rows(), 2 * 8 * 4);
 }
 

@@ -1,16 +1,11 @@
 /// @file test_softmax.cpp
 /// @brief Softmax operator tests (CPU, class API): softmax and log-softmax
-///        along an axis, temperature, f16, both regular layouts (channel-first and
-///        channel-last) and quantized input.
+///        along an axis, temperature and f16, channel-last only.
 ///
 /// The layout tests run every axis of a 4-D tensor against a reference that
-/// walks the same physical indexing (channel-first [N][C][H][W], channel-last
-/// [N][H][W][C]) in its own code, so an axis handled through the wrong stride
-/// cannot pass. Padded row pitch and channel-packed rejection are covered too.
-///
-/// Quantized input (s8/u8) is dequantized before the float softmax, so the
-/// output is always floating point (f32 by default, f16 if supplied) and never
-/// requantized. PerTensor and PerToken scales are both covered.
+/// walks the same physical indexing (channel-last [N][H][W][C]) in its own
+/// code, so an axis handled through the wrong stride cannot pass. Channel-packed
+/// weight tags are rejected.
 
 #include "nnops/ops/softmax.hpp"
 #include "common/test_harness.hpp"
@@ -29,7 +24,7 @@ NNOPS_TEST(softmax_last_axis) {
     const int64_t shape[] = {3};
     float in_data[]  = {1.0f, 2.0f, 3.0f};
 
-    TensorView input(shape, DataType::f32, in_data);
+    TensorView input(shape, DataType::f32, in_data, TensorLayout::NHWC);
     auto d_in = input.desc();
 
     auto op = Softmax::create({}, Backend::CPU);
@@ -40,7 +35,7 @@ NNOPS_TEST(softmax_last_axis) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NHWC);
 
     std::vector<float> out_buf(descs[0].numel());
     TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -62,7 +57,7 @@ NNOPS_TEST(softmax_2d_axis_1) {
     const int64_t shape[] = {2, 3};
     float in_data[]  = {1.0f, 2.0f, 3.0f, 1.0f, 1.0f, 1.0f};
 
-    TensorView input(shape, DataType::f32, in_data);
+    TensorView input(shape, DataType::f32, in_data, TensorLayout::NHWC);
     auto d_in = input.desc();
 
     SoftmaxAttributes attrs;
@@ -76,7 +71,7 @@ NNOPS_TEST(softmax_2d_axis_1) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NHWC);
 
     std::vector<float> out_buf(descs[0].numel());
     TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -100,7 +95,7 @@ NNOPS_TEST(softmax_log_softmax) {
     const int64_t shape[] = {2};
     float in_data[]  = {0.0f, 1.0f};
 
-    TensorView input(shape, DataType::f32, in_data);
+    TensorView input(shape, DataType::f32, in_data, TensorLayout::NHWC);
     auto d_in = input.desc();
 
     SoftmaxAttributes attrs;
@@ -113,7 +108,7 @@ NNOPS_TEST(softmax_log_softmax) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NHWC);
 
     std::vector<float> out_buf(descs[0].numel());
     TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -130,7 +125,10 @@ NNOPS_TEST(softmax_log_softmax) {
 }
 
 NNOPS_TEST(softmax_random) {
-    auto [in_vec, input] = test::make_random_tensor({4, 8}, -2.0f, 2.0f);
+    const int64_t shape[] = {4, 8};
+    auto [in_vec, in_default] = test::make_random_tensor({4, 8}, -2.0f, 2.0f);
+    (void)in_default;
+    const TensorView input(shape, DataType::f32, in_vec.data(), TensorLayout::NHWC);
     auto d_in = input.desc();
 
     SoftmaxAttributes attrs;
@@ -144,7 +142,7 @@ NNOPS_TEST(softmax_random) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 8);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NHWC);
 
     std::vector<float> out_buf(descs[0].numel());
     TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -246,19 +244,6 @@ static void check_all_axes(std::vector<float>& in, const int64_t dims[4],
     }
 }
 
-NNOPS_TEST(softmax_channel_first_all_axes) {
-    const int64_t dims[4] = {2, 3, 4, 5};
-    const int64_t C = dims[1], H = dims[2], W = dims[3];
-
-    auto [in_data, view] = test::make_random_tensor({dims[0], C, H, W}, -2.0f, 2.0f, 11);
-    (void)view;
-
-    check_all_axes(in_data, dims, TensorLayout::NCHW,
-                   [&](int64_t n, int64_t c, int64_t h, int64_t w) {
-                       return ((n * C + c) * H + h) * W + w;
-                   });
-}
-
 NNOPS_TEST(softmax_channel_last_all_axes) {
     // The strided path lanes across channels, so C = 5 is a partial vector and
     // C = 12 is a full one plus a half; the channel axis itself is a channel-last
@@ -351,59 +336,6 @@ NNOPS_TEST(softmax_channel_last_channel_axis_f16) {
     }
 }
 
-NNOPS_TEST(softmax_channel_first_pitched_rows) {
-    // A pitch one 32-byte step past the dense row. The last-axis path addresses
-    // whole rows; the strided path may only lane across dims that stay inside
-    // one row. The padding doubles as an overrun detector.
-    const int64_t N = 2, C = 3, H = 2, W = 4;
-    const int64_t dims[4] = {N, C, H, W};
-    const int64_t shape[] = {N, C, H, W};
-    const int64_t rows = N * C * H;
-    const int64_t pitch = W * static_cast<int64_t>(sizeof(float)) + 32;
-    const int64_t pe = pitch / static_cast<int64_t>(sizeof(float));
-    const float kPad = -777.0f;
-
-    auto [rnd, view] = test::make_random_tensor({N, C, H, W}, -2.0f, 2.0f, 17);
-    (void)view;
-
-    std::vector<float> in_buf(static_cast<size_t>(rows * pe), kPad);
-    for (int64_t r = 0; r < rows; ++r) {
-        for (int64_t w = 0; w < W; ++w) {
-            in_buf[static_cast<size_t>(r * pe + w)] = rnd[static_cast<size_t>(r * W + w)];
-        }
-    }
-
-    TensorView input(shape, DataType::f32, in_buf.data(), pitch, TensorLayout::NCHW);
-
-    for (int64_t axis = 0; axis < 4; ++axis) {
-        const auto expected = layout_softmax_reference(
-            in_buf, dims, axis, /*log_softmax=*/false,
-            [&](int64_t n, int64_t c, int64_t h, int64_t w) {
-                return ((n * C + c) * H + h) * pe + w;
-            });
-
-        SoftmaxAttributes attrs;
-        attrs.axis = axis;
-        auto op = Softmax::create(attrs, Backend::CPU);
-
-        std::vector<float> out_buf(in_buf.size(), kPad);
-        TensorView output(shape, DataType::f32, out_buf.data(), pitch, TensorLayout::NCHW);
-
-        const TensorView ins[] = {input};
-        NNOPS_EXPECT_TRUE(is_ok(op->compute(output, ins)));
-
-        for (int64_t r = 0; r < rows; ++r) {
-            for (int64_t w = 0; w < W; ++w) {
-                NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(r * pe + w)],
-                                  expected[static_cast<size_t>(r * pe + w)], 1e-5f);
-            }
-            for (int64_t w = W; w < pe; ++w) {
-                NNOPS_EXPECT_EQ(out_buf[static_cast<size_t>(r * pe + w)], kPad);
-            }
-        }
-    }
-}
-
 NNOPS_TEST(softmax_rejects_weight_tags) {
     auto op = Softmax::create(Backend::CPU);
 
@@ -412,7 +344,7 @@ NNOPS_TEST(softmax_rejects_weight_tags) {
     in_desc.dims = std::span<const int64_t>(shape, 3);
     in_desc.rank = 3;
     in_desc.dtype = DataType::f32;
-    in_desc.layout = TensorLayout::PackedOIHW;
+    in_desc.layout = TensorLayout::PackedHWIO;
     const TensorDesc out_desc = in_desc;
 
     const TensorDesc ins[] = {in_desc};
@@ -428,7 +360,7 @@ NNOPS_TEST(softmax_temperature_basic) {
     const int64_t shape[] = {3};
     float in_data[]  = {1.0f, 2.0f, 3.0f};
 
-    TensorView input(shape, DataType::f32, in_data);
+    TensorView input(shape, DataType::f32, in_data, TensorLayout::NHWC);
     auto d_in = input.desc();
 
     SoftmaxAttributes attrs;
@@ -464,7 +396,7 @@ NNOPS_TEST(softmax_temperature_sharper) {
     const int64_t shape[] = {3};
     float in_data[]  = {1.0f, 2.0f, 3.0f};
 
-    TensorView input(shape, DataType::f32, in_data);
+    TensorView input(shape, DataType::f32, in_data, TensorLayout::NHWC);
     auto d_in = input.desc();
 
     SoftmaxAttributes attrs;
@@ -500,7 +432,7 @@ NNOPS_TEST(softmax_temperature_equals_one) {
     const int64_t shape[] = {2};
     float in_data[]  = {0.0f, 2.0f};
 
-    TensorView input(shape, DataType::f32, in_data);
+    TensorView input(shape, DataType::f32, in_data, TensorLayout::NHWC);
     auto d_in = input.desc();
 
     SoftmaxAttributes attrs_default;
@@ -530,7 +462,7 @@ NNOPS_TEST(softmax_temperature_log) {
     const int64_t shape[] = {3};
     float in_data[]  = {1.0f, 2.0f, 3.0f};
 
-    TensorView input(shape, DataType::f32, in_data);
+    TensorView input(shape, DataType::f32, in_data, TensorLayout::NHWC);
     auto d_in = input.desc();
 
     SoftmaxAttributes attrs;
@@ -561,7 +493,10 @@ NNOPS_TEST(softmax_temperature_log) {
 }
 
 NNOPS_TEST(softmax_temperature_random_2d) {
-    auto [in_vec, input] = test::make_random_tensor({4, 8}, -2.0f, 2.0f);
+    const int64_t shape[] = {4, 8};
+    auto [in_vec, in_default] = test::make_random_tensor({4, 8}, -2.0f, 2.0f);
+    (void)in_default;
+    const TensorView input(shape, DataType::f32, in_vec.data(), TensorLayout::NHWC);
     auto d_in = input.desc();
 
     for (float T : {0.5f, 1.0f, 2.0f, 5.0f}) {
@@ -590,48 +525,11 @@ NNOPS_TEST(softmax_temperature_random_2d) {
     }
 }
 
-NNOPS_TEST(softmax_channel_first_axis_first) {
-    const int64_t shape[] = {3, 4, 2, 2};
-    const int64_t N = 3, C = 4, H = 2, W = 2;
-    const int64_t total = N * C * H * W;  // 48
-
-    std::vector<float> in_data(static_cast<size_t>(total));
-    for (size_t i = 0; i < in_data.size(); ++i) {
-        in_data[i] = static_cast<float>(i) * 0.1f;
-    }
-
-    TensorView input(shape, DataType::f32, in_data.data(), TensorLayout::NCHW);
-    auto d_in = input.desc();
-
-    SoftmaxAttributes attrs;
-    attrs.axis = 0;  // batch dim
-    auto op = Softmax::create(attrs, Backend::CPU);
-
-    const TensorDesc in_desc_arr[] = {d_in};
-    auto descs = op->getOutputTensorDesc(in_desc_arr);
-    std::vector<float> out_buf(static_cast<size_t>(total));
-    TensorView output(shape, DataType::f32, out_buf.data(), TensorLayout::NCHW);
-
-    const TensorView ins[] = {input};
-    op->compute(output, ins);
-
-    for (int c = 0; c < C; ++c) {
-        for (int h = 0; h < H; ++h) {
-            for (int w = 0; w < W; ++w) {
-                float sum = 0.0f;
-                for (int n = 0; n < N; ++n) {
-                    int off = n * 16 + c * 4 + h * 2 + w;
-                    sum += out_buf[off];
-                    NNOPS_EXPECT_TRUE(out_buf[off] >= 0.0f);
-                }
-                NNOPS_EXPECT_NEAR(sum, 1.0f, 1e-4f);
-            }
-        }
-    }
-}
-
 NNOPS_TEST(softmax_random_f16) {
-    auto [f16_buf, input] = test::make_random_f16_tensor({4, 8}, -2.0f, 2.0f);
+    const int64_t shape[] = {4, 8};
+    auto [f16_buf, in_default] = test::make_random_f16_tensor({4, 8}, -2.0f, 2.0f);
+    (void)in_default;
+    const TensorView input(shape, DataType::f16, f16_buf.data(), TensorLayout::NHWC);
 
     SoftmaxAttributes attrs;
     attrs.axis = 1;
@@ -660,127 +558,3 @@ NNOPS_TEST(softmax_random_f16) {
         NNOPS_EXPECT_NEAR(row_sum, 1.0f, 1e-2f);  // f16 has lower precision
     }
 }
-
-// ============================================================
-// Quantized input (s8/u8) → float output (f32/f16)
-// ============================================================
-
-NNOPS_TEST(softmax_quant_s8_per_tensor) {
-    // in {2, 4, 6} x scale 0.5 → dequantized {1, 2, 3}.
-    const int64_t shape[] = {3};
-    int8_t in_data[] = {2, 4, 6};
-
-    QuantParams qp;
-    qp.scale = 0.5f;
-    qp.granularity = QuantGranularity::PerTensor;
-    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
-
-    auto op = Softmax::create({}, Backend::CPU);
-    const TensorDesc in_arr[] = {input.desc()};
-    auto descs = op->getOutputTensorDesc(in_arr);
-
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-
-    std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
-
-    const TensorView ins[] = {input};
-    op->compute(output, ins, {}, nullptr);
-
-    float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
-    NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum_exp, 1e-4f);
-    NNOPS_EXPECT_NEAR(out_buf[1], std::exp(2.0f) / sum_exp, 1e-4f);
-    NNOPS_EXPECT_NEAR(out_buf[2], std::exp(3.0f) / sum_exp, 1e-4f);
-    NNOPS_EXPECT_NEAR(out_buf[0] + out_buf[1] + out_buf[2], 1.0f, 1e-5f);
-}
-
-NNOPS_TEST(softmax_quant_u8_per_tensor) {
-    // (in - 128) * 0.5 for {130, 132, 134} → dequantized {1, 2, 3}.
-    const int64_t shape[] = {3};
-    uint8_t in_data[] = {130, 132, 134};
-
-    QuantParams qp;
-    qp.scale = 0.5f;
-    qp.zero_point = 128;
-    qp.granularity = QuantGranularity::PerTensor;
-    TensorView input(shape, DataType::u8, in_data, TensorLayout::NCHW, qp);
-
-    auto op = Softmax::create({}, Backend::CPU);
-    const TensorDesc in_arr[] = {input.desc()};
-    auto descs = op->getOutputTensorDesc(in_arr);
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-
-    std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
-
-    const TensorView ins[] = {input};
-    op->compute(output, ins, {}, nullptr);
-
-    float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
-    NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum_exp, 1e-4f);
-    NNOPS_EXPECT_NEAR(out_buf[1], std::exp(2.0f) / sum_exp, 1e-4f);
-    NNOPS_EXPECT_NEAR(out_buf[2], std::exp(3.0f) / sum_exp, 1e-4f);
-}
-
-NNOPS_TEST(softmax_quant_s8_per_token) {
-    // Per-token s8, rows {1,2,3} and {2,4,6} with scales {1, 0.5}.
-    // Both rows dequantize to {1, 2, 3}, so softmax over axis=1 is identical.
-    const int64_t shape[] = {2, 3};
-    int8_t in_data[] = {1, 2, 3,  2, 4, 6};
-    float scale_data[] = {1.0f, 0.5f};
-
-    QuantParams qp;
-    qp.granularity = QuantGranularity::PerToken;
-    qp.scale_data = scale_data;
-    qp.num_scales = 2;
-    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
-
-    SoftmaxAttributes attrs;
-    attrs.axis = 1;
-    auto op = Softmax::create(attrs, Backend::CPU);
-    const TensorDesc in_arr[] = {input.desc()};
-    auto descs = op->getOutputTensorDesc(in_arr);
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-
-    std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
-
-    const TensorView ins[] = {input};
-    op->compute(output, ins, {}, nullptr);
-
-    float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
-    const float e0 = std::exp(1.0f) / sum_exp;
-    const float e1 = std::exp(2.0f) / sum_exp;
-    const float e2 = std::exp(3.0f) / sum_exp;
-    for (int r = 0; r < 2; ++r) {
-        NNOPS_EXPECT_NEAR(out_buf[r * 3 + 0], e0, 1e-4f);
-        NNOPS_EXPECT_NEAR(out_buf[r * 3 + 1], e1, 1e-4f);
-        NNOPS_EXPECT_NEAR(out_buf[r * 3 + 2], e2, 1e-4f);
-    }
-}
-
-NNOPS_TEST(softmax_quant_s8_f16_output) {
-    const int64_t shape[] = {3};
-    int8_t in_data[] = {2, 4, 6};
-
-    QuantParams qp;
-    qp.scale = 0.5f;
-    qp.granularity = QuantGranularity::PerTensor;
-    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
-
-    auto op = Softmax::create({}, Backend::CPU);
-
-    std::vector<nnops::backend::cpu::half> out_buf(3);
-    TensorView output(shape, DataType::f16, out_buf.data(), TensorLayout::NCHW);
-
-    const TensorDesc in_arr[] = {input.desc()};
-    const TensorDesc out_arr[] = {output.desc()};
-    const TensorView ins[] = {input};
-    op->compute(output, ins, {}, nullptr);
-
-    float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
-    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[0]), std::exp(1.0f) / sum_exp, 1e-2f);
-    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[1]), std::exp(2.0f) / sum_exp, 1e-2f);
-    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[2]), std::exp(3.0f) / sum_exp, 1e-2f);
-}
-

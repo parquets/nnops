@@ -7,12 +7,10 @@
 /// output_padding), the bias placement and the two add_to orderings, and the
 /// comparison is the same tolerance-based one the other convolution suites use.
 ///
-/// The cases split along the dispatch. Channel-first geometry takes the
-/// residue-class lane kernels, with a 32 B row pitch on the activation and on
-/// the output in one case. Channel-last takes the 16 B channel lane, plus one
-/// case whose channel count is not a whole vector so the entry's scalar
-/// fallback runs. Both filter forms appear: the [C][1][KH][KW] the grouped
-/// route hands over, and the [KH][KW][C] a channel-last graph carries.
+/// The cases take the 16 B channel lane, plus cases whose channel count is not
+/// a whole vector so the entry's scalar fallback runs. Both filter forms
+/// appear: the [C][1][KH][KW] the grouped route hands over, and the [KH][KW][C]
+/// a channel-last graph carries.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -38,12 +36,9 @@ struct DwCase {
     int64_t ph = 1, pw = 1;
     int64_t oph = 0, opw = 0;
     DataType dtype = DataType::f32;
-    bool channel_last = false;
     bool use_bias = false;
     bool add_to = false;
     bool pre_act = false;
-    /// Channel-first only: a 32 B row pitch on the activation and the output.
-    bool padded = false;
     /// Channel-last activation carrying the [C][1][KH][KW] filter, the form the
     /// grouped TransposeConv2D passes through unconverted.
     bool filter_channel_first = false;
@@ -62,13 +57,11 @@ void run_case(const DwCase& c, const char* what)
     attrs.add_to = c.add_to;
     attrs.residual_pre_activation = c.pre_act;
 
-    const TensorLayout layout =
-        c.channel_last ? TensorLayout::NHWC : TensorLayout::NCHW;
-    const bool pad = c.padded && !c.channel_last;
+    const TensorLayout layout = TensorLayout::NHWC;
 
     HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.c, c.ih, c.iw},
-                                      c.dtype, pad, 23, -0.5f, 0.5f, layout);
-    const bool hwcm = c.channel_last && !c.filter_channel_first;
+                                      c.dtype, false, 23, -0.5f, 0.5f, layout);
+    const bool hwcm = !c.filter_channel_first;
     HostTensor wgt = hwcm
         ? make_host_random(std::vector<int64_t>{c.kh, c.kw, c.c}, c.dtype, false,
                            29, -0.25f, 0.25f, TensorLayout::HWCM)
@@ -90,9 +83,9 @@ void run_case(const DwCase& c, const char* what)
 
     // The residual seed is the same on both sides; a plain case starts at zero.
     const auto seed = [&](uint64_t s) {
-        return c.add_to ? make_host_random(od.dims, od.dtype, pad, s, 0.0f, 0.5f,
+        return c.add_to ? make_host_random(od.dims, od.dtype, false, s, 0.0f, 0.5f,
                                            layout)
-                        : make_host_zeroed(od.dims, od.dtype, pad, layout);
+                        : make_host_zeroed(od.dims, od.dtype, false, layout);
     };
     HostTensor out_ref = seed(37);
     HostTensor out_dev = seed(37);
@@ -122,73 +115,13 @@ void run_case(const DwCase& c, const char* what)
 }  // namespace
 
 // ============================================================
-// Channel-first
-// ============================================================
-
-NNOPS_TEST(cuda_dwt_basic) {
-    for (DataType dt : {DataType::f32, DataType::f16}) {
-        DwCase c;
-        c.dtype = dt;
-        run_case(c, "cuda_dwt_basic");
-        c.use_bias = true;
-        run_case(c, "cuda_dwt_bias");
-    }
-}
-
-NNOPS_TEST(cuda_dwt_geometry) {
-    {   // Stride 2 with output_padding: the residue classes and the extra column.
-        DwCase c;
-        c.c = 12; c.ih = c.iw = 7; c.sh = c.sw = 2; c.oph = 1; c.opw = 1;
-        run_case(c, "cuda_dwt_stride2");
-    }
-    {   // A dilated 3x3, so the taps move within the window.
-        DwCase c;
-        c.c = 9; c.ih = c.iw = 8; c.dh = c.dw = 2;
-        run_case(c, "cuda_dwt_dilated");
-    }
-    {   // 1x1 kernel: the interior window is a single tap.
-        DwCase c;
-        c.c = 20; c.kh = c.kw = 1; c.ph = c.pw = 0;
-        run_case(c, "cuda_dwt_1x1");
-    }
-    {   // An even kernel on an even stride, no padding.
-        DwCase c;
-        c.c = 6; c.ih = c.iw = 6; c.kh = c.kw = 4; c.sh = c.sw = 2;
-        c.ph = c.pw = 0;
-        run_case(c, "cuda_dwt_even");
-    }
-}
-
-NNOPS_TEST(cuda_dwt_pitched) {
-    // A 32 B pitch on both the activation and the output.
-    DwCase c;
-    c.c = 10; c.ih = c.iw = 7; c.padded = true;
-    run_case(c, "cuda_dwt_pitched");
-    c.use_bias = true;
-    c.sh = c.sw = 2;
-    run_case(c, "cuda_dwt_pitched_stride2");
-}
-
-NNOPS_TEST(cuda_dwt_residual) {
-    // A positive residual survives a ReLU either way; a negative one tells the
-    // pre- and post-activation orders apart, so the seed has mixed signs and
-    // the epilogue is a ReLU.
-    for (bool pre : {false, true}) {
-        DwCase c;
-        c.c = 8; c.ih = c.iw = 6; c.add_to = true; c.pre_act = pre;
-        c.epilogue.type = EpilogueActivateType::Relu;
-        run_case(c, "cuda_dwt_residual");
-    }
-}
-
-// ============================================================
 // Channel-last
 // ============================================================
 
 NNOPS_TEST(cuda_dwt_channel_last) {
     for (DataType dt : {DataType::f32, DataType::f16}) {
         DwCase c;
-        c.c = 16; c.dtype = dt; c.channel_last = true; c.use_bias = true;
+        c.c = 16; c.dtype = dt; c.use_bias = true;
         run_case(c, "cuda_dwt_last");
         c.sh = c.sw = 2;
         run_case(c, "cuda_dwt_last_stride2");
@@ -201,7 +134,7 @@ NNOPS_TEST(cuda_dwt_channel_last_narrow) {
     for (DataType dt : {DataType::f32, DataType::f16}) {
         for (int64_t ch : {int64_t(5), int64_t(7)}) {
             DwCase c;
-            c.c = ch; c.ih = c.iw = 5; c.dtype = dt; c.channel_last = true;
+            c.c = ch; c.ih = c.iw = 5; c.dtype = dt;
             run_case(c, "cuda_dwt_last_narrow");
         }
     }
@@ -211,15 +144,8 @@ NNOPS_TEST(cuda_dwt_channel_last_filter_form) {
     // The grouped route hands a channel-last activation its [C][1][KH][KW]
     // filter; the entry reads it in place rather than repacking.
     DwCase c;
-    c.c = 12; c.ih = c.iw = 6; c.channel_last = true; c.filter_channel_first = true;
+    c.c = 12; c.ih = c.iw = 6; c.filter_channel_first = true;
     run_case(c, "cuda_dwt_last_cf_filter");
-}
-
-NNOPS_TEST(cuda_dwt_wide) {
-    // Past one channel tile and several batches.
-    DwCase c;
-    c.n = 3; c.c = 40; c.ih = c.iw = 11;
-    run_case(c, "cuda_dwt_wide");
 }
 
 #endif  // NNOPS_HAS_CUDA

@@ -1,39 +1,27 @@
 #pragma once
 /// @file simd_depthwise_conv.hpp
-/// @brief SIMD kernels for 2D/3D depthwise convolution, channel-first and channel-last.
+/// @brief SIMD kernels for 2D/3D depthwise convolution, channel-last.
 ///
-/// Two drivers, split by the axis the lane takes.
+/// The driver reads the raw HWCM filter [KD][KH][KW][C] — TF's depthwise order
+/// with the multiplier dropped — and puts the lane on the channel. The pixel
+/// stride and the tap stride are both the channel count, set by the driver; no
+/// prepack is involved, because the layout already is the access pattern. A call
+/// covers NV adjacent channel vectors, 2 where the channels allow, since a
+/// 64-byte line holds two f32 vectors and a one-vector call leaves the other half
+/// of every line to a later pass — 2x the line traffic for the same arithmetic.
 ///
-/// Channel-last reads the raw HWCM filter [KD][KH][KW][C] — TF's
-/// depthwise order with the multiplier dropped — and puts the lane on the channel.
-/// The pixel stride and the tap stride are both the channel count, set by the
-/// driver; no prepack is involved, because the layout already is the access
-/// pattern. A call covers NV adjacent channel vectors, 2 where the channels allow,
-/// since a 64-byte line holds two f32 vectors and a one-vector call leaves the
-/// other half of every line to a later pass — 2x the line traffic for the same
-/// arithmetic.
+/// It runs R = 4 output rows per call, R = 1 for a tail: one row's taps are a
+/// chain of KD*KH*KW dependent FMAs with nothing to interleave, and four rows are
+/// four independent chains. A KD of 1 — the 2D case — degenerates the depth loop,
+/// and padding is bounds-checked in-kernel.
 ///
-/// Channel-first reads the raw [C, 1, (KD,) KH, KW] filter — one scalar per
-/// tap, broadcast into the accumulate — and puts the lane on the output width.
-///
-/// Both run R = 4 output rows per call, R = 1 for a tail. Channel-first needs it for ILP
-/// alone: one row's taps are a chain of KD*KH*KW dependent FMAs with nothing to
-/// interleave, and four rows are four independent chains. A KD of 1 — the 2D
-/// case — degenerates the depth loop, and padding is bounds-checked in-kernel.
-///
-/// Naming: `dwconv_channel_first*` and `dwconv_channel_last*` mirror each other
-/// — the lane is the output width vs. the channels — with the channel-last 3x3
-/// route adding `_3x3`, `_3x3_16` and `_3x3_16x4` for its vector count and row
-/// blocking. The two entry points take the same bias/epilogue/flags arguments;
-/// only the lane count and the channel-last weight layout differ.
+/// Naming: the 3x3 route adds `_3x3`, `_3x3_16` and `_3x3_16x4` for its vector
+/// count and row blocking.
 ///
 /// Everything that depends only on the tap is hoisted out of the tap loops: a row
-/// pointer per (kd, kh, r), left-pad-biased on the channel-last path, and an
-/// interior span of output positions whose every tap is inside the row, where the
-/// tap loop takes no bounds test and no null test — one branch per position instead
-/// of one per tap. The channel-first interior gives a 2D 3x3 literal tap offsets
-/// (`dwconv_channel_first_rows`'s `K3`), so its three horizontal taps cost neither
-/// a loop counter nor a multiply by the runtime `KW`/`DW`.
+/// pointer per (kd, kh, r), left-pad-biased, and an interior span of output
+/// positions whose every tap is inside the row, where the tap loop takes no
+/// bounds test and no null test — one branch per position instead of one per tap.
 /// The null test (does this input row exist) can only be skipped when every row of
 /// the group does, so a group whose window reaches past the plane keeps the
 /// checked path.
@@ -45,16 +33,7 @@
 /// 1.4-1.9x slower at every shape, 1.4x even at C = 8 where only the kernel
 /// differs.
 ///
-/// The channel-first row table is gated on a row spanning at least two width vectors —
-/// at one it costs more to fill than the arithmetic it saves (1T GFLOPS, 3x3: two
-/// vectors 14.0 vs 14.3, four 18.5 vs 13.1, a 112-wide plane 28.3 vs 13.8). Its
-/// edge vectors take a lane mask instead, folded into the tap's broadcast weight;
-/// those lanes are real tensor neighbours, not zeros, so a non-finite value there
-/// would reach the FMA as 0 * NaN, and the driver nulls the mask for the tensor's
-/// first and last channel block and for any block whose neighbouring planes
-/// cannot back a whole-vector read.
-///
-/// The channel-last 3x3 kernels hold the nine taps in registers —
+/// The 3x3 kernels hold the nine taps in registers —
 /// `dwconv_channel_last_3x3` for one channel vector, `dwconv_channel_last_3x3_16` for two, which
 /// cannot hoist eighteen tap vectors and reloads one per column to feed four rows
 /// and both halves. Sixteen channels is what the driver asks for: a pixel's 16
@@ -234,354 +213,6 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag, const
             }
         }
     }
-}
-
-// ============================================================
-// Channel-first driver — the SIMD lane spans output width
-// ============================================================
-
-/// Lane masks for the plane's two edge width vectors.
-struct DwChannelFirstEdges {
-    const void* masks = nullptr;     ///< [2][KW][L] elements of T
-    const uint8_t* needed = nullptr; ///< [2][KW]
-    int64_t kw = 0;
-    int64_t last_ow = 0; ///< ow of the final width vector
-};
-
-/// Fill `masks` ([2*MaxKw*L] elements of T) and `needed` ([2*MaxKw]) from `p`.
-/// `masks == nullptr` is the general path; the buffers stay the caller's.
-template <int64_t MaxKw, typename T>
-inline DwChannelFirstEdges dwconv_channel_first_edge_masks(const DwConvParams& p, T* masks,
-                                                           uint8_t* needed)
-{
-    constexpr int64_t L = simd_lane_for<T>;
-    DwChannelFirstEdges edges;
-    if ((p.SW != 1 && p.SW != 2) || p.KW > MaxKw) {
-        return edges;
-    }
-
-    const int64_t last_ow = ((p.OW + L - 1) / L - 1) * L;
-    // One vector is both edges; e resolves to 0 for it and the two masks below
-    // come out identical.
-    const int64_t ow_edge[2] = {0, last_ow};
-    for (int64_t e = 0; e < 2; ++e) {
-        for (int64_t kw = 0; kw < p.KW; ++kw) {
-            T* mk = masks + (e * p.KW + kw) * L;
-            bool all = true;
-            for (int64_t l = 0; l < L; ++l) {
-                const int64_t col = (ow_edge[e] + l) * p.SW + kw * p.DW - p.PW;
-                const bool ok = col >= 0 && col < p.IW;
-                // s_store, not a cast: `half`'s only constructor takes raw bits,
-                // so static_cast<T>(1) is the subnormal 0x0001, not one.
-                s_store(&mk[l], ok ? 1.0f : 0.0f);
-                all = all && ok;
-            }
-            needed[e * p.KW + kw] = all ? 0 : 1;
-        }
-    }
-
-    edges.masks = masks;
-    edges.needed = needed;
-    edges.kw = p.KW;
-    edges.last_ow = last_ow;
-    return edges;
-}
-
-/// Copy `n` elements, 1 <= n < L, as one switch-selected block move.
-template <typename T> inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
-{
-    switch (n) {
-    case 1:
-        std::memcpy(dst, src, 1 * sizeof(T));
-        break;
-    case 2:
-        std::memcpy(dst, src, 2 * sizeof(T));
-        break;
-    case 3:
-        std::memcpy(dst, src, 3 * sizeof(T));
-        break;
-    case 4:
-        std::memcpy(dst, src, 4 * sizeof(T));
-        break;
-    case 5:
-        std::memcpy(dst, src, 5 * sizeof(T));
-        break;
-    case 6:
-        std::memcpy(dst, src, 6 * sizeof(T));
-        break;
-    case 7:
-        std::memcpy(dst, src, 7 * sizeof(T));
-        break;
-    case 8:
-        std::memcpy(dst, src, 8 * sizeof(T));
-        break;
-    default:
-        break;
-    }
-}
-
-/// R output rows per call, one width-vector accumulate per row. @p SW is the width
-/// stride when the caller knows it (1 or 2) and 0 when it does not, so the choice
-/// stays out of the tap loop. @p K3 says the filter is a 2D 3x3 with unit
-/// dilation, so the interior body can fold its taps into literal offsets.
-template <int R, int SW, typename T, bool K3 = false>
-inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bias,
-                                      const DwConvParams& p, const Epilogue& epilogue, bool add_to,
-                                      bool pre_act, const DwChannelFirstEdges& edges)
-{
-    constexpr int64_t L = simd_lane_for<T>;
-    // T{}, not static_cast<T>(0): bf16's float and uint16-bit constructors make
-    // an int cast ambiguous, and the value-initialised bits are zero either way.
-    const T zero = T{};
-    const auto v_bias = v_set1(out, bias);
-
-    const int64_t sw = (SW != 0) ? SW : p.SW;
-    const auto load_row = [&](const T* src) {
-        if constexpr (SW == 1) {
-            return v_load(src);
-        } else if constexpr (SW == 2) {
-            return v_load_even(src);
-        } else {
-            return (p.SW == 1) ? v_load(src) : v_load_even(src);
-        }
-    };
-
-    // Every input row this call touches, one entry per (kd, kh, r), null where
-    // the row does not exist; a table read replaces address arithmetic that
-    // would otherwise be paid per output vector.
-    constexpr int64_t kMaxTapRows = 256; // (kd, kh, r): 8x8 with R=4 fits
-    const T* row_tab[kMaxTapRows];
-    // Worth building only when a row spans more than one width vector
-    // (measured 1T GFLOPS, 3x3: two vectors 14.0 vs 14.3, four 18.5 vs 13.1,
-    // a 112-wide plane 28.3 vs 13.8).
-    const int64_t nvec = (p.OW + L - 1) / L;
-    const bool have_tab = (p.KD * p.KH * R <= kMaxTapRows) && (nvec >= 2);
-    bool all_rows = have_tab;
-    if (have_tab) {
-        int64_t t = 0;
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            const T* in_d = in + id * p.in_d_stride;
-            const bool d_ok = (id >= 0 && id < p.ID);
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                for (int r = 0; r < R; ++r) {
-                    const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
-                    const bool ok = d_ok && (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
-                    row_tab[t++] = ok ? in_d + ih * p.in_row_stride : nullptr;
-                    all_rows = all_rows && ok;
-                }
-            }
-        }
-    }
-
-    // A stride-2 vector reads 2L inputs to produce L outputs, so the interior
-    // guard widens with it — the same bound channel_first_load uses.
-    const int64_t span = (sw == 2) ? 2 * L : L;
-    const int64_t need = (p.KW - 1) * p.DW + span; // past the first column
-    const int64_t ow_lo = (p.PW + sw - 1) / sw;    // first ow with iw >= 0
-    const int64_t ow_hi = (p.IW + p.PW - need >= 0) ? (p.IW + p.PW - need) / sw : -1;
-
-    for (int64_t ow = 0; ow < p.OW; ow += L) {
-        decltype(v_set1(out, bias)) acc[R];
-        for (int r = 0; r < R; ++r) {
-            acc[r] = v_bias;
-        }
-
-        // Every lane of every tap inside the row: no bounds test, no scalar fill.
-        const bool interior = all_rows && ow >= ow_lo && ow <= ow_hi;
-
-        // Which edge vector this is: 0 first, 1 last, -1 neither.
-        const int64_t e = (ow == 0) ? 0 : ((ow == edges.last_ow) ? 1 : -1);
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                const T* row[R];
-                if (have_tab) {
-                    const int64_t t = (kd * p.KH + kh) * R;
-                    for (int r = 0; r < R; ++r) {
-                        row[r] = row_tab[t + r];
-                    }
-                } else {
-                    const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-                    if (id < 0 || id >= p.ID) {
-                        continue;
-                    }
-                    const T* in_d = in + id * p.in_d_stride;
-                    for (int r = 0; r < R; ++r) {
-                        const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
-                        const bool ok = (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
-                        row[r] = ok ? in_d + ih * p.in_row_stride : nullptr;
-                    }
-                }
-                const T* w_row = w + (kd * p.KH + kh) * p.KW;
-
-                if (interior) {
-                    if constexpr (K3) {
-                        // A 3x3 with unit dilation: the tap loop is three literal
-                        // offsets, so the column index never reaches the tap
-                        // addresses and the body carries no tap counter.
-                        const int64_t iw0 = ow * sw - p.PW;
-                        const auto vk0 = v_set1(out, s_load(&w_row[0]));
-                        const auto vk1 = v_set1(out, s_load(&w_row[1]));
-                        const auto vk2 = v_set1(out, s_load(&w_row[2]));
-                        for (int r = 0; r < R; ++r) {
-                            acc[r] = v_fmadd(load_row(row[r] + iw0), vk0, acc[r]);
-                            acc[r] = v_fmadd(load_row(row[r] + iw0 + 1), vk1, acc[r]);
-                            acc[r] = v_fmadd(load_row(row[r] + iw0 + 2), vk2, acc[r]);
-                        }
-                    } else {
-                        for (int64_t kw = 0; kw < p.KW; ++kw) {
-                            const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
-                            const auto vk = v_set1(out, s_load(&w_row[kw]));
-                            for (int r = 0; r < R; ++r) {
-                                acc[r] = v_fmadd(load_row(row[r] + iw0), vk, acc[r]);
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                // The precomputed mask is what keeps a narrow plane — where
-                // every vector is an edge — out of the scalar fallback below.
-                if (edges.masks != nullptr && e >= 0) {
-                    for (int64_t kw = 0; kw < p.KW; ++kw) {
-                        const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
-                        // The mask zeroes exactly the lanes this tap reads from
-                        // outside the row and is the same for every row, so it
-                        // folds into the broadcast weight once per tap.
-                        auto vk = v_set1(out, s_load(&w_row[kw]));
-                        if (edges.needed[e * edges.kw + kw]) {
-                            vk = v_mul(vk, v_load(static_cast<const T*>(edges.masks) +
-                                                  (e * edges.kw + kw) * L));
-                        }
-                        for (int r = 0; r < R; ++r) {
-                            if (row[r] == nullptr) {
-                                continue;
-                            }
-                            acc[r] = v_fmadd(load_row(row[r] + iw0), vk, acc[r]);
-                        }
-                    }
-                    continue;
-                }
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
-                    const auto vk = v_set1(out, s_load(&w_row[kw]));
-                    for (int r = 0; r < R; ++r) {
-                        if (row[r] == nullptr) {
-                            continue;
-                        }
-                        acc[r] =
-                            v_fmadd(channel_first_load(row[r], iw0, p.SW, p.IW, zero), vk, acc[r]);
-                    }
-                }
-            }
-        }
-
-        const int64_t lanes = (p.OW - ow < L) ? p.OW - ow : L;
-        for (int r = 0; r < R; ++r) {
-            if (p.oh + r >= p.OH) {
-                continue;
-            }
-            T* dst = out + r * p.out_row_stride + ow;
-            auto a = acc[r];
-            if (pre_act) {
-                if (lanes == L) {
-                    a = v_add(a, v_load(dst));
-                } else {
-                    alignas(32) T cur[L] = {};
-                    dwconv_copy_prefix<T>(cur, dst, lanes);
-                    a = v_add(a, v_load(cur));
-                }
-            }
-            const auto v = nnops::backend::cpu::apply_epilogue_vec(epilogue, out, a);
-            if (lanes == L) {
-                v_store_add(dst, v, add_to);
-            } else {
-                // The short last vector is a block copy of `lanes` elements, not
-                // a per-lane loop: on a 7-wide plane it is the whole row's
-                // store, and the loop cost more than the nine taps above it.
-                alignas(32) T tmp[L];
-                if (add_to) {
-                    alignas(32) T cur[L] = {};
-                    dwconv_copy_prefix<T>(cur, dst, lanes);
-                    v_store(tmp, v_add(v, v_load(cur)));
-                } else {
-                    v_store(tmp, v);
-                }
-                dwconv_copy_prefix<T>(dst, tmp, lanes);
-            }
-        }
-    }
-}
-
-// ============================================================
-// Public kernels
-// ============================================================
-
-/// A 2D 3x3 with unit dilation, the shape the straight-line interior body takes.
-inline bool dwconv_channel_first_3x3_ok(const DwConvParams& p)
-{
-    return p.KD == 1 && p.KH == 3 && p.KW == 3 && p.DH == 1 && p.DW == 1;
-}
-
-/// Route override for A/B measurement: a nonzero store in
-/// `detail::depthwise_3x3_roll` forces the rolled tap loop. The hot check is one
-/// relaxed load (no environment read on the call path).
-inline bool dwconv_3x3_route_enabled()
-{
-    return ::nnops::detail::depthwise_3x3_roll.load(std::memory_order_relaxed) == 0;
-}
-
-#define NNOPS_DWCF_DISPATCH(R, S, K3, ...) dwconv_channel_first_rows<R, S, T, K3>(__VA_ARGS__)
-
-template <int R, typename T>
-inline void dwconv_channel_first_dispatch(T* out, const T* in, const T* w, float bias,
-                                          const DwConvParams& p, const Epilogue& epilogue,
-                                          bool add_to, bool pre_act,
-                                          const DwChannelFirstEdges& edges)
-{
-    const bool k3 = dwconv_channel_first_3x3_ok(p) && dwconv_3x3_route_enabled();
-#define NNOPS_DWCF_ROUTE(S)                                                                  \
-    do {                                                                                     \
-        if (k3) {                                                                            \
-            NNOPS_DWCF_DISPATCH(R, S, true, out, in, w, bias, p, epilogue, add_to, pre_act,  \
-                                edges);                                                      \
-        } else {                                                                             \
-            NNOPS_DWCF_DISPATCH(R, S, false, out, in, w, bias, p, epilogue, add_to, pre_act, \
-                                edges);                                                      \
-        }                                                                                    \
-    } while (0)
-    switch (p.SW) {
-    case 1:
-        NNOPS_DWCF_ROUTE(1);
-        break;
-    case 2:
-        NNOPS_DWCF_ROUTE(2);
-        break;
-    default:
-        NNOPS_DWCF_ROUTE(0);
-        break;
-    }
-#undef NNOPS_DWCF_ROUTE
-}
-#undef NNOPS_DWCF_DISPATCH
-
-template <typename T>
-inline void dwconv_channel_first_h4(T* out, const T* in, const T* w, float bias,
-                                    const DwConvParams& p, const Epilogue& epilogue, bool add_to,
-                                    bool pre_act, const DwChannelFirstEdges& edges)
-{
-    dwconv_channel_first_dispatch<4>(out, in, w, bias, p, epilogue, add_to, pre_act, edges);
-}
-
-/// One row — the tail of an h4 loop, and the whole kernel for a single-row call.
-template <typename T>
-inline void dwconv_channel_first(T* out, const T* in, const T* w, float bias, const DwConvParams& p,
-                                 const Epilogue& epilogue, bool add_to, bool pre_act,
-                                 const DwChannelFirstEdges& edges)
-{
-    dwconv_channel_first_dispatch<1>(out, in, w, bias, p, epilogue, add_to, pre_act, edges);
 }
 
 // ============================================================

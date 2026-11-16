@@ -415,7 +415,7 @@ NNOPS_TEST(slice_shape_inference) {
     auto op = Slice::create(attrs, Backend::CPU);
 
     TensorDesc in_desc;
-    in_desc.layout = TensorLayout::NCHW;
+    in_desc.layout = TensorLayout::Dense;
     in_desc.dtype  = DataType::f32;
     in_desc.rank   = 3;
     in_desc.dims.resize(3);
@@ -430,7 +430,7 @@ NNOPS_TEST(slice_shape_inference) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 6);
     NNOPS_EXPECT_EQ(descs[0].dims[2], 5);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 }
 

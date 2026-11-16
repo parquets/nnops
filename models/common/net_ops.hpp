@@ -14,7 +14,6 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/ops/eltwise.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/norm.hpp"
 #include "nnops/ops/pooling.hpp"
@@ -69,25 +68,6 @@ inline int model_threads()
         return want;
     }();
     return n;
-}
-
-/// True when the runners should build their graph channel-last — activations
-/// in that order with the TensorFlow filter orders (HWIO for a conv, HWCM for a
-/// depthwise) — from NNOPS_MODEL_LAYOUT=nhwc.
-///
-/// Off by default: the checkpoints recorded in the artifact are channel-first,
-/// so the channel-last arm converts its activations back to compare (see
-/// channel_first_copy_of below). A channel-last runner also has to fold the BN:
-/// the Norm operator is channel-first, and here the fold is what the fused path
-/// does anyway.
-inline bool channel_last()
-{
-    static const bool on = [] {
-        const char* s = std::getenv("NNOPS_MODEL_LAYOUT");
-        if (s == nullptr) { return false; }
-        return std::strcmp(s, "nhwc") == 0 || std::strcmp(s, "NHWC") == 0;
-    }();
-    return on;
 }
 
 /// The split the runners ask the OpenMP provider for: the provider's own auto
@@ -368,7 +348,7 @@ inline int64_t winograd_order_override()
     return order;
 }
 
-/// The im2col route's prepacked filter (PackedOIHW / PackedHWIO), made once per
+/// The im2col route's prepacked filter (PackedHWIO), made once per
 /// weight buffer by the same two-step prepack as the U above. Both im2col
 /// drivers — fp and int8 — read the blob in place, so what it removes is the
 /// per-call pack: the shared arena copy a fitting weight would otherwise need,
@@ -432,9 +412,8 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
     // disappears is one whole read-modify-write pass over the output.
     nnops::Conv2DAttributes use = attrs;
     if (residual != nullptr) { use.add_to = true; }
-    const bool wino = nnops::winograd_applicable(
-        use, x.shape(1) / use.groups, x.shape(2), x.shape(3),
-        nnops::is_channel_last(x.layout()));
+    const bool wino =
+        nnops::winograd_applicable(use, x.shape(1) / use.groups, x.shape(2), x.shape(3));
     if (wino && winograd_order_override() != 0) {
         use.winograd_order = winograd_order_override();
     }
@@ -747,13 +726,6 @@ inline Buf add(const TensorView& a, const TensorView& b)
     return run("add", *op, in);
 }
 
-inline Buf to_layout(const TensorView& x, nnops::TensorLayout target)
-{
-    auto op = nnops::LayoutConvert::create(target, Backend::CPU);
-    const TensorView in[] = {x};
-    return run("layout_convert", *op, in);
-}
-
 /// MaxPool2d on the tensor as it is: the pooling operator reads a channel-first input
 /// on its channel-first route and a channel-last one on its channel-last route, so the
 /// runner's layout carries through.
@@ -869,7 +841,7 @@ inline Buf channel_first_copy_of(const TensorView& x)
     TensorDesc d;
     d.rank = 4;
     d.dtype = x.data_type();
-    d.layout = nnops::TensorLayout::NCHW;
+    d.layout = nnops::TensorLayout::Dense;
     d.dims.resize(4);
     d.dims[0] = N; d.dims[1] = C; d.dims[2] = H; d.dims[3] = W;
     Buf out = alloc(d);

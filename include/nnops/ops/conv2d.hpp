@@ -1,11 +1,11 @@
 #pragma once
 /// @file conv2d.hpp
-/// @brief 2D convolution — channel-first or channel-last.
+/// @brief 2D convolution — channel-last.
 ///
-/// Channel-first: input [N, IC, IH, IW], weight [OC, IC/G, KH, KW] (OIHW), output
-/// [N, OC, OH, OW], bias [OC]. Channel-last: the same activation with the weight
-/// as HWIO [KH, KW, IC/G, OC] — there the tensor's *shape* is the filter itself;
-/// the two must pair (see validate()). Both routes support groups and dilation.
+/// Input [N, IC, IH, IW] stored NHWC, weight HWIO [KH, KW, IC/G, OC] — there the
+/// tensor's *shape* is the filter itself — output [N, OC, OH, OW], bias [OC]. The
+/// activation and the filter order must pair (see validate()). Groups and
+/// dilation are supported.
 ///
 /// Data types: f32/f16 on every input and output (the floating-point route), or
 /// the quantized route — an s8 weight with per-channel QuantParams against a
@@ -26,17 +26,14 @@
 ///
 /// winograd_applicable() is what a caller checks before prepacking. It requires
 /// algorithm != ImplicitGemm (the off switch), k3s1, at least 32 input channels
-/// per group, and a plane floor that depends on the layout. The transforms cost
-/// a fixed amount per tile per channel, so the 2.25x multiply saving needs wide
-/// K to pay for them (a wash at 8 channels, ~1.2x at 32, 1.5-1.6x at 128-256).
-/// Channel-first keeps 14x14: its 8-lane tile packing inflates the GEMM's N more
-/// than the saving is worth below that — a 7x7 output packs its 4 real tile
-/// columns to 8 and runs 0.65x im2col, while 14x14 packs 7 to 8 (14% waste) and
-/// keeps a 1.15x lead. Channel-last has none of those costs — no deinterleaving
-/// load, no strided column store, no 8-lane packing (its tiles are flattened, so
-/// a 7x7 plane's 16 tiles are exactly 16) — and beats the channel-last implicit
-/// GEMM at every IC >= 32 shape down to 7x7: 0.50-0.59x of its time at 1 thread,
-/// and 2.2 ms of ResNet-18's 21.3 ms (7x7, 512->512) once the floor lets it in.
+/// per group, and a 7x7 plane floor. The transforms cost a fixed amount per tile
+/// per channel, so the 2.25x multiply saving needs wide K to pay for them (a
+/// wash at 8 channels, ~1.2x at 32, 1.5-1.6x at 128-256). Channel-last has no
+/// deinterleaving load, no strided column store and no 8-lane tile packing (its
+/// tiles are flattened, so a 7x7 plane's 16 tiles are exactly 16), and beats the
+/// channel-last implicit GEMM at every IC >= 32 shape down to 7x7: 0.50-0.59x of
+/// its time at 1 thread, and 2.2 ms of ResNet-18's 21.3 ms (7x7, 512->512) once
+/// the floor lets it in.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -124,25 +121,19 @@ struct Conv2DAttributes {
     ConvAlgorithm algorithm = ConvAlgorithm::Auto;
 
     /// Winograd transform order as the output tile side: 2 pins F(2,3), 4 pins
-    /// F(4,3), 0 (the default) lets wino_pick_order() choose — for the
-    /// channel-last route that is F(4,3) from a 28x28 plane up at any team size,
-    /// and on the channel-first route from a floor that climbs with the worker
-    /// count this call reports through ctx (28x28 up to four workers, 56x56 to
-    /// eight, 112x112 past that) — both subject to the U still fitting the
+    /// F(4,3), 0 (the default) lets wino_pick_order() choose — F(4,3) from a
+    /// 28x28 plane up at any team size, subject to the U still fitting the
     /// last-level cache. Pin 4 to take it anywhere. Any other value is refused
     /// at prepack. It only selects which U prepackWeights() builds; compute()
     /// reads the order back off the blob, so the two cannot disagree.
     int64_t winograd_order = 0;
 };
 
-/// Policy a caller checks before prepackWeights(); see the file header. @p
-/// channel_last is the activation's layout, because the two routes have
-/// different plane floors.
+/// Policy a caller checks before prepackWeights(); see the file header.
 inline bool winograd_applicable(const Conv2DAttributes& attrs,
-                                int64_t ic_per_group, int64_t ih, int64_t iw,
-                                bool channel_last = false)
+                                int64_t ic_per_group, int64_t ih, int64_t iw)
 {
-    const int64_t floor = channel_last ? 7 : 14;
+    constexpr int64_t floor = 7;
     return attrs.algorithm != ConvAlgorithm::ImplicitGemm &&
            attrs.kernel_size[0] == 3 && attrs.kernel_size[1] == 3 &&
            attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
@@ -178,11 +169,10 @@ public:
                  void* workspace = nullptr) override;
 
     /// Winograd U = G·g·Gᵀ, two-step: an empty outputs[0] queries the packed
-    /// descriptor — channel-first [16, OC, IC/G]/PackedWinoWeight (pitch IC/G ×
-    /// elem_size), channel-last [16, nb, G·jb, ldd]/PackedWinoWeightLast (pitch
-    /// ldd × elem_size)
-    /// — and a preallocated one receives U. Requires algorithm == Winograd and
-    /// k3s1, asserted: a later compute() gets U and cannot fall back to im2col.
+    /// descriptor — [16, nb, G·jb, ldd]/PackedWinoWeightLast (pitch ldd ×
+    /// elem_size) — and a preallocated one receives U. Requires algorithm ==
+    /// Winograd and k3s1, asserted: a later compute() gets U and cannot fall
+    /// back to im2col.
     ///
     /// @p ctx is not optional in effect: its worker count is what the order
     /// policy weighs (see winograd_order), and both U packers split the filter's
@@ -196,7 +186,7 @@ public:
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override
     {
-        return LayoutSupport::ChannelFirstOrChannelLast;
+        return LayoutSupport::ChannelLastOnly;
     }
 
     const Conv2DAttributes& attributes() const noexcept { return attrs_; }

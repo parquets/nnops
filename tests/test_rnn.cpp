@@ -266,9 +266,9 @@ struct Fixture {
         int64_t s_r[3] = {D, G * g.H, g.H};
         // The pack reads the fp bias as the compute dtype, so `b` stays as built.
         ins[1] = TensorView(std::span<const int64_t>(s_w, 3), DataType::s8,
-                            wq.data(), TensorLayout::NCHW, qpw);
+                            wq.data(), TensorLayout::Dense, qpw);
         ins[2] = TensorView(std::span<const int64_t>(s_r, 3), DataType::s8,
-                            rq.data(), TensorLayout::NCHW, qpr);
+                            rq.data(), TensorLayout::Dense, qpr);
     }
 
     /// X as s8 with one scale per [t, b] row; `xd` holds the dequantized values,
@@ -299,9 +299,9 @@ struct Fixture {
         const int64_t esz = static_cast<int64_t>(sizeof(T));
         ins[0] = g.pad > 0
                      ? TensorView(std::span<const int64_t>(s_x, 3), DataType::s8,
-                                  xq.data(), xw, TensorLayout::NCHW, qp)
+                                  xq.data(), xw, TensorLayout::Dense, qp)
                      : TensorView(std::span<const int64_t>(s_x, 3), DataType::s8,
-                                  xq.data(), TensorLayout::NCHW, qp);
+                                  xq.data(), TensorLayout::Dense, qp);
         x_ref_view = g.pad > 0
                          ? TensorView(std::span<const int64_t>(s_x, 3), dt_of<T>(),
                                       xd.data(), xw * esz)
@@ -908,7 +908,7 @@ NNOPS_TEST(q8_rejects_asymmetric_quantisation) {
         qp.num_scales = D * G * g.H;
         qp.zero_point = 1;  // asymmetric
         TensorView wv(std::span<const int64_t>(s_w, 3), DataType::s8, f.wq.data(),
-                      TensorLayout::NCHW, qp);
+                      TensorLayout::Dense, qp);
         std::vector<TensorView> ins = f.ins;
         ins[1] = wv;
         NNOPS_EXPECT_EQ(op->compute(f.outs, ins, ComputeContext{}, nullptr),
@@ -921,7 +921,7 @@ NNOPS_TEST(q8_rejects_asymmetric_quantisation) {
         qp.scale_data = f.wscale.data();
         qp.num_scales = 3;
         TensorView wv(std::span<const int64_t>(s_w, 3), DataType::s8, f.wq.data(),
-                      TensorLayout::NCHW, qp);
+                      TensorLayout::Dense, qp);
         std::vector<TensorView> ins = f.ins;
         ins[1] = wv;
         NNOPS_EXPECT_EQ(op->compute(f.outs, ins, ComputeContext{}, nullptr),
@@ -937,7 +937,7 @@ NNOPS_TEST(q8_rejects_asymmetric_quantisation) {
         qp.num_scales = D * G * g.H;
         qp.zero_point = -3;
         TensorView wv(std::span<const int64_t>(s_w, 3), DataType::s8, f.wq.data(),
-                      TensorLayout::NCHW, qp);
+                      TensorLayout::Dense, qp);
         std::vector<TensorView> ins = f.ins;
         ins[1] = wv;
         TensorView q{};

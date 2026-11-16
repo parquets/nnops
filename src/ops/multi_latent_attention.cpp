@@ -83,7 +83,7 @@ Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
     const size_t ck_slot = s_slot + 2;
 
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), n_req, ck_slot + 1, 1));
-    if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
+    if (!is_layout_supported(inputs[0].layout, LayoutSupport::Any)) {
         return Status::unsupported;
     }
 

@@ -31,7 +31,7 @@ NNOPS_TEST(activation_relu) {
 
     NNOPS_EXPECT_TRUE(descs[0].rank == 1);
     NNOPS_EXPECT_TRUE(descs[0].dims[0] == 8);
-    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
@@ -63,7 +63,7 @@ NNOPS_TEST(activation_leaky_relu) {
 
     NNOPS_EXPECT_TRUE(descs[0].rank == 1);
     NNOPS_EXPECT_TRUE(descs[0].dims[0] == 4);
-    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
@@ -94,7 +94,7 @@ NNOPS_TEST(activation_sigmoid) {
 
     NNOPS_EXPECT_TRUE(descs[0].rank == 1);
     NNOPS_EXPECT_TRUE(descs[0].dims[0] == 3);
-    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
@@ -124,7 +124,7 @@ NNOPS_TEST(activation_tanh) {
 
     NNOPS_EXPECT_TRUE(descs[0].rank == 1);
     NNOPS_EXPECT_TRUE(descs[0].dims[0] == 3);
-    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
@@ -154,7 +154,7 @@ NNOPS_TEST(activation_gelu) {
 
     NNOPS_EXPECT_TRUE(descs[0].rank == 1);
     NNOPS_EXPECT_TRUE(descs[0].dims[0] == 2);
-    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
@@ -183,7 +183,7 @@ NNOPS_TEST(activation_silu) {
 
     NNOPS_EXPECT_TRUE(descs[0].rank == 1);
     NNOPS_EXPECT_TRUE(descs[0].dims[0] == 2);
-    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
@@ -209,7 +209,7 @@ NNOPS_TEST(activation_random_relu) {
 
     NNOPS_EXPECT_TRUE(descs[0].rank == 1);
     NNOPS_EXPECT_TRUE(descs[0].dims[0] == 1000);
-    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
@@ -270,14 +270,14 @@ NNOPS_TEST(activation_quant_per_tensor_relu_s8) {
     QuantParams qp;
     qp.scale = 0.5f;
     qp.granularity = QuantGranularity::PerTensor;
-    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::Dense, qp);
 
     ActivationAttributes attrs;
     attrs.type = ActivationType::Relu;
     auto op = Activation::create(attrs, Backend::CPU);
 
     int8_t out_buf[6] = {};
-    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, qp);
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::Dense, qp);
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -296,14 +296,14 @@ NNOPS_TEST(activation_quant_per_tensor_sigmoid_s8) {
     QuantParams qp;
     qp.scale = 1.0f;
     qp.granularity = QuantGranularity::PerTensor;
-    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::Dense, qp);
 
     ActivationAttributes attrs;
     attrs.type = ActivationType::Sigmoid;
     auto op = Activation::create(attrs, Backend::CPU);
 
     int8_t out_buf[2] = {};
-    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, qp);
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::Dense, qp);
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -321,14 +321,14 @@ NNOPS_TEST(activation_quant_per_tensor_relu_u8) {
     qp.scale = 0.5f;
     qp.zero_point = 128;
     qp.granularity = QuantGranularity::PerTensor;
-    TensorView input(shape, DataType::u8, in_data, TensorLayout::NCHW, qp);
+    TensorView input(shape, DataType::u8, in_data, TensorLayout::Dense, qp);
 
     ActivationAttributes attrs;
     attrs.type = ActivationType::Relu;
     auto op = Activation::create(attrs, Backend::CPU);
 
     uint8_t out_buf[4] = {};
-    TensorView output(shape, DataType::u8, out_buf, TensorLayout::NCHW, qp);
+    TensorView output(shape, DataType::u8, out_buf, TensorLayout::Dense, qp);
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -430,35 +430,6 @@ NNOPS_TEST(activation_quick_gelu) {
 // PRelu — the slope is a second input, one per logical channel (dim 1)
 // ============================================================
 
-NNOPS_TEST(activation_prelu_channel_first) {
-    const int64_t H = 5, W = 7;
-    auto [in_vec, input] = test::make_random_tensor({1, 3, H, W}, -4.0f, 4.0f);
-    float slope_data[] = {2.0f, 0.5f, -1.0f};
-    const int64_t sshape[] = {3};
-    TensorView slope(sshape, DataType::f32, slope_data);
-
-    ActivationAttributes attrs;
-    attrs.type = ActivationType::PRelu;
-    auto op = Activation::create(attrs);
-
-    const TensorDesc in_descs[] = {input.desc(), slope.desc()};
-    auto out_descs = op->getOutputTensorDesc(in_descs);
-    NNOPS_EXPECT_TRUE(out_descs[0].rank == 4 && out_descs[0].dims[1] == 3);
-
-    std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = nnops::test::make_channel_first(out_descs[0], buf.data());
-
-    const TensorView ins[] = {input, slope};
-    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
-
-    for (int64_t i = 0; i < input.numel(); ++i) {
-        const int64_t c = (i / (H * W)) % 3;
-        const float x = in_vec[static_cast<size_t>(i)];
-        const float expected = x > 0.0f ? x : slope_data[c] * x;
-        NNOPS_EXPECT_NEAR(buf[static_cast<size_t>(i)], expected, 1e-6f);
-    }
-}
-
 NNOPS_TEST(activation_prelu_channel_last) {
     constexpr int64_t N = 2, C = 5, H = 4, W = 6;
     auto [in_vec, in_channel_first] = test::make_random_tensor({N, C, H, W}, -4.0f, 4.0f);
@@ -498,7 +469,13 @@ NNOPS_TEST(activation_prelu_channel_last) {
 }
 
 NNOPS_TEST(activation_prelu_single_slope) {
-    auto [in_vec, input] = test::make_random_tensor({1, 4, 3, 3}, -4.0f, 4.0f);
+    constexpr int64_t N = 1, C = 4, H = 3, W = 3;
+    auto [in_vec, input_cf] = test::make_random_tensor({N, C, H, W}, -4.0f, 4.0f);
+    (void)input_cf;
+    auto cl = test::to_channel_last<float>(in_vec, N, C, H * W);
+    const int64_t in_shape[] = {N, C, H, W};
+    TensorView input(in_shape, DataType::f32, cl.data(), TensorLayout::NHWC);
+
     float slope_data[] = {0.25f};
     const int64_t sshape[] = {1};
     TensorView slope(sshape, DataType::f32, slope_data);
@@ -507,28 +484,27 @@ NNOPS_TEST(activation_prelu_single_slope) {
     attrs.type = ActivationType::PRelu;
     auto op = Activation::create(attrs);
 
-    const TensorDesc in_descs[] = {input.desc(), slope.desc()};
-    auto out_descs = op->getOutputTensorDesc(in_descs);
-    std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = nnops::test::make_channel_first(out_descs[0], buf.data());
+    std::vector<float> buf(static_cast<size_t>(input.numel()));
+    TensorView out(in_shape, DataType::f32, buf.data(), TensorLayout::NHWC);
 
     const TensorView ins[] = {input, slope};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
 
-    for (int64_t i = 0; i < input.numel(); ++i) {
+    const auto got = test::to_channel_first<float>(buf, N, C, H * W);
+    for (int64_t i = 0; i < N * C * H * W; ++i) {
         const float x = in_vec[static_cast<size_t>(i)];
-        NNOPS_EXPECT_NEAR(buf[static_cast<size_t>(i)],
+        NNOPS_EXPECT_NEAR(got[static_cast<size_t>(i)],
                           x > 0.0f ? x : 0.25f * x, 1e-6f);
     }
 }
 
 NNOPS_TEST(activation_prelu_rejects_bad_slope) {
     TensorDesc x;
-    x.rank = 4; x.layout = TensorLayout::NCHW; x.dtype = DataType::f32;
+    x.rank = 4; x.layout = TensorLayout::Dense; x.dtype = DataType::f32;
     for (int64_t d : {1, 3, 4, 4}) { x.dims.push_back(d); }
 
     TensorDesc slope;
-    slope.rank = 1; slope.layout = TensorLayout::NCHW; slope.dtype = DataType::f32;
+    slope.rank = 1; slope.layout = TensorLayout::Dense; slope.dtype = DataType::f32;
     slope.dims.push_back(2);  // neither 3 nor 1
 
     ActivationAttributes attrs;

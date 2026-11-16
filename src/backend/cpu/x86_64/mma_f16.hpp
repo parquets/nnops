@@ -22,9 +22,8 @@
 ///    split of one accumulator and the partial C stores are 8/4/2-byte stores
 ///    of converted lanes; the 2-wide clamp keeps lanes 2,3 for the 1-wide step.
 ///
-/// Bias seed (both routes): 1 is per-row (channel-first, a row is an output
-/// channel), 2 is per-column (channel-last, rows are pixels, so the bias lands
-/// on the panel's 16 lanes). Seed 2 reads all 16 lanes, so the caller's bias
+/// Bias seed: 1 is per-row (a dense row is an output channel), 2 is per-column
+/// (channel-last, rows are pixels, so the bias lands on the panel's 16 lanes). Seed 2 reads all 16 lanes, so the caller's bias
 /// buffer must be padded to the panel width. Seeding is two loads per row per
 /// panel against a full output write and read-back if the tile were primed
 /// first. The mr1 kernels ignore `mr` and `ldc` (the packed-B ones `lda` too).

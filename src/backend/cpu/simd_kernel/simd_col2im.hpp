@@ -20,16 +20,11 @@
 ///     A tap that misses the class — the stride does not divide its offset —
 ///     contributes nothing to it.
 ///
-/// The two scatters are the two col orientations:
+/// The scatter is pixel-major — one col row per input pixel holding [tap][oc],
+/// so a tap adds one oc vector per pixel, and the pixels of a class are SW apart
+/// in the scratch row.
 ///
-///   * channel-major — one col row per (oc, tap) running over the input plane,
-///     so a tap adds one contiguous run per residue class, and the run's
-///     length is the only bound to get right.
-///   * pixel-major — one col row per input pixel holding [tap][oc], so a tap
-///     adds one oc vector per pixel, and the pixels of a class are SW apart in
-///     the scratch row.
-///
-/// Both accumulate into a caller-owned scratch row and stop there. The caller
+/// It accumulates into a caller-owned scratch row and stops there. The caller
 /// merges that row into the output with its own epilogue, which keeps one
 /// writer per output element — and that is what lets add_to read the old value
 /// without a save/restore pass. The accumulate is a callback because the same
@@ -42,10 +37,6 @@
 /// feed one output row, and every one of them contributes under the *same*
 /// W-axis walk. That is why the column side is shared rather than re-derived:
 /// the residue classes and their spans depend on nothing but the W geometry.
-/// The col row of one (oc, kd, kh, kw) is [npix] wide over the whole input
-/// volume, so the slice row a tap reads sits at
-/// ((kd·KH + kh)·KW + kw)·npix + id·(IH·IW) + ih·IW — the tap's row, then the
-/// depth slice, then the row.
 ///
 /// Strides are element strides and the caller owns the parallelism; a col is
 /// one matrix, so these take no context.
@@ -188,34 +179,6 @@ inline bool tconv2d_col_span(const Tconv2dColGeom& g, int64_t kw, int64_t r, Tco
     return s.thi > s.tlo;
 }
 
-/// Channel-major col: rows are [oc·karea + kh·KW + kw] over the input plane, so
-/// `col` points at this oc's first tap row. `acc(dst, src, n, tap)` adds one
-/// tap's contiguous run to residue class r of `row`. `tap_stride` is where one
-/// tap sits inside the col — the plane size for a real col, zero when the tap
-/// only indexes `acc`'s weight (depthwise, whose source is the input itself).
-template <typename T, typename Acc>
-void tconv2d_col2im_channel_major(const Tconv2dColGeom& g, const T* col, T* row, int64_t oh,
-                                  Acc&& acc, int64_t tap_stride)
-{
-    int64_t kh_of[kMaxRowTaps];
-    int64_t ih_of[kMaxRowTaps];
-    const int64_t taps = tconv2d_row_taps(g, oh, kh_of, ih_of);
-
-    for (int64_t ti = 0; ti < taps; ++ti) {
-        const int64_t tap_row = kh_of[ti] * g.KW;
-        const T* base = col + tap_row * tap_stride + ih_of[ti] * g.IW;
-        for (int64_t kw = 0; kw < g.KW; ++kw) {
-            for (int64_t r = 0; r < g.SW && r < g.OW; ++r) {
-                Tconv2dColSpan s;
-                if (!tconv2d_col_span(g, kw, r, s)) {
-                    continue;
-                }
-                acc(row + r * g.mic + s.tlo, base + kw * tap_stride + s.shift + s.tlo,
-                    s.thi - s.tlo, tap_row + kw);
-            }
-        }
-    }
-}
 
 /// Pixel-major col: rows are [ih·IW + iw] holding [tap][oc]. `m` is a pixel's
 /// stride in the col buffer and `nc` the oc vector length. `tap_stride` is
@@ -248,38 +211,6 @@ void tconv2d_col2im_pixel_major(const Tconv2dColGeom& g, const T* col, int64_t m
     }
 }
 
-/// Channel-major col, 3-D: rows are [oc·karea + (kd·KH + kh)·KW + kw] over the
-/// input volume, so `col` points at this oc's first tap row. The caller guards
-/// KD and KH against kMaxRowTaps.
-template <typename T, typename Acc>
-void tconv3d_col2im_channel_major(const Tconv3dColGeom& g, const T* col, T* row, int64_t od,
-                                  int64_t oh, Acc&& acc)
-{
-    int64_t kd_of[kMaxRowTaps];
-    int64_t id_of[kMaxRowTaps];
-    int64_t kh_of[kMaxRowTaps];
-    int64_t ih_of[kMaxRowTaps];
-    const int64_t dtaps = tconv2d_axis_taps(g.ID, g.KD, g.SD, g.DD, g.PD, od, kd_of, id_of);
-    const int64_t htaps = tconv2d_row_taps(g.w, oh, kh_of, ih_of);
-    const int64_t npix = g.ID * g.plane;
-
-    for (int64_t di = 0; di < dtaps; ++di) {
-        for (int64_t hi = 0; hi < htaps; ++hi) {
-            const int64_t tap_row = (kd_of[di] * g.KH + kh_of[hi]) * g.KW;
-            const T* base = col + tap_row * npix + id_of[di] * g.plane + ih_of[hi] * g.IW;
-            for (int64_t kw = 0; kw < g.KW; ++kw) {
-                for (int64_t r = 0; r < g.SW && r < g.OW; ++r) {
-                    Tconv2dColSpan s;
-                    if (!tconv2d_col_span(g.w, kw, r, s)) {
-                        continue;
-                    }
-                    acc(row + r * g.w.mic + s.tlo, base + kw * npix + s.shift + s.tlo,
-                        s.thi - s.tlo, tap_row + kw);
-                }
-            }
-        }
-    }
-}
 
 /// Pixel-major col, 3-D: voxel rows are [id·(IH·IW) + ih·IW + iw] holding
 /// [tap][oc], which is the orientation the channel-last GEMM leaves the col in.

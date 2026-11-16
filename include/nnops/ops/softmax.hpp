@@ -4,11 +4,7 @@
 ///
 /// softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max)); log-softmax subtracts
 /// log(sum) instead. A temperature T divides the max-shifted logits by T
-/// (equivalently softmax(x/T)). Quantized input (s8/u8) is dequantized to f32,
-/// softmax runs in f32, and the output is float — probabilities are never
-/// re-quantized; quantized input is channel-first and PerTensor/PerToken only.
-///
-/// Two layout families: channel-first and channel-last.
+/// (equivalently softmax(x/T)). f32/f16 input only; channel-last layouts.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -48,10 +44,6 @@ public:
     Status validate(std::span<const TensorDesc> inputs,
                     std::span<const TensorDesc> outputs) const override;
 
-    /// Always 0: the CPU kernel pools its own scratch.
-    size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
-                            std::span<const TensorDesc> outputs) const override;
-
     using OpBase::compute;
 
     Status compute(std::span<TensorView> outputs,
@@ -62,9 +54,9 @@ public:
     OpType  getOpType()  const override { return OpType::Softmax; }
     Backend getBackend() const override { return backend_; }
 
-    /// Both regular activation families; channel-packed layouts are refused.
+    /// Channel-last only; channel-packed layouts are refused.
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOrChannelLast;
+        return LayoutSupport::ChannelLastOnly;
     }
 
     const SoftmaxAttributes& attributes() const noexcept { return attrs_; }

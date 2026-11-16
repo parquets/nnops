@@ -3,15 +3,13 @@
 ///
 /// With a 1-wide height the kernel's derived channel, batch and output strides
 /// are the 1D ones, so the GEMM sees exactly the geometry a native 1D
-/// implementation builds (channel-first M = OC, N = L, K = IC/G·K; channel-last
-/// pixel-major). Scheduling is the 2D kernel's, not this file's: a one-row
-/// output has no oh axis, so the 2D plan cuts the columns instead of the filter
-/// (wide_split_chunks in conv2d_implicit_gemm.cpp), which is what makes a 1D
-/// call faster than the same values lifted by hand.
+/// implementation builds (pixel-major). Scheduling is the 2D kernel's, not this
+/// file's: a one-row output has no oh axis, so the 2D plan cuts the columns
+/// instead of the filter (wide_split_chunks in conv2d_implicit_gemm.cpp), which
+/// is what makes a 1D call faster than the same values lifted by hand.
 ///
-/// Both layouts run on the rank-3 view: NCW is channel-first with an OIHW
-/// filter, NWC channel-last with HWIO — the memory order only, the logical dims
-/// stay [N, C, L].
+/// The rank-3 view is NWC with an HWIO filter — the memory order only, the
+/// logical dims stay [N, C, L].
 ///
 /// The one thing that cannot be delegated: a depthwise geometry takes the 2D
 /// op's routing to the depthwise kernels, and this file bypasses the op.
@@ -36,14 +34,13 @@ bool is_fp(DataType dtype) noexcept
     return dtype == DataType::f32 || dtype == DataType::f16 || dtype == DataType::bf16;
 }
 
-/// The lifted filter is the 2D order, so this is Conv2D's predicate verbatim.
+/// The lifted filter is the 2D HWIO order, so this is Conv2D's predicate verbatim.
 bool is_depthwise_geometry(const Conv2DAttributes& attrs, const TensorView& w)
 {
-    if (attrs.groups <= 1) {
+    if (attrs.groups <= 1 || !is_channel_last_weight(w.layout())) {
         return false;
     }
-    const bool hwio = is_channel_last_weight(w.layout());
-    return w.shape(hwio ? 2 : 1) == 1 && w.shape(hwio ? 3 : 0) == attrs.groups;
+    return w.shape(2) == 1 && w.shape(3) == attrs.groups;
 }
 
 } // anonymous namespace

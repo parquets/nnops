@@ -1052,7 +1052,7 @@ Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
 
     // A_q's shape and parameters with no storage: the plan reads only the
     // description, and the target dtype picks the int8 geometry.
-    const TensorView aq_shape(a.shape_span(), attrs.act_quant_dtype, nullptr, TensorLayout::NCHW,
+    const TensorView aq_shape(a.shape_span(), attrs.act_quant_dtype, nullptr, TensorLayout::Dense,
                               a.quant_params());
     auto plan = get_matmul_plan(attrs, aq_shape.desc(), b.desc(), ctx.cpu.worker_count(),
                                 ctx.cpu.thread_slot_count() > 0);
@@ -1070,7 +1070,7 @@ Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
     }
 
     PoolPtr aq_buf(static_cast<size_t>(a.numel()));
-    TensorView aq(a.shape_span(), attrs.act_quant_dtype, aq_buf.get(), TensorLayout::NCHW,
+    TensorView aq(a.shape_span(), attrs.act_quant_dtype, aq_buf.get(), TensorLayout::Dense,
                   a.quant_params());
     quantize_activation<T>(a, aq, ctx);
 

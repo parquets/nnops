@@ -1,18 +1,15 @@
 /// @file bench_cuda_transpose_conv2d.cpp
-/// @brief CUDA TransposeConv2D throughput, channel-first and channel-last.
+/// @brief CUDA TransposeConv2D throughput, channel-last.
 ///
 /// The residue-class GEMM poses one stride-1 correlation per output class, with
 /// M the output pixels of that class, N the output channels per group and K the
 /// (IC/G)-times-taps reduction (the taps are the ones the class actually hits).
-/// Both memory orders run that kernel and the difference is the gather: a
-/// channel-first activation read per pixel, a channel-last one read per
-/// channel lane. The third table puts the two head to head on one geometry.
+/// The channel-last activation is read per channel lane.
 ///
 /// The layers are the ones a decoder runs — stride-2 4x4 / 3x3 upsamplers, a
 /// 2x2 pixel shuffle, stride-1 refinement passes — plus the awkward cases: a 5x5
-/// kernel, a grouped layer, a depthwise group (which is the channel-last 16 B
-/// lane, or the output-per-thread script in channel-first), a batch, and a
-/// dilated 3x3.
+/// kernel, a grouped layer, a depthwise group (the channel-last 16 B lane), a
+/// batch, and a dilated 3x3.
 ///
 /// GFLOPS is 2·N·OC·(IC/G)·IH·IW·KH·KW — the contributions, one full kernel per
 /// input pixel, the same count the CPU bench uses. Counting output taps instead
@@ -46,7 +43,6 @@ struct TConvBenchCase {
     int64_t oph = 0, opw = 0;
     int64_t groups = 1;
     DataType dtype = DataType::f32;
-    bool channel_last = false;
 
     int64_t oh() const { return (ih - 1) * sh - 2 * ph + dh * (kh - 1) + oph + 1; }
     int64_t ow() const { return (iw - 1) * sw - 2 * pw + dw * (kw - 1) + opw + 1; }
@@ -92,8 +88,7 @@ double measure(const TConvBenchCase& c)
     attrs.output_padding = {c.oph, c.opw};
     attrs.groups = c.groups;
 
-    const TensorLayout act_layout =
-        c.channel_last ? TensorLayout::NHWC : TensorLayout::NCHW;
+    const TensorLayout act_layout = TensorLayout::NHWC;
     const TensorLayout out_layout = act_layout;
 
     HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ic, c.ih, c.iw},
@@ -101,7 +96,7 @@ double measure(const TConvBenchCase& c)
     // The filter is [IC, OC/G, KH, KW] in both memory orders.
     HostTensor wgt = make_host_random(
         std::vector<int64_t>{c.ic, c.ocg(), c.kh, c.kw}, c.dtype, false, 29, -0.25f,
-        0.25f, TensorLayout::NCHW);
+        0.25f, TensorLayout::Dense);
     HostTensor out = make_host_zeroed(
         std::vector<int64_t>{c.n, c.oc, c.oh(), c.ow()}, c.dtype, false, out_layout);
 
@@ -119,8 +114,7 @@ double measure(const TConvBenchCase& c)
 double run_tconv(const TConvBenchCase& c, const char* label)
 {
     const double ms = measure(c);
-    print_cuda_row(label,
-                   tconv_geometry(c, c.channel_last ? "channel_last" : "channel_first"),
+    print_cuda_row(label, tconv_geometry(c, "channel_last"),
                    ms, cuda_gflops(ms, c.flops()));
     return cuda_gflops(ms, c.flops());
 }
@@ -160,52 +154,24 @@ std::vector<TConvBenchCase> decoder_layers()
     return v;
 }
 
-void run_table(DataType dt, bool channel_last, const char* label)
+void run_table(DataType dt, const char* label)
 {
     for (TConvBenchCase c : decoder_layers()) {
         c.dtype = dt;
-        c.channel_last = channel_last;
         run_tconv(c, label);
     }
 }
 
 }  // namespace
 
-NNOPS_BENCH(cuda_transpose_conv2d_channel_first) {
-    print_cuda_header("CUDA TransposeConv2D channel-first (f32)");
-    run_table(DataType::f32, false, "f32");
-}
-
 NNOPS_BENCH(cuda_transpose_conv2d_channel_last) {
     print_cuda_header("CUDA TransposeConv2D channel-last (f32)");
-    run_table(DataType::f32, true, "f32");
+    run_table(DataType::f32, "f32");
 }
 
 NNOPS_BENCH(cuda_transpose_conv2d_f16) {
     print_cuda_header("CUDA TransposeConv2D f16 (tensor core)");
-    run_table(DataType::f16, false, "f16 channel_first");
-    run_table(DataType::f16, true, "f16 channel_last");
-}
-
-NNOPS_BENCH(cuda_transpose_conv2d_layouts) {
-    print_cuda_header("CUDA TransposeConv2D layout A/B, same geometry (f32)");
-    // The channel-first arm is measured once before and once after each
-    // channel-last arm, so the repeat is the drift floor the ratio must clear.
-    for (TConvBenchCase c : decoder_layers()) {
-        TConvBenchCase last = c;
-        last.channel_last = true;
-
-        const double channel_first = measure(c);
-        const double last_ms = measure(last);
-        const double channel_first_again = measure(c);
-        const double floor = channel_first_again / channel_first;
-
-        const std::string geo = tconv_geometry(c, "");
-        std::printf("  %-52s channel_first %8.4f ms   channel_last %8.4f ms   "
-                    "channel_last/channel_first %.2f   drift %.3f\n",
-                    geo.c_str() + 1, channel_first, last_ms, last_ms / channel_first,
-                    floor);
-    }
+    run_table(DataType::f16, "f16 channel_last");
 }
 
 NNOPS_BENCH(cuda_transpose_conv2d_small) {
@@ -214,24 +180,19 @@ NNOPS_BENCH(cuda_transpose_conv2d_small) {
     // with stride 2 gives a 13x13 output and ~42 pixels per class — below the
     // 64-pixel tile, and four times over. And output_padding, which only grows
     // the destination.
-    for (bool last : {false, true}) {
-        const char* layout = last ? "channel_last" : "channel_first";
-        for (int64_t side : {7, 14}) {
-            TConvBenchCase c;
-            c.name = "s2 small";
-            c.ic = c.oc = 64;
-            c.ih = c.iw = side;
-            c.sh = c.sw = 2;
-            c.channel_last = last;
-            run_tconv(c, layout);
-        }
-        TConvBenchCase p;
-        p.name = "s2 outpad";
-        p.ic = p.oc = 64; p.ih = p.iw = 16; p.sh = p.sw = 2;
-        p.oph = p.opw = 1;
-        p.channel_last = last;
-        run_tconv(p, layout);
+    for (int64_t side : {7, 14}) {
+        TConvBenchCase c;
+        c.name = "s2 small";
+        c.ic = c.oc = 64;
+        c.ih = c.iw = side;
+        c.sh = c.sw = 2;
+        run_tconv(c, "channel_last");
     }
+    TConvBenchCase p;
+    p.name = "s2 outpad";
+    p.ic = p.oc = 64; p.ih = p.iw = 16; p.sh = p.sw = 2;
+    p.oph = p.opw = 1;
+    run_tconv(p, "channel_last");
 }
 
 #endif  // NNOPS_HAS_CUDA

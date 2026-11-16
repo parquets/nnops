@@ -8,10 +8,10 @@
 /// created instances of the same attributes agree.
 
 #include "nnops/ops/clamp.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "common/test_harness.hpp"
 #include "common/random_tensor.hpp"
 #include "common/test_helpers.hpp"
+#include "common/channel_last.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
 #include <vector>
@@ -194,17 +194,17 @@ NNOPS_TEST(clamp_channel_last_layout) {
     const int64_t N = 1, C = 16, H = 4, W = 4;
     auto [in_vec, input_channel_first] = test::make_random_tensor({N, C, H, W}, -10.0f, 10.0f, 444);
 
-    auto to_cl = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
-    const TensorDesc lc_in[] = {input_channel_first.desc()};
-    auto cl_desc = to_cl->getOutputTensorDesc(lc_in)[0];
+    const int64_t S = H * W;
+    std::vector<float> cl_in = test::to_channel_last(
+        std::span<const float>(input_channel_first.ptr<float>(),
+                               static_cast<size_t>(input_channel_first.numel())),
+        N, C, S);
+    TensorView input_cl(input_channel_first.shape_span(), DataType::f32, cl_in.data(),
+                        TensorLayout::NHWC);
 
-    std::vector<float> cl_in_buf(cl_desc.storage_bytes() / sizeof(float), 0.0f);
-    auto input_cl = test::make_packed(cl_desc, cl_in_buf.data());
-    const TensorView lc_inputs[] = {input_channel_first};
-    to_cl->compute(input_cl, lc_inputs);
-
-    std::vector<float> cl_out_buf(cl_desc.storage_bytes() / sizeof(float), 0.0f);
-    auto output_cl = test::make_packed(cl_desc, cl_out_buf.data());
+    std::vector<float> cl_out_buf(static_cast<size_t>(input_cl.numel()), 0.0f);
+    TensorView output_cl(input_channel_first.shape_span(), DataType::f32, cl_out_buf.data(),
+                         TensorLayout::NHWC);
 
     ClampAttributes attrs;
     attrs.min_val = -2.0f;
@@ -215,11 +215,9 @@ NNOPS_TEST(clamp_channel_last_layout) {
     op->compute(output_cl, ins);
 
     // Back to channel-first so the comparison is against logical order.
-    auto to_channel_first = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    std::vector<float> out_channel_first(static_cast<size_t>(input_channel_first.numel()), 0.0f);
-    TensorView output_channel_first(input_channel_first.shape_span(), DataType::f32, out_channel_first.data());
-    const TensorView back[] = {output_cl};
-    to_channel_first->compute(output_channel_first, back);
+    std::vector<float> out_channel_first = test::to_channel_first(
+        std::span<const float>(output_cl.ptr<float>(), static_cast<size_t>(output_cl.numel())),
+        N, C, S);
 
     for (size_t i = 0; i < in_vec.size(); ++i) {
         float expected = std::max(-2.0f, std::min(3.0f, in_vec[i]));

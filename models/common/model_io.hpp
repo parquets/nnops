@@ -119,7 +119,7 @@ struct Buf {
 /// hand one back produce, and a pitched activation would make the checkpoint
 /// comparison — which expects row-packed planes — fail on the pitch alone.
 ///
-/// @p qp rides the view: a prepacked *quantized* weight (PackedOIHW/PackedHWIO)
+/// @p qp rides the view: a prepacked *quantized* weight (PackedHWIO)
 /// is only half the operand — the kernel reads the per-channel scale and zero
 /// point off the tensor it is handed, and the raw filter's would otherwise be
 /// lost in the prepack.

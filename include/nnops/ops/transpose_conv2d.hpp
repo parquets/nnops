@@ -2,10 +2,9 @@
 /// @file transpose_conv2d.hpp
 /// @brief TransposeConv2D — transposed 2D convolution (deconvolution).
 ///
-/// The backward of a regular convolution. The image tensor is channel-first or
-/// channel-last
-/// (the output carries its layout); the weight is channel-first [IC, OC/G, KH, KW] in
-/// both cases; bias [OC] optional. Reference: ncnn Deconvolution.
+/// The backward of a regular convolution. The image tensor is channel-last
+/// (NHWC; the output carries its layout); the weight is [IC, OC/G, KH, KW];
+/// bias [OC] optional. Reference: ncnn Deconvolution.
 ///
 /// Data types: f32/f16 on every input and output (the floating-point route), or
 /// the quantized route — an s8 weight with per-channel QuantParams against a
@@ -119,7 +118,7 @@ public:
     OpType  getOpType()  const override { return OpType::TransposeConv2D; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOrChannelLast;
+        return LayoutSupport::ChannelLastOnly;
     }
 
     const TransposeConv2DAttributes& attributes() const noexcept { return attrs_; }

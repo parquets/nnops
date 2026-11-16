@@ -571,15 +571,9 @@ inline std::vector<TensorDesc> broadcast_binary_output_shape(
     out.rank   = static_cast<int64_t>(dims.size());
     out.dtype  = a.dtype;
     out.dims   = dims;
-    if (a.rank == out.rank) {
-        out.layout = a.layout;
-    } else if (is_channel_last(a.layout) && a.rank == out.rank - 1) {
-        // The extra leading axis belongs to B; prepending it to a channel-last
-        // number is the same as prepending it to a channel-first one.
-        out.layout = (out.rank == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
-    } else {
-        out.layout = (out.rank == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
-    }
+    // A rank-changing broadcast leaves a dense tensor: the extra axis is a new
+    // leading dim, not a channel position.
+    out.layout = (a.rank == out.rank) ? a.layout : TensorLayout::Dense;
     return {out};
 }
 
@@ -597,22 +591,6 @@ inline bool broadcast_compatible(std::span<const int64_t> a,
         if (da != db && da != 1 && db != 1) { return false; }
     }
     return true;
-}
-
-/// Same dims and dtype; only `layout` becomes target_layout.
-inline std::vector<TensorDesc> layout_convert_output_shape(
-    std::span<const TensorDesc> inputs,
-    TensorLayout target_layout)
-{
-    const auto& in = inputs[0];
-
-    TensorDesc out;
-    out.rank   = in.rank;
-    out.layout = target_layout;
-    out.dtype  = in.dtype;
-    out.dims   = in.dims;
-
-    return {out};
 }
 
 /// Axes reduced, dropped or kept as 1. Empty `axes` means all axes, unless
@@ -643,12 +621,10 @@ inline std::vector<TensorDesc> reduce_output_shape(
     out.layout = in.layout;
     out.dtype  = in.dtype;
 
-    // A channel-last tag describes where C sits among the *input's* axes; a
-    // rank-dropping reduce shifts them, so the result is tagged channel-first — the
-    // layout of a dense tensor whose logical order the kernel already writes.
+    // A rank-dropping reduce leaves a dense tensor: the kernel writes the
+    // reduced dims out in logical order, so the result carries no channel axis.
     if (!keepdims && is_channel_last(in.layout)) {
-        out.layout = (in.layout == TensorLayout::NDHWC)
-            ? TensorLayout::NCDHW : TensorLayout::NCHW;
+        out.layout = TensorLayout::Dense;
     }
 
     if (keepdims) {

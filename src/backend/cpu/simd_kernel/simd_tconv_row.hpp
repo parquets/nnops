@@ -4,9 +4,9 @@
 ///        contiguous run added, added as int32, FMA'd or filled, a vector at a
 ///        time.
 ///
-/// Every route of the operator — channel-first, channel-last, depthwise, 2-D or
-/// 3-D, fp or int8 — reduces to "add this tap's run into that row", so these are
-/// the leaves of all of them. The walks that produce the runs are
+/// Every route of the operator — pixel, col, depthwise, 2-D or 3-D, fp or int8
+/// — reduces to "add this tap's run into that row", so these are the leaves of
+/// all of them. The walks that produce the runs are
 /// simd_col2im.hpp; the merge that ends a channel-last row is route glue and
 /// lives in conv/tconv_cl.h.
 
@@ -42,22 +42,6 @@ template <typename T> void row_fma(T* dst, const T* src, const T* w, int64_t n)
     }
     for (; i < n; ++i) {
         s_store(dst + i, s_load(dst + i) + s_load(src + i) * s_load(w + i));
-    }
-}
-
-/// row[0, n) += src[0, n) · w, one weight over the whole run. The channel-first
-/// depthwise shape: its vectors run over pixels, so a tap's weight is a scalar.
-template <typename T> void row_fma_scalar(T* dst, const T* src, float w, int64_t n)
-{
-    constexpr int L = simd_lane_for<T>;
-    const T* tag = nullptr;
-    const auto wv = v_set1(tag, w);
-    int64_t i = 0;
-    for (; i + L <= n; i += L) {
-        v_store(dst + i, v_fmadd(v_load(src + i), wv, v_load(dst + i)));
-    }
-    for (; i < n; ++i) {
-        s_store(dst + i, s_load(dst + i) + s_load(src + i) * w);
     }
 }
 

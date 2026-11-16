@@ -107,7 +107,7 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk, const ComputeContex
     const int64_t bshape[] = {c.icg, m};
     TensorView bm(std::span<const int64_t>(bshape, 2), c.vdt,
                   c.direct_w ? const_cast<T*>(c.w + (g * c.icg * c.ocg + oc0) * c.karea) : c.aux,
-                  (c.direct_w ? c.ocg * c.karea : m) * sizeof(T), TensorLayout::NCHW);
+                  (c.direct_w ? c.ocg * c.karea : m) * sizeof(T), TensorLayout::Dense);
 
     for (int64_t n = 0; n < c.gm.N; ++n) {
         const T* in_n = c.in + n * c.in_n_stride;
@@ -117,10 +117,10 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk, const ComputeContex
         // IC, so the group offset is g·IC/G elements in.
         const int64_t ashape[] = {c.npix, c.icg};
         TensorView am(std::span<const int64_t>(ashape, 2), c.vdt, const_cast<T*>(in_n + g * c.icg),
-                      static_cast<int64_t>(c.gm.IC * sizeof(T)), TensorLayout::NCHW);
+                      static_cast<int64_t>(c.gm.IC * sizeof(T)), TensorLayout::Dense);
         const int64_t cshape[] = {c.npix, m};
         TensorView cm(std::span<const int64_t>(cshape, 2), c.vdt, c.col,
-                      static_cast<int64_t>(m * sizeof(T)), TensorLayout::NCHW);
+                      static_cast<int64_t>(m * sizeof(T)), TensorLayout::Dense);
 
         const TensorView mins[] = {am, bm};
         const MatMulAttributes mm{};

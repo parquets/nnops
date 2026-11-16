@@ -32,8 +32,8 @@ Status Slice::validate(std::span<const TensorDesc> inputs,
         out.dtype != in.dtype) {
         return Status::invalid_argument;
     }
-    if (!is_layout_supported(in.layout, LayoutSupport::ChannelFirstOnly) ||
-        !is_layout_supported(out.layout, LayoutSupport::ChannelFirstOnly)) {
+    if (!is_layout_supported(in.layout, LayoutSupport::Any) ||
+        !is_layout_supported(out.layout, LayoutSupport::Any)) {
         return Status::invalid_argument;
     }
 

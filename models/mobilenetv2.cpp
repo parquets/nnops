@@ -14,12 +14,11 @@
 /// The depthwise stage is DepthwiseConv on the exported weight as it is
 /// ([C, 1, 3, 3]): channel-first input takes the raw filter, no prepack.
 ///
-/// NNOPS_MODEL_LAYOUT=channel_last runs the same graph with every activation
-/// channel-last (see net_ops.hpp): the 1x1s and the stem read HWIO filters, the
-/// depthwise stages HWCM [KH, KW, C], the global pool its channel-last route,
-/// and each checkpoint is reordered back to channel-first before it is compared. Only
-/// the BN fold is mandatory there — the Norm operator is channel-first — which the
-/// fused path does anyway.
+/// The graph runs channel-last (see net_ops.hpp): the 1x1s and the stem read
+/// HWIO filters, the depthwise stages HWCM [KH, KW, C], the global pool its
+/// channel-last route, and each checkpoint is reordered back to channel-first
+/// before it is compared. The BN fold is mandatory — the Norm operator is
+/// channel-first — and the fused path does it.
 ///
 /// Usage:  model_mobilenetv2 [artifact-dir] [--atol X] [--rtol Y]
 /// Exit:   0 all checkpoints pass, 1 a checkpoint failed, 77 no artifact
@@ -202,26 +201,21 @@ int main(int argc, char** argv)
         return 77;
     }
 
-    const bool channel_last = model::channel_last();
-    if (channel_last && !model::fuse_enabled()) {
-        // The Norm operator reads channel-first tensors, so a channel-last graph has
-        // to fold the BN into the conv — which is what fusion already does.
+    if (!model::fuse_enabled()) {
+        // The Norm operator reads channel-first tensors, so the channel-last
+        // graph has to fold the BN into the conv — which fusion does.
         std::fprintf(stderr,
-                     "mobilenetv2: NNOPS_MODEL_LAYOUT=channel_last needs the BN fold "
+                     "mobilenetv2: the channel-last graph needs the BN fold "
                      "(unset NNOPS_MODEL_FUSE)\n");
         return 2;
     }
     Buf cl_input;
     TensorView input = artifact.at("input");
-    if (channel_last) {
-        cl_input = model::to_channel_last(input);
-        input = cl_input.view;
-    }
+    cl_input = model::to_channel_last(input);
+    input = cl_input.view;
 
-    std::printf("mobilenetv2: %zu tensors from %s (conv+bn+relu6 %s, %s)\n",
-                artifact.count(), dir.c_str(),
-                model::fuse_enabled() ? "folded" : "unfused",
-                channel_last ? "channel_last" : "channel_first");
+    std::printf("mobilenetv2: %zu tensors from %s (conv+bn+relu6 folded, channel_last)\n",
+                artifact.count(), dir.c_str());
     // The untimed pass is the model-load step: it prepacks any Winograd weights
     // (and first-touches every buffer) and it is the pass that checks every
     // checkpoint, so the number below is the steady state with no comparison in

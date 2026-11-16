@@ -28,7 +28,7 @@ Status check_repeat_dtype(Backend be, const TensorDesc& in)
                           DataType::s64>(be, in.dtype)) {
         return Status::unsupported;
     }
-    return detail::require(is_layout_supported(in.layout, LayoutSupport::ChannelFirstOnly));
+    return detail::require(is_layout_supported(in.layout, LayoutSupport::Any));
 }
 
 } // anonymous namespace

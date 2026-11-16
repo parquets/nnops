@@ -126,7 +126,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::Linear; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::Any; }
 
     const LinearAttributes& attributes() const noexcept { return attrs_; }
 

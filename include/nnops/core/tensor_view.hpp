@@ -14,10 +14,12 @@
 ///  - channel-last keeps C inside the row, so a row is one
 ///    spatial line: W pixels × C channels.
 ///
-/// TensorDesc::row_pitch() aligns rows to 32 bytes by default; a TensorView
-/// built with an explicit pitch accepts any value >= the minimum.
-///   Channel-first uint8,  W=70:  pitch = 96  (70 rounded up to a multiple of 32)
-///   Channel-last uint8, W*C=56: pitch = 64  (56 rounded up to a multiple of 32)
+/// The default layout is Dense: the logical dims are the memory order, with no
+/// channel-axis semantics. TensorDesc::row_pitch() aligns rows to 32 bytes by
+/// default; a TensorView built with an explicit pitch accepts any value >= the
+/// minimum.
+///   Dense uint8,        W=70:    pitch = 96  (70 rounded up to a multiple of 32)
+///   Channel-last uint8, W*C=56:  pitch = 64  (56 rounded up to a multiple of 32)
 
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/tensor_layout.hpp"
@@ -39,7 +41,7 @@ struct TensorDesc {
     detail::SmallVector<int64_t, kMaxRank> dims;
     int64_t rank = 0;
     DataType dtype = DataType::f32;
-    TensorLayout layout = TensorLayout::NCHW;
+    TensorLayout layout = TensorLayout::Dense;
 
     /// Row stride in units of data_type_stride_unit(); 0 = unknown, which
     /// consumers must treat as compact.
@@ -115,7 +117,7 @@ public:
 
     /// Dense (contiguous) view: pitch is one row's bytes, no padding.
     TensorView(std::span<const int64_t> shape, DataType dtype,
-               void* data, TensorLayout layout = TensorLayout::NCHW,
+               void* data, TensorLayout layout = TensorLayout::Dense,
                QuantParams qp = {})
         : dtype_(dtype), layout_(layout), data_(data), quant_params_(qp)
     {
@@ -137,7 +139,7 @@ public:
     /// View over padded/aligned data: `pitch` (bytes) may exceed the dense row size.
     TensorView(std::span<const int64_t> shape, DataType dtype,
                void* data, int64_t pitch,
-               TensorLayout layout = TensorLayout::NCHW,
+               TensorLayout layout = TensorLayout::Dense,
                QuantParams qp = {})
         : dtype_(dtype), layout_(layout), data_(data), pitch_(pitch), quant_params_(qp)
     {
@@ -335,7 +337,7 @@ private:
     void* data_ = nullptr;
     int64_t pitch_ = 0;  // row pitch in bytes
     DataType dtype_ = DataType::f32;
-    TensorLayout layout_ = TensorLayout::NCHW;
+    TensorLayout layout_ = TensorLayout::Dense;
     QuantParams quant_params_;  // scale / zero_point / granularity
     int64_t rank_ = 0;
 };

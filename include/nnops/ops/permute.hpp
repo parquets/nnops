@@ -4,7 +4,7 @@
 ///
 /// Equivalent to `np.transpose()` / `torch.permute()`, with
 /// output.shape[i] = input.shape[perm[i]]. Channel-first layout only; packed layouts
-/// must go through LayoutConvert first.
+/// must be dense.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -48,7 +48,7 @@ public:
     Backend getBackend() const override { return backend_; }
 
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::DenseOnly;
     }
 
     const PermuteAttributes& attributes() const noexcept { return attrs_; }

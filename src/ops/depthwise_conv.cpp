@@ -40,24 +40,14 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
     if (attrs_.add_to && attrs_.residual_pre_activation && backend_ != Backend::CPU) {
         return Status::unsupported;
     }
-    if (is_channel_last(in.layout)) {
-        // The channel lane loads a tap's channels as one vector, which the channel-first
-        // [C, 1, KH, KW] cannot give it (a tap's channels are C elements apart).
-        if (inputs[1].layout != TensorLayout::HWCM) {
-            return Status::unsupported;
-        }
-        return detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8>(backend_,
-                                                                                       in.dtype));
-    }
-    // Channel-first reads the raw [C, 1, KH, KW] filter one channel plane at a time,
-    // f32/f16 only.
-    if (!is_channel_first_spatial(in.layout)) {
+    // The channel lane loads a tap's channels as one vector, so the filter must
+    // be the per-tap HWCM order.
+    if (!is_channel_last(in.layout) || inputs[1].layout != TensorLayout::HWCM) {
         return Status::unsupported;
     }
-    return detail::require(detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) &&
-                               is_channel_first_spatial(inputs[1].layout),
-                           Status::unsupported);
+    return detail::require(
+        detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8>(backend_,
+                                                                                   in.dtype));
 }
 
 Status DepthwiseConv::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

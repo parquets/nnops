@@ -776,7 +776,7 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     if (output.numel() == 0) {
         return Status::ok;
     }
-    if (!is_channel_first_spatial(wgt.layout())) {
+    if (wgt.rank() != 4) {
         return Status::unsupported;
     }
     const bool last = is_channel_last(act.layout());
@@ -880,7 +880,7 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
                 launch_tconv_gemm_f<false>(p, m_max, stream);
             }
         }
-    } else if (tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last, dt, stream)) {
+    } else if (tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, dt, stream)) {
         // launched by the depthwise route
     } else if (plane_ok) {
         if (dt == DataType::bf16) {

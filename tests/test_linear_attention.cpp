@@ -108,12 +108,12 @@ using nnops::test::XorShift128;
 
 inline TensorView f32_view(std::vector<float>& buf, const std::vector<int64_t>& shape) {
     return TensorView(std::span<const int64_t>(shape.data(), shape.size()),
-                      DataType::f32, buf.data(), TensorLayout::NCHW);
+                      DataType::f32, buf.data(), TensorLayout::Dense);
 }
 
 inline TensorView f16_view(std::vector<half>& buf, const std::vector<int64_t>& shape) {
     return TensorView(std::span<const int64_t>(shape.data(), shape.size()),
-                      DataType::f16, buf.data(), TensorLayout::NCHW);
+                      DataType::f16, buf.data(), TensorLayout::Dense);
 }
 
 /// Attributes, input buffers and initial state for one problem; shapes derive
@@ -303,14 +303,14 @@ NNOPS_TEST(linear_attention_shape_inference) {
     q_desc.rank = 4;
     q_desc.dims = {1, 4, 1, 64};
     q_desc.dtype = DataType::f32;
-    q_desc.layout = TensorLayout::NCHW;
+    q_desc.layout = TensorLayout::Dense;
 
     // K: [B=1, H_kv=2, S=1, D=64]
     TensorDesc k_desc;
     k_desc.rank = 4;
     k_desc.dims = {1, 2, 1, 64};
     k_desc.dtype = DataType::f32;
-    k_desc.layout = TensorLayout::NCHW;
+    k_desc.layout = TensorLayout::Dense;
 
     // V: same as K
     TensorDesc v_desc = k_desc;
@@ -519,19 +519,19 @@ NNOPS_TEST(linear_attention_incremental_decode_matches_full_sequence) {
 
         // Narrow views onto token t of each input, and into row t of the output.
         TensorView q(std::span<const int64_t>(sh_q1.data(), sh_q1.size()),
-                     DataType::f32, p.q.data() + t * D, TensorLayout::NCHW);
+                     DataType::f32, p.q.data() + t * D, TensorLayout::Dense);
         TensorView k(std::span<const int64_t>(sh_kv1.data(), sh_kv1.size()),
-                     DataType::f32, p.k.data() + t * D, TensorLayout::NCHW);
+                     DataType::f32, p.k.data() + t * D, TensorLayout::Dense);
         TensorView v(std::span<const int64_t>(sh_kv1.data(), sh_kv1.size()),
-                     DataType::f32, p.v.data() + t * D, TensorLayout::NCHW);
+                     DataType::f32, p.v.data() + t * D, TensorLayout::Dense);
         TensorView g(std::span<const int64_t>(sh_kv1.data(), sh_kv1.size()),
-                     DataType::f32, p.gate.data() + t * D, TensorLayout::NCHW);
+                     DataType::f32, p.gate.data() + t * D, TensorLayout::Dense);
         TensorView b(std::span<const int64_t>(sh_bt1.data(), sh_bt1.size()),
-                     DataType::f32, p.beta.data() + t, TensorLayout::NCHW);
+                     DataType::f32, p.beta.data() + t, TensorLayout::Dense);
         TensorView o(std::span<const int64_t>(sh_q1.data(), sh_q1.size()),
-                     DataType::f32, got_out.data() + t * D, TensorLayout::NCHW);
+                     DataType::f32, got_out.data() + t * D, TensorLayout::Dense);
         TensorView st(std::span<const int64_t>(sh_st.data(), sh_st.size()),
-                      DataType::f32, state.data(), TensorLayout::NCHW);
+                      DataType::f32, state.data(), TensorLayout::Dense);
 
         std::vector<TensorView> outputs = {o, st};
         // Empty conv_w slot: this problem has beta but no conv, and the slots
@@ -887,7 +887,7 @@ static TensorDesc td(std::initializer_list<int64_t> dims) {
     d.rank = static_cast<int64_t>(dims.size());
     for (int64_t v : dims) { d.dims.push_back(v); }
     d.dtype  = DataType::f32;
-    d.layout = TensorLayout::NCHW;
+    d.layout = TensorLayout::Dense;
     return d;
 }
 

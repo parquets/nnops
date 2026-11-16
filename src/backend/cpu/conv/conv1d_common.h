@@ -37,28 +37,17 @@ inline TensorView lift_wide(const TensorView& v)
                       v.layout(), v.quant_params());
 }
 
-/// A conv filter (rank 3) → its 2D order: OIHW [OC, IC/G, K] → [OC, IC/G, 1, K],
+/// A channel-last conv filter (rank 3) → its 2D order:
 /// HWIO [K, IC/G, OC] → [1, K, IC/G, OC].
 ///
-/// An OIHW filter's row is its last axis, so the caller's pitch carries over.
-/// An HWIO one's rank-3 row is IC/G·OC, which is not its rank-4 row (K·OC), so
-/// the lifted view is built dense — a filter is addressed by its dims anyway,
-/// never by its pitch.
+/// The rank-3 row is IC/G·OC, which is not the rank-4 row (K·OC), so the lifted
+/// view is built dense — a filter is addressed by its dims anyway, never by its
+/// pitch.
 inline TensorView lift_filter_wide(const TensorView& w)
 {
-    const bool hwio = is_channel_last_weight(w.layout());
-    const int64_t s[4] = {
-        hwio ? 1 : w.shape(0),
-        w.shape(hwio ? 0 : 1),
-        hwio ? w.shape(1) : 1,
-        w.shape(2),
-    };
-    if (hwio) {
-        return TensorView(std::span<const int64_t>(s, 4), w.data_type(), view_data(w), w.layout(),
-                          w.quant_params());
-    }
-    return TensorView(std::span<const int64_t>(s, 4), w.data_type(), view_data(w), w.pitch(),
-                      w.layout(), w.quant_params());
+    const int64_t s[4] = {1, w.shape(0), w.shape(1), w.shape(2)};
+    return TensorView(std::span<const int64_t>(s, 4), w.data_type(), view_data(w), w.layout(),
+                      w.quant_params());
 }
 
 } // namespace nnops::backend::cpu

@@ -58,7 +58,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::TopK; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::Any; }
 
     const TopKAttributes& attributes() const noexcept { return attrs_; }
 

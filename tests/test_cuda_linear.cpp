@@ -269,7 +269,7 @@ NNOPS_TEST(cuda_linear_i8) {
         const auto view = [](const std::vector<int64_t>& sh, DataType dt,
                              void* d, const QuantParams& qp = {}) {
             return TensorView(std::span<const int64_t>(sh.data(), sh.size()), dt,
-                              d, TensorLayout::NCHW, qp);
+                              d, TensorLayout::Dense, qp);
         };
 
         TensorView xv = view(xshape, adt, x.data(), qx);

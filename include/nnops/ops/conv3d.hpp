@@ -1,10 +1,10 @@
 #pragma once
 /// @file conv3d.hpp
-/// @brief 3D convolution, channel-first (NCDHW) or channel-last (NDHWC).
+/// @brief 3D convolution, channel-last (NDHWC).
 ///
-/// Input [N, IC, ID, IH, IW], weight [OC, IC/G, KD, KH, KW] (ONNX-style, also
-/// when grouped), output [N, OC, OD, OH, OW], optional bias [OC]. Grouped and
-/// dilated; channel-first layouts only.
+/// Input [N, IC, ID, IH, IW] stored NDHWC, weight [OC, IC/G, KD, KH, KW]
+/// (ONNX-style, also when grouped), output [N, OC, OD, OH, OW] stored NDHWC,
+/// optional bias [OC]. Grouped and dilated; channel-last only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -64,7 +64,10 @@ public:
 
     OpType  getOpType()  const override { return OpType::Conv3D; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override
+    {
+        return LayoutSupport::ChannelLastOnly;
+    }
 
     const Conv3DAttributes& attributes() const noexcept { return attrs_; }
 

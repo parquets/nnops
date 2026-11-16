@@ -179,7 +179,7 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs, std::span<Ten
     const float scale =
         attrs.scale != 0.0f ? attrs.scale : 1.0f / std::sqrt(static_cast<float>(Dk));
 
-    // Element strides (channel-first; the trailing dim is contiguous).
+    // Element strides (dense; the trailing dim is contiguous).
     const int64_t qs0 = Q.stride_elems(0), qs1 = Q.stride_elems(1), qs2 = Q.stride_elems(2);
     const int64_t ks0 = K.stride_elems(0), ks1 = K.stride_elems(1), ks2 = K.stride_elems(2);
     const int64_t vs0 = V.stride_elems(0), vs1 = V.stride_elems(1), vs2 = V.stride_elems(2);

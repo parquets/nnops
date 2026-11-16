@@ -2,19 +2,20 @@
 /// @file tensor_layout.hpp
 /// @brief TensorLayout enum for describing data arrangement in memory.
 ///
-/// Two activation families, named by where the channel axis sits:
-///   NCHW / NCDHW  — channel-first 2D / 3D
-///   NHWC / NDHWC  — channel-last 2D / 3D
+/// Activations are channel-last (NHWC/NDHWC) or dense (Dense). Channel-last
+/// keeps the logical [N, C, ...] dims in the descriptor; only the physical
+/// order changes, so the "row" of the pitch model is one spatial line — (n, h)
+/// over all W pixels and all C channels — and the channel axis is contiguous.
+/// A [W][C] row is one contiguous block, with pitch =
+/// align_up(W * C * elem_size, 32) (see TensorDesc::row_pitch()); a TensorView
+/// built with an explicit pitch may use any larger value.
 ///
-/// Channel-last keeps the logical [N, C, ...] dims in the descriptor exactly as
-/// channel-first does; only the physical order changes, so the "row" of the pitch model
-/// is one spatial line — (n, h) over all W pixels and all C channels — and the
-/// channel axis is contiguous. A [W][C] row is one contiguous block, with
-/// pitch = align_up(W * C * elem_size, 32) (see TensorDesc::row_pitch()); a
-/// TensorView built with an explicit pitch may use any larger value.
+/// Dense is plain row-major by the logical dims, with no channel-axis claim:
+/// it is the default for layout-agnostic operators, GEMM operands, scratch and
+/// artifact buffers.
 ///
-/// The packed weight tags at the end describe filter blobs produced by
-/// prepackWeights, never activations.
+/// The packed weight tags describe filter blobs produced by prepackWeights,
+/// never activations.
 
 #include <cstdint>
 
@@ -22,28 +23,17 @@ namespace nnops {
 
 /// Memory layout of tensor data.
 enum class TensorLayout : uint8_t {
-    // ---- channel-first, 2D ----
-    NCHW      = 0,  ///< [N, C, H, W]
-
-    // ---- channel-first, 3D ----
-    NCDHW     = 1,  ///< [N, C, D, H, W]
-
     // ---- channel-last, 2D / 3D ----
     NHWC      = 2,  ///< logical [N, C, H, W], stored [N, H, W, C]
     NDHWC     = 3,  ///< logical [N, C, D, H, W], stored [N, D, H, W, C]
-
-    // ---- Winograd-transformed weight ----
-    PackedWinoWeight = 4,  ///< [16, OC, IC/G] — F(2,3) Winograd U for a
-                           ///< channel-first activation, one transform-domain
-                           ///< kernel per p ∈ [0,16).
 
     // ---- Channel-last conv weight ----
     HWIO      = 5,  ///< [KH][KW][IC/G][OC] — TF filter order for channel-last
                     ///< activations: the shape *is* H×W×I×O, OC contiguous.
 
     // ---- Winograd-transformed weight, channel-last ----
-    PackedWinoWeightLast = 6,  ///< the same U for a channel-last activation, as
-                               ///< the GEMM's B panels [16][⌈IC/G ÷ KC⌉][G·⌈OC/G ÷ nr⌉][ldd],
+    PackedWinoWeightLast = 6,  ///< the U for a channel-last activation, as the
+                               ///< GEMM's B panels [16][⌈IC/G ÷ KC⌉][G·⌈OC/G ÷ nr⌉][ldd],
                                ///< each [KC][nr] k-major, OC zero-padded to panels;
                                ///< KC divides IC/G, nr is the arch's panel width.
                                ///< Opaque outside the Winograd kernel.
@@ -54,20 +44,12 @@ enum class TensorLayout : uint8_t {
 
     // ---- Prepacked conv weight (Conv2D::prepackWeights, im2col route) ----
     //
-    // The tags name which route's operand a blob holds; the two routes swap their
-    // GEMM's operands, so they pack along different axes:
-    //   PackedOIHW — channel-first (OIHW) filter, channel-first activation: the
-    //                filter is the A operand (fp: [OC][IC/G·KH·KW] copy, quant:
-    //                packed-A panels).
-    //   PackedHWIO — channel-last (HWIO) filter, channel-last activation: the
-    //                filter is the B operand (one k-major panel of nr OC per k block).
-    //
-    // Both are opaque outside the im2col kernel: the descriptor's shape is
-    // [OC, ⌈elements / OC⌉] so shape inference still reads the output-channel
-    // count; panel geometry is resolved from the attributes and the filter's
-    // dims, never indexed by hand.
-    PackedOIHW = 8,   ///< channel-first activation's prepacked filter (see above)
-    PackedHWIO = 9,   ///< channel-last activation's prepacked filter (see above)
+    // PackedHWIO — channel-last (HWIO) filter: the filter is the B operand (one
+    // k-major panel of nr OC per k block). Opaque outside the im2col kernel: the
+    // descriptor's shape is [OC, ⌈elements / OC⌉] so shape inference still reads
+    // the output-channel count; panel geometry is resolved from the attributes
+    // and the filter's dims, never indexed by hand.
+    PackedHWIO = 9,
 
     // ---- Prepacked matmul RHS (MatMul / Linear ::prepackWeights) ----
     //
@@ -91,16 +73,21 @@ enum class TensorLayout : uint8_t {
     // leads with its own header, so a compute() handed one reads it in place
     // instead of running the interleave and the two pack passes.
     PackedRecurrent = 11,
+
+    // ---- dense row-major, no channel-axis semantics ----
+    //
+    // The logical dims are the memory order: dim rank-1 is contiguous, and the
+    // second-innermost step is the row pitch. There is no claim about which
+    // axis is the channel, so a kernel that only walks rows or applies an axis
+    // attribute treats this like any dense tensor. It is the default for
+    // layout-agnostic and flat tensors (GEMM operands, norm/resize scratch,
+    // artifact buffers, reference data).
+    Dense = 12,
 };
 
 /// True for the channel-last layouts, NHWC and NDHWC.
 constexpr bool is_channel_last(TensorLayout layout) noexcept {
     return layout == TensorLayout::NHWC || layout == TensorLayout::NDHWC;
-}
-
-/// True for the channel-first layouts, NCHW and NCDHW.
-constexpr bool is_channel_first_spatial(TensorLayout layout) noexcept {
-    return layout == TensorLayout::NCHW || layout == TensorLayout::NCDHW;
 }
 
 /// True for HWIO, the channel-last conv weight order.
@@ -113,17 +100,14 @@ constexpr bool is_depthwise_weight_last(TensorLayout layout) noexcept {
     return layout == TensorLayout::HWCM;
 }
 
-/// True for either Winograd weight form; the two pair with the
-/// channel-first and channel-last activations.
+/// True for the Winograd U weight form; opaque outside its kernel.
 constexpr bool is_wino_weight(TensorLayout layout) noexcept {
-    return layout == TensorLayout::PackedWinoWeight ||
-           layout == TensorLayout::PackedWinoWeightLast;
+    return layout == TensorLayout::PackedWinoWeightLast;
 }
 
-/// True for either prepacked im2col conv filter; opaque blobs.
+/// True for the prepacked im2col conv filter; an opaque blob.
 constexpr bool is_packed_conv_weight(TensorLayout layout) noexcept {
-    return layout == TensorLayout::PackedOIHW ||
-           layout == TensorLayout::PackedHWIO;
+    return layout == TensorLayout::PackedHWIO;
 }
 
 /// True for the prepacked matmul RHS; opaque, addressed by matmul_packed_b_geom.
@@ -136,23 +120,9 @@ constexpr bool is_packed_recurrent(TensorLayout layout) noexcept {
     return layout == TensorLayout::PackedRecurrent;
 }
 
-/// True for any layout a conv-family filter may carry: a raw channel-first
-/// or channel-last filter, or one of the prepacked blobs.
-constexpr bool is_conv_filter_layout(TensorLayout layout) noexcept {
-    return is_channel_first_spatial(layout) || is_channel_last(layout) ||
-           is_channel_last_weight(layout) || is_packed_conv_weight(layout) ||
-           is_wino_weight(layout);
-}
-
-/// Spatial rank encoded in the layout: the 2D names → 2, the 3D ones → 3.
+/// Spatial rank encoded in the layout: NDHWC → 3, everything else → 2.
 constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
-    switch (layout) {
-    case TensorLayout::NCDHW:
-    case TensorLayout::NDHWC:
-        return 3;
-    default:
-        return 2;
-    }
+    return layout == TensorLayout::NDHWC ? 3 : 2;
 }
 
 // ============================================================
@@ -161,25 +131,25 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
 
 /// Categories of layout support for an operator.
 ///
-///   ChannelFirstOnly           — channel-first activations (plus weight tags)
-///   Any                        — either family, pitch-aware
-///   ChannelFirstOrChannelLast  — both activation families (same as Any today;
-///                              kept so an op can declare its spatial fast path)
+///   ChannelLastOnly  — channel-last activations (plus weight tags)
+///   DenseOnly        — dense row-major only
+///   Any              — layout-agnostic: the data is walked as flat rows, so
+///                      neither family is interpreted
 enum class LayoutSupport : uint8_t {
-    ChannelFirstOnly,           ///< NCHW/NCDHW only; channel-last and weights rejected
-    Any,                        ///< every layout (pitch-aware processing)
-    ChannelFirstOrChannelLast,  ///< NCHW/NCDHW/NHWC/NDHWC
+    ChannelLastOnly,  ///< NHWC/NDHWC only; other layouts and weight tags rejected
+    DenseOnly,        ///< Dense only: the logical order is the memory order
+    Any,              ///< every layout (layout-agnostic, pitch-aware processing)
 };
 
 /// True when @p layout satisfies the @p support constraint.
 inline bool is_layout_supported(TensorLayout layout, LayoutSupport support) noexcept {
     switch (support) {
-    case LayoutSupport::ChannelFirstOnly:
-        return is_channel_first_spatial(layout);
+    case LayoutSupport::ChannelLastOnly:
+        return is_channel_last(layout);
+    case LayoutSupport::DenseOnly:
+        return layout == TensorLayout::Dense;
     case LayoutSupport::Any:
         return true;
-    case LayoutSupport::ChannelFirstOrChannelLast:
-        return is_channel_first_spatial(layout) || is_channel_last(layout);
     }
     return false;
 }

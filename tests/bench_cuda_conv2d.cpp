@@ -1,14 +1,9 @@
 /// @file bench_cuda_conv2d.cpp
-/// @brief CUDA Conv2D throughput, channel-first and channel-last.
+/// @brief CUDA Conv2D throughput, channel-last.
 ///
-/// Both memory orders run the same implicit-GEMM kernel: M is the output
-/// pixels, N is the output channels per group, K is IC/G·KH·KW, and the only
-/// difference is where each operand comes from — a gathered channel-first activation
-/// against a coalesced channel-last row, and an OIHW filter read k-major
-/// against an HWIO filter read n-major. So the two tables answer which layout
-/// the gather is cheaper in for a given layer, and the third section puts them
-/// head to head on the same geometry so the answer is a ratio, not two numbers
-/// taken minutes apart.
+/// M is the output pixels, N is the output channels per group, K is
+/// IC/G·KH·KW. The channel-last route reads a coalesced activation row and an
+/// HWIO filter n-major.
 ///
 /// The layers are the ones a CNN actually runs: a 7x7 stride-2 stem, the 3x3
 /// stack of a ResNet stage, the 1x1 expansions and projections of a MobileNet
@@ -46,7 +41,6 @@ struct ConvBenchCase {
     int64_t ph = 1, pw = 1;
     int64_t groups = 1;
     DataType dtype = DataType::f32;
-    bool channel_last = false;
 
     int64_t oh() const { return (ih + 2 * ph - dh * (kh - 1) - 1) / sh + 1; }
     int64_t ow() const { return (iw + 2 * pw - dw * (kw - 1) - 1) / sw + 1; }
@@ -92,16 +86,13 @@ double measure(const ConvBenchCase& c)
     attrs.padding = {c.ph, c.pw};
     attrs.groups = c.groups;
 
-    const TensorLayout act_layout =
-        c.channel_last ? TensorLayout::NHWC : TensorLayout::NCHW;
-    const TensorLayout wgt_layout =
-        c.channel_last ? TensorLayout::HWIO : TensorLayout::NCHW;
+    const TensorLayout act_layout = TensorLayout::NHWC;
+    const TensorLayout wgt_layout = TensorLayout::HWIO;
 
     HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ic, c.ih, c.iw}, c.dtype, false, 23,
                                       -0.5f, 0.5f, act_layout);
     HostTensor wgt = make_host_random(
-        c.channel_last ? std::vector<int64_t>{c.kh, c.kw, c.icg(), c.oc}
-                       : std::vector<int64_t>{c.oc, c.icg(), c.kh, c.kw},
+        std::vector<int64_t>{c.kh, c.kw, c.icg(), c.oc},
         c.dtype, false, 29, -0.25f, 0.25f, wgt_layout);
     HostTensor out =
         make_host_zeroed(std::vector<int64_t>{c.n, c.oc, c.oh(), c.ow()}, c.dtype,
@@ -122,7 +113,7 @@ double measure(const ConvBenchCase& c)
 double run_conv(const ConvBenchCase& c, const char* label)
 {
     const double ms = measure(c);
-    print_cuda_row(label, conv_geometry(c, c.channel_last ? "channel_last" : "channel_first"), ms,
+    print_cuda_row(label, conv_geometry(c, "channel_last"), ms,
                    cuda_gflops(ms, c.flops()));
     return cuda_gflops(ms, c.flops());
 }
@@ -191,7 +182,6 @@ double run_conv_i8(const ConvBenchCase& c, const char* label)
     attrs.groups = c.groups;
     attrs.output_dtype = DataType::s8;
 
-    const bool last = c.channel_last;
     const int64_t icg = c.icg();
     test::XorShift128 rng(23);
 
@@ -227,12 +217,10 @@ double run_conv_i8(const ConvBenchCase& c, const char* label)
         return TensorView(std::span<const int64_t>(sh.data(), sh.size()), dt, d,
                           lay, qp);
     };
-    const TensorLayout alay = last ? TensorLayout::NHWC : TensorLayout::NCHW;
-    const TensorLayout wlay = last ? TensorLayout::HWIO : TensorLayout::NCHW;
+    const TensorLayout alay = TensorLayout::NHWC;
+    const TensorLayout wlay = TensorLayout::HWIO;
     const std::vector<int64_t> ashape = {c.n, c.ic, c.ih, c.iw};
-    const std::vector<int64_t> wshape =
-        last ? std::vector<int64_t>{c.kh, c.kw, icg, c.oc}
-             : std::vector<int64_t>{c.oc, icg, c.kh, c.kw};
+    const std::vector<int64_t> wshape = {c.kh, c.kw, icg, c.oc};
 
     TensorView av = view(ashape, DataType::u8, a.data(), alay, qa);
     TensorView wv = view(wshape, DataType::s8, w.data(), wlay, qw);
@@ -256,71 +244,41 @@ double run_conv_i8(const ConvBenchCase& c, const char* label)
     const TensorView ins[] = {dav, dwv};
     const double ms = cuda_median_ms([&] { cuda_launch(*op, dcv, ins); });
     print_cuda_row(label,
-                   conv_geometry(c, last ? "channel_last" : "channel_first"), ms,
+                   conv_geometry(c, "channel_last"), ms,
                    cuda_gflops(ms, c.flops()));
     return cuda_gflops(ms, c.flops());
 }
 
-void run_table_i8(bool channel_last, const char* label)
+void run_table_i8(const char* label)
 {
     for (ConvBenchCase c : cnn_layers()) {
-        c.channel_last = channel_last;
         run_conv_i8(c, label);
     }
 }
 
-void run_table(DataType dt, bool channel_last, const char* label)
+void run_table(DataType dt, const char* label)
 {
     for (ConvBenchCase c : cnn_layers()) {
         c.dtype = dt;
-        c.channel_last = channel_last;
         run_conv(c, label);
     }
 }
 
 }  // namespace
 
-NNOPS_BENCH(cuda_conv2d_channel_first) {
-    print_cuda_header("CUDA Conv2D channel-first (f32)");
-    run_table(DataType::f32, false, "f32");
-}
-
 NNOPS_BENCH(cuda_conv2d_channel_last) {
     print_cuda_header("CUDA Conv2D channel-last (f32)");
-    run_table(DataType::f32, true, "f32");
+    run_table(DataType::f32, "f32");
 }
 
 NNOPS_BENCH(cuda_conv2d_i8) {
     print_cuda_header("CUDA Conv2D int8 (u8 x s8 -> s8)");
-    run_table_i8(false, "i8 nchw");
-    run_table_i8(true, "i8 nhwc");
+    run_table_i8("i8 nhwc");
 }
 
 NNOPS_BENCH(cuda_conv2d_f16) {
     print_cuda_header("CUDA Conv2D f16 (tensor core)");
-    run_table(DataType::f16, false, "f16 channel_first");
-    run_table(DataType::f16, true, "f16 channel_last");
-}
-
-NNOPS_BENCH(cuda_conv2d_layouts) {
-    print_cuda_header("CUDA Conv2D layout A/B, same geometry (f32)");
-    // The channel-first arm is measured once before and once after each channel-last
-    // arm, so the repeat is the drift floor the ratio has to clear.
-    for (ConvBenchCase c : cnn_layers()) {
-        ConvBenchCase last = c;
-        last.channel_last = true;
-
-        const double channel_first = measure(c);
-        const double last_ms = measure(last);
-        const double channel_first_again = measure(c);
-        const double floor = channel_first_again / channel_first;
-
-        // The shared geometry string, minus the layout prefix.
-        const std::string geo = conv_geometry(c, "");
-        std::printf("  %-36s channel_first %8.4f ms   channel_last %8.4f ms   channel_last/channel_first %.2f   "
-                    "drift %.3f\n", geo.c_str() + 1, channel_first, last_ms,
-                    last_ms / channel_first, floor);
-    }
+    run_table(DataType::f16, "f16 channel_last");
 }
 
 NNOPS_BENCH(cuda_conv2d_shapes) {
@@ -332,27 +290,23 @@ NNOPS_BENCH(cuda_conv2d_shapes) {
         ConvBenchCase c;
         c.ic = c.oc = 64;
         c.ih = c.iw = side;
-        c.channel_last = true;
         run_conv(c, "channel_last s1");
     }
     {
         ConvBenchCase c;
         c.ic = c.oc = 128; c.ih = c.iw = 56; c.sh = c.sw = 2; c.ph = c.pw = 0;
-        c.channel_last = true;
         run_conv(c, "channel_last s2");
     }
     {
         ConvBenchCase c;
         c.ic = c.oc = 64; c.ih = c.iw = 28; c.dh = c.dw = 2; c.ph = c.pw = 2;
-        c.channel_last = true;
         run_conv(c, "channel_last d2");
     }
 }
 
 NNOPS_BENCH(cuda_depthwise_layers) {
     print_cuda_header("CUDA depthwise (groups = IC, rerouted out of the GEMM)");
-    // The depthwise stack a MobileNetV2 block walks, plus the 5x5 and the two
-    // channel-first rows the depthwise kernel still owns on its own.
+    // The depthwise stack a MobileNetV2 block walks, plus the 5x5.
     struct Dw { int64_t side, c, k, s; };
     const Dw layers[] = {
         {112, 32, 3, 1}, {112, 64, 3, 2}, {56, 64, 3, 1}, {56, 128, 3, 2},
@@ -361,18 +315,15 @@ NNOPS_BENCH(cuda_depthwise_layers) {
     };
     for (DataType dt : {DataType::f32, DataType::f16}) {
         for (const Dw& l : layers) {
-            for (bool last : {true, false}) {
-                ConvBenchCase c;
-                c.ic = c.oc = l.c;
-                c.ih = c.iw = l.side;
-                c.kh = c.kw = l.k;
-                c.sh = c.sw = l.s;
-                c.ph = c.pw = l.k / 2;
-                c.groups = l.c;
-                c.dtype = dt;
-                c.channel_last = last;
+            ConvBenchCase c;
+            c.ic = c.oc = l.c;
+            c.ih = c.iw = l.side;
+            c.kh = c.kw = l.k;
+            c.sh = c.sw = l.s;
+            c.ph = c.pw = l.k / 2;
+            c.groups = l.c;
+            c.dtype = dt;
                 run_conv(c, dt == DataType::f32 ? "f32" : "f16");
-            }
         }
     }
 }

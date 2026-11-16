@@ -1,16 +1,12 @@
 /// @file depthwise_conv.cpp
-/// @brief SIMD CPU depthwise 2D/3D convolution, channel-first and
-///        channel-last.
+/// @brief SIMD CPU depthwise 2D/3D convolution, channel-last.
 ///
-/// Channel-first keeps the raw [C, 1, (KD,) KH, KW] filter, takes one channel plane at
-/// a time, and puts the SIMD lane on output width. Channel-last keeps the raw
-/// HWCM filter [KH][KW][C] (TF depthwise order, multiplier dropped) and puts the
-/// lane on channels; all channel blocks of a row group are swept inside one
-/// task so the group's input rows stay in cache across the sweep. No prepack
-/// step is involved — the storage order already is the access pattern. A task
-/// owns a strip of four rows cut to fit L2, and when the grid cannot fill the
-/// pool the filter axis splits a strip into channel chunks. Quantized depthwise
-/// exists only on the channel lane.
+/// Keeps the raw HWCM filter [KH][KW][C] (TF depthwise order, multiplier
+/// dropped) and puts the lane on channels; all channel blocks of a row group are
+/// swept inside one task so the group's input rows stay in cache across the
+/// sweep. No prepack step is involved — the storage order already is the access
+/// pattern. A task owns a strip of four rows cut to fit L2, and when the grid
+/// cannot fill the pool the filter axis splits a strip into channel chunks.
 ///
 /// Spatial rank comes from the input rank (4 → 2D, 5 → 3D). One kernel covers
 /// both: the KD loop is always present, and for 2D KD = 1 makes it a single
@@ -18,10 +14,8 @@
 ///
 /// Dispatch:
 ///   depthwise_conv_cpu
-///     channel-first fp    -> dwconv_channel_first_impl      (lane on W)
-///     channel-last fp     -> dwconv_channel_last_impl       (lane on C)
-///     channel-last s8/u8  -> dwconv_channel_last_quant_impl
-///   (channel-first quantized is rejected: there is no channel lane to load.)
+///     f32/f16/bf16       -> dwconv_channel_last_impl       (lane on C)
+///     s8/u8              -> dwconv_channel_last_quant_impl
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
@@ -36,156 +30,6 @@ namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
 namespace k = nnops::kernel;
-
-// ============================================================
-// Channel-first depthwise conv (channel-first) — the lane spans output width
-// ============================================================
-
-template <typename T>
-void dwconv_channel_first_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
-                               std::span<const TensorView> inputs, const ComputeContext& ctx)
-{
-    const auto& input = inputs[0];
-    const auto& weight = inputs[1];
-    const bool has_bias = inputs.size() > 2;
-
-    const int64_t rank = input.rank();
-    const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
-
-    // One "block" per channel: a channel-first tensor has no channel vector.
-    const int64_t N = input.shape(0);
-    const int64_t blocks = input.num_channel_blocks();
-
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
-
-    const int64_t KD = attrs.kernel_size[0];
-    const int64_t KH = attrs.kernel_size[1];
-    const int64_t KW = attrs.kernel_size[2];
-
-    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH = output.shape(srank);
-    const int64_t OW = output.shape(srank + 1);
-
-    const int64_t SD = attrs.stride[0];
-    const int64_t SH = attrs.stride[1];
-    const int64_t SW = attrs.stride[2];
-    const int64_t DD = attrs.dilation[0];
-    const int64_t DH = attrs.dilation[1];
-    const int64_t DW = attrs.dilation[2];
-    const int64_t PD = attrs.padding[0];
-    const int64_t PH = attrs.padding[1];
-    const int64_t PW = attrs.padding[2];
-
-    auto* out_ptr = output.ptr<T>();
-    const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr = weight.ptr<T>();
-    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
-
-    const int64_t in_row_stride = input.row_stride_elems();
-    const int64_t in_d_stride = IH * in_row_stride;
-    const int64_t out_row_stride = output.row_stride_elems();
-    const int64_t out_d_stride = OH * out_row_stride;
-    const int64_t in_ch_stride = input.channel_block_stride_elems();
-    const int64_t out_ch_stride = output.channel_block_stride_elems();
-    const int64_t taps = KD * KH * KW;
-
-    k::DwConvParams p{};
-    p.ID = ID;
-    p.IH = IH;
-    p.IW = IW;
-    p.OH = OH;
-    p.OW = OW;
-    p.KD = KD;
-    p.KH = KH;
-    p.KW = KW;
-    p.SD = SD;
-    p.SH = SH;
-    p.SW = SW;
-    p.DD = DD;
-    p.DH = DH;
-    p.DW = DW;
-    p.PD = PD;
-    p.PH = PH;
-    p.PW = PW;
-    p.out_row_stride = out_row_stride;
-    p.in_d_stride = in_d_stride;
-    p.in_row_stride = in_row_stride;
-
-    // Channel-first edge masks: only the first and last width vector of a row read past
-    // it, and a mask zeroes the lanes outside the row so a tap stays a load and
-    // an FMA instead of a per-lane scalar loop. The mask depends only on
-    // (edge, tap), never on the row, so it is built once for the whole call.
-    constexpr int64_t kMaskLanes = simd_lane_for<T>;
-    constexpr int64_t kMaskMaxKw = 16;
-    uint8_t edge_needed[2 * kMaskMaxKw] = {};
-    alignas(32) T edge_masks[2 * kMaskMaxKw * kMaskLanes] = {};
-    const k::DwChannelFirstEdges edges =
-        k::dwconv_channel_first_edge_masks<kMaskMaxKw, T>(p, edge_masks, edge_needed);
-
-    // The masked load is a whole vector even in a row's edge vector, so its
-    // surplus lanes are the neighbouring rows' elements — and past the last
-    // row, the next plane's; the first vector's left lane likewise reaches into
-    // the previous plane. In bounds only while the tensor has the elements to
-    // back it: `mask_hi` bounds the deepest element a masked load can touch,
-    // relative to the block base, and `mask_lo` how far before it the load can
-    // start. A block the tensor cannot back keeps the checked path.
-    const int64_t mask_span = (SW == 2) ? 2 * kMaskLanes : kMaskLanes;
-    const int64_t mask_last_ow = ((OW + kMaskLanes - 1) / kMaskLanes - 1) * kMaskLanes;
-    const int64_t mask_hi = (ID - 1) * in_d_stride + (IH - 1) * in_row_stride + mask_last_ow * SW +
-                            (KW - 1) * DW - PW + mask_span;
-    const int64_t mask_lo = PW;
-
-    // At most one of the two: the pre-activation order folds the destination
-    // into the accumulator, so nothing is left for the post-epilogue add.
-    const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
-    const bool add_to = attrs.add_to && !pre_act;
-
-    const auto compute_block = [&](int64_t n, int64_t blk) {
-        const T* in_base = in_ptr + n * blocks * in_ch_stride + blk * in_ch_stride;
-        T* out_base = out_ptr + n * blocks * out_ch_stride + blk * out_ch_stride;
-        // The raw [C, 1, (KD,) KH, KW] filter, one tap block per channel.
-        const T* w_base = w_ptr + blk * taps;
-        const float bias = b_ptr ? s_load(&b_ptr[blk]) : 0.0f;
-
-        // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
-        k::DwConvParams pc = p;
-
-        // The masked load reaches into the neighbouring row, harmlessly, since
-        // those lanes are masked to zero — except at the tensor's first and
-        // last row blocks, and where the block's remaining planes cannot back
-        // the read, which keep the bounds-checked path.
-        k::DwChannelFirstEdges blk_edges = edges;
-        if ((n == 0 && blk == 0) || (n == N - 1 && blk == blocks - 1) ||
-            mask_hi > (blocks - blk) * in_ch_stride ||
-            mask_lo > (n * blocks + blk) * in_ch_stride) {
-            blk_edges.masks = nullptr;
-        }
-
-        for (int64_t od = 0; od < OD; ++od) {
-            T* out_d = out_base + od * out_d_stride;
-
-            // Four rows per call: one row's taps are a single dependent FMA
-            // chain. Rows past OH are skipped in-kernel.
-            int64_t oh = 0;
-            for (; oh + 3 < OH; oh += 4) {
-                pc.od = od;
-                pc.oh = oh;
-                k::dwconv_channel_first_h4(out_d + oh * pc.out_row_stride, in_base, w_base, bias,
-                                           pc, attrs.epilogue, add_to, pre_act, blk_edges);
-            }
-            for (; oh < OH; ++oh) {
-                pc.od = od;
-                pc.oh = oh;
-                k::dwconv_channel_first(out_d + oh * pc.out_row_stride, in_base, w_base, bias, pc,
-                                        attrs.epilogue, add_to, pre_act, blk_edges);
-            }
-        }
-    };
-
-    ctx.cpu.run(0, N * blocks, [&](int64_t tid) { compute_block(tid / blocks, tid % blocks); });
-}
 
 // ============================================================
 // Channel-last depthwise — the lane spans channels
@@ -530,60 +374,40 @@ Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs, TensorView& outp
     const auto dtype = inputs[0].data_type();
     const auto odtype = output.data_type();
 
-    // Quantized depthwise conv lives on the channel lane: its dequantize-on-load
-    // kernels read a channel vector, which a channel-first plane does not have.
-    if (!is_channel_last(inputs[0].layout()) && (dtype == DataType::s8 || dtype == DataType::u8)) {
+    if (!is_channel_last(inputs[0].layout())) {
         return Status::unsupported;
-    }
-
-    if (is_channel_last(inputs[0].layout())) {
-        switch (dtype) {
-        case DataType::f32:
-            dwconv_channel_last_impl<float>(attrs, output, inputs, ctx);
-            return Status::ok;
-        case DataType::f16:
-            dwconv_channel_last_impl<half>(attrs, output, inputs, ctx);
-            return Status::ok;
-#ifdef NNOPS_ARCH_AARCH64
-        case DataType::bf16:
-            dwconv_channel_last_impl<bfloat16>(attrs, output, inputs, ctx);
-            return Status::ok;
-#endif
-        case DataType::s8:
-            if (odtype == DataType::s8) {
-                return dwconv_channel_last_quant_impl<int8_t, int8_t>(attrs, output, inputs, ctx);
-            }
-            if (odtype == DataType::u8) {
-                return dwconv_channel_last_quant_impl<int8_t, uint8_t>(attrs, output, inputs, ctx);
-            }
-            return Status::unsupported;
-        case DataType::u8:
-            if (odtype == DataType::s8) {
-                return dwconv_channel_last_quant_impl<uint8_t, int8_t>(attrs, output, inputs, ctx);
-            }
-            if (odtype == DataType::u8) {
-                return dwconv_channel_last_quant_impl<uint8_t, uint8_t>(attrs, output, inputs, ctx);
-            }
-            return Status::unsupported;
-        default:
-            return Status::unsupported;
-        }
     }
 
     switch (dtype) {
     case DataType::f32:
-        dwconv_channel_first_impl<float>(attrs, output, inputs, ctx);
+        dwconv_channel_last_impl<float>(attrs, output, inputs, ctx);
         return Status::ok;
     case DataType::f16:
-        dwconv_channel_first_impl<half>(attrs, output, inputs, ctx);
+        dwconv_channel_last_impl<half>(attrs, output, inputs, ctx);
         return Status::ok;
 #ifdef NNOPS_ARCH_AARCH64
     case DataType::bf16:
-        dwconv_channel_first_impl<bfloat16>(attrs, output, inputs, ctx);
+        dwconv_channel_last_impl<bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
 #endif
+    case DataType::s8:
+        if (odtype == DataType::s8) {
+            return dwconv_channel_last_quant_impl<int8_t, int8_t>(attrs, output, inputs, ctx);
+        }
+        if (odtype == DataType::u8) {
+            return dwconv_channel_last_quant_impl<int8_t, uint8_t>(attrs, output, inputs, ctx);
+        }
+        return Status::unsupported;
+    case DataType::u8:
+        if (odtype == DataType::s8) {
+            return dwconv_channel_last_quant_impl<uint8_t, int8_t>(attrs, output, inputs, ctx);
+        }
+        if (odtype == DataType::u8) {
+            return dwconv_channel_last_quant_impl<uint8_t, uint8_t>(attrs, output, inputs, ctx);
+        }
+        return Status::unsupported;
     default:
-        return Status::unsupported; // Channel-first has no quantized route
+        return Status::unsupported;
     }
 }
 

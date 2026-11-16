@@ -108,7 +108,7 @@ Two patterns worth knowing:
 | Selection / predicate | `Where`, `Compare` (equal/greater/less/…), `Logical` (and/or/xor/not) |
 | Indexing | `Gather`, `GatherElements`, `GatherND`, `ScatterElements`, `ScatterND`, `Pad`, `Split`, `Tile`, `Expand` |
 | Reduction | `Reduce` (sum/mean/max/min), `ArgMinMax`, `TopK`, `CumSum` |
-| Shape / layout | `Concat`, `Slice`, `Permute`, `Flatten`, `Embed`, `Resize`, `GridSample`, `LayoutConvert` |
+| Shape / layout | `Concat`, `Slice`, `Permute`, `Flatten`, `Embed`, `Resize`, `GridSample` |
 | Positional | `RoPE` (rotary position embeddings) |
 
 ### Fusion and accumulation
@@ -176,7 +176,7 @@ tests/                  Standalone test demos (one executable per file)
 
 Key design choices:
 
-- `TensorView` is a **non-owning view** — shape stored inline (zero heap for rank ≤ 8), with a byte `pitch` between rows (OpenCV `cv::Mat::step` style). `NCHW`/`NCDHW` (channel-first) and `NHWC`/`NDHWC` (channel-last) layouts and padded rows are supported.
+- `TensorView` is a **non-owning view** — shape stored inline (zero heap for rank ≤ 8), with a byte `pitch` between rows (OpenCV `cv::Mat::step` style). Activations are channel-last (`NHWC`/`NDHWC`) or dense row-major (`Dense`); padded rows are supported.
 - Backend kernels keep a `TensorView&` and are dispatched through `switch (backend_)`.
 - The CPU SIMD abstraction (`v_load` / `v_store` / `v_fmadd` / `v_reduce_sum` …) lets a single templated kernel target f32 and f16 across SSE/AVX2/NEON/scalar.
 

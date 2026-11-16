@@ -1,5 +1,5 @@
 /// @file bench_cuda_resize.cpp
-/// @brief CUDA resize throughput, channel-first and channel-last.
+/// @brief CUDA resize throughput, channel-last.
 ///
 /// Resize performs no MACs, so the second column is not a FLOP rate: it is the
 /// bandwidth a call moves at, counting the output it writes and the input image
@@ -12,7 +12,7 @@
 /// a U-Net decoder, a 4x pixel-shuffle-style nearest, a bilinear downsample, the
 /// bicubic pass a super-resolution head uses, an RGB three-channel image (which
 /// falls to the pixel script rather than the 16 B lane), and a trilinear 3D
-/// volume. Each runs in both memory orders and both dtypes.
+/// volume. Each runs in both dtypes.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -42,7 +42,6 @@ struct RszBenchCase {
     ResizeMode mode = ResizeMode::Nearest;
     CoordinateTransformMode coord = CoordinateTransformMode::HalfPixel;
     DataType dtype = DataType::f32;
-    bool channel_last = false;
 
     double elems(int64_t nn, int64_t cc, int64_t dd, int64_t hh, int64_t ww) const
     {
@@ -80,8 +79,7 @@ double measure(const RszBenchCase& c)
     attrs.output_size = {c.od, c.oh, c.ow};
 
     const TensorLayout layout =
-        c.channel_last ? (c.three_d ? TensorLayout::NDHWC : TensorLayout::NHWC)
-                       : (c.three_d ? TensorLayout::NCDHW : TensorLayout::NCHW);
+        c.three_d ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
     const std::vector<int64_t> in_shape = c.three_d
         ? std::vector<int64_t>{c.n, c.c, c.id, c.ih, c.iw}
@@ -112,9 +110,7 @@ double run_rsz(const RszBenchCase& c, const char* label)
         (c.elems(c.n, c.c, c.od, c.oh, c.ow) + c.elems(c.n, c.c, c.id, c.ih, c.iw)) * esz;
     const double gbps = ms > 0.0 ? bytes / (ms * 1e6) : 0.0;
     std::printf("  %-18s %-46s %9.4f ms %9.2f GB/s\n", label,
-                rsz_geometry(c, c.channel_last ? "channel_last" : "channel_first")
-                    .c_str(),
-                ms, gbps);
+                rsz_geometry(c, "channel_last").c_str(), ms, gbps);
     return gbps;
 }
 
@@ -156,31 +152,24 @@ std::vector<RszBenchCase> resize_layers()
     return v;
 }
 
-void run_table(DataType dt, bool channel_last, const char* label)
+void run_table(DataType dt, const char* label)
 {
     for (RszBenchCase c : resize_layers()) {
         c.dtype = dt;
-        c.channel_last = channel_last;
         run_rsz(c, label);
     }
 }
 
 }  // namespace
 
-NNOPS_BENCH(cuda_resize_channel_first) {
-    print_cuda_header("CUDA Resize channel-first (f32)");
-    run_table(DataType::f32, false, "f32");
-}
-
 NNOPS_BENCH(cuda_resize_channel_last) {
     print_cuda_header("CUDA Resize channel-last (f32)");
-    run_table(DataType::f32, true, "f32");
+    run_table(DataType::f32, "f32");
 }
 
 NNOPS_BENCH(cuda_resize_f16) {
-    print_cuda_header("CUDA Resize f16");
-    run_table(DataType::f16, false, "f16 channel_first");
-    run_table(DataType::f16, true, "f16 channel_last");
+    print_cuda_header("CUDA Resize f16 (channel-last)");
+    run_table(DataType::f16, "f16 channel_last");
 }
 
 #endif  // NNOPS_HAS_CUDA

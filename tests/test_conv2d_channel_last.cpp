@@ -5,8 +5,8 @@
 /// filter), floating point (f32/f16) and quantized. Every case keeps the same
 /// values in both orders — channel-first/OIHW for the reference, channel-last/HWIO
 /// for the kernel — and compares the kernel's output, converted back to
-/// channel-first, against the reference. The conversion itself is covered by test_layout_convert;
-/// here it is only plumbing, so a case that fails is a kernel bug.
+/// channel-first, against the reference. The conversion is only plumbing, so a
+/// case that fails is a kernel bug.
 ///
 /// Contracts these cases pin beyond "matches the reference":
 /// - A prepacked filter is invisible. Conv2D::prepackWeights is query then
@@ -20,8 +20,8 @@
 ///   tolerance, except in the prepacked-filter cases, which already demand bit
 ///   equality. The quantized prepack carries the per-channel sums the
 ///   compensation terms read, so each live term gets a case of its own.
-/// - Winograd's channel-last U is the GEMM's B panels, not U[16][OC][IC/G]:
-///   prepack equality against the channel-first U is checked entry by entry.
+/// - Winograd's channel-last U is the GEMM's B panels, not U[16][OC][IC/G], and
+///   its leading dimension carries the transform order.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -647,20 +647,6 @@ NNOPS_TEST(conv2d_channel_last_prepack_query) {
     NNOPS_EXPECT_TRUE(q.shape(1) * q.shape(0) >= int64_t{3 * 3 * 8 * 16});
     NNOPS_EXPECT_EQ(q.pitch(), q.shape(1) * int64_t{sizeof(float)});
 
-    // A channel-first filter queries the other form: the layout follows the filter,
-    // not the attributes, so prepack and compute cannot disagree.
-    const int64_t wsh_p[] = {16, 8, 3, 3};   // OIHW
-    std::vector<float> w_buf_p(16 * 8 * 3 * 3, 0.0f);
-    TensorView w_p(std::span<const int64_t>(wsh_p, 4), DataType::f32, w_buf_p.data());
-    TensorView q2;
-    const TensorView wi2[] = {w_p};
-    TensorView wo2[] = {q2};
-    op->prepackWeights(wi2, wo2);
-    q2 = wo2[0];
-    NNOPS_EXPECT_EQ(q2.layout(), TensorLayout::PackedOIHW);
-    NNOPS_EXPECT_EQ(q2.shape(0), int64_t{16});
-    NNOPS_EXPECT_EQ(q2.shape(1), int64_t{8 * 3 * 3});
-
     std::vector<float> blob(q.storage_bytes() / sizeof(float), 0.0f);
     TensorView packed_v(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
                         q.layout());
@@ -672,31 +658,11 @@ NNOPS_TEST(conv2d_channel_last_prepack_query) {
     const int64_t osh[] = {1, 16, 8, 8};
     TensorView out_v(std::span<const int64_t>(osh, 4), DataType::f32, out_buf.data(),
                      TensorLayout::NHWC);
-    TensorView out_channel_first(std::span<const int64_t>(osh, 4), DataType::f32,
-                        out_buf.data(), TensorLayout::NCHW);
-    TensorView in_channel_first(std::span<const int64_t>(ish, 4), DataType::f32,
-                       in_buf.data(), TensorLayout::NCHW);
 
-    // The paired forms run, the crossed ones are refused: prepacking does not
-    // widen what an activation may pair with.
+    // The paired forms run; prepacking does not widen what an activation may
+    // pair with.
     const TensorView paired[] = {in_v, packed_v};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out_v, paired)));
-    const TensorView crossed_hwio[] = {in_channel_first, packed_v};
-    NNOPS_EXPECT_TRUE(!is_ok(op->compute(out_channel_first, crossed_hwio)));
-    const TensorView crossed_raw[] = {in_channel_first, w_v};
-    NNOPS_EXPECT_TRUE(!is_ok(op->compute(out_channel_first, crossed_raw)));
-
-    const TensorView crossed_oihw[] = {in_v, w_p};
-    NNOPS_EXPECT_TRUE(!is_ok(op->compute(out_v, crossed_oihw)));
-
-    std::vector<float> blob_p(q2.storage_bytes() / sizeof(float), 0.0f);
-    TensorView packed_p(q2.shape_span(), q2.data_type(), blob_p.data(), q2.pitch(),
-                        q2.layout());
-    const TensorView pvw[] = {w_p};
-    TensorView pfw[] = {packed_p};
-    op->prepackWeights(pvw, pfw);
-    const TensorView paired_p[] = {in_channel_first, packed_p};
-    NNOPS_EXPECT_TRUE(is_ok(op->compute(out_channel_first, paired_p)));
 }
 
 NNOPS_TEST(conv2d_channel_last_fp_prepacked_filter) {
@@ -923,92 +889,10 @@ NNOPS_TEST(conv2d_channel_last_wino_hand_exact) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_wino_prepack_matches_channel_first) {
-    // Both U forms hold the same G g Gᵀ — the channel-last one is just the
-    // GEMM's B panels. Entry (p, kb, g·jb + j, k, col) must equal the channel-first
-    // U's (p, oc, ic) for oc = (g·jb + j)·nr + col, ic = kb·kc + k.
-    const int64_t IC = 40, OC = 24, G = 1;   // no vector multiple either way
-    const int64_t ICG = IC / G, OCG = OC / G;
-    const int64_t wsh[] = {OC, ICG, 3, 3};           // OIHW
-    const int64_t wsh_cl[] = {3, 3, ICG, OC};        // HWIO
-    auto [w32v, w32] = test::make_random_tensor(
-        std::span<const int64_t>(wsh, 4), -1.0f, 1.0f, 909);
-    const auto w_cl = test::oihw_to_hwio<float>(w32v, OC, ICG, 3, 3);
-
-    Conv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.padding = {1, 1};
-    attrs.groups = G;
-    attrs.algorithm = ConvAlgorithm::Winograd;
-    // Pin the order: the two routes pick differently by default (channel-last
-    // takes F(4,3) at any plane), and this test compares the blobs' packing.
-    attrs.winograd_order = 2;
-    auto op = Conv2D::create(attrs, Backend::CPU);
-
-    TensorView w_pl(wsh, DataType::f32, w32v.data()),
-               w_cl_v(std::span<const int64_t>(wsh_cl, 4), DataType::f32,
-                      const_cast<float*>(w_cl.data()), TensorLayout::HWIO);
-    std::vector<float> u_pl_buf, u_cl_buf;
-    TensorView u_pl, u_cl;
-    {
-        TensorView q;
-        const TensorView in1[] = {w_pl};
-        TensorView o1[] = {q};
-        op->prepackWeights(in1, o1);
-        const TensorView qp = o1[0];
-        u_pl_buf.assign(static_cast<size_t>(qp.storage_bytes() / sizeof(float)), 0.0f);
-        u_pl = TensorView(qp.shape_span(), DataType::f32, u_pl_buf.data(), qp.pitch(),
-                          qp.layout());
-        const TensorView in2[] = {w_pl};
-        TensorView o2[] = {u_pl};
-        op->prepackWeights(in2, o2);
-
-        TensorView q2;
-        const TensorView in3[] = {w_cl_v};
-        TensorView o3[] = {q2};
-        op->prepackWeights(in3, o3);
-        const TensorView qc = o3[0];
-        u_cl_buf.assign(static_cast<size_t>(qc.storage_bytes() / sizeof(float)), 0.0f);
-        u_cl = TensorView(qc.shape_span(), DataType::f32, u_cl_buf.data(), qc.pitch(),
-                          qc.layout());
-        const TensorView in4[] = {w_cl_v};
-        TensorView o4[] = {u_cl};
-        op->prepackWeights(in4, o4);
-    }
-    NNOPS_EXPECT_EQ(static_cast<int64_t>(u_pl.layout()),
-                    static_cast<int64_t>(TensorLayout::PackedWinoWeight));
-    NNOPS_EXPECT_EQ(static_cast<int64_t>(u_cl.layout()),
-                    static_cast<int64_t>(TensorLayout::PackedWinoWeightLast));
-
-    // Both blobs here were built with the order pinned to F(2,3), so the panels
-    // hold the same 16 planes as the channel-first U they compare to, plane for
-    // plane — and without a plane to weigh, the policy takes the safe order too.
-    NNOPS_EXPECT_TRUE(backend::cpu::wino_pick_order(DataType::f32, ICG, OCG) ==
-                      backend::cpu::WinoOrder::F23);
-    const auto ug = backend::cpu::wino_channel_last_u(ICG, OCG, G, DataType::f32);
-    const float* pl = u_pl_buf.data();   // [p][oc][ic], row stride ICG
-    const float* cl = u_cl_buf.data();
-    for (int64_t p = 0; p < 16; ++p) {
-        for (int64_t oc = 0; oc < OCG; ++oc) {
-            for (int64_t ic = 0; ic < ICG; ++ic) {
-                const int64_t kb = ic / ug.kc, k = ic - kb * ug.kc;
-                const int64_t j = oc / ug.nr, col = oc - j * ug.nr;
-                const float want = pl[(p * OC + oc) * ICG + ic];
-                const float got = cl[p * ug.plane + (kb * ug.jbg + j) * ug.ldd
-                                     + k * ug.nr + col];
-                if (got != want) {
-                    NNOPS_EXPECT_NEAR(got, want, 1e-6f);
-                    return;
-                }
-            }
-        }
-    }
-}
-
 NNOPS_TEST(conv2d_channel_last_wino_plan_and_auto) {
-    // Auto follows the U it is handed: the channel-first U pairs with a channel-first
-    // activation, the panels with a channel-last one, and a mismatched pair
-    // must not resolve to a plan at all.
+    // Auto follows the U it is handed: the panels pair with a channel-last
+    // activation, and a U that is not the panels must not resolve to a plan at
+    // all.
     const int64_t ishape[] = {1, 32, 16, 16};
     const int64_t oshape[] = {1, 32, 14, 14};
     std::vector<float> in_buf(32 * 16 * 16, 0.5f);
@@ -1044,7 +928,6 @@ NNOPS_TEST(conv2d_channel_last_wino_plan_and_auto) {
     attrs.padding = {1, 1};
 
     const auto plan = backend::cpu::get_conv2d_winograd_plan(attrs, ins, outs, 1, false);
-    NNOPS_EXPECT_TRUE(plan.route == backend::cpu::Conv2DWinogradRoute::ChannelLast);
     NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
     NNOPS_EXPECT_EQ(plan.icn_block, ug.kc);
     NNOPS_EXPECT_EQ(plan.num_tiles, int64_t{7 * 7});
@@ -1083,16 +966,6 @@ NNOPS_TEST(conv2d_channel_last_wino_plan_and_auto) {
                                                               false).workspace_size,
                         0u);
     }
-
-    // A channel-first U with a channel-last activation has no route.
-    const int64_t pu_shape[] = {16, 32, 32};
-    std::vector<float> pu_buf(16 * 32 * 32, 0.0f);
-    TensorView pu(std::span<const int64_t>(pu_shape, 3), DataType::f32, pu_buf.data(),
-                  32 * static_cast<int64_t>(sizeof(float)),
-                  TensorLayout::PackedWinoWeight);
-    const TensorDesc bad[] = {input.desc(), pu.desc()};
-    NNOPS_EXPECT_EQ(backend::cpu::get_conv2d_winograd_plan(attrs, bad, outs, 1, false)
-                        .workspace_size, 0u);
 }
 
 NNOPS_TEST(conv2d_channel_last_threaded_matches_serial) {
@@ -1295,9 +1168,9 @@ NNOPS_TEST(conv2d_channel_last_plan_blocks) {
 }
 
 NNOPS_TEST(conv2d_channel_last_layout_pairing) {
-    // The activation's order and the weight's order must agree — HWIO for
-    // Channel-last, OIHW for channel-first. A mismatch is a caller error, not
-    // something to guess at with a per-call weight reshape.
+    // Only channel-last is supported: the activation must be NHWC and the filter
+    // HWIO (or one of its packed forms). A channel-first descriptor is a caller
+    // error, not something to guess at with a per-call weight reshape.
     const int64_t ishape[] = {1, 4, 8, 8};
     const int64_t wshape[] = {3, 3, 4, 8};   // HWIO [KH][KW][IC/G][OC]
     std::vector<float> in_buf(4 * 8 * 8, 0.0f);
@@ -1320,12 +1193,13 @@ NNOPS_TEST(conv2d_channel_last_layout_pairing) {
     };
 
     NNOPS_EXPECT_TRUE(is_ok(compute_with(TensorLayout::NHWC, TensorLayout::HWIO)));
-    NNOPS_EXPECT_TRUE(is_ok(compute_with(TensorLayout::NCHW, TensorLayout::NCHW)));
-    NNOPS_EXPECT_EQ(compute_with(TensorLayout::NHWC, TensorLayout::NCHW),
+    NNOPS_EXPECT_EQ(compute_with(TensorLayout::Dense, TensorLayout::Dense),
                     Status::invalid_argument);
-    NNOPS_EXPECT_EQ(compute_with(TensorLayout::NCHW, TensorLayout::HWIO),
+    NNOPS_EXPECT_EQ(compute_with(TensorLayout::NHWC, TensorLayout::Dense),
                     Status::invalid_argument);
-    NNOPS_EXPECT_EQ(op->getLayoutSupport(), LayoutSupport::ChannelFirstOrChannelLast);
+    NNOPS_EXPECT_EQ(compute_with(TensorLayout::Dense, TensorLayout::HWIO),
+                    Status::invalid_argument);
+    NNOPS_EXPECT_EQ(op->getLayoutSupport(), LayoutSupport::ChannelLastOnly);
 }
 
 // ============================================================
@@ -1448,9 +1322,9 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
     auto op = Conv2D::create(attrs, Backend::CPU);
 
     TensorView ref_in(std::span<const int64_t>(ish, 4), c.act,
-                      act_ref.data(), TensorLayout::NCHW, qa);
+                      act_ref.data(), TensorLayout::Dense, qa);
     TensorView ref_w(std::span<const int64_t>(wsh, 4), DataType::s8,
-                     w_oihw.data(), TensorLayout::NCHW, qw);
+                     w_oihw.data(), TensorLayout::Dense, qw);
     const DataType bdt = int_out ? DataType::s32 : c.out;
     TensorView ref_b(bsh, bdt, bias_buf.empty() ? nullptr : bias_buf.data());
 
@@ -1467,7 +1341,7 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
     std::vector<uint8_t> ref_buf(od[0].nbytes(), 0);
     {
         auto ref_out = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), odt,
-                                  ref_buf.data(), TensorLayout::NCHW, qo);
+                                  ref_buf.data(), TensorLayout::Dense, qo);
         nnops::backend::cpu::reference::conv2d_int8_ref(attrs, ref_out, ref_ins, ctx, nullptr);
     }
 

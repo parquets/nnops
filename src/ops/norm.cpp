@@ -79,6 +79,14 @@ Status Norm::validate(std::span<const TensorDesc> inputs, std::span<const Tensor
         return Status::invalid_argument;
     }
     const TensorDesc& x = inputs[0];
+    // Spatial BatchNorm and GroupNorm walk the channel-last pixel order; a
+    // channel-first activation has no route.
+    if ((attrs_.type == NormType::BatchNorm && attrs_.spatial) ||
+        attrs_.type == NormType::GroupNorm) {
+        if (!is_channel_last(x.layout)) {
+            return Status::unsupported;
+        }
+    }
     const int64_t rank = x.rank;
     const int64_t axis = attrs_.axis < 0 ? attrs_.axis + rank : attrs_.axis;
     const bool tail = (axis == rank - 1);

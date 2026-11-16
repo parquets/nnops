@@ -7,18 +7,18 @@
 /// channel-last 3D for the 3D case, and SIMD output against the reference
 /// flatten.
 ///
-/// Every channel-last input is produced by running LayoutConvert into a
-/// make_packed buffer at the default 32-byte alignment, so a pitched row is
-/// exercised whenever the row width is not already a multiple of 32 bytes.
+/// Every channel-last input is produced by reordering the channel-first view's
+/// values into pixel-major order and wrapping them in a dense channel-last view.
 
 #include "nnops/ops/flatten.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "common/test_harness.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 #include "common/test_helpers.hpp"
+#include "common/channel_last.hpp"
 
 #include <vector>
+#include <span>
 
 using namespace nnops;
 
@@ -35,16 +35,16 @@ namespace {
 /// Convert a channel-first view into `target` (channel-last) and return the view; the
 /// caller keeps `buf` alive.
 TensorView to_channel_last(const TensorView& channel_first, TensorLayout target,
-                           std::vector<char>& buf)
+                           std::vector<float>& buf)
 {
-    auto op = LayoutConvert::create(target, Backend::CPU);
-    const TensorDesc in[] = {channel_first.desc()};
-    TensorDesc d = op->getOutputTensorDesc(in)[0];
-    buf.resize(d.storage_bytes());
-    TensorView cl = test::make_packed(d, buf.data());
-    const TensorView ins[] = {channel_first};
-    op->compute(cl, ins);
-    return cl;
+    const int64_t N = channel_first.shape(0);
+    const int64_t C = channel_first.shape(1);
+    const int64_t S = channel_first.numel() / (N * C);
+    buf = test::to_channel_last(
+        std::span<const float>(channel_first.ptr<float>(),
+                               static_cast<size_t>(channel_first.numel())), N, C, S);
+    return TensorView(channel_first.shape_span(), channel_first.data_type(),
+                      buf.data(), target);
 }
 
 }  // anonymous namespace
@@ -63,7 +63,7 @@ NNOPS_TEST(flatten_channel_first_identity) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
     NNOPS_EXPECT_EQ(descs[0].dims[2], 4);
     NNOPS_EXPECT_EQ(descs[0].dims[3], 4);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(descs[0].numel());
@@ -79,7 +79,7 @@ NNOPS_TEST(flatten_channel_last_to_channel_first) {
     const std::vector<int64_t> shape = {2, 5, 4, 4};  // odd C
 
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -1.0f, 1.0f, 123);
-    std::vector<char> cl_buf;
+    std::vector<float> cl_buf;
     TensorView in_cl = to_channel_last(in_channel_first, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
@@ -88,7 +88,7 @@ NNOPS_TEST(flatten_channel_last_to_channel_first) {
     auto flat_descs = flatten_op->getOutputTensorDesc(flat_in);
 
     NNOPS_EXPECT_EQ(flat_descs[0].rank, 4);
-    NNOPS_EXPECT_EQ(flat_descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(flat_descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(flat_descs[0].dtype, DataType::f32);
 
     std::vector<float> flat_buf(flat_descs[0].numel());
@@ -103,7 +103,7 @@ NNOPS_TEST(flatten_channel_last_full_c) {
     const std::vector<int64_t> shape = {1, 8, 6, 6};
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -1.0f, 1.0f, 456);
 
-    std::vector<char> cl_buf;
+    std::vector<float> cl_buf;
     TensorView in_cl = to_channel_last(in_channel_first, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
@@ -123,7 +123,7 @@ NNOPS_TEST(flatten_channel_last_single_channel) {
     const std::vector<int64_t> shape = {1, 1, 8, 8};
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -1.0f, 1.0f, 789);
 
-    std::vector<char> cl_buf;
+    std::vector<float> cl_buf;
     TensorView in_cl = to_channel_last(in_channel_first, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
@@ -144,9 +144,9 @@ NNOPS_TEST(flatten_ndhwc_to_ncdhw) {
     auto [in_vec, _] = test::make_random_tensor(shape, -1.0f, 1.0f, 111);
 
     TensorView in_channel_first(std::span<const int64_t>(shape), DataType::f32,
-                         in_vec.data(), TensorLayout::NCDHW);
+                         in_vec.data(), TensorLayout::Dense);
 
-    std::vector<char> cl_buf;
+    std::vector<float> cl_buf;
     TensorView in_cl = to_channel_last(in_channel_first, TensorLayout::NDHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
@@ -155,7 +155,7 @@ NNOPS_TEST(flatten_ndhwc_to_ncdhw) {
     auto flat_descs = flatten_op->getOutputTensorDesc(flat_in);
 
     NNOPS_EXPECT_EQ(flat_descs[0].rank, 5);
-    NNOPS_EXPECT_EQ(flat_descs[0].layout, TensorLayout::NCDHW);
+    NNOPS_EXPECT_EQ(flat_descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> flat_buf(flat_descs[0].numel());
     TensorView out_channel_first = test::make_channel_first(flat_descs[0], flat_buf.data());
@@ -169,7 +169,7 @@ NNOPS_TEST(flatten_channel_last_multibatch) {
     const std::vector<int64_t> shape = {3, 7, 4, 4};
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -1.0f, 1.0f, 222);
 
-    std::vector<char> cl_buf;
+    std::vector<float> cl_buf;
     TensorView in_cl = to_channel_last(in_channel_first, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
@@ -190,9 +190,9 @@ NNOPS_TEST(flatten_simd_vs_ref) {
 
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -1.0f, 1.0f, 333);
     TensorView in_channel_first_tv(std::span<const int64_t>(shape), DataType::f32,
-                            in_vec.data(), TensorLayout::NCHW);
+                            in_vec.data(), TensorLayout::Dense);
 
-    std::vector<char> cl_buf;
+    std::vector<float> cl_buf;
     TensorView in_cl = to_channel_last(in_channel_first_tv, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);

@@ -19,13 +19,14 @@
 /// reference at 5e-2 rather than round-tripped.
 
 #include "nnops/ops/reduce.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
+#include "common/channel_last.hpp"
 
 #include <cmath>
 #include <random>
+#include <span>
 
 using namespace nnops;
 
@@ -51,7 +52,7 @@ NNOPS_TEST(reduce_1d_sum) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 0);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -78,7 +79,7 @@ NNOPS_TEST(reduce_1d_max) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 0);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -105,7 +106,7 @@ NNOPS_TEST(reduce_1d_min) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 0);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -132,7 +133,7 @@ NNOPS_TEST(reduce_1d_mean) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 0);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -161,7 +162,7 @@ NNOPS_TEST(reduce_1d_keepdims) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 1);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -196,7 +197,7 @@ NNOPS_TEST(reduce_2d_axis0_sum) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -229,7 +230,7 @@ NNOPS_TEST(reduce_2d_axis1_max) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -259,7 +260,7 @@ NNOPS_TEST(reduce_2d_axis1_min) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -289,7 +290,7 @@ NNOPS_TEST(reduce_2d_axis0_mean) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -323,7 +324,7 @@ NNOPS_TEST(reduce_2d_keepdims) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 1);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
@@ -404,7 +405,7 @@ NNOPS_TEST(reduce_random_sum) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 5);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -433,7 +434,7 @@ NNOPS_TEST(reduce_random_max) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 10);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -464,7 +465,7 @@ NNOPS_TEST(reduce_random_min) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 7);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -495,7 +496,7 @@ NNOPS_TEST(reduce_random_mean) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 6);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -530,7 +531,7 @@ NNOPS_TEST(reduce_3d_middle_axis) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 4);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -565,7 +566,7 @@ NNOPS_TEST(reduce_3d_first_axis) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 5);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
@@ -591,16 +592,16 @@ namespace {
 
 /// Convert a channel-first view into `target` and return the view; `buf` outlives it.
 TensorView to_layout(const TensorView& channel_first, TensorLayout target,
-                     std::vector<char>& buf)
+                     std::vector<float>& buf)
 {
-    auto op = LayoutConvert::create(target);
-    const TensorDesc in[] = {channel_first.desc()};
-    auto d = op->getOutputTensorDesc(in)[0];
-    buf.resize(d.storage_bytes());
-    TensorView out = test::make_packed(d, buf.data());
-    const TensorView ins[] = {channel_first};
-    op->compute(out, ins);
-    return out;
+    const int64_t N = channel_first.shape(0);
+    const int64_t C = channel_first.shape(1);
+    const int64_t S = channel_first.numel() / (N * C);
+    buf = test::to_channel_last(
+        std::span<const float>(channel_first.ptr<float>(),
+                               static_cast<size_t>(channel_first.numel())), N, C, S);
+    return TensorView(channel_first.shape_span(), channel_first.data_type(),
+                      buf.data(), target);
 }
 
 /// Compare two same-dimension views in logical order (any layout).
@@ -664,7 +665,7 @@ void check_reduce_layout(const std::vector<int64_t>& shape,
     const TensorView ref_ins[] = {in_channel_first};
     op->compute(ref_out, ref_ins);
 
-    std::vector<char> cl_buf;
+    std::vector<float> cl_buf;
     const TensorLayout cl_layout =
         (shape.size() == 5) ? TensorLayout::NDHWC : TensorLayout::NHWC;
     auto in_cl = to_layout(in_channel_first, cl_layout, cl_buf);
@@ -678,7 +679,7 @@ void check_reduce_layout(const std::vector<int64_t>& shape,
     }
     // A rank-preserving output stays channel-last; a rank-dropping one is channel-first.
     const TensorLayout channel_first_layout =
-        (shape.size() == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+        TensorLayout::Dense;
     NNOPS_EXPECT_EQ(cl_desc[0].layout, keepdims ? cl_layout : channel_first_layout);
 
     std::vector<float> out_buf(
@@ -790,7 +791,7 @@ NNOPS_TEST(reduce_channel_last_axis_c_sum) {
     const int64_t shape[] = {N, C, H, W};
     TensorView in_channel_first(shape, DataType::f32, in_channel_first_data);
 
-    std::vector<char> cl_buf;
+    std::vector<float> cl_buf;
     auto in_cl = to_layout(in_channel_first, TensorLayout::NHWC, cl_buf);
 
     ReduceAttributes attrs;
@@ -801,7 +802,7 @@ NNOPS_TEST(reduce_channel_last_axis_c_sum) {
     const TensorDesc in_desc[] = {in_cl.desc()};
     auto descs = op->getOutputTensorDesc(in_desc);
     NNOPS_EXPECT_EQ(descs[0].rank, 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = test::make_channel_first(descs[0], out_buf.data());
@@ -1085,7 +1086,7 @@ NNOPS_TEST(reduce_multi_noop_empty_axes) {
 
 NNOPS_TEST(reduce_noop_empty_axes_channel_last) {
     auto [in_vec, cf] = test::make_random_tensor({2, 4, 3, 5}, -1.0f, 1.0f, 1234);
-    std::vector<char> cl_buf;
+    std::vector<float> cl_buf;
     auto cl = to_layout(cf, TensorLayout::NHWC, cl_buf);
 
     ReduceAttributes attrs;

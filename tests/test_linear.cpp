@@ -70,7 +70,7 @@ TensorDesc make_desc(std::initializer_list<int64_t> dims,
     d.rank = static_cast<int64_t>(dims.size());
     d.dims = std::span<const int64_t>(dims.begin(), dims.size());
     d.dtype = dtype;
-    d.layout = TensorLayout::NCHW;
+    d.layout = TensorLayout::Dense;
     return d;
 }
 
@@ -155,7 +155,7 @@ QuantParams quant_arrays(QuantGranularity g, const float* scale,
 
 TensorView make_view(std::span<const int64_t> shape, DataType dt, void* data,
                      const QuantParams& qp = {}) {
-    return TensorView(shape, dt, data, TensorLayout::NCHW, qp);
+    return TensorView(shape, dt, data, TensorLayout::Dense, qp);
 }
 
 }  // anonymous namespace
@@ -187,7 +187,7 @@ NNOPS_TEST(linear_basic) {
     NNOPS_EXPECT_EQ(descs[0].rank, 2);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 4);
-    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
+    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::Dense));
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].dtype), static_cast<int>(DataType::f32));
 
     int64_t out_numel = 1;
@@ -236,7 +236,7 @@ NNOPS_TEST(linear_with_bias) {
     NNOPS_EXPECT_EQ(descs[0].rank, 2);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 1);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
-    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
+    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::Dense));
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].dtype), static_cast<int>(DataType::f32));
 
     int64_t out_numel = 1;
@@ -695,8 +695,8 @@ NNOPS_TEST(linear_int8_output_matches_ref) {
         std::vector<uint8_t> want(static_cast<size_t>(od.nbytes()), 0);
         const auto shape = std::span<const int64_t>(od.dims.data(),
                                                     static_cast<size_t>(od.rank));
-        TensorView og(shape, odt, got.data(), TensorLayout::NCHW, oq);
-        TensorView ow(shape, odt, want.data(), TensorLayout::NCHW, oq);
+        TensorView og(shape, odt, got.data(), TensorLayout::Dense, oq);
+        TensorView ow(shape, odt, want.data(), TensorLayout::Dense, oq);
 
         const TensorView ins[] = {x, w, b};
         op->compute(og, ins);

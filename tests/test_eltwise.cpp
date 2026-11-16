@@ -50,7 +50,7 @@ NNOPS_TEST(eltwise_add_1d) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
@@ -83,7 +83,7 @@ NNOPS_TEST(eltwise_sub_1d) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
@@ -115,7 +115,7 @@ NNOPS_TEST(eltwise_mul_1d) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
@@ -148,7 +148,7 @@ NNOPS_TEST(eltwise_div_1d) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
@@ -181,7 +181,7 @@ NNOPS_TEST(eltwise_add_to) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
@@ -208,7 +208,7 @@ NNOPS_TEST(eltwise_random_add) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 1000);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> out_buf(1000);
     auto output = test::make_channel_first(descs[0], out_buf.data());
@@ -236,7 +236,7 @@ NNOPS_TEST(eltwise_random_mul) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 500);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     std::vector<float> out_buf(500);
     auto output = test::make_channel_first(descs[0], out_buf.data());
@@ -270,7 +270,7 @@ NNOPS_TEST(eltwise_2d_add) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
@@ -302,7 +302,7 @@ NNOPS_TEST(eltwise_min_1d) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
@@ -335,7 +335,7 @@ NNOPS_TEST(eltwise_max_1d) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
@@ -444,7 +444,7 @@ NNOPS_TEST(eltwise_pow_1d) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 
     auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
@@ -648,15 +648,15 @@ NNOPS_TEST(eltwise_quant_per_tensor_add_s8) {
     QuantParams qp;
     qp.scale = 1.0f;
     qp.granularity = QuantGranularity::PerTensor;
-    TensorView a(shape, DataType::s8, a_data, TensorLayout::NCHW, qp);
-    TensorView b(shape, DataType::s8, b_data, TensorLayout::NCHW, qp);
+    TensorView a(shape, DataType::s8, a_data, TensorLayout::Dense, qp);
+    TensorView b(shape, DataType::s8, b_data, TensorLayout::Dense, qp);
 
     EltwiseAttributes attrs;
     attrs.type = EltwiseType::Add;
     auto op = Eltwise::create(attrs, Backend::CPU);
 
     int8_t out_buf[4] = {};
-    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, qp);
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::Dense, qp);
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -678,15 +678,15 @@ NNOPS_TEST(eltwise_quant_per_token_sub_s8) {
     qp.granularity = QuantGranularity::PerToken;
     qp.scale_data = scale_data;
     qp.num_scales = 2;
-    TensorView a(shape, DataType::s8, a_data, TensorLayout::NCHW, qp);
-    TensorView b(shape, DataType::s8, b_data, TensorLayout::NCHW, qp);
+    TensorView a(shape, DataType::s8, a_data, TensorLayout::Dense, qp);
+    TensorView b(shape, DataType::s8, b_data, TensorLayout::Dense, qp);
 
     EltwiseAttributes attrs;
     attrs.type = EltwiseType::Sub;
     auto op = Eltwise::create(attrs, Backend::CPU);
 
     int8_t out_buf[6] = {};
-    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, qp);
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::Dense, qp);
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -709,15 +709,15 @@ NNOPS_TEST(eltwise_quant_per_tensor_add_u8) {
     qp.scale = 0.5f;
     qp.zero_point = 128;
     qp.granularity = QuantGranularity::PerTensor;
-    TensorView a(shape, DataType::u8, a_data, TensorLayout::NCHW, qp);
-    TensorView b(shape, DataType::u8, b_data, TensorLayout::NCHW, qp);
+    TensorView a(shape, DataType::u8, a_data, TensorLayout::Dense, qp);
+    TensorView b(shape, DataType::u8, b_data, TensorLayout::Dense, qp);
 
     EltwiseAttributes attrs;
     attrs.type = EltwiseType::Add;
     auto op = Eltwise::create(attrs, Backend::CPU);
 
     uint8_t out_buf[3] = {};
-    TensorView output(shape, DataType::u8, out_buf, TensorLayout::NCHW, qp);
+    TensorView output(shape, DataType::u8, out_buf, TensorLayout::Dense, qp);
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);

@@ -23,7 +23,7 @@ Status Conv3D::validate(std::span<const TensorDesc> inputs,
 {
     // input, weight [, bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
-    return detail::require(is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly));
+    return detail::require(is_layout_supported(inputs[0].layout, LayoutSupport::ChannelLastOnly));
 }
 
 Status Conv3D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

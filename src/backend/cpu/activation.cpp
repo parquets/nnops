@@ -85,9 +85,8 @@ void apply_activation_flt(ActivationType type, const T* in, T* out, int64_t M, i
 
 } // anonymous namespace
 
-/// PRelu: one slope per logical channel (dim 1). Channel-first strides a whole plane
-/// per slope, so a row is one constant-slope LeakyRelu; channel-last packs C
-/// inside every pixel, so the slope vector loads alongside the pixel vector.
+/// PRelu: one slope per logical channel (dim 1). Channel-last packs C inside
+/// every pixel, so the slope vector loads alongside the pixel vector.
 template <typename T>
 void prelu_impl(const ActivationAttributes& attrs, TensorView& output,
                 std::span<const TensorView> inputs, const ComputeContext& ctx)
@@ -109,33 +108,12 @@ void prelu_impl(const ActivationAttributes& attrs, TensorView& output,
     if (rows_total == 0) {
         return;
     }
-    const int64_t rows_per_c = (C > 0) ? rows_total / C : 0;
-
-    // Rank-2 keeps C on the innermost axis in either layout; rank ≥ 3 channel-first
-    // gives each channel a contiguous run of rows.
-    const bool per_row_slope = is_channel_first_spatial(x.layout()) && x.rank() >= 3;
-
-    constexpr int64_t kTileRows = 32;
-    const int64_t num_tiles = (rows_total + kTileRows - 1) / kTileRows;
-
-    if (per_row_slope && rows_per_c > 0) {
-        const int64_t cols = x.shape(x.rank() - 1);
-        ctx.cpu.run(0, num_tiles, [&](int64_t ti) {
-            const int64_t r0 = ti * kTileRows;
-            const int64_t m = std::min(kTileRows, rows_total - r0);
-            for (int64_t j = 0; j < m; ++j) {
-                const int64_t r = r0 + j;
-                const int64_t c = (slope_n == 1) ? 0 : r / rows_per_c;
-                kernel::leaky_relu<T>(in + r * in_stride, out + r * out_stride, 1, cols, in_stride,
-                                      out_stride, add_to, s_load(&sp[c]));
-            }
-        });
-        return;
-    }
 
     // Pixel-major: channel = column % C. A channel-last row is W pixels of C
     // channels; a rank-2 row is the channel vector itself.
     constexpr int L = simd_lane_for<T>;
+    constexpr int64_t kTileRows = 32;
+    const int64_t num_tiles = (rows_total + kTileRows - 1) / kTileRows;
     const int64_t last = (C > 0) ? x.shape(x.rank() - 1) : 0;
     const int64_t cols = is_channel_last(x.layout()) ? C * last : last;
     const bool c_aligned = (C % L) == 0;

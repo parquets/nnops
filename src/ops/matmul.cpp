@@ -60,7 +60,7 @@ Status MatMul::validate(std::span<const TensorDesc> inputs,
 {
     // A, B, [bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
-    if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
+    if (!is_layout_supported(inputs[0].layout, LayoutSupport::Any)) {
         return Status::invalid_argument;
     }
     // The pre-activation residual is a CPU-route fold (see MatMulAttributes).

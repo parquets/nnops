@@ -52,7 +52,7 @@ public:
     OpType  getOpType()  const override { return OpType::Compare; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::Any;
     }
 
     struct Impl;
@@ -97,7 +97,7 @@ public:
     OpType  getOpType()  const override { return OpType::Logical; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::Any;
     }
 
     struct Impl;

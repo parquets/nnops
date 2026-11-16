@@ -69,7 +69,7 @@ Status Split::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, n));
 
     const auto& in = inputs[0];
-    if (!is_layout_supported(in.layout, LayoutSupport::ChannelFirstOnly)) {
+    if (!is_layout_supported(in.layout, LayoutSupport::Any)) {
         return Status::unsupported;
     }
     if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8, DataType::s32,

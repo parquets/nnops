@@ -28,13 +28,10 @@ bool is_fp(DataType dtype) noexcept
 }
 
 /// One input and one output channel per group, with the filter in the
-/// channel-first order the depthwise kernels take.
+/// [C, 1, KH, KW] order the depthwise kernels take.
 bool is_depthwise_geometry(const TransposeConv2DAttributes& attrs, const TensorView& weight)
 {
-    if (attrs.groups <= 1) {
-        return false;
-    }
-    if (!is_channel_first_spatial(weight.layout()) || weight.rank() != 4) {
+    if (attrs.groups <= 1 || weight.rank() != 4) {
         return false;
     }
     return weight.shape(1) == 1 && weight.shape(0) == attrs.groups;
@@ -76,8 +73,7 @@ Status TransposeConv2D::validate(std::span<const TensorDesc> inputs,
         is_quantized_transpose_conv2d(inputs[1].dtype)) {
         return Status::unsupported;
     }
-    return detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOrChannelLast));
+    return detail::require(is_channel_last(inputs[0].layout));
 }
 
 Status TransposeConv2D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
@@ -93,9 +89,7 @@ Status TransposeConv2D::compute(std::span<TensorView> outputs, std::span<const T
     // hand-over: its TransposeConv2D entry declines the GEMM on this geometry
     // and reaches the same kernel file from its own dispatch.
     if (backend_ == Backend::CPU && inputs.size() >= 2 && is_fp(inputs[0].data_type()) &&
-        inputs[1].data_type() == inputs[0].data_type() &&
-        (is_channel_first_spatial(inputs[0].layout()) || is_channel_last(inputs[0].layout())) &&
-        is_depthwise_geometry(attrs_, inputs[1])) {
+        inputs[1].data_type() == inputs[0].data_type() && is_depthwise_geometry(attrs_, inputs[1])) {
         DepthwiseTransposeConv2DAttributes dw;
         dw.kernel_size = attrs_.kernel_size;
         dw.stride = attrs_.stride;

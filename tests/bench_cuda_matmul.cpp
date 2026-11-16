@@ -513,9 +513,9 @@ double run_i8(int64_t m, int64_t n, int64_t k, const char* tag,
     const int64_t bs[] = {tb ? n : k, tb ? k : n};
     const int64_t cs[] = {m, n};
     TensorView av(std::span<const int64_t>(as, 2), DataType::u8, da.data(),
-                  TensorLayout::NCHW, qa);
+                  TensorLayout::Dense, qa);
     TensorView bv(std::span<const int64_t>(bs, 2), DataType::s8, db.data(),
-                  TensorLayout::NCHW, qb);
+                  TensorLayout::Dense, qb);
     TensorView cv(std::span<const int64_t>(cs, 2), DataType::s32, dc.data());
 
     auto op = MatMul::create(attrs, Backend::CUDA);
@@ -1355,9 +1355,9 @@ NNOPS_BENCH(cuda_matmul_i8_ptx) {
             const int64_t bs[] = {tb ? n : k, tb ? k : n};
             const int64_t cs[] = {m, n};
             TensorView av(std::span<const int64_t>(as, 2), DataType::u8,
-                          da.data(), TensorLayout::NCHW, qa);
+                          da.data(), TensorLayout::Dense, qa);
             TensorView bv(std::span<const int64_t>(bs, 2), DataType::s8,
-                          db.data(), TensorLayout::NCHW, qb);
+                          db.data(), TensorLayout::Dense, qb);
             TensorView cv(std::span<const int64_t>(cs, 2), odt, dc.data());
 
             auto op = MatMul::create(attrs, Backend::CUDA);
@@ -1485,9 +1485,9 @@ NNOPS_BENCH(cuda_matmul_i8_cublas) {
         const int64_t bs[] = {tb ? n : k, tb ? k : n};
         const int64_t cs[] = {m, n};
         TensorView av(std::span<const int64_t>(as, 2), DataType::s8, da.data(),
-                      TensorLayout::NCHW, qa);
+                      TensorLayout::Dense, qa);
         TensorView bv(std::span<const int64_t>(bs, 2), DataType::s8, db.data(),
-                      TensorLayout::NCHW, qb);
+                      TensorLayout::Dense, qb);
         TensorView cv(std::span<const int64_t>(cs, 2), DataType::s32, dc.data());
 
         auto op = MatMul::create(attrs, Backend::CUDA);
@@ -1506,9 +1506,9 @@ NNOPS_BENCH(cuda_matmul_i8_cublas) {
             QuantParams qb0 = qb;
             qb0.zero_point = 0;
             TensorView a0(std::span<const int64_t>(as, 2), DataType::s8,
-                          da.data(), TensorLayout::NCHW, qa0);
+                          da.data(), TensorLayout::Dense, qa0);
             TensorView b0(std::span<const int64_t>(bs, 2), DataType::s8,
-                          db.data(), TensorLayout::NCHW, qb0);
+                          db.data(), TensorLayout::Dense, qb0);
             TensorView c0(std::span<const int64_t>(cs, 2), DataType::s32,
                           dc.data());
             CudaBuffer dref(static_cast<size_t>(m * n) * sizeof(int32_t));
@@ -1628,9 +1628,9 @@ NNOPS_BENCH(cuda_matmul_i8_cublas_tiles) {
         const int64_t bs[] = {tb ? n : k, tb ? k : n};
         const int64_t cs[] = {m, n};
         TensorView av(std::span<const int64_t>(as, 2), DataType::s8, da.data(),
-                      TensorLayout::NCHW, qa);
+                      TensorLayout::Dense, qa);
         TensorView bv(std::span<const int64_t>(bs, 2), DataType::s8, db.data(),
-                      TensorLayout::NCHW, qb);
+                      TensorLayout::Dense, qb);
         TensorView cv(std::span<const int64_t>(cs, 2), DataType::s32, dc.data());
         auto op = MatMul::create(attrs, Backend::CUDA);
         const TensorView ins[] = {av, bv};
@@ -1705,9 +1705,9 @@ NNOPS_BENCH(cuda_matmul_i8_tiles) {
             const int64_t bs[] = {tb ? n : k, tb ? k : n};
             const int64_t cs[] = {m, n};
             TensorView av(std::span<const int64_t>(as, 2), DataType::u8,
-                          da.data(), TensorLayout::NCHW, qa);
+                          da.data(), TensorLayout::Dense, qa);
             TensorView bv(std::span<const int64_t>(bs, 2), DataType::s8,
-                          db.data(), TensorLayout::NCHW, qb);
+                          db.data(), TensorLayout::Dense, qb);
             TensorView cv(std::span<const int64_t>(cs, 2), DataType::s32,
                           dc.data());
             auto op = MatMul::create(attrs, Backend::CUDA);

@@ -3,18 +3,19 @@
 /// channel-last.
 ///
 /// All tests use the class API path:
-/// Channel-first in -> LayoutConvert -> channel-last -> Resize::compute ->
-/// LayoutConvert -> channel-first -> compare. The parity check between the two
-/// paths also runs the channel-first Resize directly.
+/// channel-first in -> channel-last view -> Resize::compute -> channel-first
+/// copy -> compare. The parity check between the two paths also runs the
+/// channel-first Resize directly.
 
 #include "nnops/ops/resize.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "common/test_harness.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 #include "common/test_helpers.hpp"
+#include "common/channel_last.hpp"
 
 #include <algorithm>
+#include <span>
 #include <vector>
 #include <cmath>
 
@@ -39,7 +40,7 @@ void test_channel_last_vs_channel_first(const std::vector<int64_t>& in_shape,
     const int64_t rank = static_cast<int64_t>(in_shape.size());
     const int64_t srank = rank - 2;  // 2 or 3
 
-    const TensorLayout channel_first_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    const TensorLayout channel_first_layout = TensorLayout::Dense;
     const TensorLayout cl_layout = (srank == 3) ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
     auto [in_vec, in_default] = test::make_random_tensor(in_shape);
@@ -77,21 +78,21 @@ void test_channel_last_vs_channel_first(const std::vector<int64_t>& in_shape,
     }
 
     {
-        auto to_cl_op = LayoutConvert::create(cl_layout, Backend::CPU);
-        auto d = in_channel_first.desc();
-        const TensorDesc cl_in_desc[] = {d};
-        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_desc);
+        const int64_t N = in_shape[0];
+        const int64_t C = in_shape[1];
+        const int64_t in_S = in_channel_first.numel() / (N * C);
+        std::vector<float> cl_buf = test::to_channel_last(
+            std::span<const float>(in_channel_first.ptr<float>(),
+                                   static_cast<size_t>(in_channel_first.numel())),
+            N, C, in_S);
+        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+                         cl_layout);
 
-        NNOPS_EXPECT_EQ(cl_descs[0].rank, rank);
-        NNOPS_EXPECT_EQ(cl_descs[0].layout, cl_layout);
-        NNOPS_EXPECT_EQ(cl_descs[0].dtype, DataType::f32);
-        NNOPS_EXPECT_EQ(cl_descs[0].dims[0], in_shape[0]);
-        NNOPS_EXPECT_EQ(cl_descs[0].dims[1], in_shape[1]);
-
-        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
-        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_in_descs[] = {in_channel_first};
-        to_cl_op->compute(in_cl, cl_in_descs);
+        NNOPS_EXPECT_EQ(in_cl.rank(), rank);
+        NNOPS_EXPECT_EQ(in_cl.layout(), cl_layout);
+        NNOPS_EXPECT_EQ(in_cl.data_type(), DataType::f32);
+        NNOPS_EXPECT_EQ(in_cl.shape(0), in_shape[0]);
+        NNOPS_EXPECT_EQ(in_cl.shape(1), in_shape[1]);
 
         auto resize_op = Resize::create(attrs, Backend::CPU);
         auto pd = in_cl.desc();
@@ -112,39 +113,24 @@ void test_channel_last_vs_channel_first(const std::vector<int64_t>& in_shape,
             NNOPS_EXPECT_EQ(resize_descs[0].dims[3], attrs.output_size[2]);
         }
 
-        std::vector<char> resize_buf(resize_descs[0].storage_bytes());
+        std::vector<float> resize_buf(static_cast<size_t>(resize_descs[0].numel()));
         if (attrs.add_to) {
-            float* fbuf = reinterpret_cast<float*>(resize_buf.data());
-            size_t nfloats = resize_descs[0].storage_bytes() / sizeof(float);
-            std::fill(fbuf, fbuf + nfloats, prefill_val);
+            std::fill(resize_buf.begin(), resize_buf.end(), prefill_val);
         }
-        auto out_cl = test::make_packed(resize_descs[0], resize_buf.data());
+        TensorView out_cl(std::span<const int64_t>(resize_descs[0].dims.data(),
+                                                   static_cast<size_t>(resize_descs[0].rank)),
+                          DataType::f32, resize_buf.data(), cl_layout);
         const TensorView resize_ins[] = {in_cl};
         resize_op->compute(out_cl, resize_ins);
 
-        auto unto_cl_op = LayoutConvert::create(channel_first_layout, Backend::CPU);
-        auto od = out_cl.desc();
-        const TensorDesc uncl_in_desc[] = {od};
-        auto uncl_descs = unto_cl_op->getOutputTensorDesc(uncl_in_desc);
-
-        NNOPS_EXPECT_EQ(uncl_descs[0].rank, rank);
-        NNOPS_EXPECT_EQ(uncl_descs[0].layout, channel_first_layout);
-        NNOPS_EXPECT_EQ(uncl_descs[0].dtype, DataType::f32);
-        NNOPS_EXPECT_EQ(uncl_descs[0].dims[0], in_shape[0]);
-        NNOPS_EXPECT_EQ(uncl_descs[0].dims[1], in_shape[1]);
-        if (srank == 3) {
-            NNOPS_EXPECT_EQ(uncl_descs[0].dims[2], attrs.output_size[0]);
-            NNOPS_EXPECT_EQ(uncl_descs[0].dims[3], attrs.output_size[1]);
-            NNOPS_EXPECT_EQ(uncl_descs[0].dims[4], attrs.output_size[2]);
-        } else {
-            NNOPS_EXPECT_EQ(uncl_descs[0].dims[2], attrs.output_size[1]);
-            NNOPS_EXPECT_EQ(uncl_descs[0].dims[3], attrs.output_size[2]);
-        }
-
-        std::vector<char> channel_first_buf(uncl_descs[0].storage_bytes());
-        auto res_channel_first = test::make_channel_first(uncl_descs[0], channel_first_buf.data());
-        const TensorView uncl_in_descs[] = {out_cl};
-        unto_cl_op->compute(res_channel_first, uncl_in_descs);
+        const int64_t out_N = out_cl.shape(0);
+        const int64_t out_C = out_cl.shape(1);
+        const int64_t out_S = out_cl.numel() / (out_N * out_C);
+        std::vector<float> res_buf = test::to_channel_first(
+            std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
+            out_N, out_C, out_S);
+        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+                                     channel_first_layout);
 
         const float tol = (attrs.mode == ResizeMode::Nearest) ? 1e-4f : 1e-3f;
         NNOPS_EXPECT_TRUE(test::allclose(res_channel_first, out_ref, tol, tol));
@@ -162,26 +148,25 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
 {
     const int64_t rank = static_cast<int64_t>(in_shape.size());
     const int64_t srank = rank - 2;
-    const TensorLayout channel_first_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    const TensorLayout channel_first_layout = TensorLayout::Dense;
     const TensorLayout cl_layout = (srank == 3) ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
     // TensorView takes a mutable buffer; copy the const input.
     std::vector<float> in_buf = in_data;
     TensorView in_channel_first(std::span<const int64_t>(in_shape), DataType::f32, in_buf.data(), channel_first_layout);
 
-    auto to_cl_op = LayoutConvert::create(cl_layout, Backend::CPU);
-    auto d = in_channel_first.desc();
-    const TensorDesc cl_in_desc[] = {d};
-    auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_desc);
+    const int64_t N = in_shape[0];
+    const int64_t C = in_shape[1];
+    const int64_t in_S = in_channel_first.numel() / (N * C);
+    std::vector<float> cl_buf = test::to_channel_last(
+        std::span<const float>(in_channel_first.ptr<float>(),
+                               static_cast<size_t>(in_channel_first.numel())),
+        N, C, in_S);
+    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(), cl_layout);
 
-    NNOPS_EXPECT_EQ(cl_descs[0].rank, rank);
-    NNOPS_EXPECT_EQ(cl_descs[0].layout, cl_layout);
-    NNOPS_EXPECT_EQ(cl_descs[0].dtype, DataType::f32);
-
-    std::vector<char> cl_buf(cl_descs[0].storage_bytes());
-    auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-    const TensorView cl_in_descs[] = {in_channel_first};
-    to_cl_op->compute(in_cl, cl_in_descs);
+    NNOPS_EXPECT_EQ(in_cl.rank(), rank);
+    NNOPS_EXPECT_EQ(in_cl.layout(), cl_layout);
+    NNOPS_EXPECT_EQ(in_cl.data_type(), DataType::f32);
 
     auto resize_op = Resize::create(attrs, Backend::CPU);
     auto pd = in_cl.desc();
@@ -192,24 +177,21 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
     NNOPS_EXPECT_EQ(resize_descs[0].layout, cl_layout);
     NNOPS_EXPECT_EQ(resize_descs[0].dtype, DataType::f32);
 
-    std::vector<char> resize_buf(resize_descs[0].storage_bytes());
-    auto out_cl = test::make_packed(resize_descs[0], resize_buf.data());
+    std::vector<float> resize_buf(static_cast<size_t>(resize_descs[0].numel()));
+    TensorView out_cl(std::span<const int64_t>(resize_descs[0].dims.data(),
+                                               static_cast<size_t>(resize_descs[0].rank)),
+                      DataType::f32, resize_buf.data(), cl_layout);
     const TensorView resize_ins[] = {in_cl};
     resize_op->compute(out_cl, resize_ins);
 
-    auto unto_cl_op = LayoutConvert::create(channel_first_layout, Backend::CPU);
-    auto od = out_cl.desc();
-    const TensorDesc uncl_in_desc[] = {od};
-    auto uncl_descs = unto_cl_op->getOutputTensorDesc(uncl_in_desc);
-
-    NNOPS_EXPECT_EQ(uncl_descs[0].rank, rank);
-    NNOPS_EXPECT_EQ(uncl_descs[0].layout, channel_first_layout);
-    NNOPS_EXPECT_EQ(uncl_descs[0].dtype, DataType::f32);
-
-    std::vector<char> channel_first_buf(uncl_descs[0].storage_bytes());
-    auto res_channel_first = test::make_channel_first(uncl_descs[0], channel_first_buf.data());
-    const TensorView uncl_in_descs[] = {out_cl};
-    unto_cl_op->compute(res_channel_first, uncl_in_descs);
+    const int64_t out_N = out_cl.shape(0);
+    const int64_t out_C = out_cl.shape(1);
+    const int64_t out_S = out_cl.numel() / (out_N * out_C);
+    std::vector<float> res_buf = test::to_channel_first(
+        std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
+        out_N, out_C, out_S);
+    TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+                                 channel_first_layout);
 
     validate_fn(res_channel_first);
 }
@@ -461,7 +443,7 @@ NNOPS_TEST(resize_2d_cubic_ramp_interior_2d) {
 NNOPS_TEST(resize_3d_cubic_unsupported) {
     std::vector<float> in(8, 1.0f);
     const int64_t ishape[] = {1, 1, 2, 2, 2};
-    TensorView x(ishape, DataType::f32, in.data(), TensorLayout::NCDHW);
+    TensorView x(ishape, DataType::f32, in.data(), TensorLayout::NDHWC);
 
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Cubic;

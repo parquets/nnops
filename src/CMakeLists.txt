@@ -27,7 +27,6 @@ set(NNOPS_CPU_SOURCES
     ops/reduce.cpp
     ops/resize.cpp
     ops/grid_sample.cpp
-    ops/layout_convert.cpp
     ops/linear_attention.cpp
     ops/group_query_attention.cpp
     ops/multi_latent_attention.cpp
@@ -58,9 +57,6 @@ set(NNOPS_CPU_SOURCES
 
     # Operator scratch-memory pool (shared, thread-safe singleton)
     backend/cpu/common/memory_pool.cpp
-
-    # Layout conversion utilities (planar <-> channel-last)
-    backend/cpu/layout_convert.cpp
 
     # CPU optimized kernels (SIMD-accelerated)
     backend/cpu/activation.cpp

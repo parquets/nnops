@@ -1,7 +1,7 @@
 /// @file flatten.cpp
 /// @brief SIMD-optimized CPU implementation of Flatten.
 ///
-/// Row-by-row SIMD copy from any input layout to dense channel-first output.
+/// Row-by-row SIMD copy from any input layout to dense row-major output.
 /// Uses the generic SIMD API (v_load/v_store) to handle both f32 and f16.
 ///
 /// The key optimization: detect when the input is already dense in the
@@ -25,7 +25,7 @@ void flatten_impl(const FlattenAttributes& /*attrs*/, TensorView& output,
     const int64_t rank = input.rank();
     constexpr int L = simd_lane_for<T>;
 
-    // Output is always dense channel-first
+    // Output is always dense row-major
     const int64_t oW = output.shape(rank - 1);
     const int64_t o_row_stride = oW;
 

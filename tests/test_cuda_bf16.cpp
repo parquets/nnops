@@ -12,8 +12,8 @@
 ///
 /// The cases cover each kernel family the backend dispatches: the elementwise
 /// pack8 path, the CuTe GEMM with its bf16 MMA atom (and the split-K reduce,
-/// whose partial planes are f32), the conv / transpose-conv / depthwise routes in
-/// both layouts, and the movement, index and k-selection operators. Operands of
+/// whose partial planes are f32), the channel-last conv / transpose-conv /
+/// depthwise routes, and the movement, index and k-selection operators. Operands of
 /// equal shape only: the CUDA elementwise kernel walks both in lockstep, so a
 /// broadcast second operand is unsupported for every dtype, not just bf16.
 ///
@@ -69,7 +69,7 @@ constexpr float kTolRel = 2e-2f;
 
 HostTensor rnd(std::vector<int64_t> shape, bool padded = false, uint64_t seed = 17,
                float lo = -0.5f, float hi = 0.5f,
-               TensorLayout layout = TensorLayout::NCHW)
+               TensorLayout layout = TensorLayout::Dense)
 {
     return make_host_random(shape, DataType::f32, padded, seed, lo, hi, layout);
 }
@@ -342,31 +342,15 @@ NNOPS_TEST(cuda_bf16_linear) {
 NNOPS_TEST(cuda_bf16_conv2d) {
     struct Case {
         int64_t ic = 8, oc = 16, kh = 3, kw = 3, sh = 1, sw = 1, ph = 1, pw = 1;
-        bool channel_last = false;
         bool bias = false;
-        bool padded = false;
     };
     std::vector<Case> cases;
     {
-        Case c;                      // 3x3 s1 p1, channel-first pitched
-        c.padded = true;
+        Case c;                      // 3x3 s1 p1
         cases.push_back(c);
     }
     {
-        Case c;                      // stride 2
-        c.sh = c.sw = 2;
-        c.ph = c.pw = 0;
-        c.bias = true;
-        cases.push_back(c);
-    }
-    {
-        Case c;                      // the channel-last route
-        c.channel_last = true;
-        cases.push_back(c);
-    }
-    {
-        Case c;                      // 1x1 pointwise, channel-last
-        c.channel_last = true;
+        Case c;                      // 1x1 pointwise
         c.kh = c.kw = 1;
         c.ph = c.pw = 0;
         c.oc = 24;
@@ -379,16 +363,10 @@ NNOPS_TEST(cuda_bf16_conv2d) {
         attrs.stride = {c.sh, c.sw};
         attrs.padding = {c.ph, c.pw};
 
-        const TensorLayout act_layout =
-            c.channel_last ? TensorLayout::NHWC : TensorLayout::NCHW;
-        const TensorLayout wgt_layout =
-            c.channel_last ? TensorLayout::HWIO : TensorLayout::NCHW;
-
-        HostTensor act = rnd({1, c.ic, 10, 12}, c.padded, 23, -0.5f, 0.5f, act_layout);
-        HostTensor wgt =
-            c.channel_last
-                ? rnd({c.kh, c.kw, c.ic, c.oc}, false, 29, -0.25f, 0.25f, wgt_layout)
-                : rnd({c.oc, c.ic, c.kh, c.kw}, false, 29, -0.25f, 0.25f, wgt_layout);
+        HostTensor act = rnd({1, c.ic, 10, 12}, false, 23, -0.5f, 0.5f,
+                             TensorLayout::NHWC);
+        HostTensor wgt = rnd({c.kh, c.kw, c.ic, c.oc}, false, 29, -0.25f, 0.25f,
+                             TensorLayout::HWIO);
         std::vector<HostTensor> own = {act, wgt};
         if (c.bias) { own.push_back(rnd({c.oc}, false, 31, -0.25f, 0.25f)); }
         run_op_bf16([attrs](Backend be) { return Conv2D::create(attrs, be); },
@@ -398,72 +376,53 @@ NNOPS_TEST(cuda_bf16_conv2d) {
 }
 
 NNOPS_TEST(cuda_bf16_transpose_conv2d) {
-    for (bool channel_last : {false, true}) {
-        TransposeConv2DAttributes attrs;
-        attrs.kernel_size = {3, 3};
-        attrs.stride = {2, 2};
-        attrs.padding = {1, 1};
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {2, 2};
+    attrs.padding = {1, 1};
 
-        const TensorLayout act_layout =
-            channel_last ? TensorLayout::NHWC : TensorLayout::NCHW;
-        HostTensor act = rnd({1, 6, 7, 9}, !channel_last, 23, -0.5f, 0.5f, act_layout);
-        HostTensor wgt = rnd({6, 4, 3, 3}, false, 29, -0.25f, 0.25f);
-        HostTensor bias = rnd({4}, false, 31, -0.25f, 0.25f);
-        const HostTensor in[] = {act, wgt, bias};
-        run_op_bf16([attrs](Backend be) { return TransposeConv2D::create(attrs, be); },
-                    std::span<const HostTensor>(in), kTolAbs, kTolRel,
-                    "cuda_bf16_transpose_conv2d");
-    }
+    HostTensor act = rnd({1, 6, 7, 9}, false, 23, -0.5f, 0.5f,
+                         TensorLayout::NHWC);
+    HostTensor wgt = rnd({6, 4, 3, 3}, false, 29, -0.25f, 0.25f);
+    HostTensor bias = rnd({4}, false, 31, -0.25f, 0.25f);
+    const HostTensor in[] = {act, wgt, bias};
+    run_op_bf16([attrs](Backend be) { return TransposeConv2D::create(attrs, be); },
+                std::span<const HostTensor>(in), kTolAbs, kTolRel,
+                "cuda_bf16_transpose_conv2d");
 }
 
 NNOPS_TEST(cuda_bf16_depthwise_conv) {
-    for (bool channel_last : {false, true}) {
-        DepthwiseConvAttributes attrs;
-        attrs.kernel_size = {1, 3, 3};
-        attrs.padding = {0, 1, 1};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 3, 3};
+    attrs.padding = {0, 1, 1};
 
-        const int64_t C = 8;
-        const TensorLayout in_layout =
-            channel_last ? TensorLayout::NHWC : TensorLayout::NCHW;
-        HostTensor in = rnd({1, C, 9, 11}, !channel_last, 17, -1.0f, 1.0f, in_layout);
-
-        std::vector<int64_t> w_shape;
-        TensorLayout w_layout = in_layout;
-        if (channel_last) {
-            w_shape = {3, 3, C};
-            w_layout = TensorLayout::HWCM;
-        } else {
-            w_shape = {C, 1, 3, 3};
-        }
-        HostTensor w = rnd(w_shape, false, 23, -0.5f, 0.5f, w_layout);
-        HostTensor b = rnd({C}, false, 29, -0.25f, 0.25f);
-        const HostTensor ins[] = {in, w, b};
-        run_op_bf16([attrs](Backend be) { return DepthwiseConv::create(attrs, be); },
-                    std::span<const HostTensor>(ins), kTolAbs, kTolRel,
-                    "cuda_bf16_depthwise_conv");
-    }
+    const int64_t C = 8;
+    HostTensor in = rnd({1, C, 9, 11}, false, 17, -1.0f, 1.0f,
+                        TensorLayout::NHWC);
+    HostTensor w = rnd({3, 3, C}, false, 23, -0.5f, 0.5f, TensorLayout::HWCM);
+    HostTensor b = rnd({C}, false, 29, -0.25f, 0.25f);
+    const HostTensor ins[] = {in, w, b};
+    run_op_bf16([attrs](Backend be) { return DepthwiseConv::create(attrs, be); },
+                std::span<const HostTensor>(ins), kTolAbs, kTolRel,
+                "cuda_bf16_depthwise_conv");
 }
 
 NNOPS_TEST(cuda_bf16_depthwise_transpose_conv) {
-    for (bool channel_last : {false, true}) {
-        DepthwiseTransposeConv2DAttributes attrs;
-        attrs.kernel_size = {2, 2};
-        attrs.stride = {2, 2};
+    DepthwiseTransposeConv2DAttributes attrs;
+    attrs.kernel_size = {2, 2};
+    attrs.stride = {2, 2};
 
-        const int64_t C = 7;
-        const TensorLayout layout =
-            channel_last ? TensorLayout::NHWC : TensorLayout::NCHW;
-        HostTensor act = rnd({1, C, 5, 6}, !channel_last, 23, -0.5f, 0.5f, layout);
-        HostTensor wgt = channel_last
-            ? rnd({2, 2, C}, false, 29, -0.25f, 0.25f, TensorLayout::HWCM)
-            : rnd({C, 1, 2, 2}, false, 29, -0.25f, 0.25f);
-        const HostTensor in[] = {act, wgt};
-        run_op_bf16([attrs](Backend be) {
-                        return DepthwiseTransposeConv2D::create(attrs, be);
-                    },
-                    std::span<const HostTensor>(in), kTolAbs, kTolRel,
-                    "cuda_bf16_depthwise_transpose_conv");
-    }
+    const int64_t C = 7;
+    HostTensor act = rnd({1, C, 5, 6}, false, 23, -0.5f, 0.5f,
+                         TensorLayout::NHWC);
+    HostTensor wgt = rnd({2, 2, C}, false, 29, -0.25f, 0.25f,
+                         TensorLayout::HWCM);
+    const HostTensor in[] = {act, wgt};
+    run_op_bf16([attrs](Backend be) {
+                    return DepthwiseTransposeConv2D::create(attrs, be);
+                },
+                std::span<const HostTensor>(in), kTolAbs, kTolRel,
+                "cuda_bf16_depthwise_transpose_conv");
 }
 
 // ============================================================
@@ -471,18 +430,15 @@ NNOPS_TEST(cuda_bf16_depthwise_transpose_conv) {
 // ============================================================
 
 NNOPS_TEST(cuda_bf16_pooling) {
-    for (bool channel_last : {false, true}) {
-        for (PoolingType type : {PoolingType::Max, PoolingType::Average}) {
-            PoolingAttributes attrs = window(type, 3, 2, 1);
-            if (type == PoolingType::Average) { attrs.exclude_pad = true; }
-            HostTensor a = rnd({1, 8, 9, 11}, !channel_last, 13, -1.0f, 1.0f,
-                               channel_last ? TensorLayout::NHWC
-                                            : TensorLayout::NCHW);
-            const HostTensor in[] = {a};
-            run_op_bf16([attrs](Backend be) { return Pooling::create(attrs, be); },
-                        std::span<const HostTensor>(in), kTolAbs, kTolRel,
-                        "cuda_bf16_pooling");
-        }
+    for (PoolingType type : {PoolingType::Max, PoolingType::Average}) {
+        PoolingAttributes attrs = window(type, 3, 2, 1);
+        if (type == PoolingType::Average) { attrs.exclude_pad = true; }
+        HostTensor a = rnd({1, 8, 9, 11}, false, 13, -1.0f, 1.0f,
+                           TensorLayout::NHWC);
+        const HostTensor in[] = {a};
+        run_op_bf16([attrs](Backend be) { return Pooling::create(attrs, be); },
+                    std::span<const HostTensor>(in), kTolAbs, kTolRel,
+                    "cuda_bf16_pooling");
     }
 }
 
@@ -491,7 +447,8 @@ NNOPS_TEST(cuda_bf16_softmax) {
         SoftmaxAttributes attrs;
         attrs.axis = -1;
         attrs.log_softmax = log_softmax;
-        HostTensor a = rnd({2, 5, 37}, true, 17, -2.0f, 2.0f);
+        HostTensor a = rnd({2, 5, 37}, false, 17, -2.0f, 2.0f,
+                           TensorLayout::NHWC);
         const HostTensor in[] = {a};
         run_op_bf16([attrs](Backend be) { return Softmax::create(attrs, be); },
                     std::span<const HostTensor>(in), kTolAbs, kTolRel,
@@ -525,7 +482,8 @@ NNOPS_TEST(cuda_bf16_norm) {
         NormAttributes attrs;
         attrs.type = NormType::GroupNorm;
         attrs.num_groups = 4;
-        HostTensor x = rnd({2, 8, 6, 7}, true, 23, -1.0f, 1.0f);
+        HostTensor x = rnd({2, 8, 6, 7}, false, 23, -1.0f, 1.0f,
+                           TensorLayout::NHWC);
         HostTensor scale = rnd({8}, false, 95, -1.0f, 1.0f);
         HostTensor bias = rnd({8}, false, 96, -1.0f, 1.0f);
         const HostTensor in[] = {x, scale, bias};
@@ -556,7 +514,8 @@ NNOPS_TEST(cuda_bf16_resize) {
         ResizeAttributes attrs;
         attrs.mode = mode;
         attrs.output_size = {0, 13, 17};
-        HostTensor a = rnd({1, 4, 7, 9}, true, 17, -1.0f, 1.0f);
+        HostTensor a = rnd({1, 4, 7, 9}, false, 17, -1.0f, 1.0f,
+                           TensorLayout::NHWC);
         const HostTensor in[] = {a};
         run_op_bf16([attrs](Backend be) { return Resize::create(attrs, be); },
                     std::span<const HostTensor>(in), kTolAbs, kTolRel,

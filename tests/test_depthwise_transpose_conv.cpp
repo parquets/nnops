@@ -1,19 +1,14 @@
 /// @file test_depthwise_transpose_conv.cpp
-/// @brief DepthwiseTransposeConv2D tests — channel-first and channel-last.
+/// @brief DepthwiseTransposeConv2D tests — channel-last.
 ///
-/// Channel-first: the raw [C, 1, KH, KW] filter goes straight to the operator,
-/// and the output is compared with the scalar reference. Two cases are
-/// hand-computed so the suite is not only reference against reference.
-///
-/// Channel-last: the same values in both orders — channel-first plus the raw
-/// channel-first filter for the reference, channel-last plus TensorFlow's
-/// [KH][KW][C] filter for the kernel. The route reads the filter as the graph
-/// holds it, so the only plumbing is the transpose between the orders.
+/// The same values in both orders — channel-first plus the raw channel-first
+/// filter for the reference, channel-last plus TensorFlow's [KH][KW][C] filter
+/// for the kernel. The route reads the filter as the graph holds it, so the
+/// only plumbing is the transpose between the orders.
 ///
 /// The cases sweep the branch structure rather than only the shapes: stride 1
-/// takes the contiguous-store lane in both layouts, stride 2 the residue-class
-/// split (channel-first stages the strided store through a lane buffer); a
-/// 1x1 kernel leaves the interior window empty, dilation moves the taps; the
+/// takes the contiguous-store lane, stride 2 the residue-class split; a 1x1
+/// kernel leaves the interior window empty, dilation moves the taps; the
 /// channel counts pick out sub-vector, partial, full and multi-block sweeps.
 ///
 /// The threaded cases run the same call on a real pool and compare bytes:
@@ -50,132 +45,6 @@ namespace nnops::backend::cpu::reference {
                                       std::span<const TensorView> inputs,
                                       const ComputeContext& ctx,
                                       void* workspace);
-}
-
-// ============================================================
-// Channel-first
-// ============================================================
-
-static void test_channel_first_vs_ref(const std::vector<int64_t>& in_shape,
-                                      const std::vector<int64_t>& w_shape,
-                                      const DepthwiseTransposeConv2DAttributes& attrs,
-                                      bool has_bias = false,
-                                      float tol = 1e-4f)
-{
-    auto [in_vec, in] = test::make_random_tensor(in_shape);
-    auto [w_vec,  w]  = test::make_random_tensor(w_shape);
-    std::vector<float> b_vec;
-    TensorView b;
-    if (has_bias) {
-        auto p = test::make_random_tensor({w_shape[0]});
-        b_vec = std::move(p.first);
-        b = p.second;
-    }
-
-    auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
-
-    std::vector<TensorDesc> descs = {in.desc(), w.desc()};
-    if (has_bias) { descs.push_back(b.desc()); }
-    auto out_descs = op->getOutputTensorDesc(descs);
-
-    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
-    if (attrs.add_to) {
-        // Mixed signs: a positive shortcut survives a ReLU either way, only a
-        // negative one tells the pre- and post-activation orders apart.
-        for (size_t i = 0; i < out_buf.size(); ++i) {
-            out_buf[i] = static_cast<float>(i % 5) * 0.5f - 1.0f;
-        }
-    }
-    std::vector<float> ref_buf(out_buf);
-    auto out = test::make_channel_first(out_descs[0], out_buf.data());
-    auto ref = test::make_channel_first(out_descs[0], ref_buf.data());
-
-    {
-        ComputeContext ctx;
-        std::vector<TensorView> ref_ins = {in, w};
-        if (has_bias) { ref_ins.push_back(b); }
-        backend::cpu::reference::depthwise_transpose_conv_ref(
-            attrs, ref, ref_ins, ctx, nullptr);
-    }
-
-    std::vector<TensorView> ins = {in, w};
-    if (has_bias) { ins.push_back(b); }
-    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
-    NNOPS_EXPECT_TRUE(test::allclose(out, ref, tol, tol));
-}
-
-/// The channel-first route in f16. The f32 reference runs on the same values
-/// widened back from f16, so the only error left is the kernel's own f16
-/// arithmetic.
-static void test_channel_first_f16_vs_ref(const std::vector<int64_t>& in_shape,
-                                          const std::vector<int64_t>& w_shape,
-                                          const DepthwiseTransposeConv2DAttributes& attrs,
-                                          bool has_bias = false)
-{
-    auto [in_vec, in_f32] = test::make_random_tensor(in_shape);
-    auto [w_vec,  w_f32]  = test::make_random_tensor(w_shape);
-    std::vector<float> b_vec;
-    TensorView b_f32;
-    if (has_bias) {
-        auto p = test::make_random_tensor({w_shape[0]});
-        b_vec = std::move(p.first);
-        b_f32 = p.second;
-    }
-
-    // Round in place so the reference and the kernel see the same values.
-    std::vector<half> in_f16(in_vec.size()), w_f16(w_vec.size()), b_f16(b_vec.size());
-    for (size_t i = 0; i < in_f16.size(); ++i) {
-        simd::s_store(&in_f16[i], in_vec[i]);
-        in_vec[i] = simd::s_load(&in_f16[i]);
-    }
-    for (size_t i = 0; i < w_f16.size(); ++i) {
-        simd::s_store(&w_f16[i], w_vec[i]);
-        w_vec[i] = simd::s_load(&w_f16[i]);
-    }
-    for (size_t i = 0; i < b_f16.size(); ++i) {
-        simd::s_store(&b_f16[i], b_vec[i]);
-        b_vec[i] = simd::s_load(&b_f16[i]);
-    }
-
-    TensorView in(std::span<const int64_t>(in_shape), DataType::f16, in_f16.data());
-    TensorView w(std::span<const int64_t>(w_shape), DataType::f16, w_f16.data());
-    const int64_t b_shape[] = {w_shape[0]};
-    TensorView b(std::span<const int64_t>(b_shape, 1), DataType::f16, b_f16.data());
-
-    auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc in_d[] = {in.desc(), w.desc(), b.desc()};
-    auto out_descs = op->getOutputTensorDesc(
-        std::span<const TensorDesc>(in_d, has_bias ? 3 : 2));
-
-    std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
-    if (attrs.add_to) {
-        for (size_t i = 0; i < ref_buf.size(); ++i) {
-            ref_buf[i] = static_cast<float>(i % 5) * 0.5f - 1.0f;
-        }
-    }
-    auto ref = test::make_channel_first(out_descs[0], ref_buf.data());
-    {
-        ComputeContext ctx;
-        const TensorView r[] = {in_f32, w_f32, b_f32};
-        backend::cpu::reference::depthwise_transpose_conv_ref(
-            attrs, ref, std::span<const TensorView>(r, has_bias ? 3 : 2), ctx, nullptr);
-    }
-
-    std::vector<half> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = test::make_channel_first(out_descs[0], out_buf.data());
-    for (size_t i = 0; i < out_buf.size(); ++i) {
-        simd::s_store(&out_buf[i],
-                      attrs.add_to ? static_cast<float>(i % 5) * 0.5f - 1.0f : 0.0f);
-    }
-
-    const TensorView ins[] = {in, w, b};
-    NNOPS_EXPECT_TRUE(
-        is_ok(op->compute(out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
-
-    const auto got = test::f16_to_f32(out_buf);
-    for (size_t i = 0; i < got.size(); ++i) {
-        NNOPS_EXPECT_NEAR(got[i], ref_buf[i], test::kF16AccumTol);
-    }
 }
 
 // ============================================================
@@ -310,148 +179,6 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
 }
 
 // ============================================================
-// Hand-computed cases
-// ============================================================
-
-NNOPS_TEST(dwtconv_hand_exact) {
-    // 1x1 plane, 2x2 filter, stride 1: each output pixel is the input pixel
-    // times the matching tap, so the output *is* the filter.
-    const int64_t ishape[] = {1, 2, 1, 1};
-    const int64_t wshape[] = {2, 1, 2, 2};
-    std::vector<float> in_buf(2, 1.0f);
-    std::vector<float> w_buf = {1, 2, 3, 4, 5, 6, 7, 8};
-
-    TensorView in(ishape, DataType::f32, in_buf.data());
-    TensorView w(wshape, DataType::f32, w_buf.data());
-
-    DepthwiseTransposeConv2DAttributes attrs{{2, 2}, {1, 1}, {1, 1}, {0, 0}, {0, 0}};
-    auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
-
-    const TensorDesc in_desc[] = {in.desc(), w.desc()};
-    auto out_descs = op->getOutputTensorDesc(in_desc);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[2], 2);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 2);
-
-    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = test::make_channel_first(out_descs[0], out_buf.data());
-    const TensorView ins[] = {in, w};
-    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
-
-    const float expect[] = {1, 2, 3, 4, 5, 6, 7, 8};
-    for (size_t i = 0; i < out_buf.size(); ++i) {
-        NNOPS_EXPECT_NEAR(out_buf[i], expect[i], 1e-6f);
-    }
-}
-
-NNOPS_TEST(dwtconv_hand_exact_stride2) {
-    // Two input rows, a 2x1 filter, stride 2: row ih lands at output rows
-    // 2·ih + kh, so the output is [a·w0, a·w1, b·w0, b·w1].
-    const int64_t ishape[] = {1, 1, 2, 1};
-    const int64_t wshape[] = {1, 1, 2, 1};
-    std::vector<float> in_buf = {1.0f, 2.0f};
-    std::vector<float> w_buf  = {3.0f, 5.0f};
-
-    TensorView in(ishape, DataType::f32, in_buf.data());
-    TensorView w(wshape, DataType::f32, w_buf.data());
-
-    DepthwiseTransposeConv2DAttributes attrs{{2, 1}, {2, 1}, {1, 1}, {0, 0}, {0, 0}};
-    auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
-
-    const TensorDesc in_desc[] = {in.desc(), w.desc()};
-    auto out_descs = op->getOutputTensorDesc(in_desc);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[2], 4);
-
-    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = test::make_channel_first(out_descs[0], out_buf.data());
-    const TensorView ins[] = {in, w};
-    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
-
-    const float expect[] = {3.0f, 5.0f, 6.0f, 10.0f};
-    for (size_t i = 0; i < out_buf.size(); ++i) {
-        NNOPS_EXPECT_NEAR(out_buf[i], expect[i], 1e-6f);
-    }
-}
-
-// ============================================================
-// Channel-first table
-// ============================================================
-
-NNOPS_TEST(dwtconv_channel_first_vs_ref_basic) {
-    // Odd output width 15 against an 8-lane vector: the class loop ends on a
-    // partial tile and the row edge runs the scalar path.
-    test_channel_first_vs_ref({1, 4, 12, 13}, {4, 1, 3, 3},
-        DepthwiseTransposeConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}, {0, 0}});
-}
-
-NNOPS_TEST(dwtconv_channel_first_vs_ref_stride2_padding) {
-    // Both coordinates split into two residue classes; the store is strided.
-    test_channel_first_vs_ref({1, 6, 9, 11}, {6, 1, 3, 3},
-        DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}});
-}
-
-NNOPS_TEST(dwtconv_channel_first_vs_ref_output_padding) {
-    test_channel_first_vs_ref({2, 5, 7, 9}, {5, 1, 3, 3},
-        DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {0, 0}, {1, 1}});
-}
-
-NNOPS_TEST(dwtconv_channel_first_vs_ref_dilation) {
-    test_channel_first_vs_ref({1, 4, 8, 10}, {4, 1, 3, 3},
-        DepthwiseTransposeConv2DAttributes{{3, 3}, {1, 1}, {2, 2}, {0, 0}, {0, 0}});
-}
-
-NNOPS_TEST(dwtconv_channel_first_vs_ref_bias) {
-    test_channel_first_vs_ref({2, 8, 8, 8}, {8, 1, 3, 3},
-        DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}}, true);
-}
-
-NNOPS_TEST(dwtconv_channel_first_vs_ref_add_to) {
-    DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
-    attrs.add_to = true;
-    test_channel_first_vs_ref({1, 3, 8, 8}, {3, 1, 3, 3}, attrs);
-}
-
-NNOPS_TEST(dwtconv_channel_first_vs_ref_pre_act) {
-    // ReLU plus a mixed-sign residual: the post-activation order would clamp the
-    // convolution before the shortcut arrives, the pre-activation one after.
-    // Stride 2 puts the residual read on the strided staging path.
-    DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}};
-    attrs.epilogue.type = EpilogueActivateType::Relu;
-    attrs.add_to = true;
-    attrs.residual_pre_activation = true;
-    test_channel_first_vs_ref({1, 6, 9, 11}, {6, 1, 3, 3}, attrs);
-}
-
-NNOPS_TEST(dwtconv_channel_first_vs_ref_relu_epilogue) {
-    DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}};
-    attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_first_vs_ref({1, 5, 6, 11}, {5, 1, 3, 3}, attrs);
-}
-
-NNOPS_TEST(dwtconv_channel_first_vs_ref_1x1_stride2) {
-    // A 1x1 kernel leaves the interior window empty: every class step is an
-    // edge step, so the scalar tap loop carries the whole row.
-    test_channel_first_vs_ref({1, 8, 9, 9}, {8, 1, 1, 1},
-        DepthwiseTransposeConv2DAttributes{{1, 1}, {2, 2}, {1, 1}, {0, 0}, {0, 0}});
-}
-
-NNOPS_TEST(dwtconv_channel_first_f16_pre_act) {
-    DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
-    attrs.epilogue.type = EpilogueActivateType::Relu;
-    attrs.add_to = true;
-    attrs.residual_pre_activation = true;
-    test_channel_first_f16_vs_ref({1, 8, 9, 11}, {8, 1, 3, 3}, attrs, true);
-}
-
-NNOPS_TEST(dwtconv_channel_first_f16_vs_ref) {
-    test_channel_first_f16_vs_ref({1, 8, 10, 11}, {8, 1, 3, 3},
-        DepthwiseTransposeConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}}, true);
-    // Stride 2 and dilation on both axes; the f16 lanes stage through the
-    // strided store path.
-    test_channel_first_f16_vs_ref({2, 6, 7, 9}, {6, 1, 3, 3},
-        DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {2, 2}, {1, 1}, {0, 0}});
-}
-
-// ============================================================
 // Channel-last table
 // ============================================================
 
@@ -573,22 +300,19 @@ namespace {
 struct ThreadCase {
     int64_t in[4];
     int64_t kh, kw, sh, sw, ph, pw;
-    bool last;
 };
 
 }  // namespace
 
 NNOPS_TEST(dwtconv_threaded_matches_serial) {
     const ThreadCase cases[] = {
-        {{1, 32, 24, 24}, 3, 3, 1, 1, 1, 1, false},
-        {{2, 16, 20, 20}, 3, 3, 2, 2, 1, 1, false},
-        {{1, 48, 22, 22}, 3, 3, 2, 2, 1, 1, true},
-        {{2, 17, 18, 19}, 3, 3, 1, 1, 1, 1, true},
-        {{1, 8, 16, 16},   1, 1, 2, 2, 0, 0, true},
-        // Row grids too small for the pool: the channel-first route splits each
-        // row's residue steps into strips here, so the serial run must agree.
-        {{1, 3, 5, 7},     3, 3, 1, 1, 1, 1, false},
-        {{2, 2, 4, 4},     3, 3, 2, 2, 1, 1, false},
+        {{1, 48, 22, 22}, 3, 3, 2, 2, 1, 1},
+        {{2, 17, 18, 19}, 3, 3, 1, 1, 1, 1},
+        {{1, 8, 16, 16},   1, 1, 2, 2, 0, 0},
+        // Row grids too small for the pool: the route splits each row's residue
+        // steps into strips here, so the serial run must agree.
+        {{1, 3, 5, 7},     3, 3, 1, 1, 1, 1},
+        {{2, 2, 4, 4},     3, 3, 2, 2, 1, 1},
     };
 
     for (const auto& c : cases) {
@@ -596,34 +320,27 @@ NNOPS_TEST(dwtconv_threaded_matches_serial) {
             {c.kh, c.kw}, {c.sh, c.sw}, {1, 1}, {c.ph, c.pw}, {0, 0}};
         auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
 
-        auto [in_vec, in_cf] = test::make_random_tensor(
+        auto [in_vec, _] = test::make_random_tensor(
             std::span<const int64_t>(c.in, 4));
-        auto [w_vec, w_cf] = test::make_random_tensor({c.in[1], 1, c.kh, c.kw});
+        auto [w_vec, __] = test::make_random_tensor({c.in[1], 1, c.kh, c.kw});
 
-        std::vector<float> in_cl, w_cl;
-        TensorView in = in_cf;
-        TensorView w = w_cf;
-        if (c.last) {
-            in_cl = test::to_channel_last<float>(in_vec, c.in[0], c.in[1],
-                                                 c.in[2] * c.in[3]);
-            w_cl = test::depthwise_to_hwcm<float>(w_vec, c.in[1], c.kh * c.kw);
-            in = TensorView(std::span<const int64_t>(c.in, 4), DataType::f32,
-                            in_cl.data(), TensorLayout::NHWC);
-            const int64_t wsh[] = {c.kh, c.kw, c.in[1]};
-            w = TensorView(std::span<const int64_t>(wsh, 3), DataType::f32,
-                           w_cl.data(), TensorLayout::HWCM);
-        }
+        const auto in_cl = test::to_channel_last<float>(in_vec, c.in[0], c.in[1],
+                                                        c.in[2] * c.in[3]);
+        const auto w_cl = test::depthwise_to_hwcm<float>(w_vec, c.in[1], c.kh * c.kw);
+        TensorView in(std::span<const int64_t>(c.in, 4), DataType::f32,
+                      const_cast<float*>(in_cl.data()), TensorLayout::NHWC);
+        const int64_t wsh[] = {c.kh, c.kw, c.in[1]};
+        TensorView w(std::span<const int64_t>(wsh, 3), DataType::f32,
+                     const_cast<float*>(w_cl.data()), TensorLayout::HWCM);
 
         const TensorDesc in_desc[] = {in.desc(), w.desc()};
         auto out_descs = op->getOutputTensorDesc(in_desc);
         const size_t out_numel = static_cast<size_t>(out_descs[0].numel());
-        const TensorLayout out_layout =
-            c.last ? TensorLayout::NHWC : TensorLayout::NCHW;
 
         std::vector<float> serial(out_numel);
         TensorView serial_v(std::span<const int64_t>(out_descs[0].dims.data(),
                                                      static_cast<size_t>(out_descs[0].rank)),
-                            DataType::f32, serial.data(), out_layout);
+                            DataType::f32, serial.data(), TensorLayout::NHWC);
         const TensorView ins[] = {in, w};
         NNOPS_EXPECT_TRUE(is_ok(op->compute(serial_v, ins)));
 
@@ -635,7 +352,7 @@ NNOPS_TEST(dwtconv_threaded_matches_serial) {
             std::vector<float> threaded(out_numel);
             TensorView out_v(std::span<const int64_t>(out_descs[0].dims.data(),
                                                       static_cast<size_t>(out_descs[0].rank)),
-                             DataType::f32, threaded.data(), out_layout);
+                             DataType::f32, threaded.data(), TensorLayout::NHWC);
             NNOPS_EXPECT_TRUE(is_ok(op->compute(out_v, ins, ctx)));
 
             const bool same = std::memcmp(serial.data(), threaded.data(),
@@ -644,7 +361,7 @@ NNOPS_TEST(dwtconv_threaded_matches_serial) {
             if (!same) {
                 throw std::runtime_error(
                     "dwtconv threaded mismatch (" + std::to_string(nthreads) +
-                    " threads, last=" + std::to_string(c.last) + ")");
+                    " threads)");
             }
         }
     }
@@ -655,8 +372,14 @@ NNOPS_TEST(dwtconv_threaded_matches_serial) {
 // ============================================================
 
 NNOPS_TEST(dwtconv_output_desc) {
-    auto [in_vec, in] = test::make_random_tensor({2, 4, 7, 9});
-    auto [w_vec, w] = test::make_random_tensor({4, 1, 3, 3});
+    const int64_t ishape[] = {2, 4, 7, 9};
+    std::vector<float> in_buf(2 * 4 * 7 * 9, 0.0f);
+    TensorView in(std::span<const int64_t>(ishape, 4), DataType::f32, in_buf.data(),
+                  TensorLayout::NHWC);
+    const int64_t wshape[] = {3, 3, 4};
+    std::vector<float> w_buf(3 * 3 * 4, 0.0f);
+    TensorView w(std::span<const int64_t>(wshape, 3), DataType::f32, w_buf.data(),
+                 TensorLayout::HWCM);
 
     DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {1, 1}};
     auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
@@ -669,56 +392,33 @@ NNOPS_TEST(dwtconv_output_desc) {
     // (7-1)*2 - 2 + 1*(3-1) + 1 + 1 = 14; (9-1)*2 - 2 + 2 + 1 + 1 = 18
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 14);
     NNOPS_EXPECT_EQ(out_descs[0].dims[3], 18);
-    NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
     NNOPS_EXPECT_TRUE(out_descs[0].dtype == DataType::f32);
-
-    // Channel-last inherits the layout.
-    std::vector<float> in_cl(in_vec.size());
-    TensorView in_last(std::span<const int64_t>(in.shape(),
-                                                static_cast<size_t>(in.rank())),
-                       DataType::f32, in_cl.data(), TensorLayout::NHWC);
-    const int64_t wsh[] = {3, 3, 4};
-    std::vector<float> w_cl(w_vec.size());
-    TensorView w_last(std::span<const int64_t>(wsh, 3), DataType::f32, w_cl.data(),
-                      TensorLayout::HWCM);
-    const TensorDesc last_desc[] = {in_last.desc(), w_last.desc()};
-    auto last_out = op->getOutputTensorDesc(last_desc);
-    NNOPS_EXPECT_TRUE(last_out[0].layout == TensorLayout::NHWC);
-    NNOPS_EXPECT_EQ(last_out[0].dims[2], 14);
-    NNOPS_EXPECT_EQ(last_out[0].dims[3], 18);
 }
 
 NNOPS_TEST(dwtconv_refusals) {
     DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {1, 1}, {1, 1}, {0, 0}, {0, 0}};
     auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
 
-    auto [in_vec, in] = test::make_random_tensor({1, 4, 6, 6});
-    auto [w_vec, w] = test::make_random_tensor({4, 1, 3, 3});
+    const int64_t ishape[] = {1, 4, 6, 6};
+    std::vector<float> in_buf(4 * 36, 0.0f);
+    TensorView in(std::span<const int64_t>(ishape, 4), DataType::f32, in_buf.data(),
+                  TensorLayout::NHWC);
+    const int64_t wshape[] = {3, 3, 4};
+    std::vector<float> w_buf(3 * 3 * 4, 0.0f);
+    TensorView w(std::span<const int64_t>(wshape, 3), DataType::f32, w_buf.data(),
+                 TensorLayout::HWCM);
     const TensorDesc in_desc[] = {in.desc(), w.desc()};
     auto out_descs = op->getOutputTensorDesc(in_desc);
     std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
     auto out = test::make_channel_first(out_descs[0], out_buf.data());
 
-    // A channel-last weight is not accepted by a channel-first activation.
-    {
-        const int64_t wsh[] = {3, 3, 4};
-        std::vector<float> w_cl(w_vec.size());
-        TensorView w_last(std::span<const int64_t>(wsh, 3), DataType::f32,
-                          w_cl.data(), TensorLayout::HWCM);
-        const TensorView ins[] = {in, w_last};
-        NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::unsupported);
-    }
-
     // A channel-last activation takes the transpose-conv [C, 1, KH, KW] filter
     // as well as HWCM, but one filter per channel is the geometry here: a
     // multiplier is refused.
     {
-        std::vector<float> in_cl(in_vec.size());
-        TensorView in_last(std::span<const int64_t>(in.shape(),
-                                                    static_cast<size_t>(in.rank())),
-                           DataType::f32, in_cl.data(), TensorLayout::NHWC);
         auto [wm_vec, wm] = test::make_random_tensor({4, 2, 3, 3});
-        const TensorView ins[] = {in_last, wm};
+        const TensorView ins[] = {in, wm};
         NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::invalid_argument);
     }
 
@@ -733,10 +433,9 @@ NNOPS_TEST(dwtconv_refusals) {
     // suite covers it), and an s8 activation against an fp weight is a mixed
     // pair no route takes.
     {
-        std::vector<int8_t> in_i8(in_vec.size(), 1);
-        TensorView in_s8(std::span<const int64_t>(in.shape(),
-                                                  static_cast<size_t>(in.rank())),
-                         DataType::s8, in_i8.data());
+        std::vector<int8_t> in_i8(4 * 36, 1);
+        TensorView in_s8(std::span<const int64_t>(ishape, 4), DataType::s8,
+                         in_i8.data(), TensorLayout::NHWC);
         const TensorView ins[] = {in_s8, w};
         NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::unsupported);
     }
@@ -750,13 +449,12 @@ NNOPS_TEST(dwtconv_refusals) {
 /// A TransposeConv2D whose group count equals its input channels is the
 /// depthwise geometry, and compute() hands it to these kernels instead of the
 /// per-group col GEMM. Its filter is [IC, OC/G, KH, KW] = [C, 1, KH, KW], which
-/// a channel-first activation reads in place and a channel-last one has
-/// repacked. Compare against depthwise_transpose_conv_ref on the same values.
+/// a channel-last activation has repacked. Compare against
+/// depthwise_transpose_conv_ref on the same values.
 static void transpose_conv2d_depthwise_vs_ref(
     const std::vector<int64_t>& in_shape,
     const DepthwiseTransposeConv2DAttributes& dw,
-    bool has_bias,
-    bool channel_last)
+    bool has_bias)
 {
     const int64_t N  = in_shape[0];
     const int64_t C  = in_shape[1];
@@ -816,36 +514,24 @@ static void transpose_conv2d_depthwise_vs_ref(
     // A residual is a logical [N,C,OH,OW] value, so the channel-last buffer
     // takes it permuted rather than in the channel-first order it was built in.
     std::vector<float> out_buf(res_cf);
-    if (channel_last && dw.add_to) {
+    if (dw.add_to) {
         out_buf = test::to_channel_last<float>(res_cf, N, C, out_S);
     }
-    if (channel_last) {
-        auto in_cl = test::to_channel_last<float>(in_vec, N, C, S);
-        const int64_t in_cl_shape[] = {N, C, H, W};
-        TensorView in_v(in_cl_shape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
+    auto in_cl = test::to_channel_last<float>(in_vec, N, C, S);
+    const int64_t in_cl_shape[] = {N, C, H, W};
+    TensorView in_v(in_cl_shape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
 
-        const TensorDesc cl_in[] = {in_v.desc(), w_cf.desc(), b_cf.desc()};
-        auto out_descs = conv->getOutputTensorDesc(
-            std::span<const TensorDesc>(cl_in, has_bias ? 3 : 2));
-        NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
-        NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
+    const TensorDesc cl_in[] = {in_v.desc(), w_cf.desc(), b_cf.desc()};
+    auto out_descs = conv->getOutputTensorDesc(
+        std::span<const TensorDesc>(cl_in, has_bias ? 3 : 2));
+    NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
+    NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
 
-        auto out = test::make_channel_first(out_descs[0], out_buf.data());
-        const TensorView ins[] = {in_v, w_cf, b_cf};
-        NNOPS_EXPECT_TRUE(is_ok(conv->compute(
-            out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
-        out_buf = test::to_channel_first<float>(out_buf, N, C, out_S);
-    } else {
-        const TensorDesc cf_in[] = {in_cf.desc(), w_cf.desc(), b_cf.desc()};
-        auto out_descs = conv->getOutputTensorDesc(
-            std::span<const TensorDesc>(cf_in, has_bias ? 3 : 2));
-        NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
-
-        auto out = test::make_channel_first(out_descs[0], out_buf.data());
-        const TensorView ins[] = {in_cf, w_cf, b_cf};
-        NNOPS_EXPECT_TRUE(is_ok(conv->compute(
-            out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
-    }
+    auto out = test::make_channel_first(out_descs[0], out_buf.data());
+    const TensorView ins[] = {in_v, w_cf, b_cf};
+    NNOPS_EXPECT_TRUE(is_ok(conv->compute(
+        out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
+    out_buf = test::to_channel_first<float>(out_buf, N, C, out_S);
 
     for (int64_t i = 0; i < out_n; ++i) {
         NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(i)],
@@ -853,24 +539,10 @@ static void transpose_conv2d_depthwise_vs_ref(
     }
 }
 
-NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_first) {
-    DepthwiseTransposeConv2DAttributes dw{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
-    dw.epilogue.type = EpilogueActivateType::Relu;
-    transpose_conv2d_depthwise_vs_ref({1, 6, 8, 9}, dw, true, false);
-}
-
-NNOPS_TEST(tconv2d_group_eq_channels_depthwise_stride2_output_padding) {
-    // Stride 2 with output_padding: the geometry the operator reads back from
-    // the output size, not from the input's.
-    DepthwiseTransposeConv2DAttributes dw{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {1, 1}};
-    dw.add_to = true;
-    transpose_conv2d_depthwise_vs_ref({2, 5, 7, 6}, dw, false, false);
-}
-
 NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last) {
     DepthwiseTransposeConv2DAttributes dw{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
     dw.epilogue.type = EpilogueActivateType::Relu;
-    transpose_conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true, true);
+    transpose_conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true);
 }
 
 NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_add_to) {
@@ -878,15 +550,7 @@ NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_add_to) {
     // output plane a different size from the input's.
     DepthwiseTransposeConv2DAttributes dw{{2, 2}, {2, 2}, {1, 1}, {0, 0}, {0, 0}};
     dw.add_to = true;
-    transpose_conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false, true);
-}
-
-NNOPS_TEST(tconv2d_group_eq_channels_depthwise_pre_act) {
-    DepthwiseTransposeConv2DAttributes dw{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
-    dw.epilogue.type = EpilogueActivateType::Relu;
-    dw.add_to = true;
-    dw.residual_pre_activation = true;
-    transpose_conv2d_depthwise_vs_ref({1, 6, 8, 9}, dw, true, false);
+    transpose_conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false);
 }
 
 NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_pre_act) {
@@ -894,5 +558,5 @@ NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_pre_act) {
     dw.epilogue.type = EpilogueActivateType::Relu;
     dw.add_to = true;
     dw.residual_pre_activation = true;
-    transpose_conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false, true);
+    transpose_conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false);
 }

@@ -34,7 +34,6 @@
 #include "nnops/ops/grid_sample.hpp"
 #include "nnops/ops/gru.hpp"
 #include "nnops/ops/group_query_attention.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/ops/lstm.hpp"

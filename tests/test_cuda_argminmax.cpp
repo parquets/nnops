@@ -66,7 +66,7 @@ struct ArgCase {
     bool use_argmin = false;
     bool keepdims = false;
     bool padded = false;
-    TensorLayout layout = TensorLayout::NCHW;
+    TensorLayout layout = TensorLayout::Dense;
     DataType dtype = DataType::f32;
 };
 
@@ -144,7 +144,7 @@ void run_case(const ArgCase& c, const char* what)
 /// A dense f32 host tensor filled from `vals` in memory order.
 HostTensor make_host_values(std::span<const int64_t> shape,
                             const std::vector<float>& vals,
-                            TensorLayout layout = TensorLayout::NCHW)
+                            TensorLayout layout = TensorLayout::Dense)
 {
     HostTensor t;
     const TensorView probe(shape, DataType::f32, nullptr, layout);

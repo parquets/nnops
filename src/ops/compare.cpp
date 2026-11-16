@@ -19,7 +19,7 @@ namespace {
 template <size_t N> bool all_channel_first(const TensorDesc* d)
 {
     for (size_t i = 0; i < N; ++i) {
-        if (!is_layout_supported(d[i].layout, LayoutSupport::ChannelFirstOnly)) {
+        if (!is_layout_supported(d[i].layout, LayoutSupport::Any)) {
             return false;
         }
     }
@@ -116,7 +116,7 @@ Status Logical::validate(std::span<const TensorDesc> inputs,
         return Status::invalid_argument;
     }
     for (size_t i = 0; i < n_in; ++i) {
-        if (!is_layout_supported(inputs[i].layout, LayoutSupport::ChannelFirstOnly)) {
+        if (!is_layout_supported(inputs[i].layout, LayoutSupport::Any)) {
             return Status::unsupported;
         }
     }

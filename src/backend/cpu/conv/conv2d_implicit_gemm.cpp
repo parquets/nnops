@@ -1,48 +1,34 @@
 /// @file conv2d_implicit_gemm.cpp
-/// @brief Conv2D as implicit GEMM — both memory layouts, one driver.
+/// @brief Conv2D as implicit GEMM, channel-last.
 ///
-/// conv2d_implicit_gemm.h describes the two mappings and everything they share
-/// (one plan, one scratch geometry, one entry). This file is the two routes:
+/// M = pixels, N = oc block, K tap-major. The gathered activation tile is A and
+/// the packed HWIO weight is B, either prepacked once per call (shared arena
+/// region) or per task.
 ///
-/// Channel-first — M = output channels, N = pixels. The activations are gathered
-/// into packed B; the raw weight is the direct-A operand. The fp route fuses the
-/// gather with the pack (tiled_im2col_2d_packed, so no col matrix exists at
-/// all); the quantized one gathers bytes into a col buffer and packs afterwards,
-/// with an int32 accumulator and a packed weight.
-///
-/// Channel-last — M = pixels, N = oc block, K tap-major. The gathered activation
-/// tile is A and the packed HWIO weight is B, either prepacked once per call
-/// (shared arena region) or per task.
-///
-/// Two axes, resolved once each, in one place: the activation's layout picks the
-/// route (conv2d_implicit_gemm_kernel), the weight's dtype picks the family (fp
-/// or quantized, in conv2d_gemm_run). Everything else — the plan prologue, the
-/// pooled arena, the column split, the (activation, output) dtype ladders — is
-/// written once and takes the route as a template parameter, so the two routes
-/// contribute only their kernels. Each route opens its own anonymous namespace,
-/// so helpers (tile_save, pack_block, …) carry no route prefix. The
-/// decomposition is the same on both: (batch, group) × oh-chunks × oc-chunks.
-/// Output tiles are disjoint, so every route is bit-identical to serial
-/// execution.
+/// One axis selects the family: the weight's dtype (fp or quantized, in
+/// conv2d_gemm_run). Everything else — the plan prologue, the pooled arena, the
+/// column split, the (activation, output) dtype ladders — is written once. The
+/// decomposition is (batch, group) × oh-chunks × oc-chunks. Output tiles are
+/// disjoint, so the route is bit-identical to serial execution.
 ///
 /// What not to "fix" later:
 ///
 ///  * The first icn block BUILDS the tile — zero_mode, or the bias as the
-///    accumulator's initial value (tile_mma_direct's per-row bias on the channel-first
-///    route, its per-column col_bias on channel-last, whose lanes are output
-///    channels). Seeding the tile first costs a write plus a read-back of the
-///    whole tile for one addend. Only the block that builds it may be seeded: a
-///    later one would re-seed and drop the partial sum. add_to is the exception
-///    — it folds the *original* output, which no accumulator seed can express.
+///    accumulator's initial value (tile_mma_direct's per-column col_bias, whose
+///    lanes are output channels). Seeding the tile first costs a write plus a
+///    read-back of the whole tile for one addend. Only the block that builds it
+///    may be seeded: a later one would re-seed and drop the partial sum. add_to
+///    is the exception — it folds the *original* output, which no accumulator
+///    seed can express.
 ///  * A pure Relu/Relu6 folds into the MMA store's min/max, on the last icn
 ///    block only (partial sums accumulate unclamped). Measured 11% of the conv2d
 ///    row at one thread, bit-identical checkpoints. add_to adds the residual
 ///    *after* the activation, so it keeps the separate epilogue pass.
-///  * The prepacked filter's geometry comes from conv_packed_weight_last /
-///    conv_packed_weight_channel_first, and the plan ADOPTS its icn_block/ocn_block
-///    from there instead of choosing again: prepackWeights built the panels
-///    against those functions, with no activation to resolve a plan from. A plan
-///    that picked its own block would address panels the blob does not hold.
+///  * The prepacked filter's geometry comes from conv_packed_weight_last, and
+///    the plan ADOPTS its icn_block/ocn_block from there instead of choosing
+///    again: prepackWeights built the panels against that function, with no
+///    activation to resolve a plan from. A plan that picked its own block would
+///    address panels the blob does not hold.
 ///  * An fp activation is quantized into a compact plane once per call, never
 ///    inside the gather: the gather repeats once per oc block, and only the
 ///    materialized plane lets a 1x1 conv take the pointwise route.
@@ -50,35 +36,21 @@
 /// Plan heuristics, measured at one thread unless stated (this host, 6P+8E):
 ///
 ///  * ic-block ladder: kdim (= ic_block × karea) in ~144–200 is the cost knob;
-///    past it the col buffer the block multiplies costs more than the passes it
+///    past it the A tile the block multiplies costs more than the passes it
 ///    saves. Every ic block pays a full read-modify-write of its output tile and
 ///    restarts the gather. A 3x3 at the 8 rung (kdim 72) is 2.5–4.4% behind the
 ///    16 rung; the wider filters move much less.
-///  * The oh-block starts at align(PH+1, 4). It halves while more than half the
-///    pool is idle (1x256x28x28 3x3, 7→14 blocks, 406→466 GFLOPS), flooring at
-///    two n-panels so the weight panel is not re-read every oh-step. A mirror
-///    loop grows it when the filter count outnumbers the plane area — the weak
-///    filter-vs-plane test, not panel bytes vs the plane, which would also catch
-///    1x1 planes the halving already keeps at 4 rows — and stops once the next
-///    size would leave more than half the pool idle. Separately it grows back
-///    while every worker still gets a whole block of its own: +10..15% at one
-///    thread on the 28-56 row planes, a wash at 112 where the scratch has caught
-///    up. That grown block count must stay a multiple of the chunk count (an
-///    uneven split cost −12% at 4 threads on a 112 plane) and must not make the
-///    busiest chunk longer (three 30-row chunks against a 22-row one cost −4.8%
-///    at 4 threads); the scratch cap is 256K elements a slot.
 ///  * oc-chunks use the nearest whole number to nt/plane_tasks, not the ceiling:
 ///    a 9-block plane at 20 threads wants 2 chunks, ceil picks 3 and the barrier
-///    waits on a 7-task second wave (152 vs 226 GFLOPS, 17x17). Channel-first splits
-///    the filter axis only on fp (its quantized accumulator is per oh-chunk);
-///    Channel-last splits it on both, with its accumulator per pass.
-///  * channel-last adds a rows-per-pass cap (ph_block, 128 KiB of accumulator):
-///    a 56x56 full-tile set is 800 KB and every pass went to DRAM. Pixel tiles
-///    flatten across row boundaries when rows are dense, so a narrow plane stops
-///    paying MR-row granularity per row. The shared prepack cap is 8 MiB; past
-///    it each task packs its own panels.
-///  * The quantized routes' R_a/R_b walk over the weight is deliberately serial:
-///    a second pool dispatch costs more than the pass (1.18x at 2T → 1.9x at 20T
+///    waits on a 7-task second wave (152 vs 226 GFLOPS, 17x17). The filter axis
+///    splits on fp and quantized alike, with the accumulator per pass.
+///  * a rows-per-pass cap (ph_block, 128 KiB of accumulator): a 56x56 full-tile
+///    set is 800 KB and every pass went to DRAM. Pixel tiles flatten across row
+///    boundaries when rows are dense, so a narrow plane stops paying MR-row
+///    granularity per row. The shared prepack cap is 8 MiB; past it each task
+///    packs its own panels.
+///  * The quantized route's R_b walk over the weight is deliberately serial: a
+///    second pool dispatch costs more than the pass (1.18x at 2T → 1.9x at 20T
 ///    on a 3x3 whose zero points are not the packer's).
 
 #include "conv2d_implicit_gemm.h"
@@ -115,1038 +87,6 @@ constexpr bool is_fp_activation_dtype(DataType d) noexcept
 #endif
         ;
 }
-
-// =========================================================================
-//  Channel-first route — im2col into packed B, raw weight as direct A
-// =========================================================================
-
-namespace channel_first {
-namespace {
-
-using namespace nnops::simd;
-namespace k = nnops::kernel; // pure SIMD kernels: tiled_im2col_2d / tiled_im2col_3d
-
-// ---- block-size heuristics (ported from nn_compute) ----------------------
-
-/// Input-channel block: kdim = ic_block × karea lands in ~144–200.
-inline int get_ic_block(int karea) noexcept
-{
-    if (karea == 1) {
-        return 64;
-    }
-    if (karea <= 9) {
-        return 16;
-    }
-    if (karea <= 25) {
-        return 8;
-    }
-    if (karea <= 49) {
-        return 2;
-    }
-    return 1;
-}
-
-constexpr int kOcnBlock = 128; // output-channel tile (nn_compute single-thread default)
-constexpr int kAlign = 4;      // oh-block alignment
-
-// ---- tile init / save / add helpers --------------------------------------
-
-/// Fill a tile with the per-row bias, or add it into what is already there.
-template <class T>
-void tile_set_bias(T* NNOPS_RESTRICT tile, int ld, int M, int N, const T* NNOPS_RESTRICT bias,
-                   bool add_to) noexcept
-{
-    constexpr int L = simd_lane_for<T>;
-    for (int m = 0; m < M; ++m) {
-        T* row = tile + m * ld;
-        const float b = bias ? s_load(&bias[m]) : 0.0f;
-        const auto vb = v_set1(row, b);
-        int i = 0;
-        if (add_to) {
-            for (; i + L <= N; i += L) {
-                v_store(row + i, v_add(v_load(row + i), vb));
-            }
-            for (; i < N; ++i) {
-                s_store(&row[i], s_load(&row[i]) + b);
-            }
-        } else {
-            for (; i + L <= N; i += L) {
-                v_store(row + i, vb);
-            }
-            for (; i < N; ++i) {
-                s_store(&row[i], b);
-            }
-        }
-    }
-}
-
-/// Copy a strided tile (row stride ld) into a dense scratch buffer (row stride N).
-template <class T>
-void tile_save(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src, int ld, int M, int N) noexcept
-{
-    constexpr int L = simd_lane_for<T>;
-    for (int m = 0; m < M; ++m) {
-        const T* s = src + m * ld;
-        T* d = dst + m * N;
-        int i = 0;
-        for (; i + L <= N; i += L) {
-            v_store(d + i, v_load(s + i));
-        }
-        for (; i < N; ++i) {
-            d[i] = s[i];
-        }
-    }
-}
-
-// ---- main kernel ----------------------------------------------------------
-
-template <class T>
-void conv2d_channel_first_impl(const Conv2DAttributes& attrs, TensorView& output,
-                               std::span<const TensorView> inputs, const ComputeContext& ctx,
-                               const Conv2DGemmPlan& plan, void* workspace)
-{
-    const auto& input = inputs[0];
-    const auto& weight = inputs[1];
-    const bool has_bias = inputs.size() > 2;
-
-    // Input: [N, IC, IH, IW]
-    const int64_t N = input.shape(0);
-    const int64_t IC = input.shape(1);
-    const int64_t IH = input.shape(2);
-    const int64_t IW = input.shape(3);
-    const int64_t in_row_stride = input.row_stride_elems();
-
-    // Weight: [OC, IC/G, KH, KW]
-    const int64_t OC = weight.shape(0);
-
-    // Output: [N, OC, OH, OW]
-    const int64_t OH = output.shape(2);
-    const int64_t OW = output.shape(3);
-    const int64_t out_row_stride = output.row_stride_elems();
-
-    const int64_t G = attrs.groups;
-    const int64_t ic_per_group = IC / G;
-    const int64_t oc_per_group = OC / G;
-
-    const int64_t KH = attrs.kernel_size[0];
-    const int64_t KW = attrs.kernel_size[1];
-    const int64_t SH = attrs.stride[0];
-    const int64_t SW = attrs.stride[1];
-    const int64_t DH = attrs.dilation[0];
-    const int64_t DW = attrs.dilation[1];
-    const int64_t PH = attrs.padding[0];
-    const int64_t PW = attrs.padding[1];
-
-    const int64_t karea = KH * KW;
-
-    const int64_t icn_block = plan.icn_block;
-    const int64_t ocn_block = plan.ocn_block;
-    const int64_t oh_block = plan.oh_block;
-    const int64_t num_oh_blocks = plan.num_oh_blocks;
-    const int64_t oh_chunks = plan.oh_chunks;
-    const int64_t oc_chunks = plan.oc_chunks;
-
-    // Strides (elements).
-    const int64_t icn_step = IH * in_row_stride;     // between input channels
-    const int64_t ib_step = IC * icn_step;           // between batch samples
-    const int64_t ig_step = ic_per_group * icn_step; // between groups (input)
-
-    const int64_t ocn_step = OH * out_row_stride;    // between output channels
-    const int64_t ob_step = OC * ocn_step;           // between batch samples
-    const int64_t og_step = oc_per_group * ocn_step; // between groups (output)
-
-    // Weight row stride within a group: [oc_per_group][ic_per_group][karea].
-    // Dims, not pitch: a weight is a load-time constant.
-    const int64_t w_ocn_step = ic_per_group * karea;
-
-    T* out_ptr = output.ptr<T>();
-    const T* in_ptr = input.ptr<T>();
-    const T* w_ptr = weight.ptr<T>();
-    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
-
-    // One slot per worker when the backend reports thread ids, else one per
-    // task. No col buffer on this route: the gather writes packed B directly,
-    // so a slot is [orig][pack_b].
-    NNOPS_ASSERT(plan.col_size == 0);
-    constexpr int nr_max = nr_max_flt<T>();
-    constexpr int esz = static_cast<int>(sizeof(T));
-    const Conv2DGemmScratch sc = gemm_scratch_layout(plan, esz);
-    char* const arena = static_cast<char*>(workspace);
-
-    const int64_t NG = N * G;
-    const int64_t chunks_per_ng = plan.oh_chunks * plan.oc_chunks;
-    const int64_t total = NG * chunks_per_ng;
-
-    const int nslots = ctx.cpu.thread_slot_count();
-    const bool per_thread = nslots > 0 && nslots < total;
-
-    const bool epilogue_active = epilogue_is_active(attrs.epilogue);
-
-    // The residual joins the accumulator before the epilogue instead of after
-    // it: `epilogue(conv + residual)` rather than `epilogue(conv) + residual`.
-    // The tile already holds the caller's output, so the pre-activation form is
-    // the cheaper of the two — one seed, no saved copy, no post-add.
-    const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
-
-    // A pure clamp needs no epilogue pass: the MMA store's min/max bounds carry
-    // it. add_to is the exception — it adds the residual *after* the
-    // activation, so it needs the tile back in memory.
-    constexpr float kInf = std::numeric_limits<float>::infinity();
-    float clamp_lo = -kInf;
-    float clamp_hi = kInf;
-    bool epilogue_folded = false;
-    if (!attrs.add_to) {
-        switch (attrs.epilogue.type) {
-        case EpilogueActivateType::Relu:
-            clamp_lo = 0.0f;
-            epilogue_folded = true;
-            break;
-        case EpilogueActivateType::Relu6:
-            clamp_lo = 0.0f;
-            clamp_hi = 6.0f;
-            epilogue_folded = true;
-            break;
-        default:
-            break;
-        }
-    }
-    const bool epilogue_pass = epilogue_active && !epilogue_folded;
-
-    // The first icn block builds the tile from the bias row (tile_mma_direct's
-    // bias argument: the kernel's row index is the output channel, so it lands
-    // exactly where tile_set_bias would have written). add_to's original
-    // output is the exception — it still pre-fills.
-    const bool bias_in_mma = has_bias && !attrs.add_to;
-    const bool seed_needed = attrs.add_to;
-
-    const auto run_task = [&](int64_t t) {
-        const int64_t ng = t / chunks_per_ng;
-        const int64_t rem = t % chunks_per_ng;
-        // The oc-chunk varies fastest: neighbours in task order then cover
-        // different filter rows, so their weight streams differ.
-        const int64_t chunk = rem / oc_chunks;
-        const int64_t oc_chunk = rem % oc_chunks;
-        const int64_t n = ng / G;
-        const int64_t g = ng % G;
-
-        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
-        char* const slot_ptr = arena + sc.head + slot * sc.slot_stride;
-        T* orig = attrs.add_to ? reinterpret_cast<T*>(slot_ptr + sc.off_orig) : nullptr;
-        T* pack_b = reinterpret_cast<T*>(slot_ptr + sc.off_pack);
-
-        T* output_ptr = out_ptr + n * ob_step + g * og_step;
-        const T* input_ptr = in_ptr + n * ib_step + g * ig_step;
-        const T* weight_ptr = w_ptr + g * oc_per_group * ic_per_group * karea;
-        const T* bias_ptr = b_ptr ? b_ptr + g * oc_per_group : nullptr;
-
-        // This chunk's contiguous oh-block range (disjoint across chunks).
-        const int64_t b0 = chunk * num_oh_blocks / oh_chunks;
-        const int64_t b1 = (chunk + 1) * num_oh_blocks / oh_chunks;
-
-        // Disjoint oc range, split evenly over filter rows.
-        const int64_t oc_lo = oc_chunk * oc_per_group / oc_chunks;
-        const int64_t oc_hi = (oc_chunk + 1) * oc_per_group / oc_chunks;
-
-        for (int64_t b = b0; b < b1; ++b) {
-            const int64_t oh = b * oh_block;
-            const int64_t ohc = std::min(oh_block, OH - oh);
-            const int64_t roi_area = ohc * OW;
-
-            const int64_t ih = oh * SH - PH;
-            const int64_t iw = 0 * SW - PW;
-            const int roi_pad_h =
-                (ih < 0) ? static_cast<int>(-ih) : (ih >= IH ? static_cast<int>(ih - IH) : 0);
-            const int roi_pad_w =
-                (iw < 0) ? static_cast<int>(-iw) : (iw >= IW ? static_cast<int>(iw - IW) : 0);
-
-            T* tile_base = output_ptr + oh * out_row_stride;
-
-            for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
-                const int64_t icnc = std::min(icn_block, ic_per_group - icn);
-                const bool is_last_icn = (icn + icn_block) >= ic_per_group;
-
-                const T* input_local = input_ptr + icn * icn_step;
-
-                // B = [K=icnc*karea][N=roi_area], packed once per ic-block into
-                // uniform nr_max-wide panels; every oc-block below reuses it.
-                const int kdim = static_cast<int>(icnc * karea);
-                // The pack's panel stride, from the one rule the plan sizes
-                // with: bf16's BFMMLA panel rounds k up to its k-group, so a
-                // dense NR*kdim stride is wrong whenever kdim % 4 != 0.
-                const int ldd_b = static_cast<int>(
-                    gemm_panel_slot(kdim, nr_max, esz, false, std::is_same_v<T, bfloat16>));
-
-                if (!plan.pointwise) {
-                    // Gather straight into the panels: materializing the col
-                    // matrix first would move the same bytes twice for a pure
-                    // re-ordering, with identical values and panel layout.
-                    k::tiled_im2col_2d_packed<T, nr_max>(
-                        pack_b, ldd_b, input_local, 0, static_cast<int>(oh), static_cast<int>(OW),
-                        static_cast<int>(ohc), roi_pad_h, roi_pad_w, static_cast<int>(PH),
-                        static_cast<int>(PW), static_cast<int>(icnc), static_cast<int>(IH),
-                        static_cast<int>(IW), static_cast<int>(icn_step),
-                        static_cast<int>(in_row_stride), static_cast<int>(KH), static_cast<int>(KW),
-                        static_cast<int>(SH), static_cast<int>(SW), static_cast<int>(DH),
-                        static_cast<int>(DW));
-                } else {
-                    // A pointwise gather would be a dense row copy; read B from
-                    // the input instead. pad == 0 and stride == 1 keep the ROI
-                    // inside the input, so there is no border case. The ROI is
-                    // one roi_area-wide run per channel, so k strides by the
-                    // channel stride, not the ROI width. The pack stays: B is
-                    // read panel-major and a packed panel's k rows are contiguous,
-                    // where the plane's are a plane-row apart (measured 11% worse
-                    // at 1T on a 28x28 plane to read it in place).
-                    const T* b_src = input_local + oh * in_row_stride;
-                    tile_pack_rhs(false, static_cast<int>(roi_area), kdim, pack_b, ldd_b, b_src,
-                                  static_cast<int>(icn_step), 1.0f);
-                }
-
-                for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block) {
-                    const int64_t ocnc = std::min(ocn_block, oc_hi - ocn);
-                    T* tile = tile_base + ocn * ocn_step;
-
-                    if (icn == 0 && seed_needed) {
-                        // add_to keeps the original output: epilogue(bias + Σ)
-                        // then += orig. The pre-activation form keeps the
-                        // original in the tile and adds the bias onto it, so
-                        // the epilogue sees conv + residual at once.
-                        if (attrs.add_to && epilogue_pass && !pre_act) {
-                            tile_save<T>(orig, tile, static_cast<int>(ocn_step),
-                                         static_cast<int>(ocnc), static_cast<int>(roi_area));
-                        }
-                        tile_set_bias<T>(tile, static_cast<int>(ocn_step), static_cast<int>(ocnc),
-                                         static_cast<int>(roi_area),
-                                         bias_ptr ? bias_ptr + ocn : nullptr,
-                                         attrs.add_to && (!epilogue_active || pre_act));
-                    }
-
-                    const T* a = weight_ptr + icn * karea + ocn * w_ocn_step;
-                    // Only the final ic-block clamps; partial sums accumulate
-                    // unclamped.
-                    const bool clamp_here = is_last_icn && epilogue_folded;
-                    tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(roi_area), kdim, tile,
-                                    static_cast<int>(ocn_step), a, static_cast<int>(w_ocn_step),
-                                    pack_b, /*ldb=*/-1, /*stage=*/nullptr,
-                                    clamp_here ? clamp_lo : -kInf, clamp_here ? clamp_hi : kInf,
-                                    /*zero_mode=*/icn == 0 && !seed_needed,
-                                    (icn == 0 && bias_in_mma) ? bias_ptr + ocn : nullptr);
-
-                    // An identity epilogue is a whole-tile copy-back; skip it.
-                    if (is_last_icn && epilogue_pass) {
-                        epilogue_inplace<T>(static_cast<int>(ocnc), static_cast<int>(roi_area),
-                                            tile, static_cast<int>(ocn_step),
-                                            static_cast<const T*>(nullptr), attrs.epilogue,
-                                            pre_act ? nullptr : orig,
-                                            attrs.add_to && epilogue_active && !pre_act);
-                    }
-                }
-            }
-        }
-    };
-
-    ctx.cpu.run(0, total, run_task);
-}
-
-// ---- the quantized route --------------------------------------------------
-//
-// Integer operands: A the s8 weight, B the u8/s8 im2col activation, int32
-// accumulator; the epilogue compensates the zero points and either dequantizes
-// (fp destination) or requantizes (s8/u8 destination).
-
-/// True when every zero point the tensor carries equals @p v.
-inline bool all_zp_equal(const QuantParams& q, int64_t n, int32_t v) noexcept
-{
-    if (q.zero_point_data == nullptr) {
-        return q.zero_point == v;
-    }
-    for (int64_t i = 0; i < n; ++i) {
-        if (q.zero_point_data[i] != v) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/// Quantize an fp activation into the compact int8 plane, walking the source
-/// pitch.
-template <class TAct, class TDst>
-void quantize_plane(const TensorView& in, TDst* dst, float scale, int32_t zero,
-                    const ComputeContext& ctx)
-{
-    const int64_t IC = in.shape(1);
-    const int64_t IH = in.shape(2);
-    const int64_t IW = in.shape(3);
-    const int64_t N = in.shape(0);
-    const int64_t rs = in.row_stride_elems();
-    const TAct* src = in.ptr<TAct>();
-
-    const float s = scale;
-    const float z = static_cast<float>(zero);
-    const int64_t total = N * IC * IH * IW;
-
-    auto quant_range = [&](int64_t beg, int64_t end) {
-        if (rs == IW) {
-            k::quant_kernel::quantization<TDst>(static_cast<int>(1), static_cast<int>(end - beg),
-                                                dst + beg, 1, src + beg, 1, &s, &z);
-            return;
-        }
-        // Pitched source: row by row, never across the pitch tail.
-        for (int64_t e = beg; e < end;) {
-            const int64_t row = e / IW;
-            const int64_t off = e - row * IW;
-            const int64_t len = std::min(IW - off, end - e);
-            k::quant_kernel::quantization<TDst>(static_cast<int>(1), static_cast<int>(len), dst + e,
-                                                1, src + row * rs + off, 1, &s, &z);
-            e += len;
-        }
-    };
-
-    // Below this a dispatch costs more than the pass: ~100 us to re-spawn the
-    // pool at 4 threads against ~10 us of work for a 200k-element plane.
-    constexpr int64_t kInlineMax = int64_t{1} << 19;
-
-    const int64_t nt = std::max<int64_t>(ctx.cpu.thread_count(), 1);
-    if (nt == 1 || total <= kInlineMax) {
-        quant_range(0, total);
-        return;
-    }
-    const int64_t slab = (total + nt - 1) / nt;
-    const int64_t nslab = (total + slab - 1) / slab;
-    ctx.cpu.run(0, nslab,
-                [&](int64_t i) { quant_range(i * slab, std::min(i * slab + slab, total)); });
-}
-
-/// One (activation, storage, output) dtype triple of the quantized route.
-template <class TAct, class TDst, class TOut>
-void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
-                                    std::span<const TensorView> inputs, const ComputeContext& ctx,
-                                    const Conv2DGemmPlan& plan, void* workspace)
-{
-    constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
-    // The B packer XORs 0x80: stored bytes are read as unsigned, then shifted
-    // to (value − 128).
-    constexpr bool kU8 = std::is_same_v<TDst, uint8_t>;
-    constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
-
-    const auto& input = inputs[0];
-    const auto& weight = inputs[1];
-    const bool has_bias = inputs.size() > 2;
-
-    // Input: [N, IC, IH, IW]
-    const int64_t N = input.shape(0);
-    const int64_t IC = input.shape(1);
-    const int64_t IH = input.shape(2);
-    const int64_t IW = input.shape(3);
-
-    // Weight: [OC, IC/G, KH, KW], or its prepacked A panels (OC first either way).
-    const bool prepacked = is_packed_conv_weight(weight.layout());
-    const int64_t OC = weight.shape(0);
-
-    // Output: [N, OC, OH, OW]
-    const int64_t OH = output.shape(2);
-    const int64_t OW = output.shape(3);
-    const int64_t out_row_stride = output.row_stride_elems();
-
-    const int64_t G = attrs.groups;
-    const int64_t ic_per_group = IC / G;
-    const int64_t oc_per_group = OC / G;
-
-    const int64_t KH = attrs.kernel_size[0];
-    const int64_t KW = attrs.kernel_size[1];
-    const int64_t SH = attrs.stride[0];
-    const int64_t SW = attrs.stride[1];
-    const int64_t DH = attrs.dilation[0];
-    const int64_t DW = attrs.dilation[1];
-    const int64_t PH = attrs.padding[0];
-    const int64_t PW = attrs.padding[1];
-
-    const int64_t karea = KH * KW;
-    const int64_t k_full = ic_per_group * karea; // the epilogue's K
-
-    const int64_t icn_block = plan.icn_block;
-    const int64_t ocn_block = plan.ocn_block;
-    const int64_t oh_block = plan.oh_block;
-    const int64_t num_oh_blocks = plan.num_oh_blocks;
-    const int64_t oh_chunks = plan.oh_chunks;
-
-    const int64_t ocn_step = OH * out_row_stride;    // between output channels
-    const int64_t ob_step = OC * ocn_step;           // between batch samples
-    const int64_t og_step = oc_per_group * ocn_step; // between groups (output)
-
-    // Weight row stride within a group: [oc_per_group][ic_per_group][karea].
-    // Dims, not pitch: a weight is a load-time constant.
-    const int64_t w_ocn_step = ic_per_group * karea;
-
-    // ---- quantization parameters -----------------------------------------
-    const QuantParams& qa = input.quant_params();
-    const QuantParams& qw = weight.quant_params();
-
-    // Per-tensor activation parameters: fixed offline, valid whether the
-    // activation arrives quantized or as fp.
-    const float s_x = quant_scale_at(qa, 0);
-    const int32_t zp_x = quant_zp_at(qa, 0);
-    // The zero point in the shifted space the packer produces (u8 → value−128).
-    const int32_t zp_eff = zp_x - (kU8 ? 128 : 0);
-    NNOPS_ASSERT(s_x > 0.0f);
-    NNOPS_ASSERT(!kU8 || (zp_x >= 0 && zp_x <= 255));
-    NNOPS_ASSERT(kU8 || (zp_x >= -128 && zp_x <= 127));
-
-    // Only the weight's dtype drives the A-side bias.
-    const bool a_biased = int8_a_pack_bias(DataType::s8) != 0;
-    const int32_t a_bias_offset = int8_epilogue_offset(DataType::s8);
-
-    // The epilogue's compensation is
-    //     raw − (a_bias_offset + zp_a[m])·r_b[n] − zp_b·r_a[m] + k·zp_a[m]·zp_b
-    // Only the first product is per column: it survives exactly when the
-    // weight's zero point is not already the compensated one. The rest is per
-    // output channel — into the bias for an integer destination, into an int32
-    // row offset for the fp one (row_fold / bias_fold below).
-    const bool need_col_sum = !all_zp_equal(qw, OC, -a_bias_offset);
-    // r_a feeds both the column term and the fold.
-    const bool need_comp = need_col_sum || zp_eff != 0;
-
-    // ---- the activation as stored bytes -----------------------------------
-    // From here the fp route is indistinguishable from the pre-quantized one:
-    // the gather copies bytes and the pad value is the zero point.
-    const TDst* in_base = nullptr;
-    int64_t in_row_stride = 0;
-    if constexpr (kFpAct) {
-        TDst* plane = reinterpret_cast<TDst*>(workspace);
-        quantize_plane<TAct, TDst>(input, plane, s_x, zp_x, ctx);
-        in_base = plane;
-        in_row_stride = IW; // the plane is compact
-    } else {
-        in_base = input.ptr<TDst>(); // TAct == TDst on this route
-        in_row_stride = input.row_stride_elems();
-    }
-
-    const int64_t icn_step = IH * in_row_stride;     // between input channels
-    const int64_t ib_step = IC * icn_step;           // between batch samples
-    const int64_t ig_step = ic_per_group * icn_step; // between groups (input)
-
-    const int8_t* w_ptr = weight.ptr<int8_t>();
-    // The bias is the output dtype on the fp destination, int32 on the integer one.
-    [[maybe_unused]] const TOut* b_ptr = (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
-    [[maybe_unused]] const int32_t* b_i32 =
-        (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
-    TOut* out_ptr = output.ptr<TOut>();
-    // The requant's output parameters, read only for an integer destination.
-    [[maybe_unused]] const QuantParams& qc = output.quant_params();
-
-    // R_a[oc] = Σ_k weight[oc,k] over the whole K; the global output-channel
-    // index works across groups. Deliberately serial — a second pool dispatch
-    // costs more than this one SIMD pass (see the header).
-    // Panel geometry from the same function prepackWeights used.
-    const ConvPackedWeightChannelFirst pg =
-        conv_packed_weight_channel_first(attrs, ic_per_group, oc_per_group, weight.data_type());
-    NNOPS_ASSERT(!prepacked || (pg.icn_block == icn_block && pg.ocn_block == ocn_block));
-
-    PoolArray<int32_t> r_a;
-    if (need_comp) {
-        r_a.reset(static_cast<size_t>(OC));
-        if (prepacked) {
-            // The blob carries the sums, so no per-call walk of MMA-layout panels.
-            std::memcpy(r_a.data(), w_ptr + pg.sums_off, static_cast<size_t>(OC) * sizeof(int32_t));
-        } else {
-            for (int64_t oc = 0; oc < OC; ++oc) {
-                r_a[static_cast<size_t>(oc)] =
-                    k::int8_row_sum<int8_t>(w_ptr + oc * w_ocn_step, k_full);
-            }
-        }
-    }
-
-    // The per-channel half of the compensation, once per call instead of once
-    // per element: −zp_b·(r_a − k·zp_a) per output channel. The integer
-    // destination folds it into the bias, the fp one into an int32 row offset;
-    // either way the epilogue then only handles the column term.
-    PoolArray<int32_t> row_fold;
-    PoolArray<int32_t> bias_fold;
-    if (!need_col_sum && zp_eff != 0) {
-        row_fold.reset(static_cast<size_t>(OC));
-        for (int64_t oc = 0; oc < OC; ++oc) {
-            const int32_t coef_zp =
-                r_a[static_cast<size_t>(oc)] - static_cast<int32_t>(k_full) * quant_zp_at(qw, oc);
-            row_fold[static_cast<size_t>(oc)] = -zp_eff * coef_zp;
-        }
-        if constexpr (kIntOut) {
-            bias_fold.reset(static_cast<size_t>(OC));
-            for (int64_t oc = 0; oc < OC; ++oc) {
-                bias_fold[static_cast<size_t>(oc)] =
-                    row_fold[static_cast<size_t>(oc)] + (b_i32 ? b_i32[oc] : 0);
-            }
-        }
-    }
-
-    // R_b[column] = Σ_k (stored byte) over one output column's whole K,
-    // accumulated across ic-blocks; per slot and per oh-block.
-    const int64_t r_b_len = plan.oh_block * OW;
-    PoolArray<int32_t> r_b_buf(need_col_sum ? static_cast<size_t>(plan.num_slots * r_b_len) : 0);
-
-    // ---- scratch slices ---------------------------------------------------
-    // The activation plane sits at the front of the arena, shared across slots;
-    // per-slot data follows, acc / pack_a sit behind the slots.
-    // gemm_scratch_layout decides all of it.
-    const Conv2DGemmScratch sc = gemm_scratch_layout(plan, 1);
-    char* const arena = static_cast<char*>(workspace);
-    int32_t* acc_base = reinterpret_cast<int32_t*>(arena + sc.off_acc);
-    int8_t* pack_a_base = reinterpret_cast<int8_t*>(arena + sc.off_pack_a);
-
-    const int64_t NG = N * G;
-    const int64_t total = NG * oh_chunks;
-
-    const int nslots = ctx.cpu.thread_slot_count();
-    const bool per_thread = nslots > 0 && nslots < total;
-
-    ctx.cpu.run(0, total, [&](int64_t t) {
-        const int64_t ng = t / oh_chunks;
-        const int64_t chunk = t % oh_chunks;
-        const int64_t n = ng / G;
-        const int64_t g = ng % G;
-
-        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
-
-        char* const slot_ptr = arena + sc.head + slot * sc.slot_stride;
-        TDst* col_data = reinterpret_cast<TDst*>(slot_ptr + sc.off_col);
-        int8_t* pack_b = reinterpret_cast<int8_t*>(slot_ptr + sc.off_pack);
-        int32_t* acc = acc_base + slot * plan.acc_size;
-        int8_t* pack_a = pack_a_base + slot * plan.pack_a_size;
-        int32_t* r_b = need_col_sum ? r_b_buf.data() + slot * r_b_len : nullptr;
-
-        TOut* output_ptr = out_ptr + n * ob_step + g * og_step;
-        const TDst* input_ptr = in_base + n * ib_step + g * ig_step;
-        const int8_t* weight_ptr = w_ptr + g * oc_per_group * w_ocn_step;
-        [[maybe_unused]] const TOut* bias_ptr = b_ptr ? b_ptr + g * oc_per_group : nullptr;
-        [[maybe_unused]] const int32_t* ibias_ptr = b_i32 ? b_i32 + g * oc_per_group : nullptr;
-
-        // This chunk's contiguous oh-block range (disjoint across chunks).
-        const int64_t b0 = chunk * num_oh_blocks / oh_chunks;
-        const int64_t b1 = (chunk + 1) * num_oh_blocks / oh_chunks;
-
-        for (int64_t b = b0; b < b1; ++b) {
-            const int64_t oh = b * oh_block;
-            const int64_t ohc = std::min(oh_block, OH - oh);
-            const int64_t roi_area = ohc * OW;
-
-            const int64_t ih = oh * SH - PH;
-            const int64_t iw = 0 * SW - PW;
-            const int roi_pad_h =
-                (ih < 0) ? static_cast<int>(-ih) : (ih >= IH ? static_cast<int>(ih - IH) : 0);
-            const int roi_pad_w =
-                (iw < 0) ? static_cast<int>(-iw) : (iw >= IW ? static_cast<int>(iw - IW) : 0);
-
-            // oc is the outer loop: the int32 accumulator holds one oc-block's
-            // tile and its partial sums must survive every ic-block. With
-            // ic-block outer the next oc-block's fill would wipe them out; for
-            // the usual oc_per_group <= ocn_block there is one iteration. Past
-            // ocn_block the gather and B pack repeat per oc block, but that is a
-            // byte copy by then — quantizing here is what used to be expensive.
-            for (int64_t ocn = 0; ocn < oc_per_group; ocn += ocn_block) {
-                const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn);
-
-                if (need_col_sum) {
-                    std::fill(r_b, r_b + roi_area, 0);
-                }
-
-                for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
-                    const int64_t icnc = std::min(icn_block, ic_per_group - icn);
-
-                    const TDst* input_local = input_ptr + icn * icn_step;
-                    // pointwise: B is read straight from the plane instead.
-                    if (!plan.pointwise) {
-                        // A padded sample is the real value 0, stored as the
-                        // activation's zero point.
-                        k::tiled_im2col_2d<TDst>(
-                            col_data, input_local, 0, static_cast<int>(oh), static_cast<int>(OW),
-                            static_cast<int>(ohc), roi_pad_h, roi_pad_w, static_cast<int>(PH),
-                            static_cast<int>(PW), static_cast<int>(icnc), static_cast<int>(IH),
-                            static_cast<int>(IW), static_cast<int>(icn_step),
-                            static_cast<int>(in_row_stride), static_cast<int>(KH),
-                            static_cast<int>(KW), static_cast<int>(SH), static_cast<int>(SW),
-                            static_cast<int>(DH), static_cast<int>(DW), static_cast<TDst>(zp_x));
-                    }
-
-                    // B = [K=icnc*karea][N=roi_area]. The u8 shift happens inside
-                    // the pack, before the x86 panel sums.
-                    const TDst* b_src =
-                        plan.pointwise ? input_local + oh * in_row_stride : col_data;
-                    const int b_ld =
-                        plan.pointwise ? static_cast<int>(icn_step) : static_cast<int>(roi_area);
-                    const int kdim = static_cast<int>(icnc * karea);
-
-                    tile_pack_rhs_i8(false, static_cast<int>(roi_area), kdim, pack_b,
-                                     static_cast<int>(int8_panel_stride(kdim)),
-                                     reinterpret_cast<const int8_t*>(b_src), b_ld, a_biased,
-                                     /*src_shift=*/kU8);
-
-                    if (need_col_sum) {
-                        // Sum the bytes as the packer read them, then move the
-                        // unsigned sum into the kernel's shifted space.
-                        if constexpr (kU8) {
-                            k::int8_col_sum_slab<uint8_t>(b_src, b_ld, 0, roi_area, kdim, r_b);
-                            for (int64_t i = 0; i < roi_area; ++i) {
-                                r_b[i] -= 128 * kdim;
-                            }
-                        } else {
-                            k::int8_col_sum_slab<int8_t>(b_src, b_ld, 0, roi_area, kdim, r_b);
-                        }
-                    }
-
-                    // The A panels: in place for a prepacked filter (packed for
-                    // exactly this k block and oc block), else rebuilt here.
-                    const int8_t* a_panel;
-                    if (prepacked) {
-                        // From the blob base: pg.offset carries the group.
-                        a_panel = w_ptr + pg.offset(g, icn / icn_block, ocn / ocn_block);
-                    } else {
-                        tile_pack_lhs_i8(false, static_cast<int>(ocnc), kdim, pack_a,
-                                         static_cast<int>(geom_ldd_i8_a(kdim)),
-                                         weight_ptr + icn * karea + ocn * w_ocn_step,
-                                         static_cast<int>(w_ocn_step), a_biased);
-                        a_panel = pack_a;
-                    }
-
-                    // The first ic-block stores instead of accumulating, so the
-                    // tile needs no zero fill.
-                    tile_mma_pack_i8(static_cast<int>(ocnc), static_cast<int>(roi_area), kdim, acc,
-                                     static_cast<int>(roi_area), a_panel, pack_b, /*ldb=*/0,
-                                     INT32_MIN, INT32_MAX,
-                                     /*zero_mode=*/icn == 0);
-                }
-
-                // The oc-block is complete: rewrite in place while it is hot,
-                // dequantized to fp or requantized to the integer destination.
-                if constexpr (kIntOut) {
-                    // The tile's rows are output channels, so the weight's
-                    // per-channel arrays are the per-row ones.
-                    Int8EpilogueParams ip{};
-                    ip.r_a = need_comp ? r_a.data() + g * oc_per_group + ocn : nullptr;
-                    ip.s_a = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn : nullptr;
-                    ip.zp_a =
-                        qw.zero_point_data ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
-                    ip.r_b = need_col_sum ? r_b : nullptr;
-                    ip.zp_b = nullptr; // per-tensor activation
-                    ip.s_a_scalar = qw.scale;
-                    ip.s_b_scalar = s_x;
-                    ip.zp_a_scalar = qw.zero_point;
-                    ip.zp_b_scalar = zp_eff;
-                    ip.a_bias_offset = a_bias_offset;
-                    ip.k = static_cast<int32_t>(k_full);
-                    // Both terms live unless the per-channel half is in bias_fold.
-                    ip.compensate = need_col_sum;
-                    ip.col_term = need_col_sum;
-                    ip.out_scale = quant_scale_at(qc, 0);
-                    ip.zp_out = quant_zp_at(qc, 0);
-                    // Requantize epilogue: one output scale per channel.
-                    if (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
-                        attrs.epilogue.quant_param_count > 0) {
-                        ip.row_out_scales = attrs.epilogue.quant_scales;
-                        ip.row_out_zps = attrs.epilogue.quant_zero_points;
-                        ip.out_scale = epilogue_quant_scale(attrs.epilogue, 0);
-                        ip.zp_out = epilogue_quant_zero(attrs.epilogue, 0);
-                    }
-                    ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
-                    ip.bias = !bias_fold.empty() ? bias_fold.data() + g * oc_per_group + ocn :
-                                                   (ibias_ptr ? ibias_ptr + ocn : nullptr);
-                    TOut* dst = output_ptr + oh * out_row_stride + ocn * ocn_step;
-                    if constexpr (std::is_same_v<TOut, uint8_t>) {
-                        ip.out_u8 = dst;
-                    } else {
-                        ip.out = dst;
-                    }
-                    ip.ldc_out = static_cast<int>(ocn_step);
-                    int8_epilogue_tile(ip, acc, static_cast<int>(roi_area), 0, 0, ocnc, roi_area);
-                } else {
-                    DqEpilogueParams<TOut> ip{};
-                    ip.r_a = need_comp ? r_a.data() + g * oc_per_group + ocn : nullptr;
-                    ip.s_a = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn : nullptr;
-                    ip.zp_a =
-                        qw.zero_point_data ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
-                    ip.r_b = need_col_sum ? r_b : nullptr;
-                    ip.row_off =
-                        row_fold.empty() ? nullptr : row_fold.data() + g * oc_per_group + ocn;
-                    ip.zp_b = nullptr; // per-tensor activation
-                    ip.s_a_scalar = qw.scale;
-                    ip.s_b_scalar = s_x;
-                    ip.zp_a_scalar = qw.zero_point;
-                    ip.zp_b_scalar = zp_eff;
-                    ip.a_bias_offset = a_bias_offset;
-                    ip.k = static_cast<int32_t>(k_full);
-                    // Both terms unless the row half is in row_off.
-                    ip.compensate = need_col_sum;
-                    ip.col_term = need_col_sum;
-                    ip.act_u8 = kU8;
-                    ip.ep = &attrs.epilogue;
-                    ip.bias = bias_ptr ? bias_ptr + ocn : nullptr;
-                    ip.out = output_ptr + oh * out_row_stride + ocn * ocn_step;
-                    ip.ldc_out = static_cast<int>(ocn_step);
-                    dq_epilogue_tile<TOut>(ip, acc, static_cast<int>(roi_area), 0, 0, ocnc,
-                                           roi_area);
-                }
-            }
-        }
-    });
-}
-
-// =========================================================================
-//  Plan — single source of truth for block sizes, parallelism + workspace
-// =========================================================================
-
-Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDesc> inputs,
-                         std::span<const TensorDesc> outputs, int num_threads,
-                         bool use_thread_slots, int64_t num_slots)
-{
-    NNOPS_ASSERT(inputs.size() >= 2);
-    NNOPS_ASSERT(outputs.size() >= 1);
-
-    const auto& in = inputs[0];
-    const auto& wt = inputs[1];
-    const auto& out = outputs[0];
-
-    Conv2DGemmPlan plan;
-    plan.route = Conv2DGemmRoute::ChannelFirst;
-
-    const DataType dt = in.dtype;
-    const bool quant = is_quantized_conv2d(wt.dtype);
-
-    if (quant) {
-        // Activation: pre-quantized (u8/s8), or fp quantized per call.
-        if (dt != DataType::u8 && dt != DataType::s8 && dt != DataType::f32 &&
-            dt != DataType::f16) {
-            return plan;
-        }
-        // Output: fp (the activation dtype, or attributes.output_dtype when the
-        // activation is already quantized) or an integer s8/u8 requantization.
-        const bool int_out = out.dtype == DataType::s8 || out.dtype == DataType::u8;
-        if (!int_out && out.dtype != DataType::f32 && out.dtype != DataType::f16) {
-            return plan;
-        }
-        if (!int_out && (dt == DataType::f32 || dt == DataType::f16) && out.dtype != dt) {
-            return plan;
-        }
-        const DataType bias_dt = int_out ? DataType::s32 : out.dtype;
-        if (inputs.size() > 2 && inputs[2].dtype != bias_dt) {
-            return plan;
-        }
-        // Only the reference implements add_to's fold.
-        if (attrs.add_to) {
-            return plan;
-        }
-    } else {
-        if (!is_fp_activation_dtype(dt)) {
-            return plan;
-        }
-        if (wt.dtype != dt || out.dtype != dt) {
-            return plan;
-        }
-        if (inputs.size() > 2 && inputs[2].dtype != dt) {
-            return plan;
-        }
-    }
-
-    const int64_t N = in.dims[0];
-    const int64_t IC = in.dims[1];
-    const int64_t IW = in.dims[3];
-    const int64_t OC = wt.dims[0];
-    const int64_t OH = out.dims[2];
-    const int64_t OW = out.dims[3];
-
-    const int64_t G = attrs.groups;
-    const int64_t ic_per_group = IC / G;
-    const int64_t oc_per_group = OC / G;
-
-    const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
-    const int64_t PH = attrs.padding[0];
-
-    // A 1x1 kernel at unit stride with no padding lets the GEMM read the input
-    // plane directly: B = input, ldb = the channel stride, K = ic_per_group.
-    // That needs a contiguous output row's worth of input, hence the row-stride
-    // test; row_stride_elems == 0 is TensorDesc's "unknown → compact" convention.
-    // An fp activation is re-quantized into a compact plane, so its pitch does
-    // not disqualify it.
-    const bool fp_act = (dt == DataType::f32 || dt == DataType::f16);
-    plan.pointwise = (karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
-                      attrs.padding[0] == 0 && attrs.padding[1] == 0 &&
-                      ((quant && fp_act) || in.row_stride_elems == 0 || in.row_stride_elems == IW));
-
-    // An fp activation becomes a compact plane once per call, then behaves like
-    // a pre-quantized one (see the header).
-    plan.quant_size = (quant && fp_act) ? N * IC * in.dims[2] * IW : 0;
-
-    // No col buffer bounds the ic-block, so pointwise runs the whole
-    // ic_per_group in one pass.
-    //
-    // The quantized A panels are a load-time artifact (PackedOIHW), so its
-    // blocks are conv_packed_weight_channel_first's; the fp route packs its own B.
-    const bool prepacked_a = wt.layout == TensorLayout::PackedOIHW;
-    const ConvPackedWeightChannelFirst pg =
-        quant ? conv_packed_weight_channel_first(attrs, ic_per_group, oc_per_group, wt.dtype) :
-                ConvPackedWeightChannelFirst{};
-    plan.icn_block =
-        quant ? pg.icn_block :
-                (plan.pointwise ?
-                     ic_per_group :
-                     std::min<int64_t>(get_ic_block(static_cast<int>(karea)), ic_per_group));
-    plan.ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
-    plan.oh_block = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
-
-    // The GEMM's N axis is the block's rows flattened into one roi_area-wide
-    // run, and every store, seed and epilogue pass addresses it contiguously
-    // (ldc is the channel step). A block may therefore only span rows the
-    // destination lays out back to back: a pitched output pins it to one row.
-    // row_stride_elems == 0 is TensorDesc's unknown → compact convention.
-    const bool out_rows_dense = out.row_stride_elems == 0 || out.row_stride_elems == OW;
-    if (!out_rows_dense) {
-        plan.oh_block = 1;
-    }
-
-    const int64_t NG = N * G;
-    const int64_t nt = std::max<int64_t>(num_threads, 1);
-
-    // The oh-block is the atomic unit of work, so the pool is capped at
-    // NG·num_oh_blocks tasks. Halve the block while more than half the pool is
-    // idle (at 8 threads the same split is a loss: 397→349 GFLOPS), flooring at
-    // two n-panels where the weight panel re-read stops paying. col_size shrinks
-    // with the block; the expansion loop below grows it back.
-    const int64_t nr_max = quant ? NR_MAX_I8 : nr_max_dt(dt);
-    for (;;) {
-        const int64_t blocks = (OH + plan.oh_block - 1) / plan.oh_block;
-        if (2 * NG * blocks >= nt || plan.oh_block <= 1) {
-            break;
-        }
-        const int64_t next = plan.oh_block / 2;
-        if (next * OW < 2 * nr_max) {
-            break;
-        }
-        plan.oh_block = next;
-    }
-
-    // Mirror of the halving loop: when the filter rows outnumber the plane they
-    // feed, covering the whole plane sweeps the weight once instead of once per
-    // block (MLAS's ExpandThenGemm takes the same crossover, convolve.cpp:1691).
-    // The block lands on OH itself; the kernel derives the row count per block.
-    if (out_rows_dense && oc_per_group > OH * OW) {
-        while (plan.oh_block < OH) {
-            const int64_t grown = std::min<int64_t>(plan.oh_block * 2, OH);
-            const int64_t grown_blocks = (OH + grown - 1) / grown;
-            if (2 * NG * grown_blocks < nt) {
-                break;
-            } // pool still needs the split
-            plan.oh_block = grown;
-        }
-    }
-
-    // Grow the oh-block back while every worker still gets a whole block of its
-    // own: the initial block follows the filter, so a 28-row plane runs 4-row
-    // blocks that each restart the gather, the packer and their C pass (+10..15%
-    // at one thread on the 28-56 row planes, a wash at 112).
-    //
-    // The block count must stay a multiple of the chunk count (an uneven split
-    // cost -12% at 4T on a 112 plane) and must not grow the busiest chunk's rows.
-    // The search steps the block count by the chunk count rather than doubling
-    // the row count: it can land on 14 rows on a 112 plane, where 4→8→16 cannot.
-    if (out_rows_dense && !plan.pointwise) {
-        constexpr int64_t kScratchCap = int64_t{256} << 10; // elements per slot
-        const int64_t scratch_per_row = plan.icn_block * karea * OW;
-        const int64_t cap_rows = (scratch_per_row > 0) ? kScratchCap / scratch_per_row : OH;
-        const int64_t max_rows = std::max<int64_t>(plan.oh_block, std::min<int64_t>(OH, cap_rows));
-        const int64_t chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, OH);
-        // Rows the busiest oh-chunk owns under block size `block` (the kernel's
-        // own b0..b1 split).
-        auto busiest_chunk_rows = [&](int64_t block) {
-            const int64_t nblk = (OH + block - 1) / block;
-            const int64_t nc = std::min(chunks, nblk); // oh_chunks <= num_oh_blocks
-            int64_t worst = 0;
-            for (int64_t c = 0; c < nc; ++c) {
-                const int64_t lo = std::min(OH, c * nblk / nc * block);
-                const int64_t hi = std::min(OH, (c + 1) * nblk / nc * block);
-                worst = std::max(worst, hi - lo);
-            }
-            return worst;
-        };
-        const int64_t base_rows = busiest_chunk_rows(plan.oh_block);
-        for (int64_t blocks = chunks; blocks <= OH; blocks += chunks) {
-            const int64_t grown = (OH + blocks - 1) / blocks;
-            if (grown > max_rows) {
-                continue;
-            } // over the scratch budget
-            // ceil(OH/grown) need not hand `blocks` back — only then is the
-            // split actually one block per chunk.
-            if ((OH + grown - 1) / grown != blocks) {
-                continue;
-            }
-            if (busiest_chunk_rows(grown) > base_rows) {
-                continue;
-            } // long tail
-            if (grown > plan.oh_block) {
-                plan.oh_block = grown;
-            }
-            break;
-        }
-    }
-
-    plan.num_oh_blocks = (OH + plan.oh_block - 1) / plan.oh_block;
-
-    // Split oh when (batch, group) alone under-subscribes the pool (batch=1 /
-    // groups=1 would otherwise run single-threaded); cap at the oh-block count.
-    plan.oh_chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, plan.num_oh_blocks);
-
-    // Second parallel axis: the filter rows. A small plane has too few oh-blocks
-    // to fill a wide pool (a 7x7 plane is two; a 224 ResNet-18 layer4 lost 155 →
-    // 68 GFLOPS going 4T → 20T). Spend this axis first: each oc-chunk reads a
-    // *distinct* filter slice, where another oh-chunk re-reads the same rows —
-    // only the B gather duplicates, ~1/(2·M) of the GEMM's work (MLAS's
-    // ExpandThenGemm, convolve.cpp:1691). Gated like the halving and fp-only.
-    // The chunk count is the NEAREST whole number to nt/plane_tasks (see header).
-    plan.oc_chunks = 1;
-    if (!quant) {
-        // Two M-panels per task is the floor, mirroring the oh-block's two
-        // N-panels: below it the per-task overheads (bias seed, epilogue, the
-        // re-gathered B panel) stop being amortized.
-        const int64_t mr = mr_max_dt(dt);
-        const int64_t plane_tasks = NG * plan.oh_chunks;
-        if (2 * plane_tasks < nt) {
-            const int64_t max_chunks = std::max<int64_t>(1, oc_per_group / (2 * mr));
-            const int64_t want = (nt + plane_tasks / 2) / plane_tasks;
-            plan.oc_chunks = std::clamp<int64_t>(want, 1, max_chunks);
-        }
-    }
-
-    // The fp route fuses gather and pack, so it has no col matrix.
-    plan.col_size = (plan.pointwise || !quant) ? 0 : plan.icn_block * karea * plan.oh_block * OW;
-    // add_to never reaches here on the quantized route (gated above).
-    plan.orig_size = (attrs.add_to && !quant) ? plan.ocn_block * plan.oh_block * OW : 0;
-
-    // Packed-B scratch at the widest n-block and longest k-block; the packer's
-    // stride comes from the actual k, so this is a bound, not a worst case.
-    // The quantized route's is in bytes (esz 1) with the int8 panel stride.
-    const int64_t esz = quant ? 1 : static_cast<int64_t>(data_type_size(dt));
-    const int64_t kdim_max = plan.icn_block * karea;
-    plan.pack_size = ((plan.oh_block * OW + nr_max - 1) / nr_max) *
-                     gemm_panel_slot(kdim_max, nr_max, esz, quant, dt == DataType::bf16);
-
-    // One slot per worker when the backend reports ids and there are fewer of
-    // them than tasks; else one per task.
-    const int64_t total = NG * plan.oh_chunks * plan.oc_chunks;
-    const int64_t slots = (num_slots > 0) ? num_slots : nt;
-    plan.num_slots = (use_thread_slots && slots < total) ? slots : total;
-
-    if (quant) {
-        // Both regions sit behind the slots in the shared arena.
-        plan.acc_size = plan.ocn_block * plan.oh_block * OW;
-        // A prepacked filter's panels are read in place: no per-slot pack region.
-        plan.pack_a_size =
-            prepacked_a ?
-                0 :
-                static_cast<int64_t>(num_panels_max(static_cast<int>(plan.ocn_block), MR_I8)) *
-                    geom_ldd_i8_a(kdim_max);
-    }
-    plan.workspace_size = static_cast<size_t>(gemm_scratch_layout(plan, esz).total);
-    return plan;
-}
-
-} // anonymous namespace
-} // namespace channel_first
 
 // =========================================================================
 //  Channel-last route — pixels on M, the packed HWIO weight on N
@@ -1387,9 +327,9 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
     constexpr float kInf = std::numeric_limits<float>::infinity();
 
     // ---- the finish decision ----------------------------------------------
-    // A pure clamp folds into the MMA store, as on the channel-first route. The bias is
-    // per *column* here (rows are pixels), so it seeds the tile instead of the
-    // micro-kernel's per-row seed — leaving the clamp nothing else to do.
+    // A pure clamp folds into the MMA store. The bias is per *column* here
+    // (rows are pixels), so it seeds the tile instead of the micro-kernel's
+    // per-row seed — leaving the clamp nothing else to do.
     // A pre-activation residual joins the sum before the clamp, so the clamp
     // cannot ride the MMA store and the epilogue stays a separate pass.
     const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
@@ -1698,7 +638,7 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
 // the packed s8 HWIO weight, int32 accumulator (one read-modify-write pass per
 // ic block over the task's oc slice); the epilogue compensates and dequantizes
 // or requantizes. An fp activation is materialized into a compact s8 plane once
-// per call, as on the channel-first route.
+// per call.
 
 namespace k = nnops::kernel; // pure SIMD kernels: the quantizer, int8 reductions
 
@@ -1764,7 +704,7 @@ void materialize_plane(const TensorView& in, int8_t* dst, float scale, int32_t z
         }
     };
 
-    // A dispatch costs more than the pass: same split as the channel-first quantizer.
+    // A dispatch costs more than the pass.
     constexpr int64_t kInlineMax = int64_t{1} << 19;
 
     const int64_t nt = std::max<int64_t>(ctx.cpu.thread_count(), 1);
@@ -1946,8 +886,8 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs, TensorView& ou
     }
 
     // R_b[oc] = Σ_k weight[oc,k] over the whole K. A packed blob carries it, so
-    // the walk below is only for a filter too large for the arena. Serial, for
-    // the reason the channel-first route gives.
+    // the walk below is only for a filter too large for the arena, and it is
+    // serial because a second pool dispatch costs more than the pass.
     //
     // In HWIO one output channel's K values are a *strided* column, so the sum
     // accumulates over the k rows — elementwise across OC, the contiguous axis.
@@ -2244,7 +1184,6 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     const auto& out = outputs[0];
 
     Conv2DGemmPlan plan;
-    plan.route = Conv2DGemmRoute::ChannelLast;
 
     const DataType dt = in.dtype;
     const bool quant = is_quantized_conv2d(wt.dtype);
@@ -2323,8 +1262,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     const int64_t esz = quant ? 1 : static_cast<int64_t>(data_type_size(dt));
 
     // Rows first (the axis every task shares), then the filter axis when the
-    // rows cannot fill the pool — the channel-first plan's order and nearest-round
-    // rule.
+    // rows cannot fill the pool — with the nearest-round rule.
     //
     // A row chunk must still be worth a micro-kernel tile: split a 7x7 plane to
     // one row and each task is seven pixels against a 24-row tile. So the row
@@ -2411,7 +1349,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     // The int32 accumulator is a per-slot tile set shaped like the residual.
     plan.acc_size = quant ? pass_tiles * plan.ocn_block : 0;
     // An fp activation is materialized into a compact s8 channel-last plane once per
-    // call, as on the channel-first route. A pre-quantized u8 one is materialized too
+    // call. A pre-quantized u8 one is materialized too
     // when it takes the pointwise route, whose in-row A read cannot shift bytes.
     const bool fp_act = (dt == DataType::f32 || dt == DataType::f16);
     plan.quant_size = (quant && (fp_act || (dt == DataType::u8 && plan.pointwise))) ?
@@ -2438,44 +1376,6 @@ namespace {
 /// A route is (make_plan, fp_impl, quant_impl): the plan, then the two per-dtype
 /// leaves the shared ladders below call. Everything route-independent — the
 /// pool, the plan prologue, the column split, the dtype switches — lives outside.
-struct ChannelFirstRoute {
-    static Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
-                                    std::span<const TensorDesc> inputs,
-                                    std::span<const TensorDesc> outputs, int num_threads,
-                                    bool use_thread_slots, int64_t num_slots)
-    {
-        return channel_first::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
-                                        num_slots);
-    }
-
-    template <class T>
-    static void fp_impl(const Conv2DAttributes& attrs, TensorView& output,
-                        std::span<const TensorView> inputs, const ComputeContext& ctx,
-                        const Conv2DGemmPlan& plan, void* workspace)
-    {
-        channel_first::conv2d_channel_first_impl<T>(attrs, output, inputs, ctx, plan, workspace);
-    }
-
-    /// An fp activation is stored as `act_quant_dtype`; a pre-quantized one is
-    /// already its own storage.
-    template <class TAct, class TOut>
-    static void quant_impl(const Conv2DAttributes& attrs, TensorView& output,
-                           std::span<const TensorView> inputs, const ComputeContext& ctx,
-                           const Conv2DGemmPlan& plan, void* workspace)
-    {
-        constexpr bool kPreQuant = std::is_same_v<TAct, int8_t> || std::is_same_v<TAct, uint8_t>;
-        if constexpr (kPreQuant) {
-            channel_first::conv2d_channel_first_int8_impl<TAct, TAct, TOut>(attrs, output, inputs,
-                                                                            ctx, plan, workspace);
-        } else if (attrs.act_quant_dtype == DataType::u8) {
-            channel_first::conv2d_channel_first_int8_impl<TAct, uint8_t, TOut>(
-                attrs, output, inputs, ctx, plan, workspace);
-        } else {
-            channel_first::conv2d_channel_first_int8_impl<TAct, int8_t, TOut>(attrs, output, inputs,
-                                                                              ctx, plan, workspace);
-        }
-    }
-};
 
 struct ChannelLastRoute {
     static Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
@@ -2579,12 +1479,12 @@ Status conv2d_fp_run(const Conv2DAttributes& attrs, TensorView& output,
     }
 }
 
-/// [N, C, H, W] cut to `len` columns from `col0`, pitch and layout kept:
-/// channel-first shifts one element per column, channel-last a whole vector.
+/// [N, C, H, W] cut to `len` columns from `col0`, pitch and layout kept: a
+/// column is a whole channel vector.
 TensorView wide_window(const TensorView& v, int64_t col0, int64_t len)
 {
     const int64_t unit = static_cast<int64_t>(data_type_stride_unit(v.data_type()));
-    const int64_t off = col0 * (is_channel_last(v.layout()) ? v.shape(1) : 1) * unit;
+    const int64_t off = col0 * v.shape(1) * unit;
     const int64_t s[4] = {v.shape(0), v.shape(1), v.shape(2), len};
     auto* base =
         const_cast<char*>(static_cast<const char*>(static_cast<const void*>(v.ptr<uint8_t>())));
@@ -2719,7 +1619,7 @@ Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
 // two-step contract as the Winograd U. It is safe because the geometry comes from
 // the attributes plus the filter's own dims, never the activation (hence these
 // take channel counts, not a plan), and the plan adopts icn_block/ocn_block from
-// conv_packed_weight_last / _channel_first rather than choosing again — so "the panels
+// conv_packed_weight_last rather than choosing again — so "the panels
 // prepackWeights built" and "the panels the plan sized for" are one decision.
 //
 // The channel-last blob is addressed by *panel*: panel p holds output channels
@@ -2788,59 +1688,6 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs, int6
     return g;
 }
 
-ConvPackedWeightChannelFirst conv_packed_weight_channel_first(const Conv2DAttributes& attrs,
-                                                              int64_t ic_per_group,
-                                                              int64_t oc_per_group,
-                                                              DataType weight_dtype)
-{
-    ConvPackedWeightChannelFirst g;
-    if (ic_per_group <= 0 || oc_per_group <= 0 || attrs.groups <= 0) {
-        return g;
-    }
-    const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
-
-    // A float filter is already the channel-first GEMM's A operand (OIHW is exactly
-    // that), so the "prepacked" form is only a densified copy. Its one job is to
-    // make the contract total: every supported filter has one prepacked form.
-    if (!is_quantized_conv2d(weight_dtype)) {
-        g.dense = true;
-        g.total = attrs.groups * oc_per_group * ic_per_group * karea;
-        return g;
-    }
-
-    // The channel-first plan's own blocks (channel_first::make_plan), so the A
-    // panels it otherwise rebuilds per task are the ones the blob holds. A 1x1
-    // filter at unit stride runs K over the whole channel count in one pass, the
-    // plan's pointwise rule; padding is not consulted, for the channel-last
-    // reason.
-    const bool unit_1x1 = karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1;
-    g.icn_block = unit_1x1 ? ic_per_group :
-                             std::min<int64_t>(channel_first::get_ic_block(static_cast<int>(karea)),
-                                               ic_per_group);
-    g.ocn_block = std::min<int64_t>(channel_first::kOcnBlock, oc_per_group);
-    g.kdim_max = g.icn_block * karea;
-    g.num_oc_blocks = (oc_per_group + g.ocn_block - 1) / g.ocn_block;
-    g.nfull_ic = ic_per_group / g.icn_block;
-    g.tail_ic = ic_per_group - g.nfull_ic * g.icn_block;
-    const int64_t panels = num_panels_max(static_cast<int>(g.ocn_block), MR_I8);
-    g.set_full = panels * geom_ldd_i8_a(g.kdim_max);
-    g.set_tail = g.tail_ic ? panels * geom_ldd_i8_a(g.tail_ic * karea) : 0;
-    g.group_elems = (g.nfull_ic + (g.tail_ic ? 1 : 0)) * g.num_oc_blocks * g.set_full;
-    g.total = attrs.groups * g.group_elems;
-    // The R_a table trails the panels (see ConvPackedWeightLast::sums_off).
-    g.sums_off = g.total;
-    const int64_t sum_bytes = attrs.groups * oc_per_group * static_cast<int64_t>(sizeof(int32_t));
-    g.total += (sum_bytes + 3) & ~int64_t{3};
-    return g;
-}
-
-int64_t ConvPackedWeightChannelFirst::offset(int64_t g, int64_t ic_block,
-                                             int64_t oc_block) const noexcept
-{
-    const int64_t ic = ic_block * num_oc_blocks * set_full;
-    const int64_t oc = oc_block * set_full;
-    return g * group_elems + ic + oc;
-}
 
 namespace {
 
@@ -2870,26 +1717,19 @@ TensorDesc packed_weight_desc(int64_t oc_per_group, int64_t groups, int64_t elem
 
 TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs, const TensorDesc& weight)
 {
-    // The filter's own dims give the channel counts: OIHW is [OC][IC/G][KH][KW],
-    // HWIO is [KH][KW][IC/G][OC].
-    const bool hwio = is_channel_last_weight(weight.layout);
-    if (weight.rank != 4 || (!hwio && weight.layout != TensorLayout::NCHW)) {
+    // The filter's own dims give the channel counts: HWIO is [KH][KW][IC/G][OC].
+    if (weight.rank != 4 || !is_channel_last_weight(weight.layout)) {
         return TensorDesc{};
     }
-    const int64_t OC = hwio ? weight.dims[3] : weight.dims[0];
-    const int64_t ICG = hwio ? weight.dims[2] : weight.dims[1];
+    const int64_t OC = weight.dims[3];
+    const int64_t ICG = weight.dims[2];
     const int64_t G = attrs.groups;
     if (G <= 0 || OC % G != 0 || ICG <= 0) {
         return TensorDesc{};
     }
 
-    if (hwio) {
-        const ConvPackedWeightLast g = conv_packed_weight_last(attrs, ICG, OC / G, weight.dtype);
-        return packed_weight_desc(OC / G, G, g.total, weight.dtype, TensorLayout::PackedHWIO);
-    }
-    const ConvPackedWeightChannelFirst g =
-        conv_packed_weight_channel_first(attrs, ICG, OC / G, weight.dtype);
-    return packed_weight_desc(OC / G, G, g.total, weight.dtype, TensorLayout::PackedOIHW);
+    const ConvPackedWeightLast g = conv_packed_weight_last(attrs, ICG, OC / G, weight.dtype);
+    return packed_weight_desc(OC / G, G, g.total, weight.dtype, TensorLayout::PackedHWIO);
 }
 
 namespace {
@@ -3010,73 +1850,26 @@ void pack_weight_last_i8(const TensorView& weight, TensorView& packed,
     });
 }
 
-/// The quantized channel-first A panels (PackedOIHW): one set per (group, k block, oc
-/// block), each `num_panels_max(ocn_block, MR_I8)` panels of MR_I8 output
-/// channels at the k block's own A stride.
-void pack_weight_channel_first_i8(const TensorView& weight, TensorView& packed,
-                                  const ConvPackedWeightChannelFirst& g, int64_t ic_per_group,
-                                  int64_t oc_per_group, int64_t groups, const ComputeContext& ctx)
-{
-    const int64_t karea = g.kdim_max / g.icn_block;
-    const bool a_biased = arch::mma_i8_folds_a_bias;
-    const int64_t num_ic_blocks = g.nfull_ic + (g.tail_ic ? 1 : 0);
-    const int64_t oc_blocks = g.num_oc_blocks;
-    const int64_t w_ocn_step = ic_per_group * karea;
-
-    const int8_t* const w = weight.ptr<int8_t>();
-    int8_t* const blob = packed.ptr<int8_t>();
-
-    // One (group, k block, oc block) is one A panel set and one contiguous run
-    // of the blob, so the split needs no scratch and no lock.
-    const int64_t per_group = num_ic_blocks * oc_blocks;
-    ctx.cpu.run(0, groups * per_group, [&](int64_t t) {
-        const int64_t gg = t / per_group;
-        const int64_t rem = t % per_group;
-        const int64_t ib = rem / oc_blocks;
-        const int64_t ob = rem % oc_blocks;
-
-        const int64_t icn = ib * g.icn_block;
-        const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
-        const int64_t kdim = icnc * karea;
-        const int64_t ocn = ob * g.ocn_block;
-        const int64_t ocnc = std::min(g.ocn_block, oc_per_group - ocn);
-        int8_t* const dst = blob + g.offset(gg, ib, ob);
-        tile_pack_lhs_i8(false, static_cast<int>(ocnc), static_cast<int>(kdim), dst,
-                         static_cast<int>(geom_ldd_i8_a(kdim)),
-                         w + gg * oc_per_group * w_ocn_step + icn * karea + ocn * w_ocn_step,
-                         static_cast<int>(w_ocn_step), a_biased);
-    });
-}
-
 /// Σ_k weight[oc, k] per output channel over a group's whole K — the table the
-/// int8 epilogues compensate with (R_b channel-last, R_an channel-first). Written from
-/// the *raw* filter, in whichever order its layout makes contiguous.
-void write_weight_sums(const int8_t* w, int64_t OC, int64_t ic_per_group, int64_t karea, bool hwio,
+/// int8 epilogue compensates with. Written from the *raw* HWIO filter.
+void write_weight_sums(const int8_t* w, int64_t OC, int64_t ic_per_group, int64_t karea,
                        const TensorView& weight, int32_t* out, const ComputeContext& ctx)
 {
-    if (hwio) {
-        // [KH][KW][IC/G][OC]: the walk covers the group's input channels and
-        // *all* groups' output channels at once — the OC axis spans groups.
-        const int64_t w_ic = weight.shape(3);
-        const int64_t w_tap = ic_per_group * w_ic;
-        // One output channel is one task: a channel's taps are strided, but the
-        // writes are disjoint and this is the pack's smallest cost.
-        ctx.cpu.run(0, OC, [&](int64_t oc) {
-            int32_t acc = 0;
-            for (int64_t t = 0; t < karea; ++t) {
-                const int8_t* const row = w + t * w_tap + oc;
-                for (int64_t i = 0; i < ic_per_group; ++i) {
-                    acc += row[i * w_ic];
-                }
-            }
-            out[oc] = acc;
-        });
-        return;
-    }
-    // [OC][IC/G·KH·KW]: one output channel's whole K is one contiguous run.
-    const int64_t k_full = ic_per_group * karea;
+    // [KH][KW][IC/G][OC]: the walk covers the group's input channels and
+    // *all* groups' output channels at once — the OC axis spans groups.
+    const int64_t w_ic = weight.shape(3);
+    const int64_t w_tap = ic_per_group * w_ic;
+    // One output channel is one task: a channel's taps are strided, but the
+    // writes are disjoint and this is the pack's smallest cost.
     ctx.cpu.run(0, OC, [&](int64_t oc) {
-        out[oc] = nnops::kernel::int8_row_sum<int8_t>(w + oc * k_full, k_full);
+        int32_t acc = 0;
+        for (int64_t t = 0; t < karea; ++t) {
+            const int8_t* const row = w + t * w_tap + oc;
+            for (int64_t i = 0; i < ic_per_group; ++i) {
+                acc += row[i * w_ic];
+            }
+        }
+        out[oc] = acc;
     });
 }
 
@@ -3085,65 +1878,42 @@ void write_weight_sums(const int8_t* w, int64_t OC, int64_t ic_per_group, int64_
 void conv_packed_weight_pack(const Conv2DAttributes& attrs, const TensorView& weight,
                              TensorView& packed, const ComputeContext& ctx)
 {
-    const bool hwio = is_channel_last_weight(weight.layout());
-    const int64_t OC = hwio ? weight.shape(3) : weight.shape(0);
-    const int64_t ICG = hwio ? weight.shape(2) : weight.shape(1);
+    const int64_t OC = weight.shape(3);
+    const int64_t ICG = weight.shape(2);
     const int64_t G = attrs.groups;
     const int64_t OCG = OC / G;
     const DataType dtype = weight.data_type();
-    const int64_t esz = static_cast<int64_t>(data_type_size(dtype));
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
 
     // No zero-fill here: the panel packers mask-load a short panel and zero-fill
     // the lanes past its width, so every byte a consumer reads is written.
-    if (hwio) {
-        const ConvPackedWeightLast g = conv_packed_weight_last(attrs, ICG, OCG, dtype);
-        NNOPS_ASSERT(packed.numel() >= g.total &&
-                     "conv_packed_weight_pack: buffer smaller than the panels");
-        switch (dtype) {
-        case DataType::f32:
-            pack_weight_last<float>(weight, packed, g, ICG, OCG, G, ctx);
-            break;
-        case DataType::f16:
-            pack_weight_last<half>(weight, packed, g, ICG, OCG, G, ctx);
-            break;
-#ifdef NNOPS_ARCH_AARCH64
-        case DataType::bf16:
-            pack_weight_last<bfloat16>(weight, packed, g, ICG, OCG, G, ctx);
-            break;
-#endif
-        case DataType::s8:
-            pack_weight_last_i8(weight, packed, g, ICG, OCG, G, ctx);
-            break;
-        default:
-            NNOPS_ASSERT(!"conv_packed_weight_pack: unsupported filter dtype");
-            return;
-        }
-        if (is_quantized_conv2d(dtype)) {
-            // The sums land on an unaligned byte offset: accumulate whole, copy in.
-            PoolArray<int32_t> sums;
-            sums.zero(static_cast<size_t>(OC));
-            write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, true, weight, sums.data(), ctx);
-            std::memcpy(packed.ptr<char>() + g.sums_off, sums.data(),
-                        static_cast<size_t>(OC) * sizeof(int32_t));
-        }
-        return;
-    }
-
-    const ConvPackedWeightChannelFirst g = conv_packed_weight_channel_first(attrs, ICG, OCG, dtype);
+    const ConvPackedWeightLast g = conv_packed_weight_last(attrs, ICG, OCG, dtype);
     NNOPS_ASSERT(packed.numel() >= g.total &&
                  "conv_packed_weight_pack: buffer smaller than the panels");
-    if (g.dense) {
-        // A channel-first float filter is already the GEMM's A operand: the blob
-        // is that matrix, and the copy is the whole pack (and how any pitch ends
-        // up dense).
-        std::memcpy(packed.ptr<char>(), weight.ptr<char>(),
-                    static_cast<size_t>(g.total) * static_cast<size_t>(esz));
-    } else {
-        pack_weight_channel_first_i8(weight, packed, g, ICG, OCG, G, ctx);
+    switch (dtype) {
+    case DataType::f32:
+        pack_weight_last<float>(weight, packed, g, ICG, OCG, G, ctx);
+        break;
+    case DataType::f16:
+        pack_weight_last<half>(weight, packed, g, ICG, OCG, G, ctx);
+        break;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16:
+        pack_weight_last<bfloat16>(weight, packed, g, ICG, OCG, G, ctx);
+        break;
+#endif
+    case DataType::s8:
+        pack_weight_last_i8(weight, packed, g, ICG, OCG, G, ctx);
+        break;
+    default:
+        NNOPS_ASSERT(!"conv_packed_weight_pack: unsupported filter dtype");
+        return;
+    }
+    if (is_quantized_conv2d(dtype)) {
+        // The sums land on an unaligned byte offset: accumulate whole, copy in.
         PoolArray<int32_t> sums;
         sums.zero(static_cast<size_t>(OC));
-        write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, false, weight, sums.data(), ctx);
+        write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, weight, sums.data(), ctx);
         std::memcpy(packed.ptr<char>() + g.sums_off, sums.data(),
                     static_cast<size_t>(OC) * sizeof(int32_t));
     }
@@ -3154,22 +1924,15 @@ Conv2DGemmPlan get_conv2d_implicit_gemm_plan(const Conv2DAttributes& attrs,
                                              std::span<const TensorDesc> outputs, int num_threads,
                                              bool use_thread_slots, int64_t num_slots)
 {
-    if (is_channel_last(inputs[0].layout)) {
-        return ChannelLastRoute::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
-                                           num_slots);
-    }
-    return ChannelFirstRoute::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
-                                        num_slots);
+    return ChannelLastRoute::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+                                       num_slots);
 }
 
 Status conv2d_implicit_gemm_kernel(const Conv2DAttributes& attrs, TensorView& output,
                                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                                    void* /*workspace*/)
 {
-    if (is_channel_last(inputs[0].layout())) {
-        return conv2d_gemm_run<ChannelLastRoute>(attrs, output, inputs, ctx);
-    }
-    return conv2d_gemm_run<ChannelFirstRoute>(attrs, output, inputs, ctx);
+    return conv2d_gemm_run<ChannelLastRoute>(attrs, output, inputs, ctx);
 }
 
 } // namespace nnops::backend::cpu

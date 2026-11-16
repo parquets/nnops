@@ -58,7 +58,7 @@ public:
     Backend getBackend() const override { return backend_; }
 
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::Any;
     }
 
     const SliceAttributes& attributes() const noexcept { return attrs_; }

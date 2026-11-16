@@ -65,11 +65,11 @@ QuantParams per_token(const float* scale, const int32_t* zp, int64_t n) {
 // [rows, cols] view with explicit quant params; make_q_nd is the any-rank form.
 TensorView make_q(int64_t rows, int64_t cols, DataType dt, void* data, const QuantParams& qp) {
     const int64_t shape[] = {rows, cols};
-    return TensorView(shape, dt, data, TensorLayout::NCHW, qp);
+    return TensorView(shape, dt, data, TensorLayout::Dense, qp);
 }
 
 TensorView make_q_nd(std::span<const int64_t> shape, DataType dt, void* data, const QuantParams& qp) {
-    return TensorView(shape, dt, data, TensorLayout::NCHW, qp);
+    return TensorView(shape, dt, data, TensorLayout::Dense, qp);
 }
 
 // The shape getOutputTensorDesc resolved, as a span for make_q_nd.

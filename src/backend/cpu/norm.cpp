@@ -210,65 +210,27 @@ void batch_norm_impl(const NormAttributes& attrs, TensorView& output,
                 s_load(&b_ptr[c]) - s_load(&m_ptr[c]) * ns_f[static_cast<size_t>(c)];
         }
 
-        if (is_channel_last(X.layout())) {
-            // One row is a spatial line of W pixels × C channels; each pixel
-            // takes the same C factors. Rank 2 has C as its only row.
-            const int64_t pixels = (rank >= 3) ? X.shape(rank - 1) : 1;
-            const int64_t num_rows = (rank >= 3) ? X.total_rows() : N;
-            const int64_t x_rs = X.row_stride_elems();
-            const int64_t y_rs = output.row_stride_elems();
+        // One row is a spatial line of W pixels × C channels; each pixel
+        // takes the same C factors. Rank 2 has C as its only row.
+        const int64_t pixels = (rank >= 3) ? X.shape(rank - 1) : 1;
+        const int64_t num_rows = (rank >= 3) ? X.total_rows() : N;
+        const int64_t x_rs = X.row_stride_elems();
+        const int64_t y_rs = output.row_stride_elems();
 
-            const auto process_row = [&](int64_t r) {
-                const T* xr = x_ptr + r * x_rs;
-                T* yr = y_ptr + r * y_rs;
-                for (int64_t p = 0; p < pixels; ++p) {
-                    for (int64_t c = 0; c < C; ++c) {
-                        const int64_t idx = p * C + c;
-                        const float v = s_load(&xr[idx]) * ns_f[static_cast<size_t>(c)] +
-                                        nb_f[static_cast<size_t>(c)];
-                        s_store_add(&yr[idx], v, attrs.add_to);
-                    }
-                }
-            };
-
-            ctx.cpu.run(0, num_rows, process_row);
-            return;
-        }
-
-        int64_t sample_size = 1;
-        if (rank >= 2) {
-            for (int64_t i = 2; i < rank; ++i) {
-                sample_size *= X.shape(i);
-            }
-        }
-
-        const int64_t x_n_stride = X.stride_elems(0);
-        const int64_t x_c_stride = (rank >= 2) ? X.stride_elems(1) : 1;
-        const int64_t y_n_stride = output.stride_elems(0);
-        const int64_t y_c_stride = (rank >= 2) ? output.stride_elems(1) : 1;
-
-        const int64_t last_dim = (rank >= 3) ? X.shape(rank - 1) : 1;
-        const int64_t num_rows = (rank >= 3) ? sample_size / last_dim : 1;
-        const int64_t x_row_stride = X.row_stride_elems();
-        const int64_t y_row_stride = output.row_stride_elems();
-
-        const auto compute_sample = [&](int64_t n) {
-            for (int64_t c = 0; c < C; ++c) {
-                const float ns = ns_f[static_cast<size_t>(c)];
-                const float nb = nb_f[static_cast<size_t>(c)];
-                const int64_t x_ch_base = n * x_n_stride + c * x_c_stride;
-                const int64_t y_ch_base = n * y_n_stride + c * y_c_stride;
-
-                for (int64_t hh = 0; hh < num_rows; ++hh) {
-                    kernel::batch_norm_process_channel_first_row<T>(
-                        x_ptr + x_ch_base + hh * x_row_stride,
-                        y_ptr + y_ch_base + hh * y_row_stride, last_dim, ns, nb, attrs.add_to);
+        const auto process_row = [&](int64_t r) {
+            const T* xr = x_ptr + r * x_rs;
+            T* yr = y_ptr + r * y_rs;
+            for (int64_t p = 0; p < pixels; ++p) {
+                for (int64_t c = 0; c < C; ++c) {
+                    const int64_t idx = p * C + c;
+                    const float v = s_load(&xr[idx]) * ns_f[static_cast<size_t>(c)] +
+                                    nb_f[static_cast<size_t>(c)];
+                    s_store_add(&yr[idx], v, attrs.add_to);
                 }
             }
         };
 
-        ctx.cpu.run(0, N, compute_sample);
-
+        ctx.cpu.run(0, num_rows, process_row);
     } else {
         const int64_t total = X.numel();
         kernel::batch_norm_process_nonspatial_block<T>(x_ptr, y_ptr, s_ptr, b_ptr, m_ptr, v_ptr, 0,
@@ -637,9 +599,6 @@ void group_norm_impl(const NormAttributes& attrs, TensorView& output,
     for (int64_t i = 2; i < rank; ++i) {
         spatial_size *= X.shape(i);
     }
-    const int64_t W = (rank >= 3) ? X.shape(rank - 1) : int64_t(1);
-    const int64_t rows_per_channel = spatial_size / W;
-
     const int64_t norm_size = channels_per_group * spatial_size;
     const float inv_norm = 1.0f / static_cast<float>(norm_size);
     const float epsilon = attrs.epsilon;
@@ -650,76 +609,27 @@ void group_norm_impl(const NormAttributes& attrs, TensorView& output,
     auto* y_ptr = output.ptr<T>();
     const bool add_to = attrs.add_to;
 
-    if (is_channel_last(X.layout())) {
-        // Channels are contiguous inside each pixel, so a group is
-        // channels_per_group consecutive elements at every spatial offset.
-        const auto x_sp = build_offsets(X, 2, rank - 1, spatial_size);
-        const auto y_sp = build_offsets(output, 2, rank - 1, spatial_size);
-        const int64_t x_n = X.stride_elems(0);
-        const int64_t y_n = output.stride_elems(0);
-
-        const auto process_group = [&](int64_t ng) {
-            const int64_t n = ng / G;
-            const int64_t g = ng % G;
-            const int64_t c_start = g * channels_per_group;
-
-            float sum = 0.0f;
-            float sum_sq = 0.0f;
-            for (int64_t p = 0; p < spatial_size; ++p) {
-                const int64_t base = x_n * n + x_sp[static_cast<size_t>(p)] + c_start;
-                for (int64_t k = 0; k < channels_per_group; ++k) {
-                    const float v = s_load(&x_ptr[base + k]);
-                    sum += v;
-                    sum_sq += v * v;
-                }
-            }
-
-            const float mean_val = sum * inv_norm;
-            float var_val = sum_sq * inv_norm - mean_val * mean_val;
-            if (var_val < 0.0f) {
-                var_val = 0.0f;
-            }
-            const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
-
-            for (int64_t p = 0; p < spatial_size; ++p) {
-                const int64_t xo = x_n * n + x_sp[static_cast<size_t>(p)] + c_start;
-                const int64_t yo = y_n * n + y_sp[static_cast<size_t>(p)] + c_start;
-                for (int64_t k = 0; k < channels_per_group; ++k) {
-                    const int64_t c_global = c_start + k;
-                    const float s = s_load(&s_ptr[c_global]);
-                    const float b = (has_bias && b_ptr) ? s_load(&b_ptr[c_global]) : 0.0f;
-                    const float val = (s_load(&x_ptr[xo + k]) - mean_val) * inv_std * s + b;
-                    s_store_add(&y_ptr[yo + k], val, add_to);
-                }
-            }
-        };
-
-        ctx.cpu.run(0, N * G, process_group);
-        return;
-    }
-
-    const int64_t stride_N = X.stride_elems(0);
-    const int64_t stride_C = X.stride_elems(1);
-    const int64_t row_stride = X.row_stride_elems();
-
-    const int64_t total_groups = N * G;
-    const int64_t total_rows_per_group = channels_per_group * rows_per_channel;
+    // Channels are contiguous inside each pixel, so a group is
+    // channels_per_group consecutive elements at every spatial offset.
+    const auto x_sp = build_offsets(X, 2, rank - 1, spatial_size);
+    const auto y_sp = build_offsets(output, 2, rank - 1, spatial_size);
+    const int64_t x_n = X.stride_elems(0);
+    const int64_t y_n = output.stride_elems(0);
 
     const auto process_group = [&](int64_t ng) {
         const int64_t n = ng / G;
         const int64_t g = ng % G;
         const int64_t c_start = g * channels_per_group;
 
-        const int64_t group_offset = n * stride_N + c_start * stride_C;
-
         float sum = 0.0f;
         float sum_sq = 0.0f;
-
-        for (int64_t row = 0; row < total_rows_per_group; ++row) {
-            const int64_t row_off = group_offset + row * row_stride;
-            auto [s, sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + row_off, W);
-            sum += s;
-            sum_sq += sq;
+        for (int64_t p = 0; p < spatial_size; ++p) {
+            const int64_t base = x_n * n + x_sp[static_cast<size_t>(p)] + c_start;
+            for (int64_t k = 0; k < channels_per_group; ++k) {
+                const float v = s_load(&x_ptr[base + k]);
+                sum += v;
+                sum_sq += v * v;
+            }
         }
 
         const float mean_val = sum * inv_norm;
@@ -729,19 +639,20 @@ void group_norm_impl(const NormAttributes& attrs, TensorView& output,
         }
         const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
 
-        for (int64_t row = 0; row < total_rows_per_group; ++row) {
-            const int64_t c_global = c_start + row / rows_per_channel;
-            const int64_t row_off = group_offset + row * row_stride;
-
-            const float s = s_load(&s_ptr[c_global]);
-            const float b = (has_bias && b_ptr) ? s_load(&b_ptr[c_global]) : 0.0f;
-
-            kernel::norm_apply_affine_row<T>(x_ptr + row_off, y_ptr + row_off, W, mean_val, inv_std,
-                                             s, b, add_to);
+        for (int64_t p = 0; p < spatial_size; ++p) {
+            const int64_t xo = x_n * n + x_sp[static_cast<size_t>(p)] + c_start;
+            const int64_t yo = y_n * n + y_sp[static_cast<size_t>(p)] + c_start;
+            for (int64_t k = 0; k < channels_per_group; ++k) {
+                const int64_t c_global = c_start + k;
+                const float s = s_load(&s_ptr[c_global]);
+                const float b = (has_bias && b_ptr) ? s_load(&b_ptr[c_global]) : 0.0f;
+                const float val = (s_load(&x_ptr[xo + k]) - mean_val) * inv_std * s + b;
+                s_store_add(&y_ptr[yo + k], val, add_to);
+            }
         }
     };
 
-    ctx.cpu.run(0, total_groups, process_group);
+    ctx.cpu.run(0, N * G, process_group);
 }
 
 // ============================================================

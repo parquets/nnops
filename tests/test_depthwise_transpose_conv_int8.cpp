@@ -1,6 +1,6 @@
 /// @file test_depthwise_transpose_conv_int8.cpp
 /// @brief Bit-exactness tests for the quantized CPU DepthwiseTransposeConv2D
-///        route, in both layouts.
+///        channel-last route.
 ///
 /// Route matrix: activation u8 / s8 / f16 / f32 (per-tensor QuantParams) ×
 /// weight s8 (per-channel QuantParams) → f32 / f16 / s8 / u8 output, across
@@ -12,10 +12,10 @@
 /// sides share the dequant/requant expression. The fp-activation cases use a
 /// power-of-two activation scale, which makes x·(1/scale) exact.
 ///
-/// Channel-last cases run the kernel on channel-last storage (the activation as
-/// [N][H][W][C], the filter as HWCM [KH][KW][C]) and the reference on the same
-/// values in channel-first order, converting the result back before the
-/// comparison: the layouts are a permutation, so the bits must survive it.
+/// The kernel runs on channel-last storage (the activation as [N][H][W][C], the
+/// filter as HWCM [KH][KW][C]) and the reference on the same values in
+/// channel-first order, converting the result back before the comparison: the
+/// layouts are a permutation, so the bits must survive it.
 ///
 /// Threading is part of the contract: the same case must give identical bits at
 /// 2/4/8 threads, since an output row's pixels belong to exactly one task.
@@ -133,7 +133,6 @@ struct Case {
     DataType out = DataType::f32;   // output dtype
     DataType act_q = DataType::s8;  // act_quant_dtype (fp activations only)
     bool bias = false;
-    bool channel_last = false;      // NHWC activation (and therefore output)
     float s_x = 0.0078125f;         // 1/128 — exact in binary
     int32_t zp_x = 0;
     float s_out = 0.03125f;         // requant scale, integer output only
@@ -233,15 +232,15 @@ struct Fixture {
         attrs.act_quant_dtype = c.act_q;
 
         const std::span<const int64_t> ishape(c.ishape.data(), 4);
-        ins.push_back(TensorView(ishape, c.act, act.data(), TensorLayout::NCHW, qa));
+        ins.push_back(TensorView(ishape, c.act, act.data(), TensorLayout::Dense, qa));
         const int64_t wshape[] = {C, 1, c.kh, c.kw};
         ins.push_back(TensorView(std::span<const int64_t>(wshape, 4), DataType::s8,
-                                 w.data(), TensorLayout::NCHW, qw));
+                                 w.data(), TensorLayout::Dense, qw));
         if (c.bias) {
             const int64_t bshape[] = {C};
             const DataType bdt = int_out ? DataType::s32 : c.out;
             ins.push_back(TensorView(std::span<const int64_t>(bshape, 1), bdt,
-                                     bias.data(), TensorLayout::NCHW));
+                                     bias.data(), TensorLayout::Dense));
         }
     }
 
@@ -341,16 +340,12 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     Result r;
     r.desc = cf_outs[0];
 
-    if (reference || !c.channel_last) {
+    if (reference) {
         r.buf.assign(static_cast<size_t>(cf_outs[0].numel()) * esz, 0);
         seed_output(r.buf, cf_outs[0].dtype, c.seed + 3);
         auto out = make_view(cf_outs[0], r.buf.data(), f.out_q);
-        if (reference) {
-            nnops::backend::cpu::reference::depthwise_transpose_conv_int8_ref(
-                f.attrs, out, f.ins, ctx, nullptr);
-        } else {
-            r.status = op->compute(out, f.ins, ctx, nullptr);
-        }
+        nnops::backend::cpu::reference::depthwise_transpose_conv_int8_ref(
+            f.attrs, out, f.ins, ctx, nullptr);
         return r;
     }
 
@@ -432,7 +427,7 @@ void expect_matches_ref(const Case& c, const ComputeContext& ctx = {}, int idx =
     const Result fast = run_route(c, ctx, /*reference=*/false);
     if (fast.status != Status::ok) {
         throw std::runtime_error(std::string("depthwise_transpose_conv_int8 (case ") +
-                                 std::to_string(idx) + (c.channel_last ? ", NHWC" : ", NCHW") +
+                                 std::to_string(idx) + ", NHWC" +
                                  "): compute returned " +
                                  std::to_string(static_cast<int>(fast.status)));
     }
@@ -440,106 +435,14 @@ void expect_matches_ref(const Case& c, const ComputeContext& ctx = {}, int idx =
     const std::string diff = first_difference(fast, ref);
     if (!diff.empty()) {
         throw std::runtime_error(std::string("depthwise_transpose_conv_int8 vs reference (case ") +
-                                 std::to_string(idx) + (c.channel_last ? ", NHWC" : ", NCHW") +
+                                 std::to_string(idx) + ", NHWC" +
                                  "): " + diff);
     }
 }
 
-/// Every case runs in both layouts.
+/// Every case runs channel-last.
 void expect_matches_ref_both(Case c, int idx) {
-    c.channel_last = false;
     expect_matches_ref(c, {}, idx);
-    c.channel_last = true;
-    expect_matches_ref(c, {}, idx);
-}
-
-// ============================================================
-// Hand-computed cases — pin the whole formula
-// ============================================================
-
-NNOPS_TEST(dwt_i8_hand_exact) {
-    // in [1,1,2,2] = 1..4, s8 zp_x 2 s_x 0.25; w [1,1,2,2] = {1,-1,2,0}, s8
-    // zp_w 1 s_w 0.5. The deconv of those two 2x2s is the 3x3 below; acc is
-    // (w−1)·(x−2) summed per output pixel, scaled by s_w·s_x = 0.125.
-    const int64_t ishape[] = {1, 1, 2, 2};
-    const int64_t wshape[] = {1, 1, 2, 2};
-
-    std::vector<int8_t> in = {1, 2, 3, 4};
-    std::vector<int8_t> wt = {1, -1, 2, 0};
-    std::vector<float>  ws = {0.5f};
-    std::vector<int32_t> wz = {1};
-
-    DepthwiseTransposeConv2DAttributes attrs;
-    attrs.kernel_size = {2, 2};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
-
-    TensorView input(ishape, DataType::s8, in.data(), TensorLayout::NCHW,
-                     per_tensor(0.25f, 2));
-    TensorView weight(wshape, DataType::s8, wt.data(), TensorLayout::NCHW,
-                      per_channel(ws.data(), wz.data(), 1));
-
-    auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc descs[] = {input.desc(), weight.desc()};
-    auto outs = op->getOutputTensorDesc(descs);
-    NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(outs[0].dims[2], 3);
-    NNOPS_EXPECT_EQ(outs[0].dims[3], 3);
-
-    std::vector<float> out_buf(9, 0.0f);
-    auto out = make_view(outs[0], out_buf.data());
-    const TensorView ins[] = {input, weight};
-    NNOPS_EXPECT_EQ(op->compute(out, ins), Status::ok);
-
-    const float expected[9] = {0.0f, 0.25f, 0.0f,
-                               -0.125f, -0.125f, -0.5f,
-                               0.125f, 0.125f, -0.25f};
-    for (int i = 0; i < 9; ++i) {
-        NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(i)], expected[i], 1e-6f);
-    }
-}
-
-NNOPS_TEST(dwt_i8_int_out_hand_exact) {
-    // The same operands on an s8 destination: req = s_w·s_x / s_out = 0.125 /
-    // 0.125 = 1, so the output is acc + bias + zp_out.
-    const int64_t ishape[] = {1, 1, 2, 2};
-    const int64_t wshape[] = {1, 1, 2, 2};
-    const int64_t bshape[] = {1};
-
-    std::vector<int8_t> in = {1, 2, 3, 4};
-    std::vector<int8_t> wt = {1, -1, 2, 0};
-    std::vector<float>  ws = {0.5f};
-    std::vector<int32_t> wz = {1};
-    int32_t bias = 5;
-
-    DepthwiseTransposeConv2DAttributes attrs;
-    attrs.kernel_size = {2, 2};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
-    attrs.output_dtype = DataType::s8;
-
-    TensorView input(ishape, DataType::s8, in.data(), TensorLayout::NCHW,
-                     per_tensor(0.25f, 2));
-    TensorView weight(wshape, DataType::s8, wt.data(), TensorLayout::NCHW,
-                      per_channel(ws.data(), wz.data(), 1));
-    TensorView bias_view(bshape, DataType::s32, &bias, TensorLayout::NCHW);
-
-    auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc descs[] = {input.desc(), weight.desc(), bias_view.desc()};
-    auto outs = op->getOutputTensorDesc(descs);
-    NNOPS_EXPECT_EQ(outs[0].dtype, DataType::s8);
-
-    std::vector<uint8_t> buf(9, 0);
-    auto out = make_view(outs[0], buf.data(), per_tensor(0.125f, 10));
-    const TensorView ins[] = {input, weight, bias_view};
-    NNOPS_EXPECT_EQ(op->compute(out, ins), Status::ok);
-
-    // acc = {0, 2, 0, -1, -1, -4, 1, 1, -2}; + bias + zp_out.
-    const int32_t expected[9] = {15, 17, 15, 14, 14, 11, 16, 16, 13};
-    for (int i = 0; i < 9; ++i) {
-        NNOPS_EXPECT_EQ(int(static_cast<int8_t>(buf[static_cast<size_t>(i)])),
-                        int(expected[i]));
-    }
 }
 
 // ============================================================
@@ -724,8 +627,7 @@ NNOPS_TEST(dwt_i8_matches_ref_int_out) {
 
 NNOPS_TEST(dwt_i8_threaded_matches_serial) {
     // The channel-last route splits a row into strips when the row grid cannot
-    // fill the pool; the channel-first one gives each (n, c, oh) to one task.
-    // Both must land on the same bytes.
+    // fill the pool; the serial and pooled runs must land on the same bytes.
     struct ThreadCase { Case c; };
     std::vector<ThreadCase> cases;
     {
@@ -749,21 +651,18 @@ NNOPS_TEST(dwt_i8_threaded_matches_serial) {
     }
 
     for (size_t ci = 0; ci < cases.size(); ++ci) {
-        for (bool channel_last : {false, true}) {
-            Case c = cases[ci].c;
-            c.channel_last = channel_last;
-            const Result serial = run_route(c, {}, static_cast<int>(ci));
-            NNOPS_EXPECT_EQ(serial.status, Status::ok);
+        Case c = cases[ci].c;
+        const Result serial = run_route(c, {}, static_cast<int>(ci));
+        NNOPS_EXPECT_EQ(serial.status, Status::ok);
 
-            for (int nt : {2, 4, 8}) {
-                SimplePool pool(nt);
-                ComputeContext ctx;
-                ctx.cpu = pool.cpu;
-                const Result threaded = run_route(c, ctx, static_cast<int>(ci));
-                NNOPS_EXPECT_EQ(threaded.status, Status::ok);
-                NNOPS_EXPECT_TRUE(std::memcmp(serial.buf.data(), threaded.buf.data(),
-                                              serial.buf.size()) == 0);
-            }
+        for (int nt : {2, 4, 8}) {
+            SimplePool pool(nt);
+            ComputeContext ctx;
+            ctx.cpu = pool.cpu;
+            const Result threaded = run_route(c, ctx, static_cast<int>(ci));
+            NNOPS_EXPECT_EQ(threaded.status, Status::ok);
+            NNOPS_EXPECT_TRUE(std::memcmp(serial.buf.data(), threaded.buf.data(),
+                                          serial.buf.size()) == 0);
         }
     }
 }
@@ -776,15 +675,15 @@ NNOPS_TEST(dwt_i8_output_desc) {
     // f32 activation: the output follows the activation unless output_dtype is
     // an integer storage.
     const int64_t ishape[] = {1, 8, 6, 6};
-    const int64_t wshape[] = {8, 1, 3, 3};
     std::vector<float> in(1 * 8 * 6 * 6, 0.0f);
     std::vector<int8_t> w(8 * 9, 1);
     std::vector<float> ws(8, 0.01f);
     std::vector<int32_t> wz(8, 0);
 
-    TensorView input(ishape, DataType::f32, in.data(), TensorLayout::NCHW,
+    TensorView input(ishape, DataType::f32, in.data(), TensorLayout::NHWC,
                      per_tensor(0.125f, 0));
-    TensorView weight(wshape, DataType::s8, w.data(), TensorLayout::NCHW,
+    const int64_t wshape[] = {3, 3, 8};
+    TensorView weight(wshape, DataType::s8, w.data(), TensorLayout::HWCM,
                       per_channel(ws.data(), wz.data(), 8));
     const TensorDesc descs[] = {input.desc(), weight.desc()};
 
@@ -796,6 +695,7 @@ NNOPS_TEST(dwt_i8_output_desc) {
 
     auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
     auto outs = op->getOutputTensorDesc(descs);
+    NNOPS_EXPECT_EQ(outs[0].layout, TensorLayout::NHWC);
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(outs[0].dims[1], 8);
     // (6-1)*2 - 2 + 1*(3-1) + 1 + 1 = 12
@@ -805,60 +705,31 @@ NNOPS_TEST(dwt_i8_output_desc) {
     attrs.output_dtype = DataType::u8;
     op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
     outs = op->getOutputTensorDesc(descs);
+    NNOPS_EXPECT_EQ(outs[0].layout, TensorLayout::NHWC);
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::u8);
-
-    // A channel-last call reports the matching layout.
-    const int64_t ishape_cl[] = {1, 8, 6, 6};
-    TensorView in_cl(ishape_cl, DataType::f32, in.data(), TensorLayout::NHWC,
-                     per_tensor(0.125f, 0));
-    std::vector<int8_t> w_cl(w.size());
-    const int64_t wshape_cl[] = {3, 3, 8};
-    TensorView w_cl_v(wshape_cl, DataType::s8, w_cl.data(), TensorLayout::HWCM,
-                      per_channel(ws.data(), wz.data(), 8));
-    const TensorDesc cl_descs[] = {in_cl.desc(), w_cl_v.desc()};
-    op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
-    const auto cl_outs = op->getOutputTensorDesc(cl_descs);
-    NNOPS_EXPECT_EQ(cl_outs[0].layout, TensorLayout::NHWC);
-    NNOPS_EXPECT_EQ(cl_outs[0].dtype, DataType::u8);
 }
 
 NNOPS_TEST(dwt_i8_refusals) {
     const int64_t ishape[] = {1, 4, 6, 6};
-    const int64_t wshape[] = {4, 1, 3, 3};
     std::vector<int8_t> in(4 * 36, 1);
     std::vector<int8_t> w(4 * 9, 1);
     std::vector<float> ws(4, 0.01f);
     std::vector<int32_t> wz(4, 0);
 
-    TensorView input(ishape, DataType::s8, in.data(), TensorLayout::NCHW,
+    TensorView input(ishape, DataType::s8, in.data(), TensorLayout::NHWC,
                      per_tensor(0.125f, 0));
-    TensorView weight(wshape, DataType::s8, w.data(), TensorLayout::NCHW,
+    const int64_t wshape[] = {3, 3, 4};
+    TensorView weight(wshape, DataType::s8, w.data(), TensorLayout::HWCM,
                       per_channel(ws.data(), wz.data(), 4));
-
-    // A weight layout from the other family is refused, not reinterpreted.
-    const int64_t wshape_bad[] = {3, 3, 4};
-    TensorView w_bad(wshape_bad, DataType::s8, w.data(), TensorLayout::HWCM,
-                     per_channel(ws.data(), wz.data(), 4));
-    {
-        DepthwiseTransposeConv2DAttributes attrs;
-        attrs.kernel_size = {3, 3};
-        auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
-        const TensorDesc d[] = {input.desc(), w_bad.desc()};
-        auto outs = op->getOutputTensorDesc(d);
-        std::vector<float> out(static_cast<size_t>(outs[0].numel()), 0.0f);
-        TensorView out_v = make_view(outs[0], out.data());
-        const TensorView ins[] = {input, w_bad};
-        NNOPS_EXPECT_EQ(op->compute(out_v, ins), Status::unsupported);
-    }
 
     // A channel count that disagrees with the activation's is a descriptor
     // error, not an unsupported one.
     {
-        const int64_t wshape_c[] = {5, 1, 3, 3};
+        const int64_t wshape_c[] = {3, 3, 5};
         std::vector<int8_t> w5(5 * 9, 1);
         std::vector<float> ws5(5, 0.01f);
         std::vector<int32_t> wz5(5, 0);
-        TensorView w5_v(wshape_c, DataType::s8, w5.data(), TensorLayout::NCHW,
+        TensorView w5_v(wshape_c, DataType::s8, w5.data(), TensorLayout::HWCM,
                         per_channel(ws5.data(), wz5.data(), 5));
         DepthwiseTransposeConv2DAttributes attrs;
         attrs.kernel_size = {3, 3};

@@ -12,8 +12,7 @@
 /// makes the row bases alternate off the 16 B bound, so half of them take the
 /// scalar fallback; an f16 row of 37 with a 32 B pitch keeps the bases aligned
 /// and exercises the tail instead. A 20 k-element row is past the shared-memory
-/// budget, so softmax re-reads it from global memory, and the same split covers
-/// the strided general-axis path on a row either side of that budget.
+/// budget, so softmax re-reads it from global memory. Softmax is channel-last.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -38,7 +37,7 @@ constexpr float kF16Abs = 2e-2f;
 constexpr float kF16Rel = 4e-2f;
 
 void run_activation(ActivationType type, std::vector<int64_t> shape, DataType dt,
-                    bool padded, TensorLayout layout = TensorLayout::NCHW,
+                    bool padded, TensorLayout layout = TensorLayout::Dense,
                     bool add_to = false, const char* what = "")
 {
     ActivationAttributes attrs;
@@ -56,7 +55,7 @@ void run_activation(ActivationType type, std::vector<int64_t> shape, DataType dt
 }
 
 void run_softmax(std::vector<int64_t> shape, int64_t axis, DataType dt,
-                 bool padded, TensorLayout layout = TensorLayout::NCHW,
+                 bool padded, TensorLayout layout = TensorLayout::NHWC,
                  bool log_softmax = false, const char* what = "",
                  float tol_abs = 0.0f, float tol_rel = 0.0f,
                  float temperature = 1.0f)
@@ -66,7 +65,9 @@ void run_softmax(std::vector<int64_t> shape, int64_t axis, DataType dt,
     attrs.log_softmax = log_softmax;
     attrs.temperature = temperature;
 
-    HostTensor in = make_host_random(shape, dt, padded, 19, -4.0f, 4.0f, layout);
+    // Channel-last views must stay dense: their strides never consult the pitch.
+    const bool pad = padded && !is_channel_last(layout);
+    HostTensor in = make_host_random(shape, dt, pad, 19, -4.0f, 4.0f, layout);
     const HostTensor ins[] = {in};
     run_op_close([&](Backend be) { return Softmax::create(attrs, be); }, ins,
                  tol_abs, tol_rel, what);

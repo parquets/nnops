@@ -76,7 +76,7 @@ Status TopK::validate(std::span<const TensorDesc> inputs, std::span<const Tensor
         return Status::invalid_argument;
     }
 
-    return detail::require(is_layout_supported(in.layout, LayoutSupport::ChannelFirstOnly));
+    return detail::require(is_layout_supported(in.layout, LayoutSupport::Any));
 }
 
 Status TopK::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

@@ -1,12 +1,11 @@
 /// @file pool1d.cpp
-/// @brief Pool1D operator dispatch — channel-first or channel-last I/O, output
-///        layout follows the input's.
+/// @brief Pool1D operator dispatch — channel-last I/O, output layout follows
+///        the input's.
 ///
-/// The dtype rules are Pooling's, read off a rank-3 tensor: channel-first input
-/// is f32/f16; quantized (s8/u8) pooling is channel-last only, where the lane is
-/// the channel, and has no adaptive form. auto_pad resolution and the
-/// adaptive-all-ones shortcut are the 2D backend's (backend/cpu/conv/pooling.cpp),
-/// which also carries the rank-4 lift.
+/// The dtype rules are Pooling's, read off a rank-3 tensor: f32/f16 and the
+/// quantized s8/u8 pairs, whose lane is the channel; adaptive has no quantized
+/// form. auto_pad resolution and the adaptive-all-ones shortcut are the 2D
+/// backend's (backend/cpu/conv/pooling.cpp), which also carries the rank-4 lift.
 
 #include "nnops/ops/pool1d.hpp"
 #include "nnops/detail/assert.hpp"
@@ -45,21 +44,17 @@ Status Pool1D::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_rank(outputs[0].rank, 3, 3));
     const auto& in = inputs[0];
 
-    if (is_channel_first_spatial(in.layout)) {
-        return detail::require(detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype),
-                               Status::unsupported);
+    if (!is_channel_last(in.layout)) {
+        return Status::unsupported;
     }
     // Adaptive pooling walks the window per output position; the quantized
     // channel-lane kernel has no such form, so it stays float.
     if (attrs_.adaptive() && detail::dtype_in<DataType::s8, DataType::u8>(backend_, in.dtype)) {
         return Status::unsupported;
     }
-    if (is_channel_last(in.layout)) {
-        return detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8>(backend_,
-                                                                                       in.dtype));
-    }
-    return Status::unsupported;
+    return detail::require(
+        detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8>(backend_,
+                                                                                   in.dtype));
 }
 
 Status Pool1D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

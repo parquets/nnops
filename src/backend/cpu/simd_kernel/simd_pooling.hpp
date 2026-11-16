@@ -1,13 +1,11 @@
 #pragma once
 /// @file simd_pooling.hpp
-/// @brief SIMD kernels for 2D/3D spatial pooling.
+/// @brief SIMD kernels for 2D/3D spatial pooling, channel-last.
 ///
-/// Two drivers, one per lane choice. The channel driver lanes a channel vector
-/// over output columns (channel-last); the channel-first driver, 2D and 3D,
-/// lanes the output column. One channel driver covers every variant:
-/// row count R, IsMax, and Src/Dst (f32/f16, dequantize/requantize) are template
-/// parameters, and bounds are checked in-kernel, so any stride/padding works.
-/// Quantized pooling runs on the channel lane only, not channel-first.
+/// One channel driver covers every variant: row count R, IsMax, and Src/Dst
+/// (f32/f16, dequantize/requantize) are template parameters, and bounds are
+/// checked in-kernel, so any stride/padding works. Quantized pooling runs on the
+/// same channel lane.
 ///
 /// The channel walk mirrors the depthwise kernel: one row pointer per (kd, kh, r),
 /// biased by the left pad, an interior span whose every tap is in the input row
@@ -15,21 +13,15 @@
 /// 2 where the channels allow, since two f32 vectors fill a cache line and a
 /// one-vector sweep pays twice the line traffic for the same arithmetic.
 ///
-/// A channel-first lane cannot skip an out-of-range tap (a padded lane would read the
-/// pitch), so channel_first_load fills the accumulate's identity and a short last block
-/// stores through a scalar tail. Channel-first runs one output row per call — the
-/// channel path's R-row blocking shares input rows, which a width-vectorized
-/// kernel does not need. Global pooling scans contiguous memory with four
-/// accumulators. f16 AvgPool keeps half lanes — the same accumulation the window
-/// kernels do — while MaxPool widens to f32 (its result does not round). A
-/// contiguous plane is one flat run, so even a small plane — a 7x7 global pool,
-/// the shape the model runners see — vectorizes instead of falling into the tail.
+/// Global pooling scans contiguous memory with four accumulators. f16 AvgPool
+/// keeps half lanes — the same accumulation the window kernels do — while
+/// MaxPool widens to f32 (its result does not round). A contiguous plane is one
+/// flat run, so even a small plane — a 7x7 global pool, the shape the model
+/// runners see — vectorizes instead of falling into the tail.
 ///
-/// Naming: every route carries its lane in the name — `_channel_first` puts the
-/// lane on the output width, `_channel_last` on the channels — followed by the
-/// route/variant (`_rows`, `_rows_3x3`, `_quant`, `_global_*`). The two window
-/// entry points are `pool_channel_first<IsMax,T>` and
-/// `pool_channel_last<IsMax,T>`; both take the same params, scale and add_to.
+/// Naming: the lane is the channel, marked `_channel_last`, followed by the
+/// route/variant (`_rows`, `_rows_3x3`, `_quant`, `_global_*`). The window entry
+/// point is `pool_channel_last<IsMax,T>`, taking params, scale and add_to.
 
 #include "nnops/detail/bench_knobs.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -236,128 +228,6 @@ inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale
     }
 }
 
-// --- channel-first driver: the SIMD lane spans output width ---
-
-/// The value a padded lane contributes: the max's identity, or zero for the sum.
-/// `half` is a struct with no numeric_limits specialization on x86, so its
-/// lowest() is 0 — which would clamp any window that touches padding at zero.
-template <typename T> inline T pooling_fill(bool is_max) noexcept
-{
-    if (!is_max) {
-        return T{};
-    }
-    if constexpr (std::is_same_v<T, half>) {
-        return ::nnops::backend::cpu::float_to_half(-65504.0f);
-#ifdef NNOPS_ARCH_AARCH64
-    } else if constexpr (std::is_same_v<T, bfloat16>) {
-        // bf16 also has no numeric_limits specialization; 0xFF7F is its most
-        // negative finite value (rounding FLT_MAX to bf16 would give -inf).
-        return ::nnops::backend::cpu::bfloat16_from_bits(0xFF7Fu);
-#endif
-    } else {
-        return std::numeric_limits<T>::lowest();
-    }
-}
-
-template <bool IsMax, typename T>
-inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p, float avg_scale,
-                               bool add_to)
-{
-    constexpr int64_t L = simd_lane_for<T>;
-    const T fill = pooling_fill<T>(IsMax);
-
-    // Row-constant half of the tap count: in-range (kd, kh) positions.
-    int64_t row_taps = 0;
-    for (int64_t kd = 0; kd < p.KD; ++kd) {
-        const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-        if (id < 0 || id >= p.ID) {
-            continue;
-        }
-        for (int64_t kh = 0; kh < p.KH; ++kh) {
-            const int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-            if (ih >= 0 && ih < p.IH) {
-                ++row_taps;
-            }
-        }
-    }
-
-    // W padding is the only dim that trims a window per column, so it forces a
-    // per-lane count; otherwise the count is a constant — unless a window runs
-    // off the right edge, which PW cannot see: a SAME-style pad is leading-only
-    // and its trailing half is implicit, so PW == 0 with the last window past
-    // IW would divide by taps that were never read.
-    const bool cols_inside = p.PW == 0 && (p.OW - 1) * p.SW + (p.KW - 1) * p.DW < p.IW;
-    const auto taps_of = [&](int64_t col) {
-        if (cols_inside) {
-            return row_taps * p.KW;
-        }
-        const int64_t iw_first = col * p.SW - p.PW;
-        int64_t n = 0;
-        for (int64_t kw = 0; kw < p.KW; ++kw) {
-            const int64_t iw = iw_first + kw * p.DW;
-            n += (iw >= 0 && iw < p.IW) ? 1 : 0;
-        }
-        return row_taps * n;
-    };
-
-    // Max: an all-pad window is 0 (the channel kernel zeroes it too).
-    // Avg: exclude_pad divides by the tap count; with no padding the count is
-    // uniform and this is a single scale.
-    const bool count_taps = IsMax ? (p.PH > (p.KH - 1) * p.DH || p.PW > (p.KW - 1) * p.DW ||
-                                     (p.OH > 0 && (p.OH - 1) * p.SH - p.PH >= p.IH) ||
-                                     (p.OW > 0 && (p.OW - 1) * p.SW - p.PW >= p.IW)) :
-                                    p.exclude_pad;
-
-    for (int64_t ow = 0; ow < p.OW; ow += L) {
-        auto acc = IsMax ? v_set1(out, -std::numeric_limits<float>::infinity()) : v_zero(out);
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                const int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) {
-                    continue;
-                }
-                const T* row = in + id * p.in_d_stride + ih * p.in_row_stride;
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    const int64_t iw0 = ow * p.SW + kw * p.DW - p.PW;
-                    const auto v = channel_first_load(row, iw0, p.SW, p.IW, fill);
-                    acc = IsMax ? v_max(acc, v) : v_add(acc, v);
-                }
-            }
-        }
-
-        const int64_t lanes = (p.OW - ow < L) ? p.OW - ow : L;
-        if (count_taps) {
-            alignas(32) T scale[L];
-            for (int64_t l = 0; l < L; ++l) {
-                const int64_t cnt = (l < lanes) ? taps_of(ow + l) : 1;
-                const float s = IsMax ? (cnt > 0 ? 1.0f : 0.0f) :
-                                        (cnt > 0 ? 1.0f / static_cast<float>(cnt) : 0.0f);
-                s_store(&scale[l], s);
-            }
-            acc = v_mul(acc, v_load(scale));
-        } else if constexpr (!IsMax) {
-            acc = v_mul(acc, v_set1(out, avg_scale));
-        }
-
-        if (lanes == L) {
-            v_store_add(out + ow, acc, add_to);
-        } else {
-            alignas(32) T tmp[L];
-            v_store(tmp, acc);
-            for (int64_t l = 0; l < lanes; ++l) {
-                s_store_add(out + ow + l, s_load(&tmp[l]), add_to);
-            }
-        }
-    }
-}
-
 // --- Global pooling: the window is the whole extent, so a contiguous plane is one scan ---
 
 template <bool IsMax, class V> inline V global_op(const V& a, const V& b)
@@ -471,34 +341,6 @@ inline void global_accumulate(GlobalAcc<T, IsMax>& acc0, GlobalAcc<T, IsMax>& ac
     for (; i < n; ++i) {
         tail = global_op<IsMax>(tail, s_load(p + i));
     }
-}
-
-/// Max/avg of one channel-first plane. A contiguous plane (pitch == width, as an
-/// allocated tensor has) is one flat run; only a pitched plane walks row by row.
-template <bool IsMax, typename T>
-inline float global_channel_first(const T* in, const PoolingKernelParams& p, float scale)
-{
-    using V = GlobalAcc<T, IsMax>;
-    const V init = global_acc_init<T, IsMax>(in);
-    V acc0 = init, acc1 = init, acc2 = init, acc3 = init;
-    float tail = IsMax ? -std::numeric_limits<float>::infinity() : 0.0f;
-
-    const bool flat = (p.in_row_stride == p.IW) && (p.in_d_stride == p.IH * p.in_row_stride);
-    if (flat) {
-        global_accumulate<IsMax>(acc0, acc1, acc2, acc3, tail, in, p.ID * p.IH * p.IW);
-    } else {
-        for (int64_t d = 0; d < p.ID; ++d) {
-            const T* plane = in + d * p.in_d_stride;
-            for (int64_t h = 0; h < p.IH; ++h) {
-                global_accumulate<IsMax>(acc0, acc1, acc2, acc3, tail, plane + h * p.in_row_stride,
-                                         p.IW);
-            }
-        }
-    }
-
-    acc0 = global_op<IsMax>(global_op<IsMax>(acc0, acc1), global_op<IsMax>(acc2, acc3));
-    const float v = global_op<IsMax>(global_fold(acc0, IsMax), tail);
-    return IsMax ? v : v * scale;
 }
 
 template <typename T>

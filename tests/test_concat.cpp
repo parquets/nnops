@@ -6,14 +6,15 @@
 /// the interleaved-channel axis merge.
 
 #include "nnops/ops/concat.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "common/test_harness.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 #include "common/test_helpers.hpp"
+#include "common/channel_last.hpp"
 
 #include <vector>
 #include <cstring>
+#include <span>
 
 using namespace nnops;
 
@@ -38,7 +39,7 @@ void test_channel_last_concat(const std::vector<std::vector<int64_t>>& in_shapes
 
     const int64_t rank = static_cast<int64_t>(in_shapes[0].size());
     const int64_t srank = rank - 2;
-    const TensorLayout channel_first_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    const TensorLayout channel_first_layout = TensorLayout::Dense;
     const TensorLayout cl_layout = (srank == 3) ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
     std::vector<std::vector<float>> in_bufs(N);
@@ -75,20 +76,17 @@ void test_channel_last_concat(const std::vector<std::vector<int64_t>>& in_shapes
     }
 
     // Channel-last path: convert each input, concat, convert back.
-    std::vector<std::vector<char>> cl_bufs(N);
+    std::vector<std::vector<float>> cl_bufs(N);
     std::vector<TensorView> in_cls(N);
     for (int64_t i = 0; i < N; ++i) {
-        auto to_cl = LayoutConvert::create(cl_layout, Backend::CPU);
-        auto d = in_channel_firsts[static_cast<size_t>(i)].desc();
-        const TensorDesc cl_in[] = {d};
-        auto cl_descs = to_cl->getOutputTensorDesc(cl_in);
-
-        cl_bufs[static_cast<size_t>(i)].resize(
-            static_cast<size_t>(cl_descs[0].storage_bytes()));
-        in_cls[static_cast<size_t>(i)] =
-            test::make_packed(cl_descs[0], cl_bufs[static_cast<size_t>(i)].data());
-        const TensorView cl_ins[] = {in_channel_firsts[static_cast<size_t>(i)]};
-        to_cl->compute(in_cls[static_cast<size_t>(i)], cl_ins);
+        const TensorView& cf = in_channel_firsts[static_cast<size_t>(i)];
+        const int64_t in_S = cf.numel() / (cf.shape(0) * cf.shape(1));
+        cl_bufs[static_cast<size_t>(i)] = test::to_channel_last(
+            std::span<const float>(cf.ptr<float>(), static_cast<size_t>(cf.numel())),
+            cf.shape(0), cf.shape(1), in_S);
+        in_cls[static_cast<size_t>(i)] = TensorView(
+            cf.shape_span(), DataType::f32,
+            cl_bufs[static_cast<size_t>(i)].data(), cl_layout);
     }
 
     auto concat_op = Concat::create(attrs, Backend::CPU);
@@ -102,8 +100,10 @@ void test_channel_last_concat(const std::vector<std::vector<int64_t>>& in_shapes
     NNOPS_EXPECT_EQ(concat_descs[0].layout, cl_layout);
     NNOPS_EXPECT_EQ(concat_descs[0].dtype, dtype);
 
-    std::vector<char> concat_buf(static_cast<size_t>(concat_descs[0].storage_bytes()));
-    auto out_cl = test::make_packed(concat_descs[0], concat_buf.data());
+    std::vector<float> concat_buf(static_cast<size_t>(concat_descs[0].numel()));
+    TensorView out_cl(std::span<const int64_t>(concat_descs[0].dims.data(),
+                                              static_cast<size_t>(concat_descs[0].rank)),
+                      DataType::f32, concat_buf.data(), cl_layout);
 
     std::vector<TensorView> concat_ins(N);
     for (int64_t i = 0; i < N; ++i) {
@@ -111,21 +111,16 @@ void test_channel_last_concat(const std::vector<std::vector<int64_t>>& in_shapes
     }
     concat_op->compute(out_cl, concat_ins);
 
-    auto to_channel_first = LayoutConvert::create(channel_first_layout, Backend::CPU);
-    auto od = out_cl.desc();
-    const TensorDesc back_in[] = {od};
-    auto back_descs = to_channel_first->getOutputTensorDesc(back_in);
+    const int64_t out_N = out_cl.shape(0);
+    const int64_t out_C = out_cl.shape(1);
+    const int64_t out_S = out_cl.numel() / (out_N * out_C);
+    std::vector<float> res_channel_first = test::to_channel_first(
+        std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
+        out_N, out_C, out_S);
+    TensorView res_view(out_cl.shape_span(), DataType::f32, res_channel_first.data(),
+                        channel_first_layout);
 
-    NNOPS_EXPECT_EQ(back_descs[0].rank, rank);
-    NNOPS_EXPECT_EQ(back_descs[0].layout, channel_first_layout);
-    NNOPS_EXPECT_EQ(back_descs[0].dtype, dtype);
-
-    std::vector<char> back_buf(static_cast<size_t>(back_descs[0].storage_bytes()));
-    auto res_channel_first = test::make_channel_first(back_descs[0], back_buf.data());
-    const TensorView back_ins[] = {out_cl};
-    to_channel_first->compute(res_channel_first, back_ins);
-
-    NNOPS_EXPECT_TRUE(test::allclose(res_channel_first, out_ref, 1e-5f, 1e-5f));
+    NNOPS_EXPECT_TRUE(test::allclose(res_view, out_ref, 1e-5f, 1e-5f));
 }
 
 }  // anonymous namespace

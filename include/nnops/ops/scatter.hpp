@@ -53,7 +53,7 @@ public:
     OpType  getOpType()  const override { return OpType::ScatterElements; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::Any;
     }
 
     struct Impl;
@@ -93,7 +93,7 @@ public:
     OpType  getOpType()  const override { return OpType::ScatterND; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOnly;
+        return LayoutSupport::Any;
     }
 
     struct Impl;

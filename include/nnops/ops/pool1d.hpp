@@ -1,22 +1,19 @@
 #pragma once
 /// @file pool1d.hpp
-/// @brief Pool1D — max/average pooling over one spatial axis, channel-first or
-///        channel-last.
+/// @brief Pool1D — max/average pooling over one spatial axis, channel-last.
 ///
 /// The 2D pooling kernel with a 1-wide second spatial axis: [N, C, L] is lifted
 /// to [N, C, 1, L] and Pooling is called with a window of {1, K}. The lift keeps
 /// the caller's pitch and layout, so the window walk, the auto-pad resolution
 /// and the channel-last strip split are the 2D ones.
 ///
-/// The output's layout follows the input's. Channel-first input supports
-/// f32/f16; quantized (s8/u8) pooling is channel-last only, where the lane is
-/// the channel — the same rule and the same reason as Pooling.
+/// The output's layout follows the input's (NWC). f32/f16 and the quantized
+/// s8/u8 pairs are supported; the lane is the channel.
 ///
 /// global pools the whole signal to [N, C, 1]. Adaptive (`output_size > 0`)
-/// walks PyTorch's floor/ceil windows over the L axis; a channel-first adaptive
-/// walk splits over (batch, channel) while a channel-last one splits over
-/// output rows, which for a 1-wide width is one task per batch item — so
-/// adaptive pooling stays sequential on a channel-last tensor at N = 1.
+/// walks PyTorch's floor/ceil windows over the L axis, splitting over output
+/// rows, which for a 1-wide width is one task per batch item — so adaptive
+/// pooling stays sequential at N = 1.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -92,7 +89,10 @@ public:
 
     OpType  getOpType()  const override { return OpType::Pool1D; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::Any; }
+    LayoutSupport getLayoutSupport() const noexcept override
+    {
+        return LayoutSupport::ChannelLastOnly;
+    }
 
     const Pool1DAttributes& attributes() const noexcept { return attrs_; }
 

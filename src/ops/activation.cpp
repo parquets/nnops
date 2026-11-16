@@ -42,6 +42,11 @@ Status Activation::validate(std::span<const TensorDesc> inputs,
         slope.dtype != x.dtype) {
         return Status::unsupported;
     }
+    // With a spatial axis the per-channel slope needs the channel-last pixel
+    // order; rank 2 keeps C on the innermost axis in either layout.
+    if (x.rank >= 3 && !is_channel_last(x.layout)) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

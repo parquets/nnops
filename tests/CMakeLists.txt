@@ -7,9 +7,7 @@ set(TEST_SOURCES
     test_bf16.cpp
     test_matmul_int8.cpp
     test_matmul_dq.cpp
-    test_conv2d.cpp
     test_conv2d_winograd.cpp
-    test_conv2d_int8.cpp
     test_conv2d_channel_last.cpp
     test_conv3d.cpp
     test_activation.cpp
@@ -37,7 +35,6 @@ set(TEST_SOURCES
     test_shape_inference.cpp
     test_resize.cpp
     test_grid_sample.cpp
-    test_layout_convert.cpp
     test_quant_linear.cpp
     test_concat.cpp
     test_argminmax.cpp
@@ -170,7 +167,6 @@ if(NNOPS_BUILD_BENCHMARKS)
     set(BENCH_SOURCES
         bench_matmul.cpp
         bench_linear.cpp
-        bench_conv2d.cpp
         bench_conv2d_channel_last.cpp
         bench_conv3d.cpp
         bench_transpose_conv2d.cpp

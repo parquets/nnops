@@ -399,7 +399,7 @@ template <class Elem> void launch_last_scalar(const ConvParams& p, cudaStream_t 
 
 } // namespace
 
-bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max, bool channel_last,
+bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max,
                                      DataType dtype, cudaStream_t stream)
 {
     if (p.icg != 1 || p.ocg != 1) {
@@ -410,14 +410,11 @@ bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max
     }
     switch (dtype) {
     case DataType::f16:
-        return channel_last ? run_last<cute::half_t>(p, th_max, tw_max, stream) :
-                              run_first<cute::half_t>(p, th_max, tw_max, stream);
+        return run_last<cute::half_t>(p, th_max, tw_max, stream);
     case DataType::bf16:
-        return channel_last ? run_last<cute::bfloat16_t>(p, th_max, tw_max, stream) :
-                              run_first<cute::bfloat16_t>(p, th_max, tw_max, stream);
+        return run_last<cute::bfloat16_t>(p, th_max, tw_max, stream);
     default:
-        return channel_last ? run_last<float>(p, th_max, tw_max, stream) :
-                              run_first<float>(p, th_max, tw_max, stream);
+        return run_last<float>(p, th_max, tw_max, stream);
     }
 }
 
@@ -442,11 +439,7 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
         return Status::ok;
     }
 
-    const bool last = is_channel_last(act.layout());
-    if (last != is_channel_last(output.layout())) {
-        return Status::unsupported;
-    }
-    if (!last && !is_channel_first_spatial(act.layout())) {
+    if (!is_channel_last(act.layout()) || !is_channel_last(output.layout())) {
         return Status::unsupported;
     }
     const int64_t ch = act.shape(1);
@@ -509,7 +502,7 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     p.max_clip = attrs.epilogue.max_clip;
     p.add_to = attrs.add_to;
     p.pre_act = attrs.add_to && attrs.residual_pre_activation;
-    p.channels_last = last;
+    p.channels_last = true;
     p.classes = p.sh * p.sw;
 
     const int th_max = (p.oh + p.sh - 1) / p.sh;
@@ -517,13 +510,9 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     const bool half_elem = (dt != DataType::f32);
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
-    if (!tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last, dt, stream)) {
-        // The class view declines a geometry or a grid it cannot hold; on the
-        // channel-last side the scalar script still covers it, and channel-first
-        // has no such residue.
-        if (!last) {
-            return Status::unsupported;
-        }
+    if (!tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, dt, stream)) {
+        // The class view declines a geometry or a grid it cannot hold; the
+        // scalar script still covers it.
         if (dt == DataType::bf16) {
             tconv::launch_last_scalar<cute::bfloat16_t>(p, stream);
         } else if (half_elem) {

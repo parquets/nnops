@@ -1,20 +1,19 @@
 #pragma once
 /// @file depthwise_conv.hpp
-/// @brief DepthwiseConv operator — per-channel 2D/3D convolution, on a channel-first
-///        (channel-first) or a channel-last tensor.
+/// @brief DepthwiseConv operator — per-channel 2D/3D convolution, channel-last.
 ///
 /// One filter per input channel and no cross-channel mixing — the first half of
 /// a depthwise-separable convolution. The output has the input's channel count
 /// and layout; the optional bias is [C].
 ///
 /// The spatial rank comes from the input rank: rank 4 is 2D
-/// (Input [N, C, IH, IW], Weight [C, 1, KH, KW]), rank 5 is 3D
-/// (Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW]).
+/// (Input [N, C, IH, IW] stored NHWC, Weight HWCM [KH][KW][C]), rank 5 is 3D
+/// (Input [N, C, ID, IH, IW] stored NDHWC, Weight [KD][KH][KW][C]).
 ///
-/// Both routes read the raw filter: a channel-first input the [C, 1, (KD,) KH, KW]
-/// form as it is, a channel-last one the HWCM [KH][KW][C] form. The channel-first
-/// route has f32/f16 kernels only; the channel lane also covers the quantized
-/// s8/u8 pairs (PerTensor activation, PerChannel weight).
+/// The route reads the raw HWCM filter: every tap is a contiguous run of C
+/// channels, the pattern the channel-lane kernel loads as one vector. It covers
+/// f32/f16 and the quantized s8/u8 pairs (PerTensor activation, PerChannel
+/// weight).
 ///
 /// The bias, the epilogue and the add_to residual all run in the output's domain,
 /// and `residual_pre_activation` folds the destination's old contents into the
@@ -53,9 +52,9 @@ struct DepthwiseConvAttributes {
     ///   true:  y = epilogue(conv + residual)
     /// The pre-activation form is the ResNet block's `relu(dwconv + shortcut)`,
     /// which otherwise needs a separate add and activation. Only meaningful with
-    /// add_to. Every CPU route implements it — both layouts, f32/f16 and the
-    /// quantized s8/u8 pair — and the CUDA kernel refuses it rather than adding
-    /// the residual on the wrong side.
+    /// add_to. The CPU routes implement it — f32/f16 and the quantized s8/u8
+    /// pair — and the CUDA kernel refuses it rather than adding the residual on
+    /// the wrong side.
     bool residual_pre_activation = false;
 
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {
@@ -88,7 +87,10 @@ public:
 
     OpType  getOpType()  const override { return OpType::DepthwiseConv; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::Any; }
+    LayoutSupport getLayoutSupport() const noexcept override
+    {
+        return LayoutSupport::ChannelLastOnly;
+    }
 
     const DepthwiseConvAttributes& attributes() const noexcept { return attrs_; }
 

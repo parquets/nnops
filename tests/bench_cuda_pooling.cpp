@@ -1,5 +1,5 @@
 /// @file bench_cuda_pooling.cpp
-/// @brief CUDA pooling throughput, channel-first and channel-last.
+/// @brief CUDA pooling throughput, channel-last.
 ///
 /// Pooling performs no MACs, so the throughput column is not a FLOP rate: the
 /// numerator is the number of window taps the op reads (N·C·OH·OW·K·K, twice
@@ -9,9 +9,7 @@
 ///
 /// The shapes are the ones a CNN pools: the 3x3 stride-2 windows of a ResNet
 /// stage, the 2x2 windows of the older networks, a 3x3 stride-1 average, and the
-/// 7x7 global reduction a head ends with. Each runs in both memory orders and
-/// both dtypes, and the layer table is walked twice per dtype — once per
-/// layout — so a row can be read as a ratio against its twin.
+/// 7x7 global reduction a head ends with. Each runs in both dtypes.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -38,7 +36,6 @@ struct PoolBenchCase {
     bool exclude_pad = false;
     bool global = false;
     DataType dtype = DataType::f32;
-    bool channel_last = false;
 
     int64_t oh() const
     {
@@ -83,7 +80,7 @@ double measure(const PoolBenchCase& c)
     attrs.exclude_pad = c.exclude_pad;
     attrs.global = c.global;
 
-    const TensorLayout layout = c.channel_last ? TensorLayout::NHWC : TensorLayout::NCHW;
+    const TensorLayout layout = TensorLayout::NHWC;
 
     HostTensor in = make_host_random(std::vector<int64_t>{c.n, c.c, c.ih, c.iw},
                                      c.dtype, false, 23, -1.0f, 1.0f, layout);
@@ -106,8 +103,8 @@ double measure(const PoolBenchCase& c)
 void run_pool(const PoolBenchCase& c, const char* label)
 {
     const double ms = measure(c);
-    print_cuda_row(label, pool_geometry(c, c.channel_last ? "channel_last" : "channel_first"),
-                   ms, cuda_gflops(ms, c.taps()));
+    print_cuda_row(label, pool_geometry(c, "channel_last"), ms,
+                   cuda_gflops(ms, c.taps()));
 }
 
 std::vector<PoolBenchCase> cnn_pools()
@@ -138,11 +135,10 @@ std::vector<PoolBenchCase> cnn_pools()
     return v;
 }
 
-void run_table(DataType dt, bool channel_last, const char* label)
+void run_table(DataType dt, const char* label)
 {
     for (PoolBenchCase c : cnn_pools()) {
         c.dtype = dt;
-        c.channel_last = channel_last;
         c.global = c.k == 7 && c.s == 1 && c.pad == 0;
         run_pool(c, label);
     }
@@ -151,14 +147,10 @@ void run_table(DataType dt, bool channel_last, const char* label)
 }  // namespace
 
 NNOPS_BENCH(cuda_pooling) {
-    print_cuda_header("CUDA pooling (f32 channel_first)");
-    run_table(DataType::f32, false, "f32");
     print_cuda_header("CUDA pooling (f32 channel_last)");
-    run_table(DataType::f32, true, "f32");
-    print_cuda_header("CUDA pooling (f16 channel_first)");
-    run_table(DataType::f16, false, "f16");
+    run_table(DataType::f32, "f32");
     print_cuda_header("CUDA pooling (f16 channel_last)");
-    run_table(DataType::f16, true, "f16");
+    run_table(DataType::f16, "f16");
 }
 
 #endif  // NNOPS_HAS_CUDA

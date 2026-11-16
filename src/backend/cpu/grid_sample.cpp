@@ -1,13 +1,12 @@
 /// @file grid_sample.cpp
-/// @brief CPU implementation of 2D/3D grid sampling, channel-first and channel-last.
+/// @brief CPU implementation of 2D/3D grid sampling, channel-last.
 ///
-/// The image tensor is channel-first or channel-last; the grid is always dense f32
+/// The image tensor is channel-last; the grid is always dense f32
 /// ([N, (OD,) OH, OW, 2|3]), because its last axis is a coordinate pair/triple,
-/// not a channel. Channel-first dispatches one task per (n, c) and samples one channel
-/// plane per task; channel-last dispatches one task per n and keeps the SIMD
-/// lane on C, so a pixel interpolates all its channels at once. The grid
-/// coordinate is per output position, so zeros padding is all-or-nothing across
-/// the channel vector.
+/// not a channel. The dispatch is one task per n and keeps the SIMD lane on C,
+/// so a pixel interpolates all its channels at once. The grid coordinate is per
+/// output position, so zeros padding is all-or-nothing across the channel
+/// vector.
 
 #include "nnops/ops/grid_sample.hpp"
 #include "nnops/core/parallel_for.hpp"
@@ -61,80 +60,39 @@ void grid_sample_impl(const GridSampleAttributes& attrs, TensorView& output,
     const bool add_to = attrs.add_to;
     const bool nearest = (mode == GridSampleMode::Nearest);
 
-    if (is_channel_last(input.layout())) {
-        const int64_t in_n_stride = input.stride_elems(0);
-        const int64_t out_n_stride = output.stride_elems(0);
-
-        const auto process = [&](int64_t n) {
-            const T* in_base = in_ptr + n * in_n_stride;
-            T* out_base = out_ptr + n * out_n_stride;
-            const float* grid_n = grid_ptr + n * grid_n_stride;
-
-            if (srank == 3) {
-                if (nearest) {
-                    k::gridsample_nearest_last_3d<T>(out_base, in_base, grid_n, C, ID, IH, IW, OD,
-                                                     OH, OW, in_d_stride, in_row_stride,
-                                                     out_d_stride, out_row_stride, grid_row_stride,
-                                                     align, padding_mode, add_to);
-                } else {
-                    k::gridsample_last_3d<T>(out_base, in_base, grid_n, C, ID, IH, IW, OD, OH, OW,
-                                             in_d_stride, in_row_stride, out_d_stride,
-                                             out_row_stride, grid_row_stride, align, padding_mode,
-                                             add_to);
-                }
-            } else {
-                if (nearest) {
-                    k::gridsample_nearest_last_2d<T>(out_base, in_base, grid_n, C, IH, IW, OH, OW,
-                                                     in_row_stride, out_row_stride, grid_row_stride,
-                                                     align, padding_mode, add_to);
-                } else {
-                    k::gridsample_last_2d<T>(out_base, in_base, grid_n, C, IH, IW, OH, OW,
-                                             in_row_stride, out_row_stride, grid_row_stride, align,
-                                             padding_mode, add_to);
-                }
-            }
-        };
-
-        ctx.cpu.run(0, N, process);
-        return;
-    }
-
-    const int64_t in_c_stride = input.stride_elems(1);
-    const int64_t out_c_stride = output.stride_elems(1);
     const int64_t in_n_stride = input.stride_elems(0);
     const int64_t out_n_stride = output.stride_elems(0);
 
-    const auto process = [&](int64_t task) {
-        const int64_t n = task / C;
-        const int64_t c = task % C;
-        const T* in_base = in_ptr + n * in_n_stride + c * in_c_stride;
-        T* out_base = out_ptr + n * out_n_stride + c * out_c_stride;
+    const auto process = [&](int64_t n) {
+        const T* in_base = in_ptr + n * in_n_stride;
+        T* out_base = out_ptr + n * out_n_stride;
         const float* grid_n = grid_ptr + n * grid_n_stride;
 
         if (srank == 3) {
             if (nearest) {
-                k::gridsample_nearest_channel_first_3d<T>(
-                    out_base, in_base, grid_n, ID, IH, IW, OD, OH, OW, in_d_stride, in_row_stride,
-                    out_d_stride, out_row_stride, grid_row_stride, align, padding_mode, add_to);
+                k::gridsample_nearest_last_3d<T>(out_base, in_base, grid_n, C, ID, IH, IW, OD, OH,
+                                                 OW, in_d_stride, in_row_stride, out_d_stride,
+                                                 out_row_stride, grid_row_stride, align,
+                                                 padding_mode, add_to);
             } else {
-                k::gridsample_channel_first_3d<T>(
-                    out_base, in_base, grid_n, ID, IH, IW, OD, OH, OW, in_d_stride, in_row_stride,
-                    out_d_stride, out_row_stride, grid_row_stride, align, padding_mode, add_to);
+                k::gridsample_last_3d<T>(out_base, in_base, grid_n, C, ID, IH, IW, OD, OH, OW,
+                                         in_d_stride, in_row_stride, out_d_stride, out_row_stride,
+                                         grid_row_stride, align, padding_mode, add_to);
             }
         } else {
             if (nearest) {
-                k::gridsample_nearest_channel_first_2d<T>(
-                    out_base, in_base, grid_n, IH, IW, OH, OW, in_row_stride, out_row_stride,
-                    grid_row_stride, align, padding_mode, add_to);
+                k::gridsample_nearest_last_2d<T>(out_base, in_base, grid_n, C, IH, IW, OH, OW,
+                                                 in_row_stride, out_row_stride, grid_row_stride,
+                                                 align, padding_mode, add_to);
             } else {
-                k::gridsample_channel_first_2d<T>(out_base, in_base, grid_n, IH, IW, OH, OW,
-                                                  in_row_stride, out_row_stride, grid_row_stride,
-                                                  align, padding_mode, add_to);
+                k::gridsample_last_2d<T>(out_base, in_base, grid_n, C, IH, IW, OH, OW,
+                                         in_row_stride, out_row_stride, grid_row_stride, align,
+                                         padding_mode, add_to);
             }
         }
     };
 
-    ctx.cpu.run(0, N * C, process);
+    ctx.cpu.run(0, N, process);
 }
 
 Status grid_sample_cpu(const GridSampleAttributes& attrs, TensorView& output,

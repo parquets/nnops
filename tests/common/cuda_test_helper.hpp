@@ -258,7 +258,7 @@ struct HostTensor {
 inline HostTensor make_host_random(std::span<const int64_t> shape, DataType dt,
                                    bool padded, uint64_t seed,
                                    float lo = -0.5f, float hi = 0.5f,
-                                   TensorLayout layout = TensorLayout::NCHW)
+                                   TensorLayout layout = TensorLayout::Dense)
 {
     HostTensor t;
     const TensorView probe(shape, dt, nullptr, layout);
@@ -295,7 +295,7 @@ inline HostTensor make_host_random(std::span<const int64_t> shape, DataType dt,
 /// A zeroed host tensor of the given shape (the output before a run).
 inline HostTensor make_host_zeroed(std::span<const int64_t> shape, DataType dt,
                                    bool padded,
-                                   TensorLayout layout = TensorLayout::NCHW)
+                                   TensorLayout layout = TensorLayout::Dense)
 {
     HostTensor t;
     const TensorView probe(shape, dt, nullptr, layout);

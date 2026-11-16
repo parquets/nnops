@@ -242,7 +242,7 @@ NNOPS_TEST(embed_shape_inference) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 5);
     NNOPS_EXPECT_EQ(descs[0].dims[2], 64);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
 }
 
 NNOPS_TEST(embed_class_api) {
@@ -295,7 +295,7 @@ NNOPS_TEST(embed_int8_per_token_f32) {
     qp.scale_data = scale_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::Dense, qp);
 
     int64_t idx_data[] = {0, 1, 0};
     const int64_t idx_shape[] = {3};
@@ -339,7 +339,7 @@ NNOPS_TEST(embed_int8_with_zero_point) {
     qp.zero_point_data = zp_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::Dense, qp);
 
     int64_t idx_data[] = {0, 1};
     const int64_t idx_shape[] = {2};
@@ -375,7 +375,7 @@ NNOPS_TEST(embed_int8_per_channel_f32) {
     qp.scale_data = scale_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::Dense, qp);
 
     int64_t idx_data[] = {0, 1, 0};
     const int64_t idx_shape[] = {3};
@@ -421,7 +421,7 @@ NNOPS_TEST(embed_uint8_per_channel_zp) {
     qp.zero_point_data = zp_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::u8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::u8, w_data, TensorLayout::Dense, qp);
 
     int64_t idx_data[] = {0, 1};
     const int64_t idx_shape[] = {2};
@@ -458,7 +458,7 @@ NNOPS_TEST(embed_int8_output_f16) {
     qp.scale_data = scale_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::Dense, qp);
 
     int64_t idx_data[] = {0, 1};
     const int64_t idx_shape[] = {2};
@@ -502,7 +502,7 @@ NNOPS_TEST(embed_int8_out_of_bounds) {
     qp.scale_data = scale_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::Dense, qp);
 
     int64_t idx_data[] = {-1, 10};  // clamped to 0 and to V-1 = 2
     const int64_t idx_shape[] = {2};
@@ -535,7 +535,7 @@ NNOPS_TEST(embed_int8_uint8_weight) {
     qp.scale_data = scale_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::u8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::u8, w_data, TensorLayout::Dense, qp);
 
     int64_t idx_data[] = {0, 1};
     const int64_t idx_shape[] = {2};
@@ -569,7 +569,7 @@ NNOPS_TEST(embed_int8_class_api) {
     qp.scale_data = scale_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::Dense, qp);
 
     int64_t idx_data[] = {0, 1};
     const int64_t idx_shape[] = {2};

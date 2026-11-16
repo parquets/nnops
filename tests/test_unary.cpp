@@ -47,7 +47,7 @@ NNOPS_TEST(unary_exp) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -76,7 +76,7 @@ NNOPS_TEST(unary_log) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -105,7 +105,7 @@ NNOPS_TEST(unary_sin) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -134,7 +134,7 @@ NNOPS_TEST(unary_cos) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -163,7 +163,7 @@ NNOPS_TEST(unary_tanh) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -192,7 +192,7 @@ NNOPS_TEST(unary_abs) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -222,7 +222,7 @@ NNOPS_TEST(unary_neg) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -251,7 +251,7 @@ NNOPS_TEST(unary_sqrt) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -281,7 +281,7 @@ NNOPS_TEST(unary_add_to) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -306,7 +306,7 @@ NNOPS_TEST(unary_random_abs) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 1000);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(1000);
@@ -333,7 +333,7 @@ NNOPS_TEST(unary_random_exp) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 500);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(500);
@@ -364,7 +364,7 @@ NNOPS_TEST(unary_2d_sqrt) {
     NNOPS_EXPECT_EQ(descs[0].rank, 2);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     TensorView output = test::make_channel_first(descs[0], out_buf);
@@ -444,7 +444,7 @@ NNOPS_TEST(unary_quant_per_tensor_s8_to_s8) {
     QuantParams in_qp;
     in_qp.scale = 0.1f;
     in_qp.granularity = QuantGranularity::PerTensor;
-    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, in_qp);
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::Dense, in_qp);
 
     UnaryAttributes attrs;
     attrs.type = UnaryType::Abs;
@@ -454,7 +454,7 @@ NNOPS_TEST(unary_quant_per_tensor_s8_to_s8) {
     QuantParams out_qp;
     out_qp.scale = 0.1f;
     out_qp.granularity = QuantGranularity::PerTensor;
-    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, out_qp);
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::Dense, out_qp);
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -476,7 +476,7 @@ NNOPS_TEST(unary_quant_per_token_s8_to_s8) {
     in_qp.granularity = QuantGranularity::PerToken;
     in_qp.scale_data = scale_data;
     in_qp.num_scales = 2;
-    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, in_qp);
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::Dense, in_qp);
 
     UnaryAttributes attrs;
     attrs.type = UnaryType::Neg;
@@ -487,7 +487,7 @@ NNOPS_TEST(unary_quant_per_token_s8_to_s8) {
     out_qp.granularity = QuantGranularity::PerToken;
     out_qp.scale_data = scale_data;   // reuse same scales
     out_qp.num_scales = 2;
-    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, out_qp);
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::Dense, out_qp);
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -509,7 +509,7 @@ NNOPS_TEST(unary_quant_per_tensor_u8_to_u8) {
     in_qp.scale = 0.5f;
     in_qp.zero_point = 128;
     in_qp.granularity = QuantGranularity::PerTensor;
-    TensorView input(shape, DataType::u8, in_data, TensorLayout::NCHW, in_qp);
+    TensorView input(shape, DataType::u8, in_data, TensorLayout::Dense, in_qp);
 
     UnaryAttributes attrs;
     attrs.type = UnaryType::Abs;
@@ -520,7 +520,7 @@ NNOPS_TEST(unary_quant_per_tensor_u8_to_u8) {
     out_qp.scale = 0.5f;
     out_qp.zero_point = 128;
     out_qp.granularity = QuantGranularity::PerTensor;
-    TensorView output(shape, DataType::u8, out_buf, TensorLayout::NCHW, out_qp);
+    TensorView output(shape, DataType::u8, out_buf, TensorLayout::Dense, out_qp);
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -540,14 +540,14 @@ NNOPS_TEST(unary_quant_per_tensor_s8_exp) {
     QuantParams qp;
     qp.scale = 1.0f;
     qp.granularity = QuantGranularity::PerTensor;
-    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::Dense, qp);
 
     UnaryAttributes attrs;
     attrs.type = UnaryType::Exp;
     auto op = Unary::create(attrs, Backend::CPU);
 
     int8_t out_buf[3] = {};
-    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, qp);
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::Dense, qp);
 
     const TensorView ins[] = {input};
     op->compute(output, ins);

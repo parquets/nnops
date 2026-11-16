@@ -1163,9 +1163,9 @@ void bench_i8_out_ab(const char* tag, int64_t M, int64_t K, int64_t N,
     const std::span<const int64_t> ospan(oshape, 2);
     auto vout_s32 = test::make_channel_first(od_s32, out_s32.data());
     auto vout_s8 = TensorView(ospan, DataType::s8, out_s8.data(),
-                              TensorLayout::NCHW, oq_s8);
+                              TensorLayout::Dense, oq_s8);
     auto vout_u8 = TensorView(ospan, DataType::u8, out_u8.data(),
-                              TensorLayout::NCHW, oq_u8);
+                              TensorLayout::Dense, oq_u8);
 
     const TensorView ins[] = {a, b, bias};
     const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N)
@@ -2026,14 +2026,14 @@ struct DqCase {
         c_fp_buf.resize(static_cast<size_t>(M * N));
         aq_buf.resize(static_cast<size_t>(M * K));
 
-        a  = TensorView(as, dt, a_buf.data(), K * ts, TensorLayout::NCHW, qa);
-        b  = TensorView(bs, DataType::s8, b_buf.data(), b_cols, TensorLayout::NCHW, qb);
+        a  = TensorView(as, dt, a_buf.data(), K * ts, TensorLayout::Dense, qa);
+        b  = TensorView(bs, DataType::s8, b_buf.data(), b_cols, TensorLayout::Dense, qb);
         bf = TensorView(bs, dt, bf_buf.data(), b_cols * ts);
         c    = TensorView(cs, dt, c_buf.data(), N * ts);
         c_fp = TensorView(cs, dt, c_fp_buf.data(), N * ts);
         // Desc-only view of the compact A_q the backend materializes on every
         // call; only its desc is read (the backend allocates the real one).
-        aq = TensorView(as, act_dt, aq_buf.data(), K, TensorLayout::NCHW, qa);
+        aq = TensorView(as, act_dt, aq_buf.data(), K, TensorLayout::Dense, qa);
 
         ins[0] = a;     ins[1] = b;
         ins_fp[0] = a;  ins_fp[1] = bf;

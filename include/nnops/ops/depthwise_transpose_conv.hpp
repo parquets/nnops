@@ -1,21 +1,15 @@
 #pragma once
 /// @file depthwise_transpose_conv.hpp
 /// @brief DepthwiseTransposeConv2D — per-channel transposed 2D convolution, the
-///        backward of DepthwiseConv, on a channel-first or a channel-last
-///        tensor.
+///        backward of DepthwiseConv, on a channel-last tensor.
 ///
 /// One filter per channel and no cross-channel mixing, so the output has the
-/// input's channel count. The input is [N, C, IH, IW]; the weight follows the
-/// activation's family:
-///
-///   channel-first   [C, 1, KH, KW] — one tap block per channel, the same form
-///                   DepthwiseConv reads, a scalar broadcast per tap;
-///   channel-last    [KH][KW][C] (TensorLayout::HWCM) — TensorFlow's depthwise
-///                   order with the multiplier dropped, so every tap is a run
-///                   of C contiguous channels and the channel lane reads it as
-///                   one vector. The channel-first [C, 1, KH, KW] form is
-///                   accepted here too, for the grouped TransposeConv2D that
-///                   hands its filter over unconverted; the entry repacks it.
+/// input's channel count. The input is [N, C, IH, IW] stored NHWC; the weight
+/// is [KH][KW][C] (TensorLayout::HWCM) — TensorFlow's depthwise order with the
+/// multiplier dropped, so every tap is a run of C contiguous channels and the
+/// channel lane reads it as one vector. The [C, 1, KH, KW] form is accepted too,
+/// for the grouped TransposeConv2D that hands its filter over unconverted; the
+/// entry repacks it.
 ///
 /// Bias [C] is optional. The output is [N, C, OH, OW] with
 /// OH = (IH - 1)·SH - 2·PH + DH·(KH - 1) + OP_h + 1, and likewise for W.
@@ -134,7 +128,7 @@ public:
     OpType  getOpType()  const override { return OpType::DepthwiseTransposeConv2D; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::ChannelFirstOrChannelLast;
+        return LayoutSupport::ChannelLastOnly;
     }
 
     const DepthwiseTransposeConv2DAttributes& attributes() const noexcept { return attrs_; }

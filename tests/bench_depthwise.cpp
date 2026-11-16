@@ -1,29 +1,18 @@
 /// @file bench_depthwise.cpp
-/// @brief Depthwise conv: channel-first against channel-last, interleaved.
+/// @brief Depthwise conv throughput, channel-last.
 ///
-/// The two routes vectorize on opposite axes:
-///
-///   Channel-first  the lane is output width, so one load feeds 8 positions of ONE row
-///           and a 3x3 is a chain of 9 dependent FMAs.
-///   channel_last    the lane is a channel, so one load feeds 16 channels at one output
-///           position; four output rows are unrolled and each tap broadcasts one
-///           weight vector into four independent accumulates.
-///
-/// Shape decides which wins: the channel lane wastes lanes when the channel
-/// count is small (a 7x7 plane is not the issue, a 3-channel one is), while
-/// Channel-first's dependent chain is immune to channel count but cannot hide FMA
-/// latency.
+/// The channel lane vectorizes: one load feeds 16 channels at one output
+/// position, four output rows are unrolled, and each tap broadcasts one weight
+/// vector into four independent accumulates.
 ///
 /// The layout conversion is done once, outside every timed region: an engine
 /// converts a tensor once and reuses it, so billing the bench's convert per call
 /// would price the harness, not the kernel.
 ///
-/// Each round times A B A — the second A is the null control (same arm, same
-/// buffers, same binary), so an A2/A1 gap is drift and nothing else. A verdict
-/// is only read as real when it clears that floor.
+/// Each round times the same call repeatedly and reports the median, so the
+/// column is the kernel's own cost.
 
 #include "nnops/ops/depthwise_conv.hpp"
-#include "backend/cpu/simd_kernel/simd_depthwise_conv.hpp"
 #include "common/bench_harness.hpp"
 #include "common/channel_last.hpp"
 #include "common/cpu_pool.hpp"
@@ -42,7 +31,6 @@
 #include <vector>
 
 using namespace nnops;
-namespace k = nnops::kernel;
 
 namespace {
 
@@ -117,14 +105,6 @@ double median_of(std::vector<double> v) {
     return v[v.size() / 2];
 }
 
-double max_abs_diff(const float* a, const float* b, int64_t n) {
-    double worst = 0.0;
-    for (int64_t i = 0; i < n; ++i) {
-        worst = std::fmax(worst, std::fabs(static_cast<double>(a[i]) - b[i]));
-    }
-    return worst;
-}
-
 struct DepthwiseCase {
     const char* name;
     int64_t C, IH, IW;
@@ -139,9 +119,12 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
     const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
     const int64_t bshape[] = {c.C};
 
-    auto [in_vec, in_channel_first] = test::make_random_tensor(ishape, -1.0f, 1.0f, 31);
-    auto [w_vec, w_channel_first]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 32);
-    auto [b_vec, b_channel_first]   = test::make_random_tensor(bshape, -0.5f, 0.5f, 33);
+    auto [in_vec, in_raw] = test::make_random_tensor(ishape, -1.0f, 1.0f, 31);
+    auto [w_vec, w_raw]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 32);
+    auto [b_vec, b_v]     = test::make_random_tensor(bshape, -0.5f, 0.5f, 33);
+    (void)in_raw;
+    (void)w_raw;
+    (void)b_vec;
 
     DepthwiseConvAttributes attrs{};
     attrs.kernel_size = {1, c.KH, c.KW};
@@ -150,58 +133,36 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
     attrs.padding     = {0, c.PH, c.PW};
     if (c.relu6) { attrs.epilogue.type = nnops::EpilogueActivateType::Relu6; }
 
-    // ---- channel-first arm: the tensors as they come out of a PyTorch model ----
-    auto channel_first_op = DepthwiseConv::create(attrs, Backend::CPU);
-    const TensorView channel_first_in[] = {in_channel_first, w_channel_first, b_channel_first};
-    const TensorDesc channel_first_in_desc[] = {in_channel_first.desc(), w_channel_first.desc(), b_channel_first.desc()};
-    auto channel_first_out_desc = channel_first_op->getOutputTensorDesc(channel_first_in_desc)[0];
-    const int64_t OH = channel_first_out_desc.dims[2];
-    const int64_t OW = channel_first_out_desc.dims[3];
-    std::vector<float> channel_first_out_buf(static_cast<size_t>(channel_first_out_desc.numel()));
-    auto channel_first_out = test::make_channel_first(channel_first_out_desc, channel_first_out_buf.data());
-    const auto channel_first_call = [&](const ComputeContext& ctx) {
-        TensorView outs[] = {channel_first_out};
-        channel_first_op->compute(outs, channel_first_in, ctx);
-    };
-
-    // ---- channel_last arm: TensorFlow's orders, converted once like a real graph ----
+    // TensorFlow's orders, converted once like a real graph.
     auto in_cl_vec = test::to_channel_last<float>(
         std::span<const float>(in_vec.data(), in_vec.size()), 1, c.C, c.IH * c.IW);
     auto w_cl_vec = test::depthwise_to_hwcm<float>(
         std::span<const float>(w_vec.data(), w_vec.size()), c.C, c.KH * c.KW);
-    TensorView channel_last_in_v(ishape, DataType::f32, in_cl_vec.data(), TensorLayout::NHWC);
+    TensorView in_cl(ishape, DataType::f32, in_cl_vec.data(), TensorLayout::NHWC);
     const int64_t w_cl_shape[] = {1, c.KH, c.KW, c.C};
-    TensorView channel_last_w_v(std::span<const int64_t>(w_cl_shape, 4), DataType::f32,
-                        w_cl_vec.data(), TensorLayout::HWCM);
+    TensorView w_cl(std::span<const int64_t>(w_cl_shape, 4), DataType::f32,
+                    w_cl_vec.data(), TensorLayout::HWCM);
 
-    auto channel_last_op = DepthwiseConv::create(attrs, Backend::CPU);
-    const TensorView channel_last_in[] = {channel_last_in_v, channel_last_w_v, b_channel_first};
-    const TensorDesc channel_last_in_desc[] = {channel_last_in_v.desc(), channel_last_w_v.desc(), b_channel_first.desc()};
-    auto channel_last_out_desc = channel_last_op->getOutputTensorDesc(channel_last_in_desc)[0];
-    std::vector<float> channel_last_out_buf(static_cast<size_t>(channel_last_out_desc.numel()));
-    auto channel_last_out = test::make_channel_first(channel_last_out_desc, channel_last_out_buf.data());
-    const auto channel_last_call = [&](const ComputeContext& ctx) {
-        TensorView outs[] = {channel_last_out};
-        channel_last_op->compute(outs, channel_last_in, ctx);
+    auto op = DepthwiseConv::create(attrs, Backend::CPU);
+    const TensorView ins[] = {in_cl, w_cl, b_v};
+    const TensorDesc descs[] = {in_cl.desc(), w_cl.desc(), b_v.desc()};
+    auto out_desc = op->getOutputTensorDesc(descs)[0];
+    const int64_t OH = out_desc.dims[2];
+    const int64_t OW = out_desc.dims[3];
+    std::vector<float> out_buf(static_cast<size_t>(out_desc.numel()));
+    auto out = test::make_channel_first(out_desc, out_buf.data());
+    const auto call = [&](const ComputeContext& ctx) {
+        TensorView outs[] = {out};
+        op->compute(outs, ins, ctx);
     };
-
-    // ---- agreement: both arms must be computing the same function -------
-    channel_first_call(ComputeContext{});
-    channel_last_call(ComputeContext{});
-    auto channel_last_as_channel_first = test::to_channel_first<float>(
-        std::span<const float>(channel_last_out_buf.data(), channel_last_out_buf.size()),
-        1, c.C, OH * OW);
-    const double d_cl = max_abs_diff(channel_first_out_buf.data(), channel_last_as_channel_first.data(),
-                                     channel_first_out_desc.numel());
 
     const double flops = 2.0 * static_cast<double>(c.C) * OH * OW * c.KH * c.KW;
     std::printf("  %s\n", c.name);
-    std::printf("    in[1,%lld,%lld,%lld] w[%lld,1,%lldx%lld] s%lld p%lld -> out[1,%lld,%lld,%lld]"
-                "  |channel-first - channel_last| = %.2e\n",
+    std::printf("    in[1,%lld,%lld,%lld] w[%lld,1,%lldx%lld] s%lld p%lld -> out[1,%lld,%lld,%lld]\n",
                 (long long)c.C, (long long)c.IH, (long long)c.IW,
                 (long long)c.C, (long long)c.KH, (long long)c.KW,
                 (long long)c.SH, (long long)c.PH,
-                (long long)c.C, (long long)OH, (long long)OW, d_cl);
+                (long long)c.C, (long long)OH, (long long)OW);
 
     for (int nt : threads) {
         BenchPool pool(nt);
@@ -209,186 +170,28 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
-        channel_first_call(use_ctx);                // warm-up / first touch
-        channel_last_call(use_ctx);
+        call(use_ctx);                // warm-up / first touch
 
-        std::vector<double> a1, cl, a2;
+        std::vector<double> cl;
         for (int r = 0; r < rounds; ++r) {
-            a1.push_back(time_us([&] { channel_first_call(use_ctx); }, iters));
-            cl.push_back(time_us([&] { channel_last_call(use_ctx); }, iters));
-            a2.push_back(time_us([&] { channel_first_call(use_ctx); }, iters));
+            cl.push_back(time_us([&] { call(use_ctx); }, iters));
         }
-        const double tp = median_of(a1);
         const double tc = median_of(cl);
-        const double null_gap = (median_of(a2) / tp - 1.0) * 100.0;
 
-        std::printf("    %2dT  channel-first %8.1f us (%6.1f GFLOPS) | channel_last %8.1f us (%6.1f GFLOPS)"
-                    " | channel-first/channel_last %5.2fx  (null %+4.1f%%)\n",
-                    nt, tp, flops / (tp * 1e3),
-                    tc, flops / (tc * 1e3), tp / tc, null_gap);
+        std::printf("    %2dT  channel_last %8.1f us (%6.1f GFLOPS)\n",
+                    nt, tc, flops / (tc * 1e3));
     }
 }
 
-
-// ============================================================
-// The unroll itself: channel-first h1 against channel-first h4
-// ============================================================
-//
-// Same buffers, one variable: R. Single-threaded on purpose — the question is
-// instruction-level parallelism, and a pool would only add scheduling noise.
-
-/// One channel of the driver's channel-first loop. The tensor's first and last channel
-/// keep the bounds-checked edge path, as the driver's block test does.
-void channel_first_kernel(const float* in, float* out, const float* w, const float* b,
-                   const DepthwiseCase& c, int64_t OH, int64_t OW, bool h4) {
-    const Epilogue ep{};
-    constexpr int64_t kMaskMaxKw = 16;
-
-    for (int64_t ch = 0; ch < c.C; ++ch) {
-        k::DwConvParams p{};
-        p.ID = 1; p.IH = c.IH; p.IW = c.IW;
-        p.OH = OH; p.OW = OW;
-        p.KD = 1; p.KH = c.KH; p.KW = c.KW;
-        p.SD = 1; p.SH = c.SH; p.SW = c.SW;
-        p.DD = 1; p.DH = 1; p.DW = 1;
-        p.PD = 0; p.PH = c.PH; p.PW = c.PW;
-        p.out_row_stride = OW;
-        p.in_d_stride    = c.IH * c.IW;
-        p.in_row_stride  = c.IW;
-        p.od = 0;
-
-        uint8_t needed[2 * kMaskMaxKw] = {};
-        alignas(32) float masks[2 * kMaskMaxKw * 8] = {};
-        k::DwChannelFirstEdges edges =
-            k::dwconv_channel_first_edge_masks<kMaskMaxKw, float>(p, masks, needed);
-        if (ch == 0 || ch == c.C - 1) { edges.masks = nullptr; }
-
-        const float* in_c  = in  + ch * c.IH * c.IW;
-        float*       out_c = out + ch * OH * OW;
-        const float* w_c   = w   + ch * c.KH * c.KW;
-
-        int64_t oh = 0;
-        if (h4) {
-            for (; oh + 3 < OH; oh += 4) {
-                p.oh = oh;
-                k::dwconv_channel_first_h4(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, false, edges);
-            }
-        }
-        for (; oh < OH; ++oh) {
-            p.oh = oh;
-            k::dwconv_channel_first(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, false, edges);
-        }
-    }
-}
-
-void run_unroll_case(const DepthwiseCase& c, int iters, int rounds) {
-    const int64_t ishape[] = {1, c.C, c.IH, c.IW};
-    const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
-    const int64_t bshape[] = {c.C};
-
-    auto [in_vec, in_channel_first] = test::make_random_tensor(ishape, -1.0f, 1.0f, 41);
-    auto [w_vec, w_channel_first]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 42);
-    auto [b_vec, b_channel_first]   = test::make_random_tensor(bshape, -0.5f, 0.5f, 43);
-
-    const int64_t OH = (c.IH + 2 * c.PH - c.KH) / c.SH + 1;
-    const int64_t OW = (c.IW + 2 * c.PW - c.KW) / c.SW + 1;
-
-    std::vector<float> out1(static_cast<size_t>(c.C * OH * OW));
-    std::vector<float> out4(out1.size());
-
-    const float* in = in_channel_first.ptr<float>();
-    const float* w  = w_channel_first.ptr<float>();
-    const float* b  = b_channel_first.ptr<float>();
-
-    const auto h1 = [&] { channel_first_kernel(in, out1.data(), w, b, c, OH, OW, false); };
-    const auto h4 = [&] { channel_first_kernel(in, out4.data(), w, b, c, OH, OW, true); };
-
-    h1();
-    h4();
-    const double d = max_abs_diff(out1.data(), out4.data(), static_cast<int64_t>(out1.size()));
-
-    const double flops = 2.0 * static_cast<double>(c.C) * OH * OW * c.KH * c.KW;
-    std::printf("  %s\n", c.name);
-    std::printf("    out[1,%lld,%lld,%lld]  |h1 - h4| = %.2e\n",
-                (long long)c.C, (long long)OH, (long long)OW, d);
-
-    std::vector<double> a1, b4, a2;
-    for (int r = 0; r < rounds; ++r) {
-        a1.push_back(time_us(h1, iters));
-        b4.push_back(time_us(h4, iters));
-        a2.push_back(time_us(h1, iters));
-    }
-    const double t1 = median_of(a1);
-    const double t4 = median_of(b4);
-    std::printf("    h1 %8.1f us (%5.1f GFLOPS) | h4 %8.1f us (%5.1f GFLOPS) | %5.2fx"
-                "  (null %+4.1f%%)\n",
-                t1, flops / (t1 * 1e3), t4, flops / (t4 * 1e3), t1 / t4,
-                (median_of(a2) / t1 - 1.0) * 100.0);
-}
-
-/// Flips `detail::depthwise_3x3_roll`, so one process times the straight-line
-/// 3x3 interior against the rolled tap loop over the same buffers. A/B/A per
-/// round, with A the same arm twice: an A2/A1 gap is drift and nothing else.
-void run_cf_route_case(const DepthwiseCase& c, int iters, int rounds) {
-    const int64_t ishape[] = {1, c.C, c.IH, c.IW};
-    const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
-    const int64_t bshape[] = {c.C};
-
-    auto [in_vec, in_channel_first] = test::make_random_tensor(ishape, -1.0f, 1.0f, 51);
-    auto [w_vec, w_channel_first]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 52);
-    auto [b_vec, b_channel_first]   = test::make_random_tensor(bshape, -0.5f, 0.5f, 53);
-
-    const int64_t OH = (c.IH + 2 * c.PH - c.KH) / c.SH + 1;
-    const int64_t OW = (c.IW + 2 * c.PW - c.KW) / c.SW + 1;
-
-    std::vector<float> out3(static_cast<size_t>(c.C * OH * OW));
-    std::vector<float> outr(out3.size());
-
-    const float* in = in_channel_first.ptr<float>();
-    const float* w  = w_channel_first.ptr<float>();
-    const float* b  = b_channel_first.ptr<float>();
-
-    const auto flat = [&] {
-        ::nnops::detail::depthwise_3x3_roll.store(0, std::memory_order_relaxed);
-    };
-    const auto rolled = [&] {
-        ::nnops::detail::depthwise_3x3_roll.store(1, std::memory_order_relaxed);
-    };
-    const auto run3 = [&] { channel_first_kernel(in, out3.data(), w, b, c, OH, OW, true); };
-    const auto runr = [&] { channel_first_kernel(in, outr.data(), w, b, c, OH, OW, true); };
-
-    flat();   run3();
-    rolled(); runr();
-    flat();
-    const double d = max_abs_diff(out3.data(), outr.data(),
-                                  static_cast<int64_t>(out3.size()));
-
-    const double flops = 2.0 * static_cast<double>(c.C) * OH * OW * c.KH * c.KW;
-    std::printf("  %s\n", c.name);
-    std::printf("    out[1,%lld,%lld,%lld]  |3x3 - rolled| = %.2e\n",
-                (long long)c.C, (long long)OH, (long long)OW, d);
-
-    std::vector<double> t3, tr, t3b;
-    for (int r = 0; r < rounds; ++r) {
-        flat();   t3.push_back(time_us(run3, iters));
-        rolled(); tr.push_back(time_us(runr, iters));
-        flat();   t3b.push_back(time_us(run3, iters));
-    }
-    const double a = median_of(t3), bb = median_of(tr);
-    std::printf("    3x3 %8.1f us (%5.1f GFLOPS) | rolled %8.1f us (%5.1f GFLOPS)"
-                " | %5.2fx  (null %+4.1f%%)\n",
-                a, flops / (a * 1e3), bb, flops / (bb * 1e3), bb / a,
-                (median_of(t3b) / a - 1.0) * 100.0);
-}
 
 }  // namespace
 
-NNOPS_BENCH(depthwise_channel_first_vs_channel_last) {
+NNOPS_BENCH(depthwise_channel_last) {
     const std::vector<int> threads = bench_threads();
     const int iters = 20;
     const int rounds = 5;
 
-    std::printf("depthwise conv: channel-first (lane=width) against channel-last (lane=channel)\n");
+    std::printf("depthwise conv channel-last (lane=channel)\n");
     std::printf("  pool=%s  threads=", test::bench_pool_name());
     for (size_t i = 0; i < threads.size(); ++i) {
         std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
@@ -439,138 +242,6 @@ NNOPS_BENCH(depthwise_mobilenetv2_shapes) {
         {"mnv2 dw @14  C=576 s2", 576,  14,  14, 3, 3, 2, 2},
         {"mnv2 dw @7   C=576 s1", 576,   7,   7},
         {"mnv2 dw @7   C=960 s1", 960,   7,   7},
-    };
-
-    for (const auto& c : cases) {
-        run_case(c, threads, iters, rounds);
-    }
-}
-
-NNOPS_BENCH(depthwise_channel_first_unroll) {
-    const int iters = 20;
-    const int rounds = 5;
-
-    std::printf("depthwise channel-first: one output row per call (h1) against four (h4)\n");
-
-    const DepthwiseCase cases[] = {
-        {"dw 3x3 C=32  @112 s1",   32, 112, 112},
-        {"dw 3x3 C=96  @112 s2",   96, 112, 112, 3, 3, 2, 2},
-        {"dw 3x3 C=144 @56  s1",  144,  56,  56},
-        {"dw 3x3 C=240 @28  s1",  240,  28,  28},
-        {"dw 3x3 C=576 @14  s1",  576,  14,  14},
-        {"dw 3x3 C=960 @7   s1",  960,   7,   7},
-        {"dw 3x3 C=256 @200x300", 256, 200, 300},
-        {"dw 3x3 C=256 @100x150", 256, 100, 150},
-        {"dw 3x3 C=256 @60x80",   256,  60,  80},
-        {"dw 3x3 C=256 @17x23",   256,  17,  23},
-        {"dw 5x5 C=64  @56  s1",   64,  56,  56, 5, 5, 1, 1, 2, 2},
-        {"dw 1x1 C=144 @56",      144,  56,  56, 1, 1, 1, 1, 0, 0},
-    };
-
-    for (const auto& c : cases) {
-        run_unroll_case(c, iters, rounds);
-    }
-}
-
-// ============================================================
-// MobileNetV2's actual depthwise mix
-// ============================================================
-//
-// The seventeen stages as the model runs them, each a separate operator call.
-// The sum is what the model's `depthwise_fused` row should read if the kernel
-// rate holds at these shapes; the difference is per-call cost.
-
-// ============================================================
-// The 3x3 interior: literal taps against the rolled tap loop
-// ============================================================
-//
-// Same buffers, one variable: whether the interior body unrolls the three
-// horizontal taps into literal offsets or drives them off `p.KW`.
-
-NNOPS_BENCH(depthwise_channel_first_3x3_route) {
-    const int iters = 20;
-    const int rounds = 5;
-
-    std::printf("depthwise channel-first: straight-line 3x3 interior against the rolled loop\n");
-
-    const DepthwiseCase cases[] = {
-        {"dw 3x3 C=32  @112 s1",   32, 112, 112},
-        {"dw 3x3 C=96  @112 s2",   96, 112, 112, 3, 3, 2, 2},
-        {"dw 3x3 C=144 @56  s1",  144,  56,  56},
-        {"dw 3x3 C=240 @28  s1",  240,  28,  28},
-        {"dw 3x3 C=576 @14  s1",  576,  14,  14},
-        {"dw 3x3 C=960 @7   s1",  960,   7,   7},
-        {"dw 3x3 C=256 @200x300", 256, 200, 300},
-        {"dw 3x3 C=256 @60x80",   256,  60,  80},
-    };
-
-    for (const auto& c : cases) {
-        run_cf_route_case(c, iters, rounds);
-    }
-}
-
-NNOPS_BENCH(depthwise_channel_first_mobilenet) {
-    const std::vector<int> threads = bench_threads();
-    const int iters = 20;
-    const int rounds = 5;
-
-    std::printf("depthwise channel-first: MobileNetV2's seventeen stages, 3x3 p1\n");
-    std::printf("  pool=%s  threads=", test::bench_pool_name());
-    for (size_t i = 0; i < threads.size(); ++i) {
-        std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
-    }
-
-    const DepthwiseCase cases[] = {
-        {"f1   32@112 s1",    32, 112, 112, 3, 3, 1, 1, 1, 1, true},
-        {"f2   96@112 s2",    96, 112, 112, 3, 3, 2, 2, 1, 1, true},
-        {"f3  144@56  s1",   144,  56,  56, 3, 3, 1, 1, 1, 1, true},
-        {"f4  144@56  s2",   144,  56,  56, 3, 3, 2, 2, 1, 1, true},
-        {"f5  192@28  s1",   192,  28,  28, 3, 3, 1, 1, 1, 1, true},
-        {"f6  192@28  s1",   192,  28,  28, 3, 3, 1, 1, 1, 1, true},
-        {"f7  192@28  s2",   192,  28,  28, 3, 3, 2, 2, 1, 1, true},
-        {"f8  384@14  s1",   384,  14,  14, 3, 3, 1, 1, 1, 1, true},
-        {"f9  384@14  s1",   384,  14,  14, 3, 3, 1, 1, 1, 1, true},
-        {"f10 384@14  s1",   384,  14,  14, 3, 3, 1, 1, 1, 1, true},
-        {"f11 384@14  s1",   384,  14,  14, 3, 3, 1, 1, 1, 1, true},
-        {"f12 576@14  s1",   576,  14,  14, 3, 3, 1, 1, 1, 1, true},
-        {"f13 576@14  s1",   576,  14,  14, 3, 3, 1, 1, 1, 1, true},
-        {"f14 576@14  s2",   576,  14,  14, 3, 3, 2, 2, 1, 1, true},
-        {"f15 960@7   s1",   960,   7,   7, 3, 3, 1, 1, 1, 1, true},
-        {"f16 960@7   s1",   960,   7,   7, 3, 3, 1, 1, 1, 1, true},
-        {"f17 960@7   s1",   960,   7,   7, 3, 3, 1, 1, 1, 1, true},
-    };
-
-    for (const auto& c : cases) {
-        run_case(c, threads, iters, rounds);
-    }
-}
-
-// ============================================================
-// Narrow planes: the masked edge load, and what the width tail costs
-// ============================================================
-//
-// 7 and 14 are MobileNetV2's last two stages; each sits beside a width whose
-// last vector is full (8 and 16). The (7,8) and (15,16) pairs therefore read the
-// scalar store tail with the edge masking held constant.
-
-NNOPS_BENCH(depthwise_channel_first_narrow) {
-    const std::vector<int> threads = bench_threads();
-    const int iters = 20;
-    const int rounds = 5;
-
-    std::printf("depthwise channel-first: narrow widths, masked edges\n");
-    std::printf("  pool=%s  threads=", test::bench_pool_name());
-    for (size_t i = 0; i < threads.size(); ++i) {
-        std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
-    }
-
-    const DepthwiseCase cases[] = {
-        {"dw 3x3 C=960 @7  s1",  960,  7,  7},
-        {"dw 3x3 C=960 @8  s1",  960,  8,  8},
-        {"dw 3x3 C=960 @9  s1",  960,  9,  9},
-        {"dw 3x3 C=576 @14 s1",  576, 14, 14},
-        {"dw 3x3 C=576 @15 s1",  576, 15, 15},
-        {"dw 3x3 C=576 @16 s1",  576, 16, 16},
     };
 
     for (const auto& c : cases) {

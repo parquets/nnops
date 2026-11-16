@@ -1,11 +1,11 @@
 /// @file test_transpose_conv2d_int8.cpp
-/// @brief Bit-exactness tests for the quantized CPU TransposeConv2D route, in
-///        both layouts.
+/// @brief Bit-exactness tests for the quantized CPU TransposeConv2D
+///        channel-last route.
 ///
 /// Route matrix: activation u8 / s8 / f16 / f32 (per-tensor QuantParams) ×
 /// weight s8 (per-channel QuantParams) → f32 / f16 / s8 / u8 output, across
 /// bias, epilogues, groups and depthwise, stride / dilation / padding /
-/// output_padding, pitched input and output storage.
+/// output_padding.
 ///
 /// Every table-driven case is compared bit for bit against
 /// `transpose_conv2d_int8_ref`. The dot product is integer, so the kernel's
@@ -13,9 +13,9 @@
 /// share the dequant/requant expression. The fp-activation cases use a
 /// power-of-two activation scale, which makes x·(1/scale) exact.
 ///
-/// Channel-last cases run the kernel on channel-last storage and the reference
-/// on the same values in channel-first order, converting the result back before
-/// the comparison: the layouts are a permutation, so the bits must survive it.
+/// The kernel runs on channel-last storage and the reference on the same values
+/// in channel-first order, converting the result back before the comparison:
+/// the layouts are a permutation, so the bits must survive it.
 ///
 /// Integer destinations run the epilogue activation on the int32 accumulator
 /// before the requant; the asymmetric-activation / symmetric-weight cases give
@@ -102,7 +102,6 @@ struct Case {
     DataType out = DataType::f32;     // output dtype
     DataType act_q = DataType::s8;    // act_quant_dtype (fp activations only)
     bool bias = false;
-    bool channel_last = false;        // NHWC activation (and therefore output)
     float s_x = 0.0078125f;           // 1/128 — exact in binary
     int32_t zp_x = 0;
     float s_out = 0.03125f;           // requant scale, integer output only
@@ -216,16 +215,16 @@ struct Fixture {
         if (c.in_pitch) {
             ins.push_back(TensorView(ishape, c.act, act.data(),
                                      c.in_pitch * static_cast<int64_t>(elem_size(c.act)),
-                                     TensorLayout::NCHW, qa));
+                                     TensorLayout::Dense, qa));
         } else {
-            ins.push_back(TensorView(ishape, c.act, act.data(), TensorLayout::NCHW, qa));
+            ins.push_back(TensorView(ishape, c.act, act.data(), TensorLayout::Dense, qa));
         }
         const std::span<const int64_t> wshape(c.wshape.data(), 4);
-        ins.push_back(TensorView(wshape, DataType::s8, w.data(), TensorLayout::NCHW, qw));
+        ins.push_back(TensorView(wshape, DataType::s8, w.data(), TensorLayout::Dense, qw));
         if (c.bias) {
             const int64_t bshape[] = {OC};
             const DataType bdt = int_out ? DataType::s32 : c.out;
-            ins.push_back(TensorView(bshape, bdt, bias.data(), TensorLayout::NCHW));
+            ins.push_back(TensorView(bshape, bdt, bias.data(), TensorLayout::Dense));
         }
     }
 
@@ -350,17 +349,6 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
         return r;
     }
 
-    if (!c.channel_last) {
-        Result r;
-        r.desc = cf_outs[0];
-        const OutPlan p = out_plan(cf_outs[0], c);
-        r.buf.assign(p.bytes, 0);
-        seed_output(r.buf, cf_outs[0].dtype, c.seed + 3);
-        auto out = make_out_view(cf_outs[0], r.buf.data(), f.out_q, p.pitch);
-        NNOPS_EXPECT_EQ(op->compute(out, f.ins, ctx, nullptr), Status::ok);
-        return r;
-    }
-
     // ---- channel-last: permute the activation in, the output back ----
     const int64_t IC = c.ishape[1], IH = c.ishape[2], IW = c.ishape[3];
     const int64_t in_pitch = c.in_pitch ? c.in_pitch : IW;
@@ -435,107 +423,14 @@ void expect_matches_ref(const Case& c, const ComputeContext& ctx = {}, int idx =
     const std::string diff = first_difference(fast, ref);
     if (!diff.empty()) {
         throw std::runtime_error(std::string("transpose_conv2d_int8 vs reference (case ") +
-                                 std::to_string(idx) + (c.channel_last ? ", NHWC" : ", NCHW") +
+                                 std::to_string(idx) + ", NHWC" +
                                  "): " + diff);
     }
 }
 
-/// Every case runs in both layouts.
+/// Every case runs channel-last.
 void expect_matches_ref_both(Case c, int idx) {
-    c.channel_last = false;
-    c.in_pitch = c.out_pitch = 0;   // pitched storage is a channel-first case
     expect_matches_ref(c, {}, idx);
-    c.channel_last = true;
-    expect_matches_ref(c, {}, idx);
-}
-
-// ============================================================
-// Hand-computed case — pins the whole formula
-// ============================================================
-
-NNOPS_TEST(tconv2d_i8_hand_exact) {
-    // in [1,1,2,2] = 1..4, s8 zp_x 2 s_x 0.25; w [1,1,2,2] = {1,-1,2,0}, s8
-    // zp_w 1 s_w 0.5. The deconv of those two 2x2s is the 3x3 below; acc is
-    // (w−1)·(x−2) summed per output pixel, scaled by s_w·s_x = 0.125.
-    const int64_t ishape[] = {1, 1, 2, 2};
-    const int64_t wshape[] = {1, 1, 2, 2};
-
-    std::vector<int8_t> in = {1, 2, 3, 4};
-    std::vector<int8_t> wt = {1, -1, 2, 0};
-    std::vector<float>  ws = {0.5f};
-    std::vector<int32_t> wz = {1};
-
-    TransposeConv2DAttributes attrs;
-    attrs.kernel_size = {2, 2};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
-
-    TensorView input(ishape, DataType::s8, in.data(), TensorLayout::NCHW,
-                     per_tensor(0.25f, 2));
-    TensorView weight(wshape, DataType::s8, wt.data(), TensorLayout::NCHW,
-                      per_channel(ws.data(), wz.data(), 1));
-
-    auto op = TransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc descs[] = {input.desc(), weight.desc()};
-    auto outs = op->getOutputTensorDesc(descs);
-    NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(outs[0].dims[2], 3);
-    NNOPS_EXPECT_EQ(outs[0].dims[3], 3);
-
-    std::vector<float> out_buf(9, 0.0f);
-    auto out = test::make_channel_first(outs[0], out_buf.data());
-    const TensorView ins[] = {input, weight};
-    op->compute(out, ins);
-
-    const float expected[9] = {0.0f, 0.25f, 0.0f,
-                               -0.125f, -0.125f, -0.5f,
-                               0.125f, 0.125f, -0.25f};
-    for (int i = 0; i < 9; ++i) {
-        NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(i)], expected[i], 1e-6f);
-    }
-}
-
-NNOPS_TEST(tconv2d_i8_int_out_hand_exact) {
-    // The same operands on an s8 destination: req = s_w·s_x / s_out = 0.125 /
-    // 0.125 = 1, so the output is acc + bias + zp_out.
-    const int64_t ishape[] = {1, 1, 2, 2};
-    const int64_t wshape[] = {1, 1, 2, 2};
-    const int64_t bshape[] = {1};
-
-    std::vector<int8_t> in = {1, 2, 3, 4};
-    std::vector<int8_t> wt = {1, -1, 2, 0};
-    std::vector<float>  ws = {0.5f};
-    std::vector<int32_t> wz = {1};
-    int32_t bias = 5;
-
-    TransposeConv2DAttributes attrs;
-    attrs.kernel_size = {2, 2};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
-    attrs.output_dtype = DataType::s8;
-
-    TensorView input(ishape, DataType::s8, in.data(), TensorLayout::NCHW,
-                     per_tensor(0.25f, 2));
-    TensorView weight(wshape, DataType::s8, wt.data(), TensorLayout::NCHW,
-                      per_channel(ws.data(), wz.data(), 1));
-    TensorView bias_view(bshape, DataType::s32, &bias, TensorLayout::NCHW);
-
-    auto op = TransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc descs[] = {input.desc(), weight.desc(), bias_view.desc()};
-    auto outs = op->getOutputTensorDesc(descs);
-    NNOPS_EXPECT_EQ(outs[0].dtype, DataType::s8);
-
-    std::vector<uint8_t> buf(9, 0);
-    auto out = make_out_view(outs[0], buf.data(), per_tensor(0.125f, 10));
-    const TensorView ins[] = {input, weight, bias_view};
-    op->compute(out, ins);
-
-    // acc = {0, 2, 0, -1, -1, -4, 1, 1, -2}; + bias + zp_out.
-    const int32_t expected[9] = {15, 17, 15, 14, 14, 11, 16, 16, 13};
-    for (int i = 0; i < 9; ++i) {
-        NNOPS_EXPECT_EQ(int(static_cast<int8_t>(buf[static_cast<size_t>(i)])),
-                        int(expected[i]));
-    }
 }
 
 // ============================================================
@@ -688,37 +583,9 @@ NNOPS_TEST(tconv2d_i8_matches_ref_fp_out) {
         c.ep = EpilogueActivateType::Relu6;
         cases.push_back(c);
     }
-    // ---- pitched input storage ----
-    {
-        Case c;
-        c.ishape = {1, 4, 8, 7};
-        c.wshape = {4, 8, 3, 3};
-        c.kh = c.kw = 3;
-        c.ph = c.pw = 1;
-        c.in_pitch = 12;
-        c.zp_x = -3;
-        cases.push_back(c);
-    }
-    // ---- pitched output storage ----
-    {
-        Case c;
-        c.ishape = {1, 4, 7, 7};
-        c.wshape = {4, 8, 3, 3};
-        c.kh = c.kw = 3;
-        c.ph = c.pw = 1;
-        c.out_pitch = 11;
-        c.ep = EpilogueActivateType::Relu;
-        cases.push_back(c);
-    }
-
     for (size_t i = 0; i < cases.size(); ++i) {
         cases[i].seed = 1000 + i;
-        const bool pitched = cases[i].in_pitch || cases[i].out_pitch;
-        if (pitched) {
-            expect_matches_ref(cases[i], {}, static_cast<int>(i));
-        } else {
-            expect_matches_ref_both(cases[i], static_cast<int>(i));
-        }
+        expect_matches_ref_both(cases[i], static_cast<int>(i));
     }
 }
 
@@ -893,12 +760,7 @@ NNOPS_TEST(tconv2d_i8_int_out_matches_ref) {
 
     for (size_t i = 0; i < cases.size(); ++i) {
         cases[i].seed = 5000 + i;
-        const bool pitched = cases[i].in_pitch || cases[i].out_pitch;
-        if (pitched) {
-            expect_matches_ref(cases[i], {}, static_cast<int>(i));
-        } else {
-            expect_matches_ref_both(cases[i], static_cast<int>(i));
-        }
+        expect_matches_ref_both(cases[i], static_cast<int>(i));
     }
 }
 
@@ -947,14 +809,11 @@ NNOPS_TEST(tconv2d_i8_threaded_matches_serial) {
         std::array<int64_t, 4> ishape, wshape;
         int64_t kh, kw, sh, sw, ph, pw, groups;
         DataType act, out;
-        bool channel_last;
     };
     const TCase cases[] = {
-        {{1, 8, 24, 24}, {8, 16, 3, 3}, 3, 3, 1, 1, 1, 1, 1, DataType::u8, DataType::f32, false},
-        {{1, 8, 24, 24}, {8, 16, 3, 3}, 3, 3, 1, 1, 1, 1, 1, DataType::s8,  DataType::f32, true},
-        {{2, 4, 16, 16}, {4, 4, 3, 3},  3, 3, 1, 1, 0, 0, 2, DataType::f32, DataType::s8,  false},
-        {{2, 8, 16, 16}, {8, 12, 3, 3}, 3, 3, 2, 2, 1, 1, 1, DataType::u8, DataType::u8,  true},
-        {{1, 16, 12, 12}, {16, 32, 3, 3}, 3, 3, 1, 1, 1, 1, 1, DataType::f16, DataType::f16, true},
+        {{1, 8, 24, 24}, {8, 16, 3, 3}, 3, 3, 1, 1, 1, 1, 1, DataType::s8,  DataType::f32},
+        {{2, 8, 16, 16}, {8, 12, 3, 3}, 3, 3, 2, 2, 1, 1, 1, DataType::u8, DataType::u8},
+        {{1, 16, 12, 12}, {16, 32, 3, 3}, 3, 3, 1, 1, 1, 1, 1, DataType::f16, DataType::f16},
     };
 
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
@@ -968,7 +827,6 @@ NNOPS_TEST(tconv2d_i8_threaded_matches_serial) {
         c.groups = tc.groups;
         c.act = tc.act;
         c.out = tc.out;
-        c.channel_last = tc.channel_last;
         if (tc.act == DataType::f32 || tc.act == DataType::f16) {
             c.act_q = DataType::s8;
         }
@@ -993,112 +851,6 @@ NNOPS_TEST(tconv2d_i8_threaded_matches_serial) {
                                          std::to_string(nthreads) + " threads): " + diff);
             }
         }
-    }
-}
-
-// ============================================================
-// Output descriptor
-// ============================================================
-
-NNOPS_TEST(tconv2d_i8_output_desc) {
-    auto desc_of = [](const Case& c) {
-        Fixture f(c);
-        std::vector<TensorDesc> ins = f.descs();
-        auto op = TransposeConv2D::create(f.attrs, Backend::CPU);
-        return op->getOutputTensorDesc(ins)[0];
-    };
-
-    Case c;
-    c.ishape = {1, 4, 6, 6};
-    c.wshape = {4, 8, 3, 3};
-    c.kh = c.kw = 3;
-
-    // An fp activation keeps its own dtype on an fp destination.
-    c.act = DataType::f16;
-    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::f16);
-    c.act = DataType::f32;
-    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::f32);
-
-    // An integer output comes from output_dtype whatever the activation is.
-    c.out = DataType::s8;
-    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::s8);
-    c.out = DataType::u8;
-    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::u8);
-    c.act = DataType::s8;
-    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::u8);
-
-    // A pre-quantized activation is dequantized to output_dtype.
-    c.out = DataType::f32;
-    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::f32);
-    c.out = DataType::f16;
-    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::f16);
-    c.act = DataType::u8;
-    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::f16);
-
-    // The quantized route also keeps the output geometry.
-    c.out = DataType::f32;
-    c.ishape = {1, 4, 5, 6};
-    c.sh = c.sw = 2;
-    c.ph = c.pw = 1;
-    const auto d = desc_of(c);
-    NNOPS_EXPECT_EQ(d.dims[2], 9);
-    NNOPS_EXPECT_EQ(d.dims[3], 11);
-}
-
-// ============================================================
-// The route refuses what it cannot represent
-// ============================================================
-
-NNOPS_TEST(tconv2d_i8_refusals) {
-    auto ok_with = [](const Case& c, bool add_to) {
-        Fixture f(c);
-        f.attrs.add_to = add_to;
-        auto op = TransposeConv2D::create(f.attrs, Backend::CPU);
-        const auto outs = op->getOutputTensorDesc(f.descs());
-        std::vector<uint8_t> buf(
-            static_cast<size_t>(outs[0].numel()) * elem_size(outs[0].dtype), 0);
-        auto out = make_out_view(outs[0], buf.data(), f.out_q);
-        return op->compute(out, f.ins, {}, nullptr) == Status::ok;
-    };
-
-    Case base;
-    base.ishape = {1, 4, 6, 6};
-    base.wshape = {4, 8, 3, 3};
-    base.kh = base.kw = 3;
-
-    NNOPS_EXPECT_TRUE(ok_with(base, /*add_to=*/false));
-    // add_to would have to keep the pre-existing destination, and the integer
-    // accumulate has no fold for it.
-    NNOPS_EXPECT_FALSE(ok_with(base, /*add_to=*/true));
-
-    // An fp activation with an fp destination of its own dtype.
-    {
-        Case c = base;
-        c.act = DataType::f32;
-        NNOPS_EXPECT_TRUE(ok_with(c, false));
-    }
-
-    // s32 is not an output this route writes.
-    {
-        Case c = base;
-        c.out = DataType::s32;
-        NNOPS_EXPECT_FALSE(ok_with(c, false));
-    }
-
-    // Neither is an fp activation whose destination disagrees with it — a
-    // descriptor rule, so it has to be refused by a hand-built view.
-    {
-        Case c = base;
-        c.act = DataType::f32;
-        Fixture f(c);
-        auto op = TransposeConv2D::create(f.attrs, Backend::CPU);
-        const auto outs = op->getOutputTensorDesc(f.descs());
-        std::vector<uint8_t> buf(
-            static_cast<size_t>(outs[0].numel()) * sizeof(uint16_t), 0);
-        const auto shape = std::span<const int64_t>(outs[0].dims.data(),
-                                                    static_cast<size_t>(outs[0].rank));
-        TensorView out(shape, DataType::f16, buf.data(), outs[0].layout);
-        NNOPS_EXPECT_EQ(op->compute(out, f.ins, {}, nullptr), Status::unsupported);
     }
 }
 

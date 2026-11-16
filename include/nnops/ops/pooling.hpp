@@ -1,13 +1,11 @@
 #pragma once
 /// @file pooling.hpp
-/// @brief Pooling operator — 2D/3D spatial pooling, channel-first or
-///        channel-last.
+/// @brief Pooling operator — 2D/3D spatial pooling, channel-last.
 ///
-/// The output's layout follows the input's. Channel-first input supports f32/f16;
-/// quantized (s8/u8) pooling is channel-last only — its kernel lanes the
-/// channel, where a channel-first plane lanes output width. Per-axis arrays
-/// are [D, H, W]; a rank-4 (2D) input reads only the H/W entries, a rank-5
-/// (3D) input all three.
+/// The output's layout follows the input's (NHWC/NDHWC). f32/f16 and the
+/// quantized s8/u8 pairs are supported; the kernel lanes the channel. Per-axis
+/// arrays are [D, H, W]; a rank-4 (2D) input reads only the H/W entries, a
+/// rank-5 (3D) input all three.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -101,7 +99,10 @@ public:
 
     OpType  getOpType()  const override { return OpType::Pooling; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::Any; }
+    LayoutSupport getLayoutSupport() const noexcept override
+    {
+        return LayoutSupport::ChannelLastOnly;
+    }
 
     const PoolingAttributes& attributes() const noexcept { return attrs_; }
 

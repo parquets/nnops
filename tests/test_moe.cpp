@@ -119,9 +119,9 @@ struct Buf {
 
     TensorView view(DataType dt) const {
         if (dt == DataType::f16) {
-            return TensorView(shape, dt, const_cast<half*>(f16.data()), TensorLayout::NCHW);
+            return TensorView(shape, dt, const_cast<half*>(f16.data()), TensorLayout::Dense);
         }
-        return TensorView(shape, dt, const_cast<float*>(f32.data()), TensorLayout::NCHW);
+        return TensorView(shape, dt, const_cast<float*>(f32.data()), TensorLayout::Dense);
     }
 };
 
@@ -151,7 +151,7 @@ struct Q4Weight {
 
     TensorView view() const {
         return TensorView(decoded.shape, DataType::q4_1,
-                          const_cast<uint8_t*>(bytes.data()), TensorLayout::NCHW);
+                          const_cast<uint8_t*>(bytes.data()), TensorLayout::Dense);
     }
 };
 
@@ -286,10 +286,10 @@ std::vector<float> run_moe(MoEProblem& p, const MoEAttributes& attrs,
     TensorView out;
     if (dt == DataType::f16) {
         out_f16.resize(n_out);
-        out = TensorView(oshape, DataType::f16, out_f16.data(), TensorLayout::NCHW);
+        out = TensorView(oshape, DataType::f16, out_f16.data(), TensorLayout::Dense);
     } else {
         out_f32.assign(n_out, 0.0f);
-        out = TensorView(oshape, DataType::f32, out_f32.data(), TensorLayout::NCHW);
+        out = TensorView(oshape, DataType::f32, out_f32.data(), TensorLayout::Dense);
     }
 
     if (use_ref) {
@@ -377,7 +377,7 @@ NNOPS_TEST(moe_output_desc)
     auto op = MoE::create(attrs, Backend::CPU);
 
     TensorDesc d;
-    d.layout = TensorLayout::NCHW;
+    d.layout = TensorLayout::Dense;
     d.dtype  = DataType::f32;
     d.rank   = 2;
     d.dims   = {4, 8};
@@ -390,7 +390,7 @@ NNOPS_TEST(moe_output_desc)
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(4));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(8));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::Dense);
     NNOPS_EXPECT_EQ(op->getWorkspaceSize(ins, descs), size_t(0));
     NNOPS_EXPECT_EQ(static_cast<int>(op->getOpType()), static_cast<int>(OpType::MoE));
 

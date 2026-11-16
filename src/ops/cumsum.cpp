@@ -30,7 +30,7 @@ Status CumSum::validate(std::span<const TensorDesc> inputs,
     if (outputs[0].dtype != inputs[0].dtype) {
         return Status::invalid_argument;
     }
-    return detail::require(is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly));
+    return detail::require(is_layout_supported(inputs[0].layout, LayoutSupport::Any));
 }
 
 Status CumSum::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

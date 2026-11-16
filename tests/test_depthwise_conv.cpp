@@ -1,22 +1,17 @@
 /// @file test_depthwise_conv.cpp
-/// @brief DepthwiseConv tests — channel-first and channel-last.
+/// @brief DepthwiseConv tests — channel-last.
 ///
-/// Channel-first: the raw [C, 1, (KD,) KH, KW] filter goes straight to the operator,
-/// and the output is compared with the scalar reference kernel. One case is
-/// hand-computed so the suite is not only reference against reference.
+/// The same values in both orders — channel-first plus the raw channel-first
+/// filter for the reference, channel-last plus TensorFlow's [KD][KH][KW][C]
+/// filter for the kernel. The route reads the filter as the graph holds it, so
+/// the only plumbing is the transpose between the orders. A call covers 8
+/// channels, or 16 (two vectors) where the 3x3 kernel can take both halves —
+/// which the C values below pick out: sub-vector, partial, full and multi-block.
 ///
-/// Channel-last: the same values in both orders — channel-first plus the raw
-/// channel-first filter for the reference, channel-last plus TensorFlow's
-/// [KD][KH][KW][C] filter for the kernel. The route reads the filter as the
-/// graph holds it, so the only plumbing is the transpose between the orders. A
-/// call covers 8 channels, or 16 (two vectors) where the 3x3 kernel can take
-/// both halves — which the C values below pick out: sub-vector, partial, full
-/// and multi-block.
-///
-/// The channel-first shape sweep picks the geometries that strand an edge mask:
-/// a plane one row or one column wide, C of 1 and past a vector, a filter larger
-/// than a vector, stride 2 with dilation 2 (the two compose, so the tap at the
-/// far edge is read and the one past it is not), and 3D volumes with a kernel
+/// The shape sweep picks the geometries that strand an edge mask: a plane one
+/// row or one column wide, C of 1 and past a vector, a filter larger than a
+/// vector, stride 2 with dilation 2 (the two compose, so the tap at the far
+/// edge is read and the one past it is not), and 3D volumes with a kernel
 /// shorter than the rank on one axis.
 
 #include "nnops/ops/conv2d.hpp"
@@ -43,306 +38,6 @@ namespace nnops::backend::cpu::reference {
                             void* workspace);
 }
 
-static void test_channel_first_vs_ref(const std::vector<int64_t>& in_shape,
-                               const std::vector<int64_t>& w_shape,
-                               const DepthwiseConvAttributes& attrs,
-                               bool has_bias = false)
-{
-    auto [in_vec, in] = test::make_random_tensor(in_shape);
-    auto [w_vec,  w]  = test::make_random_tensor(w_shape);
-    std::vector<float> b_vec;
-    TensorView b;
-    if (has_bias) {
-        auto p = test::make_random_tensor({w_shape[0]});
-        b_vec = std::move(p.first);
-        b = p.second;
-    }
-
-    auto dw_op = DepthwiseConv::create(attrs, Backend::CPU);
-
-    TensorDesc in_desc = in.desc();
-    TensorDesc w_desc  = w.desc();
-    const TensorDesc desc_arr[] = {in_desc, w_desc};
-    auto out_descs = dw_op->getOutputTensorDesc(desc_arr);
-
-    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = test::make_channel_first(out_descs[0], out_buf.data());
-    std::vector<float> ref_buf(out_buf.size());
-    auto ref = test::make_channel_first(out_descs[0], ref_buf.data());
-    if (attrs.add_to) {
-        // Mixed signs: a positive shortcut survives a ReLU either way, only a
-        // negative one tells the pre- and post-activation orders apart.
-        for (size_t i = 0; i < out_buf.size(); ++i) {
-            out_buf[i] = ref_buf[i] = static_cast<float>(i % 5) * 0.5f - 1.0f;
-        }
-    }
-
-    {
-        ComputeContext ctx;
-        if (has_bias) {
-            const TensorView ref_ins[] = {in, w, b};
-            backend::cpu::reference::depthwise_conv_ref(attrs, ref, ref_ins, ctx, nullptr);
-        } else {
-            const TensorView ref_ins[] = {in, w};
-            backend::cpu::reference::depthwise_conv_ref(attrs, ref, ref_ins, ctx, nullptr);
-        }
-    }
-
-    if (has_bias) {
-        const TensorView ins[] = {in, w, b};
-        NNOPS_EXPECT_TRUE(is_ok(dw_op->compute(out, ins)));
-    } else {
-        const TensorView ins[] = {in, w};
-        NNOPS_EXPECT_TRUE(is_ok(dw_op->compute(out, ins)));
-    }
-    NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(dwconv_channel_first_vs_ref_basic) {
-    // C=4, odd output width 13: the plane loop, a last vector 5 of 8 lanes.
-    test_channel_first_vs_ref({1, 4, 12, 15}, {4, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
-}
-
-NNOPS_TEST(dwconv_channel_first_vs_ref_padding_stride2) {
-    // Both W edges padded, stride 2: the vector load deinterleaves.
-    test_channel_first_vs_ref({1, 6, 14, 13}, {6, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}});
-}
-
-NNOPS_TEST(dwconv_channel_first_vs_ref_dilation) {
-    test_channel_first_vs_ref({1, 4, 10, 10}, {4, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 2, 2}, {0, 0, 0}});
-}
-
-NNOPS_TEST(dwconv_channel_first_vs_ref_bias) {
-    test_channel_first_vs_ref({2, 8, 8, 8}, {8, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true);
-}
-
-NNOPS_TEST(dwconv_channel_first_vs_ref_add_to) {
-    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
-    attrs.add_to = true;
-    test_channel_first_vs_ref({1, 3, 8, 8}, {3, 1, 3, 3}, attrs);
-}
-
-NNOPS_TEST(dwconv_channel_first_vs_ref_relu_epilogue) {
-    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
-    attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_first_vs_ref({1, 5, 6, 11}, {5, 1, 3, 3}, attrs);
-}
-
-NNOPS_TEST(dwconv_channel_first_vs_ref_pre_act) {
-    // The shortcut joins the sum the activation sees. The helper's residual
-    // alternates sign, so a post-epilogue add would leave the negative half
-    // unclamped and fail here.
-    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
-    attrs.add_to = true;
-    attrs.residual_pre_activation = true;
-    attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_first_vs_ref({1, 5, 6, 11}, {5, 1, 3, 3}, attrs);
-}
-
-NNOPS_TEST(dwconv_channel_first_vs_ref_pre_act_clamp) {
-    // The clamp-only epilogue on a 13-wide plane: the last width vector is
-    // short, so the residual is read through the masked block copy too.
-    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}};
-    attrs.add_to = true;
-    attrs.residual_pre_activation = true;
-    attrs.epilogue.min_clip = -0.5f;
-    attrs.epilogue.max_clip = 0.5f;
-    test_channel_first_vs_ref({1, 7, 9, 13}, {7, 1, 3, 3}, attrs, true);
-}
-
-NNOPS_TEST(dwconv_channel_first_vs_ref_1x1_kernel_stride2) {
-    test_channel_first_vs_ref({1, 8, 9, 9}, {8, 1, 1, 1},
-        DepthwiseConvAttributes{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}});
-}
-
-/// The channel-first route in f16. The f32 reference runs on the same values widened
-/// back from f16, so the only error left is the kernel's own f16 arithmetic.
-static void test_channel_first_f16_vs_ref(const std::vector<int64_t>& in_shape,
-                                   const std::vector<int64_t>& w_shape,
-                                   const DepthwiseConvAttributes& attrs,
-                                   bool has_bias = false)
-{
-    using half = backend::cpu::half;
-    auto [in_vec, in_f32] = test::make_random_tensor(in_shape);
-    auto [w_vec,  w_f32]  = test::make_random_tensor(w_shape);
-    std::vector<float> b_vec;
-    TensorView b_f32;
-    if (has_bias) {
-        auto p = test::make_random_tensor({w_shape[0]});
-        b_vec = std::move(p.first);
-        b_f32 = p.second;
-    }
-
-    // Round in place so the reference and the kernel see the same values.
-    std::vector<half> in_f16(in_vec.size()), w_f16(w_vec.size()), b_f16(b_vec.size());
-    for (size_t i = 0; i < in_f16.size(); ++i) {
-        simd::s_store(&in_f16[i], in_vec[i]);
-        in_vec[i] = simd::s_load(&in_f16[i]);
-    }
-    for (size_t i = 0; i < w_f16.size(); ++i) {
-        simd::s_store(&w_f16[i], w_vec[i]);
-        w_vec[i] = simd::s_load(&w_f16[i]);
-    }
-    for (size_t i = 0; i < b_f16.size(); ++i) {
-        simd::s_store(&b_f16[i], b_vec[i]);
-        b_vec[i] = simd::s_load(&b_f16[i]);
-    }
-
-    TensorView in(std::span<const int64_t>(in_shape), DataType::f16, in_f16.data());
-    TensorView w(std::span<const int64_t>(w_shape), DataType::f16, w_f16.data());
-    const int64_t b_shape[] = {w_shape[0]};
-    TensorView b(std::span<const int64_t>(b_shape, 1), DataType::f16, b_f16.data());
-
-    auto op = DepthwiseConv::create(attrs, Backend::CPU);
-    const TensorDesc in_d[] = {in.desc(), w.desc(), b.desc()};
-    auto out_descs = op->getOutputTensorDesc(
-        std::span<const TensorDesc>(in_d, has_bias ? 3 : 2));
-
-    std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()),
-                               attrs.add_to ? 1.0f : 0.0f);
-    auto ref = test::make_channel_first(out_descs[0], ref_buf.data());
-    {
-        ComputeContext ctx;
-        const TensorView r[] = {in_f32, w_f32, b_f32};
-        backend::cpu::reference::depthwise_conv_ref(
-            attrs, ref, std::span<const TensorView>(r, has_bias ? 3 : 2), ctx, nullptr);
-    }
-
-    std::vector<half> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = test::make_channel_first(out_descs[0], out_buf.data());
-    for (auto& v : out_buf) { simd::s_store(&v, attrs.add_to ? 1.0f : 0.0f); }
-
-    const TensorView ins[] = {in, w, b};
-    NNOPS_EXPECT_TRUE(
-        is_ok(op->compute(out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
-
-    const auto got = test::f16_to_f32(out_buf);
-    for (size_t i = 0; i < got.size(); ++i) {
-        NNOPS_EXPECT_NEAR(got[i], ref_buf[i], test::kF16AccumTol);
-    }
-}
-
-NNOPS_TEST(dwconv_channel_first_f16_vs_ref) {
-    // Four channel blocks: the first and last skip the folded width mask (their
-    // masked load would read past the tensor), so only the middle blocks take
-    // it — and in f16 that mask was built as raw bits, i.e. the subnormal
-    // 0x0001 instead of one, which erased every masked tap.
-    test_channel_first_f16_vs_ref({1, 32, 12, 15}, {32, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true);
-    // One width vector per row: every vector is an edge vector.
-    test_channel_first_f16_vs_ref({1, 24, 9, 7}, {24, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}});
-    // Stride 2 on the width, and dilation on both axes.
-    test_channel_first_f16_vs_ref({2, 20, 9, 11}, {20, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}});
-    test_channel_first_f16_vs_ref({1, 16, 10, 10}, {16, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 2, 2}, {0, 0, 0}});
-    // 3D, which walks the depth loop.
-    test_channel_first_f16_vs_ref({1, 17, 4, 6, 9}, {17, 1, 3, 3, 3},
-        DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}}, true);
-}
-
-NNOPS_TEST(dwconv_channel_first_3d_vs_ref) {
-    test_channel_first_vs_ref({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3},
-        DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}}, true);
-}
-
-NNOPS_TEST(dwconv_channel_first_3d_vs_ref_pre_act) {
-    DepthwiseConvAttributes attrs{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}};
-    attrs.add_to = true;
-    attrs.residual_pre_activation = true;
-    attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_first_vs_ref({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3}, attrs, true);
-}
-
-NNOPS_TEST(dwconv_channel_first_shape_sweep) {
-    // Window and plane shapes the 3x3 cases above never reach: 5x5 and 7x7
-    // windows, an even 2x2, a rank-1 window on either axis, a one-row and a
-    // one-column plane, a single channel, an odd C, and the 3D forms at stride 2.
-    struct Case {
-        std::vector<int64_t> ishape, wshape;
-        DepthwiseConvAttributes attrs;
-        bool bias;
-    };
-    const Case cases[] = {
-        // 5x5 "same" over an odd plane: the width tail is 5 of 8 lanes.
-        {{1, 5, 11, 13}, {5, 1, 5, 5},
-         {{1, 5, 5}, {1, 1, 1}, {1, 1, 1}, {0, 2, 2}}, true},
-        // An even window at stride 2 with no padding.
-        {{1, 3, 8, 10}, {3, 1, 2, 2},
-         {{1, 2, 2}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}}, false},
-        // 7x7 "same" — the ResNet stem window.
-        {{1, 2, 11, 11}, {2, 1, 7, 7},
-         {{1, 7, 7}, {1, 1, 1}, {1, 1, 1}, {0, 3, 3}}, false},
-        // Rank-1 windows, one per axis.
-        {{1, 4, 9, 15}, {4, 1, 1, 7},
-         {{1, 1, 7}, {1, 1, 1}, {1, 1, 1}, {0, 0, 3}}, false},
-        {{1, 4, 15, 9}, {4, 1, 7, 1},
-         {{1, 7, 1}, {1, 1, 1}, {1, 1, 1}, {0, 3, 0}}, true},
-        // A single column and a single row of input: every window clipped.
-        {{1, 4, 7, 1}, {4, 1, 3, 3},
-         {{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true},
-        {{1, 4, 1, 7}, {4, 1, 3, 3},
-         {{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, false},
-        // One channel, and an odd C whose plane loop ends on a short tail.
-        {{1, 1, 9, 9},  {1, 1, 3, 3},
-         {{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, false},
-        {{1, 17, 8, 9}, {17, 1, 3, 3},
-         {{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true},
-        // Stride 2 with dilation 2: the gather skips a tap and a row.
-        {{1, 4, 15, 17}, {4, 1, 3, 3},
-         {{1, 3, 3}, {1, 2, 2}, {1, 2, 2}, {0, 2, 2}}, false},
-        // 3D: an even cube at stride 2, a 3x3x3 with H/W padding, and a
-        // 1x3x5 whose depth window is a single plane.
-        {{1, 3, 6, 8, 10}, {3, 1, 2, 2, 2},
-         {{2, 2, 2}, {2, 2, 2}, {1, 1, 1}, {0, 0, 0}}, false},
-        {{1, 2, 5, 9, 11}, {2, 1, 3, 3, 3},
-         {{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true},
-        {{2, 4, 5, 7, 9},  {4, 1, 1, 3, 5},
-         {{1, 3, 5}, {1, 1, 1}, {1, 1, 1}, {0, 1, 2}}, false},
-    };
-
-    for (const Case& c : cases) {
-        test_channel_first_vs_ref(c.ishape, c.wshape, c.attrs, c.bias);
-    }
-}
-
-// The one hand-computed case: everything else compares against
-// depthwise_conv_ref, itself a second implementation that could drift with the
-// kernel.
-NNOPS_TEST(dwconv_channel_first_3d_hand_check) {
-    // 1x2x3x3x3 input of ones, 1x2x2x2x2 kernel of 0.5, stride 1, pad 0:
-    // each output = 2*2*2 taps * 1.0 * 0.5 = 4.0.
-    const int64_t ishape[] = {1, 2, 3, 3, 3};
-    const int64_t wshape[] = {2, 1, 2, 2, 2};
-
-    std::vector<float> in_buf(54, 1.0f);   // 1*2*3*3*3
-    std::vector<float> w_buf(16, 0.5f);    // 2*1*2*2*2
-
-    TensorView in(ishape, DataType::f32, in_buf.data(), TensorLayout::NCDHW);
-    TensorView w(wshape, DataType::f32, w_buf.data(), TensorLayout::NCDHW);
-
-    DepthwiseConvAttributes attrs{{2, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
-    auto op = DepthwiseConv::create(attrs, Backend::CPU);
-
-    const TensorDesc in_desc_arr[] = {in.desc(), w.desc()};
-    auto out_descs = op->getOutputTensorDesc(in_desc_arr);
-
-    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = test::make_channel_first(out_descs[0], out_buf.data());
-    {
-        const TensorView ins[] = {in, w};
-        TensorView outs[] = {out};
-        NNOPS_EXPECT_TRUE(op->compute(outs, ins) == Status::ok);
-    }
-
-    for (float v : out_buf) { NNOPS_EXPECT_NEAR(v, 4.0f, 1e-4f); }
-}
-
 // ============================================================
 // Quantized depthwise conv — s8/u8 in and out, PerTensor activation and
 // output, PerChannel weight.
@@ -366,32 +61,6 @@ static QuantParams make_per_channel(const std::vector<float>& scales,
     qp.zero_point_data = zps.data();
     qp.num_scales = static_cast<int64_t>(scales.size());
     return qp;
-}
-
-// ============================================================
-// Layout contract — the channel-first path reads the raw channel-first filter, so a
-// channel-last weight is rejected at descriptor level rather than misread.
-// ============================================================
-
-NNOPS_TEST(dwconv_channel_first_rejects_channel_last_weight) {
-    TensorDesc in;
-    in.rank = 4;
-    for (int64_t d : {1, 4, 8, 8}) { in.dims.push_back(d); }
-
-    TensorDesc w;
-    w.rank   = 4;
-    w.layout = TensorLayout::NHWC;
-    for (int64_t d : {1, 3, 3, 8}) { w.dims.push_back(d); }
-
-    TensorDesc out;
-    out.rank = 4;
-    for (int64_t d : {1, 4, 6, 6}) { out.dims.push_back(d); }
-
-    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
-    auto op = DepthwiseConv::create(attrs, Backend::CPU);
-    const TensorDesc ins[] = {in, w};
-    const TensorDesc outs[] = {out};
-    NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::unsupported);
 }
 
 // ============================================================
@@ -717,9 +386,9 @@ static void dwconv_q_channel_last_test(const std::vector<int64_t>& in_shape,
     }
 
     TensorView in_channel_first(std::span<const int64_t>(in_shape), in_dt, in_data.data(),
-                       TensorLayout::NCHW, in_qp);
+                       TensorLayout::Dense, in_qp);
     TensorView w_channel_first(std::span<const int64_t>(w_shape), in_dt, w_data.data(),
-                      TensorLayout::NCHW, w_qp);
+                      TensorLayout::Dense, w_qp);
     TensorView b_channel_first;
     if (has_bias) {
         const int64_t bsh[] = {C};
@@ -745,7 +414,7 @@ static void dwconv_q_channel_last_test(const std::vector<int64_t>& in_shape,
         ref_buf[static_cast<size_t>(i)] = residual_at(i);
     }
     TensorView ref_out(std::span<const int64_t>(ref_descs[0].dims), out_dt,
-                       ref_buf.data(), TensorLayout::NCHW, out_qp);
+                       ref_buf.data(), TensorLayout::Dense, out_qp);
     {
         ComputeContext ctx;
         const TensorView r[] = {in_channel_first, w_channel_first, b_channel_first};
@@ -868,11 +537,10 @@ NNOPS_TEST(dwconv_q_channel_last_multi_block_s8) {
 /// geometry, and compute() hands it to these kernels instead of the grouped
 /// GEMM. The filter arrives in the order the GEMM path carries rather than the
 /// depthwise one, but the two index alike, so nothing is converted. Compare it
-/// against depthwise_conv_ref on the same values, in both activation layouts.
+/// against depthwise_conv_ref on the same values.
 static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
                                     const DepthwiseConvAttributes& dw,
-                                    bool has_bias,
-                                    bool channel_last)
+                                    bool has_bias)
 {
     const int64_t N    = in_shape[0];
     const int64_t C    = in_shape[1];
@@ -932,43 +600,31 @@ static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
     for (int64_t i = 0; dw.add_to && i < out_n; ++i) {
         out_buf[static_cast<size_t>(i)] = residual_at(i);
     }
-    if (channel_last) {
-        if (dw.add_to) {
-            out_buf = test::to_channel_last<float>(out_buf, N, C, out_n / (N * C));
-        }
-        auto in_cl = test::to_channel_last<float>(in_vec, N, C, S);
-        auto w_cl  = test::depthwise_to_hwcm<float>(w_vec, C, taps);
-
-        // A tensor's dims stay logical [N, C, H, W]; the layout tag is what
-        // says the storage is pixel-major.
-        const int64_t in_cl_shape[] = {N, C, H, W};
-        TensorView in_v(in_cl_shape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
-        const int64_t w_cl_shape[] = {KH, KW, 1, C};
-        TensorView w_v(w_cl_shape, DataType::f32, w_cl.data(), TensorLayout::HWIO);
-
-        const TensorDesc cl_in[] = {in_v.desc(), w_v.desc(), b_cf.desc()};
-        auto out_descs = conv->getOutputTensorDesc(
-            std::span<const TensorDesc>(cl_in, has_bias ? 3 : 2));
-        NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
-        NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
-
-        auto out = test::make_channel_first(out_descs[0], out_buf.data());
-        const TensorView ins[] = {in_v, w_v, b_cf};
-        NNOPS_EXPECT_TRUE(is_ok(conv->compute(
-            out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
-        out_buf = test::to_channel_first<float>(
-            out_buf, N, C, out_descs[0].numel() / (N * C));
-    } else {
-        const TensorDesc cf_in[] = {in_cf.desc(), w_cf.desc(), b_cf.desc()};
-        auto out_descs = conv->getOutputTensorDesc(
-            std::span<const TensorDesc>(cf_in, has_bias ? 3 : 2));
-        NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
-
-        auto out = test::make_channel_first(out_descs[0], out_buf.data());
-        const TensorView ins[] = {in_cf, w_cf, b_cf};
-        NNOPS_EXPECT_TRUE(is_ok(conv->compute(
-            out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
+    if (dw.add_to) {
+        out_buf = test::to_channel_last<float>(out_buf, N, C, out_n / (N * C));
     }
+    auto in_cl = test::to_channel_last<float>(in_vec, N, C, S);
+    auto w_cl  = test::depthwise_to_hwcm<float>(w_vec, C, taps);
+
+    // A tensor's dims stay logical [N, C, H, W]; the layout tag is what
+    // says the storage is pixel-major.
+    const int64_t in_cl_shape[] = {N, C, H, W};
+    TensorView in_v(in_cl_shape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
+    const int64_t w_cl_shape[] = {KH, KW, 1, C};
+    TensorView w_v(w_cl_shape, DataType::f32, w_cl.data(), TensorLayout::HWIO);
+
+    const TensorDesc cl_in[] = {in_v.desc(), w_v.desc(), b_cf.desc()};
+    auto out_descs = conv->getOutputTensorDesc(
+        std::span<const TensorDesc>(cl_in, has_bias ? 3 : 2));
+    NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
+    NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
+
+    auto out = test::make_channel_first(out_descs[0], out_buf.data());
+    const TensorView ins[] = {in_v, w_v, b_cf};
+    NNOPS_EXPECT_TRUE(is_ok(conv->compute(
+        out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
+    out_buf = test::to_channel_first<float>(
+        out_buf, N, C, out_descs[0].numel() / (N * C));
 
     for (int64_t i = 0; i < out_n; ++i) {
         NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(i)],
@@ -976,49 +632,29 @@ static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
     }
 }
 
-NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_first) {
-    // Padding, bias and a relu epilogue: the pieces the depthwise route has to
-    // carry across, not just the multiply-add.
-    DepthwiseConvAttributes dw{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
-    dw.epilogue.type = EpilogueActivateType::Relu;
-    conv2d_depthwise_vs_ref({1, 6, 9, 9}, dw, true, false);
-}
-
-NNOPS_TEST(conv2d_group_eq_channels_depthwise_add_to) {
-    DepthwiseConvAttributes dw{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}};
-    dw.add_to = true;
-    conv2d_depthwise_vs_ref({2, 8, 10, 11}, dw, false, false);
-}
-
 NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last) {
-    // The same route under an NHWC activation and an HWIO [KH, KW, 1, C] filter.
+    // Padding, bias and a relu epilogue: the pieces the depthwise route has to
+    // carry across, not just the multiply-add. Also an NHWC activation and an
+    // HWIO [KH, KW, 1, C] filter.
     DepthwiseConvAttributes dw{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     dw.epilogue.type = EpilogueActivateType::Relu;
-    conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true, true);
+    conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true);
 }
 
-
-NNOPS_TEST(conv2d_group_eq_channels_depthwise_pre_act) {
+NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last_pre_act) {
     // The reroute forwards the flag: a Conv2D with group == in_channels must
     // not silently apply its shortcut after the activation.
     DepthwiseConvAttributes dw{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     dw.add_to = true;
     dw.residual_pre_activation = true;
     dw.epilogue.type = EpilogueActivateType::Relu;
-    conv2d_depthwise_vs_ref({1, 6, 9, 9}, dw, true, false);
+    conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true);
 }
 
-NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last_pre_act) {
-    DepthwiseConvAttributes dw{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
-    dw.add_to = true;
-    dw.residual_pre_activation = true;
-    dw.epilogue.type = EpilogueActivateType::Relu;
-    conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true, true);
-}
 NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last_add_to) {
     // C=17 leaves a one-lane tail past two full vectors, and the filter is
     // smaller than its padding-free plane, so the output is not the input's size.
     DepthwiseConvAttributes dw{{1, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
     dw.add_to = true;
-    conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false, true);
+    conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false);
 }

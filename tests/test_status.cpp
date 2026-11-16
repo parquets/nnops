@@ -17,7 +17,6 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/ops/embed.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "nnops/ops/matmul.hpp"
 #include "nnops/ops/moe.hpp"
 #include "nnops/ops/permute.hpp"
@@ -41,7 +40,7 @@ namespace {
 
 TensorDesc desc_of(std::initializer_list<int64_t> dims,
                    DataType dtype = DataType::f32,
-                   TensorLayout layout = TensorLayout::NCHW)
+                   TensorLayout layout = TensorLayout::Dense)
 {
     TensorDesc d;
     d.rank = static_cast<int64_t>(dims.size());
@@ -201,15 +200,6 @@ NNOPS_TEST(status_validate_descriptors_only) {
         NNOPS_EXPECT_TRUE(op->validate(in, bad) == Status::invalid_argument);
     }
 
-    // LayoutConvert: converting to the current layout is rejected, not a no-op.
-    {
-        auto op = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-        const TensorDesc same[] = {desc_of({2, 3}, DataType::f32, TensorLayout::NCHW)};
-        const TensorDesc other[] = {desc_of({2, 3}, DataType::f32, TensorLayout::NHWC)};
-        NNOPS_EXPECT_TRUE(op->validate(same, same) == Status::invalid_argument);
-        NNOPS_EXPECT_TRUE(op->validate(other, same) == Status::ok);
-    }
-
     // Embed: non-integer indices are malformed; an unknown weight dtype is unsupported.
     {
         auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
@@ -224,16 +214,22 @@ NNOPS_TEST(status_validate_descriptors_only) {
         NNOPS_EXPECT_TRUE(op->validate(odd_w, out) == Status::unsupported);
     }
 
-    // Softmax dequantizes, so an integer output has no meaning.
+    // Softmax is channel-last only, and quantized input has no route at all.
     {
         auto op = Softmax::create(SoftmaxAttributes{}, Backend::CPU);
+        const TensorDesc cf[] = {desc_of({2, 8}, DataType::f32)};
+        const TensorDesc cf_out[] = {desc_of({2, 8}, DataType::f32)};
+        NNOPS_EXPECT_TRUE(op->validate(cf, cf_out) == Status::unsupported);
+
+        const TensorDesc cl[] = {desc_of({2, 8}, DataType::f32, TensorLayout::NHWC)};
+        const TensorDesc cl_out[] = {desc_of({2, 8}, DataType::f32, TensorLayout::NHWC)};
+        NNOPS_EXPECT_TRUE(op->validate(cl, cl_out) == Status::ok);
+
         // Note that a descriptor has no quant parameters — they live on the
         // view — so this rule keys off the dtype alone.
-        const TensorDesc in[] = {desc_of({2, 8}, DataType::s8)};
-        const TensorDesc int_out[] = {desc_of({2, 8}, DataType::s8)};
-        const TensorDesc fp_out[] = {desc_of({2, 8}, DataType::f32)};
-        NNOPS_EXPECT_TRUE(op->validate(in, int_out) == Status::invalid_argument);
-        NNOPS_EXPECT_TRUE(op->validate(in, fp_out) == Status::ok);
+        const TensorDesc q[] = {desc_of({2, 8}, DataType::s8, TensorLayout::NHWC)};
+        const TensorDesc q_out[] = {desc_of({2, 8}, DataType::f32, TensorLayout::NHWC)};
+        NNOPS_EXPECT_TRUE(op->validate(q, q_out) == Status::unsupported);
     }
 }
 

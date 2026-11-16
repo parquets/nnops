@@ -15,9 +15,8 @@
 /// a ten-cycle latency chain. One tap is then a multiply plus a pair of
 /// sign-extends per 16 lanes.
 ///
-/// Two weight forms: `madd_s` broadcasts one scalar per tap (a channel-first
-/// filter is [C, 1, KH, KW], one weight per tap), `madd_v` reads a staged
-/// 16-lane int16 vector (a channel-last HWCM filter is one weight per channel).
+/// `madd_v` reads a staged 16-lane int16 vector (a channel-last HWCM filter is
+/// one weight per channel).
 /// The activation zero point is not applied per lane — it would not fit the
 /// byte — so the caller folds it into the accumulator's seed, which `add_v` and
 /// `sub_scaled` build from the tap weights.
@@ -53,11 +52,6 @@ struct I8LaneAcc {
         lo = _mm256_add_epi32(lo, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(p)));
         hi = _mm256_add_epi32(hi, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(p, 1)));
     }
-    void madd_s(const int8_t* x, int32_t w) noexcept
-    {
-        madd(_mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(x))),
-             _mm256_set1_epi16(static_cast<int16_t>(w)));
-    }
     void madd_v(const int8_t* x, const int16_t* w) noexcept
     {
         madd(_mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(x))),
@@ -92,10 +86,6 @@ struct I8LaneAcc {
         hi = vmlal_s16(hi, vget_high_s16(x0), vget_high_s16(w0));
         lo2 = vmlal_s16(lo2, vget_low_s16(x1), vget_low_s16(w1));
         hi2 = vmlal_s16(hi2, vget_high_s16(x1), vget_high_s16(w1));
-    }
-    void madd_s(const int8_t* x, int32_t w) noexcept
-    {
-        madd(vmovl_s8(vld1_s8(x)), vmovl_s8(vld1_s8(x + 8)), vdupq_n_s16(w), vdupq_n_s16(w));
     }
     void madd_v(const int8_t* x, const int16_t* w) noexcept
     {
@@ -133,12 +123,6 @@ struct I8LaneAcc {
     {
         for (int64_t l = 0; l < kI8Lane; ++l) {
             a[l] = v;
-        }
-    }
-    void madd_s(const int8_t* x, int32_t w) noexcept
-    {
-        for (int64_t l = 0; l < kI8Lane; ++l) {
-            a[l] += w * static_cast<int32_t>(x[l]);
         }
     }
     void madd_v(const int8_t* x, const int16_t* w) noexcept

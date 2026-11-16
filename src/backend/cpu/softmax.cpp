@@ -1,18 +1,17 @@
 /// @file softmax.cpp
-/// @brief SIMD-optimized CPU implementation of softmax / log-softmax.
+/// @brief SIMD-optimized CPU implementation of softmax / log-softmax,
+///        channel-last.
 ///
-/// One templated implementation covers f32 and f16 over the two activation
-/// layout families — channel-first and channel-last; the
-/// operator refuses channel-packed layouts (Softmax::validate). Two dispatch
-/// paths, chosen by where the normalization axis sits in memory:
-///   - The axis is the innermost axis of the storage — channel-first's last dim, or
-///     channel-last's C. Every group is then `D` contiguous elements and the
-///     groups are a constant stride apart, so each one is one
+/// One templated implementation covers f32 and f16; the operator refuses
+/// channel-packed layouts (Softmax::validate). Two dispatch paths, chosen by
+/// where the normalization axis sits in memory:
+///   - The axis is the innermost axis of the storage — channel-last's C (or the
+///     last dim when C == 1). Every group is then `D` contiguous elements and
+///     the groups are a constant stride apart, so each one is one
 ///     kernel::softmax_process_standard_row call (horizontal reduction).
 ///   - Every other axis: each group is `D` elements strided by the axis' element
-///     stride, so kernel::softmax_per_lane runs L groups at a time. Lanes are
-///     the channels of a channel-last tensor, or the dims below a channel-first axis
-///     when the pitch keeps them contiguous; otherwise one group per lane.
+///     stride, so kernel::softmax_per_lane runs L groups at a time, the lanes
+///     being the channels of the tensor.
 ///
 /// Pitch-aware via stride_elems() / row_stride_elems(). Patterned on
 /// onnxruntime's MlasComputeSoftmax / MlasReduceMaximumF32Kernel /
@@ -22,39 +21,22 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "nnops/detail/half.hpp"
-#include "common/memory_pool.hpp"
 #include "common/dtype_dispatch.hpp"
 #include "simd_kernel/simd_softmax.hpp"
-
-#if defined(NNOPS_ARCH_X86_64)
-#include "x86_64/quant.hpp"
-#elif defined(NNOPS_ARCH_AARCH64)
-#include "aarch64/quant.hpp"
-#else
-#error "softmax: unsupported architecture for quantization kernels"
-#endif
 
 #include <cmath>
 #include <cfloat>
 #include <cstdint>
-#include <vector>
 
 namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
 
-#if defined(NNOPS_ARCH_X86_64)
-namespace quant_kernel = nnops::backend::cpu::x86_64;
-#elif defined(NNOPS_ARCH_AARCH64)
-namespace quant_kernel = nnops::backend::cpu::aarch64;
-#endif
-
 namespace {
 
-/// True when the axis is the innermost axis of the storage: channel-first's last dim
-/// and channel-last's C are one contiguous run, and the runs are a constant
-/// stride apart, so the contiguous-row kernel can take the whole axis.
+/// True when the axis is the innermost axis of the storage: channel-last's C is
+/// one contiguous run, and the runs are a constant stride apart, so the
+/// contiguous-row kernel can take the whole axis.
 bool axis_is_innermost(const TensorView& x, int64_t axis, int64_t& unit_stride)
 {
     const int64_t rank = x.rank();
@@ -62,20 +44,13 @@ bool axis_is_innermost(const TensorView& x, int64_t axis, int64_t& unit_stride)
         unit_stride = 1;
         return true;
     }
-    if (is_channel_last(x.layout())) {
-        if (axis == 1) {
-            unit_stride = x.shape(1);
-            return true;
-        }
-        // C == 1 leaves the spatial axis as the innermost one as well.
-        if (axis == rank - 1 && x.shape(1) == 1) {
-            unit_stride = x.shape(rank - 1);
-            return true;
-        }
-        return false;
+    if (axis == 1) {
+        unit_stride = x.shape(1);
+        return true;
     }
-    if (axis == rank - 1) {
-        unit_stride = x.row_stride_elems();
+    // C == 1 leaves the spatial axis as the innermost one as well.
+    if (axis == rank - 1 && x.shape(1) == 1) {
+        unit_stride = x.shape(rank - 1);
         return true;
     }
     return false;
@@ -155,33 +130,17 @@ void softmax_strided_axis(const T* x_ptr, T* y_ptr, const TensorView& X, const T
     const int64_t axis_stride = X.stride_elems(axis);
     const int64_t axis_stride_y = Y.stride_elems(axis);
 
-    // Lanes: the channels of a channel-last tensor are one vector, and so are
-    // the dims below a channel-first axis when the pitch leaves them contiguous.
-    const bool channel_last = is_channel_last(X.layout()) && rank > 1;
-    const bool lanes_are_channels = channel_last && axis != 1;
-    int64_t nlanes = 1;
-    if (lanes_are_channels) {
-        nlanes = X.shape(1);
-    } else if (axis + 1 < rank && X.stride_elems(rank - 1) == 1 &&
-               (axis == rank - 2 || X.pitch() == static_cast<int64_t>(data_type_row_bytes(
-                                                     X.data_type(), X.shape(rank - 1))))) {
-        for (int64_t d = axis + 1; d < rank; ++d) {
-            nlanes *= X.shape(d);
-        }
-    }
+    // Lanes: the channels of a channel-last tensor are one vector.
+    const bool lanes_are_channels = rank > 1 && axis != 1;
+    const int64_t nlanes = lanes_are_channels ? X.shape(1) : 1;
 
     // Both sides walk the same positions, each over its own strides: the output
     // may be pitched differently from the input.
     PositionWalk pos;
     PositionWalk pos_y;
     for (int64_t d = 0; d < rank; ++d) {
-        if (d == axis) {
+        if (d == axis || (lanes_are_channels && d == 1)) {
             continue;
-        }
-        if (nlanes > 1) {
-            if (lanes_are_channels ? (d == 1) : (d > axis)) {
-                continue;
-            }
         }
         pos.add(X, d);
         pos_y.add(Y, d);
@@ -265,118 +224,11 @@ void softmax_impl(const SoftmaxAttributes& attrs, TensorView& output,
     softmax_strided_axis<T>(x_ptr, y_ptr, X, output, axis, log_softmax, inv_T, ctx);
 }
 
-// ---- Quantized input (s8/u8) → float output (f32/f16) ----
-//
-// Dequantize to contiguous f32 scratch (arch quant.hpp per-row kernels), run f32
-// softmax on it, then write back f32 or f16 (probabilities are never
-// re-quantized). PerTensor / PerToken only, channel-first layouts only.
-
-Status softmax_quant_input_impl(const SoftmaxAttributes& attrs, TensorView& output,
-                                std::span<const TensorView> inputs, const ComputeContext& ctx,
-                                void* workspace)
-{
-    const auto& X = inputs[0];
-    const int64_t numel = X.numel();
-    const int64_t rank = X.rank();
-    NNOPS_ASSERT(rank >= 1); // Softmax::validate
-
-    const DataType in_dtype = X.data_type();       // s8 or u8
-    const DataType out_dtype = output.data_type(); // the fp output type
-    NNOPS_ASSERT(is_quantized_dtype(in_dtype));
-    NNOPS_ASSERT(is_float_dtype(out_dtype));
-
-    // Quantized softmax is only defined over channel-first layouts (Softmax::validate).
-    NNOPS_ASSERT(is_channel_first_spatial(X.layout()));
-    if (workspace == nullptr) {
-        return Status::out_of_memory;
-    }
-
-    const QuantParams& qp = X.quant_params();
-    const bool per_token = qp.granularity == QuantGranularity::PerToken && qp.scale_data != nullptr;
-
-    // Row shape: one (scale, zero_point) per innermost row for PerToken, one
-    // parameter for the whole tensor for PerTensor.
-    const int64_t last_dim = X.shape(rank - 1);
-    const int64_t M = numel / last_dim; // number of `last_dim`-element rows
-
-    // Carve the pooled scratch (allocated once in softmax_cpu; getWorkspaceSize
-    // returns 0):
-    //   [ x_f32 : numel ][ scale : M ][ zero : M ][ y_f32 : numel (f16 only) ]
-    float* x_f32 = static_cast<float*>(workspace);
-    float* scale = x_f32 + numel;
-    float* zero = scale + M;
-
-    // Quant kernels take int dimensions/strides (see x86_64/quant.hpp).
-    const uint8_t* in_base = X.ptr<uint8_t>();
-    const int sr_i = static_cast<int>(X.row_stride_elems());
-    const int m_i = static_cast<int>(M);
-    const int n_i = static_cast<int>(last_dim);
-
-    for (int64_t i = 0; i < M; ++i) {
-        if (per_token) {
-            scale[i] = qp.scale_data[i];
-            zero[i] =
-                qp.zero_point_data != nullptr ? static_cast<float>(qp.zero_point_data[i]) : 0.0f;
-        } else {
-            scale[i] = qp.scale;
-            zero[i] = static_cast<float>(qp.zero_point);
-        }
-    }
-
-    if (in_dtype == DataType::s8) {
-        quant_kernel::dequantization<int8_t>(
-            m_i, n_i, x_f32, n_i, reinterpret_cast<const int8_t*>(in_base), sr_i, scale, zero);
-    } else {
-        quant_kernel::dequantization<uint8_t>(m_i, n_i, x_f32, n_i, in_base, sr_i, scale, zero);
-    }
-
-    TensorView x_view(X.shape_span(), DataType::f32, x_f32, TensorLayout::NCHW);
-    const TensorView ins[] = {x_view};
-
-    if (out_dtype == DataType::f32) {
-        softmax_impl<float>(attrs, output, ins, ctx);
-    } else {
-        // f32 staging, downcast to f16/bf16 on store (probabilities are not
-        // re-quantized).
-        float* y_f32 = zero + M;
-        TensorView y_view(X.shape_span(), DataType::f32, y_f32, TensorLayout::NCHW);
-        softmax_impl<float>(attrs, y_view, ins, ctx);
-        dispatch_f32_f16(out_dtype, "softmax_cpu", [&](auto tag) {
-            using T = typename decltype(tag)::type;
-            T* out = output.ptr<T>();
-            for (int64_t i = 0; i < numel; ++i) {
-                s_store(&out[i], y_f32[i]);
-            }
-        });
-    }
-    return Status::ok;
-}
-
 Status softmax_cpu(const SoftmaxAttributes& attrs, TensorView& output,
                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                    void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    if (is_quantized_dtype(dtype)) {
-        // softmax probabilities are dequantized float, never int
-        NNOPS_ASSERT(!is_quantized_dtype(output.data_type()));
-
-        // Dequantization scratch is pooled internally (getWorkspaceSize returns 0):
-        //   [ x_f32 : numel ][ scale : M ][ zero : M ][ y_f32 : numel (f16) ].
-        const int64_t numel = inputs[0].numel();
-        const int64_t rank = inputs[0].rank();
-        const int64_t last_dim = inputs[0].shape(rank - 1);
-        const int64_t M = numel / last_dim;
-        size_t ws = static_cast<size_t>(numel) * sizeof(float)    // x_f32
-                    + 2 * static_cast<size_t>(M) * sizeof(float); // scale + zero
-        if (output.data_type() != DataType::f32) {
-            ws += static_cast<size_t>(numel) * sizeof(float); // y_f32 staging
-        }
-        PoolPtr scratch(ws);
-
-        return softmax_quant_input_impl(attrs, output, inputs, ctx, scratch.get());
-    }
-    dispatch_f32_f16(dtype, "softmax_cpu", [&](auto tag) {
+    dispatch_f32_f16(inputs[0].data_type(), "softmax_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
         softmax_impl<T>(attrs, output, inputs, ctx);
     });

@@ -73,7 +73,7 @@ NNOPS_TEST(attention_basic_single_head) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(1));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(4));
-    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
+    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::Dense));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
@@ -126,7 +126,7 @@ NNOPS_TEST(attention_multi_head) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(1));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(4));
-    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
+    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::Dense));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
@@ -166,7 +166,7 @@ NNOPS_TEST(attention_random) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(1));
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(16));
-    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
+    NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::Dense));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));

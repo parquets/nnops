@@ -27,7 +27,7 @@ std::vector<TensorDesc> Where::getOutputTensorDesc(std::span<const TensorDesc> i
     TensorDesc out;
     out.rank = static_cast<int64_t>(bc.size());
     out.dtype = x.dtype;
-    out.layout = (out.rank == x.rank) ? x.layout : TensorLayout::NCHW;
+    out.layout = (out.rank == x.rank) ? x.layout : TensorLayout::Dense;
     out.dims = bc;
     return {out};
 }
@@ -50,9 +50,9 @@ Status Where::validate(std::span<const TensorDesc> inputs,
                           DataType::s64>(backend_, x.dtype)) {
         return Status::unsupported;
     }
-    if (!is_layout_supported(cond.layout, LayoutSupport::ChannelFirstOnly) ||
-        !is_layout_supported(x.layout, LayoutSupport::ChannelFirstOnly) ||
-        !is_layout_supported(y.layout, LayoutSupport::ChannelFirstOnly)) {
+    if (!is_layout_supported(cond.layout, LayoutSupport::Any) ||
+        !is_layout_supported(x.layout, LayoutSupport::Any) ||
+        !is_layout_supported(y.layout, LayoutSupport::Any)) {
         return Status::unsupported;
     }
 

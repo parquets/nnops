@@ -9,11 +9,9 @@
 /// and both routes read the identical views, so nothing in the comparison
 /// depends on a layout conversion.
 ///
-/// The cases split along the kernel's two routes. Channel-first cases carry a padded
-/// pitch, which is the stride model a graph hands the op. Channel-last cases
-/// cover the vector lane and its scalar tail (C = 4/8 exactly, then 5 and 17,
-/// which leave one or nine channels for the scalar launch), plus the 3D forms
-/// and global pooling on both routes.
+/// The cases cover the channel-last vector lane and its scalar tail (C = 4/8
+/// exactly, then 5 and 17, which leave one or nine channels for the scalar
+/// launch), plus the 3D forms, the flat fallback and global pooling.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -35,7 +33,7 @@ struct PoolCase {
     std::vector<int64_t> shape;
     PoolingAttributes attrs;
     DataType dtype = DataType::f32;
-    TensorLayout layout = TensorLayout::NCHW;
+    TensorLayout layout = TensorLayout::NHWC;
     bool add_to = false;
 };
 
@@ -52,10 +50,8 @@ void run_case(const PoolCase& c, const char* what)
     PoolingAttributes attrs = c.attrs;
     attrs.add_to = c.add_to;
 
-    // A channel-first tensor carries the 32 B pitch a graph gives it; a channel-last
-    // one must stay dense, because its strides never consult the pitch.
-    const bool padded = !is_channel_last(c.layout);
-    HostTensor in = make_host_random(c.shape, c.dtype, padded, 13, -1.0f, 1.0f,
+    // Channel-last views stay dense: their strides never consult the pitch.
+    HostTensor in = make_host_random(c.shape, c.dtype, false, 13, -1.0f, 1.0f,
                                      c.layout);
 
     auto op_cpu = Pooling::create(attrs, Backend::CPU);
@@ -67,9 +63,9 @@ void run_case(const PoolCase& c, const char* what)
 
     // add_to reads the destination, so both runs must start from the same bytes.
     const auto seed = [&](uint64_t s) {
-        return c.add_to ? make_host_random(od.dims, od.dtype, padded, s, -1.0f, 1.0f,
+        return c.add_to ? make_host_random(od.dims, od.dtype, false, s, -1.0f, 1.0f,
                                            c.layout)
-                        : make_host_zeroed(od.dims, od.dtype, padded, c.layout);
+                        : make_host_zeroed(od.dims, od.dtype, false, c.layout);
     };
     HostTensor out_ref = seed(41);
     HostTensor out_dev = seed(41);
@@ -101,124 +97,6 @@ PoolingAttributes window(PoolingType type, int64_t k, int64_t stride = 1,
 }
 
 }  // namespace
-
-// ============================================================
-// Channel-first
-// ============================================================
-
-NNOPS_TEST(cuda_pooling_channel_first_max) {
-    for (int64_t k : {2, 3}) {
-        for (int64_t s : {1, 2}) {
-            PoolCase c;
-            c.shape = {2, 3, 9, 13};
-            c.attrs = window(PoolingType::Max, k, s);
-            run_case(c, "cuda_pooling_channel_first_max");
-        }
-    }
-}
-
-NNOPS_TEST(cuda_pooling_channel_first_average) {
-    for (int64_t k : {2, 3}) {
-        PoolCase c;
-        c.shape = {1, 4, 8, 11};
-        c.attrs = window(PoolingType::Average, k, 2, 1);
-        run_case(c, "cuda_pooling_channel_first_average");
-        c.attrs.exclude_pad = true;
-        run_case(c, "cuda_pooling_channel_first_average");
-    }
-    // A dilation the window walk has to step over.
-    PoolCase d;
-    d.shape = {1, 2, 12, 12};
-    d.attrs = window(PoolingType::Average, 2, 1, 0, 2);
-    run_case(d, "cuda_pooling_channel_first_average");
-}
-
-NNOPS_TEST(cuda_pooling_channel_first_f16) {
-    PoolCase c;
-    c.shape = {1, 3, 10, 7};
-    c.dtype = DataType::f16;
-    c.attrs = window(PoolingType::Max, 3, 2, 1);
-    run_case(c, "cuda_pooling_channel_first_f16_max");
-    c.attrs = window(PoolingType::Average, 3, 1, 1);
-    c.attrs.exclude_pad = true;
-    run_case(c, "cuda_pooling_channel_first_f16_avg");
-}
-
-NNOPS_TEST(cuda_pooling_channel_first_add_to) {
-    PoolCase c;
-    c.shape = {1, 3, 7, 9};
-    c.attrs = window(PoolingType::Max, 2, 2);
-    c.add_to = true;
-    run_case(c, "cuda_pooling_channel_first_add_to");
-    c.attrs = window(PoolingType::Average, 2, 2);
-    run_case(c, "cuda_pooling_channel_first_add_to");
-}
-
-NNOPS_TEST(cuda_pooling_channel_first_window) {
-    // A row wide enough for four column runs: the only channel-first shapes
-    // that take the column-walking kernel. 21 wide at stride 2 leaves 11
-    // outputs, so the last thread covers three of its four columns.
-    for (DataType dt : {DataType::f32, DataType::f16}) {
-        PoolCase c;
-        c.shape = {1, 3, 15, 21};
-        c.dtype = dt;
-        c.attrs = window(PoolingType::Max, 3, 2, 1);
-        run_case(c, "cuda_pooling_channel_first_window");
-        c.attrs = window(PoolingType::Average, 3, 2, 1);
-        c.attrs.exclude_pad = true;
-        run_case(c, "cuda_pooling_channel_first_window");
-        c.attrs = window(PoolingType::Max, 2, 1, 0);
-        run_case(c, "cuda_pooling_channel_first_window");
-    }
-    // The same kernel walks the depth loop, so a 3D window takes it too.
-    PoolCase d;
-    d.shape = {1, 3, 4, 6, 12};
-    d.layout = TensorLayout::NCDHW;
-    d.attrs = window(PoolingType::Average, 3, 1, 1);
-    d.attrs.exclude_pad = true;
-    run_case(d, "cuda_pooling_channel_first_window");
-}
-
-NNOPS_TEST(cuda_pooling_first_flat_fallback) {
-    // N·C·OD past blockIdx.z's range: this geometry keeps the flat script,
-    // which is the route every channel-first shape took before the axes did.
-    PoolCase c;
-    c.shape = {1, 512, 130, 2, 2};
-    c.layout = TensorLayout::NCDHW;
-    c.attrs = window(PoolingType::Average, 1, 1, 0);
-    run_case(c, "cuda_pooling_first_flat_fallback");
-}
-
-NNOPS_TEST(cuda_pooling_channel_first_3d) {
-    PoolCase c;
-    c.shape = {1, 3, 4, 6, 8};
-    c.layout = TensorLayout::NCDHW;
-    c.attrs = window(PoolingType::Max, 2, 2);
-    run_case(c, "cuda_pooling_channel_first_3d");
-    c.attrs = window(PoolingType::Average, 3, 1, 1);
-    run_case(c, "cuda_pooling_channel_first_3d");
-}
-
-NNOPS_TEST(cuda_pooling_global_channel_first) {
-    for (const auto& shape : {std::vector<int64_t>{2, 5, 7, 9},
-                              std::vector<int64_t>{1, 1, 4, 4}}) {
-        for (PoolingType type : {PoolingType::Max, PoolingType::Average}) {
-            PoolCase c;
-            c.shape = shape;
-            c.attrs.global = true;
-            c.attrs.type = type;
-            run_case(c, "cuda_pooling_global_channel_first");
-            c.add_to = true;
-            run_case(c, "cuda_pooling_global_channel_first");
-        }
-    }
-    PoolCase d;
-    d.shape = {1, 3, 3, 4, 5};
-    d.layout = TensorLayout::NCDHW;
-    d.attrs.global = true;
-    d.attrs.type = PoolingType::Average;
-    run_case(d, "cuda_pooling_global_channel_first");
-}
 
 // ============================================================
 // Channel-last

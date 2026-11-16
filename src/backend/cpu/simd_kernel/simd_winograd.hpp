@@ -42,23 +42,11 @@
 ///         [ 0, 2,-1,-2, 1, 0],        [ 1/24,-1/12,  1/6 ],
 ///         [ 0, 4, 0,-5, 0, 1]]        [ 0,    0,     1   ]]
 ///
-/// Layouts. Both orders appear in both layouts:
-///
-///   * Channel-first puts the *tile* axis in the vector lanes. F(2,3) reads
-///     eight horizontally adjacent tiles from two stride-2 loads (offsets 0 and
-///     2), matching NEON vld2q and compiling to the portable v_load_even /
-///     v_load_odd primitives on both arches. Two caller obligations follow: the
-///     8 tiles must lie in the same tile *row* (the tile grid cannot be
-///     flattened to a 1-D index), and the padded halo row must be at least
-///     2·tile_block + 2 wide — the offset-2 loads touch element
-///     2·(tile_block−8) + 17. F(4,3) needs a stride-4 gather the portable layer
-///     does not have and deinterleaves twice to build it.
-///   * Channel-last puts the *channel* axis in the vector lanes: a window is
-///     sixteen (F(2,3)) or thirty-six (F(4,3)) channel-vector loads and an
-///     output tile four or sixteen stores, with no deinterleave and no
-///     neighbour coupling, so its tile grid can flatten. The channel-first halo
-///     is a padded-grid strip that must be zero outside the image; V's
-///     transform position p lives at v_base + p·v_plane_stride, tile tw0+t at +t.
+/// Layouts. Channel-last puts the *channel* axis in the vector lanes: a window
+/// is sixteen (F(2,3)) or thirty-six (F(4,3)) channel-vector loads and an output
+/// tile four or sixteen stores, with no deinterleave and no neighbour coupling,
+/// so its tile grid can flatten. V's transform position p lives at
+/// v_base + p·v_plane_stride, tile tw0+t at +t.
 ///
 /// The output paths apply bias and epilogue on the write-back, per element: our
 /// bias is per output *channel* (epilogue_inplace's is per *column*), and
@@ -111,90 +99,6 @@ inline void winograd_weight_transform(const T* g, int ld_g, T* u, int ld_u, int 
         s_store(row + 1 * ld_c, 0.5f * (c0 + c1 + c2));
         s_store(row + 2 * ld_c, 0.5f * (c0 - c1 + c2));
         s_store(row + 3 * ld_c, c2);
-    }
-}
-
-// ---- Bᵀ d B — input window → V -------------------------------------------
-
-/// Transform 8 horizontally adjacent 4×4 input windows into V = Bᵀ d B.
-template <class T>
-inline void winograd_input_tile8(const T* halo, int halo_ld, int ph0, int pw0, T* v_base,
-                                 int v_plane_stride) noexcept
-{
-    // E = d B kept in an f32 stack buffer: all 16 live in registers would spill
-    // on 16-ymm x86.
-    alignas(32) float e[4][4][8];
-    for (int r = 0; r < 4; ++r) {
-        const T* row = halo + static_cast<ptrdiff_t>(ph0 + r) * halo_ld + pw0;
-        // Two stride-2 loads (offsets 0 and 2): lane t of d_k is window column 2·t + k.
-        const v_f32x8 d0 = wino_widen(v_load_even(row));
-        const v_f32x8 d1 = wino_widen(v_load_odd(row));
-        const v_f32x8 d2 = wino_widen(v_load_even(row + 2));
-        const v_f32x8 d3 = wino_widen(v_load_odd(row + 2));
-        v_store(&e[r][0][0], v_sub(d0, d2));
-        v_store(&e[r][1][0], v_add(d1, d2));
-        v_store(&e[r][2][0], v_sub(d2, d1));
-        v_store(&e[r][3][0], v_sub(d1, d3));
-    }
-    for (int j = 0; j < 4; ++j) {
-        const v_f32x8 e0 = v_load(&e[0][j][0]);
-        const v_f32x8 e1 = v_load(&e[1][j][0]);
-        const v_f32x8 e2 = v_load(&e[2][j][0]);
-        const v_f32x8 e3 = v_load(&e[3][j][0]);
-        wino_store(v_base + (0 * 4 + j) * v_plane_stride, v_sub(e0, e2));
-        wino_store(v_base + (1 * 4 + j) * v_plane_stride, v_add(e1, e2));
-        wino_store(v_base + (2 * 4 + j) * v_plane_stride, v_sub(e2, e1));
-        wino_store(v_base + (3 * 4 + j) * v_plane_stride, v_sub(e1, e3));
-    }
-}
-
-// ---- Aᵀ M A — M → 2×2 output tile ----------------------------------------
-
-/// Transform 8 horizontally adjacent tiles' M into their 2×2 outputs, written straight into the output plane.
-template <class T>
-inline void winograd_output_tile8(const T* m_base, int m_plane_stride, int m_row_stride, int oc,
-                                  int t0, T* out0, T* out1, int ow0, int ow_end, bool row1_ok,
-                                  const Epilogue& ep, float bias_oc, bool add_to,
-                                  bool pre_act = false) noexcept
-{
-    // Aᵀ M per column c: the four M rows sit 4·m_plane_stride apart.
-    v_f32x8 t[2][4];
-    for (int c = 0; c < 4; ++c) {
-        const T* mp = m_base + c * m_plane_stride + static_cast<ptrdiff_t>(oc) * m_row_stride + t0;
-        const v_f32x8 m0 = wino_widen(v_load(mp + 0 * 4 * m_plane_stride));
-        const v_f32x8 m1 = wino_widen(v_load(mp + 1 * 4 * m_plane_stride));
-        const v_f32x8 m2 = wino_widen(v_load(mp + 2 * 4 * m_plane_stride));
-        const v_f32x8 m3 = wino_widen(v_load(mp + 3 * 4 * m_plane_stride));
-        t[0][c] = v_add(v_add(m0, m1), m2);
-        t[1][c] = v_sub(v_sub(m1, m2), m3);
-    }
-    // Columns 2t and 2t+1 come from separate vectors (no portable
-    // v_interleave), so the write-back is scalar strided stores masked at
-    // ow_end; row1_ok drops the second row when OH is odd.
-    for (int r = 0; r < 2; ++r) {
-        if (r == 1 && !row1_ok) {
-            break;
-        }
-        const v_f32x8 o0 = v_add(v_add(t[r][0], t[r][1]), t[r][2]);
-        const v_f32x8 o1 = v_sub(v_sub(t[r][1], t[r][2]), t[r][3]);
-        alignas(32) float b0[8], b1[8];
-        v_store(b0, o0);
-        v_store(b1, o1);
-        T* row = (r == 0) ? out0 : out1;
-        for (int lane = 0; lane < 8; ++lane) {
-            const int ow = ow0 + 2 * lane;
-            if (ow >= ow_end) {
-                break;
-            }
-            // pre_act is the ResNet order: the residual joins the sum before
-            // the activation. The read is the same either way.
-            backend::cpu::apply_epilogue_store<T>(row + ow, b0[lane] + bias_oc, ep, oc, add_to,
-                                                  pre_act);
-            if (ow + 1 < ow_end) {
-                backend::cpu::apply_epilogue_store<T>(row + ow + 1, b1[lane] + bias_oc, ep, oc,
-                                                      add_to, pre_act);
-            }
-        }
     }
 }
 
@@ -484,104 +388,6 @@ inline void winograd43_output_channel_last(const T* m, int64_t m_plane, T* const
         wino43_at(row);
         for (int c = 0; c < 4; ++c) {
             emit(p[r][c], row[c]);
-        }
-    }
-}
-
-// =========================================================================
-//  F(4×4, 3×3) channel-first transforms — the tile axis is the vector lane
-// =========================================================================
-//
-// Eight horizontally adjacent tiles sit four columns apart, and the portable
-// SIMD layer only deinterleaves by two. Twice, though, is four: the even
-// elements of the even elements are the elements four apart, so a stride-4
-// gather is two v_load_even passes with the intermediate staged in a register
-// pair. Each gather costs a store and a reload of that pair; six of them per
-// window row is still cheaper than the multiplies they feed.
-
-/// Gather @p p[0], @p p[4], … @p p[28] — eight tiles' column @c of one window
-/// row. Reads p[0..31]; the caller's halo strip must own that span.
-template <class T> inline v_f32x8 wino43_stride4(const T* p) noexcept
-{
-    alignas(32) T ev[16];
-    wino_store(ev, wino_widen(v_load_even(p)));          // p0, p2, … p14
-    wino_store(ev + 8, wino_widen(v_load_even(p + 16))); // p16, p18, … p30
-    return wino_widen(v_load_even(ev));                  // p0, p4, … p28
-}
-
-/// Transform 8 horizontally adjacent 6×6 windows into V = Bᵀ d B. @p halo_ld
-/// must own tile·tile_block + 8 columns from @p pw0 (the stride-4 gathers of
-/// the last group reach four past its last tile).
-template <class T>
-inline void winograd43_input_tile8(const T* halo, int halo_ld, int ph0, int pw0, T* v_base,
-                                   int v_plane_stride) noexcept
-{
-    alignas(32) T rowbuf[40]; // the six window columns of eight tiles
-    alignas(32) float e[6][6][8];
-    for (int r = 0; r < 6; ++r) {
-        const T* row = halo + static_cast<ptrdiff_t>(ph0 + r) * halo_ld + pw0;
-        for (int i = 0; i < 40; ++i) {
-            rowbuf[i] = row[i];
-        }
-        v_f32x8 d[6];
-        for (int k = 0; k < 6; ++k) {
-            d[k] = wino43_stride4<T>(rowbuf + k);
-        }
-        wino43_bt(d);
-        for (int k = 0; k < 6; ++k) {
-            v_store(&e[r][k][0], d[k]);
-        }
-    }
-    for (int j = 0; j < 6; ++j) {
-        v_f32x8 d[6];
-        for (int i = 0; i < 6; ++i) {
-            d[i] = v_load(&e[i][j][0]);
-        }
-        wino43_bt(d);
-        for (int i = 0; i < 6; ++i) {
-            wino_store(v_base + (i * 6 + j) * v_plane_stride, d[i]);
-        }
-    }
-}
-
-/// Transform 8 horizontally adjacent tiles' 36 M planes into their 4×4
-/// outputs, written straight into the output plane: @p out holds the first
-/// @p rows_ok rows of the tile, and columns past @p ow_end are masked.
-template <class T>
-inline void winograd43_output_tile8(const T* m_base, int m_plane_stride, int m_row_stride, int oc,
-                                    int t0, T* const out[4], int ow0, int ow_end, int rows_ok,
-                                    const Epilogue& ep, float bias_oc, bool add_to,
-                                    bool pre_act = false) noexcept
-{
-    alignas(32) float t[4][6][8];
-    for (int c = 0; c < 6; ++c) {
-        const T* mp = m_base + c * m_plane_stride + static_cast<ptrdiff_t>(oc) * m_row_stride + t0;
-        v_f32x8 col[6];
-        for (int i = 0; i < 6; ++i) {
-            col[i] = wino_widen(v_load(mp + i * 6 * m_plane_stride));
-        }
-        wino43_at(col);
-        for (int r = 0; r < 4; ++r) {
-            v_store(&t[r][c][0], col[r]);
-        }
-    }
-    for (int r = 0; r < rows_ok; ++r) {
-        v_f32x8 row[6];
-        for (int c = 0; c < 6; ++c) {
-            row[c] = v_load(&t[r][c][0]);
-        }
-        wino43_at(row);
-        for (int c = 0; c < 4; ++c) {
-            alignas(32) float b[8];
-            v_store(b, row[c]);
-            for (int lane = 0; lane < 8; ++lane) {
-                const int ow = ow0 + 4 * lane + c;
-                if (ow >= ow_end) {
-                    break;
-                }
-                backend::cpu::apply_epilogue_store<T>(out[r] + ow, b[lane] + bias_oc, ep, oc,
-                                                      add_to, pre_act);
-            }
         }
     }
 }

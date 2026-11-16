@@ -13,14 +13,13 @@ NNOPS_OP_BOILERPLATE(Flatten, FlattenAttributes, backend::cpu::flatten_cpu, null
 
 std::vector<TensorDesc> Flatten::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
-    // Same logical shape, always dense channel-first layout.
+    // Same logical shape, dense row-major (the layout carries no channel axis).
     const auto& in = inputs[0];
     const int64_t rank = in.rank;
-    const int64_t srank = rank - 2;
 
     TensorDesc out;
     out.rank = rank;
-    out.layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    out.layout = TensorLayout::Dense;
     out.dtype = in.dtype;
     out.dims = in.dims;
 

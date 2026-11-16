@@ -1,17 +1,15 @@
 /// @file resize.cpp
-/// @brief CPU implementation of 2D/3D spatial resize, channel-first and channel-last.
+/// @brief CPU implementation of 2D/3D spatial resize, channel-last.
 ///
 /// The coordinate tables are built once per call: for each output coordinate,
-/// the source index (or the two neighbours and their weight). Channel-first walks one
-/// channel plane per task and evaluates scalar pixels; channel-last dispatches
-/// per sample and lets the kernel interpolate a pixel's whole C vector with SIMD.
-/// Cubic swaps the two-tap table for four taps per axis (ResizeCubicTap) and is
-/// 2D only.
+/// the source index (or the two neighbours and their weight). The kernel
+/// interpolates a pixel's whole C vector with SIMD, one sample per task. Cubic
+/// swaps the two-tap table for four taps per axis (ResizeCubicTap) and is 2D
+/// only.
 ///
 /// Crop: crop_start/crop_end are indexed as {D,H,W} to match output_size, and
 /// crop_end[d] > 0 enables cropping on that axis. The kernel sees the effective
-/// size; the crop start becomes one element offset through stride_elems(), so
-/// Channel-first and channel-last need no separate arithmetic.
+/// size; the crop start becomes one element offset through stride_elems().
 
 #include "nnops/ops/resize.hpp"
 #include "nnops/detail/assert.hpp"
@@ -147,61 +145,29 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
     const int64_t out_row_stride = output.row_stride_elems();
     const int64_t out_d_stride = OH * out_row_stride;
 
-    if (is_channel_last(input.layout())) {
-        const int64_t in_n_stride = input.stride_elems(0);
-        const int64_t out_n_stride = output.stride_elems(0);
-
-        const auto process = [&](int64_t n) {
-            const T* in_base = in_ptr + n * in_n_stride + crop_off;
-            T* out_base = out_ptr + n * out_n_stride;
-
-            if (cubic) {
-                k::resize_last_2d_cubic<T>(out_base, in_base, C, OH, OW, ky.taps.data(),
-                                           kx.taps.data(), in_row_stride, out_row_stride, add_to);
-            } else if (srank == 3) {
-                k::resize_last_3d<T>(out_base, in_base, C, OD, OH, OW, cz.i0.data(), cz.i1.data(),
-                                     cz.w.data(), cy.i0.data(), cy.i1.data(), cy.w.data(),
-                                     cx.i0.data(), cx.i1.data(), cx.w.data(), in_d_stride,
-                                     in_row_stride, out_d_stride, out_row_stride, linear, add_to);
-            } else {
-                k::resize_last_2d<T>(out_base, in_base, C, OH, OW, cy.i0.data(), cy.i1.data(),
-                                     cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
-                                     in_row_stride, out_row_stride, linear, add_to);
-            }
-        };
-
-        ctx.cpu.run(0, N, process);
-        return;
-    }
-
-    const int64_t in_c_stride = input.stride_elems(1);
-    const int64_t out_c_stride = output.stride_elems(1);
     const int64_t in_n_stride = input.stride_elems(0);
     const int64_t out_n_stride = output.stride_elems(0);
 
-    const auto process = [&](int64_t task) {
-        const int64_t n = task / C;
-        const int64_t c = task % C;
-        const T* in_base = in_ptr + n * in_n_stride + c * in_c_stride + crop_off;
-        T* out_base = out_ptr + n * out_n_stride + c * out_c_stride;
+    const auto process = [&](int64_t n) {
+        const T* in_base = in_ptr + n * in_n_stride + crop_off;
+        T* out_base = out_ptr + n * out_n_stride;
 
         if (cubic) {
-            k::resize_channel_first_2d_cubic<T>(out_base, in_base, OH, OW, ky.taps.data(),
-                                                kx.taps.data(), in_row_stride, out_row_stride,
-                                                add_to);
+            k::resize_last_2d_cubic<T>(out_base, in_base, C, OH, OW, ky.taps.data(),
+                                       kx.taps.data(), in_row_stride, out_row_stride, add_to);
         } else if (srank == 3) {
-            k::resize_channel_first_3d<T>(
-                out_base, in_base, OD, OH, OW, cz.i0.data(), cz.i1.data(), cz.w.data(),
-                cy.i0.data(), cy.i1.data(), cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
-                in_d_stride, in_row_stride, out_d_stride, out_row_stride, linear, add_to);
+            k::resize_last_3d<T>(out_base, in_base, C, OD, OH, OW, cz.i0.data(), cz.i1.data(),
+                                 cz.w.data(), cy.i0.data(), cy.i1.data(), cy.w.data(),
+                                 cx.i0.data(), cx.i1.data(), cx.w.data(), in_d_stride,
+                                 in_row_stride, out_d_stride, out_row_stride, linear, add_to);
         } else {
-            k::resize_channel_first_2d<T>(out_base, in_base, OH, OW, cy.i0.data(), cy.i1.data(),
-                                          cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
-                                          in_row_stride, out_row_stride, linear, add_to);
+            k::resize_last_2d<T>(out_base, in_base, C, OH, OW, cy.i0.data(), cy.i1.data(),
+                                 cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
+                                 in_row_stride, out_row_stride, linear, add_to);
         }
     };
 
-    ctx.cpu.run(0, N * C, process);
+    ctx.cpu.run(0, N, process);
 }
 
 Status resize_cpu(const ResizeAttributes& attrs, TensorView& output,

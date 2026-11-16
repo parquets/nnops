@@ -173,7 +173,7 @@ inline Status recurrent_check(Backend be, const RecurrentSpec& s,
     if (quantized ? (r.dtype != DataType::s8) : (w.dtype != x.dtype || r.dtype != x.dtype)) {
         return Status::invalid_argument;
     }
-    if (!is_layout_supported(x.layout, LayoutSupport::ChannelFirstOnly)) {
+    if (!is_layout_supported(x.layout, LayoutSupport::Any)) {
         return Status::invalid_argument;
     }
     if (!w_packed && (w.dims[0] != D || w.dims[1] != G * H || w.dims[2] != I)) {

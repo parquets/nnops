@@ -595,25 +595,8 @@ template <class T> bool lane_ok(const ResizeGeom& g, const T* in, T* out)
 }
 
 template <class T, int Mode, bool ThreeD>
-void resize_launch(const ResizeGeom& g, bool last, const T* in, T* out, cudaStream_t stream)
+void resize_launch(const ResizeGeom& g, const T* in, T* out, cudaStream_t stream)
 {
-    if (!last) {
-        // A wider window buys columns at the cost of row lanes, and it only pays
-        // while neighbouring output columns still share their source taps: that
-        // is always true going up and for a nearest pass (one load a column),
-        // but on a bilinear downsample each column lands on its own pair, so the
-        // window stops at four and the block keeps its lanes.
-        const bool share = (Mode == 0) || g.ow >= g.iw;
-        if (g.ow >= 32 && share) {
-            launch_first<T, Mode, 8, ThreeD>(g, in, out, stream);
-        } else if (g.ow >= 64) {
-            launch_first<T, Mode, 4, ThreeD>(g, in, out, stream);
-        } else {
-            launch_first<T, Mode, 1, ThreeD>(g, in, out, stream);
-        }
-        return;
-    }
-
     constexpr int Vec = 16 / int(sizeof(T));
     if (lane_ok<T>(g, in, out)) {
         const int64_t cvecs = g.c / Vec;
@@ -637,7 +620,6 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
     const int64_t rank = input.rank();
     const int64_t srank = ResizeAttributes::spatial_rank(rank);
     const bool three_d = (srank == 3);
-    const bool last = is_channel_last(input.layout());
 
     ResizeGeom g{};
     g.n = input.shape(0);
@@ -668,25 +650,14 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
         }
     }
 
-    if (last) {
-        g.in_n = input.stride_elems(0);
-        g.in_row = input.row_stride_elems();
-        g.in_d = raw_ih * g.in_row;
-        g.in_pix = g.c;
-        g.out_n = output.stride_elems(0);
-        g.out_row = output.row_stride_elems();
-        g.out_d = g.oh * g.out_row;
-        g.out_pix = g.c;
-    } else {
-        g.in_n = input.stride_elems(0);
-        g.in_c = input.stride_elems(1);
-        g.in_row = input.row_stride_elems();
-        g.in_d = raw_ih * g.in_row;
-        g.out_n = output.stride_elems(0);
-        g.out_c = output.stride_elems(1);
-        g.out_row = output.row_stride_elems();
-        g.out_d = g.oh * g.out_row;
-    }
+    g.in_n = input.stride_elems(0);
+    g.in_row = input.row_stride_elems();
+    g.in_d = raw_ih * g.in_row;
+    g.in_pix = g.c;
+    g.out_n = output.stride_elems(0);
+    g.out_row = output.row_stride_elems();
+    g.out_d = g.oh * g.out_row;
+    g.out_pix = g.c;
 
     if (g.n == 0 || g.c == 0 || g.ow == 0 || g.oh == 0 || g.od == 0) {
         return;
@@ -702,20 +673,20 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
     switch (attrs.mode) {
     case ResizeMode::Nearest:
         if (three_d) {
-            resize_launch<T, 0, true>(g, last, in, out, stream);
+            resize_launch<T, 0, true>(g, in, out, stream);
         } else {
-            resize_launch<T, 0, false>(g, last, in, out, stream);
+            resize_launch<T, 0, false>(g, in, out, stream);
         }
         break;
     case ResizeMode::Linear:
         if (three_d) {
-            resize_launch<T, 1, true>(g, last, in, out, stream);
+            resize_launch<T, 1, true>(g, in, out, stream);
         } else {
-            resize_launch<T, 1, false>(g, last, in, out, stream);
+            resize_launch<T, 1, false>(g, in, out, stream);
         }
         break;
     default:
-        resize_launch<T, 2, false>(g, last, in, out, stream);
+        resize_launch<T, 2, false>(g, in, out, stream);
         break;
     }
 }
@@ -728,6 +699,9 @@ Status resize_cuda(const ResizeAttributes& attrs, TensorView& output,
 {
     // Cubic is the 2D bicubic; PyTorch and ONNX Runtime stop there too.
     if (attrs.mode == ResizeMode::Cubic && ResizeAttributes::spatial_rank(inputs[0].rank()) != 2) {
+        return Status::unsupported;
+    }
+    if (!is_channel_last(inputs[0].layout()) || !is_channel_last(output.layout())) {
         return Status::unsupported;
     }
     switch (inputs[0].data_type()) {

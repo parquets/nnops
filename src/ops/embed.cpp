@@ -40,8 +40,8 @@ Status Embed::validate(std::span<const TensorDesc> inputs,
     if (weight.rank < 2) {
         return Status::invalid_argument;
     }
-    if (!is_layout_supported(weight.layout, LayoutSupport::ChannelFirstOnly) ||
-        !is_layout_supported(indices.layout, LayoutSupport::ChannelFirstOnly)) {
+    if (!is_layout_supported(weight.layout, LayoutSupport::Any) ||
+        !is_layout_supported(indices.layout, LayoutSupport::Any)) {
         return Status::invalid_argument;
     }
 

@@ -54,18 +54,15 @@ Status Conv1D::validate(std::span<const TensorDesc> inputs,
 {
     // input, weight [, bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
-    NNOPS_TRY(detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOrChannelLast)));
     // Rank 3 exactly: the lift reads shape(2) as the signal and fabricates the
     // fourth axis, so anything else would be silently misdescribed.
     NNOPS_TRY(detail::check_rank(inputs[0].rank, 3, 3));
     NNOPS_TRY(detail::check_rank(outputs[0].rank, 3, 3));
     NNOPS_TRY(detail::check_rank(inputs[1].rank, 3, 3));
 
-    // A raw filter only: the packed and Winograd forms describe a 2D kernel.
-    const TensorLayout wl = inputs[1].layout;
-    NNOPS_TRY(detail::require(is_channel_first_spatial(wl) || is_channel_last_weight(wl)));
-    return detail::require(is_channel_last(inputs[0].layout) == is_channel_last_weight(wl));
+    // A raw HWIO filter only: the packed and Winograd forms describe a 2D kernel.
+    return detail::require(is_channel_last(inputs[0].layout) &&
+                           is_channel_last_weight(inputs[1].layout));
 }
 
 Status Conv1D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

@@ -327,9 +327,9 @@ struct QuantProblem {
         const int64_t ws[] = {s.N, s.K};
         const int64_t os[] = {s.M, s.N};
         ins.emplace_back(std::span<const int64_t>(as, 2), a_dt,
-                         a_buf.data(), TensorLayout::NCHW, qx);
+                         a_buf.data(), TensorLayout::Dense, qx);
         ins.emplace_back(std::span<const int64_t>(ws, 2), DataType::s8,
-                         w_buf.data(), TensorLayout::NCHW, qw);
+                         w_buf.data(), TensorLayout::Dense, qw);
         if (with_bias) {
             const int64_t bs[] = {s.N};
             if (int_out) {
@@ -338,7 +338,7 @@ struct QuantProblem {
                     b = static_cast<int32_t>(rng.next_u64() % 4096) - 2048;
                 }
                 ins.emplace_back(std::span<const int64_t>(bs, 1), DataType::s32,
-                                 ibias.data(), TensorLayout::NCHW);
+                                 ibias.data(), TensorLayout::Dense);
             } else {
                 fbias.resize(static_cast<size_t>(s.N));
                 for (auto& b : fbias) {
@@ -349,11 +349,11 @@ struct QuantProblem {
                     }
                 }
                 ins.emplace_back(std::span<const int64_t>(bs, 1), out_dt,
-                                 fbias.data(), TensorLayout::NCHW);
+                                 fbias.data(), TensorLayout::Dense);
             }
         }
         out = TensorView(std::span<const int64_t>(os, 2), out_dt, out_buf.data(),
-                         TensorLayout::NCHW, out_q);
+                         TensorLayout::Dense, out_q);
 
         LinearAttributes la;
         la.output_dtype = out_dt;

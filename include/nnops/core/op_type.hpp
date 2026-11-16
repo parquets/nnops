@@ -30,7 +30,6 @@ enum class OpType : uint8_t {
     Reduce          = 15,
     Resize          = 16,
     GridSample      = 17,
-    LayoutConvert   = 18,
     QuantizeLinear  = 19,
     DequantizeLinear = 20,
     Concat          = 21,

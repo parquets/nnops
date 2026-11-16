@@ -43,7 +43,7 @@
 ///
 /// E = num_experts; fc1_out = inter_size on Separate / non-gated, and
 /// 2 * inter_size on Interleaved / Block gated. Output is
-/// [num_tokens, hidden_size], ChannelFirstOnly (GEMM weights are channel-first),
+/// [num_tokens, hidden_size], layout-agnostic (GEMM weights are dense),
 /// consistent with Linear/MatMul/Attention.
 ///
 /// `router_gating(router_probs)` drives both the top-K *selection* and the
@@ -180,7 +180,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::MoE; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::Any; }
 
     const MoEAttributes& attributes() const noexcept { return attrs_; }
 

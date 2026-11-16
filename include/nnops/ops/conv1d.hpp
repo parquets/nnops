@@ -1,7 +1,6 @@
 #pragma once
 /// @file conv1d.hpp
-/// @brief 1D convolution — channel-first or channel-last, with groups and
-///        dilation.
+/// @brief 1D convolution — channel-last, with groups and dilation.
 ///
 /// 1D is the 2D convolution with a 1-wide second spatial axis, and that is
 /// exactly how it runs: the activation is lifted from [N, C, L] to
@@ -9,10 +8,10 @@
 /// {1, K}. The lift keeps the caller's row pitch and layout, and because the
 /// lifted height is one the derived channel/batch/output strides are the 1D
 /// ones — so the GEMM geometry is the one a native 1D conv would have
-/// (channel-first M = OC, N = L, K = IC/G·K; channel-last pixel-major).
+/// (pixel-major).
 ///
-/// Activation [N, IC, L], weight [OC, IC/G, K] (OIHW) channel-first or
-/// [K, IC/G, OC] (HWIO) channel-last, bias [OC] optional, output [N, OC, OL].
+/// Activation [N, IC, L] stored NWC, weight [K, IC/G, OC] (HWIO), bias [OC]
+/// optional, output [N, OC, OL].
 ///
 /// Data types: f32/f16 on every tensor (the floating-point route), or the
 /// quantized route — an s8 weight with per-channel QuantParams against a
@@ -29,8 +28,8 @@
 ///
 /// Parallelism: the 2D plan splits over (batch, group, output-row chunk, filter
 /// chunk) and a 1D tensor has exactly one output row, so on a wide pool a 1D
-/// call can leave most workers idle — a channel-first int8 conv at N = 1 has a
-/// single task. The CPU driver splits the L axis into contiguous chunks when
+/// call can leave most workers idle — an int8 conv at N = 1 has a single task.
+/// The CPU driver splits the L axis into contiguous chunks when
 /// the plan under-subscribes the pool, each chunk calling the same kernel on a
 /// sub-view; the chunks write disjoint output positions and read the same
 /// filter, so the result is bit-exact whatever the split. See
@@ -129,7 +128,7 @@ public:
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override
     {
-        return LayoutSupport::ChannelFirstOrChannelLast;
+        return LayoutSupport::ChannelLastOnly;
     }
 
     const Conv1DAttributes& attributes() const noexcept { return attrs_; }

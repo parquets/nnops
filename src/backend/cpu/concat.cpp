@@ -1,12 +1,12 @@
 /// @file concat.cpp
 /// @brief Copy-based CPU implementation of Concat (f32/f16).
 ///
-/// Driven by the logical axis, so channel-first and channel-last
-/// (channel-last) share one walk. Every tensor is split into *lines* — the run
-/// that is physically contiguous and perpendicular to the concat axis:
+/// Driven by the logical axis, so dense and channel-last tensors share one
+/// walk. Every tensor is split into *lines* — the run that is physically
+/// contiguous and perpendicular to the concat axis:
 ///
-///   Channel-first  line = one (n, c, spatial…) row of W elements
-///   Channel-last   line = one pixel's C channels
+///   Dense         line = one row of the innermost dimension
+///   Channel-last  line = one pixel's C channels
 ///
 /// The axis coordinate selects the source input; the remaining coordinates give
 /// the source and destination offsets through stride_elems(), so pitch padding

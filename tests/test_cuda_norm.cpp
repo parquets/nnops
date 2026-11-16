@@ -10,9 +10,8 @@
 ///
 /// The cases split the way the CUDA file does: one block per row for
 /// LayerNorm / RMSNorm / L2Norm (tail axis and an interior one), one block per
-/// (sample, channel) plane for BatchNorm on both its plane sizes plus the flat
-/// non-spatial map, and one block per (sample, group) for GroupNorm. Channel-
-/// first carries the 32 B pitch a graph hands the op; channel-last stays dense.
+/// channel for the spatial BatchNorm and GroupNorm routes, and the flat
+/// non-spatial BatchNorm map. The spatial routes are channel-last.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -36,7 +35,7 @@ struct NormCase {
     int64_t axis = -1;
     int64_t groups = 1;
     DataType dtype = DataType::f32;
-    TensorLayout layout = TensorLayout::NCHW;
+    TensorLayout layout = TensorLayout::Dense;
     bool bias = false;
     bool residual = false;
     bool add_to = false;
@@ -94,7 +93,7 @@ void run_case(const NormCase& c, const char* what)
         const std::vector<int64_t> sh = c.spatial
             ? std::vector<int64_t>{C} : c.shape;
         const bool pad = c.spatial ? false : padded;
-        const TensorLayout lay = c.spatial ? TensorLayout::NCHW : c.layout;
+        const TensorLayout lay = c.spatial ? TensorLayout::Dense : c.layout;
         add(sh, 71, -1.0f, 1.0f, pad, lay);   // scale
         add(sh, 72, -1.0f, 1.0f, pad, lay);   // bias
         add(sh, 73, -1.0f, 1.0f, pad, lay);   // mean
@@ -103,20 +102,20 @@ void run_case(const NormCase& c, const char* what)
     }
     case NormType::LayerNorm: {
         const std::vector<int64_t> sh = {c.scalar_scale ? 1 : norm_size};
-        add(sh, 81, -1.0f, 1.0f, false, TensorLayout::NCHW);
-        if (c.bias) { add(sh, 82, -1.0f, 1.0f, false, TensorLayout::NCHW); }
+        add(sh, 81, -1.0f, 1.0f, false, TensorLayout::Dense);
+        if (c.bias) { add(sh, 82, -1.0f, 1.0f, false, TensorLayout::Dense); }
         if (c.residual) { add(c.shape, 83, -1.0f, 1.0f, padded, c.layout); }
         break;
     }
     case NormType::RMSNorm: {
         const std::vector<int64_t> sh = {c.scalar_scale ? 1 : norm_size};
-        add(sh, 91, -1.0f, 1.0f, false, TensorLayout::NCHW);
+        add(sh, 91, -1.0f, 1.0f, false, TensorLayout::Dense);
         if (c.residual) { add(c.shape, 92, -1.0f, 1.0f, padded, c.layout); }
         break;
     }
     case NormType::GroupNorm: {
-        add({C}, 95, -1.0f, 1.0f, false, TensorLayout::NCHW);
-        if (c.bias) { add({C}, 96, -1.0f, 1.0f, false, TensorLayout::NCHW); }
+        add({C}, 95, -1.0f, 1.0f, false, TensorLayout::Dense);
+        if (c.bias) { add({C}, 96, -1.0f, 1.0f, false, TensorLayout::Dense); }
         break;
     }
     case NormType::L2Norm:
@@ -285,7 +284,7 @@ NNOPS_TEST(cuda_layer_norm_f16) {
     run_case(c, "cuda_layer_norm_f16_channel_last");
     // A one-element scale tensor: the row kernel broadcasts it, and the CPU's
     // SIMD path has to as well instead of loading a lane past its end.
-    c.layout = TensorLayout::NCHW;
+    c.layout = TensorLayout::Dense;
     c.bias = false;
     c.scalar_scale = true;
     run_case(c, "cuda_layer_norm_f16_scalar");
@@ -366,22 +365,10 @@ NNOPS_TEST(cuda_l2_norm_inner_axis) {
 // GroupNorm
 // ============================================================
 
-NNOPS_TEST(cuda_group_norm_channel_first) {
-    NormCase c;
-    c.type = NormType::GroupNorm;
-    c.shape = {2, 8, 5, 6};
-    c.groups = 4;
-    run_case(c, "cuda_group_norm_channel_first");
-    c.bias = true;
-    run_case(c, "cuda_group_norm_channel_first_bias");
-    c.bias = false;
-    c.add_to = true;
-    run_case(c, "cuda_group_norm_channel_first_add_to");
-}
-
 NNOPS_TEST(cuda_group_norm_group_shapes) {
     NormCase c;
     c.type = NormType::GroupNorm;
+    c.layout = TensorLayout::NHWC;
     // One channel per group is instance norm; one group over all of them is the
     // layer-norm-like extreme.
     c.shape = {2, 4, 3, 5};
@@ -411,26 +398,6 @@ NNOPS_TEST(cuda_group_norm_channel_last_and_f16) {
 // BatchNorm
 // ============================================================
 
-NNOPS_TEST(cuda_batch_norm_spatial) {
-    NormCase c;
-    c.type = NormType::BatchNorm;
-    c.shape = {2, 3, 7, 9};   // plane 63: the block-per-plane route
-    run_case(c, "cuda_batch_norm_spatial");
-    c.add_to = true;
-    run_case(c, "cuda_batch_norm_spatial_add_to");
-}
-
-NNOPS_TEST(cuda_batch_norm_small_plane) {
-    NormCase c;
-    c.type = NormType::BatchNorm;
-    c.shape = {2, 4, 2, 3};   // plane 6: a thread per plane
-    run_case(c, "cuda_batch_norm_small_plane");
-    c.shape = {3, 5};         // rank two: the channel is the row
-    run_case(c, "cuda_batch_norm_rank2");
-    c.shape = {6};            // rank one: one implicit channel
-    run_case(c, "cuda_batch_norm_rank1");
-}
-
 NNOPS_TEST(cuda_batch_norm_channel_last) {
     NormCase c;
     c.type = NormType::BatchNorm;
@@ -453,10 +420,8 @@ NNOPS_TEST(cuda_batch_norm_nonspatial) {
 NNOPS_TEST(cuda_batch_norm_f16) {
     NormCase c;
     c.type = NormType::BatchNorm;
-    c.shape = {2, 3, 6, 5};
-    c.dtype = DataType::f16;
-    run_case(c, "cuda_batch_norm_f16");
     c.shape = {2, 8, 3};
+    c.dtype = DataType::f16;
     c.layout = TensorLayout::NHWC;
     run_case(c, "cuda_batch_norm_f16_channel_last");
 }

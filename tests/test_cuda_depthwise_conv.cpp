@@ -4,15 +4,14 @@
 /// Every case builds one random host operand set, runs the operator twice —
 /// once with Backend::CPU and once with Backend::CUDA over device copies — and
 /// compares the outputs. The CPU route is the oracle and both routes read the
-/// identical views, so a channel-first case exercises the width lane and a channel-last
-/// case the channel lane without any layout conversion in the comparison.
+/// identical views, exercising the channel lane without any layout conversion in
+/// the comparison.
 ///
 /// Cases cover the shapes the kernel branches on: the vector lane's exact fit
-/// (C = 4 f32 / 8 f16), a short and a long scalar tail (C = 5 and 17), padded
-/// and strided windows, dilation, the bias seed, the epilogue, add_to's ordering,
-/// the 3D forms, and f16 throughout. Channel-first tensors carry a padded pitch, as a
-/// graph hands them; channel-last ones stay dense because their strides never
-/// consult the pitch.
+/// (C = 4 f32 / 8 f16), a short and a long scalar tail (C = 5 and 17), strided
+/// windows, dilation, the bias seed, the epilogue, add_to's ordering, the 3D
+/// forms, and f16 throughout. Channel-last tensors stay dense because their
+/// strides never consult the pitch.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -39,7 +38,6 @@ struct DwCase {
     std::array<int64_t, 3> padding = {0, 0, 0};
     Epilogue epilogue{};
     DataType dtype = DataType::f32;
-    bool channel_last = false;
     bool bias = false;
     bool add_to = false;
 };
@@ -64,31 +62,19 @@ void run_case(const DwCase& c, const char* what)
     const int64_t srank = static_cast<int64_t>(c.in_shape.size()) - 2;
     const bool three_d = srank == 3;
     const TensorLayout in_layout =
-        c.channel_last ? (three_d ? TensorLayout::NDHWC : TensorLayout::NHWC)
-                       : (three_d ? TensorLayout::NCDHW : TensorLayout::NCHW);
-    const bool padded = !c.channel_last;
+        three_d ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
-    HostTensor in = make_host_random(c.in_shape, c.dtype, padded, 17, -1.0f, 1.0f,
+    HostTensor in = make_host_random(c.in_shape, c.dtype, false, 17, -1.0f, 1.0f,
                                      in_layout);
 
-    // Channel-first reads the raw [C, 1, (KD,) KH, KW]; channel-last the HWCM
-    // [(KD,) KH, KW, C], whose every tap is a contiguous run of C.
+    // The HWCM [(KD,) KH, KW, C] filter, whose every tap is a contiguous run of C.
     std::vector<int64_t> w_shape;
-    TensorLayout w_layout = in_layout;
-    if (c.channel_last) {
-        if (three_d) { w_shape.push_back(c.kernel[0]); }
-        w_shape.push_back(c.kernel[1]);
-        w_shape.push_back(c.kernel[2]);
-        w_shape.push_back(C);
-        w_layout = TensorLayout::HWCM;
-    } else {
-        w_shape = {C, 1};
-        if (three_d) { w_shape.push_back(c.kernel[0]); }
-        w_shape.push_back(c.kernel[1]);
-        w_shape.push_back(c.kernel[2]);
-    }
+    if (three_d) { w_shape.push_back(c.kernel[0]); }
+    w_shape.push_back(c.kernel[1]);
+    w_shape.push_back(c.kernel[2]);
+    w_shape.push_back(C);
     HostTensor w = make_host_random(w_shape, c.dtype, false, 23, -0.5f, 0.5f,
-                                    w_layout);
+                                    TensorLayout::HWCM);
 
     HostTensor b;
     if (c.bias) {
@@ -107,9 +93,9 @@ void run_case(const DwCase& c, const char* what)
 
     // add_to reads the destination, so both runs must start from the same bytes.
     const auto seed = [&](uint64_t s) {
-        return c.add_to ? make_host_random(od.dims, od.dtype, padded, s, -1.0f,
+        return c.add_to ? make_host_random(od.dims, od.dtype, false, s, -1.0f,
                                            1.0f, in_layout)
-                        : make_host_zeroed(od.dims, od.dtype, padded, in_layout);
+                        : make_host_zeroed(od.dims, od.dtype, false, in_layout);
     };
     HostTensor out_ref = seed(41);
     HostTensor out_dev = seed(41);
@@ -138,77 +124,6 @@ void run_case(const DwCase& c, const char* what)
 }  // namespace
 
 // ============================================================
-// Channel-first
-// ============================================================
-
-NNOPS_TEST(cuda_dwconv_channel_first_stride_padding) {
-    for (const auto& k : {std::array<int64_t, 3>{1, 3, 3},
-                          std::array<int64_t, 3>{1, 1, 1}}) {
-        DwCase c;
-        c.in_shape = {2, 4, 12, 15};
-        c.kernel = k;
-        c.stride = {1, 2, 2};
-        c.padding = {0, 1, 1};
-        run_case(c, "cuda_dwconv_channel_first_stride_padding");
-    }
-}
-
-NNOPS_TEST(cuda_dwconv_channel_first_dilation_epilogue) {
-    DwCase c;
-    c.in_shape = {1, 5, 10, 9};
-    c.dilation = {1, 2, 2};
-    c.epilogue.type = EpilogueActivateType::Relu;
-    run_case(c, "cuda_dwconv_channel_first_dilation_epilogue");
-
-    c.in_shape = {1, 3, 7, 6};
-    c.dilation = {1, 1, 1};
-    c.padding = {0, 1, 1};
-    c.epilogue.type = EpilogueActivateType::Relu6;
-    c.bias = true;
-    c.add_to = true;
-    run_case(c, "cuda_dwconv_channel_first_dilation_epilogue");
-}
-
-NNOPS_TEST(cuda_dwconv_channel_first_3d) {
-    DwCase c;
-    c.in_shape = {1, 4, 4, 6, 9};
-    c.kernel = {3, 3, 3};
-    c.padding = {1, 1, 1};
-    c.bias = true;
-    run_case(c, "cuda_dwconv_channel_first_3d");
-    c.in_shape = {1, 2, 3, 5, 5};
-    c.kernel = {2, 2, 2};
-    c.padding = {0, 0, 0};
-    c.add_to = true;
-    run_case(c, "cuda_dwconv_channel_first_3d");
-}
-
-NNOPS_TEST(cuda_dwconv_channel_first_f16) {
-    DwCase c;
-    c.in_shape = {1, 8, 9, 11};
-    c.dtype = DataType::f16;
-    c.padding = {0, 1, 1};
-    c.bias = true;
-    run_case(c, "cuda_dwconv_channel_first_f16");
-}
-
-NNOPS_TEST(cuda_dwconv_channel_first_window) {
-    // Unit stride, a square kernel and a row wide enough to hold two column
-    // runs: the only channel-first shape that takes the column-walking kernel.
-    // The other cases here land on the grid kernel (stride or dilation) or
-    // stay under its width gate.
-    for (DataType dt : {DataType::f32, DataType::f16}) {
-        DwCase c;
-        c.in_shape = {2, 4, 12, 15};
-        c.padding = {0, 1, 1};
-        c.bias = true;
-        c.add_to = true;
-        c.dtype = dt;
-        run_case(c, "cuda_dwconv_channel_first_window");
-    }
-}
-
-// ============================================================
 // Channel-last
 // ============================================================
 
@@ -221,7 +136,6 @@ NNOPS_TEST(cuda_dwconv_last_vector_lane) {
             DwCase c;
             c.in_shape = {2, C, 9, 11};
             c.dtype = dt;
-            c.channel_last = true;
             run_case(c, "cuda_dwconv_last_vector_lane");
         }
     }
@@ -230,7 +144,6 @@ NNOPS_TEST(cuda_dwconv_last_vector_lane) {
 NNOPS_TEST(cuda_dwconv_last_window) {
     DwCase c;
     c.in_shape = {1, 16, 14, 13};
-    c.channel_last = true;
     c.stride = {1, 2, 2};
     c.padding = {0, 1, 1};
     c.bias = true;
@@ -249,7 +162,6 @@ NNOPS_TEST(cuda_dwconv_last_f16) {
     DwCase c;
     c.in_shape = {1, 8, 7, 7};
     c.dtype = DataType::f16;
-    c.channel_last = true;
     c.kernel = {1, 1, 1};
     c.stride = {1, 2, 2};
     run_case(c, "cuda_dwconv_last_f16");
@@ -266,7 +178,6 @@ NNOPS_TEST(cuda_dwconv_last_3d) {
     c.in_shape = {1, 8, 3, 5, 6};
     c.kernel = {2, 2, 2};
     c.stride = {1, 1, 1};
-    c.channel_last = true;
     run_case(c, "cuda_dwconv_last_3d");
     c.kernel = {3, 3, 3};
     c.padding = {1, 1, 1};

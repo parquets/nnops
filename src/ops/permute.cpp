@@ -36,8 +36,8 @@ Status Permute::validate(std::span<const TensorDesc> inputs,
         out.dtype != in.dtype) {
         return Status::invalid_argument;
     }
-    if (!is_layout_supported(in.layout, LayoutSupport::ChannelFirstOnly) ||
-        !is_layout_supported(out.layout, LayoutSupport::ChannelFirstOnly)) {
+    if (!is_layout_supported(in.layout, LayoutSupport::DenseOnly) ||
+        !is_layout_supported(out.layout, LayoutSupport::DenseOnly)) {
         return Status::invalid_argument;
     }
     if (out.rank != rank) {

@@ -217,9 +217,9 @@ void run_recurrent(const RecurrentCase& c, const std::vector<int>& threads, int 
         qr = qw;
         qr.scale_data = rsc.data();
         w_view = TensorView(std::span<const int64_t>(wshape, 3), DataType::s8,
-                            wq.data(), TensorLayout::NCHW, qw);
+                            wq.data(), TensorLayout::Dense, qw);
         r_view = TensorView(std::span<const int64_t>(rshape, 3), DataType::s8,
-                            rq.data(), TensorLayout::NCHW, qr);
+                            rq.data(), TensorLayout::Dense, qr);
     }
 
     std::vector<TensorView> ins = {x, w_view, r_view, b, TensorView{}, h0};
@@ -714,9 +714,9 @@ void ab_rnn_q8(RecurrentMode mode, int64_t steps, int64_t B, int64_t I, int64_t 
     qr = qw;
     qr.scale_data = rsc.data();
     const TensorView w8w(std::span<const int64_t>(wshape, 3), DataType::s8, wq.data(),
-                         TensorLayout::NCHW, qw);
+                         TensorLayout::Dense, qw);
     const TensorView r8w(std::span<const int64_t>(rshape, 3), DataType::s8, rq.data(),
-                         TensorLayout::NCHW, qr);
+                         TensorLayout::Dense, qr);
 
     std::vector<T> y_buf(static_cast<size_t>(steps * D * B * H));
     std::vector<T> yh_buf(static_cast<size_t>(D * B * H));
