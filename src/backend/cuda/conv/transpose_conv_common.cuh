@@ -23,8 +23,11 @@
 #pragma once
 
 #include "../cuda_common.cuh"
-#include "../matmul/cute_gemm.cuh"
+#include "../matmul/gemm_common.cuh"
 #include "nnops/core/data_type.hpp"
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <limits>
 

@@ -40,6 +40,7 @@
 #include "../matmul/matmul_f32.cuh"
 #include "../matmul/matmul_i8_common.cuh" // I8OutKind + the shared int8 epilogue pieces
 #include "../matmul/matmul_i8_ptx.cuh"
+#include "conv_panel.cuh"
 #include "nnops/ops/conv2d.hpp"
 
 namespace nnops::backend::cuda {
@@ -333,16 +334,8 @@ __device__ inline void conv_store(const ConvParams& p, int64_t base, int pixel, 
 /// panels lose the same way, on resident blocks.
 using ConvShapeH = ManualHShape<32, 32, 2, 2, 64, 2, 1, false, 1>;
 
-/// The k-major A panel in the shape's swizzle, as the gather's (row, col, stage)
-/// indexer. The base already carries the stage.
-template <class S, class Elem>
-struct ConvHPanel {
-    Elem* base;
-    __device__ __forceinline__ Elem& operator()(int row, int col, int) const
-    {
-        return base[manual_swz<S>(row, col)];
-    }
-};
+/// The gather's (row, col, stage) indexer over the k-major swizzled panel.
+template <class S, class Elem> using ConvHPanel = conv::KMajorPanel<S, Elem>;
 
 template <class Elem>
 __global__ __launch_bounds__(ConvShapeH::threads, ConvShapeH::MinBlocks)
@@ -514,13 +507,7 @@ using ConvShapeF = ManualFShape<4, 8, 2, 2, 16, 3>;
 
 /// The A panel in float units: rows of `BK + Pad`, the padding being what keeps
 /// a 16 B gather vector 16 B aligned on every row.
-struct ConvFPanel {
-    float* base;
-    __device__ __forceinline__ float& operator()(int row, int col, int) const
-    {
-        return base[row * ConvShapeF::LDA + col];
-    }
-};
+using ConvFPanel = conv::PaddedPanel<ConvShapeF::LDA>;
 
 __global__ __launch_bounds__(ConvShapeF::threads, ConvShapeF::MinBlocks)
 void conv_gemm_f_kernel(ConvParams p)

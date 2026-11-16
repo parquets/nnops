@@ -48,7 +48,7 @@ __device__ inline void dw_last_store(const ConvParams& p, Elem* dst, const float
     const Elem* bias = static_cast<const Elem*>(p.bias);
     V out;
     Elem* os = reinterpret_cast<Elem*>(&out);
-    CUTE_UNROLL
+#pragma unroll
     for (int v = 0; v < Vec; ++v) {
         float x = acc[v];
         if (bias != nullptr) {
@@ -112,7 +112,7 @@ __global__ void dw_last_kernel(ConvParams pin, int th_max, int col_blocks)
                 const Elem* xs = reinterpret_cast<const Elem*>(&x);
                 // Group == output channel here, so lane v's channel is c0 + v.
                 const Elem* wv = wp;
-                CUTE_UNROLL
+#pragma unroll
                 for (int v = 0; v < Vec; ++v) {
                     acc[v] = fmaf(float(wv[0]), float(xs[v]), acc[v]);
                     wv += W_IC;
@@ -265,9 +265,9 @@ bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max
     }
     switch (dtype) {
     case DataType::f16:
-        return run_last<cute::half_t>(p, th_max, tw_max, stream);
+        return run_last<__half>(p, th_max, tw_max, stream);
     case DataType::bf16:
-        return run_last<cute::bfloat16_t>(p, th_max, tw_max, stream);
+        return run_last<__nv_bfloat16>(p, th_max, tw_max, stream);
     default:
         return run_last<float>(p, th_max, tw_max, stream);
     }
@@ -368,9 +368,9 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
         // The class view declines a geometry or a grid it cannot hold; the
         // scalar script still covers it.
         if (dt == DataType::bf16) {
-            tconv::launch_last_scalar<cute::bfloat16_t>(p, stream);
+            tconv::launch_last_scalar<__nv_bfloat16>(p, stream);
         } else if (half_elem) {
-            tconv::launch_last_scalar<cute::half_t>(p, stream);
+            tconv::launch_last_scalar<__half>(p, stream);
         } else {
             tconv::launch_last_scalar<float>(p, stream);
         }

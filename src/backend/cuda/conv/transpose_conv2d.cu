@@ -36,7 +36,9 @@
 /// unsupported.
 
 #include "../cuda_common.cuh"
-#include "../matmul/cute_gemm.cuh"
+#include "../matmul/matmul_f16.cuh"
+#include "../matmul/matmul_f32.cuh"
+#include "conv_panel.cuh"
 #include "transpose_conv_common.cuh"
 #include "nnops/ops/transpose_conv2d.hpp"
 
@@ -48,8 +50,6 @@ using tconv::tconv_class;
 using tconv::tconv_store;
 
 namespace {
-
-constexpr int kThreads = detail::kGemmThreads;
 
 /// Element (n, k) of one group's filter, walked through its own strides. The k
 /// flattening is channel-fastest inside a tap.
@@ -92,7 +92,7 @@ __device__ inline ConvRows conv_rows(const ConvParams& p, int pixel0)
 
     ConvRows r;
     r.count = bM / step;
-    CUTE_UNROLL
+#pragma unroll
     for (int i = 0; i < ConvRows::kMax; ++i) {
         if (i >= r.count) {
             break;
@@ -134,7 +134,7 @@ __device__ inline void conv_fill_a_vec(const ConvParams& p, SmemA sA, int stage,
     const bool k_ok = k < K;
     const Vec zero = {};
 
-    CUTE_UNROLL
+#pragma unroll
     for (int i = 0; i < ConvRows::kMax; ++i) {
         if (i >= rows.count) {
             break;
@@ -215,27 +215,20 @@ __device__ inline Elem* tconv_out_addr(const ConvParams& p, int64_t base, int pi
 /// two stages — the depth that keeps three blocks resident per SM, which is
 /// what the shallow upsampler grids need. A wider n tile is the tempting lever
 /// and it is worse here for the same reason it is worse there.
-struct ConvTileH {
-    static constexpr int bM = 64;
-    static constexpr int bN = 64;
-    static constexpr int bK = 64; // the swizzle atom is 64 halves wide in k
-    static constexpr int stages = 2;
-    static constexpr int wm = 2;
-    static constexpr int wn = 2;
-    static constexpr int mmaM = 32;
-    static constexpr int mmaN = 32;
-    static constexpr int threads = 32 * wm * wn;
-};
+using ConvShapeH = ManualHShape<32, 32, 2, 2, 64, 2, 1, false, 1>;
+
+/// The gather's (row, col, stage) indexer over the k-major swizzled panel.
+template <class S, class Elem> using TConvHPanel = conv::KMajorPanel<S, Elem>;
 
 template <class Elem>
-__global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvParams pin)
+__global__ __launch_bounds__(ConvShapeH::threads, ConvShapeH::MinBlocks)
+void tconv_gemm_h_kernel(ConvParams pin)
 {
-    using namespace cute;
-
-    constexpr int bM = ConvTileH::bM;
-    constexpr int bN = ConvTileH::bN;
-    constexpr int bK = ConvTileH::bK;
-    constexpr int kStages = ConvTileH::stages;
+    using S = ConvShapeH;
+    constexpr int BM = S::BM;
+    constexpr int BN = S::BN;
+    constexpr int BK = S::BK;
+    constexpr int ST = S::stages;
 
     const int cls = int(blockIdx.z) % pin.classes;
     const int zg = int(blockIdx.z) / pin.classes;
@@ -248,11 +241,11 @@ __global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvPa
     const int M = p.oh * p.ow;
     const int N = p.ocg;
     const int K = p.icg * p.kh * p.kw;
-    const int m0 = int(blockIdx.x) * bM;
+    const int m0 = int(blockIdx.x) * BM;
     if (m0 >= M) {
         return;
     }
-    const int n0 = int(blockIdx.y) * bN;
+    const int n0 = int(blockIdx.y) * BN;
 
     const int zb = zg / p.groups;
     const int g = zg - zb * p.groups;
@@ -261,148 +254,117 @@ __global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvPa
     const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c + tc.out_off;
 
     // A group owns IC/G consecutive input channels, so its filter slice starts
-    // at g·IC/G·w_ic — the input axis, not the output one.
+    // at g·IC/G·w_ic -- the input axis, not the output one.
     Elem const* W = static_cast<Elem const*>(p.weight) + int64_t(g) * p.icg * p.w_ic + tc.w_off;
-    // Shifted once so the fill's own arithmetic stays 32-bit (the launch gate
+    // Shifted once so the gather's own arithmetic stays 32-bit (the launch gate
     // keeps every offset it forms inside int).
     Elem const* in = static_cast<Elem const*>(p.input) + in_base;
-    const ConvRows rows = conv_rows<Elem, ConvTileH::threads, bM, bK>(p, m0);
+    const ConvRows rows = conv_rows<Elem, S::threads, BM, BK>(p, m0);
 
-    auto cta_tiler = make_shape(Int<bM>{}, Int<bN>{}, Int<bK>{});
-    auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
+    const int tid = int(threadIdx.x);
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int warp_m = warp / S::wn;
+    const int warp_n = warp - warp_m * S::wn;
 
-    constexpr auto sA_layout = detail::gemm_smem_layout<true>(Int<bM>{}, Int<bK>{}, Int<kStages>{});
-    constexpr auto sB_layout =
-        detail::gemm_smem_layout<false>(Int<bN>{}, Int<bK>{}, Int<kStages>{});
-    constexpr int kSmemA = int(cosize(sA_layout));
+    extern __shared__ __align__(16) unsigned char tconv_smem[];
+    Elem* const sAbase = reinterpret_cast<Elem*>(tconv_smem);
+    Elem* const sBbase = sAbase + ST * S::kAMax;
 
-    extern __shared__ char gemm_smem[];
-    Tensor sA = make_tensor(make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem)), sA_layout);
-    Tensor sB = make_tensor(
-        make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem + kSmemA * int(sizeof(Elem)))), sB_layout);
+    const int k_tiles = (K + BK - 1) / BK;
+    constexpr int per = S::threads / BK; // filter rows per round
 
-    TiledMMA mma = make_tiled_mma(detail::gemm_mma_atom<Elem>{},
-                                  Layout<Shape<Int<ConvTileH::wm>, Int<ConvTileH::wn>, _1>>{},
-                                  cute::Tile<Int<ConvTileH::mmaM>, Int<ConvTileH::mmaN>, _16>{});
-
-    auto load_a = [&](int kt, int stage) {
-        if (p.fill_vec) {
-            conv_fill_a_vec<Elem, bK>(p, sA, stage, in, rows, kt * bK);
+    // One call is one committed group, whether or not it copies anything: the
+    // wait's group count has to stay uniform when the reduction runs dry.
+    auto fill = [&](int kt, int stage) {
+        if (kt >= k_tiles) {
+            cp_async_commit_group();
             return;
         }
-        conv_fill_a<Elem, ConvTileH::threads, bM, bK>(p, sA, stage, in, m0, kt * bK);
-    };
-    // One column of B per thread, so the tap is decoded once and the row walk is
-    // a stride. The filter's k axis is never contiguous here (the output channel
-    // sits inside the reduction), so there is no copy atom to fall back on.
-    auto load_b = [&](int kt, int stage) {
-        constexpr int per = ConvTileH::threads / bK; // rows per round
-        const int col = int(threadIdx.x) % bK;
-        const int k = kt * bK + col;
+        const int k0 = kt * BK;
+        Elem* const sA = sAbase + stage * S::kAMax;
+        Elem* const sB = sBbase + stage * S::kBMax;
+        if (p.fill_vec) {
+            conv_fill_a_vec<Elem, BK>(p, TConvHPanel<S, Elem>{sA}, stage, in, rows, k0);
+        } else {
+            conv_fill_a<Elem, S::threads, BM, BK>(p, TConvHPanel<S, Elem>{sA}, stage, in, m0, k0);
+        }
+        // One filter column per thread into the n-major panel. The output
+        // channel sits inside the reduction, so no vector is contiguous here.
+        const int col = tid % BK;
+        const int k = k0 + col;
         const int tap = k / p.icg;
         const int ic = k - tap * p.icg;
         const int kh = tap / p.kw;
         const int kw = tap - kh * p.kw;
         const bool k_ok = k < K;
         const Elem* wc = W + int64_t(ic) * p.w_ic + int64_t(kh) * p.w_kh + int64_t(kw) * p.w_kw;
-        for (int row = int(threadIdx.x) / bK; row < bN; row += per) {
+        for (int row = tid / BK; row < BN; row += per) {
             const int n = n0 + row;
-            sB(row, col, stage) = (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : Elem(0);
+            sB[manual_swz_n<S>(col, row)] =
+                (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : manual_zero<Elem>();
         }
+        cp_async_commit_group();
     };
 
-    const int k_tile_count = (K + bK - 1) / bK;
-    int k_tile_next = 0;
-    int tiles_left = k_tile_count;
+    float acc[S::MA][S::NA][4];
+#pragma unroll
+    for (int i = 0; i < S::MA; ++i)
+#pragma unroll
+        for (int j = 0; j < S::NA; ++j)
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                acc[i][j][t] = 0.0f;
+            }
 
-    CUTE_UNROLL
-    for (int pipe = 0; pipe < kStages - 1; ++pipe) {
-        load_a(k_tile_next, pipe);
-        load_b(k_tile_next, pipe);
-        cp_async_fence();
-        --tiles_left;
-        if (tiles_left > 0) {
-            ++k_tile_next;
-        }
+    // Prime every stage but one; the loop then keeps exactly ST groups in
+    // flight, so `wait_group<ST-2>` retires precisely the tile about to be read.
+#pragma unroll
+    for (int t = 0; t < ST - 1; ++t) {
+        fill(t, t % ST);
     }
-
-    ThrMMA thr_mma = mma.get_slice(threadIdx.x);
-    Tensor tCrA = thr_mma.partition_fragment_A(sA(_, _, 0));
-    Tensor tCrB = thr_mma.partition_fragment_B(sB(_, _, 0));
-    // The identity tile carries the (m, n) coordinates the epilogue needs and
-    // gives the fragment its static extent; there is no strided C tensor to
-    // partition because the pixel axis is only uniform inside one output row.
-    Tensor gCc =
-        local_tile(make_identity_tensor(make_shape(M, N)), cta_tiler, cta_coord, Step<_1, _1, X>{});
-    Tensor tCcC = thr_mma.partition_C(gCc);
-    Tensor tCrC = thr_mma.make_fragment_C(tCcC);
-    clear(tCrC);
-
-    Copy_Atom<SM75_U32x4_LDSM_N, Elem> s2r_atom_a;
-    Copy_Atom<SM75_U16x8_LDSM_T, Elem> s2r_atom_b;
-
-    TiledCopy s2r_copy_a = make_tiled_copy_A(s2r_atom_a, mma);
-    ThrCopy s2r_thr_copy_a = s2r_copy_a.get_slice(threadIdx.x);
-    Tensor tXsA = s2r_thr_copy_a.partition_S(sA);
-    Tensor tXrA = s2r_thr_copy_a.retile_D(tCrA);
-
-    TiledCopy s2r_copy_b = make_tiled_copy_B(s2r_atom_b, mma);
-    ThrCopy s2r_thr_copy_b = s2r_copy_b.get_slice(threadIdx.x);
-    Tensor tXsB = s2r_thr_copy_b.partition_S(sB);
-    Tensor tXrB = s2r_thr_copy_b.retile_D(tCrB);
-
-    int smem_pipe_read = 0;
-    int smem_pipe_write = kStages - 1;
-    Tensor tXsA_p = tXsA(_, _, _, smem_pipe_read);
-    Tensor tXsB_p = tXsB(_, _, _, smem_pipe_read);
-    constexpr int kBlocks = bK / 16;
-
-    cp_async_wait<kStages - 2>();
-    __syncthreads();
-    copy(s2r_atom_a, tXsA_p(_, _, Int<0>{}), tXrA(_, _, Int<0>{}));
-    copy(s2r_atom_b, tXsB_p(_, _, Int<0>{}), tXrB(_, _, Int<0>{}));
-
-    CUTE_NO_UNROLL
-    while (tiles_left > -(kStages - 1)) {
-        CUTE_UNROLL
-        for (int k_block = 0; k_block < kBlocks; ++k_block) {
-            if (k_block == kBlocks - 1) {
-                tXsA_p = tXsA(_, _, _, smem_pipe_read);
-                tXsB_p = tXsB(_, _, _, smem_pipe_read);
-                cp_async_wait<kStages - 2>();
-                __syncthreads();
-            }
-            const int k_block_next = (k_block + 1) % kBlocks;
-            copy(s2r_atom_a, tXsA_p(_, _, k_block_next), tXrA(_, _, k_block_next));
-            copy(s2r_atom_b, tXsB_p(_, _, k_block_next), tXrB(_, _, k_block_next));
-            if (k_block == 0) {
-                load_a(k_tile_next, smem_pipe_write);
-                load_b(k_tile_next, smem_pipe_write);
-                cp_async_fence();
-                --tiles_left;
-                if (tiles_left > 0) {
-                    ++k_tile_next;
-                }
-                smem_pipe_write = smem_pipe_read;
-                smem_pipe_read = (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
-            }
-            gemm(mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
-        }
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        const int stage = kt % ST;
+        // One barrier a tile: the wait retires this tile's group, the barrier
+        // then publishes the gather's plain stores and retires every warp's
+        // reads of the tile before it -- whose stage the fill now overwrites.
+        cp_async_wait_group<ST - 2>();
+        __syncthreads();
+        fill(kt + ST - 1, (kt + ST - 1) % ST);
+        manual_gemm_h_tile<S, Elem, false, false>(sAbase + stage * S::kAMax,
+                                                  sBbase + stage * S::kBMax, warp_m, warp_n, lane,
+                                                  acc);
     }
 
     Elem const* bias =
         p.bias != nullptr ? static_cast<Elem const*>(p.bias) + int64_t(g) * p.ocg : nullptr;
 
-    CUTE_UNROLL
-    for (int i = 0; i < size(tCrC); ++i) {
-        auto coord = tCcC(i);
-        const int m = int(get<0>(coord));
-        const int n = int(get<1>(coord));
-        if (m >= M || n >= N) {
-            continue;
+    // C: lane l holds (m = l/4, n = 2*(l%4)), plus the +1 column and the +8 row.
+    const int cm = lane / 4;
+    const int cn = 2 * (lane % 4);
+#pragma unroll
+    for (int i = 0; i < S::MA; ++i) {
+        const int gm = m0 + warp_m * S::WM + i * 16 + cm;
+#pragma unroll
+        for (int j = 0; j < S::NA; ++j) {
+            const int gn = n0 + warp_n * S::WN + j * 8 + cn;
+#pragma unroll
+            for (int rr = 0; rr < 2; ++rr) {
+                const int m = gm + rr * 8;
+                if (m >= M) {
+                    continue;
+                }
+#pragma unroll
+                for (int cc = 0; cc < 2; ++cc) {
+                    const int n = gn + cc;
+                    if (n >= N) {
+                        continue;
+                    }
+                    Elem* dst = tconv_out_addr<Elem>(p, out_base, m, n);
+                    tconv_store<Elem>(p, dst, acc[i][j][rr * 2 + cc], n, bias);
+                }
+            }
         }
-        Elem* dst = tconv_out_addr<Elem>(p, out_base, m, n);
-        tconv_store<Elem>(p, dst, float(tCrC(i)), n, bias);
     }
 }
 
@@ -410,16 +372,20 @@ __global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvPa
 // f32 SIMT kernel
 // ============================================================
 
-__global__ __launch_bounds__(kThreads) void tconv_gemm_f_kernel(ConvParams pin)
-{
-    using namespace cute;
-    using Elem = float;
+using ConvShapeF = ManualFShape<4, 8, 2, 2, 16, 3>;
 
-    constexpr int bM = 64;
-    constexpr int bN = 64;
-    constexpr int bK = 16;
-    constexpr int kStages = 3;
-    constexpr int kPad = 4; // 16 B: a cp.async destination row start must be 16 B aligned
+/// The A panel in float units, padded rows of `BK + Pad`.
+using TConvFPanel = conv::PaddedPanel<ConvShapeF::LDA>;
+
+__global__ __launch_bounds__(ConvShapeF::threads, ConvShapeF::MinBlocks)
+void tconv_gemm_f_kernel(ConvParams pin)
+{
+    using S = ConvShapeF;
+    using Elem = float;
+    constexpr int BM = S::BM;
+    constexpr int BN = S::BN;
+    constexpr int BK = S::BK;
+    constexpr int ST = S::stages;
 
     const int cls = int(blockIdx.z) % pin.classes;
     const int zg = int(blockIdx.z) / pin.classes;
@@ -432,11 +398,11 @@ __global__ __launch_bounds__(kThreads) void tconv_gemm_f_kernel(ConvParams pin)
     const int M = p.oh * p.ow;
     const int N = p.ocg;
     const int K = p.icg * p.kh * p.kw;
-    const int m0 = int(blockIdx.x) * bM;
+    const int m0 = int(blockIdx.x) * BM;
     if (m0 >= M) {
         return;
     }
-    const int n0 = int(blockIdx.y) * bN;
+    const int n0 = int(blockIdx.y) * BN;
 
     const int zb = zg / p.groups;
     const int g = zg - zb * p.groups;
@@ -445,121 +411,100 @@ __global__ __launch_bounds__(kThreads) void tconv_gemm_f_kernel(ConvParams pin)
     const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c + tc.out_off;
 
     // A group owns IC/G consecutive input channels, so its filter slice starts
-    // at g·IC/G·w_ic — the input axis, not the output one.
+    // at g·IC/G·w_ic -- the input axis, not the output one.
     Elem const* W = static_cast<Elem const*>(p.weight) + int64_t(g) * p.icg * p.w_ic + tc.w_off;
-    // Shifted once so the fill's own arithmetic stays 32-bit (the launch gate
+    // Shifted once so the gather's own arithmetic stays 32-bit (the launch gate
     // keeps every offset it forms inside int).
     Elem const* in = static_cast<Elem const*>(p.input) + in_base;
-    const ConvRows rows = conv_rows<Elem, kThreads, bM, bK>(p, m0);
+    const ConvRows rows = conv_rows<Elem, S::threads, BM, BK>(p, m0);
 
-    auto cta_tiler = make_shape(Int<bM>{}, Int<bN>{}, Int<bK>{});
-    auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
+    const int tid = int(threadIdx.x);
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int warp_m = warp / S::wn;
+    const int warp_n = warp - warp_m * S::wn;
 
-    constexpr auto sA_layout =
-        make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
-                    make_stride(Int<bK + kPad>{}, Int<1>{}, Int<(bK + kPad) * bM>{}));
-    constexpr auto sB_layout =
-        make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
-                    make_stride(Int<1>{}, Int<bN + kPad>{}, Int<(bN + kPad) * bK>{}));
-    constexpr int kSmemA = int(cosize(sA_layout));
+    extern __shared__ __align__(16) unsigned char tconv_smem[];
+    float* const sAbase = reinterpret_cast<float*>(tconv_smem);
+    float* const sBbase = sAbase + ST * S::kAMax;
 
-    extern __shared__ char gemm_smem[];
-    Tensor sA = make_tensor(make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem)), sA_layout);
-    Tensor sB = make_tensor(
-        make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem + kSmemA * int(sizeof(Elem)))), sB_layout);
+    const int k_tiles = (K + BK - 1) / BK;
+    constexpr int per = S::threads / BK; // filter rows per round
 
-    // One-thread atom: the atom layout has to cover every launched thread, or
-    // the extra threads alias thread 0's slice and race with it (the epilogue
-    // reads the destination for add_to).
-    TiledMMA mma = make_tiled_mma(UniversalFMA<float, float, float>{}, Layout<Shape<_8, _16, _1>>{},
-                                  Tile<_64, _64, _1>{});
-
-    auto load_a = [&](int kt, int stage) {
-        if (p.fill_vec) {
-            conv_fill_a_vec<Elem, bK>(p, sA, stage, in, rows, kt * bK);
+    auto fill = [&](int kt, int stage) {
+        if (kt >= k_tiles) {
+            cp_async_commit_group();
             return;
         }
-        conv_fill_a<Elem, kThreads, bM, bK>(p, sA, stage, in, m0, kt * bK);
-    };
-    auto load_b = [&](int kt, int stage) {
-        constexpr int per = kThreads / bK; // rows per round
-        const int col = int(threadIdx.x) % bK;
-        const int k = kt * bK + col;
+        const int k0 = kt * BK;
+        float* const sA = sAbase + stage * S::kAMax;
+        float* const sB = sBbase + stage * S::kBMax;
+        if (p.fill_vec) {
+            conv_fill_a_vec<Elem, BK>(p, TConvFPanel{sA}, stage, in, rows, k0);
+        } else {
+            conv_fill_a<Elem, S::threads, BM, BK>(p, TConvFPanel{sA}, stage, in, m0, k0);
+        }
+        // One filter column per thread into the [k][n] panel.
+        const int col = tid % BK;
+        const int k = k0 + col;
         const int tap = k / p.icg;
         const int ic = k - tap * p.icg;
         const int kh = tap / p.kw;
         const int kw = tap - kh * p.kw;
         const bool k_ok = k < K;
         const Elem* wc = W + int64_t(ic) * p.w_ic + int64_t(kh) * p.w_kh + int64_t(kw) * p.w_kw;
-        for (int row = int(threadIdx.x) / bK; row < bN; row += per) {
+        for (int row = tid / BK; row < BN; row += per) {
             const int n = n0 + row;
-            sB(row, col, stage) = (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : Elem(0);
+            sB[col * S::LDN + row] = (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : 0.0f;
         }
+        cp_async_commit_group();
     };
 
-    const int k_tile_count = (K + bK - 1) / bK;
-    int k_tile_next = 0;
-    int tiles_left = k_tile_count;
-
-    CUTE_UNROLL
-    for (int pipe = 0; pipe < kStages - 1; ++pipe) {
-        load_a(k_tile_next, pipe);
-        load_b(k_tile_next, pipe);
-        cp_async_fence();
-        --tiles_left;
-        if (tiles_left > 0) {
-            ++k_tile_next;
+    float acc[S::LaneRow][S::LaneCol];
+#pragma unroll
+    for (int r = 0; r < S::LaneRow; ++r)
+#pragma unroll
+        for (int c = 0; c < S::LaneCol; ++c) {
+            acc[r][c] = 0.0f;
         }
+
+#pragma unroll
+    for (int t = 0; t < ST - 1; ++t) {
+        fill(t, t % ST);
     }
-
-    ThrMMA thr_mma = mma.get_slice(threadIdx.x);
-    Tensor tCsA = thr_mma.partition_A(sA);
-    Tensor tCsB = thr_mma.partition_B(sB);
-    Tensor tCrA = thr_mma.make_fragment_A(tCsA(_, _, _, 0));
-    Tensor tCrB = thr_mma.make_fragment_B(tCsB(_, _, _, 0));
-    Tensor gCc =
-        local_tile(make_identity_tensor(make_shape(M, N)), cta_tiler, cta_coord, Step<_1, _1, X>{});
-    Tensor tCcC = thr_mma.partition_C(gCc);
-    Tensor tCrC = thr_mma.make_fragment_C(tCcC);
-    clear(tCrC);
-
-    int smem_pipe_read = 0;
-    int smem_pipe_write = kStages - 1;
-
-    CUTE_NO_UNROLL
-    while (tiles_left > -(kStages - 1)) {
-        cp_async_wait<kStages - 2>();
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        const int stage = kt % ST;
+        cp_async_wait_group<ST - 2>();
         __syncthreads();
-
-        load_a(k_tile_next, smem_pipe_write);
-        load_b(k_tile_next, smem_pipe_write);
-        cp_async_fence();
-
-        copy(tCsA(_, _, _, smem_pipe_read), tCrA);
-        copy(tCsB(_, _, _, smem_pipe_read), tCrB);
-        gemm(mma, tCrA, tCrB, tCrC);
-
-        --tiles_left;
-        if (tiles_left > 0) {
-            ++k_tile_next;
-        }
-        smem_pipe_write = smem_pipe_read;
-        smem_pipe_read = (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
+        fill(kt + ST - 1, (kt + ST - 1) % ST);
+        manual_gemm_f_tile<S, false, false>(sAbase + stage * S::kAMax,
+                                            sBbase + stage * S::kBMax, warp_m, warp_n, lane, acc);
     }
 
     Elem const* bias =
         p.bias != nullptr ? static_cast<Elem const*>(p.bias) + int64_t(g) * p.ocg : nullptr;
 
-    CUTE_UNROLL
-    for (int i = 0; i < size(tCrC); ++i) {
-        auto coord = tCcC(i);
-        const int m = int(get<0>(coord));
-        const int n = int(get<1>(coord));
-        if (m >= M || n >= N) {
+    // A lane is eight lane-rows by four lane-cols; its accumulator row r is the
+    // row eight apart, its column c the next column of the lane's row.
+    const int lrow = lane % 8;
+    const int lcol = lane / 8;
+    const int row0 = warp_m * S::warpRows + lrow;
+    const int col0 = warp_n * S::warpCols + lcol * S::LaneCol;
+#pragma unroll
+    for (int r = 0; r < S::LaneRow; ++r) {
+        const int m = m0 + row0 + r * 8;
+        if (m >= M) {
             continue;
         }
-        Elem* dst = tconv_out_addr<Elem>(p, out_base, m, n);
-        tconv_store<Elem>(p, dst, tCrC(i), n, bias);
+#pragma unroll
+        for (int c = 0; c < S::LaneCol; ++c) {
+            const int n = n0 + col0 + c;
+            if (n >= N) {
+                continue;
+            }
+            Elem* dst = tconv_out_addr<Elem>(p, out_base, m, n);
+            tconv_store<Elem>(p, dst, acc[r][c], n, bias);
+        }
     }
 }
 
@@ -639,36 +584,28 @@ template <class Elem> __global__ void tconv_plane_kernel(ConvParams p, int ow_ti
 template <class Elem>
 void launch_tconv_gemm_h(const ConvParams& p, int m_max, cudaStream_t stream)
 {
-    using namespace cute;
-    constexpr int bM = ConvTileH::bM, bN = ConvTileH::bN, bK = ConvTileH::bK;
-    constexpr auto la =
-        detail::gemm_smem_layout<true>(Int<bM>{}, Int<bK>{}, Int<ConvTileH::stages>{});
-    constexpr auto lb =
-        detail::gemm_smem_layout<false>(Int<bN>{}, Int<bK>{}, Int<ConvTileH::stages>{});
-    constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(Elem));
-
+    using S = ConvShapeH;
+    constexpr int smem = S::kSmemBytes;
     auto kernel = tconv_gemm_h_kernel<Elem>;
     static const cudaError_t cfg =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
-    dim3 grid(ceil_div(m_max, bM), ceil_div(p.ocg, bN), p.batch * p.groups * p.classes);
-    kernel<<<grid, ConvTileH::threads, smem, stream>>>(p);
+    dim3 grid(ceil_div(m_max, S::BM), ceil_div(p.ocg, S::BN), p.batch * p.groups * p.classes);
+    kernel<<<grid, S::threads, smem, stream>>>(p);
 }
 
 inline void launch_tconv_gemm_f(const ConvParams& p, int m_max, cudaStream_t stream)
 {
-    using namespace cute; // ceil_div
-    constexpr int bM = 64, bN = 64, bK = 16, kStages = 3, kPad = 4;
-    constexpr int smem = (bM * (bK + kPad) + bN * (bK + kPad)) * kStages * int(sizeof(float));
-
+    using S = ConvShapeF;
+    constexpr int smem = S::stages * (S::kAMax + S::kBMax) * int(sizeof(float));
     auto kernel = tconv_gemm_f_kernel;
     static const cudaError_t cfg =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
-    dim3 grid(ceil_div(m_max, bM), ceil_div(p.ocg, bN), p.batch * p.groups * p.classes);
-    kernel<<<grid, kThreads, smem, stream>>>(p);
+    dim3 grid(ceil_div(m_max, S::BM), ceil_div(p.ocg, S::BN), p.batch * p.groups * p.classes);
+    kernel<<<grid, S::threads, smem, stream>>>(p);
 }
 
 template <class Elem> void launch_tconv_plane(const ConvParams& p, cudaStream_t stream)
@@ -780,9 +717,9 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     if (gemm) {
         if (dt == DataType::bf16) {
-            launch_tconv_gemm_h<cute::bfloat16_t>(p, m_max, stream);
+            launch_tconv_gemm_h<__nv_bfloat16>(p, m_max, stream);
         } else if (esz == 2) {
-            launch_tconv_gemm_h<cute::half_t>(p, m_max, stream);
+            launch_tconv_gemm_h<__half>(p, m_max, stream);
         } else {
             launch_tconv_gemm_f(p, m_max, stream);
         }
@@ -790,9 +727,9 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
         // launched by the depthwise route
     } else if (plane_ok) {
         if (dt == DataType::bf16) {
-            launch_tconv_plane<cute::bfloat16_t>(p, stream);
+            launch_tconv_plane<__nv_bfloat16>(p, stream);
         } else if (esz == 2) {
-            launch_tconv_plane<cute::half_t>(p, stream);
+            launch_tconv_plane<__half>(p, stream);
         } else {
             launch_tconv_plane<float>(p, stream);
         }
