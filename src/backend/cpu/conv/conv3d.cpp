@@ -15,7 +15,7 @@
 /// one vector copy per tap; the GEMM's C rows are pixels and its columns are
 /// output channels, which is exactly the destination's own order.
 ///
-/// The gather is tiled_im2col_3d_channel_last (simd_kernel/simd_im2col.hpp),
+/// The gather is tiled_im2col_3d (simd_kernel/simd_im2col.hpp),
 /// one call per block, zero-filling the six padded faces. A block is a
 /// rectangle of output — whole depth slices while they fit, otherwise a run of
 /// rows inside one slice — because the col's row stride is the block's own
@@ -178,7 +178,7 @@ bool conv3d_im2col_gemm(const Geom& gm, TensorView& output, std::span<const Tens
                         ? const_cast<const T*>(in_g + p0 * in_pix)
                         : static_cast<const T*>(col.data());
                     if (!pointwise) {
-                        nnops::kernel::tiled_im2col_3d_channel_last<T>(
+                        nnops::kernel::tiled_im2col_3d<T>(
                             col.data(), static_cast<int>(kdim), in_g, in_pix, in_d_stride,
                             in_row_stride, static_cast<int>(gm.IC_per_G),
                             static_cast<int>(od0), static_cast<int>(oh0), static_cast<int>(nd),

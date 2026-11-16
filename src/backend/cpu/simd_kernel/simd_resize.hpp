@@ -1,9 +1,9 @@
 #pragma once
 /// @file simd_resize.hpp
-/// @brief CPU kernels for 2D/3D spatial resize, channel-first and channel-last.
+/// @brief CPU kernels for 2D/3D spatial resize.
 ///
-/// Channel-first walks one channel plane and evaluates scalar output pixels; the
-/// channel-last kernels put the SIMD lane on C, so a pixel's whole channel
+/// One sample is one task: the lane is C, so a pixel's whole channel
+/// vector is interpolated at once.
 /// vector interpolates with v_fmadd and only the C tail runs scalar.
 ///
 /// The coordinate tables (source indices and the weight of the upper/right
@@ -97,7 +97,7 @@ inline ResizeCubicTap resize_make_cubic_tap(float src, int64_t size, float a)
 
 
 // ============================================================
-// Channel-last: the SIMD lane spans C
+// The SIMD lane spans C
 // ============================================================
 
 /// Interpolate one output pixel: `dst[c] = w_y0*(w_x0*a0[c] + w_x*a1[c]) +

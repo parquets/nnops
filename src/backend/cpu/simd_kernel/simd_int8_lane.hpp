@@ -15,7 +15,7 @@
 /// a ten-cycle latency chain. One tap is then a multiply plus a pair of
 /// sign-extends per 16 lanes.
 ///
-/// `madd_v` reads a staged 16-lane int16 vector (a channel-last HWCM filter is
+/// `madd_v` reads a staged 16-lane int16 vector (an HWCM filter is
 /// one weight per channel).
 /// The activation zero point is not applied per lane — it would not fit the
 /// byte — so the caller folds it into the accumulator's seed, which `add_v` and

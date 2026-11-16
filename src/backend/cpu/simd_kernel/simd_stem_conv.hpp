@@ -6,7 +6,7 @@
 /// A wide filter over at most four input channels cannot pay for a gather: the
 /// GEMM route copies `karea·IC` elements per pixel into an im2col tile only to
 /// read them back, and at the 3-channel stem that copy is most of the layer's
-/// time. The patch is already in place on the channel-last plane, so convolve it
+/// time. The patch is already in place on the plane, so convolve it
 /// where it lies — one weight vector per (tap, input channel), one broadcast per
 /// pixel tap, four pixels against two vectors of output channels. That is the
 /// MMA's own FMA-to-load ratio with nothing copied on either side, and the
@@ -85,7 +85,7 @@ template <typename T> inline void stem_store(T* p, const simd::v_f32x8& v)
 
 /// One pixel's tap from the plane: broadcast the input, two vectors of output
 /// channels. `c` is the tap *column*, so the element is `c·IC + ic`
-/// (channel-last).
+/// (one channel vector at a time).
 template <typename T, int IC, bool Fast>
 inline void stem_px(simd::v_f32x8& a0, simd::v_f32x8& a1, const T* NNOPS_RESTRICT r, int64_t c,
                     int64_t iw, int ic, const simd::v_f32x8& w0, const simd::v_f32x8& w1) noexcept

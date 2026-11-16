@@ -213,7 +213,7 @@ void tconv2d_col2im_pixel_major(const Tconv2dColGeom& g, const T* col, int64_t m
 
 
 /// Pixel-major col, 3-D: voxel rows are [id·(IH·IW) + ih·IW + iw] holding
-/// [tap][oc], which is the orientation the channel-last GEMM leaves the col in.
+/// [tap][oc], which is the orientation the GEMM leaves the col in.
 template <typename T, typename Acc>
 void tconv3d_col2im_pixel_major(const Tconv3dColGeom& g, const T* col, int64_t m, int64_t nc,
                                 int64_t tap_stride, T* row, int64_t od, int64_t oh, Acc&& acc)

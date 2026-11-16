@@ -14,8 +14,8 @@
 ///
 /// Dispatch:
 ///   depthwise_conv_cpu
-///     f32/f16/bf16       -> dwconv_channel_last_impl       (lane on C)
-///     s8/u8              -> dwconv_channel_last_quant_impl
+///     f32/f16/bf16       -> dwconv_fp_impl       (lane on C)
+///     s8/u8              -> dwconv_quant_impl
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
@@ -36,7 +36,7 @@ namespace k = nnops::kernel;
 // ============================================================
 
 template <typename T>
-void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
+void dwconv_fp_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
                               std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -192,16 +192,16 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
                 // of the 7 rows, and at R = 1 a row is a quarter of the ILP and
                 // shares no input row with its neighbour.
                 if (rows_here == 4) {
-                    k::dwconv_channel_last<4>(out_rows + co, in_blk, w_blk, b_blk, pc,
+                    k::dwconv_block<4>(out_rows + co, in_blk, w_blk, b_blk, pc,
                                               attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 } else if (rows_here == 3) {
-                    k::dwconv_channel_last<3>(out_rows + co, in_blk, w_blk, b_blk, pc,
+                    k::dwconv_block<3>(out_rows + co, in_blk, w_blk, b_blk, pc,
                                               attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 } else if (rows_here == 2) {
-                    k::dwconv_channel_last<2>(out_rows + co, in_blk, w_blk, b_blk, pc,
+                    k::dwconv_block<2>(out_rows + co, in_blk, w_blk, b_blk, pc,
                                               attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 } else {
-                    k::dwconv_channel_last<1>(out_rows + co, in_blk, w_blk, b_blk, pc,
+                    k::dwconv_block<1>(out_rows + co, in_blk, w_blk, b_blk, pc,
                                               attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 }
             }
@@ -214,11 +214,11 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
 // ============================================================
 //
 // Same task grid as the fp route; the HWCM weight is dequantized per row per
-// block into a staging vector (see dwconv_channel_last_quant). The activation is
+// block into a staging vector (see dwconv_block_quant). The activation is
 // PerTensor and the weight PerChannel.
 
 template <typename InT, typename OutT>
-Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
+Status dwconv_quant_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
                                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -244,7 +244,7 @@ Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, Tens
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    if (attrs.kernel_size[0] * attrs.kernel_size[1] * attrs.kernel_size[2] > k::kMaxLastQuantTaps) {
+    if (attrs.kernel_size[0] * attrs.kernel_size[1] * attrs.kernel_size[2] > k::kMaxQuantTaps) {
         return Status::unsupported; // the staging buffer is sized for 9x9x9
     }
 
@@ -342,19 +342,19 @@ Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, Tens
             const int32_t* wz = w_qp.zero_point_data ? w_qp.zero_point_data + c0 : nullptr;
             // One call at the short group's own height, as in the f32 driver.
             if (rows_here == 4) {
-                k::dwconv_channel_last_quant<4, InT, OutT>(
+                k::dwconv_block_quant<4, InT, OutT>(
                     out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue, add_to,
                     pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             } else if (rows_here == 3) {
-                k::dwconv_channel_last_quant<3, InT, OutT>(
+                k::dwconv_block_quant<3, InT, OutT>(
                     out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue, add_to,
                     pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             } else if (rows_here == 2) {
-                k::dwconv_channel_last_quant<2, InT, OutT>(
+                k::dwconv_block_quant<2, InT, OutT>(
                     out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue, add_to,
                     pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             } else {
-                k::dwconv_channel_last_quant<1, InT, OutT>(
+                k::dwconv_block_quant<1, InT, OutT>(
                     out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue, add_to,
                     pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             }
@@ -380,30 +380,30 @@ Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs, TensorView& outp
 
     switch (dtype) {
     case DataType::f32:
-        dwconv_channel_last_impl<float>(attrs, output, inputs, ctx);
+        dwconv_fp_impl<float>(attrs, output, inputs, ctx);
         return Status::ok;
     case DataType::f16:
-        dwconv_channel_last_impl<half>(attrs, output, inputs, ctx);
+        dwconv_fp_impl<half>(attrs, output, inputs, ctx);
         return Status::ok;
 #ifdef NNOPS_ARCH_AARCH64
     case DataType::bf16:
-        dwconv_channel_last_impl<bfloat16>(attrs, output, inputs, ctx);
+        dwconv_fp_impl<bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
 #endif
     case DataType::s8:
         if (odtype == DataType::s8) {
-            return dwconv_channel_last_quant_impl<int8_t, int8_t>(attrs, output, inputs, ctx);
+            return dwconv_quant_impl<int8_t, int8_t>(attrs, output, inputs, ctx);
         }
         if (odtype == DataType::u8) {
-            return dwconv_channel_last_quant_impl<int8_t, uint8_t>(attrs, output, inputs, ctx);
+            return dwconv_quant_impl<int8_t, uint8_t>(attrs, output, inputs, ctx);
         }
         return Status::unsupported;
     case DataType::u8:
         if (odtype == DataType::s8) {
-            return dwconv_channel_last_quant_impl<uint8_t, int8_t>(attrs, output, inputs, ctx);
+            return dwconv_quant_impl<uint8_t, int8_t>(attrs, output, inputs, ctx);
         }
         if (odtype == DataType::u8) {
-            return dwconv_channel_last_quant_impl<uint8_t, uint8_t>(attrs, output, inputs, ctx);
+            return dwconv_quant_impl<uint8_t, uint8_t>(attrs, output, inputs, ctx);
         }
         return Status::unsupported;
     default:

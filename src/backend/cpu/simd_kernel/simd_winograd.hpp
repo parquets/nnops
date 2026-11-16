@@ -42,7 +42,7 @@
 ///         [ 0, 2,-1,-2, 1, 0],        [ 1/24,-1/12,  1/6 ],
 ///         [ 0, 4, 0,-5, 0, 1]]        [ 0,    0,     1   ]]
 ///
-/// Layouts. Channel-last puts the *channel* axis in the vector lanes: a window
+/// Layout. The *channel* axis is in the vector lanes: a window
 /// is sixteen (F(2,3)) or thirty-six (F(4,3)) channel-vector loads and an output
 /// tile four or sixteen stores, with no deinterleave and no neighbour coupling,
 /// so its tile grid can flatten. V's transform position p lives at
@@ -103,7 +103,7 @@ inline void winograd_weight_transform(const T* g, int ld_g, T* u, int ld_u, int 
 }
 
 // =========================================================================
-//  F(2×2, 3×3) channel-last transforms
+//  F(2×2, 3×3) transforms
 // =========================================================================
 
 /// A zero vector in the transform domain (f32 whatever the storage type).
@@ -141,7 +141,7 @@ template <class T> inline void wino_store_lanes(T* p, const v_f32x8& v, int lane
 
 /// Transform one 4×4 input window into V = Bᵀ d B, one channel vector at a time.
 template <class T>
-inline void winograd_input_channel_last(const T* in_plane, int64_t in_row, int64_t ic_stride,
+inline void winograd_input(const T* in_plane, int64_t in_row, int64_t ic_stride,
                                         int ih0, int iw0, int IH, int IW, T* v, int64_t v_plane,
                                         int lanes) noexcept
 {
@@ -178,7 +178,7 @@ inline void winograd_input_channel_last(const T* in_plane, int64_t in_row, int64
 
 /// Transform one tile's 16 M planes into its 2×2 outputs, one channel vector at a time; a nullptr destination skips that pixel (past OW/OH on an odd extent). @p p is the tile's destination grid, row-major.
 template <class T>
-inline void winograd_output_channel_last(const T* m, int64_t m_plane, T* const p[2][2],
+inline void winograd_output(const T* m, int64_t m_plane, T* const p[2][2],
                                          const Epilogue& ep, const T* bias, bool add_to, int lanes,
                                          bool pre_act = false) noexcept
 {
@@ -288,12 +288,12 @@ inline void wino43_bt(v_f32x8 d[6]) noexcept
 }
 
 // =========================================================================
-//  F(4×4, 3×3) channel-last transforms — the channel axis is the vector lane
+//  F(4×4, 3×3) transforms — the channel axis is the vector lane
 // =========================================================================
 
 /// Transform one 6×6 input window into V = Bᵀ d B, one channel vector at a time.
 template <class T>
-inline void winograd43_input_channel_last(const T* in_plane, int64_t in_row, int64_t ic_stride,
+inline void winograd43_input(const T* in_plane, int64_t in_row, int64_t ic_stride,
                                           int ih0, int iw0, int IH, int IW, T* v, int64_t v_plane,
                                           int lanes) noexcept
 {
@@ -348,7 +348,7 @@ inline void wino43_at(v_f32x8 m[6]) noexcept
 /// Transform one tile's 36 M planes into its 4×4 outputs, one channel vector at
 /// a time; a nullptr destination skips that pixel (past OW/OH on a short extent).
 template <class T>
-inline void winograd43_output_channel_last(const T* m, int64_t m_plane, T* const p[4][4],
+inline void winograd43_output(const T* m, int64_t m_plane, T* const p[4][4],
                                            const Epilogue& ep, const T* bias, bool add_to,
                                            int lanes, bool pre_act = false) noexcept
 {

@@ -574,7 +574,7 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
                             a = in_g + oh * in_row_stride + ow0 * IC + icn;
                             lda = static_cast<int>(IC);
                         } else {
-                            tiled_im2col_channel_last<T>(a_buf, kdim, in_g + icn, in_row_stride, IC,
+                            tiled_im2col<T>(a_buf, kdim, in_g + icn, in_row_stride, IC,
                                                          T{}, p, static_cast<int>(OW), flat, mc,
                                                          static_cast<int>(IH), static_cast<int>(IW),
                                                          KH, KW, SH, SW, DH, DW, PH, PW,
@@ -1011,7 +1011,7 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs, TensorView& ou
                                 a = reinterpret_cast<const int8_t*>(in_row + ow0 * IC + icn);
                                 lda = static_cast<int>(IC);
                             } else {
-                                tiled_im2col_channel_last_i8(
+                                tiled_im2col_i8(
                                     a_buf, kdim4, in_g + icn, in_row_stride, IC, xr,
                                     static_cast<uint8_t>(plane ? zp_x + d : zp_x), p,
                                     static_cast<int>(OW), flat, mc, static_cast<int>(IH),
@@ -1068,7 +1068,7 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs, TensorView& ou
                                             std::min(icn_block, ic_per_group - icn2);
                                         const int kd2 = static_cast<int>(icnc2 * karea);
                                         const int kd24 = static_cast<int>(align4(kd2));
-                                        tiled_im2col_channel_last_i8(
+                                        tiled_im2col_i8(
                                             a_buf, kd24, in_g + icn2, in_row_stride, IC, xr,
                                             static_cast<uint8_t>(plane ? zp_x + d : zp_x), p,
                                             static_cast<int>(OW), flat, mc, static_cast<int>(IH),

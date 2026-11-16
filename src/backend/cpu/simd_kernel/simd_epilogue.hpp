@@ -689,7 +689,7 @@ struct Int8EpilogueParams {
     bool compensate;
     bool col_term;
     const int32_t* bias;     ///< row int32 bias (Conv2D's [OC] or a folded row term)
-    const int32_t* col_bias; ///< column int32 bias (MatMul [N], Conv2D channel-last)
+    const int32_t* col_bias; ///< column int32 bias (MatMul [N], Conv2D)
     int8_t* out;             ///< s8 destination; nullptr → s32 or u8 (see out_u8)
     uint8_t* out_u8;         ///< u8 destination; takes precedence over out
     int ldc_out;
@@ -974,7 +974,7 @@ template <class TOut> struct DqEpilogueParams {
     /// place fp's accumulator seed puts it. nullptr → no bias.
     const TOut* bias;
     /// Per-column bias over the full [N] output width, added in the same place:
-    /// MatMul's [N] bias, or Conv2D's channel-last one. nullptr → none.
+    /// MatMul's [N] bias, or Conv2D's per-column one. nullptr → none.
     const TOut* col_bias;
     /// Add the destination's old value to the dequantized sum before the clip —
     /// the pre-activation residual. The int8 routes accumulate into a buffer of

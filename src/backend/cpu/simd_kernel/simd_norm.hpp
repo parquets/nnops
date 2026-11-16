@@ -11,7 +11,7 @@
 ///    (norm_apply_row, L2/RMS/Layer; scale/bias broadcast or per-element).
 ///  - BatchNorm's fused fmadd, one ns*x + nb per block with ns/nb pre-folding
 ///    scale/bias/mean/var (the non-spatial kernel folds them itself), written
-///    per storage: packed C8, channel-first, or per-element block.
+///    per storage: a per-pixel channel vector or a per-element block.
 ///
 /// Every writer goes through v_store_add/s_store_add, so a residual `add_to`
 /// costs no extra pass.

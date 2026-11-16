@@ -221,11 +221,11 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
                 // channel and the activation's channel lane.
                 T* v_tile = v_all + tl * v_lda + ic;
                 if constexpr (O == WinoOrder::F23) {
-                    k::winograd_input_channel_last<T>(
+                    k::winograd_input<T>(
                         task_in + ic, in_row, IC, static_cast<int>(ih0), static_cast<int>(iw0),
                         static_cast<int>(IH), static_cast<int>(IW), v_tile, v_p_stride, lanes);
                 } else {
-                    k::winograd43_input_channel_last<T>(
+                    k::winograd43_input<T>(
                         task_in + ic, in_row, IC, static_cast<int>(ih0), static_cast<int>(iw0),
                         static_cast<int>(IH), static_cast<int>(IW), v_tile, v_p_stride, lanes);
                 }
@@ -280,11 +280,11 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
                     const T* bias_oc = b_ptr ? b_ptr + g * oc_per_group + ocn0 + oc : nullptr;
                     const T* m_tile = m_all + tl * m_oc_stride + oc;
                     if constexpr (O == WinoOrder::F23) {
-                        k::winograd_output_channel_last<T>(m_tile, m_p_stride, dst, attrs.epilogue,
+                        k::winograd_output<T>(m_tile, m_p_stride, dst, attrs.epilogue,
                                                            bias_oc, attrs.add_to, lanes,
                                                            attrs.residual_pre_activation);
                     } else {
-                        k::winograd43_output_channel_last<T>(m_tile, m_p_stride, dst,
+                        k::winograd43_output<T>(m_tile, m_p_stride, dst,
                                                              attrs.epilogue, bias_oc, attrs.add_to,
                                                              lanes, attrs.residual_pre_activation);
                     }

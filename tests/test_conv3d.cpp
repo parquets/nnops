@@ -13,7 +13,6 @@
 /// Weight:  [OC, IC/G, KD, KH, KW]
 /// Output:  [N, OC, OD, OH, OW] stored NDHWC
 
-#include "backend/cpu/simd_kernel/simd_im2col.hpp"
 #include "nnops/ops/conv3d.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
@@ -520,73 +519,5 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
         const TensorView ins[] = {in_view, w_view};
         NNOPS_EXPECT_EQ(op->compute(outs, ins, ctx), Status::ok);
         NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-5f, 1e-5f));
-    }
-}
-
-// ============================================================
-// tiled_im2col_3d kernel correctness (vs brute-force)
-// ============================================================
-NNOPS_TEST(conv3d_im2col_kernel_matches_ref) {
-    // tiled_im2col_3d vs a naive per-position gather, across stride / padding /
-    // dilation / block-origin.
-    struct Cfg { int ID, IH, IW, KD, KH, KW, SD, SH, SW, DD, DH, DW, PD, PH, PW;
-                 int rod, roh, row, rd, rh, rw; };
-    const Cfg cfgs[] = {
-        // full output, pad 1, stride 1, dilation 1, block at origin
-        {5, 5, 5, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1,  0, 0, 0, 5, 5, 5},
-        // no pad, stride 2
-        {6, 6, 6, 2, 2, 2, 2, 2, 2, 1, 1, 1, 0, 0, 0,  0, 0, 0, 3, 3, 3},
-        // dilation 2, pad 2
-        {7, 7, 7, 3, 3, 3, 1, 1, 1, 2, 2, 2, 2, 2, 2,  0, 0, 0, 7, 7, 7},
-        // sub-block at a non-zero origin (local vs global padding differ)
-        {6, 6, 6, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1,  1, 1, 0, 3, 4, 6},
-    };
-
-    for (const auto& c : cfgs) {
-        const int64_t ishape[] = {1, 1, c.ID, c.IH, c.IW};
-        auto [in_vec, input] = test::make_random_tensor(ishape, -1.0f, 1.0f, 55);
-        const float* in = input.ptr<float>();
-
-        const int id_step = c.IH * c.IW;
-        const int ih_step = c.IW;
-        const int icn_step = c.ID * id_step;
-
-        const int karea = c.KD * c.KH * c.KW;
-        const int roi_volume = c.rd * c.rh * c.rw;
-
-        std::vector<float> col(static_cast<size_t>(karea * roi_volume), -12345.0f);
-        nnops::kernel::tiled_im2col_3d<float>(
-            col.data(), in,
-            c.rod, c.roh, c.row, c.rd, c.rh, c.rw,
-            c.PD, c.PH, c.PW,   // same pad twice: no block starts inside the padded band
-            c.PD, c.PH, c.PW,
-            1, c.ID, c.IH, c.IW,
-            icn_step, id_step, ih_step,
-            c.KD, c.KH, c.KW, c.SD, c.SH, c.SW, c.DD, c.DH, c.DW);
-
-        bool ok = true;
-        for (int kd = 0; kd < c.KD && ok; ++kd) {
-            for (int kh = 0; kh < c.KH && ok; ++kh) {
-                for (int kw = 0; kw < c.KW && ok; ++kw) {
-                    const int row0 = (kd * c.KH + kh) * c.KW + kw;
-                    for (int od = 0; od < c.rd && ok; ++od) {
-                        for (int oh = 0; oh < c.rh && ok; ++oh) {
-                            for (int ow = 0; ow < c.rw; ++ow) {
-                                const int id = (c.rod + od) * c.SD + kd * c.DD - c.PD;
-                                const int ih = (c.roh + oh) * c.SH + kh * c.DH - c.PH;
-                                const int iw = (c.row + ow) * c.SW + kw * c.DW - c.PW;
-                                float expect = 0.0f;
-                                if (id >= 0 && id < c.ID && ih >= 0 && ih < c.IH && iw >= 0 && iw < c.IW) {
-                                    expect = in[id * id_step + ih * ih_step + iw];
-                                }
-                                const float got = col[row0 * roi_volume + (od * c.rh + oh) * c.rw + ow];
-                                if (got != expect) { ok = false; break; }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        NNOPS_EXPECT_TRUE(ok);
     }
 }

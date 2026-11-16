@@ -177,10 +177,10 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs, TensorView& outpu
             for (int s = 0; s < nseg; ++s) {
                 const int64_t co = c0 + seg_off[s];
                 if constexpr (IsMax) {
-                    k::pool_channel_last<true>(out_row + co, in_img + co, pc, 0.0f, attrs.add_to,
+                    k::pool_block<true>(out_row + co, in_img + co, pc, 0.0f, attrs.add_to,
                                                seg_lanes[s]);
                 } else {
-                    k::pool_channel_last<false>(out_row + co, in_img + co, pc, avg_scale,
+                    k::pool_block<false>(out_row + co, in_img + co, pc, avg_scale,
                                                 attrs.add_to, seg_lanes[s]);
                 }
             }
@@ -234,14 +234,14 @@ void pooling_global_impl(const PoolingAttributes& attrs, TensorView& output,
         const T* in_base = in_ptr + n * in_ch_stride + c0;
         T* out_base = out_ptr + n * out_ch_stride + c0;
         if (lanes == 16) {
-            k::global_channel_last_vec<IsMax, T, 2>(out_base, in_base, p, scale, attrs.add_to,
+            k::global_plane_vec<IsMax, T, 2>(out_base, in_base, p, scale, attrs.add_to,
                                                     lanes);
         } else if (lanes > 8) {
-            k::global_channel_last_vec<IsMax, T, 2, 4, false>(out_base, in_base, p, scale,
+            k::global_plane_vec<IsMax, T, 2, 4, false>(out_base, in_base, p, scale,
                                                               attrs.add_to, lanes);
         } else {
             k::global_store_lanes(out_base,
-                                  k::global_channel_last<IsMax>(in_base, p, scale, lanes),
+                                  k::global_plane<IsMax>(in_base, p, scale, lanes),
                                   attrs.add_to, lanes);
         }
     });
@@ -516,16 +516,16 @@ void pooling_channel_last_quant_impl(const PoolingAttributes& attrs, TensorView&
             if constexpr (IsMax) {
                 if constexpr (std::is_same_v<InT, OutT>) {
                     if (use_fast && lanes == k::kChannelLanes) {
-                        k::maxpool_channel_last_quant_fast<4>(out_row + c0, in_img + c0, pc,
+                        k::maxpool_quant_fast<4>(out_row + c0, in_img + c0, pc,
                                                               out_zero);
                         continue;
                     }
                 }
-                k::pool_channel_last_quant<true, InT, OutT>(out_row + c0, in_img + c0, pc, 0.0f,
+                k::pool_block_quant<true, InT, OutT>(out_row + c0, in_img + c0, pc, 0.0f,
                                                             in_scale, in_zero, out_scale, out_zero,
                                                             attrs.add_to, lanes);
             } else {
-                k::pool_channel_last_quant<false, InT, OutT>(
+                k::pool_block_quant<false, InT, OutT>(
                     out_row + c0, in_img + c0, pc, avg_scale, in_scale, in_zero, out_scale,
                     out_zero, attrs.add_to, lanes);
             }

@@ -6,7 +6,7 @@
 /// to f32 on load and requantized on store, so a kernel templated on these needs
 /// no per-type copy.
 ///
-/// @c Full says the channel block is a whole vector. A channel-last plane's last
+/// @c Full says the channel block is a whole vector. A plane's last
 /// block holds C % 8 channels, and an 8-wide load there takes in the neighbouring
 /// pixel's channels — in bounds, so no fault, but the lanes are garbage. The short
 /// form fills those lanes from a zeroed stack copy on load and writes only the
@@ -111,7 +111,7 @@ inline auto channel_first_load(const T* row, int64_t iw0, int64_t sw, int64_t iw
 }
 
 /// Stores for R rows, r == 0 being the current output row; @c pix is the element
-/// distance between adjacent output positions (the channel count, channel-last).
+/// distance between adjacent output positions (the channel count).
 template <typename T, bool Full = true> struct FpDst {
     T* out;
     int64_t row_stride;

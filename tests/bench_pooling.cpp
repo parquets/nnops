@@ -6,7 +6,7 @@
 /// stride-2 max, both channel-last, with the pixel channels dense.
 ///
 /// The window bench isolates the channel-last 3x3 route: the straight-line
-/// `pool_channel_last_rows_3x3` against the rolled `pool_channel_last_rows` walk, over the same buffers,
+/// `pool_3x3_rows` against the rolled `pool_rows` walk, over the same buffers,
 /// by flipping `detail::pooling_3x3_roll`. Max/avg, stride 1/2, one-block and
 /// multi-block shapes, so a per-call or per-block cost shows up separately
 /// from the tap work.

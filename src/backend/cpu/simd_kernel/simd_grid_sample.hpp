@@ -1,10 +1,9 @@
 #pragma once
 /// @file simd_grid_sample.hpp
-/// @brief CPU kernels for 2D/3D grid sampling, channel-last.
+/// @brief CPU kernels for 2D/3D grid sampling.
 ///
-/// The grid itself is always dense f32, laid out channel-first as
-/// [N, (OD,) OH, OW, 2|3] — its last axis is a coordinate pair/triple, not a
-/// channel. The kernel computes the source position once per output pixel and
+/// The grid is always dense f32 in [N, (OD,) OH, OW, 2|3] order — its last axis
+/// is a coordinate pair/triple, not a channel. The kernel computes the source position once per output pixel and
 /// runs the interpolation across the whole C vector with SIMD. Zeros padding is
 /// all-or-nothing per pixel, so the channel vector is either interpolated or
 /// zeroed.
@@ -85,7 +84,7 @@ inline bool gridsample_trilinear_bounds_ok(float px, float py, float pz, int64_t
 }
 
 // ============================================================
-// Shared pixel helpers (channel-last)
+// Shared pixel helpers
 // ============================================================
 
 /// Copy one pixel's C channels, or leave `add_to` destinations untouched.
@@ -119,7 +118,7 @@ template <typename T> inline void gridsample_zero_pixel(T* dst, int64_t C, bool 
 }
 
 // ============================================================
-// Channel-last: the SIMD lane spans C
+// The SIMD lane spans C
 // ============================================================
 
 template <typename T>

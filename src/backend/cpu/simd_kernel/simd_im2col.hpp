@@ -2,35 +2,21 @@
 /// @file simd_im2col.hpp
 /// @brief SIMD im2col gathers — the gathered operand of a conv-as-GEMM.
 ///
-/// Two families:
-///  - channel-first Conv3D: one row per (ic, tap), the row spanning the current
-///    output block (the roi). tiled_im2col_3d writes a row-major col matrix
-///    [ic*karea3d][roi_volume]; out-of-input positions store zero.
-///  - channel-last Conv2D: one row per output pixel, k tap-major
-///    (k = tap*icnc + ic). A tap is a contiguous channel run, so a row is
-///    karea straight copies — the same access the 1x1 route reads for free —
-///    and that order is the weight's own (HWIO), so the ordinary panel packer
-///    reads B. Adjacent taps of one filter row merge into a single KW*icnc span
-///    when DW == 1 and ic_stride == icnc. tiled_im2col_channel_last_i8 is the same
-///    gather into s8 for the quantized route: bytes in, XORed by `xr`, the zero
-///    point as `pad`, and the k tail zeroed to kdim4 for the direct-A MMA.
+/// Two gathers, both pixel-major and tap-major (k = tap*icnc + ic):
+///  - Conv2D: one row per output pixel. A tap is a contiguous channel run, so a
+///    row is karea straight copies — the same access the 1x1 route reads for
+///    free — and that order is the weight's own (HWIO), so the ordinary panel
+///    packer reads B. Adjacent taps of one filter row merge into a single
+///    KW*icnc span when DW == 1 and ic_stride == icnc. tiled_im2col_i8 is the
+///    same gather into s8 for the quantized route: bytes in, XORed by `xr`, the
+///    zero point as `pad`, and the k tail zeroed to kdim4 for the direct-A MMA.
+///  - Conv3D: one row per output voxel, [roi_volume][icnc*karea3d]. Each tap is
+///    again one contiguous channel run; a padded tap fills its run with `pad`.
 ///
-/// Address arguments are element strides, not bytes: icn_step between input
-/// channels, ih_step between input rows (the padded row pitch), plus id_step
-/// between depth slices on the 3D route. `pad` / `pad_value` is 0 on the fp
-/// routes and the activation zero point on the pre-quantized one.
-///
-/// Padding on the 3D route: the *local* pad (the part inside this block) says
-/// where the valid region starts; the *global* pad (the operator's PD/PH/PW)
-/// says where it ends and what the input address is. Mixing them yields
-/// off-by-padding input rows on every block after the first.
-///
-/// The fused pack zero-fills the columns past roi_area in the last panel,
-/// because the MMA reads all NR lanes of every panel row. A panel row is the
-/// unit of work, so it takes a compile-time store sequence: a dynamic-length
-/// loop cannot be unrolled, and it measured ~3x per row. Width copies use an
-/// L-wide SIMD loop at stride_w == 1 (the dominant case), a scalar stride_w
-/// loop otherwise.
+/// Address arguments are element strides, not bytes. The 2D gather takes the
+/// input row stride and the channel step; the 3D gather takes the pixel, row
+/// and depth strides. `pad` / `pad_value` is 0 on the fp routes and the
+/// activation zero point on the pre-quantized one.
 
 #include "backend/cpu/common/common_utils.hpp"
 #include "nnops/detail/half.hpp"
@@ -47,93 +33,13 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-/// 3D Conv3D gather into
-/// col_data[ic*karea3d + (kd*kernel_h + kh)*kernel_w + kw][roi_d*roi_h*roi_w];
-/// out-of-input positions are zero. This one zeroes each row and copies the
-/// valid interior — simpler for the 6-face/12-edge padding of a 3D block.
-template <class T>
-inline void tiled_im2col_3d(T* col_data, const T* input, int roi_od, int roi_oh,
-                            int roi_ow,                      // roi origin (global output coords)
-                            int roi_d, int roi_h, int roi_w, // roi extent (block sizes)
-                            int pad_d_local, int pad_h_local, int pad_w_local, int pad_d_global,
-                            int pad_h_global, int pad_w_global, int in_channel, int in_d, int in_h,
-                            int in_w, int icn_step, int id_step, int ih_step, int kernel_d,
-                            int kernel_h, int kernel_w, int stride_d, int stride_h, int stride_w,
-                            int dilate_d, int dilate_h, int dilate_w) noexcept
-{
-    const int karea = kernel_d * kernel_h * kernel_w;
-    const int roi_volume = roi_d * roi_h * roi_w;
-    constexpr int L = simd_lane_for<T>;
+// ---- gathers ------------------------------------------
 
-    for (int ic = 0; ic < in_channel; ++ic) {
-        const T* input_ptr = input + ic * icn_step;
-        for (int kd = 0; kd < kernel_d; ++kd) {
-            const int ikd = kd * dilate_d;
-            const int od_beg =
-                std::max(0, (int)std::ceil((pad_d_local - ikd) / (float)stride_d) - roi_od);
-            const int od_end = std::max(
-                od_beg,
-                std::min(roi_d,
-                         (int)std::ceil((pad_d_global + in_d - ikd) / (float)stride_d) - roi_od));
-
-            for (int kh = 0; kh < kernel_h; ++kh) {
-                const int ikh = kh * dilate_h;
-                const int oh_beg =
-                    std::max(0, (int)std::ceil((pad_h_local - ikh) / (float)stride_h) - roi_oh);
-                const int oh_end = std::max(
-                    oh_beg,
-                    std::min(roi_h, (int)std::ceil((pad_h_global + in_h - ikh) / (float)stride_h) -
-                                        roi_oh));
-
-                for (int kw = 0; kw < kernel_w; ++kw) {
-                    const int ikw = kw * dilate_w;
-                    const int ow_beg =
-                        std::max(0, (int)std::ceil((pad_w_local - ikw) / (float)stride_w) - roi_ow);
-                    const int ow_end = std::max(
-                        ow_beg, std::min(roi_w, (int)std::ceil((pad_w_global + in_w - ikw) /
-                                                               (float)stride_w) -
-                                                    roi_ow));
-
-                    T* col_ptr =
-                        col_data + (ic * karea + (kd * kernel_h + kh) * kernel_w + kw) * roi_volume;
-
-                    std::memset(col_ptr, 0, sizeof(T) * static_cast<size_t>(roi_volume));
-
-                    int id_paded = (od_beg + roi_od) * stride_d - pad_d_global + ikd;
-                    for (int od = od_beg; od < od_end; ++od, id_paded += stride_d) {
-                        const T* d_ptr = input_ptr + id_paded * id_step;
-                        int ih_paded = (oh_beg + roi_oh) * stride_h - pad_h_global + ikh;
-
-                        for (int oh = oh_beg; oh < oh_end; ++oh, ih_paded += stride_h) {
-                            const T* in_row = d_ptr + ih_paded * ih_step;
-                            int iw_paded = (ow_beg + roi_ow) * stride_w - pad_w_global + ikw;
-                            T* out_row = col_ptr + (od * roi_h + oh) * roi_w;
-
-                            int w = ow_beg;
-                            int in_id = iw_paded;
-                            if (stride_w == 1) {
-                                for (; w + L <= ow_end; w += L, in_id += L) {
-                                    v_store(out_row + w, v_load(in_row + in_id));
-                                }
-                            }
-                            for (; w < ow_end; ++w, in_id += stride_w) {
-                                out_row[w] = in_row[in_id];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ---- channel-last gathers ------------------------------------------
-
-/// 3D channel-last gather into a pixel-major, tap-major col:
+/// 3D gather into a pixel-major, tap-major col:
 /// a[pixel][tap·icnc + ic]. A pixel is a whole channel run, so one tap is one
 /// contiguous copy of `icnc` values; a padded tap writes the pad value.
 template <class T>
-inline void tiled_im2col_3d_channel_last(
+inline void tiled_im2col_3d(
     T* NNOPS_RESTRICT a, int lda, const T* NNOPS_RESTRICT in, int64_t in_pix_stride,
     int64_t in_d_stride, int64_t in_row_stride, int icnc, int od0, int oh0, int rd, int rh,
     int rw, int in_d, int in_h, int in_w, int kernel_d, int kernel_h, int kernel_w, int stride_d,
@@ -205,7 +111,7 @@ inline void tiled_im2col_3d_channel_last(
 /// @p flat walks the tile past a row end into the next, legal only because the
 /// rows are dense.
 template <class T>
-inline void tiled_im2col_channel_last(T* NNOPS_RESTRICT a, int lda, const T* NNOPS_RESTRICT in,
+inline void tiled_im2col(T* NNOPS_RESTRICT a, int lda, const T* NNOPS_RESTRICT in,
                                       int64_t in_row_stride, int64_t ic_stride, T pad, int64_t p0,
                                       int OW, bool flat, int mc, int IH, int IW, int KH, int KW,
                                       int SH, int SW, int DH, int DW, int PH, int PW, int icnc,
@@ -333,7 +239,7 @@ inline void tiled_im2col_channel_last(T* NNOPS_RESTRICT a, int lda, const T* NNO
 /// @p kdim4 is zeroed so the direct-A kernel, which reads whole 4-byte groups,
 /// sees a zero product there (the B panel is zero-padded over the same range).
 /// @p p0 / @p flat mean what they do in the fp gather.
-inline void tiled_im2col_channel_last_i8(int8_t* NNOPS_RESTRICT a, int lda,
+inline void tiled_im2col_i8(int8_t* NNOPS_RESTRICT a, int lda,
                                          const uint8_t* NNOPS_RESTRICT in, int64_t in_row_stride,
                                          int64_t ic_stride, uint8_t xr, uint8_t pad, int64_t p0,
                                          int OW, bool flat, int mc, int IH, int IW, int KH, int KW,

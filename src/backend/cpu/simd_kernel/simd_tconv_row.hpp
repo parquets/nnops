@@ -7,7 +7,7 @@
 /// Every route of the operator — pixel, col, depthwise, 2-D or 3-D, fp or int8
 /// — reduces to "add this tap's run into that row", so these are the leaves of
 /// all of them. The walks that produce the runs are
-/// simd_col2im.hpp; the merge that ends a channel-last row is route glue and
+/// simd_col2im.hpp; the merge that ends a row is route glue and
 /// lives in conv/tconv_cl.h.
 
 #include "nnops/detail/simd/simd.hpp"

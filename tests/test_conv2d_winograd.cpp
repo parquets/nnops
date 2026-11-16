@@ -211,7 +211,7 @@ NNOPS_TEST(wino43_input_transform_matches_naive) {
 
     std::vector<float> v(36 * kVPlane, -99.0f);
     const int th = 2, tw = 2;  // tile [8..11] x [8..11]: its window ends at 13
-    nnops::kernel::winograd43_input_channel_last<float>(
+    nnops::kernel::winograd43_input<float>(
         plane.data(), IW * IC, IC, 4 * th, 4 * tw, IH, IW,
         v.data(), kVPlane, IC);
 
@@ -251,7 +251,7 @@ NNOPS_TEST(wino43_output_transform_matches_naive) {
     }
     p[3][2] = nullptr;  // past the output extent: must stay untouched
     const Epilogue ep{};
-    nnops::kernel::winograd43_output_channel_last<float>(m.data(), kOcn, p, ep, bias.data(),
+    nnops::kernel::winograd43_output<float>(m.data(), kOcn, p, ep, bias.data(),
                                                  false, kOcn);
 
     for (int k = 0; k < kOcn; ++k) {
