@@ -243,6 +243,75 @@ template <class Elem> __device__ __forceinline__ Elem manual_zero()
     return manual_from_float<Elem>(0.0f);
 }
 
+/// One staged pair of panels through the warp's MMA grid: four ldmatrix reads per
+/// m atom and two per n atom, then the m16n8k16 products. The panels are indexed
+/// in `S`'s own layouts, so a kernel that fills them by any means -- a dense copy
+/// or a convolution gather -- can call this for its mainloop.
+template <class S, class Elem, bool TransA, bool TransB>
+__device__ __forceinline__ void manual_gemm_h_tile(const Elem* sA, const Elem* sB, int warp_m,
+                                                   int warp_n, int lane,
+                                                   float (&acc)[S::MA][S::NA][4])
+{
+    constexpr int MA = S::MA, NA = S::NA;
+    uint32_t frA[MA][4];
+    uint32_t frB[NA][2];
+    const int ld_row = lane % 16;
+    const int ld_col = (lane / 16) * 8;
+#pragma unroll
+    for (int ks = 0; ks < S::kKSteps; ++ks) {
+        const int kcol = ks * 16;
+#pragma unroll
+        for (int i = 0; i < MA; ++i) {
+            if constexpr (!TransA) {
+                const Elem* src = &sA[manual_swz<S>(warp_m * S::WM + i * 16 + ld_row, kcol + ld_col)];
+                ldmatrix_x4(&frA[i][0], &frA[i][1], &frA[i][2], &frA[i][3], src);
+            } else {
+                // `[k][m]` transposed on load: (k0-7,m0-7) and (k8-15,m0-7) land
+                // as a0/a2, the m+8 pair as a1/a3.
+                const Elem* src =
+                    &sA[manual_swz_t<S>(kcol + ld_row, warp_m * S::WM + i * 16 + ld_col)];
+                uint32_t r0, r1, r2, r3;
+                ldmatrix_x4_trans(&r0, &r1, &r2, &r3, src);
+                frA[i][0] = r0;
+                frA[i][1] = r2;
+                frA[i][2] = r1;
+                frA[i][3] = r3;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NA; j += 2) {
+            uint32_t r0, r1, r2, r3;
+            if constexpr (TransB) {
+                // `[n][k]`: the four 8x8 panels are (n0-7,k0-7), (n8-15,k0-7),
+                // (n0-7,k8-15), (n8-15,k8-15).
+                const Elem* src = &sB[manual_swz<S>(warp_n * S::WN + j * 8 + ld_row, kcol + ld_col)];
+                ldmatrix_x4(&r0, &r1, &r2, &r3, src);
+                frB[j][0] = r0;
+                frB[j][1] = r2;
+                frB[j + 1][0] = r1;
+                frB[j + 1][1] = r3;
+            } else {
+                // `[k][n]` transposed on load: (k0-7,n0-7), (k8-15,n0-7),
+                // (k0-7,n8-15), (k8-15,n8-15) are the two atoms' b0/b1.
+                const Elem* src =
+                    &sB[manual_swz_n<S>(kcol + ld_row, warp_n * S::WN + j * 8 + ld_col)];
+                ldmatrix_x4_trans(&r0, &r1, &r2, &r3, src);
+                frB[j][0] = r0;
+                frB[j][1] = r1;
+                frB[j + 1][0] = r2;
+                frB[j + 1][1] = r3;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < MA; ++i) {
+#pragma unroll
+            for (int j = 0; j < NA; ++j) {
+                manual_mma<Elem>(acc[i][j], frA[i], frB[j]);
+            }
+        }
+    }
+}
+
 /// The 16-bit GEMM: per-warp value tile from `S`, cp.async ring, swizzled panels.
 template <class S, class Elem, bool TransA, bool TransB>
 __global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_h_kernel(ManualHParams p)
@@ -434,11 +503,6 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_h_kernel
                 acc[i][j][t] = 0.0f;
             }
 
-    uint32_t frA[MA][4];
-    uint32_t frB[NA][2];
-    const int ld_row = lane % 16;
-    const int ld_col = (lane / 16) * 8;
-
     // Prime every stage but one; the loop then keeps exactly ST groups in flight,
     // so `wait_group<ST-1>` retires precisely the tile about to be consumed.
 #pragma unroll
@@ -454,63 +518,9 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_h_kernel
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
 
-        const Elem* const sA = sAbase + stage * S::kAMax;
-        const Elem* const sB = sBbase + stage * S::kBMax;
-#pragma unroll
-        for (int ks = 0; ks < S::kKSteps; ++ks) {
-            const int kcol = ks * 16;
-#pragma unroll
-            for (int i = 0; i < MA; ++i) {
-                if constexpr (!TransA) {
-                    const Elem* src =
-                        &sA[manual_swz<S>(warp_m * WM + i * 16 + ld_row, kcol + ld_col)];
-                    ldmatrix_x4(&frA[i][0], &frA[i][1], &frA[i][2], &frA[i][3], src);
-                } else {
-                    // `[k][m]` transposed on load: (k0-7,m0-7) and (k8-15,m0-7)
-                    // land as a0/a2, the m+8 pair as a1/a3.
-                    const Elem* src =
-                        &sA[manual_swz_t<S>(kcol + ld_row, warp_m * WM + i * 16 + ld_col)];
-                    uint32_t r0, r1, r2, r3;
-                    ldmatrix_x4_trans(&r0, &r1, &r2, &r3, src);
-                    frA[i][0] = r0;
-                    frA[i][1] = r2;
-                    frA[i][2] = r1;
-                    frA[i][3] = r3;
-                }
-            }
-#pragma unroll
-            for (int j = 0; j < NA; j += 2) {
-                uint32_t r0, r1, r2, r3;
-                if constexpr (TransB) {
-                    // `[n][k]`: the four 8x8 panels are (n0-7,k0-7), (n8-15,k0-7),
-                    // (n0-7,k8-15), (n8-15,k8-15).
-                    const Elem* src =
-                        &sB[manual_swz<S>(warp_n * WN + j * 8 + ld_row, kcol + ld_col)];
-                    ldmatrix_x4(&r0, &r1, &r2, &r3, src);
-                    frB[j][0] = r0;
-                    frB[j][1] = r2;
-                    frB[j + 1][0] = r1;
-                    frB[j + 1][1] = r3;
-                } else {
-                    // `[k][n]` transposed on load: (k0-7,n0-7), (k8-15,n0-7),
-                    // (k0-7,n8-15), (k8-15,n8-15) are the two atoms' b0/b1.
-                    const Elem* src =
-                        &sB[manual_swz_n<S>(kcol + ld_row, warp_n * WN + j * 8 + ld_col)];
-                    ldmatrix_x4_trans(&r0, &r1, &r2, &r3, src);
-                    frB[j][0] = r0;
-                    frB[j][1] = r1;
-                    frB[j + 1][0] = r2;
-                    frB[j + 1][1] = r3;
-                }
-            }
-#pragma unroll
-            for (int i = 0; i < MA; ++i) {
-#pragma unroll
-                for (int j = 0; j < NA; ++j) {
-                    manual_mma<Elem>(acc[i][j], frA[i], frB[j]);
-                }
-            }
-        }
+        manual_gemm_h_tile<S, Elem, TransA, TransB>(sAbase + stage * S::kAMax,
+                                                    sBbase + stage * S::kBMax, warp_m, warp_n,
+                                                    lane, acc);
     }
 
     // A split's block stops at its accumulator: the sum and the alpha belong to

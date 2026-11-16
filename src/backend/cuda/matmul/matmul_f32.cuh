@@ -112,6 +112,281 @@ struct ManualFParams {
     float* partial = nullptr;
 };
 
+/// One staged pair of panels through the register-blocked FFMA nest. The panels
+/// are addressed in `S`'s own layouts, so a kernel that fills them by any means
+/// -- a dense copy or a convolution gather -- can call this for its mainloop.
+template <class S, bool TransA, bool TransB>
+__device__ __forceinline__ void manual_gemm_f_tile(const float* sA, const float* sB, int warp_m,
+                                                   int warp_n, int lane,
+                                                   float (&acc)[S::LaneRow][S::LaneCol])
+{
+    constexpr int LR = S::LaneRow, LC = S::LaneCol, KU = S::KU;
+    constexpr int LDA = TransA ? S::LDAt : S::LDA;
+    constexpr int LDK = TransB ? S::LDk : S::LDN;
+
+    const int lrow = lane % 8;
+    const int lcol = lane / 8;
+    const int row0 = warp_m * S::warpRows + (TransA ? 4 * lrow : lrow);
+    const int col0 = warp_n * S::warpCols + lcol * LC;
+    // Per-lane panel bases, hoisted out of the k groups. Measured honestly:
+    // the SASS is byte-identical to spelling the full index per load, so
+    // ptxas was already doing this -- the 544 IADD3 in this function are not
+    // the load addressing. Kept because it reads as what the code means.
+    const float* const aRow = sA + row0 * LDA;
+    // The k-major B panel is indexed by row, so the column offset scales by
+    // the row stride; the n-major one is indexed by column inside a row.
+    const float* const bCol = sB + col0 * LDK;
+    const float* const sA_m = sA + row0;
+    const float* const sB_k = sB + col0;
+#pragma unroll
+    for (int ks = 0; ks < S::kKSteps; ++ks) {
+        // One A-fragment array for both arrival orders: the k-major panel
+        // fills it one entry per row, the m-major one one entry per (k, row
+        // group). Declaring a second array for the other order left it
+        // live -- the transposed pose used 177 registers against 152 and
+        // lost its third resident block on that alone.
+        constexpr int G = LR / 4;
+        float4 af[LR];
+        const int kv = ks * KU;
+        if constexpr (TransA) {
+#pragma unroll
+            for (int t = 0; t < KU; ++t) {
+#pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    af[t * G + g] =
+                        *reinterpret_cast<const float4*>(&sA_m[(kv + t) * LDA + 32 * g]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int r = 0; r < LR; ++r) {
+                af[r] = *reinterpret_cast<const float4*>(&aRow[(r * 8) * LDA + kv]);
+            }
+        }
+        if constexpr (TransB) {
+            // `[n][k]`: one vector per column, holding four k values.
+            float4 bv[LC];
+#pragma unroll
+            for (int c = 0; c < LC; ++c) {
+                bv[c] = *reinterpret_cast<const float4*>(&bCol[c * LDK + kv]);
+            }
+#pragma unroll
+            for (int c = 0; c < LC; ++c) {
+                const float4 b = bv[c];
+                if constexpr (!TransA) {
+#pragma unroll
+                    for (int r = 0; r < LR; ++r) {
+                        acc[r][c] = fmaf(af[r].x, b.x, acc[r][c]);
+                        acc[r][c] = fmaf(af[r].y, b.y, acc[r][c]);
+                        acc[r][c] = fmaf(af[r].z, b.z, acc[r][c]);
+                        acc[r][c] = fmaf(af[r].w, b.w, acc[r][c]);
+                    }
+                } else {
+                    // The A vector holds four rows for one k, the B vector
+                    // four k for one column: a 4-row by 4-k outer product.
+                    static_assert(KU == 4, "the transposed-A nest is a four-deep unroll");
+#pragma unroll
+                    for (int g = 0; g < LR / 4; ++g) {
+                        acc[4 * g + 0][c] = fmaf(af[0 * G + g].x, b.x, acc[4 * g + 0][c]);
+                        acc[4 * g + 0][c] = fmaf(af[1 * G + g].x, b.y, acc[4 * g + 0][c]);
+                        acc[4 * g + 0][c] = fmaf(af[2 * G + g].x, b.z, acc[4 * g + 0][c]);
+                        acc[4 * g + 0][c] = fmaf(af[3 * G + g].x, b.w, acc[4 * g + 0][c]);
+                        acc[4 * g + 1][c] = fmaf(af[0 * G + g].y, b.x, acc[4 * g + 1][c]);
+                        acc[4 * g + 1][c] = fmaf(af[1 * G + g].y, b.y, acc[4 * g + 1][c]);
+                        acc[4 * g + 1][c] = fmaf(af[2 * G + g].y, b.z, acc[4 * g + 1][c]);
+                        acc[4 * g + 1][c] = fmaf(af[3 * G + g].y, b.w, acc[4 * g + 1][c]);
+                        acc[4 * g + 2][c] = fmaf(af[0 * G + g].z, b.x, acc[4 * g + 2][c]);
+                        acc[4 * g + 2][c] = fmaf(af[1 * G + g].z, b.y, acc[4 * g + 2][c]);
+                        acc[4 * g + 2][c] = fmaf(af[2 * G + g].z, b.z, acc[4 * g + 2][c]);
+                        acc[4 * g + 2][c] = fmaf(af[3 * G + g].z, b.w, acc[4 * g + 2][c]);
+                        acc[4 * g + 3][c] = fmaf(af[0 * G + g].w, b.x, acc[4 * g + 3][c]);
+                        acc[4 * g + 3][c] = fmaf(af[1 * G + g].w, b.y, acc[4 * g + 3][c]);
+                        acc[4 * g + 3][c] = fmaf(af[2 * G + g].w, b.z, acc[4 * g + 3][c]);
+                        acc[4 * g + 3][c] = fmaf(af[3 * G + g].w, b.w, acc[4 * g + 3][c]);
+                    }
+                }
+            }
+        } else {
+            // `[k][n]`: one vector per k of the unroll, holding four
+            // adjacent columns. A lane's columns are contiguous, so a LC=8
+            // tile reads two vectors per k and the accumulator's column is
+            // the vector's component. Every lane in a lane-column reads the
+            // same vector, which the hardware broadcasts.
+            float4 bv[KU][LC / 4];
+#pragma unroll
+            for (int t = 0; t < KU; ++t) {
+#pragma unroll
+                for (int g = 0; g < LC / 4; ++g) {
+                    bv[t][g] = *reinterpret_cast<const float4*>(&sB_k[(kv + t) * LDK + 4 * g]);
+                }
+            }
+            static_assert(KU == 4, "the n-major inner loop is a four-deep unroll");
+            if constexpr (!TransA) {
+#pragma unroll
+                for (int r = 0; r < LR; ++r) {
+                    const float4 v = af[r];
+#pragma unroll
+                    for (int g = 0; g < LC / 4; ++g) {
+                        acc[r][4 * g + 0] = fmaf(v.x, bv[0][g].x, acc[r][4 * g + 0]);
+                        acc[r][4 * g + 0] = fmaf(v.y, bv[1][g].x, acc[r][4 * g + 0]);
+                        acc[r][4 * g + 0] = fmaf(v.z, bv[2][g].x, acc[r][4 * g + 0]);
+                        acc[r][4 * g + 0] = fmaf(v.w, bv[3][g].x, acc[r][4 * g + 0]);
+                        acc[r][4 * g + 1] = fmaf(v.x, bv[0][g].y, acc[r][4 * g + 1]);
+                        acc[r][4 * g + 1] = fmaf(v.y, bv[1][g].y, acc[r][4 * g + 1]);
+                        acc[r][4 * g + 1] = fmaf(v.z, bv[2][g].y, acc[r][4 * g + 1]);
+                        acc[r][4 * g + 1] = fmaf(v.w, bv[3][g].y, acc[r][4 * g + 1]);
+                        acc[r][4 * g + 2] = fmaf(v.x, bv[0][g].z, acc[r][4 * g + 2]);
+                        acc[r][4 * g + 2] = fmaf(v.y, bv[1][g].z, acc[r][4 * g + 2]);
+                        acc[r][4 * g + 2] = fmaf(v.z, bv[2][g].z, acc[r][4 * g + 2]);
+                        acc[r][4 * g + 2] = fmaf(v.w, bv[3][g].z, acc[r][4 * g + 2]);
+                        acc[r][4 * g + 3] = fmaf(v.x, bv[0][g].w, acc[r][4 * g + 3]);
+                        acc[r][4 * g + 3] = fmaf(v.y, bv[1][g].w, acc[r][4 * g + 3]);
+                        acc[r][4 * g + 3] = fmaf(v.z, bv[2][g].w, acc[r][4 * g + 3]);
+                        acc[r][4 * g + 3] = fmaf(v.w, bv[3][g].w, acc[r][4 * g + 3]);
+                    }
+                }
+            } else {
+                // Both panels are in their n/m order: the A vector is four
+                // rows of one k, the B vector four columns of one k.
+#pragma unroll
+                for (int g = 0; g < LR / 4; ++g) {
+#pragma unroll
+                    for (int h = 0; h < LC / 4; ++h) {
+                        acc[4 * g + 0][4 * h + 0] =
+                            fmaf(af[0 * G + g].x, bv[0][h].x, acc[4 * g + 0][4 * h + 0]);
+                        acc[4 * g + 0][4 * h + 0] =
+                            fmaf(af[1 * G + g].x, bv[1][h].x, acc[4 * g + 0][4 * h + 0]);
+                        acc[4 * g + 0][4 * h + 0] =
+                            fmaf(af[2 * G + g].x, bv[2][h].x, acc[4 * g + 0][4 * h + 0]);
+                        acc[4 * g + 0][4 * h + 0] =
+                            fmaf(af[3 * G + g].x, bv[3][h].x, acc[4 * g + 0][4 * h + 0]);
+                        acc[4 * g + 0][4 * h + 1] =
+                            fmaf(af[0 * G + g].x, bv[0][h].y, acc[4 * g + 0][4 * h + 1]);
+                        acc[4 * g + 0][4 * h + 1] =
+                            fmaf(af[1 * G + g].x, bv[1][h].y, acc[4 * g + 0][4 * h + 1]);
+                        acc[4 * g + 0][4 * h + 1] =
+                            fmaf(af[2 * G + g].x, bv[2][h].y, acc[4 * g + 0][4 * h + 1]);
+                        acc[4 * g + 0][4 * h + 1] =
+                            fmaf(af[3 * G + g].x, bv[3][h].y, acc[4 * g + 0][4 * h + 1]);
+                        acc[4 * g + 0][4 * h + 2] =
+                            fmaf(af[0 * G + g].x, bv[0][h].z, acc[4 * g + 0][4 * h + 2]);
+                        acc[4 * g + 0][4 * h + 2] =
+                            fmaf(af[1 * G + g].x, bv[1][h].z, acc[4 * g + 0][4 * h + 2]);
+                        acc[4 * g + 0][4 * h + 2] =
+                            fmaf(af[2 * G + g].x, bv[2][h].z, acc[4 * g + 0][4 * h + 2]);
+                        acc[4 * g + 0][4 * h + 2] =
+                            fmaf(af[3 * G + g].x, bv[3][h].z, acc[4 * g + 0][4 * h + 2]);
+                        acc[4 * g + 0][4 * h + 3] =
+                            fmaf(af[0 * G + g].x, bv[0][h].w, acc[4 * g + 0][4 * h + 3]);
+                        acc[4 * g + 0][4 * h + 3] =
+                            fmaf(af[1 * G + g].x, bv[1][h].w, acc[4 * g + 0][4 * h + 3]);
+                        acc[4 * g + 0][4 * h + 3] =
+                            fmaf(af[2 * G + g].x, bv[2][h].w, acc[4 * g + 0][4 * h + 3]);
+                        acc[4 * g + 0][4 * h + 3] =
+                            fmaf(af[3 * G + g].x, bv[3][h].w, acc[4 * g + 0][4 * h + 3]);
+                        acc[4 * g + 1][4 * h + 0] =
+                            fmaf(af[0 * G + g].y, bv[0][h].x, acc[4 * g + 1][4 * h + 0]);
+                        acc[4 * g + 1][4 * h + 0] =
+                            fmaf(af[1 * G + g].y, bv[1][h].x, acc[4 * g + 1][4 * h + 0]);
+                        acc[4 * g + 1][4 * h + 0] =
+                            fmaf(af[2 * G + g].y, bv[2][h].x, acc[4 * g + 1][4 * h + 0]);
+                        acc[4 * g + 1][4 * h + 0] =
+                            fmaf(af[3 * G + g].y, bv[3][h].x, acc[4 * g + 1][4 * h + 0]);
+                        acc[4 * g + 1][4 * h + 1] =
+                            fmaf(af[0 * G + g].y, bv[0][h].y, acc[4 * g + 1][4 * h + 1]);
+                        acc[4 * g + 1][4 * h + 1] =
+                            fmaf(af[1 * G + g].y, bv[1][h].y, acc[4 * g + 1][4 * h + 1]);
+                        acc[4 * g + 1][4 * h + 1] =
+                            fmaf(af[2 * G + g].y, bv[2][h].y, acc[4 * g + 1][4 * h + 1]);
+                        acc[4 * g + 1][4 * h + 1] =
+                            fmaf(af[3 * G + g].y, bv[3][h].y, acc[4 * g + 1][4 * h + 1]);
+                        acc[4 * g + 1][4 * h + 2] =
+                            fmaf(af[0 * G + g].y, bv[0][h].z, acc[4 * g + 1][4 * h + 2]);
+                        acc[4 * g + 1][4 * h + 2] =
+                            fmaf(af[1 * G + g].y, bv[1][h].z, acc[4 * g + 1][4 * h + 2]);
+                        acc[4 * g + 1][4 * h + 2] =
+                            fmaf(af[2 * G + g].y, bv[2][h].z, acc[4 * g + 1][4 * h + 2]);
+                        acc[4 * g + 1][4 * h + 2] =
+                            fmaf(af[3 * G + g].y, bv[3][h].z, acc[4 * g + 1][4 * h + 2]);
+                        acc[4 * g + 1][4 * h + 3] =
+                            fmaf(af[0 * G + g].y, bv[0][h].w, acc[4 * g + 1][4 * h + 3]);
+                        acc[4 * g + 1][4 * h + 3] =
+                            fmaf(af[1 * G + g].y, bv[1][h].w, acc[4 * g + 1][4 * h + 3]);
+                        acc[4 * g + 1][4 * h + 3] =
+                            fmaf(af[2 * G + g].y, bv[2][h].w, acc[4 * g + 1][4 * h + 3]);
+                        acc[4 * g + 1][4 * h + 3] =
+                            fmaf(af[3 * G + g].y, bv[3][h].w, acc[4 * g + 1][4 * h + 3]);
+                        acc[4 * g + 2][4 * h + 0] =
+                            fmaf(af[0 * G + g].z, bv[0][h].x, acc[4 * g + 2][4 * h + 0]);
+                        acc[4 * g + 2][4 * h + 0] =
+                            fmaf(af[1 * G + g].z, bv[1][h].x, acc[4 * g + 2][4 * h + 0]);
+                        acc[4 * g + 2][4 * h + 0] =
+                            fmaf(af[2 * G + g].z, bv[2][h].x, acc[4 * g + 2][4 * h + 0]);
+                        acc[4 * g + 2][4 * h + 0] =
+                            fmaf(af[3 * G + g].z, bv[3][h].x, acc[4 * g + 2][4 * h + 0]);
+                        acc[4 * g + 2][4 * h + 1] =
+                            fmaf(af[0 * G + g].z, bv[0][h].y, acc[4 * g + 2][4 * h + 1]);
+                        acc[4 * g + 2][4 * h + 1] =
+                            fmaf(af[1 * G + g].z, bv[1][h].y, acc[4 * g + 2][4 * h + 1]);
+                        acc[4 * g + 2][4 * h + 1] =
+                            fmaf(af[2 * G + g].z, bv[2][h].y, acc[4 * g + 2][4 * h + 1]);
+                        acc[4 * g + 2][4 * h + 1] =
+                            fmaf(af[3 * G + g].z, bv[3][h].y, acc[4 * g + 2][4 * h + 1]);
+                        acc[4 * g + 2][4 * h + 2] =
+                            fmaf(af[0 * G + g].z, bv[0][h].z, acc[4 * g + 2][4 * h + 2]);
+                        acc[4 * g + 2][4 * h + 2] =
+                            fmaf(af[1 * G + g].z, bv[1][h].z, acc[4 * g + 2][4 * h + 2]);
+                        acc[4 * g + 2][4 * h + 2] =
+                            fmaf(af[2 * G + g].z, bv[2][h].z, acc[4 * g + 2][4 * h + 2]);
+                        acc[4 * g + 2][4 * h + 2] =
+                            fmaf(af[3 * G + g].z, bv[3][h].z, acc[4 * g + 2][4 * h + 2]);
+                        acc[4 * g + 2][4 * h + 3] =
+                            fmaf(af[0 * G + g].z, bv[0][h].w, acc[4 * g + 2][4 * h + 3]);
+                        acc[4 * g + 2][4 * h + 3] =
+                            fmaf(af[1 * G + g].z, bv[1][h].w, acc[4 * g + 2][4 * h + 3]);
+                        acc[4 * g + 2][4 * h + 3] =
+                            fmaf(af[2 * G + g].z, bv[2][h].w, acc[4 * g + 2][4 * h + 3]);
+                        acc[4 * g + 2][4 * h + 3] =
+                            fmaf(af[3 * G + g].z, bv[3][h].w, acc[4 * g + 2][4 * h + 3]);
+                        acc[4 * g + 3][4 * h + 0] =
+                            fmaf(af[0 * G + g].w, bv[0][h].x, acc[4 * g + 3][4 * h + 0]);
+                        acc[4 * g + 3][4 * h + 0] =
+                            fmaf(af[1 * G + g].w, bv[1][h].x, acc[4 * g + 3][4 * h + 0]);
+                        acc[4 * g + 3][4 * h + 0] =
+                            fmaf(af[2 * G + g].w, bv[2][h].x, acc[4 * g + 3][4 * h + 0]);
+                        acc[4 * g + 3][4 * h + 0] =
+                            fmaf(af[3 * G + g].w, bv[3][h].x, acc[4 * g + 3][4 * h + 0]);
+                        acc[4 * g + 3][4 * h + 1] =
+                            fmaf(af[0 * G + g].w, bv[0][h].y, acc[4 * g + 3][4 * h + 1]);
+                        acc[4 * g + 3][4 * h + 1] =
+                            fmaf(af[1 * G + g].w, bv[1][h].y, acc[4 * g + 3][4 * h + 1]);
+                        acc[4 * g + 3][4 * h + 1] =
+                            fmaf(af[2 * G + g].w, bv[2][h].y, acc[4 * g + 3][4 * h + 1]);
+                        acc[4 * g + 3][4 * h + 1] =
+                            fmaf(af[3 * G + g].w, bv[3][h].y, acc[4 * g + 3][4 * h + 1]);
+                        acc[4 * g + 3][4 * h + 2] =
+                            fmaf(af[0 * G + g].w, bv[0][h].z, acc[4 * g + 3][4 * h + 2]);
+                        acc[4 * g + 3][4 * h + 2] =
+                            fmaf(af[1 * G + g].w, bv[1][h].z, acc[4 * g + 3][4 * h + 2]);
+                        acc[4 * g + 3][4 * h + 2] =
+                            fmaf(af[2 * G + g].w, bv[2][h].z, acc[4 * g + 3][4 * h + 2]);
+                        acc[4 * g + 3][4 * h + 2] =
+                            fmaf(af[3 * G + g].w, bv[3][h].z, acc[4 * g + 3][4 * h + 2]);
+                        acc[4 * g + 3][4 * h + 3] =
+                            fmaf(af[0 * G + g].w, bv[0][h].w, acc[4 * g + 3][4 * h + 3]);
+                        acc[4 * g + 3][4 * h + 3] =
+                            fmaf(af[1 * G + g].w, bv[1][h].w, acc[4 * g + 3][4 * h + 3]);
+                        acc[4 * g + 3][4 * h + 3] =
+                            fmaf(af[2 * G + g].w, bv[2][h].w, acc[4 * g + 3][4 * h + 3]);
+                        acc[4 * g + 3][4 * h + 3] =
+                            fmaf(af[3 * G + g].w, bv[3][h].w, acc[4 * g + 3][4 * h + 3]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The f32 tile: 8x8 per thread, cp.async ring, padded panels.
 template <class S, bool TransA, bool TransB>
 __global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_f_kernel(ManualFParams p)
@@ -343,264 +618,11 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_f_kernel
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
 
-        // Per-lane panel bases, hoisted out of the k groups. Measured honestly:
-        // the SASS is byte-identical to spelling the full index per load, so
-        // ptxas was already doing this -- the 544 IADD3 in this function are not
-        // the load addressing. Kept because it reads as what the code means.
-        const float* const aRow = sAbase + stage * S::kAMax + row0 * LDA;
-        // The k-major B panel is indexed by row, so the column offset scales by
-        // the row stride; the n-major one is indexed by column inside a row.
-        const float* const bCol = sBbase + stage * S::kBMax + col0 * LDK;
-        const float* const sA_m = sAbase + stage * S::kAMax + row0;
-        const float* const sB_k = sBbase + stage * S::kBMax + col0;
-#pragma unroll
-        for (int ks = 0; ks < S::kKSteps; ++ks) {
-            // One A-fragment array for both arrival orders: the k-major panel
-            // fills it one entry per row, the m-major one one entry per (k, row
-            // group). Declaring a second array for the other order left it
-            // live -- the transposed pose used 177 registers against 152 and
-            // lost its third resident block on that alone.
-            constexpr int G = LR / 4;
-            float4 af[LR];
-            const int kv = ks * KU;
-            if constexpr (TransA) {
-#pragma unroll
-                for (int t = 0; t < KU; ++t) {
-#pragma unroll
-                    for (int g = 0; g < G; ++g) {
-                        af[t * G + g] =
-                            *reinterpret_cast<const float4*>(&sA_m[(kv + t) * LDA + 32 * g]);
-                    }
-                }
-            } else {
-#pragma unroll
-                for (int r = 0; r < LR; ++r) {
-                    af[r] = *reinterpret_cast<const float4*>(&aRow[(r * 8) * LDA + kv]);
-                }
-            }
-            if constexpr (TransB) {
-                // `[n][k]`: one vector per column, holding four k values.
-                float4 bv[LC];
-#pragma unroll
-                for (int c = 0; c < LC; ++c) {
-                    bv[c] = *reinterpret_cast<const float4*>(&bCol[c * LDK + kv]);
-                }
-#pragma unroll
-                for (int c = 0; c < LC; ++c) {
-                    const float4 b = bv[c];
-                    if constexpr (!TransA) {
-#pragma unroll
-                        for (int r = 0; r < LR; ++r) {
-                            acc[r][c] = fmaf(af[r].x, b.x, acc[r][c]);
-                            acc[r][c] = fmaf(af[r].y, b.y, acc[r][c]);
-                            acc[r][c] = fmaf(af[r].z, b.z, acc[r][c]);
-                            acc[r][c] = fmaf(af[r].w, b.w, acc[r][c]);
-                        }
-                    } else {
-                        // The A vector holds four rows for one k, the B vector
-                        // four k for one column: a 4-row by 4-k outer product.
-                        static_assert(KU == 4, "the transposed-A nest is a four-deep unroll");
-#pragma unroll
-                        for (int g = 0; g < LR / 4; ++g) {
-                            acc[4 * g + 0][c] = fmaf(af[0 * G + g].x, b.x, acc[4 * g + 0][c]);
-                            acc[4 * g + 0][c] = fmaf(af[1 * G + g].x, b.y, acc[4 * g + 0][c]);
-                            acc[4 * g + 0][c] = fmaf(af[2 * G + g].x, b.z, acc[4 * g + 0][c]);
-                            acc[4 * g + 0][c] = fmaf(af[3 * G + g].x, b.w, acc[4 * g + 0][c]);
-                            acc[4 * g + 1][c] = fmaf(af[0 * G + g].y, b.x, acc[4 * g + 1][c]);
-                            acc[4 * g + 1][c] = fmaf(af[1 * G + g].y, b.y, acc[4 * g + 1][c]);
-                            acc[4 * g + 1][c] = fmaf(af[2 * G + g].y, b.z, acc[4 * g + 1][c]);
-                            acc[4 * g + 1][c] = fmaf(af[3 * G + g].y, b.w, acc[4 * g + 1][c]);
-                            acc[4 * g + 2][c] = fmaf(af[0 * G + g].z, b.x, acc[4 * g + 2][c]);
-                            acc[4 * g + 2][c] = fmaf(af[1 * G + g].z, b.y, acc[4 * g + 2][c]);
-                            acc[4 * g + 2][c] = fmaf(af[2 * G + g].z, b.z, acc[4 * g + 2][c]);
-                            acc[4 * g + 2][c] = fmaf(af[3 * G + g].z, b.w, acc[4 * g + 2][c]);
-                            acc[4 * g + 3][c] = fmaf(af[0 * G + g].w, b.x, acc[4 * g + 3][c]);
-                            acc[4 * g + 3][c] = fmaf(af[1 * G + g].w, b.y, acc[4 * g + 3][c]);
-                            acc[4 * g + 3][c] = fmaf(af[2 * G + g].w, b.z, acc[4 * g + 3][c]);
-                            acc[4 * g + 3][c] = fmaf(af[3 * G + g].w, b.w, acc[4 * g + 3][c]);
-                        }
-                    }
-                }
-            } else {
-                // `[k][n]`: one vector per k of the unroll, holding four
-                // adjacent columns. A lane's columns are contiguous, so a LC=8
-                // tile reads two vectors per k and the accumulator's column is
-                // the vector's component. Every lane in a lane-column reads the
-                // same vector, which the hardware broadcasts.
-                float4 bv[KU][LC / 4];
-#pragma unroll
-                for (int t = 0; t < KU; ++t) {
-#pragma unroll
-                    for (int g = 0; g < LC / 4; ++g) {
-                        bv[t][g] = *reinterpret_cast<const float4*>(&sB_k[(kv + t) * LDK + 4 * g]);
-                    }
-                }
-                static_assert(KU == 4, "the n-major inner loop is a four-deep unroll");
-                if constexpr (!TransA) {
-#pragma unroll
-                    for (int r = 0; r < LR; ++r) {
-                        const float4 v = af[r];
-#pragma unroll
-                        for (int g = 0; g < LC / 4; ++g) {
-                            acc[r][4 * g + 0] = fmaf(v.x, bv[0][g].x, acc[r][4 * g + 0]);
-                            acc[r][4 * g + 0] = fmaf(v.y, bv[1][g].x, acc[r][4 * g + 0]);
-                            acc[r][4 * g + 0] = fmaf(v.z, bv[2][g].x, acc[r][4 * g + 0]);
-                            acc[r][4 * g + 0] = fmaf(v.w, bv[3][g].x, acc[r][4 * g + 0]);
-                            acc[r][4 * g + 1] = fmaf(v.x, bv[0][g].y, acc[r][4 * g + 1]);
-                            acc[r][4 * g + 1] = fmaf(v.y, bv[1][g].y, acc[r][4 * g + 1]);
-                            acc[r][4 * g + 1] = fmaf(v.z, bv[2][g].y, acc[r][4 * g + 1]);
-                            acc[r][4 * g + 1] = fmaf(v.w, bv[3][g].y, acc[r][4 * g + 1]);
-                            acc[r][4 * g + 2] = fmaf(v.x, bv[0][g].z, acc[r][4 * g + 2]);
-                            acc[r][4 * g + 2] = fmaf(v.y, bv[1][g].z, acc[r][4 * g + 2]);
-                            acc[r][4 * g + 2] = fmaf(v.z, bv[2][g].z, acc[r][4 * g + 2]);
-                            acc[r][4 * g + 2] = fmaf(v.w, bv[3][g].z, acc[r][4 * g + 2]);
-                            acc[r][4 * g + 3] = fmaf(v.x, bv[0][g].w, acc[r][4 * g + 3]);
-                            acc[r][4 * g + 3] = fmaf(v.y, bv[1][g].w, acc[r][4 * g + 3]);
-                            acc[r][4 * g + 3] = fmaf(v.z, bv[2][g].w, acc[r][4 * g + 3]);
-                            acc[r][4 * g + 3] = fmaf(v.w, bv[3][g].w, acc[r][4 * g + 3]);
-                        }
-                    }
-                } else {
-                    // Both panels are in their n/m order: the A vector is four
-                    // rows of one k, the B vector four columns of one k.
-#pragma unroll
-                    for (int g = 0; g < LR / 4; ++g) {
-#pragma unroll
-                        for (int h = 0; h < LC / 4; ++h) {
-                            acc[4 * g + 0][4 * h + 0] =
-                                fmaf(af[0 * G + g].x, bv[0][h].x, acc[4 * g + 0][4 * h + 0]);
-                            acc[4 * g + 0][4 * h + 0] =
-                                fmaf(af[1 * G + g].x, bv[1][h].x, acc[4 * g + 0][4 * h + 0]);
-                            acc[4 * g + 0][4 * h + 0] =
-                                fmaf(af[2 * G + g].x, bv[2][h].x, acc[4 * g + 0][4 * h + 0]);
-                            acc[4 * g + 0][4 * h + 0] =
-                                fmaf(af[3 * G + g].x, bv[3][h].x, acc[4 * g + 0][4 * h + 0]);
-                            acc[4 * g + 0][4 * h + 1] =
-                                fmaf(af[0 * G + g].x, bv[0][h].y, acc[4 * g + 0][4 * h + 1]);
-                            acc[4 * g + 0][4 * h + 1] =
-                                fmaf(af[1 * G + g].x, bv[1][h].y, acc[4 * g + 0][4 * h + 1]);
-                            acc[4 * g + 0][4 * h + 1] =
-                                fmaf(af[2 * G + g].x, bv[2][h].y, acc[4 * g + 0][4 * h + 1]);
-                            acc[4 * g + 0][4 * h + 1] =
-                                fmaf(af[3 * G + g].x, bv[3][h].y, acc[4 * g + 0][4 * h + 1]);
-                            acc[4 * g + 0][4 * h + 2] =
-                                fmaf(af[0 * G + g].x, bv[0][h].z, acc[4 * g + 0][4 * h + 2]);
-                            acc[4 * g + 0][4 * h + 2] =
-                                fmaf(af[1 * G + g].x, bv[1][h].z, acc[4 * g + 0][4 * h + 2]);
-                            acc[4 * g + 0][4 * h + 2] =
-                                fmaf(af[2 * G + g].x, bv[2][h].z, acc[4 * g + 0][4 * h + 2]);
-                            acc[4 * g + 0][4 * h + 2] =
-                                fmaf(af[3 * G + g].x, bv[3][h].z, acc[4 * g + 0][4 * h + 2]);
-                            acc[4 * g + 0][4 * h + 3] =
-                                fmaf(af[0 * G + g].x, bv[0][h].w, acc[4 * g + 0][4 * h + 3]);
-                            acc[4 * g + 0][4 * h + 3] =
-                                fmaf(af[1 * G + g].x, bv[1][h].w, acc[4 * g + 0][4 * h + 3]);
-                            acc[4 * g + 0][4 * h + 3] =
-                                fmaf(af[2 * G + g].x, bv[2][h].w, acc[4 * g + 0][4 * h + 3]);
-                            acc[4 * g + 0][4 * h + 3] =
-                                fmaf(af[3 * G + g].x, bv[3][h].w, acc[4 * g + 0][4 * h + 3]);
-                            acc[4 * g + 1][4 * h + 0] =
-                                fmaf(af[0 * G + g].y, bv[0][h].x, acc[4 * g + 1][4 * h + 0]);
-                            acc[4 * g + 1][4 * h + 0] =
-                                fmaf(af[1 * G + g].y, bv[1][h].x, acc[4 * g + 1][4 * h + 0]);
-                            acc[4 * g + 1][4 * h + 0] =
-                                fmaf(af[2 * G + g].y, bv[2][h].x, acc[4 * g + 1][4 * h + 0]);
-                            acc[4 * g + 1][4 * h + 0] =
-                                fmaf(af[3 * G + g].y, bv[3][h].x, acc[4 * g + 1][4 * h + 0]);
-                            acc[4 * g + 1][4 * h + 1] =
-                                fmaf(af[0 * G + g].y, bv[0][h].y, acc[4 * g + 1][4 * h + 1]);
-                            acc[4 * g + 1][4 * h + 1] =
-                                fmaf(af[1 * G + g].y, bv[1][h].y, acc[4 * g + 1][4 * h + 1]);
-                            acc[4 * g + 1][4 * h + 1] =
-                                fmaf(af[2 * G + g].y, bv[2][h].y, acc[4 * g + 1][4 * h + 1]);
-                            acc[4 * g + 1][4 * h + 1] =
-                                fmaf(af[3 * G + g].y, bv[3][h].y, acc[4 * g + 1][4 * h + 1]);
-                            acc[4 * g + 1][4 * h + 2] =
-                                fmaf(af[0 * G + g].y, bv[0][h].z, acc[4 * g + 1][4 * h + 2]);
-                            acc[4 * g + 1][4 * h + 2] =
-                                fmaf(af[1 * G + g].y, bv[1][h].z, acc[4 * g + 1][4 * h + 2]);
-                            acc[4 * g + 1][4 * h + 2] =
-                                fmaf(af[2 * G + g].y, bv[2][h].z, acc[4 * g + 1][4 * h + 2]);
-                            acc[4 * g + 1][4 * h + 2] =
-                                fmaf(af[3 * G + g].y, bv[3][h].z, acc[4 * g + 1][4 * h + 2]);
-                            acc[4 * g + 1][4 * h + 3] =
-                                fmaf(af[0 * G + g].y, bv[0][h].w, acc[4 * g + 1][4 * h + 3]);
-                            acc[4 * g + 1][4 * h + 3] =
-                                fmaf(af[1 * G + g].y, bv[1][h].w, acc[4 * g + 1][4 * h + 3]);
-                            acc[4 * g + 1][4 * h + 3] =
-                                fmaf(af[2 * G + g].y, bv[2][h].w, acc[4 * g + 1][4 * h + 3]);
-                            acc[4 * g + 1][4 * h + 3] =
-                                fmaf(af[3 * G + g].y, bv[3][h].w, acc[4 * g + 1][4 * h + 3]);
-                            acc[4 * g + 2][4 * h + 0] =
-                                fmaf(af[0 * G + g].z, bv[0][h].x, acc[4 * g + 2][4 * h + 0]);
-                            acc[4 * g + 2][4 * h + 0] =
-                                fmaf(af[1 * G + g].z, bv[1][h].x, acc[4 * g + 2][4 * h + 0]);
-                            acc[4 * g + 2][4 * h + 0] =
-                                fmaf(af[2 * G + g].z, bv[2][h].x, acc[4 * g + 2][4 * h + 0]);
-                            acc[4 * g + 2][4 * h + 0] =
-                                fmaf(af[3 * G + g].z, bv[3][h].x, acc[4 * g + 2][4 * h + 0]);
-                            acc[4 * g + 2][4 * h + 1] =
-                                fmaf(af[0 * G + g].z, bv[0][h].y, acc[4 * g + 2][4 * h + 1]);
-                            acc[4 * g + 2][4 * h + 1] =
-                                fmaf(af[1 * G + g].z, bv[1][h].y, acc[4 * g + 2][4 * h + 1]);
-                            acc[4 * g + 2][4 * h + 1] =
-                                fmaf(af[2 * G + g].z, bv[2][h].y, acc[4 * g + 2][4 * h + 1]);
-                            acc[4 * g + 2][4 * h + 1] =
-                                fmaf(af[3 * G + g].z, bv[3][h].y, acc[4 * g + 2][4 * h + 1]);
-                            acc[4 * g + 2][4 * h + 2] =
-                                fmaf(af[0 * G + g].z, bv[0][h].z, acc[4 * g + 2][4 * h + 2]);
-                            acc[4 * g + 2][4 * h + 2] =
-                                fmaf(af[1 * G + g].z, bv[1][h].z, acc[4 * g + 2][4 * h + 2]);
-                            acc[4 * g + 2][4 * h + 2] =
-                                fmaf(af[2 * G + g].z, bv[2][h].z, acc[4 * g + 2][4 * h + 2]);
-                            acc[4 * g + 2][4 * h + 2] =
-                                fmaf(af[3 * G + g].z, bv[3][h].z, acc[4 * g + 2][4 * h + 2]);
-                            acc[4 * g + 2][4 * h + 3] =
-                                fmaf(af[0 * G + g].z, bv[0][h].w, acc[4 * g + 2][4 * h + 3]);
-                            acc[4 * g + 2][4 * h + 3] =
-                                fmaf(af[1 * G + g].z, bv[1][h].w, acc[4 * g + 2][4 * h + 3]);
-                            acc[4 * g + 2][4 * h + 3] =
-                                fmaf(af[2 * G + g].z, bv[2][h].w, acc[4 * g + 2][4 * h + 3]);
-                            acc[4 * g + 2][4 * h + 3] =
-                                fmaf(af[3 * G + g].z, bv[3][h].w, acc[4 * g + 2][4 * h + 3]);
-                            acc[4 * g + 3][4 * h + 0] =
-                                fmaf(af[0 * G + g].w, bv[0][h].x, acc[4 * g + 3][4 * h + 0]);
-                            acc[4 * g + 3][4 * h + 0] =
-                                fmaf(af[1 * G + g].w, bv[1][h].x, acc[4 * g + 3][4 * h + 0]);
-                            acc[4 * g + 3][4 * h + 0] =
-                                fmaf(af[2 * G + g].w, bv[2][h].x, acc[4 * g + 3][4 * h + 0]);
-                            acc[4 * g + 3][4 * h + 0] =
-                                fmaf(af[3 * G + g].w, bv[3][h].x, acc[4 * g + 3][4 * h + 0]);
-                            acc[4 * g + 3][4 * h + 1] =
-                                fmaf(af[0 * G + g].w, bv[0][h].y, acc[4 * g + 3][4 * h + 1]);
-                            acc[4 * g + 3][4 * h + 1] =
-                                fmaf(af[1 * G + g].w, bv[1][h].y, acc[4 * g + 3][4 * h + 1]);
-                            acc[4 * g + 3][4 * h + 1] =
-                                fmaf(af[2 * G + g].w, bv[2][h].y, acc[4 * g + 3][4 * h + 1]);
-                            acc[4 * g + 3][4 * h + 1] =
-                                fmaf(af[3 * G + g].w, bv[3][h].y, acc[4 * g + 3][4 * h + 1]);
-                            acc[4 * g + 3][4 * h + 2] =
-                                fmaf(af[0 * G + g].w, bv[0][h].z, acc[4 * g + 3][4 * h + 2]);
-                            acc[4 * g + 3][4 * h + 2] =
-                                fmaf(af[1 * G + g].w, bv[1][h].z, acc[4 * g + 3][4 * h + 2]);
-                            acc[4 * g + 3][4 * h + 2] =
-                                fmaf(af[2 * G + g].w, bv[2][h].z, acc[4 * g + 3][4 * h + 2]);
-                            acc[4 * g + 3][4 * h + 2] =
-                                fmaf(af[3 * G + g].w, bv[3][h].z, acc[4 * g + 3][4 * h + 2]);
-                            acc[4 * g + 3][4 * h + 3] =
-                                fmaf(af[0 * G + g].w, bv[0][h].w, acc[4 * g + 3][4 * h + 3]);
-                            acc[4 * g + 3][4 * h + 3] =
-                                fmaf(af[1 * G + g].w, bv[1][h].w, acc[4 * g + 3][4 * h + 3]);
-                            acc[4 * g + 3][4 * h + 3] =
-                                fmaf(af[2 * G + g].w, bv[2][h].w, acc[4 * g + 3][4 * h + 3]);
-                            acc[4 * g + 3][4 * h + 3] =
-                                fmaf(af[3 * G + g].w, bv[3][h].w, acc[4 * g + 3][4 * h + 3]);
-                        }
-                    }
-                }
-            }
-        }
+        manual_gemm_f_tile<S, TransA, TransB>(sAbase + stage * S::kAMax,
+                                              sBbase + stage * S::kBMax, warp_m, warp_n, lane,
+                                              acc);
     }
+
 
     // A split's block stops at its accumulator; the reduce pass owns the sum and
     // the alpha.

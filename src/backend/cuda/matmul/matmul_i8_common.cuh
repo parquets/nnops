@@ -20,9 +20,10 @@
 
 #pragma once
 
-#include "matmul_common.cuh"
+#include "gemm_common.cuh"
 #include "nnops/core/data_type.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdint>

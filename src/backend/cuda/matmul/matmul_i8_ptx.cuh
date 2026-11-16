@@ -161,6 +161,65 @@ __device__ __forceinline__ void i8_fill_kcontig(int8_t* sP, const int8_t* src, i
     }
 }
 
+/// One staged pair of k-major s8 panels through the warp's MMA grid. Both panels
+/// carry the same pose whatever the operand's memory order -- the fills land
+/// them k-major -- so the read has no transpose arm to choose.
+template <class S, class AElem>
+__device__ __forceinline__ void manual_gemm_i8_tile(const int8_t* sA, const int8_t* sB,
+                                                    int warp_m, int warp_n, int lane,
+                                                    int32_t (&acc)[S::MA][S::NA][4])
+{
+    constexpr int MA = S::MA, NA = S::NA, LD = S::LD, WM = S::WM, WN = S::WN;
+    uint32_t fa[MA][4];
+    uint32_t fb[NA][2];
+    // ldmatrix's per-lane row and k block. A's x4 names sixteen rows in two
+    // 16-byte k halves (lanes 0-15 -> rows 0-15 at k+0, lanes 16-31 -> the same
+    // rows at k+16); B's x2 names eight rows at k+0 and the same eight at k+16.
+    const int a_row = lane % 16;
+    const int a_koff = (lane / 16) * 16;
+    const int b_row = lane % 8;
+    const int b_koff = ((lane / 8) & 1) * 16;
+    // ldmatrix is typed 16-bit but moves 16-byte rows, and one 32-bit register
+    // is two halves -- four consecutive bytes -- which is exactly one int8
+    // fragment register. Its m8n8 distribution hands lane l the four bytes at
+    // 4*(l%4) of row l/4, the (g, 4t) layout a0 wants, so one x4 covers A's
+    // four registers and one x2 covers B's pair: nine instructions where the
+    // element-wise path needed twenty-four.
+    //
+    // The lane's base address is resolved once per stage into a 32-bit shared
+    // offset, so every load below is `base + constant` with the constant known
+    // at compile time -- no per-load cvta and no 64-bit pointer arithmetic. That
+    // arithmetic was a large part of why this kernel spends 6.03 instructions
+    // per MMA where cuBLAS spends 2.27.
+    //
+    // A register-level double buffer was tried here and measured flat (4096^3
+    // NT 1.704 against 1.698 ms, and 12% worse on the 64x64 tile, which lost a
+    // resident block to the extra fragments). That is what `short_scoreboard` at
+    // 1.5% already said: the ldmatrix-to-MMA latency is hidden across warps, so
+    // moving the loads earlier inside one warp buys nothing and costs registers.
+    const uint32_t sAl = smem_addr_u32(sA + (warp_m * WM + a_row) * LD + a_koff);
+    const uint32_t sBl = smem_addr_u32(sB + (warp_n * WN + b_row) * LD + b_koff);
+#pragma unroll
+    for (int ks = 0; ks < S::kKC; ++ks) {
+        const int kc = ks * 32;
+#pragma unroll
+        for (int i = 0; i < MA; ++i) {
+            ldmatrix_x4_at(&fa[i][0], &fa[i][1], &fa[i][2], &fa[i][3], sAl + i * 16 * LD + kc);
+        }
+#pragma unroll
+        for (int j = 0; j < NA; ++j) {
+            ldmatrix_x2_at(&fb[j][0], &fb[j][1], sBl + j * 8 * LD + kc);
+        }
+#pragma unroll
+        for (int i = 0; i < MA; ++i) {
+#pragma unroll
+            for (int j = 0; j < NA; ++j) {
+                manual_mma_i8<AElem>(acc[i][j], fa[i], fb[j]);
+            }
+        }
+    }
+}
+
 /// The integer GEMM: per-warp value tile from `S`, cp.async ring, k-major panels.
 template <class S, class AElem, bool TransA, bool TransB, bool Dequant>
 __global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_i8_kernel(GemmI8Params q)
@@ -267,16 +326,6 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_i8_kerne
                 acc[i][j][t] = 0;
             }
 
-    uint32_t fa[MA][4];
-    uint32_t fb[NA][2];
-    // ldmatrix's per-lane row and k block. A's x4 names sixteen rows in two
-    // 16-byte k halves (lanes 0-15 -> rows 0-15 at k+0, lanes 16-31 -> the same
-    // rows at k+16); B's x2 names eight rows at k+0 and the same eight at k+16.
-    const int a_row = lane % 16;
-    const int a_koff = (lane / 16) * 16;
-    const int b_row = lane % 8;
-    const int b_koff = ((lane / 8) & 1) * 16;
-
     // Prime every stage but one; the loop then keeps exactly ST groups in
     // flight, so `wait_group<ST-2>` retires precisely the tile about to be read.
 #pragma unroll
@@ -292,48 +341,8 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_i8_kerne
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
 
-        const int8_t* const sA = sAbase + stage * S::kABytes;
-        const int8_t* const sB = sBbase + stage * S::kBBytes;
-        // ldmatrix is typed 16-bit but moves 16-byte rows, and one 32-bit
-        // register is two halves -- four consecutive bytes -- which is exactly
-        // one int8 fragment register. Its m8n8 distribution hands lane l the
-        // four bytes at 4*(l%4) of row l/4, the (g, 4t) layout a0 wants, so one
-        // x4 covers A's four registers and one x2 covers B's pair: nine
-        // instructions where the element-wise path needed twenty-four.
-        //
-        // The lane's base address is resolved once per stage into a 32-bit
-        // shared offset, so every load below is `base + constant` with the
-        // constant known at compile time -- no per-load cvta and no 64-bit
-        // pointer arithmetic. That arithmetic was a large part of why this
-        // kernel spends 6.03 instructions per MMA where cuBLAS spends 2.27.
-        //
-        // A register-level double buffer was tried here and measured flat
-        // (4096^3 NT 1.704 against 1.698 ms, and 12% worse on the 64x64 tile,
-        // which lost a resident block to the extra fragments). That is what
-        // `short_scoreboard` at 1.5% already said: the ldmatrix-to-MMA latency
-        // is hidden across warps, so moving the loads earlier inside one warp
-        // buys nothing and costs registers.
-        const uint32_t sAl = smem_addr_u32(sA + (warp_m * WM + a_row) * LD + a_koff);
-        const uint32_t sBl = smem_addr_u32(sB + (warp_n * WN + b_row) * LD + b_koff);
-#pragma unroll
-        for (int ks = 0; ks < S::kKC; ++ks) {
-            const int kc = ks * 32;
-#pragma unroll
-            for (int i = 0; i < MA; ++i) {
-                ldmatrix_x4_at(&fa[i][0], &fa[i][1], &fa[i][2], &fa[i][3], sAl + i * 16 * LD + kc);
-            }
-#pragma unroll
-            for (int j = 0; j < NA; ++j) {
-                ldmatrix_x2_at(&fb[j][0], &fb[j][1], sBl + j * 8 * LD + kc);
-            }
-#pragma unroll
-            for (int i = 0; i < MA; ++i) {
-#pragma unroll
-                for (int j = 0; j < NA; ++j) {
-                    manual_mma_i8<AElem>(acc[i][j], fa[i], fb[j]);
-                }
-            }
-        }
+        manual_gemm_i8_tile<S, AElem>(sAbase + stage * S::kABytes, sBbase + stage * S::kBBytes,
+                                      warp_m, warp_n, lane, acc);
     }
 
     // ---- the destination --------------------------------------------------
