@@ -6,6 +6,7 @@
 
 ## 目录
 
+0. [读前必读：一段 GLSL 的四个去处](#0-读前必读一段-glsl-的四个去处)
 1. [版本与扩展声明](#1-版本与扩展声明)
 2. [执行模型：Workgroup 与 Invocation](#2-执行模型workgroup-与-invocation)
 3. [数据绑定：SSBO / UBO / Push Constant](#3-数据绑定ssbo--ubo--push-constant)
@@ -20,6 +21,43 @@
 12. [Warp Divergence 与性能考量](#12-warp-divergence-与性能考量)
 13. [编译工具链：glslc → SPIR-V](#13-编译工具链glslc--spir-v)
 14. [Vulkan 1.4 / Roadmap 2026 新特性](#14-vulkan-14--roadmap-2026-新特性)
+
+---
+
+## 0. 读前必读：一段 GLSL 的四个去处
+
+如果你只写过 C++，可以这样理解 Vulkan 的着色器流程：
+
+```text
+eltwise_f32.comp   ──glslc──→  eltwise_f32.spv   ──vkCreateComputePipelines──→  VkPipeline
+   "源文件"                      "目标文件"                  "链接 + 编译成机器码"
+   (.cpp)                        (.obj)                       (带 -D 宏的最终产物)
+```
+
+- `.comp` 只是文本，GPU 不认识。
+- SPIR-V 是**中间表示**，类似 `.obj`，仍然不是机器码。
+- 驱动在 `vkCreateComputePipelines` 时把 SPIR-V 编译成目标 GPU 的机器码，并把特化常量代入，产出一条固定的 `VkPipeline`。
+
+因此，GLSL 里的每一种 `layout(...)` 声明，最终都会变成 C++ 侧某个**必须与之一致**的配置：
+
+| GLSL 声明 | 最终去处 | 不一致的后果 |
+| --- | --- | --- |
+| `layout(local_size_x = 256) in;` | 编译进 SPIR-V | 无 C++ 对应项；dispatch 的 group 数要按它算 |
+| `layout(constant_id = 0) const int OP;` | `VkSpecializationMapEntry` | 特化值错位 → 逻辑错但可能不报错 |
+| `layout(set = 0, binding = N) buffer ...` | `VkDescriptorSetLayoutBinding` | binding 数量/类型不符 → 管线创建失败或绑错 buffer |
+| `layout(push_constant) uniform { ... }` | `VkPushConstantRange` + `vkCmdPushConstants` | 大小不符 → 创建失败；字段偏移不符 → 读到垃圾 |
+| `readonly` / `writeonly` | 驱动优化提示 | 不是内存保护，写只读 buffer 是未定义行为 |
+| `#extension GL_EXT_...` | Device 创建时启用的 feature/extension | 未启用 → 管线创建失败 |
+| `shared` / `barrier()` | 只用 workgroup 内资源 | 无需 C++ 侧配置，但需要正确同步 |
+
+### 写 shader 时的四条铁律
+
+1. **推送常量的二进制布局必须与 C++ struct 完全一致**。GLSL 的 `int/float` 是 4 字节、自然对齐，和 C++ 相同；但 `vec3` 会按 16 字节对齐，别踩。
+2. **binding 编号必须和 C++ 的 `num_bindings`、buffer 数组顺序一致**。nnops 约定：`set=0`，binding 从 0 连续编号，输入在前、输出在后。
+3. **每个 dispatch 都必须有边界守卫**（`if (gid >= pc.total) return;`）。GPU 没有页保护，越界是未定义行为。
+4. **特化常量只放"建管线时就能决定"的值**。需要每次调用变化的值放推送常量。
+
+> 完整的对象关系与生命周期见 [Vulkan 零基础入门](vulkan_zero_basics.md)；C++ 侧怎么把这些声明建出来见 [运行时结构体与接口](vulkan_runtime_interfaces.md)。
 
 ---
 
@@ -119,9 +157,11 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
 ```
 
 **约束**：
-- `local_size_x * local_size_y * local_size_z ≤ 128`（Vulkan 保证值；多数 GPU 支持到 1024）
-- `local_size_x` 个别维度上限因 GPU 而异，一般为 1024
-- **最佳实践**：选择 32 和 64 的公倍数（256, 512, 1024），以填满 warp/wavefront 调度单元
+
+- Vulkan 只保证 `maxComputeWorkGroupInvocations >= 128`，即**至少**能支持 128 个线程；实际上限因 GPU 而异，常见为 1024。
+- 每个维度的上限见 `maxComputeWorkGroupSize[0..2]`：`x` 一般可达 1024，`z` 通常只有 64。
+- 本项目固定使用 256（32 和 64 的公倍数，能填满常见 warp/wavefront，且低于所有设备的保证值）。
+- 选 workgroup 大小前应先查 `VkPhysicalDeviceLimits`，不要假设 1024 一定可用。
 
 ### 2.2 内置变量
 
@@ -180,7 +220,8 @@ layout(set = 0, binding = 2) buffer Name { float arr[]; };  // 可读写
 //   vec3           → 12 bytes, 16-byte aligned  (尾对齐到 16!)
 //   vec4           → 16 bytes, 16-byte aligned
 //   struct { ... } → 按最大成员对齐
-//   数组元素       → 紧密排列，无尾填充（与 UBO std140 不同！）
+//   标量数组元素   → 紧密排列，无尾填充（与 UBO std140 不同！）
+//   vec3 数组      → 每个元素仍按 16 字节对齐，stride 是 16 而不是 12
 
 // ---- 可选：显式 std430 声明 ----
 layout(std430, set = 0, binding = 0) buffer MyBuf {
@@ -1578,13 +1619,32 @@ layout(push_constant) uniform PushConstants { int total; } pc;
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= pc.total) return;
-    float va = a[gid], vb = b[gid], result;
-    if (OP == 0)      result = va + vb;
-    else if (OP == 1) result = va - vb;
-    else if (OP == 2) result = va * vb;
-    else              result = va / vb;
-    if (ADD_TO == 1) c[gid] += result;
-    else             c[gid] = result;
+
+    float va = a[gid];
+    float vb = b[gid];
+    float result;
+
+    if (OP == 0) {
+        result = va + vb;
+    } else if (OP == 1) {
+        result = va - vb;
+    } else if (OP == 2) {
+        result = va * vb;
+    } else if (OP == 3) {
+        result = va / vb;
+    } else if (OP == 4) {
+        result = min(va, vb);
+    } else if (OP == 5) {
+        result = max(va, vb);
+    } else {
+        result = pow(va, vb);
+    }
+
+    if (ADD_TO == 1) {
+        c[gid] += result;
+    } else {
+        c[gid] = result;
+    }
 }
 ```
 
@@ -1606,12 +1666,27 @@ void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= pc.total) return;
     float va = float(a[gid]), vb = float(b[gid]), result;
-    if (OP == 0)      result = va + vb;
-    else if (OP == 1) result = va - vb;
-    else if (OP == 2) result = va * vb;
-    else              result = va / vb;
-    if (ADD_TO == 1) c[gid] = float16_t(float(c[gid]) + result);
-    else             c[gid] = float16_t(result);
+    if (OP == 0) {
+        result = va + vb;
+    } else if (OP == 1) {
+        result = va - vb;
+    } else if (OP == 2) {
+        result = va * vb;
+    } else if (OP == 3) {
+        result = va / vb;
+    } else if (OP == 4) {
+        result = min(va, vb);
+    } else if (OP == 5) {
+        result = max(va, vb);
+    } else {
+        result = pow(va, vb);
+    }
+
+    if (ADD_TO == 1) {
+        c[gid] = float16_t(float(c[gid]) + result);
+    } else {
+        c[gid] = float16_t(result);
+    }
 }
 ```
 

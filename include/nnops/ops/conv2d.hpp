@@ -112,7 +112,8 @@ struct Conv2DAttributes {
     ///                        clamped to the storage range; the product is f32).
     ///                        Honoured for every activation dtype; the bias is
     ///                        then int32 rather than the output dtype.
-    /// Any other value is refused by the kernel plan.
+    /// Any other value is refused by the kernel plan (s32 included: the raw
+    /// MatMulInteger destination exists on MatMul, not on Conv2D).
     DataType output_dtype = DataType::f32;
 
     /// Integer storage an fp activation is quantized to inside the kernel, per

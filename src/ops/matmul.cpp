@@ -75,6 +75,12 @@ Status MatMul::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_rank(a.rank, 2));
     NNOPS_TRY(detail::check_rank(b.rank, 2));
 
+    // The CUDA kernels carry four batch axes, so rank six is their ceiling.
+    // The CPU batch walk is unbounded, which keeps this a backend rule.
+    if (backend_ == Backend::CUDA && (a.rank > 6 || b.rank > 6)) {
+        return Status::unsupported;
+    }
+
     const int64_t k_a = attrs_.transpose_a
         ? a.dims[static_cast<size_t>(a.rank - 2)]
         : a.dims[static_cast<size_t>(a.rank - 1)];

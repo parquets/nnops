@@ -56,6 +56,12 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::require(
         is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)));
 
+    // The CUDA kernels carry four batch axes — the same rank-six ceiling as
+    // MatMul's front end — while the CPU batch walk is unbounded.
+    if (backend_ == Backend::CUDA && inputs[0].rank > 6) {
+        return Status::unsupported;
+    }
+
     // The CPU routes implement the pre-activation residual — int8 included —
     // but the gated combine and the CUDA kernel apply the residual after their
     // own activation. Refusing beats applying it on the wrong side.

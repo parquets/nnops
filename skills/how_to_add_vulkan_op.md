@@ -6,6 +6,43 @@
 
 ---
 
+## 0. 五分钟补齐前置概念
+
+如果你从没写过 Vulkan，先记住这一组对应关系，后面所有代码都能对号入座：
+
+```cpp
+// 你想让 GPU 做的事，在 C++ 里叫：
+void add_kernel(const float* a, const float* b, float* c, int total, int op);
+
+// Vulkan 把它拆成：
+VkPipeline            // 编译好的 add_kernel（op 已固化，无分支）
+VkDescriptorSetLayout // 参数类型：三个 storage buffer 槽位
+VkPipelineLayout      // 完整调用约定：三个 buffer + 4 字节 total
+VkDescriptorSet       // 本次的实参：a、b、c 三个 VkBuffer
+Push Constant         // 本次的实参：total
+vkCmdDispatch         // "调用"
+```
+
+| 概念 | 一句话 | 在本项目中由谁负责 |
+| --- | --- | --- |
+| 着色器 | GPU 上的"函数体"，用 GLSL 写 | 你写 `.comp` |
+| 管线 (Pipeline) | 编译好的 kernel，创建一次很贵 | `VulkanPipelineCache` 缓存 |
+| 描述符集布局 | "参数包里有几个槽、各是什么类型" | 由 `num_bindings` 自动生成 |
+| 管线布局 | 管线接受的描述符集 + 推送常量范围 | 随管线一起创建 |
+| 描述符集 | 一次调用实际绑定的 buffer 句柄 | 每次 `compute()` 分配 |
+| 推送常量 | 按值传的小标量（如 `total`） | 每次 `compute()` 填 |
+| 特化常量 | 创建管线时固化的编译期常量（如 `op`） | 进 `PipelineKey` |
+
+**三个最容易踩的坑**：
+
+1. `set = 0, binding = N` 在 shader 里写了几个，C++ 的 `num_bindings` 就必须是几，且 buffer 数组顺序要一致。
+2. 特化常量不是运行时参数。换一个 `op` 就是另一条管线，所以要进 `PipelineKey`。
+3. `vkCmd*` 只是**录制**，不执行。真正跑起来要等调用方 `vkQueueSubmit`。
+
+> 想系统建立心智模型，看 [Vulkan 零基础入门](vulkan_zero_basics.md)；想逐条对照 nnops 的结构体，看 [运行时结构体与接口](vulkan_runtime_interfaces.md)。
+
+---
+
 ## 1. 架构概览
 
 Vulkan 后端遵循与 CUDA 后端相同的三层架构：
@@ -18,12 +55,16 @@ src/backend/vulkan/shaders/<op>_f32.comp  # GLSL 计算着色器
 ```
 
 关键组件：
-- **Pipeline Cache** — 全局单例 `VulkanPipelineCache`，按 `(VkDevice, SPIR-V, 特化常量)` 缓存计算管线
+
+- **Pipeline Cache** — 全局单例 `VulkanPipelineCache`，按 `(VkDevice, SPIR-V, 特化常量, binding 数量)` 缓存计算管线
 - **Descriptor Set** — 每次 `compute()` 调用从用户提供的 `VkDescriptorPool` 分配，绑定 I/O 缓冲区
 - **Push Constants** — 传递 `total` 元素数量等运行时参数
 - **Specialization Constants** — 在管线创建时固化操作类型（Add/Sub/...），允许编译器优化分支
 
 > 💡 **相关参考文档**：
+>
+> - [Vulkan 零基础入门](vulkan_zero_basics.md) — 对象地图、pipeline/layout/descriptor 的关系、一次 dispatch 的完整旅程、FAQ、术语表
+> - [Vulkan 运行时结构体与接口](vulkan_runtime_interfaces.md) — nnops 的结构体、接口、生命周期逐条对照
 > - [Vulkan Compute Shader 语法参考](vulkan_compute_shader_grammar.md) — 完整的 GLSL 计算着色器语法（13 节 + Vulkan 1.4/Roadmap 2026 新特性）
 > - [Vulkan 线程模型与内存模型](vulkan_threading_memory_model.md) — Host 端多线程、GPU 执行层次、SPIR-V 内存模型、Synchronization2、Timeline Semaphore 深度解析
 
@@ -225,13 +266,28 @@ struct PipelineKey {
 
 ### 4.3 管线创建流程
 
+```text
+vkCreateShaderModule          // ① 把 SPIR-V 字节包成 Vulkan 对象
+  → vkCreateDescriptorSetLayout // ② 声明"参数包"有几个槽、各是什么类型
+    → vkCreatePipelineLayout    // ③ 声明"调用约定"：参数包 + 推送常量范围
+      → vkCreateComputePipelines // ④ 真正编译（唯一昂贵的一步）
+        → vkDestroyShaderModule  // ⑤ 编译输入用完即可销毁
 ```
-vkCreateShaderModule
-  → vkCreateDescriptorSetLayout (根据 num_bindings)
-    → vkCreatePipelineLayout (绑定 set layout + push constant range)
-      → vkCreateComputePipelines (应用特化常量)
-        → vkDestroyShaderModule (管线创建后可销毁)
-```
+
+**为什么必须是这个顺序**：建管线时驱动要同时看到"代码"和"参数形状"，才能生成正确的机器码并做校验。所以 ① 提供代码，②③ 提供形状，④ 才能编译。
+
+**每一步固化了什么**：
+
+| 步骤 | 固化内容 | 改动它需要 |
+| --- | --- | --- |
+| ① ShaderModule | 着色器代码 | 重新编译 `.comp` |
+| ② DescriptorSetLayout | binding 数量 / 类型 | 新 `num_bindings` → 新管线 |
+| ③ PipelineLayout | 推送常量大小 | 改 `ComputePushConstants` → 新管线 |
+| ④ Specialization | `spec_op` / `spec_add_to` | 新特化值 → 新管线 |
+
+⑤ 常被误解：`VkShaderModule` 只是 `vkCreateComputePipelines` 的输入，管线建好后驱动已经复制了需要的信息，模块可以立刻销毁。**不要**把它缓存起来。
+
+> 更完整的概念解释（为什么 Vulkan 要预编译、管线为什么贵、layout 与 pipeline 的兼容规则）见 [Vulkan 零基础入门 §4–§5](vulkan_zero_basics.md#4-三个-layout-千万别搞混)。
 
 ### 4.4 特化常量应用
 
@@ -664,6 +720,8 @@ const char* enabled_exts[] = { VK_KHR_16BIT_STORAGE_EXTENSION_NAME };
 dci.enabledExtensionCount = supports_16bit ? 1 : 0;
 dci.ppEnabledExtensionNames = supports_16bit ? enabled_exts : nullptr;
 ```
+
+> ⚠️ 已知不一致：`tests/common/vulkan_test_helper.hpp` 的实际实现只在**没有独显、走回退路径**时才查询并启用 16-bit storage，因此独显机器上 `supports_fp16()` 恒为 false；而现有 f16 测试没有按它跳过。跑 f16 用例前先确认目标驱动。
 
 ### 11.5 CMake 配置
 

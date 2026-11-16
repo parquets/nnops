@@ -36,7 +36,7 @@
 /// weight) returns unsupported.
 
 #include "../cuda_common.cuh"
-#include "../gemm/cute_gemm.cuh"
+#include "../matmul/cute_gemm.cuh"
 #include "transpose_conv_common.cuh"
 #include "nnops/ops/transpose_conv2d.hpp"
 

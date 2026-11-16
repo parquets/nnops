@@ -26,12 +26,16 @@
 /// Only compiled under NNOPS_HAS_CUDA.
 
 #include "nnops/ops/conv2d.hpp"
+#include "nnops/detail/half.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/cuda_test_helper.hpp"
 #include "common/channel_last.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #ifdef NNOPS_HAS_CUDA
@@ -445,6 +449,258 @@ NNOPS_TEST(cuda_conv2d_pitched_output) {
         expect_same(got, want, f16 ? kF16AccumTol : 1e-5f, f16 ? 2e-2f : 1e-5f,
                     "cuda_conv2d_pitched_output");
         NNOPS_EXPECT_EQ(bad_tail, 0);
+    }
+}
+
+NNOPS_TEST(cuda_conv2d_i8) {
+    // The quantized route on CUDA: a pre-quantized u8/s8 activation against an
+    // s8 OIHW filter, channel-first, compared bit for bit with the CPU route.
+    // Integer destinations are exact by construction (the accumulate is int32);
+    // the dequantizing ones use the fp tolerance.
+    struct I8Conv {
+        int64_t n, ic, ih, iw, oc, kh, kw, sh, sw, dh, dw, ph, pw, groups;
+        DataType adt, odt;
+        bool bias, relu;
+        uint64_t seed;
+        bool cl = false;   // NHWC activation + HWIO filter
+        int32_t zp_x = 999;  // 999 keeps the default; else an explicit value
+        bool sym_w = false;  // all-zero per-channel weight zero points
+    };
+    // Every (activation, destination) pair the quantized route resolves, in
+    // both memory orders: channel-first OIHW above the channel-last HWIO block.
+    const I8Conv cases[] = {
+        // Isolation: s8 activation with a zero point of 0 and symmetric weights,
+        // so the raw accumulate is the whole answer.
+        {1, 4, 8, 8, 4, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::s8, false, false, 77, false, 0, true},
+        // Only the -zp_a·R_b[n] half is live (the weight zero points are zero).
+        {1, 4, 8, 8, 4, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::s8, false, false, 79, false, 128, true},
+        // Only the -(R_a[m] - K·zp_a)·zp_b[n] half is live (the activation zero
+        // point is zero).
+        {1, 4, 8, 8, 4, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::s8, false, false, 78, false, 0, false},
+        {2, 8, 9, 7, 12, 3, 3, 1, 1, 1, 1, 1, 1, 2, DataType::u8, DataType::s8, true, true, 91},
+        {2, 8, 9, 7, 12, 3, 3, 2, 1, 1, 1, 1, 1, 2, DataType::s8, DataType::s8, true, false, 93},
+        // 1x1 has no padding and a filter row shorter than a 16 B vector.
+        {1, 4, 8, 8, 6, 1, 1, 1, 1, 1, 1, 0, 0, 1, DataType::u8, DataType::u8, true, true, 97},
+        {1, 4, 8, 8, 6, 3, 3, 1, 1, 2, 1, 1, 1, 1, DataType::s8, DataType::u8, true, true, 99},
+        {1, 4, 8, 8, 6, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::f32, true, true, 101},
+        {1, 4, 8, 8, 6, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::f32, true, true, 103},
+        {1, 4, 8, 8, 6, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::f16, true, true, 107},
+        {1, 4, 8, 8, 6, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::f16, false, false, 109},
+
+        // Channel-last: IC/G a multiple of 16 so the vector A-fill runs.
+        {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::s8, true, true, 111, true},
+        {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::s8, true, false, 113, true},
+        {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::u8, true, true, 115, true},
+        {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::u8, true, true, 117, true},
+        {1, 16, 8, 8, 8, 1, 1, 1, 1, 1, 1, 0, 0, 1, DataType::u8, DataType::f32, true, true, 119, true},
+        {1, 16, 8, 8, 8, 1, 1, 1, 1, 1, 1, 0, 0, 1, DataType::s8, DataType::f32, false, false, 121, true},
+        {1, 16, 8, 8, 8, 3, 3, 2, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::f16, true, true, 123, true},
+        {1, 16, 8, 8, 8, 3, 3, 1, 1, 2, 1, 1, 1, 1, DataType::s8, DataType::f16, true, true, 125, true},
+        // Groups split ICG to 8, so this one takes the scalar channel-last fill.
+        {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 2, DataType::u8, DataType::s8, true, true, 127, true},
+
+        // Depthwise-shaped groups (IC/G = OC/G = 1) stay on the quantized GEMM.
+        {1, 4, 8, 8, 4, 3, 3, 1, 1, 1, 1, 1, 1, 4, DataType::u8, DataType::s8, true, true, 129},
+        {1, 16, 8, 8, 16, 3, 3, 1, 1, 1, 1, 1, 1, 16, DataType::s8, DataType::u8, true, true, 131, true},
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+        const I8Conv& c = cases[ci];
+        const int64_t icg = c.ic / c.groups;
+        test::XorShift128 rng(c.seed);
+        const int64_t an = c.n * c.ic * c.ih * c.iw;
+        std::vector<uint8_t> a(static_cast<size_t>(an));
+        for (auto& e : a) { e = static_cast<uint8_t>(rng.next_u64() & 0xFFu); }
+        const int64_t wn = c.oc * icg * c.kh * c.kw;
+        std::vector<int8_t> w(static_cast<size_t>(wn));
+        for (auto& e : w) {
+            e = static_cast<int8_t>(int32_t(rng.next_u64() % 255) - 127);
+        }
+
+        std::vector<float> w_s(static_cast<size_t>(c.oc));
+        std::vector<int32_t> w_zp(static_cast<size_t>(c.oc));
+        for (int64_t i = 0; i < c.oc; ++i) {
+            w_s[static_cast<size_t>(i)] = 0.008f + 0.001f * float(i % 5);
+            w_zp[static_cast<size_t>(i)] = c.sym_w ? 0 : int32_t(i % 7) - 3;
+        }
+
+        QuantParams qa;
+        qa.scale = 0.0078125f;
+        qa.zero_point = c.zp_x != 999 ? c.zp_x : (c.adt == DataType::u8 ? 128 : -6);
+        QuantParams qw;
+        qw.granularity = QuantGranularity::PerChannel;
+        qw.scale_data = w_s.data();
+        qw.zero_point_data = w_zp.data();
+        qw.num_scales = c.oc;
+        qw.scale = 0.008f;
+        qw.zero_point = 0;
+        QuantParams qc;
+        qc.scale = 0.03f;
+        qc.zero_point = c.odt == DataType::u8 ? 110 : 0;
+
+        const bool int_out = c.odt == DataType::s32 || c.odt == DataType::s8 ||
+                             c.odt == DataType::u8;
+        const DataType bdt = int_out ? DataType::s32 : c.odt;
+        std::vector<uint8_t> bias_bytes;
+        if (c.bias) {
+            bias_bytes.resize(static_cast<size_t>(c.oc) *
+                              size_t(data_type_size(bdt)));
+            for (int64_t i = 0; i < c.oc; ++i) {
+                if (bdt == DataType::s32) {
+                    reinterpret_cast<int32_t*>(bias_bytes.data())[i] =
+                        int32_t(rng.next_u64() % 2001) - 1000;
+                } else if (bdt == DataType::f16) {
+                    reinterpret_cast<nnops::backend::cpu::half*>(
+                        bias_bytes.data())[i] =
+                        nnops::backend::cpu::float_to_half(
+                            rng.next_float(-0.5f, 0.5f));
+                } else {
+                    reinterpret_cast<float*>(bias_bytes.data())[i] =
+                        rng.next_float(-0.5f, 0.5f);
+                }
+            }
+        }
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {c.kh, c.kw};
+        attrs.stride = {c.sh, c.sw};
+        attrs.dilation = {c.dh, c.dw};
+        attrs.padding = {c.ph, c.pw};
+        attrs.groups = c.groups;
+        attrs.output_dtype = c.odt;
+        if (c.relu) { attrs.epilogue.type = EpilogueActivateType::Relu; }
+
+        const auto view = [](const std::vector<int64_t>& sh, DataType dt,
+                             void* d, TensorLayout lay,
+                             const QuantParams& qp = {}) {
+            return TensorView(std::span<const int64_t>(sh.data(), sh.size()), dt,
+                              d, lay, qp);
+        };
+        const TensorLayout alay = c.cl ? TensorLayout::NHWC : TensorLayout::NCHW;
+        const TensorLayout wlay = c.cl ? TensorLayout::HWIO : TensorLayout::NCHW;
+        const std::vector<int64_t> ashape = {c.n, c.ic, c.ih, c.iw};
+        const std::vector<int64_t> wshape =
+            c.cl ? std::vector<int64_t>{c.kh, c.kw, icg, c.oc}
+                 : std::vector<int64_t>{c.oc, icg, c.kh, c.kw};
+
+        TensorView av = view(ashape, c.adt, a.data(), alay, qa);
+        TensorView wv = view(wshape, DataType::s8, w.data(), wlay, qw);
+        TensorView biasv;
+        std::vector<TensorView> ins = {av, wv};
+        std::vector<TensorDesc> descs = {av.desc(), wv.desc()};
+        if (c.bias) {
+            biasv = view({c.oc}, bdt, bias_bytes.data(), TensorLayout::NCHW);
+            ins.push_back(biasv);
+            descs.push_back(biasv.desc());
+        }
+
+        auto op_cpu = Conv2D::create(attrs, Backend::CPU);
+        const TensorDesc od = op_cpu->getOutputTensorDesc(descs).front();
+        const std::vector<int64_t> odims(od.dims.begin(), od.dims.begin() + od.rank);
+        int64_t on = 1;
+        for (auto d : odims) { on *= d; }
+        const size_t obytes = static_cast<size_t>(on) *
+                              size_t(data_type_size(od.dtype));
+        std::vector<uint8_t> out_cpu(obytes, 0);
+        std::vector<uint8_t> out_dev(obytes, 0);
+        TensorView cv = view(odims, od.dtype, out_cpu.data(), od.layout, qc);
+        cpu_run(*op_cpu, cv, ins);
+
+        CudaBuffer da(static_cast<size_t>(an)), dw(static_cast<size_t>(wn));
+        da.upload(a.data(), a.size());
+        dw.upload(w.data(), w.size());
+        TensorView dav = view(ashape, c.adt, da.data(), alay, qa);
+        TensorView dwv = view(wshape, DataType::s8, dw.data(), wlay, qw);
+        CudaBuffer dbias;
+        std::vector<TensorView> dins = {dav, dwv};
+        if (c.bias) {
+            dbias = CudaBuffer(bias_bytes.size());
+            dbias.upload(bias_bytes.data(), bias_bytes.size());
+            dins.push_back(view({c.oc}, bdt, dbias.data(), TensorLayout::NCHW));
+        }
+        CudaBuffer dout(obytes);
+        dout.zero();
+        TensorView dcv = view(odims, od.dtype, dout.data(), od.layout, qc);
+        auto op_dev = Conv2D::create(attrs, Backend::CUDA);
+        cuda_run(*op_dev, dcv, dins);
+        dout.download(out_dev.data(), obytes);
+
+        if (int_out) {
+            if (std::memcmp(out_cpu.data(), out_dev.data(), obytes) != 0) {
+                const size_t esz = size_t(data_type_size(od.dtype));
+                const size_t n = obytes / esz;
+                size_t bad = 0;
+                while (bad < n &&
+                       std::memcmp(out_cpu.data() + bad * esz,
+                                   out_dev.data() + bad * esz, esz) == 0) {
+                    ++bad;
+                }
+                char msg[512];
+                int off = std::snprintf(msg, sizeof(msg),
+                              "conv2d_i8 case %zu (cl=%d act=%d out=%d): elem %zu; "
+                              "cpu:", ci, int(c.cl), int(c.adt), int(c.odt), bad);
+                for (size_t k = 0; k < 8 && k < n; ++k) {
+                    off += std::snprintf(msg + off, sizeof(msg) - size_t(off), " %d",
+                                         od.dtype == DataType::s8
+                                             ? int(int8_t(out_cpu[k]))
+                                             : int(out_cpu[k]));
+                }
+                off += std::snprintf(msg + off, sizeof(msg) - size_t(off), " | cuda:");
+                for (size_t k = 0; k < 8 && k < n; ++k) {
+                    off += std::snprintf(msg + off, sizeof(msg) - size_t(off), " %d",
+                                         od.dtype == DataType::s8
+                                             ? int(int8_t(out_dev[k]))
+                                             : int(out_dev[k]));
+                }
+                throw std::runtime_error(msg);
+            }
+            continue;
+        }
+        const size_t n = obytes / size_t(data_type_size(od.dtype));
+        for (size_t i = 0; i < n; ++i) {
+            float x = 0.0f, y = 0.0f;
+            if (od.dtype == DataType::f16) {
+                x = nnops::backend::cpu::half_to_float(
+                    reinterpret_cast<const nnops::backend::cpu::half*>(
+                        out_dev.data())[i]);
+                y = nnops::backend::cpu::half_to_float(
+                    reinterpret_cast<const nnops::backend::cpu::half*>(
+                        out_cpu.data())[i]);
+            } else {
+                x = reinterpret_cast<const float*>(out_dev.data())[i];
+                y = reinterpret_cast<const float*>(out_cpu.data())[i];
+            }
+            NNOPS_EXPECT_TRUE(std::fabs(x - y) <=
+                              1e-4f * std::max(1.0f, std::fabs(y)));
+        }
+    }
+
+    // An s32 destination has no Conv2D route on either backend (MatMul keeps it).
+    {
+        const int64_t ashape[] = {1, 4, 8, 8};
+        const int64_t wshape[] = {6, 4, 3, 3};
+        std::vector<uint8_t> a(1 * 4 * 8 * 8, 1);
+        std::vector<int8_t> w(6 * 4 * 3 * 3, 1);
+        QuantParams qa;
+        qa.scale = 0.01f;
+        qa.zero_point = 128;
+        QuantParams qw;
+        qw.scale = 0.01f;
+        qw.zero_point = 0;
+        TensorView av(ashape, DataType::u8, a.data(), TensorLayout::NCHW, qa);
+        TensorView wv(wshape, DataType::s8, w.data(), TensorLayout::NCHW, qw);
+        const int64_t cshape[] = {1, 6, 6, 6};
+        std::vector<int32_t> out(1 * 6 * 6 * 6, 0);
+        TensorView cv(cshape, DataType::s32, out.data());
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {3, 3};
+        attrs.padding = {1, 1};
+        attrs.output_dtype = DataType::s32;
+        auto op = Conv2D::create(attrs, Backend::CUDA);
+        const TensorView ins[] = {av, wv};
+        NNOPS_EXPECT_EQ(op->compute({&cv, 1}, ins, cuda_context(), nullptr),
+                        Status::unsupported);
     }
 }
 

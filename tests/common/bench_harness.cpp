@@ -5,6 +5,8 @@
 #include "cpu_pool.hpp"
 
 #include <cstring>
+#include <exception>
+#include <iostream>
 
 int main(int argc, char** argv) {
     // Optional substring filter on the benchmark name; no argument runs all.
@@ -19,7 +21,13 @@ int main(int argc, char** argv) {
             continue;
         }
         std::cout << "--- " << e.name << " ---" << std::endl;
-        e.fn();
+        // An arm that checks its timing against a reference throws on a
+        // mismatch; that must not take the rest of the run down with it.
+        try {
+            e.fn();
+        } catch (const std::exception& err) {
+            std::cout << "!! " << e.name << ": " << err.what() << std::endl;
+        }
     }
     return 0;
 }

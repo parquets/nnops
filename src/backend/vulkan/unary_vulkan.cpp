@@ -12,8 +12,8 @@
 ///   - The descriptor set is allocated per call from the caller's pool.
 ///
 /// Requires ComputeContext: vulkan_cmd_buffer, vulkan_device,
-/// vulkan_descriptor_pool (FREE_DESCRIPTOR_SET_BIT), and vulkan_buffers holding
-/// [input, output].
+/// vulkan_descriptor_pool (reclaimed by resetting the pool after submission),
+/// and vulkan_buffers holding [input, output].
 
 #include "vulkan_common.hpp"
 #include "unary_f32_spv.h"
