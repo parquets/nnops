@@ -56,23 +56,38 @@ namespace detail {
 
 /// Per-(dtype, transpose, vectorized) dispatch table.
 template <class F>
-inline void dispatch_dense(const GemmParams& p, bool trans_a, bool trans_b,
-                           bool vectorized, F&& fn)
+inline void dispatch_dense(const GemmParams& p, bool trans_a, bool trans_b, bool vectorized, F&& fn)
 {
     const int key = (trans_a ? 2 : 0) + (trans_b ? 1 : 0) + (vectorized ? 4 : 0);
     switch (key) {
-    case 0: fn.template operator()<false, false, false>(); break;
-    case 1: fn.template operator()<false, true, false>(); break;
-    case 2: fn.template operator()<true, false, false>(); break;
-    case 3: fn.template operator()<true, true, false>(); break;
-    case 4: fn.template operator()<false, false, true>(); break;
-    case 5: fn.template operator()<false, true, true>(); break;
-    case 6: fn.template operator()<true, false, true>(); break;
-    default: fn.template operator()<true, true, true>(); break;
+    case 0:
+        fn.template operator()<false, false, false>();
+        break;
+    case 1:
+        fn.template operator()<false, true, false>();
+        break;
+    case 2:
+        fn.template operator()<true, false, false>();
+        break;
+    case 3:
+        fn.template operator()<true, true, false>();
+        break;
+    case 4:
+        fn.template operator()<false, false, true>();
+        break;
+    case 5:
+        fn.template operator()<false, true, true>();
+        break;
+    case 6:
+        fn.template operator()<true, false, true>();
+        break;
+    default:
+        fn.template operator()<true, true, true>();
+        break;
     }
 }
 
-}  // namespace detail
+} // namespace detail
 
 /// Launch one f32 GEMM with an explicit tile shape, bypassing the narrow/wide
 /// heuristic. Every distinct tile (and every transpose/vectorized flag) is its
@@ -97,38 +112,40 @@ inline void dense_gemm_f16_tile(const GemmParams& p, cudaStream_t stream)
 template <class Tile, int Groups, bool TransA, bool TransB, bool Vectorized = true>
 inline void dense_gemm_f16_groups(const GemmParams& p, cudaStream_t stream)
 {
-    detail::launch_dense_h<Tile, cute::half_t, TransA, TransB, Vectorized, Groups>(p,
-                                                                                  stream);
+    detail::launch_dense_h<Tile, cute::half_t, TransA, TransB, Vectorized, Groups>(p, stream);
 }
 
 /// Dense C = alpha*A*B + beta*C + bias, epilogue applied, optional residual.
 /// Returns false when the request has no kernel (bad extents).
-inline bool dense_gemm_launch(const GemmParams& p, GemmElem elem,
-                              bool trans_a, bool trans_b, bool vectorized,
-                              cudaStream_t stream)
+inline bool dense_gemm_launch(const GemmParams& p, GemmElem elem, bool trans_a, bool trans_b,
+                              bool vectorized, cudaStream_t stream)
 {
-    if (p.m <= 0 || p.n <= 0 || p.k <= 0) { return false; }
+    if (p.m <= 0 || p.n <= 0 || p.k <= 0) {
+        return false;
+    }
     // Below a full tile of rows the mma is waste and B is the only operand that
     // matters, so the narrow-m loop takes the product instead of a tile.
     if (detail::small_m_applies(p, elem, trans_a, trans_b, vectorized)) {
-        const bool done = elem == GemmElem::F16
-                              ? detail::launch_small_m<cute::half_t>(p, stream)
-                              : detail::launch_small_m<float>(p, stream);
-        if (done) { return true; }
+        const bool done = elem == GemmElem::F16 ? detail::launch_small_m<cute::half_t>(p, stream) :
+                                                  detail::launch_small_m<float>(p, stream);
+        if (done) {
+            return true;
+        }
     }
     // The same rows, with the operand stored the other way round.
     if (detail::small_nt_applies(p, elem, trans_a, trans_b, vectorized)) {
-        const bool done = elem == GemmElem::F16
-                              ? detail::launch_small_nt<cute::half_t>(p, stream)
-                              : detail::launch_small_nt<float>(p, stream);
-        if (done) { return true; }
+        const bool done = elem == GemmElem::F16 ? detail::launch_small_nt<cute::half_t>(p, stream) :
+                                                  detail::launch_small_nt<float>(p, stream);
+        if (done) {
+            return true;
+        }
     }
     // The 128-wide tile reads A half as often, which takes a quarter off the
     // operand traffic, but its 26 KB of smem costs a resident block, so it only
     // pays once the grid can refill the machine several times over.
     const int sm = detail::device_sm_count();
-    const long long wide_blocks = static_cast<long long>((p.m + 63) / 64) *
-                                  ((p.n + 127) / 128) * detail::gemm_batch_count(p);
+    const long long wide_blocks =
+        static_cast<long long>((p.m + 63) / 64) * ((p.n + 127) / 128) * detail::gemm_batch_count(p);
     const bool wide = sm > 0 && wide_blocks >= 4LL * sm;
     // f16/bf16 pick between one 64-wide tile a block and two of them: the paired
     // CTA shares the A panel between its groups, so it reads a quarter less, and
@@ -145,37 +162,30 @@ inline bool dense_gemm_launch(const GemmParams& p, GemmElem elem,
     // on its own. The k floor keeps it off the short-k shapes, where the extra
     // warps have nothing to hide behind.
     const int num_m = (p.m + 63) / 64;
-    const long long pair_blocks = static_cast<long long>(num_m) *
-                                  (((p.n + 63) / 64 + 1) / 2) *
-                                  detail::gemm_batch_count(p);
-    const bool pair_h =
-        sm > 0 && p.k >= 1024 && (num_m == 1 || pair_blocks >= sm);
-    detail::dispatch_dense(
-        p, trans_a, trans_b, vectorized,
-        [&]<bool TA, bool TB, bool V>() {
-            if (elem == GemmElem::F16) {
-                // The f16 kernel's two-level accumulator (an f16 MMA fragment
-                // plus the f32 running sum) costs about eighteen more registers
-                // than the f32-accumulate twin, which puts the paired CTA at one
-                // block a SM. The four-warp CTA keeps three blocks there, and
-                // that occupancy is worth more than the pairing.
-                detail::launch_dense_split<cute::half_t, kF16Narrow, TA, TB, V>(
-                    p, stream);
-            } else if (elem == GemmElem::BF16) {
-                if (pair_h) {
-                    detail::launch_dense_split<cute::bfloat16_t, kF16Narrow, TA, TB, V,
-                                               2>(p, stream);
-                } else {
-                    detail::launch_dense_split<cute::bfloat16_t, kF16Narrow, TA, TB, V>(
-                        p, stream);
-                }
-            } else if (wide) {
-                detail::launch_dense_f<kF32Wide, TA, TB, V>(p, stream);
+    const long long pair_blocks =
+        static_cast<long long>(num_m) * (((p.n + 63) / 64 + 1) / 2) * detail::gemm_batch_count(p);
+    const bool pair_h = sm > 0 && p.k >= 1024 && (num_m == 1 || pair_blocks >= sm);
+    detail::dispatch_dense(p, trans_a, trans_b, vectorized, [&]<bool TA, bool TB, bool V>() {
+        if (elem == GemmElem::F16) {
+            // The f16 kernel's two-level accumulator (an f16 MMA fragment
+            // plus the f32 running sum) costs about eighteen more registers
+            // than the f32-accumulate twin, which puts the paired CTA at one
+            // block a SM. The four-warp CTA keeps three blocks there, and
+            // that occupancy is worth more than the pairing.
+            detail::launch_dense_split<cute::half_t, kF16Narrow, TA, TB, V>(p, stream);
+        } else if (elem == GemmElem::BF16) {
+            if (pair_h) {
+                detail::launch_dense_split<cute::bfloat16_t, kF16Narrow, TA, TB, V, 2>(p, stream);
             } else {
-                detail::launch_dense_split<float, kF32Narrow, TA, TB, V>(p, stream);
+                detail::launch_dense_split<cute::bfloat16_t, kF16Narrow, TA, TB, V>(p, stream);
             }
-        });
+        } else if (wide) {
+            detail::launch_dense_f<kF32Wide, TA, TB, V>(p, stream);
+        } else {
+            detail::launch_dense_split<float, kF32Narrow, TA, TB, V>(p, stream);
+        }
+    });
     return true;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

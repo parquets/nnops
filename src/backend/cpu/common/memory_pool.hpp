@@ -31,7 +31,7 @@
 namespace nnops::backend::cpu {
 
 class MemoryPool {
-public:
+  public:
     /// Process-wide singleton shared by all CPU operators.
     static MemoryPool& instance();
 
@@ -49,8 +49,8 @@ public:
     void deallocate(void* ptr) noexcept;
 
     /// Allocate @p count elements of type T, 64-byte aligned.
-    template <class T>
-    T* allocate_typed(size_t count) {
+    template <class T> T* allocate_typed(size_t count)
+    {
         return static_cast<T*>(allocate(count * sizeof(T)));
     }
 
@@ -69,7 +69,7 @@ public:
     /// Allocate() calls served from the free lists (reuse hits).
     uint64_t reuse_count() const noexcept;
 
-private:
+  private:
     MemoryPool();
     ~MemoryPool();
 
@@ -79,7 +79,7 @@ private:
 
 /// RAII guard for a single pooled allocation: frees the block on destruction.
 class PoolPtr {
-public:
+  public:
     PoolPtr() noexcept = default;
     /// Allocate @p size bytes from the process-wide pool.
     explicit PoolPtr(size_t size) : ptr_(MemoryPool::instance().allocate(size)) {}
@@ -98,7 +98,7 @@ public:
     /// Free the block (if any) and clear the guard.
     void reset() noexcept;
 
-private:
+  private:
     void* ptr_ = nullptr;
 };
 
@@ -106,20 +106,20 @@ private:
 /// replacement for std::vector so every per-call request goes through the pool
 /// and returns to it on scope exit. Unlike a vector it does not value-initialize
 /// its elements; call zero()/assign() when the consumer relies on that.
-template <class T>
-class PoolArray {
-public:
+template <class T> class PoolArray {
+  public:
     PoolArray() noexcept = default;
     explicit PoolArray(size_t n) { reset(n); }
 
     PoolArray(const PoolArray&) = delete;
     PoolArray& operator=(const PoolArray&) = delete;
-    PoolArray(PoolArray&& o) noexcept
-        : owner_(std::move(o.owner_)), ptr_(o.ptr_), n_(o.n_) {
+    PoolArray(PoolArray&& o) noexcept : owner_(std::move(o.owner_)), ptr_(o.ptr_), n_(o.n_)
+    {
         o.ptr_ = nullptr;
         o.n_ = 0;
     }
-    PoolArray& operator=(PoolArray&& o) noexcept {
+    PoolArray& operator=(PoolArray&& o) noexcept
+    {
         if (this != &o) {
             owner_ = std::move(o.owner_);
             ptr_ = o.ptr_;
@@ -143,28 +143,40 @@ public:
     explicit operator bool() const noexcept { return ptr_ != nullptr; }
 
     /// Size the array, keeping the block when the size is unchanged.
-    bool reset(size_t n) {
-        if (n == n_ && (n == 0 || ptr_ != nullptr)) { return true; }
+    bool reset(size_t n)
+    {
+        if (n == n_ && (n == 0 || ptr_ != nullptr)) {
+            return true;
+        }
         owner_.reset();
         ptr_ = nullptr;
         n_ = 0;
-        if (n == 0) { return true; }
+        if (n == 0) {
+            return true;
+        }
         owner_ = PoolPtr(n * sizeof(T));
-        if (!owner_) { return false; }
+        if (!owner_) {
+            return false;
+        }
         ptr_ = owner_.as<T>();
         n_ = n;
         return true;
     }
 
     /// Size the array and fill every element with @p v.
-    void assign(size_t n, T v) { if (reset(n)) { std::fill_n(ptr_, n, v); } }
+    void assign(size_t n, T v)
+    {
+        if (reset(n)) {
+            std::fill_n(ptr_, n, v);
+        }
+    }
     /// Size the array and zero every element.
     void zero(size_t n) { assign(n, T{}); }
 
-private:
+  private:
     PoolPtr owner_;
-    T*      ptr_ = nullptr;
-    size_t  n_ = 0;
+    T* ptr_ = nullptr;
+    size_t n_ = 0;
 };
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

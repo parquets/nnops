@@ -31,14 +31,18 @@ Gru::~Gru() = default;
 
 namespace {
 
-auto resolve_gru_kernel(Backend backend) -> Gru::Impl::KernelFn {
+auto resolve_gru_kernel(Backend backend) -> Gru::Impl::KernelFn
+{
     switch (backend) {
-    case Backend::CPU: return backend::cpu::recurrent_cpu;
-    default:           return nullptr;
+    case Backend::CPU:
+        return backend::cpu::recurrent_cpu;
+    default:
+        return nullptr;
     }
 }
 
-detail::RecurrentSpec gru_spec(const GruAttributes& a) {
+detail::RecurrentSpec gru_spec(const GruAttributes& a)
+{
     detail::RecurrentSpec s;
     s.mode = RecurrentMode::Gru;
     s.hidden_size = a.hidden_size;
@@ -58,7 +62,7 @@ detail::RecurrentSpec gru_spec(const GruAttributes& a) {
     return s;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 NNOPS_OP_CREATE(Gru, GruAttributes)
 
@@ -68,39 +72,37 @@ Gru::Gru(const GruAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_gru_kernel(backend);
 }
 
-std::vector<TensorDesc> Gru::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Gru::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
-    if (inputs.size() < 3) { return {}; }
-    return recurrent_output_shape(attrs_.hidden_size,
-                                  rnn_num_directions(attrs_.direction),
+    if (inputs.size() < 3) {
+        return {};
+    }
+    return recurrent_output_shape(attrs_.hidden_size, rnn_num_directions(attrs_.direction),
                                   /*with_cell=*/false, inputs);
 }
 
-Status Gru::validate(std::span<const TensorDesc> inputs,
-                     std::span<const TensorDesc> outputs) const
+Status Gru::validate(std::span<const TensorDesc> inputs, std::span<const TensorDesc> outputs) const
 {
-    if (attrs_.layout != 0) { return Status::unsupported; }
+    if (attrs_.layout != 0) {
+        return Status::unsupported;
+    }
     return detail::recurrent_check(backend_, gru_spec(attrs_), inputs, outputs,
                                    /*with_cell=*/false);
 }
 
-Status Gru::compute(std::span<TensorView> outputs,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace)
+Status Gru::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                    const ComputeContext& ctx, void* workspace)
 {
     (void)workspace;
     NNOPS_TRY(validate_views(outputs, inputs));
-    return detail::recurrent_run(backend_, gru_spec(attrs_), impl_->kernel_fn, outputs,
-                                 inputs, ctx);
+    return detail::recurrent_run(backend_, gru_spec(attrs_), impl_->kernel_fn, outputs, inputs,
+                                 ctx);
 }
 
-void Gru::prepackWeights(std::span<const TensorView> inputs,
-                        std::span<TensorView> outputs,
-                        const ComputeContext& ctx)
+void Gru::prepackWeights(std::span<const TensorView> inputs, std::span<TensorView> outputs,
+                         const ComputeContext& ctx)
 {
     detail::recurrent_prepack(backend_, gru_spec(attrs_), inputs, outputs, ctx);
 }
 
-}  // namespace nnops
+} // namespace nnops

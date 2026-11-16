@@ -66,21 +66,20 @@ namespace nnops::backend::cuda {
 /// tile is what the warp grid multiplies it into. Every derived value is a
 /// compile-time constant, so a tile costs nothing at run time and the search is
 /// a switch.
-template <int WarpM_, int WarpN_, int WarpsM_, int WarpsN_, int BK_, int ST_,
-          int Swz_ = 1, bool StagedEpi_ = true, int MinBlocks_ = 1>
-struct ManualHShape
-{
+template <int WarpM_, int WarpN_, int WarpsM_, int WarpsN_, int BK_, int ST_, int Swz_ = 1,
+          bool StagedEpi_ = true, int MinBlocks_ = 1>
+struct ManualHShape {
     static constexpr int WM = WarpM_;  ///< rows per warp (16-row atoms)
     static constexpr int WN = WarpN_;  ///< columns per warp (8-col atoms)
-    static constexpr int MA = WM / 16;  ///< m atoms per warp
-    static constexpr int NA = WN / 8;   ///< n atoms per warp
-    static constexpr int wm = WarpsM_;  ///< warps along m
-    static constexpr int wn = WarpsN_;  ///< warps along n
+    static constexpr int MA = WM / 16; ///< m atoms per warp
+    static constexpr int NA = WN / 8;  ///< n atoms per warp
+    static constexpr int wm = WarpsM_; ///< warps along m
+    static constexpr int wn = WarpsN_; ///< warps along n
     static constexpr int threads = wm * wn * 32;
-    static constexpr int BM = WM * wm;  ///< rows per CTA
-    static constexpr int BN = WN * wn;  ///< columns per CTA
-    static constexpr int BK = BK_;      ///< reduction depth per stage
-    static constexpr int stages = ST_;  ///< cp.async ring depth
+    static constexpr int BM = WM * wm; ///< rows per CTA
+    static constexpr int BN = WN * wn; ///< columns per CTA
+    static constexpr int BK = BK_;     ///< reduction depth per stage
+    static constexpr int stages = ST_; ///< cp.async ring depth
     /// `__launch_bounds__` minimum blocks: it caps the register count, which is
     /// what stands between the small tiles and a fourth resident block.
     static constexpr int MinBlocks = MinBlocks_;
@@ -94,9 +93,9 @@ struct ManualHShape
     /// A skewed panel adds eight elements to the row so consecutive rows land on
     /// different bank quads -- the padding the XOR swizzle exists to avoid.
     static constexpr int kSkew = Swz_ == 0 ? 8 : 0;
-    static constexpr int LDA = BK + kSkew;  ///< k-major row halves
-    static constexpr int LDT = BM + kSkew;  ///< m-major row halves (A transposed)
-    static constexpr int LDN = BN + kSkew;  ///< n-major row halves
+    static constexpr int LDA = BK + kSkew; ///< k-major row halves
+    static constexpr int LDT = BM + kSkew; ///< m-major row halves (A transposed)
+    static constexpr int LDN = BN + kSkew; ///< n-major row halves
     static constexpr int kKSteps = BK / 16;
     static constexpr int kNChunks = BN / 8;
     /// One fill pass is one 16 B vector per thread: BK/8 vectors along a k row,
@@ -106,12 +105,11 @@ struct ManualHShape
     /// The panels and the epilogue share one buffer; the union is the larger.
     /// Each panel is sized to the larger of its two arrival orders, so one
     /// buffer serves every pose.
-    static constexpr int kAMax = BM * LDA > BK * LDT ? BM * LDA : BK * LDT;
-    static constexpr int kBMax = BN * LDA > BK * LDN ? BN * LDA : BK * LDN;
+    static constexpr int kAMax = BM * LDA > BK* LDT ? BM* LDA : BK* LDT;
+    static constexpr int kBMax = BN * LDA > BK* LDN ? BN* LDA : BK* LDN;
     static constexpr int kPanelHalves = stages * (kAMax + kBMax);
     static constexpr int kEpiHalves = BM * LDN;
-    static constexpr int kSmemHalves =
-        kPanelHalves > kEpiHalves ? kPanelHalves : kEpiHalves;
+    static constexpr int kSmemHalves = kPanelHalves > kEpiHalves ? kPanelHalves : kEpiHalves;
     static constexpr int kSmemBytes = kSmemHalves * int(sizeof(__half));
 
     static_assert(WM % 16 == 0, "the warp tile must hold whole 16-row atoms");
@@ -149,8 +147,7 @@ struct ManualHParams {
 /// ldmatrix reads land on different bank quads. It is an involution, so the fill
 /// and the read use the same function, and it costs no padding bytes -- which is
 /// what lets the panels share the epilogue buffer.
-template <class S>
-__device__ __forceinline__ int manual_swz(int row, int col)
+template <class S> __device__ __forceinline__ int manual_swz(int row, int col)
 {
     if constexpr (S::Swz == 0) {
         return row * S::LDA + col;
@@ -169,8 +166,7 @@ __device__ __forceinline__ int manual_swz(int row, int col)
 /// conflict on every B load, which is what put this pose 20% behind the k-major
 /// one.
 /// The m-major A panel `[k][m]`: the n-major B scheme, one BM-wide row.
-template <class S>
-__device__ __forceinline__ int manual_swz_t(int row, int col)
+template <class S> __device__ __forceinline__ int manual_swz_t(int row, int col)
 {
     if constexpr (S::Swz == 0) {
         return row * S::LDT + col;
@@ -181,8 +177,7 @@ __device__ __forceinline__ int manual_swz_t(int row, int col)
     }
 }
 
-template <class S>
-__device__ __forceinline__ int manual_swz_n(int row, int col)
+template <class S> __device__ __forceinline__ int manual_swz_n(int row, int col)
 {
     if constexpr (S::Swz == 0) {
         return row * S::LDN + col;
@@ -196,8 +191,7 @@ __device__ __forceinline__ int manual_swz_n(int row, int col)
 /// The epilogue buffer `[bm][bn]`, swizzled the same way: the write is a lane's
 /// element pair and the read is a thread's 16 B, and both want eight row groups
 /// apart.
-template <class S>
-__device__ __forceinline__ int manual_epi(int row, int col)
+template <class S> __device__ __forceinline__ int manual_epi(int row, int col)
 {
     if constexpr (S::Swz == 0) {
         return row * S::LDN + col;
@@ -211,21 +205,18 @@ __device__ __forceinline__ int manual_epi(int row, int col)
 /// bf16 and f16 differ in exactly two places: the mma opcode, and the f32
 /// conversion the epilogue and the reduce pass need. Everything else is bits.
 template <class Elem>
-__device__ __forceinline__ void manual_mma(float* acc, const uint32_t* a,
-                                           const uint32_t* b)
+__device__ __forceinline__ void manual_mma(float* acc, const uint32_t* a, const uint32_t* b)
 {
     if constexpr (std::is_same_v<Elem, __nv_bfloat16>) {
-        mma_m16n8k16_bf16_f32(&acc[0], &acc[1], &acc[2], &acc[3], a[0], a[1],
-                              a[2], a[3], b[0], b[1], acc[0], acc[1], acc[2],
-                              acc[3]);
+        mma_m16n8k16_bf16_f32(&acc[0], &acc[1], &acc[2], &acc[3], a[0], a[1], a[2], a[3], b[0],
+                              b[1], acc[0], acc[1], acc[2], acc[3]);
     } else {
-        mma_m16n8k16_f32(&acc[0], &acc[1], &acc[2], &acc[3], a[0], a[1], a[2],
-                         a[3], b[0], b[1], acc[0], acc[1], acc[2], acc[3]);
+        mma_m16n8k16_f32(&acc[0], &acc[1], &acc[2], &acc[3], a[0], a[1], a[2], a[3], b[0], b[1],
+                         acc[0], acc[1], acc[2], acc[3]);
     }
 }
 
-template <class Elem>
-__device__ __forceinline__ Elem manual_from_float(float v)
+template <class Elem> __device__ __forceinline__ Elem manual_from_float(float v)
 {
     if constexpr (std::is_same_v<Elem, __nv_bfloat16>) {
         return __float2bfloat16(v);
@@ -236,8 +227,7 @@ __device__ __forceinline__ Elem manual_from_float(float v)
 
 /// Two adjacent columns as one 4 B store; the accumulator fragment always pairs
 /// them, so the epilogue never writes an element on its own.
-template <class Elem>
-__device__ __forceinline__ uint32_t manual_pack2(float lo, float hi)
+template <class Elem> __device__ __forceinline__ uint32_t manual_pack2(float lo, float hi)
 {
     if constexpr (std::is_same_v<Elem, __nv_bfloat16>) {
         const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
@@ -248,16 +238,14 @@ __device__ __forceinline__ uint32_t manual_pack2(float lo, float hi)
     }
 }
 
-template <class Elem>
-__device__ __forceinline__ Elem manual_zero()
+template <class Elem> __device__ __forceinline__ Elem manual_zero()
 {
     return manual_from_float<Elem>(0.0f);
 }
 
 /// The 16-bit GEMM: per-warp value tile from `S`, cp.async ring, swizzled panels.
 template <class S, class Elem, bool TransA, bool TransB>
-__global__ __launch_bounds__(S::threads, S::MinBlocks)
-void manual_gemm_h_kernel(ManualHParams p)
+__global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_h_kernel(ManualHParams p)
 {
     constexpr int BM = S::BM, BN = S::BN, BK = S::BK, ST = S::stages;
     constexpr int WM = S::WM, WN = S::WN, MA = S::MA, NA = S::NA;
@@ -294,18 +282,17 @@ void manual_gemm_h_kernel(ManualHParams p)
     const int split = int(blockIdx.z) - batch * splits;
     const int kt_begin = int(int64_t(k_tiles) * split / splits);
     const int kt_end = int(int64_t(k_tiles) * (split + 1) / splits);
-    if (kt_begin >= kt_end) { return; }
+    if (kt_begin >= kt_end) {
+        return;
+    }
 
     // Batch offsets resolved once; a broadcast axis carries stride 0.
     const Elem* const A =
-        static_cast<const Elem*>(p.a) +
-        manual_batch_offset(p.bsize, p.a_bstr, p.batch_rank, batch);
+        static_cast<const Elem*>(p.a) + manual_batch_offset(p.bsize, p.a_bstr, p.batch_rank, batch);
     const Elem* const B =
-        static_cast<const Elem*>(p.b) +
-        manual_batch_offset(p.bsize, p.b_bstr, p.batch_rank, batch);
-    Elem* const C = static_cast<Elem*>(p.c) +
-                    manual_batch_offset(p.bsize, p.c_bstr, p.batch_rank, batch);
-
+        static_cast<const Elem*>(p.b) + manual_batch_offset(p.bsize, p.b_bstr, p.batch_rank, batch);
+    Elem* const C =
+        static_cast<Elem*>(p.c) + manual_batch_offset(p.bsize, p.c_bstr, p.batch_rank, batch);
 
     // gmem -> smem: one 16 B vector per thread per pass. A k row is BK/8 vectors
     // wide, so a pass covers threads/(BK/8) rows and the panel takes BM divided
@@ -320,7 +307,7 @@ void manual_gemm_h_kernel(ManualHParams p)
     const int mCol = (tid % kMVecPerRow) * 8;
     const int mRow0 = tid / kMVecPerRow;
 
-    constexpr int kNVec = BN / 8;  // 16 B vectors along one B row of the NN panel
+    constexpr int kNVec = BN / 8; // 16 B vectors along one B row of the NN panel
     // One call is one committed group, whether or not it copies anything: the
     // wait's group count has to stay uniform when a split runs dry near its end.
     auto fill = [&](int kt, int stage) {
@@ -346,23 +333,22 @@ void manual_gemm_h_kernel(ManualHParams p)
                                     B + int64_t(k0 + kr) * p.ldb + n_tile + nv * 8);
                 }
             } else
-            for (int i = tid; i < BK * kNVec; i += S::threads) {
-                const int kr = i / kNVec;
-                const int nv = i - kr * kNVec;
-                const int kk = k0 + kr;
-                const int nn = n_tile + nv * 8;
-                if (kk < K && nn + 8 <= N) {
-                    cp_async_ca_16B(&sB[manual_swz_n<S>(kr, nv * 8)],
-                                    B + int64_t(kk) * p.ldb + nn);
-                } else {
-                    for (int t = 0; t < 8; ++t) {
-                        sB[manual_swz_n<S>(kr, nv * 8 + t)] =
-                            (kk < K && nn + t < N)
-                                ? B[int64_t(kk) * p.ldb + nn + t]
-                                : manual_zero<Elem>();
+                for (int i = tid; i < BK * kNVec; i += S::threads) {
+                    const int kr = i / kNVec;
+                    const int nv = i - kr * kNVec;
+                    const int kk = k0 + kr;
+                    const int nn = n_tile + nv * 8;
+                    if (kk < K && nn + 8 <= N) {
+                        cp_async_ca_16B(&sB[manual_swz_n<S>(kr, nv * 8)],
+                                        B + int64_t(kk) * p.ldb + nn);
+                    } else {
+                        for (int t = 0; t < 8; ++t) {
+                            sB[manual_swz_n<S>(kr, nv * 8 + t)] =
+                                (kk < K && nn + t < N) ? B[int64_t(kk) * p.ldb + nn + t] :
+                                                         manual_zero<Elem>();
+                        }
                     }
                 }
-            }
         }
         if constexpr (!TransA) {
             if (aFull) {
@@ -383,9 +369,9 @@ void manual_gemm_h_kernel(ManualHParams p)
                     } else {
                         for (int t = 0; t < 8; ++t) {
                             sA[manual_swz<S>(row, vcol + t)] =
-                                (am < M && k0 + vcol + t < K)
-                                    ? A[int64_t(am) * p.lda + k0 + vcol + t]
-                                    : manual_zero<Elem>();
+                                (am < M && k0 + vcol + t < K) ?
+                                    A[int64_t(am) * p.lda + k0 + vcol + t] :
+                                    manual_zero<Elem>();
                         }
                     }
                 }
@@ -397,14 +383,12 @@ void manual_gemm_h_kernel(ManualHParams p)
                 const int kk = k0 + kr;
                 const int gm = m_tile + mCol;
                 if (aFull || (kk < K && gm + 8 <= M)) {
-                    cp_async_ca_16B(&sA[manual_swz_t<S>(kr, mCol)],
-                                    A + int64_t(kk) * p.lda + gm);
+                    cp_async_ca_16B(&sA[manual_swz_t<S>(kr, mCol)], A + int64_t(kk) * p.lda + gm);
                 } else {
                     for (int t = 0; t < 8; ++t) {
-                        sA[manual_swz_t<S>(kr, mCol + t)] =
-                            (kk < K && gm + t < M)
-                                ? A[int64_t(kk) * p.lda + gm + t]
-                                : manual_zero<Elem>();
+                        sA[manual_swz_t<S>(kr, mCol + t)] = (kk < K && gm + t < M) ?
+                                                                A[int64_t(kk) * p.lda + gm + t] :
+                                                                manual_zero<Elem>();
                     }
                 }
             }
@@ -421,21 +405,21 @@ void manual_gemm_h_kernel(ManualHParams p)
                 }
             } else
 #pragma unroll
-            for (int r = 0; r < BN / kRowsPerPass; ++r) {
-                const int row = vrow + r * kRowsPerPass;
-                const int an = n_tile + row;
-                if (an < N && k0 + vcol + 8 <= K) {
-                    cp_async_ca_16B(&sB[manual_swz<S>(row, vcol)],
-                                    B + int64_t(an) * p.ldb + k0 + vcol);
-                } else {
-                    for (int t = 0; t < 8; ++t) {
-                        sB[manual_swz<S>(row, vcol + t)] =
-                            (an < N && k0 + vcol + t < K)
-                                ? B[int64_t(an) * p.ldb + k0 + vcol + t]
-                                : manual_zero<Elem>();
+                for (int r = 0; r < BN / kRowsPerPass; ++r) {
+                    const int row = vrow + r * kRowsPerPass;
+                    const int an = n_tile + row;
+                    if (an < N && k0 + vcol + 8 <= K) {
+                        cp_async_ca_16B(&sB[manual_swz<S>(row, vcol)],
+                                        B + int64_t(an) * p.ldb + k0 + vcol);
+                    } else {
+                        for (int t = 0; t < 8; ++t) {
+                            sB[manual_swz<S>(row, vcol + t)] =
+                                (an < N && k0 + vcol + t < K) ?
+                                    B[int64_t(an) * p.ldb + k0 + vcol + t] :
+                                    manual_zero<Elem>();
+                        }
                     }
                 }
-            }
         }
         cp_async_commit_group();
     };
@@ -446,7 +430,9 @@ void manual_gemm_h_kernel(ManualHParams p)
 #pragma unroll
         for (int j = 0; j < NA; ++j)
 #pragma unroll
-            for (int t = 0; t < 4; ++t) { acc[i][j][t] = 0.0f; }
+            for (int t = 0; t < 4; ++t) {
+                acc[i][j][t] = 0.0f;
+            }
 
     uint32_t frA[MA][4];
     uint32_t frB[NA][2];
@@ -477,16 +463,13 @@ void manual_gemm_h_kernel(ManualHParams p)
             for (int i = 0; i < MA; ++i) {
                 if constexpr (!TransA) {
                     const Elem* src =
-                        &sA[manual_swz<S>(warp_m * WM + i * 16 + ld_row,
-                                          kcol + ld_col)];
-                    ldmatrix_x4(&frA[i][0], &frA[i][1], &frA[i][2], &frA[i][3],
-                                src);
+                        &sA[manual_swz<S>(warp_m * WM + i * 16 + ld_row, kcol + ld_col)];
+                    ldmatrix_x4(&frA[i][0], &frA[i][1], &frA[i][2], &frA[i][3], src);
                 } else {
                     // `[k][m]` transposed on load: (k0-7,m0-7) and (k8-15,m0-7)
                     // land as a0/a2, the m+8 pair as a1/a3.
                     const Elem* src =
-                        &sA[manual_swz_t<S>(kcol + ld_row,
-                                            warp_m * WM + i * 16 + ld_col)];
+                        &sA[manual_swz_t<S>(kcol + ld_row, warp_m * WM + i * 16 + ld_col)];
                     uint32_t r0, r1, r2, r3;
                     ldmatrix_x4_trans(&r0, &r1, &r2, &r3, src);
                     frA[i][0] = r0;
@@ -502,8 +485,7 @@ void manual_gemm_h_kernel(ManualHParams p)
                     // `[n][k]`: the four 8x8 panels are (n0-7,k0-7), (n8-15,k0-7),
                     // (n0-7,k8-15), (n8-15,k8-15).
                     const Elem* src =
-                        &sB[manual_swz<S>(warp_n * WN + j * 8 + ld_row,
-                                          kcol + ld_col)];
+                        &sB[manual_swz<S>(warp_n * WN + j * 8 + ld_row, kcol + ld_col)];
                     ldmatrix_x4(&r0, &r1, &r2, &r3, src);
                     frB[j][0] = r0;
                     frB[j][1] = r2;
@@ -513,8 +495,7 @@ void manual_gemm_h_kernel(ManualHParams p)
                     // `[k][n]` transposed on load: (k0-7,n0-7), (k8-15,n0-7),
                     // (k0-7,n8-15), (k8-15,n8-15) are the two atoms' b0/b1.
                     const Elem* src =
-                        &sB[manual_swz_n<S>(kcol + ld_row,
-                                            warp_n * WN + j * 8 + ld_col)];
+                        &sB[manual_swz_n<S>(kcol + ld_row, warp_n * WN + j * 8 + ld_col)];
                     ldmatrix_x4_trans(&r0, &r1, &r2, &r3, src);
                     frB[j][0] = r0;
                     frB[j][1] = r1;
@@ -539,7 +520,7 @@ void manual_gemm_h_kernel(ManualHParams p)
 #pragma unroll
         for (int i = 0; i < MA; ++i) {
             const int gm = m0 + i * 16 + lane / 4;
-    #pragma unroll
+#pragma unroll
             for (int j = 0; j < NA; ++j) {
                 const int gn = n0 + j * 8 + 2 * (lane % 4);
                 if (gm < M && gn + 1 < N) {
@@ -554,8 +535,7 @@ void manual_gemm_h_kernel(ManualHParams p)
                     for (int rr = 0; rr < 2; ++rr) {
                         for (int cc = 0; cc < 2; ++cc) {
                             if (rows[rr] < M && gn + cc < N) {
-                                part[int64_t(rows[rr]) * N + gn + cc] =
-                                    acc[i][j][rr * 2 + cc];
+                                part[int64_t(rows[rr]) * N + gn + cc] = acc[i][j][rr * 2 + cc];
                             }
                         }
                     }
@@ -589,21 +569,20 @@ void manual_gemm_h_kernel(ManualHParams p)
                 const int gn = n0 + j * 8 + cn;
                 for (int rr = 0; rr < 2; ++rr) {
                     const int row = gm + rr * 8;
-                    if (row >= M) { continue; }
+                    if (row >= M) {
+                        continue;
+                    }
                     Elem* const dst = C + int64_t(row) * p.ldc;
-                    const float v0 = manual_epilogue<Elem>(
-                        p.epi, acc[i][j][rr * 2], row, gn, dst);
-                    const float v1 = gn + 1 < N
-                        ? manual_epilogue<Elem>(p.epi, acc[i][j][rr * 2 + 1], row,
-                                                gn + 1, dst)
-                        : 0.0f;
+                    const float v0 = manual_epilogue<Elem>(p.epi, acc[i][j][rr * 2], row, gn, dst);
+                    const float v1 =
+                        gn + 1 < N ?
+                            manual_epilogue<Elem>(p.epi, acc[i][j][rr * 2 + 1], row, gn + 1, dst) :
+                            0.0f;
                     if (pair4 && gn + 2 <= N) {
-                        *reinterpret_cast<uint32_t*>(dst + gn) =
-                            manual_pack2<Elem>(v0, v1);
+                        *reinterpret_cast<uint32_t*>(dst + gn) = manual_pack2<Elem>(v0, v1);
                     } else {
                         for (int cc = 0; cc < 2 && gn + cc < N; ++cc) {
-                            dst[gn + cc] =
-                                manual_from_float<Elem>(cc == 0 ? v0 : v1);
+                            dst[gn + cc] = manual_from_float<Elem>(cc == 0 ? v0 : v1);
                         }
                     }
                 }
@@ -630,14 +609,15 @@ void manual_gemm_h_kernel(ManualHParams p)
             const bool in_lo = gm + 8 < M && gn < N;
             const Elem* const dhi = C + int64_t(gm) * p.ldc;
             const Elem* const dlo = C + int64_t(gm + 8) * p.ldc;
-            const float v0 = in_hi
-                ? manual_epilogue<Elem>(p.epi, acc[i][j][0], gm, gn, dhi) : 0.0f;
-            const float v1 = in_hi && gn + 1 < N
-                ? manual_epilogue<Elem>(p.epi, acc[i][j][1], gm, gn + 1, dhi) : 0.0f;
-            const float v2 = in_lo
-                ? manual_epilogue<Elem>(p.epi, acc[i][j][2], gm + 8, gn, dlo) : 0.0f;
-            const float v3 = in_lo && gn + 1 < N
-                ? manual_epilogue<Elem>(p.epi, acc[i][j][3], gm + 8, gn + 1, dlo) : 0.0f;
+            const float v0 = in_hi ? manual_epilogue<Elem>(p.epi, acc[i][j][0], gm, gn, dhi) : 0.0f;
+            const float v1 = in_hi && gn + 1 < N ?
+                                 manual_epilogue<Elem>(p.epi, acc[i][j][1], gm, gn + 1, dhi) :
+                                 0.0f;
+            const float v2 =
+                in_lo ? manual_epilogue<Elem>(p.epi, acc[i][j][2], gm + 8, gn, dlo) : 0.0f;
+            const float v3 = in_lo && gn + 1 < N ?
+                                 manual_epilogue<Elem>(p.epi, acc[i][j][3], gm + 8, gn + 1, dlo) :
+                                 0.0f;
             *reinterpret_cast<uint32_t*>(&stage[manual_epi<S>(em, en)]) =
                 manual_pack2<Elem>(v0, v1);
             *reinterpret_cast<uint32_t*>(&stage[manual_epi<S>(em + 8, en)]) =
@@ -655,25 +635,30 @@ void manual_gemm_h_kernel(ManualHParams p)
         const int row = idx / S::kNChunks;
         const int c = idx - row * S::kNChunks;
         const int gm = m_tile + row;
-        if (gm >= M) { continue; }
+        if (gm >= M) {
+            continue;
+        }
         const int gn = n_tile + c * 8;
         const Elem* src = &stage[manual_epi<S>(row, c * 8)];
         Elem* dst = C + int64_t(gm) * p.ldc + gn;
         if (vec && gn + 8 <= N) {
             *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
         } else {
-            for (int t = 0; t < 8 && gn + t < N; ++t) { dst[t] = src[t]; }
+            for (int t = 0; t < 8 && gn + t < N; ++t) {
+                dst[t] = src[t];
+            }
         }
     }
 }
 
 /// Sum the split-K planes and write the destination, one thread per element.
-template <class Elem>
-__global__ void manual_gemm_h_reduce_kernel(ManualHParams p)
+template <class Elem> __global__ void manual_gemm_h_reduce_kernel(ManualHParams p)
 {
     const int64_t plane = int64_t(p.m) * p.n;
     const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= plane) { return; }
+    if (idx >= plane) {
+        return;
+    }
     const int splits = int(gridDim.y);
     const int m = int(idx / p.n);
     const int n = int(idx - int64_t(m) * p.n);
@@ -682,10 +667,10 @@ __global__ void manual_gemm_h_reduce_kernel(ManualHParams p)
         for (int s = 0; s < splits; ++s) {
             sum += p.partial[(b * splits + s) * plane + idx];
         }
-        Elem* const dst = static_cast<Elem*>(p.c) +
-                          manual_batch_offset(p.bsize, p.c_bstr, p.batch_rank, b);
+        Elem* const dst =
+            static_cast<Elem*>(p.c) + manual_batch_offset(p.bsize, p.c_bstr, p.batch_rank, b);
         dst[int64_t(m) * p.ldc + n] = manual_from_float<Elem>(p.alpha * sum);
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

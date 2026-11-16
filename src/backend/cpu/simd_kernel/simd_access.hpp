@@ -34,27 +34,28 @@ constexpr int64_t kChannelLanes = 8;
 
 /// Load @p lanes elements, zero-filling the rest — a short channel block, and the
 /// bias vector.
-template <typename T>
-inline auto load_lanes(const T* p, int64_t lanes)
+template <typename T> inline auto load_lanes(const T* p, int64_t lanes)
 {
-    if (lanes == kChannelLanes) { return v_load(p); }
+    if (lanes == kChannelLanes) {
+        return v_load(p);
+    }
     T tmp[kChannelLanes] = {};
     std::memcpy(tmp, p, static_cast<size_t>(lanes) * sizeof(T));
     return v_load(tmp);
 }
 
-template <typename T, bool Full = true>
-struct FpSrc {
+template <typename T, bool Full = true> struct FpSrc {
     using elem = T;
-    static constexpr bool full = Full;  ///< a whole channel vector, so no lane masks
-    const T* in;    // also picks the v_set1/v_zero overload
+    static constexpr bool full = Full; ///< a whole channel vector, so no lane masks
+    const T* in;                       // also picks the v_set1/v_zero overload
     int64_t lanes = kChannelLanes;
 
     const T* ptr_at(int64_t off) const { return in + off; }
     auto load_at(int64_t off) const { return load_ptr(in + off); }
     /// An address the caller built — the kernels keep a per-tap row pointer so
     /// the width loop does no address arithmetic.
-    auto load_ptr(const T* p) const {
+    auto load_ptr(const T* p) const
+    {
         if constexpr (Full) {
             return v_load(p);
         } else {
@@ -65,17 +66,17 @@ struct FpSrc {
     auto set1(float s) const { return v_set1(in, s); }
 };
 
-template <typename InT, bool Full = true>
-struct QuantSrc {
+template <typename InT, bool Full = true> struct QuantSrc {
     using elem = InT;
-    static constexpr bool full = Full;  ///< a whole channel vector, so no lane masks
+    static constexpr bool full = Full; ///< a whole channel vector, so no lane masks
     const InT* in;
     float scale, zero_pt;
     int64_t lanes = kChannelLanes;
 
     const InT* ptr_at(int64_t off) const { return in + off; }
     v_f32x8 load_at(int64_t off) const { return load_ptr(in + off); }
-    v_f32x8 load_ptr(const InT* p) const {
+    v_f32x8 load_ptr(const InT* p) const
+    {
         if constexpr (Full) {
             return dequantize_tensor(p, scale, zero_pt);
         } else {
@@ -94,8 +95,12 @@ inline auto channel_first_load(const T* row, int64_t iw0, int64_t sw, int64_t iw
 {
     constexpr int64_t L = simd_lane_for<T>;
     if (iw0 >= 0) {
-        if (sw == 1 && iw0 + L <= iw) { return v_load(row + iw0); }
-        if (sw == 2 && iw0 + 2 * L <= iw) { return v_load_even(row + iw0); }
+        if (sw == 1 && iw0 + L <= iw) {
+            return v_load(row + iw0);
+        }
+        if (sw == 2 && iw0 + 2 * L <= iw) {
+            return v_load_even(row + iw0);
+        }
     }
     T tmp[L];
     for (int64_t l = 0; l < L; ++l) {
@@ -107,16 +112,15 @@ inline auto channel_first_load(const T* row, int64_t iw0, int64_t sw, int64_t iw
 
 /// Stores for R rows, r == 0 being the current output row; @c pix is the element
 /// distance between adjacent output positions (the channel count, channel-last).
-template <typename T, bool Full = true>
-struct FpDst {
+template <typename T, bool Full = true> struct FpDst {
     T* out;
     int64_t row_stride;
     bool add_to;
     int64_t pix = kChannelLanes;
     int64_t lanes = kChannelLanes;
 
-    template <typename V>
-    void store(int64_t r, int64_t ow, const V& v) const {
+    template <typename V> void store(int64_t r, int64_t ow, const V& v) const
+    {
         T* p = out + r * row_stride + ow * pix;
         if constexpr (Full) {
             v_store_add(p, v, add_to);
@@ -130,15 +134,18 @@ struct FpDst {
     }
 
     /// The destination's current contents, for the pre-activation residual.
-    auto load(int64_t r, int64_t ow) const {
+    auto load(int64_t r, int64_t ow) const
+    {
         const T* p = out + r * row_stride + ow * pix;
-        if constexpr (Full) { return v_load(p); }
-        else { return load_lanes(p, lanes); }
+        if constexpr (Full) {
+            return v_load(p);
+        } else {
+            return load_lanes(p, lanes);
+        }
     }
 };
 
-template <typename OutT, bool Full = true>
-struct QuantDst {
+template <typename OutT, bool Full = true> struct QuantDst {
     OutT* out;
     int64_t row_stride;
     float scale, zero_pt;
@@ -146,8 +153,8 @@ struct QuantDst {
     int64_t pix = kChannelLanes;
     int64_t lanes = kChannelLanes;
 
-    template <typename V>
-    void store(int64_t r, int64_t ow, const V& v) const {
+    template <typename V> void store(int64_t r, int64_t ow, const V& v) const
+    {
         OutT* p = out + r * row_stride + ow * pix;
         if constexpr (Full) {
             requantize_store(p, v, scale, zero_pt, add_to);
@@ -165,7 +172,8 @@ struct QuantDst {
 
     /// The destination's current contents in the accumulate's (f32) domain, for
     /// the pre-activation residual.
-    v_f32x8 load(int64_t r, int64_t ow) const {
+    v_f32x8 load(int64_t r, int64_t ow) const
+    {
         const OutT* p = out + r * row_stride + ow * pix;
         if constexpr (Full) {
             return dequantize_tensor(p, scale, zero_pt);
@@ -177,4 +185,4 @@ struct QuantDst {
     }
 };
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

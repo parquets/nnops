@@ -60,17 +60,17 @@ namespace sims = ::nnops::simd;
 // that carries it.
 
 /// A operand, full k-group: one row pair's four k values in each half.
-__attribute__((target("bf16")))
-inline bfloat16x8_t bf16_a_pair(const bfloat16* r0, const bfloat16* r1) noexcept {
-    return vreinterpretq_bf16_u16(
-        vcombine_u16(vld1_u16(reinterpret_cast<const uint16_t*>(r0)),
-                     vld1_u16(reinterpret_cast<const uint16_t*>(r1))));
+__attribute__((target("bf16"))) inline bfloat16x8_t bf16_a_pair(const bfloat16* r0,
+                                                                const bfloat16* r1) noexcept
+{
+    return vreinterpretq_bf16_u16(vcombine_u16(vld1_u16(reinterpret_cast<const uint16_t*>(r0)),
+                                               vld1_u16(reinterpret_cast<const uint16_t*>(r1))));
 }
 
 /// A operand for the short final k-group: @p rem (< 4) values, zero past them.
-__attribute__((target("bf16")))
-inline bfloat16x8_t bf16_a_pair_tail(const bfloat16* r0, const bfloat16* r1,
-                                     int rem) noexcept {
+__attribute__((target("bf16"))) inline bfloat16x8_t
+bf16_a_pair_tail(const bfloat16* r0, const bfloat16* r1, int rem) noexcept
+{
     uint16_t tmp[8] = {};
     for (int j = 0; j < rem; ++j) {
         tmp[j] = r0[j].bits;
@@ -81,30 +81,30 @@ inline bfloat16x8_t bf16_a_pair_tail(const bfloat16* r0, const bfloat16* r1,
 
 /// B operand out of a packed panel: k-group @p g, colpair @p cp (0..7, i.e. the
 /// whole 16-column panel; the low 4 are the block's first 8 columns).
-__attribute__((target("bf16")))
-inline bfloat16x8_t bf16_b_panel(const bfloat16* b, int g, int cp) noexcept {
+__attribute__((target("bf16"))) inline bfloat16x8_t bf16_b_panel(const bfloat16* b, int g,
+                                                                 int cp) noexcept
+{
     return vreinterpretq_bf16_u16(
         vld1q_u16(reinterpret_cast<const uint16_t*>(b) + g * bf16_b_k4_elems + cp * 8));
 }
 
 /// B operand out of a caller's matrix, rows @p ldb apart, full k-group and
 /// in-range columns: only the gather is left.
-__attribute__((target("bf16")))
-inline bfloat16x8_t bf16_b_stride(const bfloat16* b, int64_t ldb, int g,
-                                  int cp) noexcept {
+__attribute__((target("bf16"))) inline bfloat16x8_t bf16_b_stride(const bfloat16* b, int64_t ldb,
+                                                                  int g, int cp) noexcept
+{
     uint16_t tmp[8];
     for (int lane = 0; lane < 8; ++lane) {
-        tmp[lane] =
-            b[static_cast<int64_t>(g * 4 + (lane & 3)) * ldb + 2 * cp + (lane >> 2)].bits;
+        tmp[lane] = b[static_cast<int64_t>(g * 4 + (lane & 3)) * ldb + 2 * cp + (lane >> 2)].bits;
     }
     return vreinterpretq_bf16_u16(vld1q_u16(tmp));
 }
 
 /// The same gather with the bounds checks: rows past @p kc and columns past
 /// @p nc read as zero.
-__attribute__((target("bf16")))
-inline bfloat16x8_t bf16_b_stride_tail(const bfloat16* b, int64_t ldb, int g,
-                                       int cp, int kc, int nc) noexcept {
+__attribute__((target("bf16"))) inline bfloat16x8_t
+bf16_b_stride_tail(const bfloat16* b, int64_t ldb, int g, int cp, int kc, int nc) noexcept
+{
     uint16_t tmp[8] = {};
     for (int lane = 0; lane < 8; ++lane) {
         const int k = g * 4 + (lane & 3);
@@ -124,9 +124,9 @@ inline bfloat16x8_t bf16_b_stride_tail(const bfloat16* b, int64_t ldb, int g,
 /// pair's two columns for row 0, then the same two for row 1. A row past `mr`
 /// goes through the same alias index as A and C, so `bias[r]` stays in range.
 template <int seed>
-__attribute__((target("bf16")))
-inline float32x4_t bf16_seed(const bfloat16* bias, int r0, int r1,
-                             int col) noexcept {
+__attribute__((target("bf16"))) inline float32x4_t bf16_seed(const bfloat16* bias, int r0, int r1,
+                                                             int col) noexcept
+{
     if constexpr (seed == 1) {
         return vcombine_f32(vdup_n_f32(sims::s_load(bias + r0)),
                             vdup_n_f32(sims::s_load(bias + r1)));
@@ -142,9 +142,9 @@ inline float32x4_t bf16_seed(const bfloat16* bias, int r0, int r1,
 
 /// Join four column pairs' accumulators into one 8-column row: @p hi picks the
 /// row of each pair (0 = the pair's first row, 1 = its second).
-__attribute__((target("bf16")))
-inline sims::v_f32x8 bf16_gather(bool hi, float32x4_t a0, float32x4_t a1,
-                                 float32x4_t a2, float32x4_t a3) noexcept {
+__attribute__((target("bf16"))) inline sims::v_f32x8
+bf16_gather(bool hi, float32x4_t a0, float32x4_t a1, float32x4_t a2, float32x4_t a3) noexcept
+{
     const float32x2_t x0 = hi ? vget_high_f32(a0) : vget_low_f32(a0);
     const float32x2_t x1 = hi ? vget_high_f32(a1) : vget_low_f32(a1);
     const float32x2_t x2 = hi ? vget_high_f32(a2) : vget_low_f32(a2);
@@ -153,18 +153,20 @@ inline sims::v_f32x8 bf16_gather(bool hi, float32x4_t a0, float32x4_t a1,
 }
 
 /// The C read that has to happen before any store of the block.
-__attribute__((target("bf16")))
-inline sims::v_f32x8 bf16_get8(const bfloat16* p) noexcept {
+__attribute__((target("bf16"))) inline sims::v_f32x8 bf16_get8(const bfloat16* p) noexcept
+{
     return sims::v_cvt_bf16_to_f32(reinterpret_cast<const uint16_t*>(p));
 }
 
 /// C add, clamp, narrow, store, for one row's 8 columns.
 template <bool zero_mode>
-__attribute__((target("bf16")))
-inline void bf16_put8(bfloat16* NNOPS_RESTRICT p, sims::v_f32x8 v,
-                      const sims::v_f32x8& cur, const sims::v_f32x8& vmin,
-                      const sims::v_f32x8& vmax) noexcept {
-    if constexpr (!zero_mode) { v = sims::v_add(v, cur); }
+__attribute__((target("bf16"))) inline void
+bf16_put8(bfloat16* NNOPS_RESTRICT p, sims::v_f32x8 v, const sims::v_f32x8& cur,
+          const sims::v_f32x8& vmin, const sims::v_f32x8& vmax) noexcept
+{
+    if constexpr (!zero_mode) {
+        v = sims::v_add(v, cur);
+    }
     sims::v_cvt_f32_to_bf16(reinterpret_cast<uint16_t*>(p),
                             sims::v_min(sims::v_max(v, vmin), vmax));
 }
@@ -175,11 +177,10 @@ inline void bf16_put8(bfloat16* NNOPS_RESTRICT p, sims::v_f32x8 v,
 
 /// One live row of a store block: bias seed, the C read, clamp, narrow.
 template <bool zero_mode, int seed>
-__attribute__((target("bf16")))
-inline void bf16_store_row(bfloat16* NNOPS_RESTRICT cp, int n, int rem, int r,
-                           const bfloat16* bias, sims::v_f32x8 v,
-                           const sims::v_f32x8& vmin,
-                           const sims::v_f32x8& vmax) noexcept {
+__attribute__((target("bf16"))) inline void
+bf16_store_row(bfloat16* NNOPS_RESTRICT cp, int n, int rem, int r, const bfloat16* bias,
+               sims::v_f32x8 v, const sims::v_f32x8& vmin, const sims::v_f32x8& vmax) noexcept
+{
     if constexpr (seed == 1) {
         v = sims::v_add(v, sims::v_set1_f32x8(static_cast<float>(bias[r])));
     } else if constexpr (seed == 2) {
@@ -192,7 +193,9 @@ inline void bf16_store_row(bfloat16* NNOPS_RESTRICT cp, int n, int rem, int r,
             // A short block reads only its live columns; the panel's padding
             // past `rem` must not reach C.
             float cur[8] = {};
-            for (int i = 0; i < rem; ++i) { cur[i] = static_cast<float>(cp[i]); }
+            for (int i = 0; i < rem; ++i) {
+                cur[i] = static_cast<float>(cp[i]);
+            }
             v = sims::v_add(v, sims::v_load(cur));
         }
     }
@@ -203,7 +206,9 @@ inline void bf16_store_row(bfloat16* NNOPS_RESTRICT cp, int n, int rem, int r,
     } else {
         float lane[8];
         sims::v_store(lane, v);
-        for (int i = 0; i < rem; ++i) { cp[i] = bfloat16(lane[i]); }
+        for (int i = 0; i < rem; ++i) {
+            cp[i] = bfloat16(lane[i]);
+        }
     }
 }
 
@@ -211,11 +216,11 @@ inline void bf16_store_row(bfloat16* NNOPS_RESTRICT cp, int n, int rem, int r,
 /// looped over: @p rem is the block's live width (the panel's columns past it
 /// are dropped).
 template <int PAIRS, bool zero_mode, int seed>
-__attribute__((target("bf16")))
-inline void bf16_store_block(int mr, int n, int rem,
-                             bfloat16* const (&c_rows)[2 * PAIRS],
-                             const float32x4_t (&acc)[PAIRS][4],
-                             float lo, float hi, const bfloat16* bias) noexcept {
+__attribute__((target("bf16"))) inline void
+bf16_store_block(int mr, int n, int rem, bfloat16* const (&c_rows)[2 * PAIRS],
+                 const float32x4_t (&acc)[PAIRS][4], float lo, float hi,
+                 const bfloat16* bias) noexcept
+{
     const sims::v_f32x8 vmin = sims::v_set1_f32x8(lo);
     const sims::v_f32x8 vmax = sims::v_set1_f32x8(hi);
     for (int p = 0; p < PAIRS; ++p) {
@@ -225,14 +230,12 @@ inline void bf16_store_block(int mr, int n, int rem,
         if (2 * p < mr) {
             bf16_store_row<zero_mode, seed>(
                 c_rows[2 * p] + n, n, rem, 2 * p, bias,
-                bf16_gather(false, acc[p][0], acc[p][1], acc[p][2], acc[p][3]),
-                vmin, vmax);
+                bf16_gather(false, acc[p][0], acc[p][1], acc[p][2], acc[p][3]), vmin, vmax);
         }
         if (2 * p + 1 < mr) {
             bf16_store_row<zero_mode, seed>(
                 c_rows[2 * p + 1] + n, n, rem, 2 * p + 1, bias,
-                bf16_gather(true, acc[p][0], acc[p][1], acc[p][2], acc[p][3]),
-                vmin, vmax);
+                bf16_gather(true, acc[p][0], acc[p][1], acc[p][2], acc[p][3]), vmin, vmax);
         }
     }
 }
@@ -240,10 +243,9 @@ inline void bf16_store_block(int mr, int n, int rem,
 /// The two routes' row pointers: a row past `mr` aliases the last live one, so
 /// a partial panel stays inside its own rows.
 template <int PAIRS>
-inline void bf16_rows(const bfloat16* a, int lda, int mr,
-                      bfloat16* c, int ldc,
-                      const bfloat16* (&a_rows)[2 * PAIRS],
-                      bfloat16* (&c_rows)[2 * PAIRS]) noexcept {
+inline void bf16_rows(const bfloat16* a, int lda, int mr, bfloat16* c, int ldc,
+                      const bfloat16* (&a_rows)[2 * PAIRS], bfloat16* (&c_rows)[2 * PAIRS]) noexcept
+{
     for (int r = 0; r < 2 * PAIRS; ++r) {
         const int i = (r < mr) ? r : mr - 1;
         a_rows[r] = a + static_cast<int64_t>(i) * lda;
@@ -254,11 +256,10 @@ inline void bf16_rows(const bfloat16* a, int lda, int mr,
 /// One 8-column block, array form. The unrolled kernels hand their leftover
 /// columns (fewer than 8 for mr8, fewer than 16 for mr4/mr1) to this.
 template <int PAIRS, bool Strided, bool zero_mode, int seed>
-__attribute__((target("bf16")))
-inline void bf16_block8(int mr, int n, int nc, int kc, bfloat16* c, int ldc,
-                        const bfloat16* a, int lda,
-                        const bfloat16* b, int64_t ldb,
-                        float lo, float hi, const bfloat16* bias) noexcept {
+__attribute__((target("bf16"))) inline void
+bf16_block8(int mr, int n, int nc, int kc, bfloat16* c, int ldc, const bfloat16* a, int lda,
+            const bfloat16* b, int64_t ldb, float lo, float hi, const bfloat16* bias) noexcept
+{
     const bfloat16* a_rows[2 * PAIRS];
     bfloat16* c_rows[2 * PAIRS];
     bf16_rows<PAIRS>(a, lda, mr, c, ldc, a_rows, c_rows);
@@ -273,16 +274,17 @@ inline void bf16_block8(int mr, int n, int nc, int kc, bfloat16* c, int ldc,
 
     float32x4_t acc[PAIRS][4];
     for (int p = 0; p < PAIRS; ++p) {
-        for (int cp = 0; cp < 4; ++cp) { acc[p][cp] = vdupq_n_f32(0.0f); }
+        for (int cp = 0; cp < 4; ++cp) {
+            acc[p][cp] = vdupq_n_f32(0.0f);
+        }
     }
 
     for (int g = 0; g < kgroups; ++g) {
         bfloat16x8_t bop[4];
         for (int cp = 0; cp < 4; ++cp) {
             if constexpr (Strided) {
-                bop[cp] = (nblk < 8)
-                              ? bf16_b_stride_tail(b, ldb, g, blk * 4 + cp, kc, nloc)
-                              : bf16_b_stride(b, ldb, g, blk * 4 + cp);
+                bop[cp] = (nblk < 8) ? bf16_b_stride_tail(b, ldb, g, blk * 4 + cp, kc, nloc) :
+                                       bf16_b_stride(b, ldb, g, blk * 4 + cp);
             } else {
                 bop[cp] = bf16_b_panel(b, g, blk * 4 + cp);
             }
@@ -306,16 +308,14 @@ inline void bf16_block8(int mr, int n, int nc, int kc, bfloat16* c, int ldc,
             }
         }
         for (int p = 0; p < PAIRS; ++p) {
-            const bfloat16x8_t aop =
-                bf16_a_pair_tail(a_rows[2 * p], a_rows[2 * p + 1], ktail);
+            const bfloat16x8_t aop = bf16_a_pair_tail(a_rows[2 * p], a_rows[2 * p + 1], ktail);
             for (int cp = 0; cp < 4; ++cp) {
                 acc[p][cp] = vbfmmlaq_f32(acc[p][cp], aop, bop[cp]);
             }
         }
     }
 
-    bf16_store_block<PAIRS, zero_mode, seed>(mr, n, std::min(8, nc - n), c_rows,
-                                             acc, lo, hi, bias);
+    bf16_store_block<PAIRS, zero_mode, seed>(mr, n, std::min(8, nc - n), c_rows, acc, lo, hi, bias);
 }
 
 /// Step from one packed panel to the next. Below -1 a negative ldb is how far
@@ -323,7 +323,8 @@ inline void bf16_block8(int mr, int n, int nc, int kc, bfloat16* c, int ldc,
 /// packed into — for bf16 that is the whole-K slot, so it differs from this
 /// call's own pack on a short k block. `-1` (and a non-negative ldb, which only
 /// the in-place route sees) means the panels are this call's.
-inline int64_t bf16_panel_step(int64_t ldb, int64_t kc) noexcept {
+inline int64_t bf16_panel_step(int64_t ldb, int64_t kc) noexcept
+{
     return (ldb < -1) ? -ldb : bf16_b_panel_stride(kc);
 }
 
@@ -331,15 +332,17 @@ inline int64_t bf16_panel_step(int64_t ldb, int64_t kc) noexcept {
 /// panel @p b already points at. One panel is 16 columns, so an in-place B
 /// (Strided) steps 16 elements to the next one, not 16 k-rows.
 template <int PAIRS, bool Strided, bool zero_mode, int seed>
-__attribute__((target("bf16")))
-inline void bf16_tail(int mr, int n, int nc, int kc, bfloat16* c, int ldc,
-                      const bfloat16* a, int lda, const bfloat16* b, int64_t ldb,
-                      float lo, float hi, const bfloat16* bias) noexcept {
+__attribute__((target("bf16"))) inline void
+bf16_tail(int mr, int n, int nc, int kc, bfloat16* c, int ldc, const bfloat16* a, int lda,
+          const bfloat16* b, int64_t ldb, float lo, float hi, const bfloat16* bias) noexcept
+{
     const int64_t advance = Strided ? 16 : bf16_panel_step(ldb, kc);
     for (; n < nc; n += 8) {
-        bf16_block8<PAIRS, Strided, zero_mode, seed>(mr, n, nc, kc, c, ldc, a, lda,
-                                                     b, ldb, lo, hi, bias);
-        if (n & 8) { b += advance; }
+        bf16_block8<PAIRS, Strided, zero_mode, seed>(mr, n, nc, kc, c, ldc, a, lda, b, ldb, lo, hi,
+                                                     bias);
+        if (n & 8) {
+            b += advance;
+        }
     }
 }
 
@@ -348,12 +351,11 @@ inline void bf16_tail(int mr, int n, int nc, int kc, bfloat16* c, int ldc,
 // =========================================================================
 
 template <bool Strided, bool zero_mode, int seed>
-__attribute__((target("bf16")))
-inline void bf16_kernel_mr8(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
-                            int ldc, const bfloat16* NNOPS_RESTRICT A, int lda,
-                            const bfloat16* NNOPS_RESTRICT B, int64_t ldb,
-                            float lo, float hi,
-                            const bfloat16* NNOPS_RESTRICT bias) noexcept {
+__attribute__((target("bf16"))) inline void
+bf16_kernel_mr8(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C, int ldc,
+                const bfloat16* NNOPS_RESTRICT A, int lda, const bfloat16* NNOPS_RESTRICT B,
+                int64_t ldb, float lo, float hi, const bfloat16* NNOPS_RESTRICT bias) noexcept
+{
     bfloat16* NNOPS_RESTRICT c0 = C + 0 * ldc;
     bfloat16* NNOPS_RESTRICT c1 = (mr > 1) ? C + 1 * ldc : c0;
     bfloat16* NNOPS_RESTRICT c2 = (mr > 2) ? C + 2 * ldc : c1;
@@ -446,8 +448,14 @@ inline void bf16_kernel_mr8(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
             c32 = vbfmmlaq_f32(c32, a67, b2);
             c33 = vbfmmlaq_f32(c33, a67, b3);
 
-            p0 += 4; p1 += 4; p2 += 4; p3 += 4;
-            p4 += 4; p5 += 4; p6 += 4; p7 += 4;
+            p0 += 4;
+            p1 += 4;
+            p2 += 4;
+            p3 += 4;
+            p4 += 4;
+            p5 += 4;
+            p6 += 4;
+            p7 += 4;
         }
 
         if (ktail) {
@@ -511,20 +519,21 @@ inline void bf16_kernel_mr8(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
         }
 
         bf16_put8<zero_mode>(c0 + n, bf16_gather(false, c00, c01, c02, c03), k0, vmin, vmax);
-        bf16_put8<zero_mode>(c1 + n, bf16_gather(true,  c00, c01, c02, c03), k1, vmin, vmax);
+        bf16_put8<zero_mode>(c1 + n, bf16_gather(true, c00, c01, c02, c03), k1, vmin, vmax);
         bf16_put8<zero_mode>(c2 + n, bf16_gather(false, c10, c11, c12, c13), k2, vmin, vmax);
-        bf16_put8<zero_mode>(c3 + n, bf16_gather(true,  c10, c11, c12, c13), k3, vmin, vmax);
+        bf16_put8<zero_mode>(c3 + n, bf16_gather(true, c10, c11, c12, c13), k3, vmin, vmax);
         bf16_put8<zero_mode>(c4 + n, bf16_gather(false, c20, c21, c22, c23), k4, vmin, vmax);
-        bf16_put8<zero_mode>(c5 + n, bf16_gather(true,  c20, c21, c22, c23), k5, vmin, vmax);
+        bf16_put8<zero_mode>(c5 + n, bf16_gather(true, c20, c21, c22, c23), k5, vmin, vmax);
         bf16_put8<zero_mode>(c6 + n, bf16_gather(false, c30, c31, c32, c33), k6, vmin, vmax);
-        bf16_put8<zero_mode>(c7 + n, bf16_gather(true,  c30, c31, c32, c33), k7, vmin, vmax);
+        bf16_put8<zero_mode>(c7 + n, bf16_gather(true, c30, c31, c32, c33), k7, vmin, vmax);
 
-        if (blk) { B += advance; }
+        if (blk) {
+            B += advance;
+        }
     }
 
     if (n < nc) {
-        bf16_tail<4, Strided, zero_mode, seed>(mr, n, nc, kc, C, ldc, A, lda, B,
-                                               ldb, lo, hi, bias);
+        bf16_tail<4, Strided, zero_mode, seed>(mr, n, nc, kc, C, ldc, A, lda, B, ldb, lo, hi, bias);
     }
 }
 
@@ -535,12 +544,11 @@ inline void bf16_kernel_mr8(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
 /// Shared body of the two narrow-M kernels: @p PAIRS row pairs over all 8
 /// column pairs of a panel. mr1 keeps one pair and stores one row.
 template <int PAIRS, bool Strided, bool zero_mode, int seed>
-__attribute__((target("bf16")))
-inline void bf16_kernel_wide(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
-                             int ldc, const bfloat16* NNOPS_RESTRICT A, int lda,
-                             const bfloat16* NNOPS_RESTRICT B, int64_t ldb,
-                             float lo, float hi,
-                             const bfloat16* NNOPS_RESTRICT bias) noexcept {
+__attribute__((target("bf16"))) inline void
+bf16_kernel_wide(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C, int ldc,
+                 const bfloat16* NNOPS_RESTRICT A, int lda, const bfloat16* NNOPS_RESTRICT B,
+                 int64_t ldb, float lo, float hi, const bfloat16* NNOPS_RESTRICT bias) noexcept
+{
     // A row past `mr` aliases the last live row, so a pair's second half is
     // that row's own value and its store repeats it.
     bfloat16* NNOPS_RESTRICT c0 = C;
@@ -581,10 +589,8 @@ inline void bf16_kernel_wide(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
         const bfloat16* NNOPS_RESTRICT b = B;
         const bfloat16* NNOPS_RESTRICT p0 = A;
         const bfloat16* NNOPS_RESTRICT p1 = A + static_cast<int64_t>(r1) * lda;
-        [[maybe_unused]] const bfloat16* NNOPS_RESTRICT p2 =
-            A + static_cast<int64_t>(r2) * lda;
-        [[maybe_unused]] const bfloat16* NNOPS_RESTRICT p3 =
-            A + static_cast<int64_t>(r3) * lda;
+        [[maybe_unused]] const bfloat16* NNOPS_RESTRICT p2 = A + static_cast<int64_t>(r2) * lda;
+        [[maybe_unused]] const bfloat16* NNOPS_RESTRICT p3 = A + static_cast<int64_t>(r3) * lda;
 
         for (int g = 0; g < kgroups; ++g) {
             bfloat16x8_t b0, b1, b2, b3, b4, b5, b6, b7;
@@ -630,8 +636,12 @@ inline void bf16_kernel_wide(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
                 c17 = vbfmmlaq_f32(c17, a23, b7);
             }
 
-            p0 += 4; p1 += 4;
-            if constexpr (PAIRS > 1) { p2 += 4; p3 += 4; }
+            p0 += 4;
+            p1 += 4;
+            if constexpr (PAIRS > 1) {
+                p2 += 4;
+                p3 += 4;
+            }
         }
 
         if (ktail) {
@@ -702,31 +712,25 @@ inline void bf16_kernel_wide(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
             }
         }
 
-        bf16_put8<zero_mode>(c0 + n, bf16_gather(false, c00, c01, c02, c03),
-                             ka0, vmin, vmax);
-        bf16_put8<zero_mode>(c0 + n + 8, bf16_gather(false, c04, c05, c06, c07),
-                             ka1, vmin, vmax);
-        bf16_put8<zero_mode>(c1 + n, bf16_gather(true, c00, c01, c02, c03),
-                             kb0, vmin, vmax);
-        bf16_put8<zero_mode>(c1 + n + 8, bf16_gather(true, c04, c05, c06, c07),
-                             kb1, vmin, vmax);
+        bf16_put8<zero_mode>(c0 + n, bf16_gather(false, c00, c01, c02, c03), ka0, vmin, vmax);
+        bf16_put8<zero_mode>(c0 + n + 8, bf16_gather(false, c04, c05, c06, c07), ka1, vmin, vmax);
+        bf16_put8<zero_mode>(c1 + n, bf16_gather(true, c00, c01, c02, c03), kb0, vmin, vmax);
+        bf16_put8<zero_mode>(c1 + n + 8, bf16_gather(true, c04, c05, c06, c07), kb1, vmin, vmax);
         if constexpr (PAIRS > 1) {
-            bf16_put8<zero_mode>(c2 + n, bf16_gather(false, c10, c11, c12, c13),
-                                 kc0, vmin, vmax);
-            bf16_put8<zero_mode>(c2 + n + 8, bf16_gather(false, c14, c15, c16, c17),
-                                 kc1, vmin, vmax);
-            bf16_put8<zero_mode>(c3 + n, bf16_gather(true, c10, c11, c12, c13),
-                                 kd0, vmin, vmax);
-            bf16_put8<zero_mode>(c3 + n + 8, bf16_gather(true, c14, c15, c16, c17),
-                                 kd1, vmin, vmax);
+            bf16_put8<zero_mode>(c2 + n, bf16_gather(false, c10, c11, c12, c13), kc0, vmin, vmax);
+            bf16_put8<zero_mode>(c2 + n + 8, bf16_gather(false, c14, c15, c16, c17), kc1, vmin,
+                                 vmax);
+            bf16_put8<zero_mode>(c3 + n, bf16_gather(true, c10, c11, c12, c13), kd0, vmin, vmax);
+            bf16_put8<zero_mode>(c3 + n + 8, bf16_gather(true, c14, c15, c16, c17), kd1, vmin,
+                                 vmax);
         }
 
         B += advance;
     }
 
     if (n < nc) {
-        bf16_tail<PAIRS, Strided, zero_mode, seed>(mr, n, nc, kc, C, ldc, A, lda, B,
-                                                    ldb, lo, hi, bias);
+        bf16_tail<PAIRS, Strided, zero_mode, seed>(mr, n, nc, kc, C, ldc, A, lda, B, ldb, lo, hi,
+                                                   bias);
     }
 }
 
@@ -735,10 +739,10 @@ inline void bf16_kernel_wide(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
 // =========================================================================
 
 template <int PAIRS, bool Strided, bool zero_mode, int seed>
-inline void bf16_gemm_wide(int mr, int nc, int kc, bfloat16* c, int ldc,
-                           const bfloat16* a, int lda,
-                           const bfloat16* b, int64_t ldb,
-                           float lo, float hi, const bfloat16* bias) noexcept {
+inline void bf16_gemm_wide(int mr, int nc, int kc, bfloat16* c, int ldc, const bfloat16* a, int lda,
+                           const bfloat16* b, int64_t ldb, float lo, float hi,
+                           const bfloat16* bias) noexcept
+{
     const bfloat16* a_rows[2 * PAIRS];
     bfloat16* c_rows[2 * PAIRS];
     bf16_rows<PAIRS>(a, lda, mr, c, ldc, a_rows, c_rows);
@@ -753,7 +757,9 @@ inline void bf16_gemm_wide(int mr, int nc, int kc, bfloat16* c, int ldc,
 
         float32x4_t acc[PAIRS][4];
         for (int p = 0; p < PAIRS; ++p) {
-            for (int cp = 0; cp < 4; ++cp) { acc[p][cp] = vdupq_n_f32(0.0f); }
+            for (int cp = 0; cp < 4; ++cp) {
+                acc[p][cp] = vdupq_n_f32(0.0f);
+            }
         }
 
         for (int k = 0; k < kc; ++k) {
@@ -777,15 +783,17 @@ inline void bf16_gemm_wide(int mr, int nc, int kc, bfloat16* c, int ldc,
                 const float av[4] = {a0, a0, a1, a1};
                 const float32x4_t avv = vld1q_f32(av);
                 for (int cp = 0; cp < 4; ++cp) {
-                    const float bv[4] = {bcol[2 * cp], bcol[2 * cp + 1],
-                                         bcol[2 * cp], bcol[2 * cp + 1]};
+                    const float bv[4] = {bcol[2 * cp], bcol[2 * cp + 1], bcol[2 * cp],
+                                         bcol[2 * cp + 1]};
                     acc[p][cp] = vfmaq_f32(acc[p][cp], avv, vld1q_f32(bv));
                 }
             }
         }
 
         bf16_store_block<PAIRS, zero_mode, seed>(mr, n, rem, c_rows, acc, lo, hi, bias);
-        if (blk == 1) { b += advance; }
+        if (blk == 1) {
+            b += advance;
+        }
     }
 }
 
@@ -794,43 +802,43 @@ inline void bf16_gemm_wide(int mr, int nc, int kc, bfloat16* c, int ldc,
 inline bool bf16_force_wide = false;
 
 template <int PAIRS, bool zero_mode, int seed>
-inline void bf16_gemm(int mr, int nc, int kc, bfloat16* c, int ldc,
-                      const bfloat16* a, int lda,
-                      const bfloat16* b, int64_t ldb,
-                      float lo, float hi, const bfloat16* bias) noexcept {
+inline void bf16_gemm(int mr, int nc, int kc, bfloat16* c, int ldc, const bfloat16* a, int lda,
+                      const bfloat16* b, int64_t ldb, float lo, float hi,
+                      const bfloat16* bias) noexcept
+{
     if (sims::cpu_has_bf16() && !bf16_force_wide) {
         if constexpr (PAIRS == 4) {
             if (ldb > 0) {
-                bf16_kernel_mr8<true, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda,
-                                                       b, ldb, lo, hi, bias);
+                bf16_kernel_mr8<true, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo, hi,
+                                                       bias);
             } else {
-                bf16_kernel_mr8<false, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda,
-                                                        b, ldb, lo, hi, bias);
+                bf16_kernel_mr8<false, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo, hi,
+                                                        bias);
             }
         } else if constexpr (PAIRS == 2) {
             if (ldb > 0) {
-                bf16_kernel_wide<2, true, zero_mode, seed>(mr, nc, kc, c, ldc, a,
-                                                           lda, b, ldb, lo, hi, bias);
+                bf16_kernel_wide<2, true, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo,
+                                                           hi, bias);
             } else {
-                bf16_kernel_wide<2, false, zero_mode, seed>(mr, nc, kc, c, ldc, a,
-                                                            lda, b, ldb, lo, hi, bias);
+                bf16_kernel_wide<2, false, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo,
+                                                            hi, bias);
             }
         } else {
             if (ldb > 0) {
-                bf16_kernel_wide<1, true, zero_mode, seed>(mr, nc, kc, c, ldc, a,
-                                                           lda, b, ldb, lo, hi, bias);
+                bf16_kernel_wide<1, true, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo,
+                                                           hi, bias);
             } else {
-                bf16_kernel_wide<1, false, zero_mode, seed>(mr, nc, kc, c, ldc, a,
-                                                            lda, b, ldb, lo, hi, bias);
+                bf16_kernel_wide<1, false, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo,
+                                                            hi, bias);
             }
         }
     } else {
         if (ldb > 0) {
-            bf16_gemm_wide<PAIRS, true, zero_mode, seed>(
-                mr, nc, kc, c, ldc, a, lda, b, ldb, lo, hi, bias);
+            bf16_gemm_wide<PAIRS, true, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo, hi,
+                                                         bias);
         } else {
-            bf16_gemm_wide<PAIRS, false, zero_mode, seed>(
-                mr, nc, kc, c, ldc, a, lda, b, ldb, lo, hi, bias);
+            bf16_gemm_wide<PAIRS, false, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo,
+                                                          hi, bias);
         }
     }
 }
@@ -841,37 +849,34 @@ inline void bf16_gemm(int mr, int nc, int kc, bfloat16* c, int ldc,
 
 /// A packed: the panel base walks `kc` apart inside its slot.
 template <int PAIRS, bool zero_mode = false, int seed = 0>
-inline void mma_pack_mrxncxkc_bf16(int mr, int nc, int kc, bfloat16* C, int ldc,
-                                   const bfloat16* A, const bfloat16* B,
-                                   float clamp_min, float clamp_max,
-                                   const bfloat16* bias = nullptr) noexcept {
-    bf16_gemm<PAIRS, zero_mode, seed>(mr, nc, kc, C, ldc, A, kc, B, -1,
-                                      clamp_min, clamp_max, bias);
+inline void mma_pack_mrxncxkc_bf16(int mr, int nc, int kc, bfloat16* C, int ldc, const bfloat16* A,
+                                   const bfloat16* B, float clamp_min, float clamp_max,
+                                   const bfloat16* bias = nullptr) noexcept
+{
+    bf16_gemm<PAIRS, zero_mode, seed>(mr, nc, kc, C, ldc, A, kc, B, -1, clamp_min, clamp_max, bias);
 }
 
 /// A read row-major through @p lda; `ldb` is the packed panel (<= -1) or B's
 /// own row pitch (> 0).
 template <int PAIRS, bool zero_mode = false, int seed = 0>
 inline void mma_direct_mrxncxkc_bf16(int mr, int nc, int kc, bfloat16* C, int ldc,
-                                     const bfloat16* A, int lda,
-                                     const bfloat16* B, int64_t ldb,
+                                     const bfloat16* A, int lda, const bfloat16* B, int64_t ldb,
                                      float clamp_min, float clamp_max,
-                                     const bfloat16* bias = nullptr) noexcept {
-    bf16_gemm<PAIRS, zero_mode, seed>(mr, nc, kc, C, ldc, A, lda, B, ldb,
-                                      clamp_min, clamp_max, bias);
+                                     const bfloat16* bias = nullptr) noexcept
+{
+    bf16_gemm<PAIRS, zero_mode, seed>(mr, nc, kc, C, ldc, A, lda, B, ldb, clamp_min, clamp_max,
+                                      bias);
 }
 
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
 template <bool Z, int Seed = 0>
-inline constexpr auto mma_pack_fns_bf16 = std::array{
-    &mma_pack_mrxncxkc_bf16<4, Z, Seed>,
-    &mma_pack_mrxncxkc_bf16<2, Z, Seed>,
-    &mma_pack_mrxncxkc_bf16<1, Z, Seed>};
+inline constexpr auto mma_pack_fns_bf16 =
+    std::array{&mma_pack_mrxncxkc_bf16<4, Z, Seed>, &mma_pack_mrxncxkc_bf16<2, Z, Seed>,
+               &mma_pack_mrxncxkc_bf16<1, Z, Seed>};
 
 template <bool Z, int Seed = 0>
-inline constexpr auto mma_direct_fns_bf16 = std::array{
-    &mma_direct_mrxncxkc_bf16<4, Z, Seed>,
-    &mma_direct_mrxncxkc_bf16<2, Z, Seed>,
-    &mma_direct_mrxncxkc_bf16<1, Z, Seed>};
+inline constexpr auto mma_direct_fns_bf16 =
+    std::array{&mma_direct_mrxncxkc_bf16<4, Z, Seed>, &mma_direct_mrxncxkc_bf16<2, Z, Seed>,
+               &mma_direct_mrxncxkc_bf16<1, Z, Seed>};
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

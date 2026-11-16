@@ -11,12 +11,10 @@ namespace nnops {
 NNOPS_DECLARE_CPU(PermuteAttributes, permute_cpu)
 NNOPS_DECLARE_CUDA(PermuteAttributes, permute_cuda)
 
-NNOPS_OP_BOILERPLATE(Permute, PermuteAttributes,
-        backend::cpu::permute_cpu, NNOPS_IF_CUDA(backend::cuda::permute_cuda),
-        nullptr)
+NNOPS_OP_BOILERPLATE(Permute, PermuteAttributes, backend::cpu::permute_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::permute_cuda), nullptr)
 
-std::vector<TensorDesc> Permute::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Permute::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     return permute_output_shape(attrs_.perm, inputs);
 }
@@ -34,7 +32,8 @@ Status Permute::validate(std::span<const TensorDesc> inputs,
         return Status::invalid_argument;
     }
     NNOPS_TRY(detail::check_rank(rank, 1, TensorDesc::kMaxRank));
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) || out.dtype != in.dtype) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) ||
+        out.dtype != in.dtype) {
         return Status::invalid_argument;
     }
     if (!is_layout_supported(in.layout, LayoutSupport::ChannelFirstOnly) ||
@@ -53,15 +52,15 @@ Status Permute::validate(std::span<const TensorDesc> inputs,
     return Status::ok;
 }
 
-Status Permute::compute(std::span<TensorView> outputs,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx,
-                        void* workspace)
+Status Permute::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

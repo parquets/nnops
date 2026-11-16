@@ -23,62 +23,67 @@ namespace nnops::backend::cuda {
 // Device activation functions (compute a single element)
 // ============================================================
 
-__device__ inline float activation_relu(float x, float, float) {
-    return fmaxf(x, 0.0f);
-}
+__device__ inline float activation_relu(float x, float, float) { return fmaxf(x, 0.0f); }
 
-__device__ inline float activation_leaky_relu(float x, float alpha, float) {
+__device__ inline float activation_leaky_relu(float x, float alpha, float)
+{
     return (x > 0.0f) ? x : alpha * x;
 }
 
-__device__ inline float activation_sigmoid(float x, float, float) {
+__device__ inline float activation_sigmoid(float x, float, float)
+{
     return 1.0f / (1.0f + expf(-x));
 }
 
-__device__ inline float activation_tanh(float x, float, float) {
-    return tanhf(x);
-}
+__device__ inline float activation_tanh(float x, float, float) { return tanhf(x); }
 
-__device__ inline float activation_gelu(float x, float, float) {
-    const float c = 0.7978845608028654f;  // sqrt(2/pi)
+__device__ inline float activation_gelu(float x, float, float)
+{
+    const float c = 0.7978845608028654f; // sqrt(2/pi)
     return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x * x * x)));
 }
 
-__device__ inline float activation_silu(float x, float, float) {
-    return x / (1.0f + expf(-x));
-}
+__device__ inline float activation_silu(float x, float, float) { return x / (1.0f + expf(-x)); }
 
-__device__ inline float activation_hard_swish(float x, float, float beta) {
+__device__ inline float activation_hard_swish(float x, float, float beta)
+{
     float relu6 = fminf(fmaxf(x + 3.0f, 0.0f), 6.0f);
     return x * relu6 * (beta / 6.0f);
 }
 
-__device__ inline float activation_elu(float x, float alpha, float) {
+__device__ inline float activation_elu(float x, float alpha, float)
+{
     return (x > 0.0f) ? x : alpha * (expf(x) - 1.0f);
 }
 
-__device__ inline float activation_hard_sigmoid(float x, float alpha, float beta) {
+__device__ inline float activation_hard_sigmoid(float x, float alpha, float beta)
+{
     return fminf(fmaxf(alpha * x + beta, 0.0f), 1.0f);
 }
 
-__device__ inline float activation_softplus(float x, float, float beta) {
+__device__ inline float activation_softplus(float x, float, float beta)
+{
     const float z = beta * x;
     return (fmaxf(z, 0.0f) + log1pf(expf(-fabsf(z)))) / beta;
 }
 
-__device__ inline float activation_selu(float x, float alpha, float scale) {
+__device__ inline float activation_selu(float x, float alpha, float scale)
+{
     return scale * ((x > 0.0f) ? x : alpha * (expf(x) - 1.0f));
 }
 
-__device__ inline float activation_mish(float x, float, float) {
+__device__ inline float activation_mish(float x, float, float)
+{
     return x * tanhf(fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x))));
 }
 
-__device__ inline float activation_gelu_exact(float x, float, float) {
+__device__ inline float activation_gelu_exact(float x, float, float)
+{
     return 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));
 }
 
-__device__ inline float activation_quick_gelu(float x, float alpha, float) {
+__device__ inline float activation_quick_gelu(float x, float alpha, float)
+{
     return x / (1.0f + expf(-alpha * x));
 }
 
@@ -88,23 +93,39 @@ __device__ inline float activation_quick_gelu(float x, float alpha, float) {
 
 using ActivationFn = float (*)(float, float, float);
 
-__device__ ActivationFn get_activation_fn(ActivationType type) {
+__device__ ActivationFn get_activation_fn(ActivationType type)
+{
     switch (type) {
-    case ActivationType::Relu:       return activation_relu;
-    case ActivationType::LeakyRelu:  return activation_leaky_relu;
-    case ActivationType::Sigmoid:    return activation_sigmoid;
-    case ActivationType::Tanh:       return activation_tanh;
-    case ActivationType::Gelu:       return activation_gelu;
-    case ActivationType::Silu:       return activation_silu;
-    case ActivationType::HardSwish:  return activation_hard_swish;
-    case ActivationType::Elu:        return activation_elu;
-    case ActivationType::HardSigmoid: return activation_hard_sigmoid;
-    case ActivationType::Softplus:   return activation_softplus;
-    case ActivationType::Selu:       return activation_selu;
-    case ActivationType::Mish:       return activation_mish;
-    case ActivationType::GeluExact:  return activation_gelu_exact;
-    case ActivationType::QuickGelu:  return activation_quick_gelu;
-    case ActivationType::PRelu:      return activation_relu;  // rejected on entry
+    case ActivationType::Relu:
+        return activation_relu;
+    case ActivationType::LeakyRelu:
+        return activation_leaky_relu;
+    case ActivationType::Sigmoid:
+        return activation_sigmoid;
+    case ActivationType::Tanh:
+        return activation_tanh;
+    case ActivationType::Gelu:
+        return activation_gelu;
+    case ActivationType::Silu:
+        return activation_silu;
+    case ActivationType::HardSwish:
+        return activation_hard_swish;
+    case ActivationType::Elu:
+        return activation_elu;
+    case ActivationType::HardSigmoid:
+        return activation_hard_sigmoid;
+    case ActivationType::Softplus:
+        return activation_softplus;
+    case ActivationType::Selu:
+        return activation_selu;
+    case ActivationType::Mish:
+        return activation_mish;
+    case ActivationType::GeluExact:
+        return activation_gelu_exact;
+    case ActivationType::QuickGelu:
+        return activation_quick_gelu;
+    case ActivationType::PRelu:
+        return activation_relu; // rejected on entry
     }
     return activation_relu;
 }
@@ -117,17 +138,10 @@ __device__ ActivationFn get_activation_fn(ActivationType type) {
 /// odd last dim leaves alternate rows off the 16 B bound) drops to the scalar
 /// loop instead, and so does the tail.
 template <typename T>
-__global__ void activation_kernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    int64_t num_rows,
-    int64_t last_dim,
-    int64_t in_row_stride,
-    int64_t out_row_stride,
-    ActivationType type,
-    float alpha,
-    float beta,
-    bool add_to)
+__global__ void activation_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                  int64_t num_rows, int64_t last_dim, int64_t in_row_stride,
+                                  int64_t out_row_stride, ActivationType type, float alpha,
+                                  float beta, bool add_to)
 {
     constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
     const ActivationFn fn = get_activation_fn(type);
@@ -135,23 +149,28 @@ __global__ void activation_kernel(
     const int tid = threadIdx.x;
     const int row = blockIdx.x;
 
-    if (row >= num_rows) return;
+    if (row >= num_rows)
+        return;
 
-    const T* in_row  = input  + row * in_row_stride;
-    T*       out_row = output + row * out_row_stride;
+    const T* in_row = input + row * in_row_stride;
+    T* out_row = output + row * out_row_stride;
 
     const int64_t vec_end = aligned16(in_row, out_row) ? (last_dim / VEC) * VEC : 0;
     for (int64_t i = tid * VEC; i < vec_end; i += int64_t(blockDim.x) * VEC) {
         float v[VEC];
         load_channels<T, VEC>(&in_row[i], v);
         float r[VEC];
-        #pragma unroll
-        for (int k = 0; k < VEC; ++k) { r[k] = fn(v[k], alpha, beta); }
+#pragma unroll
+        for (int k = 0; k < VEC; ++k) {
+            r[k] = fn(v[k], alpha, beta);
+        }
         if (add_to) {
             float o[VEC];
             load_channels<T, VEC>(&out_row[i], o);
-            #pragma unroll
-            for (int k = 0; k < VEC; ++k) { r[k] += o[k]; }
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                r[k] += o[k];
+            }
         }
         store_channels<T, VEC>(&out_row[i], r);
     }
@@ -172,14 +191,9 @@ __global__ void activation_kernel(
 // ============================================================
 
 template <typename T>
-__global__ void activation_flat_kernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    int64_t total,
-    ActivationType type,
-    float alpha,
-    float beta,
-    bool add_to)
+__global__ void activation_flat_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                       int64_t total, ActivationType type, float alpha, float beta,
+                                       bool add_to)
 {
     constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
     const ActivationFn fn = get_activation_fn(type);
@@ -192,13 +206,17 @@ __global__ void activation_flat_kernel(
         float v[VEC];
         load_channels<T, VEC>(&input[i], v);
         float r[VEC];
-        #pragma unroll
-        for (int k = 0; k < VEC; ++k) { r[k] = fn(v[k], alpha, beta); }
+#pragma unroll
+        for (int k = 0; k < VEC; ++k) {
+            r[k] = fn(v[k], alpha, beta);
+        }
         if (add_to) {
             float o[VEC];
             load_channels<T, VEC>(&output[i], o);
-            #pragma unroll
-            for (int k = 0; k < VEC; ++k) { r[k] += o[k]; }
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                r[k] += o[k];
+            }
         }
         store_channels<T, VEC>(&output[i], r);
     }
@@ -219,15 +237,13 @@ __global__ void activation_flat_kernel(
 // ============================================================
 
 template <typename T>
-void activation_cuda_impl(
-    const ActivationAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void activation_cuda_impl(const ActivationAttributes& attrs, TensorView& output,
+                          std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t total = input.numel();
-    if (total == 0) return;
+    if (total == 0)
+        return;
 
     const int64_t rank = input.rank();
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
@@ -240,26 +256,24 @@ void activation_cuda_impl(
         constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
         const int block_size = kCudaBlockSize;
         const int64_t lane = static_cast<int64_t>(block_size) * VEC;
-        const int grid_size = std::min(static_cast<int>(ceil_div(total, lane)),
-                                       65535);
+        const int grid_size = std::min(static_cast<int>(ceil_div(total, lane)), 65535);
         activation_flat_kernel<<<grid_size, block_size, 0, stream>>>(
-            input.ptr<T>(), output.ptr<T>(), total,
-            attrs.type, attrs.alpha, attrs.beta, attrs.add_to);
+            input.ptr<T>(), output.ptr<T>(), total, attrs.type, attrs.alpha, attrs.beta,
+            attrs.add_to);
     } else {
         // Row-by-row processing, respecting pitch. A channel-last row is one
         // spatial line — W pixels × C channels.
-        const int64_t last_dim = (rank >= 3 && is_channel_last(input.layout()))
-            ? input.shape(1) * input.shape(rank - 1)
-            : input.shape(rank - 1);
+        const int64_t last_dim = (rank >= 3 && is_channel_last(input.layout())) ?
+                                     input.shape(1) * input.shape(rank - 1) :
+                                     input.shape(rank - 1);
         const int64_t num_rows = input.total_rows();
-        const int64_t in_row_stride  = input.row_stride_elems();
+        const int64_t in_row_stride = input.row_stride_elems();
         const int64_t out_row_stride = output.row_stride_elems();
 
         const int block_size = std::min(static_cast<int>(last_dim), kCudaBlockSize);
 
         activation_kernel<<<num_rows, block_size, 0, stream>>>(
-            input.ptr<T>(), output.ptr<T>(),
-            num_rows, last_dim, in_row_stride, out_row_stride,
+            input.ptr<T>(), output.ptr<T>(), num_rows, last_dim, in_row_stride, out_row_stride,
             attrs.type, attrs.alpha, attrs.beta, attrs.add_to);
     }
 }
@@ -268,16 +282,15 @@ void activation_cuda_impl(
 // Entry point
 // ============================================================
 
-Status activation_cuda(
-    const ActivationAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx,
-    void* /*workspace*/)
+Status activation_cuda(const ActivationAttributes& attrs, TensorView& output,
+                       std::span<const TensorView> inputs, const ComputeContext& ctx,
+                       void* /*workspace*/)
 {
     // PRelu reads a per-channel slope tensor, which the scalar device-function
     // table has no room for.
-    if (attrs.type == ActivationType::PRelu) { return Status::unsupported; }
+    if (attrs.type == ActivationType::PRelu) {
+        return Status::unsupported;
+    }
     const auto dtype = inputs[0].data_type();
     switch (dtype) {
     case DataType::f32:
@@ -295,4 +308,4 @@ Status activation_cuda(
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

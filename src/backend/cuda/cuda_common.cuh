@@ -26,7 +26,7 @@ namespace nnops::backend::cuda {
 // ============================================================
 
 constexpr int kCudaBlockSize = 256;
-constexpr int kCudaWarpSize  = 32;
+constexpr int kCudaWarpSize = 32;
 
 /// Dynamic shared memory a kernel may ask for without opting in to the larger
 /// carveout and without dropping the occupancy that keeps a row's blocks in
@@ -54,8 +54,8 @@ __host__ __device__ inline bool row_resident_worth(int64_t size, int64_t esz,
 // ceil_div
 // ============================================================
 
-template <typename T, typename U>
-__host__ __device__ constexpr auto ceil_div(T a, U b) noexcept {
+template <typename T, typename U> __host__ __device__ constexpr auto ceil_div(T a, U b) noexcept
+{
     return (a + b - 1) / b;
 }
 
@@ -63,13 +63,9 @@ __host__ __device__ constexpr auto ceil_div(T a, U b) noexcept {
 // f16 ↔ f32 conversion helpers
 // ============================================================
 
-__host__ __device__ inline float half_to_float(__half h) noexcept {
-    return __half2float(h);
-}
+__host__ __device__ inline float half_to_float(__half h) noexcept { return __half2float(h); }
 
-__host__ __device__ inline __half float_to_half(float f) noexcept {
-    return __float2half(f);
-}
+__host__ __device__ inline __half float_to_half(float f) noexcept { return __float2half(f); }
 
 // ============================================================
 // Element type ↔ float — the one conversion surface a kernel templated
@@ -81,8 +77,8 @@ __host__ __device__ inline __half float_to_half(float f) noexcept {
 
 // Both directions are `__host__ __device__`: a launcher converts a scalar (a
 // pad constant, a clamp bound) before it hands the value to a kernel.
-template <typename T>
-__host__ __device__ inline float elem_to_float(T x) noexcept {
+template <typename T> __host__ __device__ inline float elem_to_float(T x) noexcept
+{
     if constexpr (std::is_same_v<T, float>) {
         return x;
     } else if constexpr (std::is_same_v<T, __half>) {
@@ -92,8 +88,8 @@ __host__ __device__ inline float elem_to_float(T x) noexcept {
     }
 }
 
-template <typename T>
-__host__ __device__ inline T float_to_elem(float x) noexcept {
+template <typename T> __host__ __device__ inline T float_to_elem(float x) noexcept
+{
     if constexpr (std::is_same_v<T, float>) {
         return x;
     } else if constexpr (std::is_same_v<T, __half>) {
@@ -113,7 +109,10 @@ __device__ inline float s_load(const __half* ptr) noexcept { return __half2float
 __device__ inline float s_load(const __nv_bfloat16* ptr) noexcept { return __bfloat162float(*ptr); }
 __device__ inline void s_store(float* ptr, float val) noexcept { *ptr = val; }
 __device__ inline void s_store(__half* ptr, float val) noexcept { *ptr = __float2half(val); }
-__device__ inline void s_store(__nv_bfloat16* ptr, float val) noexcept { *ptr = __float2bfloat16(val); }
+__device__ inline void s_store(__nv_bfloat16* ptr, float val) noexcept
+{
+    *ptr = __float2bfloat16(val);
+}
 
 // ============================================================
 // 128-bit vectorized load/store helpers
@@ -124,32 +123,37 @@ __device__ inline void s_store(__nv_bfloat16* ptr, float val) noexcept { *ptr = 
 // These generate a single 128-bit LDG/STG instruction, reducing
 // memory transactions by 4× (f32) or 8× (2-byte) vs scalar s_load.
 
-template <typename T>
-struct alignas(16) pack8 {
+template <typename T> struct alignas(16) pack8 {
     T data[8];
 };
 
 using half8 = pack8<__half>;
-using bf8   = pack8<__nv_bfloat16>;
+using bf8 = pack8<__nv_bfloat16>;
 
-__device__ inline float4 v4_load(const float* ptr) noexcept {
+__device__ inline float4 v4_load(const float* ptr) noexcept
+{
     return *reinterpret_cast<const float4*>(ptr);
 }
-__device__ inline void v4_store(float* ptr, float4 val) noexcept {
+__device__ inline void v4_store(float* ptr, float4 val) noexcept
+{
     *reinterpret_cast<float4*>(ptr) = val;
 }
 
-__device__ inline half8 v4_load(const __half* ptr) noexcept {
+__device__ inline half8 v4_load(const __half* ptr) noexcept
+{
     return *reinterpret_cast<const half8*>(ptr);
 }
-__device__ inline void v4_store(__half* ptr, half8 val) noexcept {
+__device__ inline void v4_store(__half* ptr, half8 val) noexcept
+{
     *reinterpret_cast<half8*>(ptr) = val;
 }
 
-__device__ inline bf8 v4_load(const __nv_bfloat16* ptr) noexcept {
+__device__ inline bf8 v4_load(const __nv_bfloat16* ptr) noexcept
+{
     return *reinterpret_cast<const bf8*>(ptr);
 }
-__device__ inline void v4_store(__nv_bfloat16* ptr, bf8 val) noexcept {
+__device__ inline void v4_store(__nv_bfloat16* ptr, bf8 val) noexcept
+{
     *reinterpret_cast<bf8*>(ptr) = val;
 }
 
@@ -157,39 +161,42 @@ __device__ inline void v4_store(__nv_bfloat16* ptr, bf8 val) noexcept {
 /// walks rows has to know whether its row bases landed on one. A dense row of a
 /// 2-byte dtype is 2·last_dim bytes and a 4-byte one 4·last_dim, so an odd last
 /// dim leaves alternate rows unaligned; such a row drops to its scalar loop.
-__device__ inline bool aligned16(const void* a) noexcept {
+__device__ inline bool aligned16(const void* a) noexcept
+{
     return (reinterpret_cast<uintptr_t>(a) & 15u) == 0;
 }
-__device__ inline bool aligned16(const void* a, const void* b) noexcept {
-    return ((reinterpret_cast<uintptr_t>(a) |
-             reinterpret_cast<uintptr_t>(b)) & 15u) == 0;
+__device__ inline bool aligned16(const void* a, const void* b) noexcept
+{
+    return ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b)) & 15u) == 0;
 }
-__device__ inline bool aligned16(const void* a, const void* b,
-                                 const void* c) noexcept {
+__device__ inline bool aligned16(const void* a, const void* b, const void* c) noexcept
+{
     return ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b) |
-             reinterpret_cast<uintptr_t>(c)) & 15u) == 0;
+             reinterpret_cast<uintptr_t>(c)) &
+            15u) == 0;
 }
 
 // 2-byte 128-bit helpers: pack 8 float results into a pack8<T>, and accumulate
 // onto an existing one (for add_to mode).  Reduces per-op boilerplate.
 template <typename T>
-__device__ inline pack8<T> pack8_set(
-    float r0, float r1, float r2, float r3,
-    float r4, float r5, float r6, float r7) noexcept
+__device__ inline pack8<T> pack8_set(float r0, float r1, float r2, float r3, float r4, float r5,
+                                     float r6, float r7) noexcept
 {
     pack8<T> r;
-    r.data[0] = float_to_elem<T>(r0); r.data[1] = float_to_elem<T>(r1);
-    r.data[2] = float_to_elem<T>(r2); r.data[3] = float_to_elem<T>(r3);
-    r.data[4] = float_to_elem<T>(r4); r.data[5] = float_to_elem<T>(r5);
-    r.data[6] = float_to_elem<T>(r6); r.data[7] = float_to_elem<T>(r7);
+    r.data[0] = float_to_elem<T>(r0);
+    r.data[1] = float_to_elem<T>(r1);
+    r.data[2] = float_to_elem<T>(r2);
+    r.data[3] = float_to_elem<T>(r3);
+    r.data[4] = float_to_elem<T>(r4);
+    r.data[5] = float_to_elem<T>(r5);
+    r.data[6] = float_to_elem<T>(r6);
+    r.data[7] = float_to_elem<T>(r7);
     return r;
 }
 
 template <typename T>
-__device__ inline pack8<T> pack8_add(
-    pack8<T> base,
-    float r0, float r1, float r2, float r3,
-    float r4, float r5, float r6, float r7) noexcept
+__device__ inline pack8<T> pack8_add(pack8<T> base, float r0, float r1, float r2, float r3,
+                                     float r4, float r5, float r6, float r7) noexcept
 {
     pack8<T> r;
     r.data[0] = float_to_elem<T>(elem_to_float(base.data[0]) + r0);
@@ -224,8 +231,10 @@ __device__ inline void load_channels(const T* ptr, float (&v)[Vec]) noexcept
         v[3] = r.w;
     } else {
         const pack8<T> r = v4_load(ptr);
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { v[i] = elem_to_float(r.data[i]); }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            v[i] = elem_to_float(r.data[i]);
+        }
     }
 }
 
@@ -238,8 +247,10 @@ __device__ inline void store_channels(T* ptr, const float (&v)[Vec]) noexcept
         v4_store(ptr, make_float4(v[0], v[1], v[2], v[3]));
     } else {
         pack8<T> r;
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { r.data[i] = float_to_elem<T>(v[i]); }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            r.data[i] = float_to_elem<T>(v[i]);
+        }
         v4_store(ptr, r);
     }
 }
@@ -255,18 +266,27 @@ __host__ __device__ inline float cuda_reduce_max(float a, float b) noexcept { re
 __host__ __device__ inline float cuda_reduce_min(float a, float b) noexcept { return fminf(a, b); }
 
 /// Generic warp shuffle-down reduction. `combine` is the binary op (sum/max/min).
-template <typename Combine>
-__device__ inline float warp_reduce(float val, Combine combine) noexcept {
-    #pragma unroll
+template <typename Combine> __device__ inline float warp_reduce(float val, Combine combine) noexcept
+{
+#pragma unroll
     for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
         val = combine(val, __shfl_down_sync(0xffffffff, val, offset));
     }
     return val;
 }
 
-__device__ inline float warp_reduce_sum(float val) noexcept { return warp_reduce(val, cuda_reduce_add); }
-__device__ inline float warp_reduce_max(float val) noexcept { return warp_reduce(val, cuda_reduce_max); }
-__device__ inline float warp_reduce_min(float val) noexcept { return warp_reduce(val, cuda_reduce_min); }
+__device__ inline float warp_reduce_sum(float val) noexcept
+{
+    return warp_reduce(val, cuda_reduce_add);
+}
+__device__ inline float warp_reduce_max(float val) noexcept
+{
+    return warp_reduce(val, cuda_reduce_max);
+}
+__device__ inline float warp_reduce_min(float val) noexcept
+{
+    return warp_reduce(val, cuda_reduce_min);
+}
 
 // ============================================================
 // Block-level reductions (shared memory)
@@ -276,9 +296,11 @@ __device__ inline float warp_reduce_min(float val) noexcept { return warp_reduce
 /// then have warp 0 reduce across leaders (padding inactive lanes with
 /// `identity`, the op's neutral element). `combine` is the binary op.
 template <typename Combine>
-__device__ inline float block_reduce(float val, float* shared, Combine combine, float identity) noexcept {
+__device__ inline float block_reduce(float val, float* shared, Combine combine,
+                                     float identity) noexcept
+{
     const int lane = threadIdx.x % kCudaWarpSize;
-    const int wid  = threadIdx.x / kCudaWarpSize;
+    const int wid = threadIdx.x / kCudaWarpSize;
 
     // Step 1: warp-level reduction
     val = warp_reduce(val, combine);
@@ -302,17 +324,20 @@ __device__ inline float block_reduce(float val, float* shared, Combine combine, 
 
 /// Block-level sum reduction. Each thread provides a float value;
 /// the total sum is stored in shared[0] and returned by all threads.
-__device__ inline float block_reduce_sum(float val, float* shared) noexcept {
+__device__ inline float block_reduce_sum(float val, float* shared) noexcept
+{
     return block_reduce(val, shared, cuda_reduce_add, 0.0f);
 }
 
 /// Block-level max reduction.
-__device__ inline float block_reduce_max(float val, float* shared) noexcept {
+__device__ inline float block_reduce_max(float val, float* shared) noexcept
+{
     return block_reduce(val, shared, cuda_reduce_max, -1e30f);
 }
 
 /// Block-level min reduction.
-__device__ inline float block_reduce_min(float val, float* shared) noexcept {
+__device__ inline float block_reduce_min(float val, float* shared) noexcept
+{
     return block_reduce(val, shared, cuda_reduce_min, 1e30f);
 }
 
@@ -320,14 +345,16 @@ __device__ inline float block_reduce_min(float val, float* shared) noexcept {
 // CUDA error check helper
 // ============================================================
 
-inline void cuda_check(cudaError_t err, const char* file, int line) {
+inline void cuda_check(cudaError_t err, const char* file, int line)
+{
     if (err != cudaSuccess) {
         // In a real implementation this would log + abort.
         // For now, no-op (project doesn't use exceptions).
-        (void)file; (void)line;
+        (void)file;
+        (void)line;
     }
 }
 
 #define CUDA_CHECK(err) cuda_check(err, __FILE__, __LINE__)
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

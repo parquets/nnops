@@ -33,8 +33,7 @@ namespace {
 /// The integer route's operand/quantization contract, shared by MatMul and
 /// Linear (which differ only in transpose_b and where the bias comes from).
 Status matmul_i8_cuda(const MatMulAttributes& attrs, TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx, I8OutKind kind)
+                      std::span<const TensorView> inputs, const ComputeContext& ctx, I8OutKind kind)
 {
     const TensorView& a = inputs[0];
     const TensorView& b = inputs[1];
@@ -44,7 +43,9 @@ Status matmul_i8_cuda(const MatMulAttributes& attrs, TensorView& output,
     const int64_t Ka = attrs.transpose_a ? a.shape(a.rank() - 2) : a.shape(a.rank() - 1);
     const int64_t Kb = attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2);
     const int64_t N = attrs.transpose_b ? b.shape(b.rank() - 2) : b.shape(b.rank() - 1);
-    if (Ka != Kb) { return Status::invalid_argument; }
+    if (Ka != Kb) {
+        return Status::invalid_argument;
+    }
 
     GemmI8Params q;
     q.g.a = a.ptr<void>();
@@ -78,29 +79,25 @@ Status matmul_i8_cuda(const MatMulAttributes& attrs, TensorView& output,
     q.sc_b_scalar = qb.scale;
 
     q.out = kind;
-    const bool int_out = kind == I8OutKind::S32 || kind == I8OutKind::S8 ||
-                         kind == I8OutKind::U8;
+    const bool int_out = kind == I8OutKind::S32 || kind == I8OutKind::S8 || kind == I8OutKind::U8;
     q.relu = int_out && attrs.epilogue.type == EpilogueActivateType::Relu;
     if (int_out) {
         const QuantParams& qc = output.quant_params();
         q.out_scale = qc.scale_data != nullptr ? qc.scale_data[0] : qc.scale;
-        q.out_zp = qc.zero_point_data != nullptr ? qc.zero_point_data[0]
-                                                 : qc.zero_point;
+        q.out_zp = qc.zero_point_data != nullptr ? qc.zero_point_data[0] : qc.zero_point;
     }
     if (bias != nullptr) {
         q.bias = int_out ? bias->ptr<int32_t>() : bias->ptr<void>();
     }
 
-    return dense_gemm_i8_status(
-        q, a.data_type(), attrs.transpose_a, attrs.transpose_b,
-        static_cast<cudaStream_t>(ctx.cuda_stream));
+    return dense_gemm_i8_status(q, a.data_type(), attrs.transpose_a, attrs.transpose_b,
+                                static_cast<cudaStream_t>(ctx.cuda_stream));
 }
 
-}  // namespace
+} // namespace
 
 Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx, void*)
+                   std::span<const TensorView> inputs, const ComputeContext& ctx, void*)
 {
     const TensorView& a = inputs[0];
     const TensorView& b = inputs[1];
@@ -108,7 +105,9 @@ Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
 
     const DataType dt = a.data_type();
     if (is_int8_matmul(dt, b.data_type())) {
-        if (output.numel() == 0) { return Status::ok; }
+        if (output.numel() == 0) {
+            return Status::ok;
+        }
         I8OutKind kind;
         if (!i8_out_kind(output.data_type(), kind)) {
             return Status::unsupported;
@@ -119,13 +118,17 @@ Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
         b.data_type() != dt) {
         return Status::unsupported;
     }
-    if (output.numel() == 0) { return Status::ok; }
+    if (output.numel() == 0) {
+        return Status::ok;
+    }
 
     const int64_t M = attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2);
     const int64_t Ka = attrs.transpose_a ? a.shape(a.rank() - 2) : a.shape(a.rank() - 1);
     const int64_t Kb = attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2);
     const int64_t N = attrs.transpose_b ? b.shape(b.rank() - 2) : b.shape(b.rank() - 1);
-    if (Ka != Kb) { return Status::invalid_argument; }
+    if (Ka != Kb) {
+        return Status::invalid_argument;
+    }
 
     GemmParams p;
     p.a = a.ptr<void>();
@@ -188,8 +191,7 @@ Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
                 call.b_bstr[d] = p.b_batch[d];
                 call.c_bstr[d] = p.c_batch[d];
             }
-            if (manual_dense_h_call(call,
-                                    static_cast<cudaStream_t>(ctx.cuda_stream))) {
+            if (manual_dense_h_call(call, static_cast<cudaStream_t>(ctx.cuda_stream))) {
                 return Status::ok;
             }
         }
@@ -239,4 +241,4 @@ Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
                              static_cast<cudaStream_t>(ctx.cuda_stream));
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

@@ -30,18 +30,18 @@ namespace nnops::backend::cpu::aarch64 {
 //  LHS transpose pack (f32)  —  N rows x 4-k block, scaled
 // =========================================================================
 
-inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 1) noexcept {
+inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 1) noexcept
+{
     for (int k = 0; k < K; ++k) {
         *output++ = input[0] * scale;
-        input += 1;  // consecutive k within the M×K source row
+        input += 1; // consecutive k within the M×K source row
     }
 }
 
-inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 4) noexcept {
+inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 4) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -53,10 +53,14 @@ inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
     const float32x4_t s = vdupq_n_f32(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float32x4_t v0 = vld1q_f32(p0); p0 += 4;
-        float32x4_t v1 = vld1q_f32(p1); p1 += 4;
-        float32x4_t v2 = vld1q_f32(p2); p2 += 4;
-        float32x4_t v3 = vld1q_f32(p3); p3 += 4;
+        float32x4_t v0 = vld1q_f32(p0);
+        p0 += 4;
+        float32x4_t v1 = vld1q_f32(p1);
+        p1 += 4;
+        float32x4_t v2 = vld1q_f32(p2);
+        p2 += 4;
+        float32x4_t v3 = vld1q_f32(p3);
+        p3 += 4;
 
         transpose_4x4_f32(v0, v1, v2, v3);
 
@@ -75,9 +79,9 @@ inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 8) noexcept {
+inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 8) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -97,14 +101,22 @@ inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
     const float32x4_t s = vdupq_n_f32(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float32x4_t v0 = vld1q_f32(p0); p0 += 4;
-        float32x4_t v1 = vld1q_f32(p1); p1 += 4;
-        float32x4_t v2 = vld1q_f32(p2); p2 += 4;
-        float32x4_t v3 = vld1q_f32(p3); p3 += 4;
-        float32x4_t v4 = vld1q_f32(p4); p4 += 4;
-        float32x4_t v5 = vld1q_f32(p5); p5 += 4;
-        float32x4_t v6 = vld1q_f32(p6); p6 += 4;
-        float32x4_t v7 = vld1q_f32(p7); p7 += 4;
+        float32x4_t v0 = vld1q_f32(p0);
+        p0 += 4;
+        float32x4_t v1 = vld1q_f32(p1);
+        p1 += 4;
+        float32x4_t v2 = vld1q_f32(p2);
+        p2 += 4;
+        float32x4_t v3 = vld1q_f32(p3);
+        p3 += 4;
+        float32x4_t v4 = vld1q_f32(p4);
+        p4 += 4;
+        float32x4_t v5 = vld1q_f32(p5);
+        p5 += 4;
+        float32x4_t v6 = vld1q_f32(p6);
+        p6 += 4;
+        float32x4_t v7 = vld1q_f32(p7);
+        p7 += 4;
 
         transpose_8x4_f32(v0, v1, v2, v3, v4, v5, v6, v7);
 
@@ -131,9 +143,9 @@ inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n12_f32(float* NNOPS_RESTRICT output,
-                               const float* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale, int mr = 12) noexcept {
+inline void pack_trans_n12_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                               int ir_step, int K, float scale, int mr = 12) noexcept
+{
     const int last = (mr > 1) ? mr - 1 : 0;
     const float* NNOPS_RESTRICT p[12];
     for (int i = 0; i < 12; ++i) {
@@ -145,11 +157,12 @@ inline void pack_trans_n12_f32(float* NNOPS_RESTRICT output,
     for (; k <= K - 4; k += 4) {
         float32x4_t v[12];
         for (int i = 0; i < 12; ++i) {
-            v[i] = vld1q_f32(p[i]); p[i] += 4;
+            v[i] = vld1q_f32(p[i]);
+            p[i] += 4;
         }
 
-        transpose_12x4_f32(v[0], v[1], v[2], v[3], v[4], v[5],
-                           v[6], v[7], v[8], v[9], v[10], v[11]);
+        transpose_12x4_f32(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10],
+                           v[11]);
 
         for (int i = 0; i < 12; ++i) {
             vst1q_f32(output + i * 4, vmulq_f32(v[i], s));
@@ -164,9 +177,9 @@ inline void pack_trans_n12_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
-                               const float* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale, int mr = 16) noexcept {
+inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                               int ir_step, int K, float scale, int mr = 16) noexcept
+{
     const int last = (mr > 1) ? mr - 1 : 0;
     const float* NNOPS_RESTRICT p[16];
     for (int i = 0; i < 16; ++i) {
@@ -178,11 +191,12 @@ inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
     for (; k <= K - 4; k += 4) {
         float32x4_t v[16];
         for (int i = 0; i < 16; ++i) {
-            v[i] = vld1q_f32(p[i]); p[i] += 4;
+            v[i] = vld1q_f32(p[i]);
+            p[i] += 4;
         }
 
-        transpose_16x4_f32(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-                           v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+        transpose_16x4_f32(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11],
+                           v[12], v[13], v[14], v[15]);
 
         for (int i = 0; i < 16; ++i) {
             vst1q_f32(output + i * 4, vmulq_f32(v[i], s));
@@ -201,18 +215,18 @@ inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
 //  RHS copy pack (f32)  —  contiguous rows, panels by N, optional scale
 // =========================================================================
 
-inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output,
-                             const float* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 1) noexcept {
+inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 1) noexcept
+{
     for (int k = 0; k < K; ++k) {
         *output++ = (nr > 0) ? input[0] * scale : 0.0f;
         input += ir_step;
     }
 }
 
-inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output,
-                             const float* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 4) noexcept {
+inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 4) noexcept
+{
     const float32x4_t s = vdupq_n_f32(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
@@ -250,9 +264,9 @@ inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_copy_n6_f32(float* NNOPS_RESTRICT output,
-                             const float* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 6) noexcept {
+inline void pack_copy_n6_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 6) noexcept
+{
     for (int k = 0; k < K; ++k) {
         for (int i = 0; i < 6; ++i) {
             *output++ = (i < nr) ? input[i * ir_step] * scale : 0.0f;
@@ -261,9 +275,9 @@ inline void pack_copy_n6_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_copy_n8_f32(float* NNOPS_RESTRICT output,
-                             const float* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 8) noexcept {
+inline void pack_copy_n8_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 8) noexcept
+{
     const float32x4_t s = vdupq_n_f32(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
@@ -308,9 +322,9 @@ inline void pack_copy_n8_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_copy_n12_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int nr = 12) noexcept {
+inline void pack_copy_n12_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int nr = 12) noexcept
+{
     const float32x4_t s = vdupq_n_f32(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 12) {
@@ -327,13 +341,13 @@ inline void pack_copy_n12_f32(float* NNOPS_RESTRICT output,
             }
         }
         output += 12;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
-inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int nr = 16) noexcept {
+inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int nr = 16) noexcept
+{
     const float32x4_t s = vdupq_n_f32(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 16) {
@@ -352,7 +366,7 @@ inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
             }
         }
         output += 16;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
@@ -361,9 +375,9 @@ inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
 //  reads the `nr` live columns of each and writes them k-major.
 // =========================================================================
 
-inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int nr = 6) noexcept {
+inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int nr = 6) noexcept
+{
     for (int k = 0; k < K; ++k) {
         for (int i = 0; i < 6; ++i) {
             *output++ = (i < nr) ? input[i] * scale : 0.0f;
@@ -381,4 +395,4 @@ inline constexpr int mr_f32[4] = {8, 4, 1, 0};
 
 inline constexpr int nr_f32[3] = {12, 4, 1};
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

@@ -10,11 +10,10 @@ namespace nnops {
 
 NNOPS_DECLARE_CPU(GridSampleAttributes, grid_sample_cpu)
 
-NNOPS_OP_BOILERPLATE(GridSample, GridSampleAttributes,
-        backend::cpu::grid_sample_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(GridSample, GridSampleAttributes, backend::cpu::grid_sample_cpu, nullptr,
+                     nullptr)
 
-std::vector<TensorDesc> GridSample::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> GridSample::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     return grid_sample_output_shape(inputs);
 }
@@ -27,15 +26,15 @@ Status GridSample::validate(std::span<const TensorDesc> inputs,
         is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOrChannelLast));
 }
 
-Status GridSample::compute(std::span<TensorView> outputs,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx,
-                           void* workspace)
+Status GridSample::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                           const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

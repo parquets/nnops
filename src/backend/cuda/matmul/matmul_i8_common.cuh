@@ -31,18 +31,35 @@
 namespace nnops::backend::cuda {
 
 /// Where the compensated int32 accumulate goes.
-enum class I8OutKind { S32, S8, U8, F32, F16 };
+enum class I8OutKind {
+    S32,
+    S8,
+    U8,
+    F32,
+    F16
+};
 
 /// Map an output dtype onto the kind the epilogue switches on.
 inline bool i8_out_kind(DataType dt, I8OutKind& kind) noexcept
 {
     switch (dt) {
-    case DataType::s32: kind = I8OutKind::S32; return true;
-    case DataType::s8:  kind = I8OutKind::S8;  return true;
-    case DataType::u8:  kind = I8OutKind::U8;  return true;
-    case DataType::f32: kind = I8OutKind::F32; return true;
-    case DataType::f16: kind = I8OutKind::F16; return true;
-    default: return false;
+    case DataType::s32:
+        kind = I8OutKind::S32;
+        return true;
+    case DataType::s8:
+        kind = I8OutKind::S8;
+        return true;
+    case DataType::u8:
+        kind = I8OutKind::U8;
+        return true;
+    case DataType::f32:
+        kind = I8OutKind::F32;
+        return true;
+    case DataType::f16:
+        kind = I8OutKind::F16;
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -84,8 +101,8 @@ struct GemmI8Params {
     int32_t out_zp = 0;
 
     I8OutKind out = I8OutKind::S32;
-    const void* bias = nullptr;  ///< [N]; int32 for an integer destination
-    bool relu = false;           ///< integer destinations: Relu before the store
+    const void* bias = nullptr; ///< [N]; int32 for an integer destination
+    bool relu = false;          ///< integer destinations: Relu before the store
 
     /// The A domain the accumulate lives in: 0 when the MMA sees the stored
     /// values (the tensor-core path, whose u8 atom is unsigned), -128 when the
@@ -96,28 +113,21 @@ struct GemmI8Params {
 
 namespace detail {
 
-template <class Elem>
-__device__ inline float i8_to_float(Elem x) { return float(x); }
-template <>
-__device__ inline float i8_to_float<float>(float x) { return x; }
+template <class Elem> __device__ inline float i8_to_float(Elem x) { return float(x); }
+template <> __device__ inline float i8_to_float<float>(float x) { return x; }
 
 /// round(x) with ties away from zero, the scalar/vector epilogue's rule.
-__device__ inline float i8_round_away(float x)
-{
-    return truncf(x + copysignf(0.5f, x));
-}
+__device__ inline float i8_round_away(float x) { return truncf(x + copysignf(0.5f, x)); }
 
 /// The compensated value, exactly as `matmul_int8_compensate` expresses it:
 /// raw − zp_a·R_b[n] − (R_a[m] − K·zp_a)·zp_b[n]. `a_shift` moves the whole
 /// formula into the domain the accumulator was built in (0 for the u8 MMA, -128
 /// for a sign-shifted `__dp4a` A). The two reduction planes arrive already
 /// offset to this batch element, so the loop body is pure 32-bit arithmetic.
-__device__ inline int32_t i8_compensate(GemmI8Params q, int32_t raw, int m,
-                                        int n, const int32_t* r_a_b,
-                                        const int32_t* r_b_b)
+__device__ inline int32_t i8_compensate(GemmI8Params q, int32_t raw, int m, int n,
+                                        const int32_t* r_a_b, const int32_t* r_b_b)
 {
-    const int32_t zpa =
-        (q.zp_a != nullptr ? q.zp_a[m] : q.zp_a_scalar) + q.a_shift;
+    const int32_t zpa = (q.zp_a != nullptr ? q.zp_a[m] : q.zp_a_scalar) + q.a_shift;
     const int32_t zpb = q.zp_b != nullptr ? q.zp_b[n] : q.zp_b_scalar;
     const int32_t ra_v = r_a_b[m] + q.a_shift * q.g.k;
     int32_t v = raw - zpa * r_b_b[n];
@@ -141,38 +151,38 @@ __device__ inline TOut i8_requant(int32_t acc, float row_k, float s_b, float zp_
 
 /// The integer destination's value: the compensated accumulate, the int32 bias,
 /// and the Relu stage an integer destination applies (the only one it does).
-__device__ inline int32_t i8_int_value(const GemmI8Params& q, int32_t raw, int m,
-                                       int n, const int32_t* r_a_b,
-                                       const int32_t* r_b_b)
+__device__ inline int32_t i8_int_value(const GemmI8Params& q, int32_t raw, int m, int n,
+                                       const int32_t* r_a_b, const int32_t* r_b_b)
 {
     int32_t v = i8_compensate(q, raw, m, n, r_a_b, r_b_b);
     const int32_t* bias32 = static_cast<const int32_t*>(q.bias);
-    if (bias32 != nullptr) { v += bias32[n]; }
-    if (q.relu) { v = v < 0 ? 0 : v; }
+    if (bias32 != nullptr) {
+        v += bias32[n];
+    }
+    if (q.relu) {
+        v = v < 0 ? 0 : v;
+    }
     return v;
 }
 
 /// The s8/u8 requant of that value -- so the argument is the biased, Relu'd int,
 /// not the raw accumulate. Spelled so the f32 product, the clamp, the rounding
 /// and the convert match `matmul_int8_requant` on the CPU.
-__device__ inline int32_t i8_requant_value(const GemmI8Params& q, int32_t v,
-                                           int m, int n)
+__device__ inline int32_t i8_requant_value(const GemmI8Params& q, int32_t v, int m, int n)
 {
     const float s_am = q.sc_a != nullptr ? q.sc_a[m] : q.sc_a_scalar;
     const float s_bn = q.sc_b != nullptr ? q.sc_b[n] : q.sc_b_scalar;
     const float row_k = s_am / q.out_scale;
-    return q.out == I8OutKind::S8
-               ? int32_t(i8_requant<int8_t>(v, row_k, s_bn, float(q.out_zp)))
-               : int32_t(i8_requant<uint8_t>(v, row_k, s_bn, float(q.out_zp)));
+    return q.out == I8OutKind::S8 ? int32_t(i8_requant<int8_t>(v, row_k, s_bn, float(q.out_zp))) :
+                                    int32_t(i8_requant<uint8_t>(v, row_k, s_bn, float(q.out_zp)));
 }
 
 /// The dequantizing destination's value: the compensated accumulate scaled by
 /// s_a*s_b, the bias in the output's own format, the clamp and the activation.
 /// The bias lands *after* the dequantization here, unlike an integer
 /// destination's, which is why this cannot share the value above.
-__device__ inline float i8_fp_value(const GemmI8Params& q, int32_t raw, int m,
-                                    int n, const int32_t* r_a_b,
-                                    const int32_t* r_b_b)
+__device__ inline float i8_fp_value(const GemmI8Params& q, int32_t raw, int m, int n,
+                                    const int32_t* r_a_b, const int32_t* r_b_b)
 {
     const GemmParams& p = q.g;
     const int32_t v = i8_compensate(q, raw, m, n, r_a_b, r_b_b);
@@ -182,14 +192,20 @@ __device__ inline float i8_fp_value(const GemmI8Params& q, int32_t raw, int m,
     float b = 0.0f;
     if (q.out == I8OutKind::F32) {
         const float* biasf = static_cast<const float*>(q.bias);
-        if (biasf != nullptr) { b = biasf[n]; }
+        if (biasf != nullptr) {
+            b = biasf[n];
+        }
     } else {
         const __half* biash = static_cast<const __half*>(q.bias);
-        if (biash != nullptr) { b = __half2float(biash[n]); }
+        if (biash != nullptr) {
+            b = __half2float(biash[n]);
+        }
     }
     // A zero bias is skipped: x + 0 turns -0 into +0, and fp outputs are
     // compared bitwise across the two backends.
-    if (b != 0.0f) { f += b; }
+    if (b != 0.0f) {
+        f += b;
+    }
     f = fminf(fmaxf(f, p.min_clip), p.max_clip);
     return gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, f);
 }
@@ -197,29 +213,25 @@ __device__ inline float i8_fp_value(const GemmI8Params& q, int32_t raw, int m,
 /// One output element from its compensated accumulate: the value path its
 /// destination calls for, then the store. Shared by the tile engines, the
 /// narrow-m kernel and the split-K reduce so they cannot drift apart.
-__device__ inline void i8_epilogue_element(GemmI8Params q, int64_t c_off,
-                                           const int32_t* r_a_b,
-                                           const int32_t* r_b_b, int32_t raw,
-                                           int m, int n)
+__device__ inline void i8_epilogue_element(GemmI8Params q, int64_t c_off, const int32_t* r_a_b,
+                                           const int32_t* r_b_b, int32_t raw, int m, int n)
 {
     const GemmParams& p = q.g;
     const int64_t idx = int64_t(m) * p.ldc + n;
     switch (q.out) {
     case I8OutKind::S32:
-        static_cast<int32_t*>(p.c)[c_off + idx] =
-            i8_int_value(q, raw, m, n, r_a_b, r_b_b);
+        static_cast<int32_t*>(p.c)[c_off + idx] = i8_int_value(q, raw, m, n, r_a_b, r_b_b);
         return;
     case I8OutKind::S8:
-        static_cast<int8_t*>(p.c)[c_off + idx] = int8_t(uint8_t(i8_requant_value(
-            q, i8_int_value(q, raw, m, n, r_a_b, r_b_b), m, n)));
+        static_cast<int8_t*>(p.c)[c_off + idx] =
+            int8_t(uint8_t(i8_requant_value(q, i8_int_value(q, raw, m, n, r_a_b, r_b_b), m, n)));
         return;
     case I8OutKind::U8:
-        static_cast<uint8_t*>(p.c)[c_off + idx] = uint8_t(i8_requant_value(
-            q, i8_int_value(q, raw, m, n, r_a_b, r_b_b), m, n));
+        static_cast<uint8_t*>(p.c)[c_off + idx] =
+            uint8_t(i8_requant_value(q, i8_int_value(q, raw, m, n, r_a_b, r_b_b), m, n));
         return;
     case I8OutKind::F32:
-        static_cast<float*>(p.c)[c_off + idx] =
-            i8_fp_value(q, raw, m, n, r_a_b, r_b_b);
+        static_cast<float*>(p.c)[c_off + idx] = i8_fp_value(q, raw, m, n, r_a_b, r_b_b);
         return;
     case I8OutKind::F16:
         static_cast<__half*>(p.c)[c_off + idx] =
@@ -238,7 +250,9 @@ __device__ inline void i8_block_sum_store(int32_t s, int32_t* dst)
     for (int off = 16; off > 0; off >>= 1) {
         s += __shfl_down_sync(0xffffffffu, s, off);
     }
-    if (lane == 0) { red[wid] = s; }
+    if (lane == 0) {
+        red[wid] = s;
+    }
     __syncthreads();
     if (wid == 0) {
         s = (lane < int(blockDim.x) / 32) ? red[lane] : 0;
@@ -246,19 +260,19 @@ __device__ inline void i8_block_sum_store(int32_t s, int32_t* dst)
         for (int off = 16; off > 0; off >>= 1) {
             s += __shfl_down_sync(0xffffffffu, s, off);
         }
-        if (lane == 0) { *dst = s; }
+        if (lane == 0) {
+            *dst = s;
+        }
     }
 }
 
 /// Σ_k of one A row, per batch element. One block per (m, batch).
-template <class AT>
-static __global__ void i8_row_sums_kernel(GemmI8Params q, int32_t* out)
+template <class AT> static __global__ void i8_row_sums_kernel(GemmI8Params q, int32_t* out)
 {
     const GemmParams& p = q.g;
     const int batch = int(blockIdx.y);
     const int m = int(blockIdx.x);
-    const AT* a = static_cast<const AT*>(p.a) +
-                  gemm_batch_offset(p, p.a_batch, batch);
+    const AT* a = static_cast<const AT*>(p.a) + gemm_batch_offset(p, p.a_batch, batch);
 
     int32_t s = 0;
     if (q.a_row_major) {
@@ -283,8 +297,7 @@ static __global__ void i8_col_sums_kernel(GemmI8Params q, int32_t* out)
 {
     const GemmParams& p = q.g;
     const int batch = int(blockIdx.y);
-    const int8_t* b = static_cast<const int8_t*>(p.b) +
-                      gemm_batch_offset(p, p.b_batch, batch);
+    const int8_t* b = static_cast<const int8_t*>(p.b) + gemm_batch_offset(p, p.b_batch, batch);
 
     if (q.b_row_major) {
         const int n = int(blockIdx.x);
@@ -299,8 +312,7 @@ static __global__ void i8_col_sums_kernel(GemmI8Params q, int32_t* out)
     constexpr int kV = 4;
     const int n0 = int(blockIdx.x) * int(blockDim.x) * kV + int(threadIdx.x) * kV;
     int32_t* dst = out + int64_t(batch) * p.n;
-    const bool row_aligned = (p.ldb % 4 == 0) &&
-                             (reinterpret_cast<uintptr_t>(b) % 4 == 0);
+    const bool row_aligned = (p.ldb % 4 == 0) && (reinterpret_cast<uintptr_t>(b) % 4 == 0);
     // Every blockIdx.z slice owns a k range -- the tail path included, or each
     // slice would add the whole column.
     const int zs = int(gridDim.z);
@@ -310,20 +322,25 @@ static __global__ void i8_col_sums_kernel(GemmI8Params q, int32_t* out)
     if (n0 + kV <= p.n && row_aligned) {
         int32_t s[kV] = {0, 0, 0, 0};
         for (int k = k_begin; k < k_end; ++k) {
-            const uint32_t v = *reinterpret_cast<const uint32_t*>(
-                b + int64_t(k) * p.ldb + n0);
+            const uint32_t v = *reinterpret_cast<const uint32_t*>(b + int64_t(k) * p.ldb + n0);
             const int8_t* e = reinterpret_cast<const int8_t*>(&v);
 #pragma unroll
-            for (int t = 0; t < kV; ++t) { s[t] += int32_t(e[t]); }
+            for (int t = 0; t < kV; ++t) {
+                s[t] += int32_t(e[t]);
+            }
         }
 #pragma unroll
-        for (int t = 0; t < kV; ++t) { atomicAdd(dst + n0 + t, s[t]); }
+        for (int t = 0; t < kV; ++t) {
+            atomicAdd(dst + n0 + t, s[t]);
+        }
         return;
     }
 #pragma unroll
     for (int t = 0; t < kV; ++t) {
         const int n = n0 + t;
-        if (n >= p.n) { break; }
+        if (n >= p.n) {
+            break;
+        }
         int32_t s = 0;
         for (int k = k_begin; k < k_end; ++k) {
             s += int32_t(b[int64_t(k) * p.ldb + n]);
@@ -344,9 +361,8 @@ static __global__ void i8_col_sums_kernel(GemmI8Params q, int32_t* out)
 /// hand-written one a plain pointer. A 4-byte-aligned source is the caller's
 /// contract (the word reads below assume it).
 template <int bN, int bK>
-__device__ inline void i8_transpose_fill(int8_t* dst, int ld, const int8_t* b,
-                                         int n0, int k0, int N, int K, int ldb,
-                                         int tid, int nthr)
+__device__ inline void i8_transpose_fill(int8_t* dst, int ld, const int8_t* b, int n0, int k0,
+                                         int N, int K, int ldb, int tid, int nthr)
 {
     constexpr int nb4 = bN / 4;
     constexpr int nblocks = nb4 * (bK / 4);
@@ -380,14 +396,14 @@ __device__ inline void i8_transpose_fill(int8_t* dst, int ld, const int8_t* b,
             for (int i = 0; i < 4; ++i) {
                 const int nn = n + i;
                 const int kk = k + j;
-                row[i * ld + j] = (nn < N && kk < K)
-                    ? int8_t(b[int64_t(kk) * ldb + nn]) : int8_t(0);
+                row[i * ld + j] =
+                    (nn < N && kk < K) ? int8_t(b[int64_t(kk) * ldb + nn]) : int8_t(0);
             }
         }
     }
 }
 
-}  // namespace detail
+} // namespace detail
 
 /// A 16 B cp.async needs both the base pointer and the row pitch aligned; the
 /// k and batch offsets are multiples of the row pitch, so those follow.
@@ -396,4 +412,4 @@ inline bool i8_operand_vectorizable(const void* ptr, int64_t ld)
     return (reinterpret_cast<uintptr_t>(ptr) % 16 == 0) && (ld % 16 == 0);
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

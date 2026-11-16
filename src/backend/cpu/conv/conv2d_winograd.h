@@ -120,16 +120,16 @@ namespace nnops::backend::cpu {
 
 /// Which layout a plan was resolved for — the tag the kernel dispatches on.
 enum class Conv2DWinogradRoute : uint8_t {
-    ChannelFirst,  ///< activation channel-first, U [16][OC][IC/G]
-    ChannelLast,   ///< activation channel-last, U as B panels [16][nb][G·jb][ldd]
+    ChannelFirst, ///< activation channel-first, U [16][OC][IC/G]
+    ChannelLast,  ///< activation channel-last, U as B panels [16][nb][G·jb][ldd]
 };
 
 /// Which transform order the U was built with — F(2×2,3×3) or F(4×4,3×3). The
 /// two are not interchangeable, so the U's leading dimension has to say which:
 /// 16 positions or 36. Prepack picks one; compute reads it back off the blob.
 enum class WinoOrder : uint8_t {
-    F23,  ///< 16 positions, a 4×4 window per 2×2 output tile
-    F43,  ///< 36 positions, a 6×6 window per 4×4 output tile
+    F23, ///< 16 positions, a 4×4 window per 2×2 output tile
+    F43, ///< 36 positions, a 6×6 window per 4×4 output tile
 };
 
 constexpr int64_t wino_pos(WinoOrder o) noexcept { return o == WinoOrder::F43 ? 36 : 16; }
@@ -147,24 +147,23 @@ constexpr int64_t wino_alpha(WinoOrder o) noexcept { return wino_tile(o) + 2; }
 /// output channels run zero-padded to whole panels, so a partial panel's dead
 /// columns are computed and dropped.
 struct WinoChannelLastU {
-    WinoOrder order = WinoOrder::F23;  ///< which transform produced these panels
-    int64_t pos = 0;    ///< transform positions = wino_pos(order)
-    int64_t nr = 0;     ///< panel width: the arch's nr_max for the dtype
-    int64_t kc = 0;     ///< k-block length: the largest divisor of IC/G that is
-                        ///< <= 128 (f16) or 256 (f32)
-    int64_t nb = 0;     ///< k-blocks per position = IC/G / kc
-    int64_t jb = 0;     ///< oc panels per group = ceil(oc_per_group / nr)
-    int64_t jbg = 0;    ///< oc panels over all groups = groups · jb
-    int64_t ldd = 0;    ///< elements per panel (kc·nr, padded to the pack align)
-    int64_t plane = 0;  ///< elements per transform position = nb · jbg · ldd
-    int64_t total = 0;  ///< pos · plane — the whole U
+    WinoOrder order = WinoOrder::F23; ///< which transform produced these panels
+    int64_t pos = 0;                  ///< transform positions = wino_pos(order)
+    int64_t nr = 0;                   ///< panel width: the arch's nr_max for the dtype
+    int64_t kc = 0;                   ///< k-block length: the largest divisor of IC/G that is
+                                      ///< <= 128 (f16) or 256 (f32)
+    int64_t nb = 0;                   ///< k-blocks per position = IC/G / kc
+    int64_t jb = 0;                   ///< oc panels per group = ceil(oc_per_group / nr)
+    int64_t jbg = 0;                  ///< oc panels over all groups = groups · jb
+    int64_t ldd = 0;                  ///< elements per panel (kc·nr, padded to the pack align)
+    int64_t plane = 0;                ///< elements per transform position = nb · jbg · ldd
+    int64_t total = 0;                ///< pos · plane — the whole U
 };
 
 /// Resolve the channel-last U geometry for a dtype and transform order (see
 /// WinoChannelLastU).
-WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group,
-                                     int64_t groups, DataType dt,
-                                     WinoOrder order = WinoOrder::F23) noexcept;
+WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
+                                     DataType dt, WinoOrder order = WinoOrder::F23) noexcept;
 
 /// Which order a prepack should build, for both routes. The trade is F(4,3)'s
 /// 1.78x fewer multiplies per output against ~4.5x the transform work per tile,
@@ -191,58 +190,58 @@ WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group,
 /// safe order. The policy is what `ConvAlgorithm::Winograd` means for a filter:
 /// compute never re-decides it, it reads the order back off the U.
 WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_group,
-                          int64_t out_h = 0, int64_t out_w = 0,
-                          bool channel_last = false, int num_threads = 1) noexcept;
+                          int64_t out_h = 0, int64_t out_w = 0, bool channel_last = false,
+                          int num_threads = 1) noexcept;
 
 /// Single source of truth for the Winograd block sizes, the parallel
 /// decomposition and the scratch layout; the fields a route does not use stay
 /// zero.
 struct Conv2DWinogradPlan {
     Conv2DWinogradRoute route = Conv2DWinogradRoute::ChannelFirst;
-    WinoOrder order = WinoOrder::F23;   ///< transform order (channel-last only)
+    WinoOrder order = WinoOrder::F23; ///< transform order (channel-last only)
 
     // ---- transform-domain geometry ----
-    int64_t num_tile_rows = 0;      ///< TH  = ceil(OH / tile)
-    int64_t num_tile_cols = 0;      ///< TW  = ceil(OW / tile)
-    int64_t num_tile_cols_pad = 0;  ///< channel-first: TW_pad = ceil(TW / 8) · 8
-    int64_t tile_rows = 0;          ///< channel-first: tile rows per task, so a task's
-                                    ///< N side can fill an nr_max-wide panel
-                                    ///< channel-last: the flat tile count TH · TW
-    int64_t num_tiles = 0;          ///< channel-first: TH · TW_pad — the GEMM's N
+    int64_t num_tile_rows = 0;     ///< TH  = ceil(OH / tile)
+    int64_t num_tile_cols = 0;     ///< TW  = ceil(OW / tile)
+    int64_t num_tile_cols_pad = 0; ///< channel-first: TW_pad = ceil(TW / 8) · 8
+    int64_t tile_rows = 0;         ///< channel-first: tile rows per task, so a task's
+                                   ///< N side can fill an nr_max-wide panel
+                                   ///< channel-last: the flat tile count TH · TW
+    int64_t num_tiles = 0;         ///< channel-first: TH · TW_pad — the GEMM's N
 
     // ---- blocking ----
-    int64_t icn_block = 0;   ///< channel-first: input-channel (GEMM K) block
-                             ///< channel-last: the U's k-block (kc)
-    int64_t ocn_block = 0;   ///< channel-first: output-channel (GEMM M) block
-                             ///< channel-last: oc block (GEMM N), a multiple of nr
-    int64_t tile_block = 0;  ///< tiles per task: 8 or 16 within one tile row,
-                             ///< or a whole multi-row block (channel-first); up to 24
-                             ///< flattened (channel-last)
+    int64_t icn_block = 0;  ///< channel-first: input-channel (GEMM K) block
+                            ///< channel-last: the U's k-block (kc)
+    int64_t ocn_block = 0;  ///< channel-first: output-channel (GEMM M) block
+                            ///< channel-last: oc block (GEMM N), a multiple of nr
+    int64_t tile_block = 0; ///< tiles per task: 8 or 16 within one tile row,
+                            ///< or a whole multi-row block (channel-first); up to 24
+                            ///< flattened (channel-last)
 
-    int64_t num_tile_blocks = 1;   ///< ceil(tiles / tile_block)
-    int64_t oc_chunks = 1;         ///< parallel filter-row chunks per plane; 1
-                                   ///< unless the plane is too small for the pool
-    int64_t num_tasks = 0;         ///< N · G · num_tile_blocks · oc_chunks, with
-                                   ///< TH also in the product on the channel-first
-                                   ///< route
+    int64_t num_tile_blocks = 1; ///< ceil(tiles / tile_block)
+    int64_t oc_chunks = 1;       ///< parallel filter-row chunks per plane; 1
+                                 ///< unless the plane is too small for the pool
+    int64_t num_tasks = 0;       ///< N · G · num_tile_blocks · oc_chunks, with
+                                 ///< TH also in the product on the channel-first
+                                 ///< route
 
     // ---- channel-last only ----
-    WinoChannelLastU u;       ///< the prepacked U's panel geometry
-    int64_t v_lda = 0;        ///< elements per tile row of one V position =
-                              ///< IC/G rounded up to the vector (the GEMM's lda)
-    int64_t m_oc_stride = 0;  ///< channel-last: M's row (tile) stride in oc
+    WinoChannelLastU u;      ///< the prepacked U's panel geometry
+    int64_t v_lda = 0;       ///< elements per tile row of one V position =
+                             ///< IC/G rounded up to the vector (the GEMM's lda)
+    int64_t m_oc_stride = 0; ///< channel-last: M's row (tile) stride in oc
 
     // ---- scratch (elements, not bytes), all per slot ----
-    int64_t num_slots = 0;    ///< worker threads, else tasks
-    int64_t halo_ld = 0;      ///< channel-first: padded columns = 2·tile_block + 2
-    int64_t halo_rows = 0;    ///< channel-first: padded rows — the window (alpha)
-                              ///< plus ktile per extra tile row the task spans
-    int64_t halo_size = 0;    ///< channel-first: ic_per_group · halo_rows · halo_ld
-    int64_t v_p_stride = 0;   ///< elements between transform positions
-    int64_t v_size = 0;       ///< pos · v_p_stride
-    int64_t m_size = 0;       ///< pos · tile_block · ocn_block
-    int64_t b_size = 0;       ///< channel-first: uniform packed-B elements
-    int64_t slot_size = 0;    ///< halo + V + M + B; channel-last rounds to 16
+    int64_t num_slots = 0;  ///< worker threads, else tasks
+    int64_t halo_ld = 0;    ///< channel-first: padded columns = 2·tile_block + 2
+    int64_t halo_rows = 0;  ///< channel-first: padded rows — the window (alpha)
+                            ///< plus ktile per extra tile row the task spans
+    int64_t halo_size = 0;  ///< channel-first: ic_per_group · halo_rows · halo_ld
+    int64_t v_p_stride = 0; ///< elements between transform positions
+    int64_t v_size = 0;     ///< pos · v_p_stride
+    int64_t m_size = 0;     ///< pos · tile_block · ocn_block
+    int64_t b_size = 0;     ///< channel-first: uniform packed-B elements
+    int64_t slot_size = 0;  ///< halo + V + M + B; channel-last rounds to 16
     size_t workspace_size = 0;
 };
 
@@ -252,20 +251,16 @@ struct Conv2DWinogradPlan {
 /// non-k3s1, or groups the U layout cannot express.
 Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
                                             std::span<const TensorDesc> inputs,
-                                            std::span<const TensorDesc> outputs,
-                                            int num_threads,
-                                            bool use_thread_slots = false,
-                                            int64_t num_slots = 0);
+                                            std::span<const TensorDesc> outputs, int num_threads,
+                                            bool use_thread_slots = false, int64_t num_slots = 0);
 
 /// Winograd F(2×2, 3×3) Conv2D kernel (f32 / f16, k3s1, channel-first or channel-last).
 ///
 /// inputs[1] must be the prepacked U produced by Conv2D::prepackWeights, in the
 /// form that pairs with the activation's layout. Scratch is pooled internally
 /// (sized by get_conv2d_winograd_plan); @p workspace is vestigial.
-Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
-                            TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx,
-                            void* workspace);
+Status conv2d_winograd_kernel(const Conv2DAttributes& attrs, TensorView& output,
+                              std::span<const TensorView> inputs, const ComputeContext& ctx,
+                              void* workspace);
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

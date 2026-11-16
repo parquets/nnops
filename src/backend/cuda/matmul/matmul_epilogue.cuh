@@ -21,8 +21,7 @@ namespace nnops::backend::cuda {
 /// A flat batch index resolved against up to four (size, stride) axes. Both
 /// hand-written GEMMs fold the batch into blockIdx.z beside the k splits, so
 /// they resolve the operand offsets with the same helper.
-__device__ inline int64_t manual_batch_offset(const int64_t* size,
-                                              const int64_t* stride, int rank,
+__device__ inline int64_t manual_batch_offset(const int64_t* size, const int64_t* stride, int rank,
                                               int64_t idx)
 {
     int64_t off = 0;
@@ -36,7 +35,7 @@ __device__ inline int64_t manual_batch_offset(const int64_t* size,
 
 struct ManualEpilogue {
     const void* bias = nullptr;
-    bool bias_row = false;      ///< the bias is indexed by row, else by column
+    bool bias_row = false; ///< the bias is indexed by row, else by column
     float alpha = 1.0f;
     float beta = 0.0f;
     const void* residual = nullptr;
@@ -48,8 +47,7 @@ struct ManualEpilogue {
     float max_clip = INFINITY;
 };
 
-__device__ inline float manual_apply_activation(EpilogueActivateType ep, float a,
-                                                float b, float x)
+__device__ inline float manual_apply_activation(EpilogueActivateType ep, float a, float b, float x)
 {
     switch (ep) {
     case EpilogueActivateType::None:
@@ -80,15 +78,12 @@ __device__ inline float manual_apply_activation(EpilogueActivateType ep, float a
     return x;
 }
 
-template <class Elem>
-__device__ __forceinline__ float manual_elem_load(const Elem* p, int64_t i)
+template <class Elem> __device__ __forceinline__ float manual_elem_load(const Elem* p, int64_t i)
 {
     return static_cast<float>(p[i]);
 }
 
-template <>
-__device__ __forceinline__ float manual_elem_load<__half>(const __half* p,
-                                                          int64_t i)
+template <> __device__ __forceinline__ float manual_elem_load<__half>(const __half* p, int64_t i)
 {
     return __half2float(p[i]);
 }
@@ -96,16 +91,17 @@ __device__ __forceinline__ float manual_elem_load<__half>(const __half* p,
 /// One destination element: `dst` points at C[m][n] and `dst[n]` is its old
 /// value for the beta term.
 template <class Elem>
-__device__ __forceinline__ float manual_epilogue(const ManualEpilogue& e, float acc,
-                                                 int64_t m, int64_t n,
-                                                 const Elem* dst)
+__device__ __forceinline__ float manual_epilogue(const ManualEpilogue& e, float acc, int64_t m,
+                                                 int64_t n, const Elem* dst)
 {
     float x = e.alpha * acc;
     if (e.bias != nullptr) {
         const auto* b = static_cast<const Elem*>(e.bias);
         x += manual_elem_load<Elem>(b, e.bias_row ? m : n);
     }
-    if (e.beta != 0.0f) { x += e.beta * manual_elem_load<Elem>(dst, n); }
+    if (e.beta != 0.0f) {
+        x += e.beta * manual_elem_load<Elem>(dst, n);
+    }
     x = fminf(fmaxf(x, e.min_clip), e.max_clip);
     x = manual_apply_activation(e.type, e.ep_alpha, e.ep_beta, x);
     if (e.residual != nullptr) {
@@ -115,4 +111,4 @@ __device__ __forceinline__ float manual_epilogue(const ManualEpilogue& e, float 
     return x;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

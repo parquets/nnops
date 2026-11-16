@@ -19,7 +19,7 @@
 /// product's dims, the epilogue predicates, and the batch walk that maps a flat
 /// batch index to per-operand element offsets.
 
-#include "matmul_helper.h"                 // MatMulPlan geometry, block sizes
+#include "matmul_helper.h" // MatMulPlan geometry, block sizes
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/detail/assert.hpp"
@@ -35,7 +35,8 @@
 namespace nnops::backend::cpu {
 
 /// Only the final k-block clamps; partial sums accumulate unclamped.
-inline std::pair<float, float> kblock_clamp(const MatMulAttributes& attrs, bool last_k) noexcept {
+inline std::pair<float, float> kblock_clamp(const MatMulAttributes& attrs, bool last_k) noexcept
+{
     if (!last_k) {
         const float inf = std::numeric_limits<float>::infinity();
         return {-inf, inf};
@@ -44,32 +45,33 @@ inline std::pair<float, float> kblock_clamp(const MatMulAttributes& attrs, bool 
 }
 
 /// Non-clamp epilogues (Relu is folded into the MMA clamp) run in place.
-inline bool has_inplace_epilogue(const MatMulAttributes& attrs) noexcept {
-    return epilogue_is_active(attrs.epilogue) &&
-           attrs.epilogue.type != EpilogueActivateType::Relu;
+inline bool has_inplace_epilogue(const MatMulAttributes& attrs) noexcept
+{
+    return epilogue_is_active(attrs.epilogue) && attrs.epilogue.type != EpilogueActivateType::Relu;
 }
 
 /// M, N and K of the product, honouring the transpose flags.
-struct MatMulDims { int64_t M, N, K; };
+struct MatMulDims {
+    int64_t M, N, K;
+};
 
-inline MatMulDims matmul_dims(const MatMulAttributes& attrs,
-                              const TensorView& a, const TensorView& b) noexcept {
+inline MatMulDims matmul_dims(const MatMulAttributes& attrs, const TensorView& a,
+                              const TensorView& b) noexcept
+{
     // A packed RHS (see matmul_helper.h) leads with N and carries no K of its
     // own — the blob is addressed from K, not shaped by it — so K comes from A.
-    const int64_t k_a = attrs.transpose_a ? a.shape(a.rank() - 2)
-                                          : a.shape(a.rank() - 1);
+    const int64_t k_a = attrs.transpose_a ? a.shape(a.rank() - 2) : a.shape(a.rank() - 1);
     if (is_packed_matmul_b(b.layout())) {
-        return { attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2),
-                 b.shape(0), k_a };
+        return {attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2), b.shape(0), k_a};
     }
-    return { attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2),
-             attrs.transpose_b ? b.shape(b.rank() - 2) : b.shape(b.rank() - 1),
-             attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2) };
+    return {attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2),
+            attrs.transpose_b ? b.shape(b.rank() - 2) : b.shape(b.rank() - 1),
+            attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2)};
 }
 
 /// A block-packed B (q4_1) at a per-batch offset already counted in blocks.
-inline const uint8_t* block_rhs_at(const uint8_t* base, int64_t block_off,
-                                   DataType dt) noexcept {
+inline const uint8_t* block_rhs_at(const uint8_t* base, int64_t block_off, DataType dt) noexcept
+{
     return base + block_off * static_cast<int64_t>(data_type_stride_unit(dt));
 }
 
@@ -77,11 +79,12 @@ inline const uint8_t* block_rhs_at(const uint8_t* base, int64_t block_off,
 struct BatchWalk {
     const TensorView* a;
     const TensorView* b;
-    int64_t ndim  = 0;
+    int64_t ndim = 0;
     int64_t total = 1;
     std::vector<int64_t> a_shape, b_shape, out_shape;
 
-    BatchWalk(const TensorView& a_, const TensorView& b_) : a(&a_), b(&b_) {
+    BatchWalk(const TensorView& a_, const TensorView& b_) : a(&a_), b(&b_)
+    {
         const int64_t a_dims = a->rank() - 2;
         const int64_t b_dims = b->rank() - 2;
         ndim = std::max(a_dims, b_dims);
@@ -89,8 +92,10 @@ struct BatchWalk {
         b_shape.assign(static_cast<size_t>(ndim), 1);
         out_shape.assign(static_cast<size_t>(ndim), 1);
 
-        for (int64_t i = 0; i < a_dims; ++i) a_shape[ndim - a_dims + i] = a->shape(i);
-        for (int64_t i = 0; i < b_dims; ++i) b_shape[ndim - b_dims + i] = b->shape(i);
+        for (int64_t i = 0; i < a_dims; ++i)
+            a_shape[ndim - a_dims + i] = a->shape(i);
+        for (int64_t i = 0; i < b_dims; ++i)
+            b_shape[ndim - b_dims + i] = b->shape(i);
 
         for (int64_t i = 0; i < ndim; ++i) {
             const int64_t da = a_shape[i];
@@ -106,8 +111,9 @@ struct BatchWalk {
         }
     }
 
-    void offsets(int64_t bi, const TensorView& out,
-                 int64_t& a_off, int64_t& b_off, int64_t& c_off) const {
+    void offsets(int64_t bi, const TensorView& out, int64_t& a_off, int64_t& b_off,
+                 int64_t& c_off) const
+    {
         a_off = 0;
         b_off = 0;
         c_off = 0;
@@ -135,18 +141,14 @@ struct BatchWalk {
 /// Dense f32/f16 small products: the naive kernel below GEMM_FAST_PATH_THRESHOLD
 /// MACs, the direct GEMV at M <= GEMV_M_MAX. Returns false when the product is
 /// not one of those (wrong dtypes, or large enough that the plan should run).
-bool matmul_small_fp(const MatMulAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx);
+bool matmul_small_fp(const MatMulAttributes& attrs, TensorView& output,
+                     std::span<const TensorView> inputs, const ComputeContext& ctx);
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 /// Whole product through the fused Q4_1 kernels; false if not applicable.
-bool matmul_qblock_fused(const MatMulAttributes& attrs,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         int M, int N, int K);
+bool matmul_qblock_fused(const MatMulAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs, const ComputeContext& ctx, int M,
+                         int N, int K);
 #endif
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

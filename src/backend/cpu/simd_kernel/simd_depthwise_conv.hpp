@@ -77,21 +77,21 @@
 namespace nnops::kernel {
 
 struct DwConvParams {
-    int64_t ID, IH, IW;           // input spatial dims
-    int64_t OH, OW;               // output spatial dims (for store bounds)
-    int64_t od, oh;               // current output position (set before call)
-    int64_t KD, KH, KW;           // kernel shape
-    int64_t SD, SH, SW;           // stride
-    int64_t DD, DH, DW;           // dilation
-    int64_t PD, PH, PW;           // padding
-    int64_t out_row_stride;       // output row stride (elems)
-    int64_t ow0 = 0;              // first output column this call covers
-    int64_t ow_end = -1;          // one past the last; negative means OW
-    int64_t in_d_stride;          // input depth stride (elems)
-    int64_t in_row_stride;        // input row stride (elems)
-    int64_t pix_stride = 8;       // elems between pixels (= C, set by the driver)
-    int64_t w_tap_stride = 8;     // elems between taps (= C of a raw HWCM filter,
-                                  // 8 in the dequantized staging block)
+    int64_t ID, IH, IW;       // input spatial dims
+    int64_t OH, OW;           // output spatial dims (for store bounds)
+    int64_t od, oh;           // current output position (set before call)
+    int64_t KD, KH, KW;       // kernel shape
+    int64_t SD, SH, SW;       // stride
+    int64_t DD, DH, DW;       // dilation
+    int64_t PD, PH, PW;       // padding
+    int64_t out_row_stride;   // output row stride (elems)
+    int64_t ow0 = 0;          // first output column this call covers
+    int64_t ow_end = -1;      // one past the last; negative means OW
+    int64_t in_d_stride;      // input depth stride (elems)
+    int64_t in_row_stride;    // input row stride (elems)
+    int64_t pix_stride = 8;   // elems between pixels (= C, set by the driver)
+    int64_t w_tap_stride = 8; // elems between taps (= C of a raw HWCM filter,
+                              // 8 in the dequantized staging block)
 };
 
 /// R output rows per call; W is the weight type and Tag picks the epilogue overload.
@@ -99,23 +99,26 @@ struct DwConvParams {
 /// @p add_to adds the destination after the epilogue, @p pre_act folds it into
 /// the accumulator before it; the driver sets at most one of the two.
 template <int R, int NV, typename W, typename Tag, typename Src, typename Dst, typename V>
-inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
-                        const Epilogue& epilogue, const Src (&srcs)[NV],
-                        const Dst (&dsts)[NV], const V (&vbias)[NV], bool pre_act)
+inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag, const Epilogue& epilogue,
+                        const Src (&srcs)[NV], const Dst (&dsts)[NV], const V (&vbias)[NV],
+                        bool pre_act)
 {
     using InPtr = const typename Src::elem*;
     const int64_t pix = p.pix_stride;
     const int64_t wtap = p.w_tap_stride;
     constexpr int64_t kVec = kChannelLanes;
-    constexpr int64_t kMaxTapRows = 256;  // (kd, kh, r): 8x8 with R = 4 fits
+    constexpr int64_t kMaxTapRows = 256; // (kd, kh, r): 8x8 with R = 4 fits
 
     // A short channel block's filter is short too: the last tap of the raw HWCM
     // weight ends at C, so a whole-vector read there would run past the filter.
     // The activation's live lanes are zero past `lanes`, so the lanes the weight
     // read must not touch contribute nothing.
     const auto load_w = [&](const W* wp) -> V {
-        if constexpr (Src::full) { return v_load(wp); }
-        else { return load_lanes(wp, srcs[0].lanes); }
+        if constexpr (Src::full) {
+            return v_load(wp);
+        } else {
+            return load_lanes(wp, srcs[0].lanes);
+        }
     };
 
     // The row table is built from vector 0's base, so vector k adds k*kVec to it.
@@ -132,8 +135,7 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
             for (int64_t kh = 0; kh < p.KH; ++kh) {
                 for (int r = 0; r < R; ++r) {
                     const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
-                    const bool ok = d_ok && (p.oh + r < p.OH) &&
-                                    ih >= 0 && ih < p.IH;
+                    const bool ok = d_ok && (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
                     row_base[t++] = ok ? in_d + ih * p.in_row_stride : nullptr;
                     all_rows = all_rows && ok;
                 }
@@ -155,7 +157,9 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
     for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
         V acc[R][NV];
         for (int r = 0; r < R; ++r) {
-            for (int k = 0; k < NV; ++k) { acc[r][k] = vbias[k]; }
+            for (int k = 0; k < NV; ++k) {
+                acc[r][k] = vbias[k];
+            }
         }
 
         const bool interior = all_rows && ow >= ow_lo && ow <= ow_hi;
@@ -167,10 +171,14 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                 InPtr row[R];
                 if (have_tab) {
                     const int64_t t = (kd * p.KH + kh) * R;
-                    for (int64_t r = 0; r < R; ++r) { row[r] = row_base[t + r]; }
+                    for (int64_t r = 0; r < R; ++r) {
+                        row[r] = row_base[t + r];
+                    }
                 } else {
                     const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-                    if (id < 0 || id >= p.ID) { continue; }
+                    if (id < 0 || id >= p.ID) {
+                        continue;
+                    }
                     const InPtr in_d = srcs[0].ptr_at(id * p.in_d_stride - p.PW * pix);
                     for (int64_t r = 0; r < R; ++r) {
                         const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
@@ -205,8 +213,8 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                             if (row[r] == nullptr) {
                                 continue;
                             }
-                            acc[r][k] = v_fmadd(srcs[k].load_ptr(row[r] + at + k * kVec), vk,
-                                                acc[r][k]);
+                            acc[r][k] =
+                                v_fmadd(srcs[k].load_ptr(row[r] + at + k * kVec), vk, acc[r][k]);
                         }
                     }
                 }
@@ -219,9 +227,10 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
             }
             for (int k = 0; k < NV; ++k) {
                 V a = acc[r][k];
-                if (pre_act) { a = v_add(a, dsts[k].load(r, ow)); }
-                dsts[k].store(r, ow,
-                              nnops::backend::cpu::apply_epilogue_vec(epilogue, tag, a));
+                if (pre_act) {
+                    a = v_add(a, dsts[k].load(r, ow));
+                }
+                dsts[k].store(r, ow, nnops::backend::cpu::apply_epilogue_vec(epilogue, tag, a));
             }
         }
     }
@@ -233,16 +242,17 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
 
 /// Lane masks for the plane's two edge width vectors.
 struct DwChannelFirstEdges {
-    const void* masks = nullptr;      ///< [2][KW][L] elements of T
-    const uint8_t* needed = nullptr;  ///< [2][KW]
+    const void* masks = nullptr;     ///< [2][KW][L] elements of T
+    const uint8_t* needed = nullptr; ///< [2][KW]
     int64_t kw = 0;
-    int64_t last_ow = 0;              ///< ow of the final width vector
+    int64_t last_ow = 0; ///< ow of the final width vector
 };
 
 /// Fill `masks` ([2*MaxKw*L] elements of T) and `needed` ([2*MaxKw]) from `p`.
 /// `masks == nullptr` is the general path; the buffers stay the caller's.
 template <int64_t MaxKw, typename T>
-inline DwChannelFirstEdges dwconv_channel_first_edge_masks(const DwConvParams& p, T* masks, uint8_t* needed)
+inline DwChannelFirstEdges dwconv_channel_first_edge_masks(const DwConvParams& p, T* masks,
+                                                           uint8_t* needed)
 {
     constexpr int64_t L = simd_lane_for<T>;
     DwChannelFirstEdges edges;
@@ -270,27 +280,43 @@ inline DwChannelFirstEdges dwconv_channel_first_edge_masks(const DwConvParams& p
         }
     }
 
-    edges.masks   = masks;
-    edges.needed  = needed;
-    edges.kw      = p.KW;
+    edges.masks = masks;
+    edges.needed = needed;
+    edges.kw = p.KW;
     edges.last_ow = last_ow;
     return edges;
 }
 
 /// Copy `n` elements, 1 <= n < L, as one switch-selected block move.
-template <typename T>
-inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
+template <typename T> inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
 {
     switch (n) {
-        case 1: std::memcpy(dst, src, 1 * sizeof(T)); break;
-        case 2: std::memcpy(dst, src, 2 * sizeof(T)); break;
-        case 3: std::memcpy(dst, src, 3 * sizeof(T)); break;
-        case 4: std::memcpy(dst, src, 4 * sizeof(T)); break;
-        case 5: std::memcpy(dst, src, 5 * sizeof(T)); break;
-        case 6: std::memcpy(dst, src, 6 * sizeof(T)); break;
-        case 7: std::memcpy(dst, src, 7 * sizeof(T)); break;
-        case 8: std::memcpy(dst, src, 8 * sizeof(T)); break;
-        default: break;
+    case 1:
+        std::memcpy(dst, src, 1 * sizeof(T));
+        break;
+    case 2:
+        std::memcpy(dst, src, 2 * sizeof(T));
+        break;
+    case 3:
+        std::memcpy(dst, src, 3 * sizeof(T));
+        break;
+    case 4:
+        std::memcpy(dst, src, 4 * sizeof(T));
+        break;
+    case 5:
+        std::memcpy(dst, src, 5 * sizeof(T));
+        break;
+    case 6:
+        std::memcpy(dst, src, 6 * sizeof(T));
+        break;
+    case 7:
+        std::memcpy(dst, src, 7 * sizeof(T));
+        break;
+    case 8:
+        std::memcpy(dst, src, 8 * sizeof(T));
+        break;
+    default:
+        break;
     }
 }
 
@@ -300,9 +326,8 @@ inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
 /// dilation, so the interior body can fold its taps into literal offsets.
 template <int R, int SW, typename T, bool K3 = false>
 inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bias,
-                               const DwConvParams& p, const Epilogue& epilogue,
-                               bool add_to, bool pre_act,
-                               const DwChannelFirstEdges& edges)
+                                      const DwConvParams& p, const Epilogue& epilogue, bool add_to,
+                                      bool pre_act, const DwChannelFirstEdges& edges)
 {
     constexpr int64_t L = simd_lane_for<T>;
     // T{}, not static_cast<T>(0): bf16's float and uint16-bit constructors make
@@ -324,7 +349,7 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
     // Every input row this call touches, one entry per (kd, kh, r), null where
     // the row does not exist; a table read replaces address arithmetic that
     // would otherwise be paid per output vector.
-    constexpr int64_t kMaxTapRows = 256;   // (kd, kh, r): 8x8 with R=4 fits
+    constexpr int64_t kMaxTapRows = 256; // (kd, kh, r): 8x8 with R=4 fits
     const T* row_tab[kMaxTapRows];
     // Worth building only when a row spans more than one width vector
     // (measured 1T GFLOPS, 3x3: two vectors 14.0 vs 14.3, four 18.5 vs 13.1,
@@ -341,8 +366,7 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
             for (int64_t kh = 0; kh < p.KH; ++kh) {
                 for (int r = 0; r < R; ++r) {
                     const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
-                    const bool ok = d_ok && (p.oh + r < p.OH) &&
-                                    ih >= 0 && ih < p.IH;
+                    const bool ok = d_ok && (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
                     row_tab[t++] = ok ? in_d + ih * p.in_row_stride : nullptr;
                     all_rows = all_rows && ok;
                 }
@@ -352,15 +376,16 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
 
     // A stride-2 vector reads 2L inputs to produce L outputs, so the interior
     // guard widens with it — the same bound channel_first_load uses.
-    const int64_t span  = (sw == 2) ? 2 * L : L;
-    const int64_t need  = (p.KW - 1) * p.DW + span;    // past the first column
-    const int64_t ow_lo = (p.PW + sw - 1) / sw;        // first ow with iw >= 0
-    const int64_t ow_hi = (p.IW + p.PW - need >= 0)
-                              ? (p.IW + p.PW - need) / sw : -1;
+    const int64_t span = (sw == 2) ? 2 * L : L;
+    const int64_t need = (p.KW - 1) * p.DW + span; // past the first column
+    const int64_t ow_lo = (p.PW + sw - 1) / sw;    // first ow with iw >= 0
+    const int64_t ow_hi = (p.IW + p.PW - need >= 0) ? (p.IW + p.PW - need) / sw : -1;
 
     for (int64_t ow = 0; ow < p.OW; ow += L) {
         decltype(v_set1(out, bias)) acc[R];
-        for (int r = 0; r < R; ++r) { acc[r] = v_bias; }
+        for (int r = 0; r < R; ++r) {
+            acc[r] = v_bias;
+        }
 
         // Every lane of every tap inside the row: no bounds test, no scalar fill.
         const bool interior = all_rows && ow >= ow_lo && ow <= ow_hi;
@@ -373,10 +398,14 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
                 const T* row[R];
                 if (have_tab) {
                     const int64_t t = (kd * p.KH + kh) * R;
-                    for (int r = 0; r < R; ++r) { row[r] = row_tab[t + r]; }
+                    for (int r = 0; r < R; ++r) {
+                        row[r] = row_tab[t + r];
+                    }
                 } else {
                     const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-                    if (id < 0 || id >= p.ID) { continue; }
+                    if (id < 0 || id >= p.ID) {
+                        continue;
+                    }
                     const T* in_d = in + id * p.in_d_stride;
                     for (int r = 0; r < R; ++r) {
                         const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
@@ -426,7 +455,9 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
                                                   (e * edges.kw + kw) * L));
                         }
                         for (int r = 0; r < R; ++r) {
-                            if (row[r] == nullptr) { continue; }
+                            if (row[r] == nullptr) {
+                                continue;
+                            }
                             acc[r] = v_fmadd(load_row(row[r] + iw0), vk, acc[r]);
                         }
                     }
@@ -437,9 +468,11 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
                     const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
                     const auto vk = v_set1(out, s_load(&w_row[kw]));
                     for (int r = 0; r < R; ++r) {
-                        if (row[r] == nullptr) { continue; }
-                        acc[r] = v_fmadd(channel_first_load(row[r], iw0, p.SW, p.IW, zero),
-                                         vk, acc[r]);
+                        if (row[r] == nullptr) {
+                            continue;
+                        }
+                        acc[r] =
+                            v_fmadd(channel_first_load(row[r], iw0, p.SW, p.IW, zero), vk, acc[r]);
                     }
                 }
             }
@@ -447,7 +480,9 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
 
         const int64_t lanes = (p.OW - ow < L) ? p.OW - ow : L;
         for (int r = 0; r < R; ++r) {
-            if (p.oh + r >= p.OH) { continue; }
+            if (p.oh + r >= p.OH) {
+                continue;
+            }
             T* dst = out + r * p.out_row_stride + ow;
             auto a = acc[r];
             if (pre_act) {
@@ -498,30 +533,35 @@ inline bool dwconv_3x3_route_enabled()
     return ::nnops::detail::depthwise_3x3_roll.load(std::memory_order_relaxed) == 0;
 }
 
-#define NNOPS_DWCF_DISPATCH(R, S, K3, ...)                                     \
-    dwconv_channel_first_rows<R, S, T, K3>(__VA_ARGS__)
+#define NNOPS_DWCF_DISPATCH(R, S, K3, ...) dwconv_channel_first_rows<R, S, T, K3>(__VA_ARGS__)
 
 template <int R, typename T>
 inline void dwconv_channel_first_dispatch(T* out, const T* in, const T* w, float bias,
-                                          const DwConvParams& p,
-                                          const Epilogue& epilogue, bool add_to,
-                                          bool pre_act, const DwChannelFirstEdges& edges)
+                                          const DwConvParams& p, const Epilogue& epilogue,
+                                          bool add_to, bool pre_act,
+                                          const DwChannelFirstEdges& edges)
 {
     const bool k3 = dwconv_channel_first_3x3_ok(p) && dwconv_3x3_route_enabled();
-#define NNOPS_DWCF_ROUTE(S)                                                    \
-    do {                                                                       \
-        if (k3) {                                                              \
-            NNOPS_DWCF_DISPATCH(R, S, true, out, in, w, bias, p, epilogue,      \
-                                add_to, pre_act, edges);                       \
-        } else {                                                               \
-            NNOPS_DWCF_DISPATCH(R, S, false, out, in, w, bias, p, epilogue,     \
-                                add_to, pre_act, edges);                       \
-        }                                                                      \
+#define NNOPS_DWCF_ROUTE(S)                                                                  \
+    do {                                                                                     \
+        if (k3) {                                                                            \
+            NNOPS_DWCF_DISPATCH(R, S, true, out, in, w, bias, p, epilogue, add_to, pre_act,  \
+                                edges);                                                      \
+        } else {                                                                             \
+            NNOPS_DWCF_DISPATCH(R, S, false, out, in, w, bias, p, epilogue, add_to, pre_act, \
+                                edges);                                                      \
+        }                                                                                    \
     } while (0)
     switch (p.SW) {
-        case 1: NNOPS_DWCF_ROUTE(1); break;
-        case 2: NNOPS_DWCF_ROUTE(2); break;
-        default: NNOPS_DWCF_ROUTE(0); break;
+    case 1:
+        NNOPS_DWCF_ROUTE(1);
+        break;
+    case 2:
+        NNOPS_DWCF_ROUTE(2);
+        break;
+    default:
+        NNOPS_DWCF_ROUTE(0);
+        break;
     }
 #undef NNOPS_DWCF_ROUTE
 }
@@ -529,17 +569,17 @@ inline void dwconv_channel_first_dispatch(T* out, const T* in, const T* w, float
 
 template <typename T>
 inline void dwconv_channel_first_h4(T* out, const T* in, const T* w, float bias,
-                             const DwConvParams& p, const Epilogue& epilogue,
-                             bool add_to, bool pre_act, const DwChannelFirstEdges& edges)
+                                    const DwConvParams& p, const Epilogue& epilogue, bool add_to,
+                                    bool pre_act, const DwChannelFirstEdges& edges)
 {
     dwconv_channel_first_dispatch<4>(out, in, w, bias, p, epilogue, add_to, pre_act, edges);
 }
 
 /// One row — the tail of an h4 loop, and the whole kernel for a single-row call.
 template <typename T>
-inline void dwconv_channel_first(T* out, const T* in, const T* w, float bias,
-                          const DwConvParams& p, const Epilogue& epilogue,
-                          bool add_to, bool pre_act, const DwChannelFirstEdges& edges)
+inline void dwconv_channel_first(T* out, const T* in, const T* w, float bias, const DwConvParams& p,
+                                 const Epilogue& epilogue, bool add_to, bool pre_act,
+                                 const DwChannelFirstEdges& edges)
 {
     dwconv_channel_first_dispatch<1>(out, in, w, bias, p, epilogue, add_to, pre_act, edges);
 }
@@ -571,8 +611,8 @@ inline bool dwconv_channel_last_3x3_ok(const DwConvParams& p)
 /// `row[r*SH + kh]` — compile-time indices. The horizontal stride stays runtime.
 template <int R, int SH, typename T>
 inline void dwconv_channel_last_3x3(T* out_rows, const T* in_img, const T* w_tap0,
-                           const T* bias_vec, const DwConvParams& p,
-                           const Epilogue& epilogue, bool add_to, bool pre_act)
+                                    const T* bias_vec, const DwConvParams& p,
+                                    const Epilogue& epilogue, bool add_to, bool pre_act)
 {
     using V = decltype(v_load(in_img));
     const int64_t pix = p.pix_stride;
@@ -581,12 +621,13 @@ inline void dwconv_channel_last_3x3(T* out_rows, const T* in_img, const T* w_tap
 
     const V vbias = bias_vec ? v_load(bias_vec) : v_zero(in_img);
     V wt[9];
-    for (int t = 0; t < 9; ++t) { wt[t] = v_load(w_tap0 + t * wtap); }
+    for (int t = 0; t < 9; ++t) {
+        wt[t] = v_load(w_tap0 + t * wtap);
+    }
     // An inactive epilogue writes the accumulator out as it stands; the runtime
     // switch in apply_epilogue_vec would otherwise cost a load and an indirect
     // branch per store.
-    const bool simple = !add_to && !pre_act &&
-                        !nnops::epilogue_is_active(epilogue);
+    const bool simple = !add_to && !pre_act && !nnops::epilogue_is_active(epilogue);
 
     // One row pointer per distinct input row of the group, biased by the left
     // pad so a tap's address is `row + (ow*SW + kw)*pix`.
@@ -608,7 +649,9 @@ inline void dwconv_channel_last_3x3(T* out_rows, const T* in_img, const T* w_tap
 
     for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
         V acc[R];
-        for (int r = 0; r < R; ++r) { acc[r] = vbias; }
+        for (int r = 0; r < R; ++r) {
+            acc[r] = vbias;
+        }
 
         if (all_rows && ow >= ow_lo && ow <= ow_hi) {
             const int64_t o = ow * p.SW * pix;
@@ -616,8 +659,7 @@ inline void dwconv_channel_last_3x3(T* out_rows, const T* in_img, const T* w_tap
                 for (int kw = 0; kw < 3; ++kw) {
                     const int64_t at = o + kw * pix;
                     for (int r = 0; r < R; ++r) {
-                        acc[r] = v_fmadd(v_load(row[r * SH + kh] + at),
-                                         wt[kh * 3 + kw], acc[r]);
+                        acc[r] = v_fmadd(v_load(row[r * SH + kh] + at), wt[kh * 3 + kw], acc[r]);
                     }
                 }
             }
@@ -626,25 +668,34 @@ inline void dwconv_channel_last_3x3(T* out_rows, const T* in_img, const T* w_tap
             for (int kh = 0; kh < 3; ++kh) {
                 for (int kw = 0; kw < 3; ++kw) {
                     const int64_t off = ow_off + kw;
-                    if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+                    if (off < off_ok_lo || off >= off_ok_hi) {
+                        continue;
+                    }
                     const int64_t at = off * pix;
                     for (int r = 0; r < R; ++r) {
-                        if (row[r * SH + kh] == nullptr) { continue; }
-                        acc[r] = v_fmadd(v_load(row[r * SH + kh] + at),
-                                         wt[kh * 3 + kw], acc[r]);
+                        if (row[r * SH + kh] == nullptr) {
+                            continue;
+                        }
+                        acc[r] = v_fmadd(v_load(row[r * SH + kh] + at), wt[kh * 3 + kw], acc[r]);
                     }
                 }
             }
         }
 
         for (int r = 0; r < R; ++r) {
-            if (p.oh + r >= p.OH) { continue; }
+            if (p.oh + r >= p.OH) {
+                continue;
+            }
             T* dst = out_rows + r * p.out_row_stride + ow * pix;
-            if (simple) { v_store(dst, acc[r]); continue; }
+            if (simple) {
+                v_store(dst, acc[r]);
+                continue;
+            }
             V a = acc[r];
-            if (pre_act) { a = v_add(a, v_load(dst)); }
-            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(epilogue,
-                                                                     out_rows, a),
+            if (pre_act) {
+                a = v_add(a, v_load(dst));
+            }
+            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(epilogue, out_rows, a),
                         add_to);
         }
     }
@@ -656,11 +707,9 @@ inline void dwconv_channel_last_3x3(T* out_rows, const T* in_img, const T* w_tap
 /// both ends of every plane that is exactly one row: skipping its tap at
 /// compile time is what puts those groups back on the unchecked loop.
 template <int R, int SH, bool TOP_OK, bool BOT_OK, typename T>
-inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
-                                     const T* w_tap0, const T* bias_vec,
-                                     const DwConvParams& p,
-                                     const Epilogue& epilogue, bool add_to,
-                                     bool pre_act)
+inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img, const T* w_tap0,
+                                              const T* bias_vec, const DwConvParams& p,
+                                              const Epilogue& epilogue, bool add_to, bool pre_act)
 {
     using V = decltype(v_load(in_img));
     constexpr int64_t kL = kChannelLanes;
@@ -677,8 +726,7 @@ inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
     const T* row[kRows];
     for (int64_t i = 0; i < kRows; ++i) {
         const int64_t ih = p.oh * SH + i - p.PH;
-        row[i] = (!TOP_OK && i == 0) ? in_img
-                                     : in_img + ih * p.in_row_stride - p.PW * pix;
+        row[i] = (!TOP_OK && i == 0) ? in_img : in_img + ih * p.in_row_stride - p.PW * pix;
     }
 
     const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
@@ -689,7 +737,10 @@ inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
 
     for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
         V acc[R][2];
-        for (int r = 0; r < R; ++r) { acc[r][0] = vbias[0]; acc[r][1] = vbias[1]; }
+        for (int r = 0; r < R; ++r) {
+            acc[r][0] = vbias[0];
+            acc[r][1] = vbias[1];
+        }
 
         if (ow >= ow_lo && ow <= ow_hi) {
             const int64_t o = ow * p.SW * pix;
@@ -700,8 +751,7 @@ inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
                     const V w0 = v_load(wp);
                     const V w1 = v_load(wp + kL);
                     for (int r = 0; r < R; ++r) {
-                        if ((!TOP_OK && r == 0 && kh == 0) ||
-                            (!BOT_OK && r == R - 1 && kh == 2)) {
+                        if ((!TOP_OK && r == 0 && kh == 0) || (!BOT_OK && r == R - 1 && kh == 2)) {
                             continue;
                         }
                         const T* ip = row[r * SH + kh] + at;
@@ -715,14 +765,15 @@ inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
             for (int kh = 0; kh < 3; ++kh) {
                 for (int kw = 0; kw < 3; ++kw) {
                     const int64_t off = ow_off + kw;
-                    if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+                    if (off < off_ok_lo || off >= off_ok_hi) {
+                        continue;
+                    }
                     const int64_t at = off * pix;
                     const T* wp = w_tap0 + (kh * 3 + kw) * wtap;
                     const V w0 = v_load(wp);
                     const V w1 = v_load(wp + kL);
                     for (int r = 0; r < R; ++r) {
-                        if ((!TOP_OK && r == 0 && kh == 0) ||
-                            (!BOT_OK && r == R - 1 && kh == 2)) {
+                        if ((!TOP_OK && r == 0 && kh == 0) || (!BOT_OK && r == R - 1 && kh == 2)) {
                             continue;
                         }
                         const T* ip = row[r * SH + kh] + at;
@@ -734,7 +785,9 @@ inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
         }
 
         for (int r = 0; r < R; ++r) {
-            if (p.oh + r >= p.OH) { continue; }
+            if (p.oh + r >= p.OH) {
+                continue;
+            }
             T* dst = out_rows + r * p.out_row_stride + ow * pix;
             V a0 = acc[r][0];
             V a1 = acc[r][1];
@@ -742,10 +795,10 @@ inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
                 a0 = v_add(a0, v_load(dst));
                 a1 = v_add(a1, v_load(dst + kL));
             }
-            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(
-                                 epilogue, out_rows, a0), add_to);
-            v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(
-                                      epilogue, out_rows, a1), add_to);
+            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(epilogue, out_rows, a0),
+                        add_to);
+            v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(epilogue, out_rows, a1),
+                        add_to);
         }
     }
 }
@@ -767,56 +820,55 @@ inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
 // pointer reloads it saves.
 //
 // `OFF` is the running byte-free column offset for this tap's `kw`.
-#define NNOPS_DW16X4_TAP(KH, KW, OFF)                                          \
-    {                                                                          \
-        const V w0 = v_load(wsrc + ((KH) * 3 + (KW)) * 2 * kL);                 \
-        const V w1 = v_load(wsrc + ((KH) * 3 + (KW)) * 2 * kL + kL);            \
-        if (TOP_OK || (KH) != 0) {                                             \
-            a00 = v_fmadd(v_load(row[(KH)] + (OFF)), w0, a00);                  \
-            a01 = v_fmadd(v_load(row[(KH)] + (OFF) + kL), w1, a01);             \
-        }                                                                      \
-        a10 = v_fmadd(v_load(row[SH + (KH)] + (OFF)), w0, a10);                 \
-        a11 = v_fmadd(v_load(row[SH + (KH)] + (OFF) + kL), w1, a11);            \
-        a20 = v_fmadd(v_load(row[2 * SH + (KH)] + (OFF)), w0, a20);             \
-        a21 = v_fmadd(v_load(row[2 * SH + (KH)] + (OFF) + kL), w1, a21);        \
-        if (BOT_OK || (KH) != 2) {                                             \
-            a30 = v_fmadd(v_load(row[3 * SH + (KH)] + (OFF)), w0, a30);         \
-            a31 = v_fmadd(v_load(row[3 * SH + (KH)] + (OFF) + kL), w1, a31);    \
-        }                                                                      \
+#define NNOPS_DW16X4_TAP(KH, KW, OFF)                                        \
+    {                                                                        \
+        const V w0 = v_load(wsrc + ((KH) * 3 + (KW)) * 2 * kL);              \
+        const V w1 = v_load(wsrc + ((KH) * 3 + (KW)) * 2 * kL + kL);         \
+        if (TOP_OK || (KH) != 0) {                                           \
+            a00 = v_fmadd(v_load(row[(KH)] + (OFF)), w0, a00);               \
+            a01 = v_fmadd(v_load(row[(KH)] + (OFF) + kL), w1, a01);          \
+        }                                                                    \
+        a10 = v_fmadd(v_load(row[SH + (KH)] + (OFF)), w0, a10);              \
+        a11 = v_fmadd(v_load(row[SH + (KH)] + (OFF) + kL), w1, a11);         \
+        a20 = v_fmadd(v_load(row[2 * SH + (KH)] + (OFF)), w0, a20);          \
+        a21 = v_fmadd(v_load(row[2 * SH + (KH)] + (OFF) + kL), w1, a21);     \
+        if (BOT_OK || (KH) != 2) {                                           \
+            a30 = v_fmadd(v_load(row[3 * SH + (KH)] + (OFF)), w0, a30);      \
+            a31 = v_fmadd(v_load(row[3 * SH + (KH)] + (OFF) + kL), w1, a31); \
+        }                                                                    \
     }
 
 // `rows_left` is p.OH - p.oh, hoisted: read from the params, the four store predicates
 // cost four loads, four adds and four compares per column.
-#define NNOPS_DW16X4_STORE_AT(R, DST)                                          \
-    if ((R) < rows_left) {                                                     \
-        T* dst = (DST);                                                         \
-        if constexpr (ACT == 0) {                                               \
-            v_store(dst, a##R##0);                                              \
-            v_store(dst + kL, a##R##1);                                         \
-        } else if constexpr (ACT == 1) {                                        \
-            v_store(dst, v_relu(a##R##0, v_zero(in_img)));                      \
-            v_store(dst + kL, v_relu(a##R##1, v_zero(in_img)));                 \
-        } else if constexpr (ACT == 2) {                                        \
-            const V v0 = v_zero(in_img);                                        \
-            const V v6 = v_set1(in_img, 6.0f);                                  \
-            v_store(dst, v_min(v_max(a##R##0, v0), v6));                        \
-            v_store(dst + kL, v_min(v_max(a##R##1, v0), v6));                   \
-        } else {                                                                \
-            V x0 = a##R##0;                                                     \
-            V x1 = a##R##1;                                                     \
-            if (pre_act) {                                                      \
-                x0 = v_add(x0, v_load(dst));                                    \
-                x1 = v_add(x1, v_load(dst + kL));                               \
-            }                                                                   \
-            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(           \
-                                    epilogue, out_rows, x0), add_to);           \
-            v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(      \
-                                      epilogue, out_rows, x1), add_to);         \
-        }                                                                       \
+#define NNOPS_DW16X4_STORE_AT(R, DST)                                                              \
+    if ((R) < rows_left) {                                                                         \
+        T* dst = (DST);                                                                            \
+        if constexpr (ACT == 0) {                                                                  \
+            v_store(dst, a##R##0);                                                                 \
+            v_store(dst + kL, a##R##1);                                                            \
+        } else if constexpr (ACT == 1) {                                                           \
+            v_store(dst, v_relu(a##R##0, v_zero(in_img)));                                         \
+            v_store(dst + kL, v_relu(a##R##1, v_zero(in_img)));                                    \
+        } else if constexpr (ACT == 2) {                                                           \
+            const V v0 = v_zero(in_img);                                                           \
+            const V v6 = v_set1(in_img, 6.0f);                                                     \
+            v_store(dst, v_min(v_max(a##R##0, v0), v6));                                           \
+            v_store(dst + kL, v_min(v_max(a##R##1, v0), v6));                                      \
+        } else {                                                                                   \
+            V x0 = a##R##0;                                                                        \
+            V x1 = a##R##1;                                                                        \
+            if (pre_act) {                                                                         \
+                x0 = v_add(x0, v_load(dst));                                                       \
+                x1 = v_add(x1, v_load(dst + kL));                                                  \
+            }                                                                                      \
+            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(epilogue, out_rows, x0),      \
+                        add_to);                                                                   \
+            v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(epilogue, out_rows, x1), \
+                        add_to);                                                                   \
+        }                                                                                          \
     }
 
-#define NNOPS_DW16X4_STORE(R)                                                  \
-    NNOPS_DW16X4_STORE_AT(R, out_rows + (R) * p.out_row_stride + ow * pix)
+#define NNOPS_DW16X4_STORE(R) NNOPS_DW16X4_STORE_AT(R, out_rows + (R) * p.out_row_stride + ow * pix)
 
 /// The two-vector 3x3 at four rows, straight-line: the nine taps of a column are
 /// a compile-time sequence with literal source offsets, so the body carries no tap
@@ -834,17 +886,19 @@ inline void dwconv_channel_last_3x3_16_masked(T* out_rows, const T* in_img,
 /// straight-line, so the register file the store-only path had survives.
 template <int SH, bool TOP_OK, bool BOT_OK, int ACT, typename T>
 inline void dwconv_channel_last_3x3_16x4(T* out_rows, const T* in_img, const T* w_tap0,
-                                const T* bias_vec, const DwConvParams& p,
-                                const Epilogue& epilogue, bool add_to, bool pre_act)
+                                         const T* bias_vec, const DwConvParams& p,
+                                         const Epilogue& epilogue, bool add_to, bool pre_act)
 {
     constexpr bool SIMPLE = (ACT == 0);
     if constexpr (ACT != 3) {
-        (void)epilogue; (void)add_to; (void)pre_act;
+        (void)epilogue;
+        (void)add_to;
+        (void)pre_act;
     }
     using V = decltype(v_load(in_img));
     constexpr int64_t kL = kChannelLanes;
     constexpr int64_t kRows = 3 * SH + 3;
-    const int64_t pix  = p.pix_stride;
+    const int64_t pix = p.pix_stride;
     const int64_t wtap = p.w_tap_stride;
     const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
 
@@ -857,7 +911,9 @@ inline void dwconv_channel_last_3x3_16x4(T* out_rows, const T* in_img, const T* 
         row[i] = in_img + ih * p.in_row_stride - p.PW * pix;
     }
     // A masked-out row never reaches an FMA, so it can hold any valid pointer.
-    if (!TOP_OK) { row[0] = in_img; }
+    if (!TOP_OK) {
+        row[0] = in_img;
+    }
 
     // The nine taps copied into tap order. Addressing them through `wtap` costs an
     // imul per load, and the width loop has no general register to spare; copied, every
@@ -897,14 +953,18 @@ inline void dwconv_channel_last_3x3_16x4(T* out_rows, const T* in_img, const T* 
             const int64_t ih = p.oh * SH + i - p.PH;
             mrow[i] = in_img + ih * p.in_row_stride - p.PW * pix;
         }
-        if (!TOP_OK) { mrow[0] = in_img; }
+        if (!TOP_OK) {
+            mrow[0] = in_img;
+        }
         V a00 = vb0, a01 = vb1, a10 = vb0, a11 = vb1;
         V a20 = vb0, a21 = vb1, a30 = vb0, a31 = vb1;
         const int64_t ow_off = ow * p.SW;
         for (int64_t kh = 0; kh < 3; ++kh) {
             for (int64_t kw = 0; kw < 3; ++kw) {
                 const int64_t off = ow_off + kw;
-                if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+                if (off < off_ok_lo || off >= off_ok_hi) {
+                    continue;
+                }
                 const int64_t at = off * pix;
                 const V w0 = v_load(w_tap0 + (kh * 3 + kw) * wtap);
                 const V w1 = v_load(w_tap0 + (kh * 3 + kw) * wtap + kL);
@@ -922,15 +982,16 @@ inline void dwconv_channel_last_3x3_16x4(T* out_rows, const T* in_img, const T* 
                 }
             }
         }
-        NNOPS_DW16X4_STORE(0) NNOPS_DW16X4_STORE(1) NNOPS_DW16X4_STORE(2)
-        NNOPS_DW16X4_STORE(3)
+        NNOPS_DW16X4_STORE(0) NNOPS_DW16X4_STORE(1) NNOPS_DW16X4_STORE(2) NNOPS_DW16X4_STORE(3)
     };
 
     const int64_t iw_lo = (ow_lo > p.ow0) ? ow_lo : p.ow0;
     const int64_t iw_hi = (ow_hi + 1 < ow_end) ? ow_hi + 1 : ow_end;
     const int64_t iw_tail = (iw_hi > iw_lo) ? iw_hi : iw_lo;
 
-    for (int64_t ow = p.ow0; ow < iw_lo; ++ow) { masked_col(ow); }
+    for (int64_t ow = p.ow0; ow < iw_lo; ++ow) {
+        masked_col(ow);
+    }
 
     // Three walking source offsets, one per `kw`, and a walking destination offset: the
     // column index disappears from the loop, leaving literal displacements in the tap
@@ -941,8 +1002,7 @@ inline void dwconv_channel_last_3x3_16x4(T* out_rows, const T* in_img, const T* 
     int64_t o1 = o0 + pix;
     int64_t o2 = o1 + pix;
     int64_t dpos = iw_lo * pix;
-    for (int64_t ow = iw_lo; ow < iw_hi;
-         ++ow, o0 += swpix, o1 += swpix, o2 += swpix, dpos += pix) {
+    for (int64_t ow = iw_lo; ow < iw_hi; ++ow, o0 += swpix, o1 += swpix, o2 += swpix, dpos += pix) {
         T* dst0 = out_rows + dpos;
         V a00 = vb0, a01 = vb1, a10 = vb0, a11 = vb1;
         V a20 = vb0, a21 = vb1, a30 = vb0, a31 = vb1;
@@ -961,7 +1021,9 @@ inline void dwconv_channel_last_3x3_16x4(T* out_rows, const T* in_img, const T* 
         NNOPS_DW16X4_STORE_AT(3, dst0 + 3 * stride)
     }
 
-    for (int64_t ow = iw_tail; ow < ow_end; ++ow) { masked_col(ow); }
+    for (int64_t ow = iw_tail; ow < ow_end; ++ow) {
+        masked_col(ow);
+    }
 }
 
 #undef NNOPS_DW16X4_TAP
@@ -974,8 +1036,8 @@ inline void dwconv_channel_last_3x3_16x4(T* out_rows, const T* in_img, const T* 
 /// eight FMAs.
 template <int R, int SH, typename T>
 inline void dwconv_channel_last_3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
-                              const T* bias_vec, const DwConvParams& p,
-                              const Epilogue& epilogue, bool add_to, bool pre_act)
+                                       const T* bias_vec, const DwConvParams& p,
+                                       const Epilogue& epilogue, bool add_to, bool pre_act)
 {
     // A group misses at most its top row when `oh*SH - PH` is -1 and at most its
     // bottom row when the last one is exactly `IH`; a wider reach keeps the
@@ -986,43 +1048,44 @@ inline void dwconv_channel_last_3x3_16(T* out_rows, const T* in_img, const T* w_
         const bool top_ok = ih0 >= 0;
         const bool bot_ok = ih_max < p.IH;
         if (R == 4) {
-            const bool plain =
-                !add_to && !pre_act &&
-                epilogue.quant == EpilogueQuantType::None &&
-                epilogue.min_clip == -std::numeric_limits<float>::infinity() &&
-                epilogue.max_clip ==  std::numeric_limits<float>::infinity();
-            const int act =
-                !nnops::epilogue_is_active(epilogue) ? 0
-                : (plain && epilogue.type == EpilogueActivateType::Relu)  ? 1
-                : (plain && epilogue.type == EpilogueActivateType::Relu6) ? 2
-                                                                          : 3;
-#define NNOPS_DW16X4_DISPATCH(A)                                               \
-            do {                                                               \
-                if (top_ok) {                                                  \
-                    if (bot_ok) {                                              \
-                        dwconv_channel_last_3x3_16x4<SH, true, true, A>(                \
-                            out_rows, in_img, w_tap0, bias_vec, p, epilogue,   \
-                            add_to, pre_act);                                  \
-                    } else {                                                   \
-                        dwconv_channel_last_3x3_16x4<SH, true, false, A>(               \
-                            out_rows, in_img, w_tap0, bias_vec, p, epilogue,   \
-                            add_to, pre_act);                                  \
-                    }                                                          \
-                } else if (bot_ok) {                                           \
-                    dwconv_channel_last_3x3_16x4<SH, false, true, A>(                   \
-                        out_rows, in_img, w_tap0, bias_vec, p, epilogue,       \
-                        add_to, pre_act);                                      \
-                } else {                                                       \
-                    dwconv_channel_last_3x3_16x4<SH, false, false, A>(                  \
-                        out_rows, in_img, w_tap0, bias_vec, p, epilogue,       \
-                        add_to, pre_act);                                      \
-                }                                                              \
-            } while (0)
+            const bool plain = !add_to && !pre_act && epilogue.quant == EpilogueQuantType::None &&
+                               epilogue.min_clip == -std::numeric_limits<float>::infinity() &&
+                               epilogue.max_clip == std::numeric_limits<float>::infinity();
+            const int act = !nnops::epilogue_is_active(epilogue)                    ? 0 :
+                            (plain && epilogue.type == EpilogueActivateType::Relu)  ? 1 :
+                            (plain && epilogue.type == EpilogueActivateType::Relu6) ? 2 :
+                                                                                      3;
+#define NNOPS_DW16X4_DISPATCH(A)                                                                  \
+    do {                                                                                          \
+        if (top_ok) {                                                                             \
+            if (bot_ok) {                                                                         \
+                dwconv_channel_last_3x3_16x4<SH, true, true, A>(                                  \
+                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);            \
+            } else {                                                                              \
+                dwconv_channel_last_3x3_16x4<SH, true, false, A>(                                 \
+                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);            \
+            }                                                                                     \
+        } else if (bot_ok) {                                                                      \
+            dwconv_channel_last_3x3_16x4<SH, false, true, A>(out_rows, in_img, w_tap0, bias_vec,  \
+                                                             p, epilogue, add_to, pre_act);       \
+        } else {                                                                                  \
+            dwconv_channel_last_3x3_16x4<SH, false, false, A>(out_rows, in_img, w_tap0, bias_vec, \
+                                                              p, epilogue, add_to, pre_act);      \
+        }                                                                                         \
+    } while (0)
             switch (act) {
-            case 0: NNOPS_DW16X4_DISPATCH(0); break;
-            case 1: NNOPS_DW16X4_DISPATCH(1); break;
-            case 2: NNOPS_DW16X4_DISPATCH(2); break;
-            default: NNOPS_DW16X4_DISPATCH(3); break;
+            case 0:
+                NNOPS_DW16X4_DISPATCH(0);
+                break;
+            case 1:
+                NNOPS_DW16X4_DISPATCH(1);
+                break;
+            case 2:
+                NNOPS_DW16X4_DISPATCH(2);
+                break;
+            default:
+                NNOPS_DW16X4_DISPATCH(3);
+                break;
             }
 #undef NNOPS_DW16X4_DISPATCH
             return;
@@ -1072,7 +1135,10 @@ inline void dwconv_channel_last_3x3_16(T* out_rows, const T* in_img, const T* w_
 
     for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
         V acc[R][2];
-        for (int r = 0; r < R; ++r) { acc[r][0] = vbias[0]; acc[r][1] = vbias[1]; }
+        for (int r = 0; r < R; ++r) {
+            acc[r][0] = vbias[0];
+            acc[r][1] = vbias[1];
+        }
 
         if (all_rows && ow >= ow_lo && ow <= ow_hi) {
             const int64_t o = ow * p.SW * pix;
@@ -1094,13 +1160,17 @@ inline void dwconv_channel_last_3x3_16(T* out_rows, const T* in_img, const T* w_
             for (int kh = 0; kh < 3; ++kh) {
                 for (int kw = 0; kw < 3; ++kw) {
                     const int64_t off = ow_off + kw;
-                    if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+                    if (off < off_ok_lo || off >= off_ok_hi) {
+                        continue;
+                    }
                     const int64_t at = off * pix;
                     const T* wp = w_tap0 + (kh * 3 + kw) * wtap;
                     const V w0 = v_load(wp);
                     const V w1 = v_load(wp + kL);
                     for (int r = 0; r < R; ++r) {
-                        if (row[r * SH + kh] == nullptr) { continue; }
+                        if (row[r * SH + kh] == nullptr) {
+                            continue;
+                        }
                         const T* ip = row[r * SH + kh] + at;
                         acc[r][0] = v_fmadd(v_load(ip), w0, acc[r][0]);
                         acc[r][1] = v_fmadd(v_load(ip + kL), w1, acc[r][1]);
@@ -1110,7 +1180,9 @@ inline void dwconv_channel_last_3x3_16(T* out_rows, const T* in_img, const T* w_
         }
 
         for (int r = 0; r < R; ++r) {
-            if (p.oh + r >= p.OH) { continue; }
+            if (p.oh + r >= p.OH) {
+                continue;
+            }
             T* dst = out_rows + r * p.out_row_stride + ow * pix;
             V a0 = acc[r][0];
             V a1 = acc[r][1];
@@ -1118,75 +1190,70 @@ inline void dwconv_channel_last_3x3_16(T* out_rows, const T* in_img, const T* w_
                 a0 = v_add(a0, v_load(dst));
                 a1 = v_add(a1, v_load(dst + kL));
             }
-            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(
-                                 epilogue, out_rows, a0), add_to);
-            v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(
-                                      epilogue, out_rows, a1), add_to);
+            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(epilogue, out_rows, a0),
+                        add_to);
+            v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(epilogue, out_rows, a1),
+                        add_to);
         }
     }
 }
 
 /// The 8-channel call: pick the kernel for the shape, then the vertical stride.
 template <int R, typename T>
-inline void dwconv_channel_last_8(T* out_rows, const T* in_img, const T* w_tap0,
-                         const T* bias_vec, const DwConvParams& p,
-                         const Epilogue& epilogue, bool add_to, bool pre_act)
+inline void dwconv_channel_last_8(T* out_rows, const T* in_img, const T* w_tap0, const T* bias_vec,
+                                  const DwConvParams& p, const Epilogue& epilogue, bool add_to,
+                                  bool pre_act)
 {
     if (dwconv_channel_last_3x3_ok(p)) {
         if (p.SH == 1) {
-            dwconv_channel_last_3x3<R, 1>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
-                                 add_to, pre_act);
+            dwconv_channel_last_3x3<R, 1>(out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+                                          pre_act);
         } else {
-            dwconv_channel_last_3x3<R, 2>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
-                                 add_to, pre_act);
+            dwconv_channel_last_3x3<R, 2>(out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+                                          pre_act);
         }
         return;
     }
     const FpSrc<T, true> src[1] = {FpSrc<T, true>{in_img, kChannelLanes}};
-    const FpDst<T, true> dst[1] = {FpDst<T, true>{out_rows, p.out_row_stride,
-                                                  add_to, p.pix_stride,
-                                                  kChannelLanes}};
+    const FpDst<T, true> dst[1] = {
+        FpDst<T, true>{out_rows, p.out_row_stride, add_to, p.pix_stride, kChannelLanes}};
     const auto vb = bias_vec ? v_load(bias_vec) : v_zero(out_rows);
     const decltype(vb) vbias[1] = {vb};
     dwconv_rows<R, 1>(p, w_tap0, out_rows, epilogue, src, dst, vbias, pre_act);
 }
 
 template <int R, typename T>
-inline void dwconv_channel_last(T* out_rows, const T* in_img, const T* w_tap0,
-                        const T* bias_vec, const DwConvParams& p,
-                        const Epilogue& epilogue, bool add_to, bool pre_act,
-                        int64_t lanes)
+inline void dwconv_channel_last(T* out_rows, const T* in_img, const T* w_tap0, const T* bias_vec,
+                                const DwConvParams& p, const Epilogue& epilogue, bool add_to,
+                                bool pre_act, int64_t lanes)
 {
     if (lanes > kChannelLanes) {
         if (lanes == 2 * kChannelLanes && dwconv_channel_last_3x3_ok(p)) {
             if (p.SH == 1) {
-                dwconv_channel_last_3x3_16<R, 1>(out_rows, in_img, w_tap0, bias_vec, p,
-                                        epilogue, add_to, pre_act);
+                dwconv_channel_last_3x3_16<R, 1>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
+                                                 add_to, pre_act);
             } else {
-                dwconv_channel_last_3x3_16<R, 2>(out_rows, in_img, w_tap0, bias_vec, p,
-                                        epilogue, add_to, pre_act);
+                dwconv_channel_last_3x3_16<R, 2>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
+                                                 add_to, pre_act);
             }
             return;
         }
         const auto vb0 = bias_vec ? v_load(bias_vec) : v_zero(out_rows);
         const auto vb1 = bias_vec ? v_load(bias_vec + kChannelLanes) : v_zero(out_rows);
         const decltype(vb0) vbias[2] = {vb0, vb1};
-        const FpSrc<T, true> src[2] = {
-            FpSrc<T, true>{in_img, kChannelLanes},
-            FpSrc<T, true>{in_img + kChannelLanes, kChannelLanes}};
+        const FpSrc<T, true> src[2] = {FpSrc<T, true>{in_img, kChannelLanes},
+                                       FpSrc<T, true>{in_img + kChannelLanes, kChannelLanes}};
         const FpDst<T, true> dst[2] = {
-            FpDst<T, true>{out_rows, p.out_row_stride, add_to, p.pix_stride,
-                           kChannelLanes},
-            FpDst<T, true>{out_rows + kChannelLanes, p.out_row_stride, add_to,
-                           p.pix_stride, kChannelLanes}};
+            FpDst<T, true>{out_rows, p.out_row_stride, add_to, p.pix_stride, kChannelLanes},
+            FpDst<T, true>{out_rows + kChannelLanes, p.out_row_stride, add_to, p.pix_stride,
+                           kChannelLanes}};
         dwconv_rows<R, 2>(p, w_tap0, out_rows, epilogue, src, dst, vbias, pre_act);
         return;
     }
     const auto vb = bias_vec ? load_lanes(bias_vec, lanes) : v_zero(out_rows);
     const decltype(vb) vbias[1] = {vb};
     if (lanes == kChannelLanes) {
-        dwconv_channel_last_8<R>(out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
-                        pre_act);
+        dwconv_channel_last_8<R>(out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
     } else {
         const FpSrc<T, false> src[1] = {FpSrc<T, false>{in_img, lanes}};
         const FpDst<T, false> dst[1] = {
@@ -1195,20 +1262,22 @@ inline void dwconv_channel_last(T* out_rows, const T* in_img, const T* w_tap0,
     }
 }
 
-constexpr int64_t kMaxLastQuantTaps = 9 * 9 * 9;  // 729
+constexpr int64_t kMaxLastQuantTaps = 9 * 9 * 9; // 729
 
 /// Dequantize this block's taps once per call into a staging block, then run the
 /// f32 kernel. Pad lanes get scale 0.
 template <int R, typename InT, typename OutT>
 inline void dwconv_channel_last_quant(OutT* out_rows, const InT* in_img, const InT* w_tap0,
-                              const float* w_scale, const int32_t* w_zero,
-                              const float* bias_vec, const DwConvParams& p,
-                              const Epilogue& epilogue, bool add_to, bool pre_act,
-                              int64_t lanes, float in_scale, float in_zero,
-                              float out_scale, float out_zero)
+                                      const float* w_scale, const int32_t* w_zero,
+                                      const float* bias_vec, const DwConvParams& p,
+                                      const Epilogue& epilogue, bool add_to, bool pre_act,
+                                      int64_t lanes, float in_scale, float in_zero, float out_scale,
+                                      float out_zero)
 {
     const int64_t taps = p.KD * p.KH * p.KW;
-    if (taps > kMaxLastQuantTaps) { return; }   // the driver rejects this shape
+    if (taps > kMaxLastQuantTaps) {
+        return;
+    } // the driver rejects this shape
     const int64_t C = p.pix_stride;
 
     alignas(32) float w_scale8[kChannelLanes];
@@ -1216,8 +1285,7 @@ inline void dwconv_channel_last_quant(OutT* out_rows, const InT* in_img, const I
     for (int64_t l = 0; l < kChannelLanes; ++l) {
         const bool live = (l < lanes) && (w_scale != nullptr);
         w_scale8[l] = live ? w_scale[l] : 0.0f;
-        w_zero8[l]  = (live && w_zero != nullptr)
-                          ? static_cast<float>(w_zero[l]) : 0.0f;
+        w_zero8[l] = (live && w_zero != nullptr) ? static_cast<float>(w_zero[l]) : 0.0f;
     }
 
     alignas(32) float wq[kMaxLastQuantTaps * kChannelLanes];
@@ -1232,23 +1300,19 @@ inline void dwconv_channel_last_quant(OutT* out_rows, const InT* in_img, const I
     DwConvParams pq = p;
     pq.w_tap_stride = kChannelLanes;
 
-    const v_f32x8 vbias[1] = {bias_vec ? load_lanes(bias_vec, lanes)
-                                       : v_zero_f32x8()};
+    const v_f32x8 vbias[1] = {bias_vec ? load_lanes(bias_vec, lanes) : v_zero_f32x8()};
     if (lanes == kChannelLanes) {
-        const QuantSrc<InT, true> src[1] = {QuantSrc<InT, true>{in_img, in_scale,
-                                                                in_zero, lanes}};
-        const QuantDst<OutT, true> dst[1] = {
-            QuantDst<OutT, true>{out_rows, p.out_row_stride, out_scale, out_zero,
-                                 add_to, p.pix_stride, lanes}};
+        const QuantSrc<InT, true> src[1] = {QuantSrc<InT, true>{in_img, in_scale, in_zero, lanes}};
+        const QuantDst<OutT, true> dst[1] = {QuantDst<OutT, true>{
+            out_rows, p.out_row_stride, out_scale, out_zero, add_to, p.pix_stride, lanes}};
         dwconv_rows<R, 1>(pq, wq, &out_scale, epilogue, src, dst, vbias, pre_act);
     } else {
-        const QuantSrc<InT, false> src[1] = {QuantSrc<InT, false>{in_img, in_scale,
-                                                                  in_zero, lanes}};
-        const QuantDst<OutT, false> dst[1] = {
-            QuantDst<OutT, false>{out_rows, p.out_row_stride, out_scale, out_zero,
-                                  add_to, p.pix_stride, lanes}};
+        const QuantSrc<InT, false> src[1] = {
+            QuantSrc<InT, false>{in_img, in_scale, in_zero, lanes}};
+        const QuantDst<OutT, false> dst[1] = {QuantDst<OutT, false>{
+            out_rows, p.out_row_stride, out_scale, out_zero, add_to, p.pix_stride, lanes}};
         dwconv_rows<R, 1>(pq, wq, &out_scale, epilogue, src, dst, vbias, pre_act);
     }
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

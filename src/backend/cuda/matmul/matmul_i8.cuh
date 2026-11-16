@@ -33,7 +33,7 @@
 #include "matmul_i8_common.cuh"
 #include "matmul_i8_ptx_host.hpp"
 
-#include "matmul_splitk.cuh"  // the pooled workspace, plus the shared front end
+#include "matmul_splitk.cuh" // the pooled workspace, plus the shared front end
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/status.hpp"
 
@@ -49,9 +49,8 @@ namespace detail {
 
 /// 64x64x64 on four warps: the s8 panels are half the fp16 footprint, so three
 /// stages cost 30 KB and still leave three blocks a SM.
-struct GemmTileI8
-{
-    static constexpr int threads = 128;  ///< one four-warp group
+struct GemmTileI8 {
+    static constexpr int threads = 128; ///< one four-warp group
     static constexpr int bM = 64;
     static constexpr int bN = 64;
     static constexpr int bK = 64;
@@ -67,8 +66,8 @@ struct GemmTileI8
 constexpr int kI8Pad = 16;
 
 template <class AElem, bool TransA, bool TransB, int Groups = 1>
-static __global__ __launch_bounds__(GemmTileI8::threads * Groups)
-void dense_gemm_i8_kernel(GemmI8Params q)
+static __global__
+__launch_bounds__(GemmTileI8::threads* Groups) void dense_gemm_i8_kernel(GemmI8Params q)
 {
     using namespace cute;
     using BElem = int8_t;
@@ -102,18 +101,15 @@ void dense_gemm_i8_kernel(GemmI8Params q)
     const int group_span = kGroupM * num_nc;
     const int gid = int(blockIdx.x) / group_span;
     const int within = int(blockIdx.x) - gid * group_span;
-    const int m_span =
-        (num_m - gid * kGroupM) < kGroupM ? (num_m - gid * kGroupM) : kGroupM;
+    const int m_span = (num_m - gid * kGroupM) < kGroupM ? (num_m - gid * kGroupM) : kGroupM;
     const int tile_m = gid * kGroupM + within % m_span;
     const int tile_n = (within / m_span) * Groups + wg;
     const int m0 = tile_m * bM;
     const int n0 = tile_n * bN;
 
     const int batch = gemm_block_batch(p);
-    AElem const* A = static_cast<AElem const*>(p.a) +
-                     gemm_batch_offset(p, p.a_batch, batch);
-    BElem const* B = static_cast<BElem const*>(p.b) +
-                     gemm_batch_offset(p, p.b_batch, batch);
+    AElem const* A = static_cast<AElem const*>(p.a) + gemm_batch_offset(p, p.a_batch, batch);
+    BElem const* B = static_cast<BElem const*>(p.b) + gemm_batch_offset(p, p.b_batch, batch);
 
     Tensor mA = [&] {
         if constexpr (TransA) {
@@ -139,31 +135,26 @@ void dense_gemm_i8_kernel(GemmI8Params q)
     Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{});
     Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{});
 
-    constexpr auto sA_layout = make_layout(
-        make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
-        make_stride(Int<bK + kI8Pad>{}, Int<1>{}, Int<(bK + kI8Pad) * bM>{}));
-    constexpr auto sB_layout = make_layout(
-        make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
-        make_stride(Int<bK + kI8Pad>{}, Int<1>{}, Int<(bK + kI8Pad) * bN>{}));
+    constexpr auto sA_layout =
+        make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
+                    make_stride(Int<bK + kI8Pad>{}, Int<1>{}, Int<(bK + kI8Pad) * bM>{}));
+    constexpr auto sB_layout =
+        make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
+                    make_stride(Int<bK + kI8Pad>{}, Int<1>{}, Int<(bK + kI8Pad) * bN>{}));
     constexpr int kSmemA = int(cosize(sA_layout));
 
     extern __shared__ char gemm_smem[];
-    Tensor sA = make_tensor(make_smem_ptr(reinterpret_cast<AElem*>(gemm_smem)),
-                            sA_layout);
+    Tensor sA = make_tensor(make_smem_ptr(reinterpret_cast<AElem*>(gemm_smem)), sA_layout);
     constexpr int kSmemB = int(cosize(sB_layout));
-    Tensor sB = make_tensor(
-        make_smem_ptr(reinterpret_cast<BElem*>(
-            gemm_smem + (kSmemA + wg * kSmemB) * int(sizeof(AElem)))),
-        sB_layout);
+    Tensor sB = make_tensor(make_smem_ptr(reinterpret_cast<BElem*>(
+                                gemm_smem + (kSmemA + wg * kSmemB) * int(sizeof(AElem)))),
+                            sB_layout);
 
-    using Atom = std::conditional_t<std::is_same_v<AElem, uint8_t>,
-                                    SM80_16x8x32_S32U8S8S32_TN,
+    using Atom = std::conditional_t<std::is_same_v<AElem, uint8_t>, SM80_16x8x32_S32U8S8S32_TN,
                                     SM80_16x8x32_S32S8S8S32_TN>;
-    TiledMMA mma = make_tiled_mma(Atom{},
-                                  Layout<Shape<Int<GemmTileI8::wm>,
-                                               Int<GemmTileI8::wn>, _1>>{},
-                                  cute::Tile<Int<GemmTileI8::mmaM>,
-                                             Int<GemmTileI8::mmaN>, Int<32>>{});
+    TiledMMA mma =
+        make_tiled_mma(Atom{}, Layout<Shape<Int<GemmTileI8::wm>, Int<GemmTileI8::wn>, _1>>{},
+                       cute::Tile<Int<GemmTileI8::mmaM>, Int<GemmTileI8::mmaN>, Int<32>>{});
 
     // The vectorized copy is only legal for a k-contiguous operand.
     auto copy_a = gemm_copy_half<AElem, kCtaThreads, bM, bK, true>();
@@ -183,19 +174,16 @@ void dense_gemm_i8_kernel(GemmI8Params q)
     // axis: read it as one 16 B vector and scatter its bytes into the k-major
     // panel, which is coalesced where the element-wise walk is not. A 16 B
     // vector needs the row pitch and the base 16 B aligned.
-    const bool a_rows = (reinterpret_cast<uintptr_t>(A) % 4 == 0) &&
-                        (p.lda % 4 == 0);
-    const bool b_rows = (reinterpret_cast<uintptr_t>(B) % 4 == 0) &&
-                        (p.ldb % 4 == 0);
+    const bool a_rows = (reinterpret_cast<uintptr_t>(A) % 4 == 0) && (p.lda % 4 == 0);
+    const bool b_rows = (reinterpret_cast<uintptr_t>(B) % 4 == 0) && (p.ldb % 4 == 0);
 
     auto fill_a = [&](int kt, int stage) {
         const int k0 = kt * bK;
         if constexpr (TransA) {
             if (a_rows) {
-                i8_transpose_fill<bM, bK>(
-                    reinterpret_cast<int8_t*>(&sA(0, 0, stage)), bK + kI8Pad,
-                    reinterpret_cast<const int8_t*>(A), m0, k0, M, K, int(p.lda),
-                    int(threadIdx.x), int(blockDim.x));
+                i8_transpose_fill<bM, bK>(reinterpret_cast<int8_t*>(&sA(0, 0, stage)), bK + kI8Pad,
+                                          reinterpret_cast<const int8_t*>(A), m0, k0, M, K,
+                                          int(p.lda), int(threadIdx.x), int(blockDim.x));
                 return;
             }
         }
@@ -219,10 +207,9 @@ void dense_gemm_i8_kernel(GemmI8Params q)
         const int k0 = kt * bK;
         if constexpr (!TransB) {
             if (b_rows) {
-                i8_transpose_fill<bN, bK>(
-                    reinterpret_cast<int8_t*>(&sB(0, 0, stage)), bK + kI8Pad,
-                    reinterpret_cast<const int8_t*>(B), n0, k0, N, K, int(p.ldb),
-                    lane, kThreads);
+                i8_transpose_fill<bN, bK>(reinterpret_cast<int8_t*>(&sB(0, 0, stage)), bK + kI8Pad,
+                                          reinterpret_cast<const int8_t*>(B), n0, k0, N, K,
+                                          int(p.ldb), lane, kThreads);
                 return;
             }
         }
@@ -272,15 +259,16 @@ void dense_gemm_i8_kernel(GemmI8Params q)
         load_b(k_tile_next, pipe);
         cp_async_fence();
         --k_tile_count;
-        if (k_tile_count > 0) { ++k_tile_next; }
+        if (k_tile_count > 0) {
+            ++k_tile_next;
+        }
     }
 
     ThrMMA thr_mma = mma.get_slice(lane);
     Tensor tCrA = thr_mma.partition_fragment_A(sA(_, _, 0));
     Tensor tCrB = thr_mma.partition_fragment_B(sB(_, _, 0));
-    Tensor tCrC = thr_mma.make_fragment_C(
-        thr_mma.partition_C(local_tile(make_identity_tensor(make_shape(M, N)),
-                                       cta_tiler, cta_coord, Step<_1, _1, X>{})));
+    Tensor tCrC = thr_mma.make_fragment_C(thr_mma.partition_C(local_tile(
+        make_identity_tensor(make_shape(M, N)), cta_tiler, cta_coord, Step<_1, _1, X>{})));
     clear(tCrC);
 
     Copy_Atom<SM75_U32x4_LDSM_N, AElem> s2r_atom_a;
@@ -323,10 +311,11 @@ void dense_gemm_i8_kernel(GemmI8Params q)
                 load_b(k_tile_next, smem_pipe_write);
                 cp_async_fence();
                 --k_tile_count;
-                if (k_tile_count > 0) { ++k_tile_next; }
+                if (k_tile_count > 0) {
+                    ++k_tile_next;
+                }
                 smem_pipe_write = smem_pipe_read;
-                smem_pipe_read =
-                    (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
+                smem_pipe_read = (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
             }
             gemm(mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
         }
@@ -334,8 +323,7 @@ void dense_gemm_i8_kernel(GemmI8Params q)
 
     // ---- output ---------------------------------------------------------
     Tensor cC = make_identity_tensor(make_shape(M, N));
-    Tensor tCcC = thr_mma.partition_C(
-        local_tile(cC, cta_tiler, cta_coord, Step<_1, _1, X>{}));
+    Tensor tCcC = thr_mma.partition_C(local_tile(cC, cta_tiler, cta_coord, Step<_1, _1, X>{}));
 
     // The epilogue is spelled out here rather than shared with the narrow and
     // reduce kernels: as a function call it costs ~35 registers per thread,
@@ -344,23 +332,16 @@ void dense_gemm_i8_kernel(GemmI8Params q)
     const int64_t c_off = gemm_batch_offset(p, p.c_batch, batch);
     const int32_t* r_a_b = q.r_a + int64_t(batch) * M;
     const int32_t* r_b_b = q.r_b + int64_t(batch) * N;
-    const bool int_out = q.out == I8OutKind::S32 || q.out == I8OutKind::S8 ||
-                         q.out == I8OutKind::U8;
+    const bool int_out =
+        q.out == I8OutKind::S32 || q.out == I8OutKind::S8 || q.out == I8OutKind::U8;
     const int32_t* bias32 = int_out ? static_cast<const int32_t*>(q.bias) : nullptr;
-    const float* biasf32 = q.out == I8OutKind::F32
-                               ? static_cast<const float*>(q.bias) : nullptr;
-    const __half* biasf16 = q.out == I8OutKind::F16
-                                ? static_cast<const __half*>(q.bias) : nullptr;
-    int32_t* c32 = q.out == I8OutKind::S32
-                       ? static_cast<int32_t*>(p.c) + c_off : nullptr;
-    int8_t* c8 = q.out == I8OutKind::S8
-                     ? static_cast<int8_t*>(p.c) + c_off : nullptr;
-    uint8_t* cu8 = q.out == I8OutKind::U8
-                       ? static_cast<uint8_t*>(p.c) + c_off : nullptr;
-    float* cf32 = q.out == I8OutKind::F32
-                      ? static_cast<float*>(p.c) + c_off : nullptr;
-    __half* cf16 = q.out == I8OutKind::F16
-                       ? static_cast<__half*>(p.c) + c_off : nullptr;
+    const float* biasf32 = q.out == I8OutKind::F32 ? static_cast<const float*>(q.bias) : nullptr;
+    const __half* biasf16 = q.out == I8OutKind::F16 ? static_cast<const __half*>(q.bias) : nullptr;
+    int32_t* c32 = q.out == I8OutKind::S32 ? static_cast<int32_t*>(p.c) + c_off : nullptr;
+    int8_t* c8 = q.out == I8OutKind::S8 ? static_cast<int8_t*>(p.c) + c_off : nullptr;
+    uint8_t* cu8 = q.out == I8OutKind::U8 ? static_cast<uint8_t*>(p.c) + c_off : nullptr;
+    float* cf32 = q.out == I8OutKind::F32 ? static_cast<float*>(p.c) + c_off : nullptr;
+    __half* cf16 = q.out == I8OutKind::F16 ? static_cast<__half*>(p.c) + c_off : nullptr;
     const int32_t a_shift_k = q.a_shift * p.k;
 
     CUTE_UNROLL
@@ -368,10 +349,11 @@ void dense_gemm_i8_kernel(GemmI8Params q)
         auto coord = tCcC(i);
         const int m = int(get<0>(coord));
         const int n = int(get<1>(coord));
-        if (m >= M || n >= N) { continue; }
+        if (m >= M || n >= N) {
+            continue;
+        }
 
-        const int32_t zpa =
-            (q.zp_a != nullptr ? q.zp_a[m] : q.zp_a_scalar) + q.a_shift;
+        const int32_t zpa = (q.zp_a != nullptr ? q.zp_a[m] : q.zp_a_scalar) + q.a_shift;
         const int32_t zpb = q.zp_b != nullptr ? q.zp_b[n] : q.zp_b_scalar;
         int32_t raw = int32_t(tCrC(i));
         raw -= zpa * r_b_b[n];
@@ -380,8 +362,12 @@ void dense_gemm_i8_kernel(GemmI8Params q)
 
         if (int_out) {
             int32_t v = raw;
-            if (bias32 != nullptr) { v += bias32[n]; }
-            if (q.relu) { v = v < 0 ? 0 : v; }
+            if (bias32 != nullptr) {
+                v += bias32[n];
+            }
+            if (q.relu) {
+                v = v < 0 ? 0 : v;
+            }
             if (c32 != nullptr) {
                 c32[idx] = v;
                 continue;
@@ -406,7 +392,9 @@ void dense_gemm_i8_kernel(GemmI8Params q)
         } else if (biasf16 != nullptr) {
             b = __half2float(biasf16[n]);
         }
-        if (b != 0.0f) { f += b; }
+        if (b != 0.0f) {
+            f += b;
+        }
         f = fminf(fmaxf(f, p.min_clip), p.max_clip);
         f = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, f);
         if (cf32 != nullptr) {
@@ -428,9 +416,9 @@ void dense_gemm_i8_kernel(GemmI8Params q)
 /// with the int8 pair dot in place of the FMA sweep.
 constexpr int kI8NarrowRows = 16;
 constexpr int kI8NarrowThreads = 128;
-constexpr int kI8NarrowCols = kI8NarrowThreads;  ///< one output column per thread
-constexpr int kI8NarrowKC = 32;                  ///< k staged per chunk
-constexpr int kI8NarrowPad = 4;   ///< 36 B rows: 4-byte reads, 32 banks
+constexpr int kI8NarrowCols = kI8NarrowThreads; ///< one output column per thread
+constexpr int kI8NarrowKC = 32;                 ///< k staged per chunk
+constexpr int kI8NarrowPad = 4;                 ///< 36 B rows: 4-byte reads, 32 banks
 constexpr int kI8NarrowStages = 2;
 
 /// Split-K: the column axis alone gives N/128 blocks (32 at N=4096), a third of
@@ -439,7 +427,9 @@ constexpr int kI8NarrowStages = 2;
 inline int i8_narrow_splits(const GemmParams& p)
 {
     const int forced = splitk_env();
-    if (forced == 0) { return 1; }
+    if (forced == 0) {
+        return 1;
+    }
     const int k_tiles = (p.k + kI8NarrowKC - 1) / kI8NarrowKC;
     if (forced > 1) {
         return std::max(1, std::min({forced, k_tiles, 16}));
@@ -448,17 +438,18 @@ inline int i8_narrow_splits(const GemmParams& p)
     int splits = int(std::min<int64_t>(std::max<int64_t>(p.k / 512, 1), 16));
     const int64_t l2 = device_l2_bytes();
     if (l2 > 0) {
-        splits = int(std::min<int64_t>(
-            splits, std::max<int64_t>(l2 * 9 / 8 / plane, 1)));
+        splits = int(std::min<int64_t>(splits, std::max<int64_t>(l2 * 9 / 8 / plane, 1)));
     }
     splits = std::min(splits, k_tiles);
-    while (splits > 1 && int64_t(splits) * plane > kSplitKMaxBytes) { splits /= 2; }
+    while (splits > 1 && int64_t(splits) * plane > kSplitKMaxBytes) {
+        splits /= 2;
+    }
     return splits;
 }
 
 template <class AElem, bool TransB>
-static __global__ __launch_bounds__(kI8NarrowThreads)
-void dense_gemm_i8_narrow_kernel(GemmI8Params q)
+static __global__
+__launch_bounds__(kI8NarrowThreads) void dense_gemm_i8_narrow_kernel(GemmI8Params q)
 {
     using namespace cute;
     const GemmParams& p = q.g;
@@ -474,23 +465,23 @@ void dense_gemm_i8_narrow_kernel(GemmI8Params q)
     int kt_begin = 0;
     int kt_count = 0;
     gemm_split_range(p, kI8NarrowKC, split, kt_begin, kt_count);
-    if (kt_count <= 0) { return; }
+    if (kt_count <= 0) {
+        return;
+    }
     const int k_begin = kt_begin * kI8NarrowKC;
     const int k_end = min(K, (kt_begin + kt_count) * kI8NarrowKC);
 
     constexpr int kCols = kI8NarrowCols;
     constexpr int kKC = kI8NarrowKC;
-    constexpr int kNG = kKC / 4;               // four-byte k groups per chunk
+    constexpr int kNG = kKC / 4; // four-byte k groups per chunk
     constexpr int kRow = kKC + kI8NarrowPad;
     constexpr int kStages = kI8NarrowStages;
 
     __shared__ __align__(16) int8_t smem_b[kStages * kCols * kRow];
     __shared__ __align__(16) uint32_t smem_a[kStages * kI8NarrowRows * kNG];
 
-    const AElem* A = static_cast<const AElem*>(p.a) +
-                     gemm_batch_offset(p, p.a_batch, batch);
-    const int8_t* B = static_cast<const int8_t*>(p.b) +
-                      gemm_batch_offset(p, p.b_batch, batch);
+    const AElem* A = static_cast<const AElem*>(p.a) + gemm_batch_offset(p, p.a_batch, batch);
+    const int8_t* B = static_cast<const int8_t*>(p.b) + gemm_batch_offset(p, p.b_batch, batch);
     // The u8 form cannot use an unsigned dp4a (there is none for a mixed pair),
     // so the A bytes are shifted by -128 and the epilogue moves the whole
     // compensation into that domain.
@@ -524,7 +515,7 @@ void dense_gemm_i8_narrow_kernel(GemmI8Params q)
     // four-byte aligned and the warp's reads walk the banks.
     uint32_t rb[kNG];
     auto fetch_b = [&](int k0) {
-        if constexpr (TransB) {   // B [N, K]: the column's k run is contiguous
+        if constexpr (TransB) { // B [N, K]: the column's k run is contiguous
             const int8_t* src = B + int64_t(ncol) * p.ldb + k0;
             if (ncol < N && k0 + kKC <= K) {
                 CUTE_UNROLL
@@ -556,23 +547,28 @@ void dense_gemm_i8_narrow_kernel(GemmI8Params q)
     auto load_b_transposed = [&](int k0, int stage) {
         // B [K, N]: the coalesced run is along n, so the 4x4 byte transpose
         // fills the k-major rows (one word store per four k of one column).
-        i8_transpose_fill<kCols, kKC>(smem_b + stage * kCols * kRow, kRow, B,
-                                      n0, k0, N, K, int(p.ldb), tid,
-                                      kI8NarrowThreads);
+        i8_transpose_fill<kCols, kKC>(smem_b + stage * kCols * kRow, kRow, B, n0, k0, N, K,
+                                      int(p.ldb), tid, kI8NarrowThreads);
     };
 
     int32_t acc[kI8NarrowRows];
     CUTE_UNROLL
-    for (int m = 0; m < kI8NarrowRows; ++m) { acc[m] = 0; }
+    for (int m = 0; m < kI8NarrowRows; ++m) {
+        acc[m] = 0;
+    }
 
     int stage = 0;
-    if constexpr (TransB) { fetch_b(k_begin); }
+    if constexpr (TransB) {
+        fetch_b(k_begin);
+    }
     for (int k0 = k_begin; k0 < k_end; k0 += kKC) {
         __syncthreads();
         load_a(k0, stage);
         if constexpr (TransB) {
             store_b(stage);
-            if (k0 + kKC < k_end) { fetch_b(k0 + kKC); }
+            if (k0 + kKC < k_end) {
+                fetch_b(k0 + kKC);
+            }
         } else {
             load_b_transposed(k0, stage);
         }
@@ -590,11 +586,12 @@ void dense_gemm_i8_narrow_kernel(GemmI8Params q)
         stage ^= 1;
     }
 
-    if (ncol >= N) { return; }
+    if (ncol >= N) {
+        return;
+    }
     if (p.k_splits > 1) {
         int32_t* part = reinterpret_cast<int32_t*>(p.partial) +
-                        (int64_t(batch) * p.k_splits + split) *
-                            int64_t(M) * N;
+                        (int64_t(batch) * p.k_splits + split) * int64_t(M) * N;
         CUTE_UNROLL
         for (int m = 0; m < mlim; ++m) {
             part[int64_t(m) * N + ncol] = acc[m];
@@ -617,13 +614,15 @@ static __global__ void dense_gemm_i8_reduce_kernel(GemmI8Params q)
     const GemmParams& p = q.g;
     const int64_t plane = int64_t(p.m) * p.n;
     const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= plane) { return; }
+    if (idx >= plane) {
+        return;
+    }
     const int m = int(idx / p.n);
     const int n = int(idx - int64_t(m) * p.n);
     const int batch = int(blockIdx.y);
 
-    const int32_t* src = reinterpret_cast<const int32_t*>(p.partial) +
-                         (int64_t(batch) * p.k_splits) * plane + idx;
+    const int32_t* src =
+        reinterpret_cast<const int32_t*>(p.partial) + (int64_t(batch) * p.k_splits) * plane + idx;
     int32_t sum = 0;
     for (int s = 0; s < p.k_splits; ++s) {
         sum += src[int64_t(s) * plane];
@@ -633,24 +632,27 @@ static __global__ void dense_gemm_i8_reduce_kernel(GemmI8Params q)
                         q.r_b + int64_t(batch) * int64_t(p.n), sum, m, n);
 }
 
-}  // namespace detail
-
+} // namespace detail
 
 /// The int8 twin of `dense_gemm_status`: stage the per-token/per-channel
 /// parameters, sweep the two reductions, run the tile, and return a Status.
-inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a,
-                                   bool trans_b, cudaStream_t stream)
+inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a, bool trans_b,
+                                   cudaStream_t stream)
 {
     const GemmParams& p = q.g;
     if (a_dt != DataType::s8 && a_dt != DataType::u8) {
         return Status::unsupported;
     }
-    if (p.m <= 0 || p.n <= 0 || p.k <= 0) { return Status::unsupported; }
+    if (p.m <= 0 || p.n <= 0 || p.k <= 0) {
+        return Status::unsupported;
+    }
 
     constexpr int kGroups = 2;
     const int64_t num_m = (p.m + detail::GemmTileI8::bM - 1) / detail::GemmTileI8::bM;
     const int64_t num_n = (p.n + detail::GemmTileI8::bN - 1) / detail::GemmTileI8::bN;
-    if (num_m * num_n > (int64_t(1) << 30)) { return Status::unsupported; }
+    if (num_m * num_n > (int64_t(1) << 30)) {
+        return Status::unsupported;
+    }
 
     q.a_row_major = !trans_a;
     q.b_row_major = trans_b;
@@ -663,17 +665,13 @@ inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a,
     // A decode-shaped product (at most sixteen rows) takes the column-parallel
     // narrow kernel: the tile would compute four times the rows it needs, and
     // B is the only operand that matters.
-    const bool narrow =
-        !trans_a && p.m >= 1 && p.m <= detail::kI8NarrowRows && p.n >= 4 &&
-        p.k >= 256 && batch == 1 &&
-        (reinterpret_cast<uintptr_t>(p.a) % 4 == 0) && (p.lda % 4 == 0) &&
-        (reinterpret_cast<uintptr_t>(p.b) % 4 == 0) && (p.ldb % 4 == 0);
+    const bool narrow = !trans_a && p.m >= 1 && p.m <= detail::kI8NarrowRows && p.n >= 4 &&
+                        p.k >= 256 && batch == 1 && (reinterpret_cast<uintptr_t>(p.a) % 4 == 0) &&
+                        (p.lda % 4 == 0) && (reinterpret_cast<uintptr_t>(p.b) % 4 == 0) &&
+                        (p.ldb % 4 == 0);
     const int splits = narrow ? detail::i8_narrow_splits(p) : 1;
     const int64_t partial_bytes =
-        (splits > 1)
-            ? int64_t(splits) * batch * int64_t(p.m) * p.n *
-                  int64_t(sizeof(int32_t))
-            : 0;
+        (splits > 1) ? int64_t(splits) * batch * int64_t(p.m) * p.n * int64_t(sizeof(int32_t)) : 0;
 
     // ---- workspace -------------------------------------------------------
     // The two reduction planes, then the staged parameter arrays. Each staged
@@ -684,7 +682,10 @@ inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a,
     int64_t cursor = r_b_off + batch * int64_t(p.n) * int64_t(sizeof(int32_t));
 
     const auto stage = [&](const void* src, int64_t bytes, int64_t& off) {
-        if (src == nullptr) { off = -1; return; }
+        if (src == nullptr) {
+            off = -1;
+            return;
+        }
         off = cursor;
         cursor += (bytes + 15) & ~int64_t(15);
     };
@@ -699,56 +700,51 @@ inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a,
     cursor += partial_bytes;
 
     const detail::GemmWorkspace ws = detail::gemm_workspace_alloc(cursor, stream);
-    if (ws.ptr == nullptr) { return Status::internal; }
+    if (ws.ptr == nullptr) {
+        return Status::internal;
+    }
     char* base = static_cast<char*>(ws.ptr);
 
     q.r_a = reinterpret_cast<int32_t*>(base + r_a_off);
     q.r_b = reinterpret_cast<int32_t*>(base + r_b_off);
     const auto copy_in = [&](const void* src, int64_t off, int64_t bytes) {
-        if (off < 0) { return true; }
-        return cudaMemcpyAsync(base + off, src, size_t(bytes),
-                               cudaMemcpyHostToDevice, stream) == cudaSuccess;
+        if (off < 0) {
+            return true;
+        }
+        return cudaMemcpyAsync(base + off, src, size_t(bytes), cudaMemcpyHostToDevice, stream) ==
+               cudaSuccess;
     };
-    const bool staged =
-        copy_in(q.zp_a, off_zpa, int64_t(p.m) * 4) &&
-        copy_in(q.zp_b, off_zpb, int64_t(p.n) * 4) &&
-        (!need_scale || (copy_in(q.sc_a, off_sca, int64_t(p.m) * 4) &&
-                         copy_in(q.sc_b, off_scb, int64_t(p.n) * 4)));
+    const bool staged = copy_in(q.zp_a, off_zpa, int64_t(p.m) * 4) &&
+                        copy_in(q.zp_b, off_zpb, int64_t(p.n) * 4) &&
+                        (!need_scale || (copy_in(q.sc_a, off_sca, int64_t(p.m) * 4) &&
+                                         copy_in(q.sc_b, off_scb, int64_t(p.n) * 4)));
     if (!staged) {
         detail::gemm_workspace_free(ws, stream);
         cudaGetLastError();
         return Status::internal;
     }
-    q.zp_a = off_zpa >= 0
-                 ? reinterpret_cast<const int32_t*>(base + off_zpa) : nullptr;
-    q.zp_b = off_zpb >= 0
-                 ? reinterpret_cast<const int32_t*>(base + off_zpb) : nullptr;
-    q.sc_a = off_sca >= 0
-                 ? reinterpret_cast<const float*>(base + off_sca) : nullptr;
-    q.sc_b = off_scb >= 0
-                 ? reinterpret_cast<const float*>(base + off_scb) : nullptr;
+    q.zp_a = off_zpa >= 0 ? reinterpret_cast<const int32_t*>(base + off_zpa) : nullptr;
+    q.zp_b = off_zpb >= 0 ? reinterpret_cast<const int32_t*>(base + off_zpb) : nullptr;
+    q.sc_a = off_sca >= 0 ? reinterpret_cast<const float*>(base + off_sca) : nullptr;
+    q.sc_b = off_scb >= 0 ? reinterpret_cast<const float*>(base + off_scb) : nullptr;
 
     // ---- reductions ------------------------------------------------------
     constexpr int kSumThreads = 128;
     const dim3 ra_grid(unsigned(p.m), unsigned(batch), 1);
     const dim3 rb_grid(unsigned(p.n), unsigned(batch), 1);
     if (a_dt == DataType::u8) {
-        detail::i8_row_sums_kernel<uint8_t><<<ra_grid, kSumThreads, 0, stream>>>(
-            q, q.r_a);
+        detail::i8_row_sums_kernel<uint8_t><<<ra_grid, kSumThreads, 0, stream>>>(q, q.r_a);
     } else {
-        detail::i8_row_sums_kernel<int8_t><<<ra_grid, kSumThreads, 0, stream>>>(
-            q, q.r_a);
+        detail::i8_row_sums_kernel<int8_t><<<ra_grid, kSumThreads, 0, stream>>>(q, q.r_a);
     }
     if (q.b_row_major) {
         detail::i8_col_sums_kernel<<<rb_grid, kSumThreads, 0, stream>>>(q, q.r_b);
     } else {
         // The transposed walk accumulates with atomics; the plane is per call.
-        cudaMemsetAsync(q.r_b, 0, size_t(batch) * size_t(p.n) * sizeof(int32_t),
-                        stream);
+        cudaMemsetAsync(q.r_b, 0, size_t(batch) * size_t(p.n) * sizeof(int32_t), stream);
         const int64_t cols_per_block = int64_t(kSumThreads) * 4;
-        const dim3 rb_grid2(
-            unsigned((p.n + cols_per_block - 1) / cols_per_block),
-            unsigned(batch), 8);
+        const dim3 rb_grid2(unsigned((p.n + cols_per_block - 1) / cols_per_block), unsigned(batch),
+                            8);
         detail::i8_col_sums_kernel<<<rb_grid2, kSumThreads, 0, stream>>>(q, q.r_b);
     }
 
@@ -756,11 +752,9 @@ inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a,
     if (narrow) {
         q.a_shift = (a_dt == DataType::u8) ? -128 : 0;
         q.g.k_splits = splits;
-        q.g.partial = splits > 1
-                          ? reinterpret_cast<float*>(base + off_partial) : nullptr;
-        const dim3 ngrid(unsigned((p.n + detail::kI8NarrowCols - 1) /
-                                  detail::kI8NarrowCols),
-                         1, unsigned(splits));
+        q.g.partial = splits > 1 ? reinterpret_cast<float*>(base + off_partial) : nullptr;
+        const dim3 ngrid(unsigned((p.n + detail::kI8NarrowCols - 1) / detail::kI8NarrowCols), 1,
+                         unsigned(splits));
         constexpr unsigned kNThreads = detail::kI8NarrowThreads;
         if (a_dt == DataType::u8) {
             if (trans_b) {
@@ -784,8 +778,7 @@ inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a,
             const int64_t plane = int64_t(p.m) * p.n;
             const dim3 rgrid(unsigned((plane + kReduceThreads - 1) / kReduceThreads),
                              unsigned(batch), 1);
-            detail::dense_gemm_i8_reduce_kernel
-                <<<rgrid, kReduceThreads, 0, stream>>>(q);
+            detail::dense_gemm_i8_reduce_kernel<<<rgrid, kReduceThreads, 0, stream>>>(q);
         }
         detail::gemm_workspace_free(ws, stream);
         return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
@@ -797,16 +790,14 @@ inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a,
     // knob forces either side, and N >= 2 also names a menu row.
     const int ptx_i8 = ::nnops::detail::cuda_ptx_i8.load(std::memory_order_relaxed);
     if (ptx_i8 >= 0 &&
-        manual_dense_i8_tile(q, a_dt, trans_a, trans_b, stream,
-                             ptx_i8 >= 2 ? ptx_i8 - 2 : -1)) {
+        manual_dense_i8_tile(q, a_dt, trans_a, trans_b, stream, ptx_i8 >= 2 ? ptx_i8 - 2 : -1)) {
         detail::gemm_workspace_free(ws, stream);
         return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
     }
 
     using Tile = detail::GemmTileI8;
-    constexpr int smem = (Tile::bM + kGroups * Tile::bN) *
-                         (Tile::bK + detail::kI8Pad) * Tile::stages *
-                         int(sizeof(int8_t));
+    constexpr int smem = (Tile::bM + kGroups * Tile::bN) * (Tile::bK + detail::kI8Pad) *
+                         Tile::stages * int(sizeof(int8_t));
     const int64_t num_nc = (num_n + kGroups - 1) / kGroups;
     const dim3 grid(unsigned(num_m * num_nc), 1, unsigned(batch));
     const unsigned threads = unsigned(Tile::threads * kGroups);
@@ -849,4 +840,4 @@ inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a,
     return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

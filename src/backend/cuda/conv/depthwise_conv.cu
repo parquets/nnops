@@ -46,9 +46,8 @@ namespace nnops::backend::cuda {
 // Device-side epilogue apply (mirrors host apply_epilogue)
 // ============================================================
 
-__device__ inline float device_apply_epilogue(
-    EpilogueActivateType ep_type, float alpha, float beta,
-    float min_clip, float max_clip, float x)
+__device__ inline float device_apply_epilogue(EpilogueActivateType ep_type, float alpha, float beta,
+                                              float min_clip, float max_clip, float x)
 {
     // activate(clamp(x)) — the same contract as the CPU's apply_epilogue.
     x = fminf(fmaxf(x, min_clip), max_clip);
@@ -107,39 +106,41 @@ struct DwFirstGeom {
 /// nothing here divides an index by the width the way a flat thread walk did,
 /// and a warp's lanes are a contiguous run of the row they read.
 template <typename T>
-__global__ void depthwise_conv_2d_grid_kernel(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    const T* __restrict__ bias,     // may be nullptr
-    T* __restrict__ output,
-    DwFirstGeom g)
+__global__ void depthwise_conv_2d_grid_kernel(const T* __restrict__ input,
+                                              const T* __restrict__ weight,
+                                              const T* __restrict__ bias, // may be nullptr
+                                              T* __restrict__ output, DwFirstGeom g)
 {
     const int64_t ow = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t oh = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
-    const int64_t c  = blockIdx.z;
-    if (ow >= g.OW || oh >= g.OH) { return; }
+    const int64_t c = blockIdx.z;
+    if (ow >= g.OW || oh >= g.OH) {
+        return;
+    }
 
     const T* w_ch = weight + c * g.w_ch_stride;
     const float bias_val = g.has_bias ? s_load(&bias[c]) : 0.0f;
 
     for (int64_t n = 0; n < g.N; ++n) {
-        const T* in_ch  = input  + (n * gridDim.z + c) * g.in_ch_stride;
-        T*       out_ch = output + (n * gridDim.z + c) * g.out_ch_stride;
+        const T* in_ch = input + (n * gridDim.z + c) * g.in_ch_stride;
+        T* out_ch = output + (n * gridDim.z + c) * g.out_ch_stride;
 
         float sum = bias_val;
         for (int64_t kh = 0; kh < g.KH; ++kh) {
             const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
-            if (ih < 0 || ih >= g.IH) continue;
+            if (ih < 0 || ih >= g.IH)
+                continue;
             const T* row = in_ch + ih * g.in_row_stride;
             for (int64_t kw = 0; kw < g.KW; ++kw) {
                 const int64_t iw = ow * g.SW + kw * g.DW - g.PW;
-                if (iw < 0 || iw >= g.IW) continue;
+                if (iw < 0 || iw >= g.IW)
+                    continue;
                 sum += s_load(&row[iw]) * s_load(&w_ch[kh * g.KW + kw]);
             }
         }
 
-        const float val = device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta,
-                                                g.ep_min, g.ep_max, sum);
+        const float val =
+            device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta, g.ep_min, g.ep_max, sum);
         const int64_t out_idx = oh * g.out_row_stride + ow;
         if (g.add_to) {
             s_store(&out_ch[out_idx], s_load(&out_ch[out_idx]) + val);
@@ -154,49 +155,54 @@ __global__ void depthwise_conv_2d_grid_kernel(
 /// its outputs from the same registers. The filter row is loaded once per
 /// (kh) and held.
 template <typename T, int K, int VW>
-__global__ void depthwise_conv_2d_window_kernel(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    const T* __restrict__ bias,     // may be nullptr
-    T* __restrict__ output,
-    DwFirstGeom g)
+__global__ void depthwise_conv_2d_window_kernel(const T* __restrict__ input,
+                                                const T* __restrict__ weight,
+                                                const T* __restrict__ bias, // may be nullptr
+                                                T* __restrict__ output, DwFirstGeom g)
 {
     const int64_t ow0 = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) * VW;
-    const int64_t oh  = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
-    const int64_t c   = blockIdx.z;
-    if (ow0 >= g.OW || oh >= g.OH) { return; }
+    const int64_t oh = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
+    const int64_t c = blockIdx.z;
+    if (ow0 >= g.OW || oh >= g.OH) {
+        return;
+    }
 
     const int64_t cols = (g.OW - ow0 < int64_t(VW)) ? (g.OW - ow0) : int64_t(VW);
     const T* w_ch = weight + c * g.w_ch_stride;
     const float bias_val = g.has_bias ? s_load(&bias[c]) : 0.0f;
 
     for (int64_t n = 0; n < g.N; ++n) {
-        const T* in_ch  = input  + (n * gridDim.z + c) * g.in_ch_stride;
-        T*       out_ch = output + (n * gridDim.z + c) * g.out_ch_stride;
+        const T* in_ch = input + (n * gridDim.z + c) * g.in_ch_stride;
+        T* out_ch = output + (n * gridDim.z + c) * g.out_ch_stride;
 
         float acc[VW];
-        #pragma unroll
-        for (int v = 0; v < VW; ++v) { acc[v] = bias_val; }
+#pragma unroll
+        for (int v = 0; v < VW; ++v) {
+            acc[v] = bias_val;
+        }
 
         for (int64_t kh = 0; kh < K; ++kh) {
             const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
-            if (ih < 0 || ih >= g.IH) continue;
+            if (ih < 0 || ih >= g.IH)
+                continue;
             const T* row = in_ch + ih * g.in_row_stride;
             const T* w_row = w_ch + kh * K;
 
             float wv[K];
-            #pragma unroll
-            for (int kw = 0; kw < K; ++kw) { wv[kw] = s_load(&w_row[kw]); }
+#pragma unroll
+            for (int kw = 0; kw < K; ++kw) {
+                wv[kw] = s_load(&w_row[kw]);
+            }
 
             float x[VW + K - 1];
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < VW + K - 1; ++j) {
                 const int64_t iw = ow0 - g.PW + j;
                 x[j] = (iw >= 0 && iw < g.IW) ? s_load(&row[iw]) : 0.0f;
             }
-            #pragma unroll
+#pragma unroll
             for (int v = 0; v < VW; ++v) {
-                #pragma unroll
+#pragma unroll
                 for (int kw = 0; kw < K; ++kw) {
                     acc[v] = fmaf(wv[kw], x[v + kw], acc[v]);
                 }
@@ -205,8 +211,8 @@ __global__ void depthwise_conv_2d_window_kernel(
 
         T* out_row = out_ch + oh * g.out_row_stride + ow0;
         for (int64_t v = 0; v < cols; ++v) {
-            float val = device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta,
-                                              g.ep_min, g.ep_max, acc[v]);
+            float val =
+                device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta, g.ep_min, g.ep_max, acc[v]);
             if (g.add_to) {
                 s_store(&out_row[v], s_load(&out_row[v]) + val);
             } else {
@@ -220,40 +226,22 @@ __global__ void depthwise_conv_2d_window_kernel(
 /// block walks the whole (n, c) volume.
 template <typename T>
 __global__ void depthwise_conv_3d_kernel(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    const T* __restrict__ bias,
-    T* __restrict__ output,
-    int64_t N, int64_t C,
-    int64_t ID, int64_t IH, int64_t IW,
-    int64_t OD, int64_t OH, int64_t OW,
-    int64_t KD, int64_t KH, int64_t KW,
-    int64_t SD, int64_t SH, int64_t SW,
-    int64_t DD, int64_t DH, int64_t DW,
-    int64_t PD, int64_t PH, int64_t PW,
-    int64_t in_ch_stride,
-    int64_t in_row_stride,
-    int64_t in_d_stride,
-    int64_t out_ch_stride,
-    int64_t out_row_stride,
-    int64_t out_d_stride,
-    int64_t w_ch_stride,
-    EpilogueActivateType ep_type,
-    float ep_alpha,
-    float ep_beta,
-    float ep_min,
-    float ep_max,
-    bool has_bias,
-    bool add_to)
+    const T* __restrict__ input, const T* __restrict__ weight, const T* __restrict__ bias,
+    T* __restrict__ output, int64_t N, int64_t C, int64_t ID, int64_t IH, int64_t IW, int64_t OD,
+    int64_t OH, int64_t OW, int64_t KD, int64_t KH, int64_t KW, int64_t SD, int64_t SH, int64_t SW,
+    int64_t DD, int64_t DH, int64_t DW, int64_t PD, int64_t PH, int64_t PW, int64_t in_ch_stride,
+    int64_t in_row_stride, int64_t in_d_stride, int64_t out_ch_stride, int64_t out_row_stride,
+    int64_t out_d_stride, int64_t w_ch_stride, EpilogueActivateType ep_type, float ep_alpha,
+    float ep_beta, float ep_min, float ep_max, bool has_bias, bool add_to)
 {
     const int n = blockIdx.y / C;
     const int c = blockIdx.y % C;
     const int tid = threadIdx.x;
     const int64_t total_spatial = OD * OH * OW;
 
-    const T* in_ch  = input  + n * C * in_ch_stride  + c * in_ch_stride;
-    const T* w_ch   = weight + c * w_ch_stride;
-    T*       out_ch = output + n * C * out_ch_stride + c * out_ch_stride;
+    const T* in_ch = input + n * C * in_ch_stride + c * in_ch_stride;
+    const T* w_ch = weight + c * w_ch_stride;
+    T* out_ch = output + n * C * out_ch_stride + c * out_ch_stride;
 
     const float bias_val = has_bias ? s_load(&bias[c]) : 0.0f;
 
@@ -267,21 +255,23 @@ __global__ void depthwise_conv_3d_kernel(
 
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t id = od * SD + kd * DD - PD;
-            if (id < 0 || id >= ID) continue;
+            if (id < 0 || id >= ID)
+                continue;
             for (int64_t kh = 0; kh < KH; ++kh) {
                 const int64_t ih = oh * SH + kh * DH - PH;
-                if (ih < 0 || ih >= IH) continue;
+                if (ih < 0 || ih >= IH)
+                    continue;
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     const int64_t iw = ow * SW + kw * DW - PW;
-                    if (iw < 0 || iw >= IW) continue;
-                    sum += s_load(&in_ch[id * in_d_stride + ih * in_row_stride + iw])
-                         * s_load(&w_ch[kd * KH * KW + kh * KW + kw]);
+                    if (iw < 0 || iw >= IW)
+                        continue;
+                    sum += s_load(&in_ch[id * in_d_stride + ih * in_row_stride + iw]) *
+                           s_load(&w_ch[kd * KH * KW + kh * KW + kw]);
                 }
             }
         }
 
-        float val = device_apply_epilogue(ep_type, ep_alpha, ep_beta,
-                                          ep_min, ep_max, sum);
+        float val = device_apply_epilogue(ep_type, ep_alpha, ep_beta, ep_min, ep_max, sum);
 
         const int64_t out_idx = od * out_d_stride + oh * out_row_stride + ow;
         if (add_to) {
@@ -325,7 +315,9 @@ struct DwLastGeom {
 /// neighbour's), y lanes walk output columns. Every index a thread needs then
 /// comes out of a block coordinate, which is what the first kernel spent four
 /// 64-bit divisions on.
-struct DwLastBlock { int bx, by; };
+struct DwLastBlock {
+    int bx, by;
+};
 
 inline DwLastBlock dw_last_block(int64_t chunks)
 {
@@ -336,71 +328,80 @@ inline DwLastBlock dw_last_block(int64_t chunks)
 /// One output vector per thread, flat over the plane. The fallback for anything
 /// the row-walking kernel below does not cover.
 template <typename T, int Vec>
-__global__ void depthwise_conv_last_flat_kernel(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    const T* __restrict__ bias,     // may be nullptr
-    T* __restrict__ output,
-    DwLastGeom g)
+__global__ void depthwise_conv_last_flat_kernel(const T* __restrict__ input,
+                                                const T* __restrict__ weight,
+                                                const T* __restrict__ bias, // may be nullptr
+                                                T* __restrict__ output, DwLastGeom g)
 {
     const int64_t chunk = int64_t(blockIdx.y) * blockDim.x + threadIdx.x;
-    const int64_t ow    = int64_t(blockIdx.z) * blockDim.y + threadIdx.y;
-    if (chunk >= g.chunks || ow >= g.OW) { return; }
+    const int64_t ow = int64_t(blockIdx.z) * blockDim.y + threadIdx.y;
+    if (chunk >= g.chunks || ow >= g.OW) {
+        return;
+    }
 
     const int64_t plane = int64_t(blockIdx.x) / g.OH;
-    const int64_t oh    = int64_t(blockIdx.x) % g.OH;
-    const int64_t img   = plane / g.OD;
-    const int64_t od    = plane % g.OD;
-    const int64_t c0    = g.c_begin + chunk * Vec;
+    const int64_t oh = int64_t(blockIdx.x) % g.OH;
+    const int64_t img = plane / g.OD;
+    const int64_t od = plane % g.OD;
+    const int64_t c0 = g.c_begin + chunk * Vec;
 
-    const T* in_img  = input  + img * g.ID * g.in_d_stride + c0;
-    T*       out_img = output + img * g.OD * g.out_d_stride + c0;
-    const T* w_base  = weight + c0;
+    const T* in_img = input + img * g.ID * g.in_d_stride + c0;
+    T* out_img = output + img * g.OD * g.out_d_stride + c0;
+    const T* w_base = weight + c0;
 
     float acc[Vec];
     if (g.has_bias) {
         load_channels<T, Vec>(bias + c0, acc);
     } else {
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { acc[i] = 0.0f; }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] = 0.0f;
+        }
     }
 
     const int64_t iw_base = ow * g.SW - g.PW;
     for (int64_t kd = 0; kd < g.KD; ++kd) {
         const int64_t id = od * g.SD + kd * g.DD - g.PD;
-        if (id < 0 || id >= g.ID) continue;
+        if (id < 0 || id >= g.ID)
+            continue;
         const T* in_d = in_img + id * g.in_d_stride;
-        const T* w_d  = w_base + kd * g.KH * g.KW * g.w_tap_stride;
+        const T* w_d = w_base + kd * g.KH * g.KW * g.w_tap_stride;
         for (int64_t kh = 0; kh < g.KH; ++kh) {
             const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
-            if (ih < 0 || ih >= g.IH) continue;
-            const T* row   = in_d + ih * g.in_row_stride;
+            if (ih < 0 || ih >= g.IH)
+                continue;
+            const T* row = in_d + ih * g.in_row_stride;
             const T* w_row = w_d + kh * g.KW * g.w_tap_stride;
             for (int64_t kw = 0; kw < g.KW; ++kw) {
                 const int64_t iw = iw_base + kw * g.DW;
-                if (iw < 0 || iw >= g.IW) continue;
+                if (iw < 0 || iw >= g.IW)
+                    continue;
                 float v[Vec];
                 float wv[Vec];
                 load_channels<T, Vec>(row + iw * g.in_pix_stride, v);
                 load_channels<T, Vec>(w_row + kw * g.w_tap_stride, wv);
-                #pragma unroll
-                for (int i = 0; i < Vec; ++i) { acc[i] = fmaf(wv[i], v[i], acc[i]); }
+#pragma unroll
+                for (int i = 0; i < Vec; ++i) {
+                    acc[i] = fmaf(wv[i], v[i], acc[i]);
+                }
             }
         }
     }
 
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < Vec; ++i) {
-        acc[i] = device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta,
-                                      g.ep_min, g.ep_max, acc[i]);
+        acc[i] =
+            device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta, g.ep_min, g.ep_max, acc[i]);
     }
 
     T* out = out_img + od * g.out_d_stride + oh * g.out_row_stride + ow * g.out_pix_stride;
     if (g.add_to) {
         float prev[Vec];
         load_channels<T, Vec>(out, prev);
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { acc[i] += prev[i]; }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] += prev[i];
+        }
     }
     store_channels<T, Vec>(out, acc);
 }
@@ -413,69 +414,77 @@ __global__ void depthwise_conv_last_flat_kernel(
 constexpr int kDwRows = 2;
 
 template <typename T, int Vec, int K, int ROWS>
-__global__ void depthwise_conv_last_rows_kernel(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    const T* __restrict__ bias,     // may be nullptr
-    T* __restrict__ output,
-    DwLastGeom g)
+__global__ void depthwise_conv_last_rows_kernel(const T* __restrict__ input,
+                                                const T* __restrict__ weight,
+                                                const T* __restrict__ bias, // may be nullptr
+                                                T* __restrict__ output, DwLastGeom g)
 {
     const int64_t chunk = int64_t(blockIdx.y) * blockDim.x + threadIdx.x;
-    const int64_t ow    = int64_t(blockIdx.z) * blockDim.y + threadIdx.y;
-    if (chunk >= g.chunks || ow >= g.OW) { return; }
+    const int64_t ow = int64_t(blockIdx.z) * blockDim.y + threadIdx.y;
+    if (chunk >= g.chunks || ow >= g.OW) {
+        return;
+    }
 
     const int64_t row_blocks = (g.OH + ROWS - 1) / ROWS;
     const int64_t plane = int64_t(blockIdx.x) / row_blocks;
-    const int64_t oh0   = (int64_t(blockIdx.x) % row_blocks) * ROWS;
-    const int64_t img   = plane / g.OD;
-    const int64_t od    = plane % g.OD;
-    const int64_t c0    = g.c_begin + chunk * Vec;
+    const int64_t oh0 = (int64_t(blockIdx.x) % row_blocks) * ROWS;
+    const int64_t img = plane / g.OD;
+    const int64_t od = plane % g.OD;
+    const int64_t c0 = g.c_begin + chunk * Vec;
 
-    const T* in_img  = input  + img * g.ID * g.in_d_stride + c0;
-    T*       out_img = output + img * g.OD * g.out_d_stride + c0;
-    const T* w_base  = weight + c0;
+    const T* in_img = input + img * g.ID * g.in_d_stride + c0;
+    T* out_img = output + img * g.OD * g.out_d_stride + c0;
+    const T* w_base = weight + c0;
 
     float acc[ROWS][Vec];
     if (g.has_bias) {
         float b[Vec];
         load_channels<T, Vec>(bias + c0, b);
-        #pragma unroll
+#pragma unroll
         for (int r = 0; r < ROWS; ++r)
-            #pragma unroll
-            for (int i = 0; i < Vec; ++i) { acc[r][i] = b[i]; }
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                acc[r][i] = b[i];
+            }
     } else {
-        #pragma unroll
+#pragma unroll
         for (int r = 0; r < ROWS; ++r)
-            #pragma unroll
-            for (int i = 0; i < Vec; ++i) { acc[r][i] = 0.0f; }
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                acc[r][i] = 0.0f;
+            }
     }
 
     for (int64_t kd = 0; kd < g.KD; ++kd) {
         const int64_t id = od * g.SD + kd * g.DD - g.PD;
-        if (id < 0 || id >= g.ID) continue;
+        if (id < 0 || id >= g.ID)
+            continue;
         const T* in_d = in_img + id * g.in_d_stride;
-        const T* w_d  = w_base + kd * K * K * g.w_tap_stride;
-        #pragma unroll
+        const T* w_d = w_base + kd * K * K * g.w_tap_stride;
+#pragma unroll
         for (int kw = 0; kw < K; ++kw) {
             const int64_t iw = ow * g.SW + kw * g.DW - g.PW;
-            if (iw < 0 || iw >= g.IW) continue;
+            if (iw < 0 || iw >= g.IW)
+                continue;
             const T* w_col = w_d + kw * g.w_tap_stride;
             float wv[K][Vec];
-            #pragma unroll
+#pragma unroll
             for (int kh = 0; kh < K; ++kh) {
                 load_channels<T, Vec>(w_col + kh * K * g.w_tap_stride, wv[kh]);
             }
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < ROWS + K - 1; ++j) {
                 const int64_t iy = oh0 + j - g.PH;
-                if (iy < 0 || iy >= g.IH) continue;
+                if (iy < 0 || iy >= g.IH)
+                    continue;
                 float v[Vec];
                 load_channels<T, Vec>(in_d + iy * g.in_row_stride + iw * g.in_pix_stride, v);
-                #pragma unroll
+#pragma unroll
                 for (int kh = 0; kh < K; ++kh) {
                     const int r = j - kh;
-                    if (r < 0 || r >= ROWS || oh0 + r >= g.OH) continue;
-                    #pragma unroll
+                    if (r < 0 || r >= ROWS || oh0 + r >= g.OH)
+                        continue;
+#pragma unroll
                     for (int i = 0; i < Vec; ++i) {
                         acc[r][i] = fmaf(wv[kh][i], v[i], acc[r][i]);
                     }
@@ -485,21 +494,25 @@ __global__ void depthwise_conv_last_rows_kernel(
     }
 
     T* out_plane = out_img + od * g.out_d_stride + ow * g.out_pix_stride;
-    #pragma unroll
+#pragma unroll
     for (int r = 0; r < ROWS; ++r) {
-        if (oh0 + r >= g.OH) { break; }
+        if (oh0 + r >= g.OH) {
+            break;
+        }
         float res[Vec];
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < Vec; ++i) {
-            res[i] = device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta,
-                                           g.ep_min, g.ep_max, acc[r][i]);
+            res[i] = device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta, g.ep_min, g.ep_max,
+                                           acc[r][i]);
         }
         T* out = out_plane + (oh0 + r) * g.out_row_stride;
         if (g.add_to) {
             float prev[Vec];
             load_channels<T, Vec>(out, prev);
-            #pragma unroll
-            for (int i = 0; i < Vec; ++i) { res[i] += prev[i]; }
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                res[i] += prev[i];
+            }
         }
         store_channels<T, Vec>(out, res);
     }
@@ -510,18 +523,15 @@ __global__ void depthwise_conv_last_rows_kernel(
 // ============================================================
 
 template <typename T>
-void depthwise_conv_cuda_2d_impl(
-    const DepthwiseConvAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void depthwise_conv_cuda_2d_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
+                                 std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t N  = input.shape(0);
-    const int64_t C  = input.shape(1);
+    const int64_t N = input.shape(0);
+    const int64_t C = input.shape(1);
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
 
@@ -538,58 +548,73 @@ void depthwise_conv_cuda_2d_impl(
     const int64_t PH = attrs.padding[1];
     const int64_t PW = attrs.padding[2];
 
-    const int64_t in_row_stride  = input.row_stride_elems();
-    const int64_t in_ch_stride   = IH * in_row_stride;
+    const int64_t in_row_stride = input.row_stride_elems();
+    const int64_t in_ch_stride = IH * in_row_stride;
     const int64_t out_row_stride = output.row_stride_elems();
-    const int64_t out_ch_stride  = OH * out_row_stride;
-    const int64_t w_ch_stride    = KH * KW;
+    const int64_t out_ch_stride = OH * out_row_stride;
+    const int64_t w_ch_stride = KH * KW;
 
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
     DwFirstGeom g{};
     g.N = N;
-    g.IH = IH; g.IW = IW; g.OH = OH; g.OW = OW;
-    g.KH = KH; g.KW = KW; g.SH = SH; g.SW = SW;
-    g.DH = DH; g.DW = DW; g.PH = PH; g.PW = PW;
-    g.in_ch_stride   = in_ch_stride;
-    g.in_row_stride  = in_row_stride;
-    g.out_ch_stride  = out_ch_stride;
+    g.IH = IH;
+    g.IW = IW;
+    g.OH = OH;
+    g.OW = OW;
+    g.KH = KH;
+    g.KW = KW;
+    g.SH = SH;
+    g.SW = SW;
+    g.DH = DH;
+    g.DW = DW;
+    g.PH = PH;
+    g.PW = PW;
+    g.in_ch_stride = in_ch_stride;
+    g.in_row_stride = in_row_stride;
+    g.out_ch_stride = out_ch_stride;
     g.out_row_stride = out_row_stride;
-    g.w_ch_stride    = w_ch_stride;
-    g.ep_type  = attrs.epilogue.type;
+    g.w_ch_stride = w_ch_stride;
+    g.ep_type = attrs.epilogue.type;
     g.ep_alpha = attrs.epilogue.alpha;
-    g.ep_beta  = attrs.epilogue.beta;
-    g.ep_min   = attrs.epilogue.min_clip;
-    g.ep_max   = attrs.epilogue.max_clip;
+    g.ep_beta = attrs.epilogue.beta;
+    g.ep_min = attrs.epilogue.min_clip;
+    g.ep_max = attrs.epilogue.max_clip;
     g.has_bias = has_bias;
-    g.add_to   = attrs.add_to;
+    g.add_to = attrs.add_to;
 
-    const T* in  = input.ptr<T>();
-    const T* w   = weight.ptr<T>();
-    const T* b   = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const T* in = input.ptr<T>();
+    const T* w = weight.ptr<T>();
+    const T* b = has_bias ? inputs[2].ptr<T>() : nullptr;
     T* out = output.ptr<T>();
 
     // A thread's run of columns shares one input window, which only exists
     // while the window is a contiguous K-wide slide: unit width stride, unit
     // dilation, and a square kernel.
     constexpr int VW = 4;
-    const bool window = KH == KW && (KH == 1 || KH == 3 || KH == 5)
-                        && SW == 1 && DW == 1 && OW >= 2 * VW;
+    const bool window =
+        KH == KW && (KH == 1 || KH == 3 || KH == 5) && SW == 1 && DW == 1 && OW >= 2 * VW;
     if (window) {
         const dim3 block(16, 16, 1);
-        const dim3 grid(unsigned((OW + 16 * VW - 1) / (16 * VW)),
-                        unsigned((OH + 15) / 16), unsigned(C));
+        const dim3 grid(unsigned((OW + 16 * VW - 1) / (16 * VW)), unsigned((OH + 15) / 16),
+                        unsigned(C));
         switch (int(KH)) {
-        case 1:  depthwise_conv_2d_window_kernel<T, 1, VW><<<grid, block, 0, stream>>>(in, w, b, out, g); return;
-        case 3:  depthwise_conv_2d_window_kernel<T, 3, VW><<<grid, block, 0, stream>>>(in, w, b, out, g); return;
-        default: depthwise_conv_2d_window_kernel<T, 5, VW><<<grid, block, 0, stream>>>(in, w, b, out, g); return;
+        case 1:
+            depthwise_conv_2d_window_kernel<T, 1, VW><<<grid, block, 0, stream>>>(in, w, b, out, g);
+            return;
+        case 3:
+            depthwise_conv_2d_window_kernel<T, 3, VW><<<grid, block, 0, stream>>>(in, w, b, out, g);
+            return;
+        default:
+            depthwise_conv_2d_window_kernel<T, 5, VW><<<grid, block, 0, stream>>>(in, w, b, out, g);
+            return;
         }
     }
     // Narrow planes take a narrower block: at 7 and 14 columns a 32-lane row
     // leaves more than half the block parked on the bounds check.
     const int bx = OW >= 32 ? 32 : (OW >= 16 ? 16 : 8);
     const int cap = kCudaBlockSize / bx;
-    const int rows = int((OH + 3) / 4) * 4;    // whole warps of rows, no more
+    const int rows = int((OH + 3) / 4) * 4; // whole warps of rows, no more
     const int by = rows < cap ? rows : cap;
     const dim3 block(unsigned(bx), unsigned(by), 1);
     const dim3 grid(unsigned((OW + bx - 1) / bx), unsigned((OH + by - 1) / by), unsigned(C));
@@ -597,18 +622,15 @@ void depthwise_conv_cuda_2d_impl(
 }
 
 template <typename T>
-void depthwise_conv_cuda_3d_impl(
-    const DepthwiseConvAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void depthwise_conv_cuda_3d_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
+                                 std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t N  = input.shape(0);
-    const int64_t C  = input.shape(1);
+    const int64_t N = input.shape(0);
+    const int64_t C = input.shape(1);
     const int64_t ID = input.shape(2);
     const int64_t IH = input.shape(3);
     const int64_t IW = input.shape(4);
@@ -631,13 +653,13 @@ void depthwise_conv_cuda_3d_impl(
     const int64_t PH = attrs.padding[1];
     const int64_t PW = attrs.padding[2];
 
-    const int64_t in_row_stride  = input.row_stride_elems();
-    const int64_t in_d_stride    = IH * in_row_stride;
-    const int64_t in_ch_stride   = ID * in_d_stride;
+    const int64_t in_row_stride = input.row_stride_elems();
+    const int64_t in_d_stride = IH * in_row_stride;
+    const int64_t in_ch_stride = ID * in_d_stride;
     const int64_t out_row_stride = output.row_stride_elems();
-    const int64_t out_d_stride   = OH * out_row_stride;
-    const int64_t out_ch_stride  = OD * out_d_stride;
-    const int64_t w_ch_stride    = KD * KH * KW;
+    const int64_t out_d_stride = OH * out_row_stride;
+    const int64_t out_ch_stride = OD * out_d_stride;
+    const int64_t w_ch_stride = KD * KH * KW;
 
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
@@ -647,17 +669,11 @@ void depthwise_conv_cuda_3d_impl(
     const dim3 grid(1, static_cast<unsigned int>(NC), 1);
 
     depthwise_conv_3d_kernel<<<grid, block_size, 0, stream>>>(
-        input.ptr<T>(), weight.ptr<T>(),
-        has_bias ? inputs[2].ptr<T>() : nullptr,
-        output.ptr<T>(),
-        N, C, ID, IH, IW, OD, OH, OW, KD, KH, KW,
-        SD, SH, SW, DD, DH, DW, PD, PH, PW,
-        in_ch_stride, in_row_stride, in_d_stride,
-        out_ch_stride, out_row_stride, out_d_stride,
-        w_ch_stride,
-        attrs.epilogue.type, attrs.epilogue.alpha, attrs.epilogue.beta,
-        attrs.epilogue.min_clip, attrs.epilogue.max_clip,
-        has_bias, attrs.add_to);
+        input.ptr<T>(), weight.ptr<T>(), has_bias ? inputs[2].ptr<T>() : nullptr, output.ptr<T>(),
+        N, C, ID, IH, IW, OD, OH, OW, KD, KH, KW, SD, SH, SW, DD, DH, DW, PD, PH, PW, in_ch_stride,
+        in_row_stride, in_d_stride, out_ch_stride, out_row_stride, out_d_stride, w_ch_stride,
+        attrs.epilogue.type, attrs.epilogue.alpha, attrs.epilogue.beta, attrs.epilogue.min_clip,
+        attrs.epilogue.max_clip, has_bias, attrs.add_to);
 }
 
 // ============================================================
@@ -665,19 +681,15 @@ void depthwise_conv_cuda_3d_impl(
 // ============================================================
 
 template <typename T, int Vec>
-void depthwise_last_launch(
-    DwLastGeom g,
-    int64_t c_begin,
-    int64_t c_count,
-    const TensorView& input,
-    const TensorView& weight,
-    const TensorView* bias,
-    TensorView& output,
-    cudaStream_t stream)
+void depthwise_last_launch(DwLastGeom g, int64_t c_begin, int64_t c_count, const TensorView& input,
+                           const TensorView& weight, const TensorView* bias, TensorView& output,
+                           cudaStream_t stream)
 {
-    if (c_count <= 0) { return; }
-    g.c_begin  = c_begin;
-    g.chunks   = (c_count + Vec - 1) / Vec;
+    if (c_count <= 0) {
+        return;
+    }
+    g.c_begin = c_begin;
+    g.chunks = (c_count + Vec - 1) / Vec;
     g.has_bias = bias != nullptr;
 
     const DwLastBlock blk = dw_last_block(g.chunks);
@@ -689,34 +701,40 @@ void depthwise_last_launch(
     // row r and tap kh share an input row), and four times its own depth in
     // rows: a 14x14 plane cut into four-row blocks leaves eight blocks for the
     // machine, and measured 1.2x *worse* than the flat kernel's 28.
-    const bool rows = g.KH == g.KW && (g.KH == 1 || g.KH == 3 || g.KH == 5)
-                      && g.SH == 1 && g.DH == 1 && g.OH >= 2 * kDwRows;
+    const bool rows = g.KH == g.KW && (g.KH == 1 || g.KH == 3 || g.KH == 5) && g.SH == 1 &&
+                      g.DH == 1 && g.OH >= 2 * kDwRows;
     const int64_t row_blocks = rows ? (g.OH + kDwRows - 1) / kDwRows : g.OH;
     const dim3 grid(unsigned(g.N * g.OD * row_blocks), gy, gz);
 
     const T* in = input.ptr<T>();
-    const T* w  = weight.ptr<T>();
-    const T* b  = bias != nullptr ? bias->ptr<T>() : nullptr;
+    const T* w = weight.ptr<T>();
+    const T* b = bias != nullptr ? bias->ptr<T>() : nullptr;
     T* out = output.ptr<T>();
 
     if (rows) {
         switch (int(g.KH)) {
-        case 1:  depthwise_conv_last_rows_kernel<T, Vec, 1, kDwRows><<<grid, block, 0, stream>>>(in, w, b, out, g); return;
-        case 3:  depthwise_conv_last_rows_kernel<T, Vec, 3, kDwRows><<<grid, block, 0, stream>>>(in, w, b, out, g); return;
-        default: depthwise_conv_last_rows_kernel<T, Vec, 5, kDwRows><<<grid, block, 0, stream>>>(in, w, b, out, g); return;
+        case 1:
+            depthwise_conv_last_rows_kernel<T, Vec, 1, kDwRows>
+                <<<grid, block, 0, stream>>>(in, w, b, out, g);
+            return;
+        case 3:
+            depthwise_conv_last_rows_kernel<T, Vec, 3, kDwRows>
+                <<<grid, block, 0, stream>>>(in, w, b, out, g);
+            return;
+        default:
+            depthwise_conv_last_rows_kernel<T, Vec, 5, kDwRows>
+                <<<grid, block, 0, stream>>>(in, w, b, out, g);
+            return;
         }
     }
     depthwise_conv_last_flat_kernel<T, Vec><<<grid, block, 0, stream>>>(in, w, b, out, g);
 }
 
 template <typename T>
-void depthwise_conv_last_impl(
-    const DepthwiseConvAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void depthwise_conv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
+                              std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
     const int64_t rank = input.rank();
@@ -724,7 +742,7 @@ void depthwise_conv_last_impl(
     const int64_t C = input.shape(1);
 
     DwLastGeom g{};
-    g.N  = input.shape(0);
+    g.N = input.shape(0);
     g.ID = three_d ? input.shape(2) : 1;
     g.IH = input.shape(rank - 2);
     g.IW = input.shape(rank - 1);
@@ -747,27 +765,27 @@ void depthwise_conv_last_impl(
 
     // Channel-last: a pixel is C channels wide, a row IW of them, and the filter
     // is [tap][C].
-    g.in_pix_stride  = C;
-    g.in_row_stride  = input.row_stride_elems();
-    g.in_d_stride    = g.IH * g.in_row_stride;
+    g.in_pix_stride = C;
+    g.in_row_stride = input.row_stride_elems();
+    g.in_d_stride = g.IH * g.in_row_stride;
     g.out_pix_stride = C;
     g.out_row_stride = output.row_stride_elems();
-    g.out_d_stride   = g.OH * g.out_row_stride;
-    g.w_tap_stride   = C;
+    g.out_d_stride = g.OH * g.out_row_stride;
+    g.w_tap_stride = C;
 
-    g.ep_type  = attrs.epilogue.type;
+    g.ep_type = attrs.epilogue.type;
     g.ep_alpha = attrs.epilogue.alpha;
-    g.ep_beta  = attrs.epilogue.beta;
-    g.ep_min   = attrs.epilogue.min_clip;
-    g.ep_max   = attrs.epilogue.max_clip;
-    g.add_to   = attrs.add_to;
+    g.ep_beta = attrs.epilogue.beta;
+    g.ep_min = attrs.epilogue.min_clip;
+    g.ep_max = attrs.epilogue.max_clip;
+    g.add_to = attrs.add_to;
 
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
     constexpr int kVec = static_cast<int>(16 / sizeof(T));
-    const bool vec_ok = C % kVec == 0
-                        && g.in_pix_stride % kVec == 0 && g.in_row_stride % kVec == 0
-                        && g.out_pix_stride % kVec == 0 && g.out_row_stride % kVec == 0;
+    const bool vec_ok = C % kVec == 0 && g.in_pix_stride % kVec == 0 &&
+                        g.in_row_stride % kVec == 0 && g.out_pix_stride % kVec == 0 &&
+                        g.out_row_stride % kVec == 0;
 
     const TensorView* bias = has_bias ? &inputs[2] : nullptr;
     const int64_t full = vec_ok ? (C / kVec) * kVec : 0;
@@ -779,12 +797,9 @@ void depthwise_conv_last_impl(
 // Unified entry point
 // ============================================================
 
-Status depthwise_conv_cuda(
-    const DepthwiseConvAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx,
-    void* /*workspace*/)
+Status depthwise_conv_cuda(const DepthwiseConvAttributes& attrs, TensorView& output,
+                           std::span<const TensorView> inputs, const ComputeContext& ctx,
+                           void* /*workspace*/)
 {
     const auto& input = inputs[0];
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(input.rank());
@@ -823,4 +838,4 @@ Status depthwise_conv_cuda(
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

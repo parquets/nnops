@@ -38,13 +38,12 @@
 namespace nnops::backend::cpu::aarch64 {
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_pack_mr8_nr16_mrxncxkc_f16(
-    int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc,
-    const float16_t* NNOPS_RESTRICT A,
-    const float16_t* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept {
-
+inline void mma_pack_mr8_nr16_mrxncxkc_f16(int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C,
+                                           int ldc, const float16_t* NNOPS_RESTRICT A,
+                                           const float16_t* NNOPS_RESTRICT B, float clamp_min,
+                                           float clamp_max,
+                                           const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     float16_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
     float16_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
     float16_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
@@ -62,7 +61,8 @@ inline void mma_pack_mr8_nr16_mrxncxkc_f16(
     const int r6 = (mr > 6) ? 6 : r5;
     const int r7 = (mr > 7) ? 7 : r6;
 
-    const int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
+    const int ldb_panel =
+        static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
     const float16_t cmin = static_cast<float16_t>(clamp_min);
     const float16_t cmax = static_cast<float16_t>(clamp_max);
     const float16x8_t vmin = vdupq_n_f16(cmin);
@@ -72,9 +72,13 @@ inline void mma_pack_mr8_nr16_mrxncxkc_f16(
 
     // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f16(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f16(bias + n + off); }
-        else { return vdupq_n_f16(0.0f16); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f16(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f16(bias + n + off);
+        } else {
+            return vdupq_n_f16(0.0f16);
+        }
     };
 
     for (; n < nc - 15; n += 16) {
@@ -256,12 +260,10 @@ inline void mma_pack_mr8_nr16_mrxncxkc_f16(
 
 template <bool zero_mode = false, int seed = 0>
 inline void mma_direct_mr8_nr16_mrxncxkc_f16(
-    int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc,
-    const float16_t* NNOPS_RESTRICT A, int lda,
-    const float16_t* NNOPS_RESTRICT B, int ldb,
-    float clamp_min, float clamp_max,
-    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept {
-
+    int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc, const float16_t* NNOPS_RESTRICT A,
+    int lda, const float16_t* NNOPS_RESTRICT B, int ldb, float clamp_min, float clamp_max,
+    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -279,7 +281,8 @@ inline void mma_direct_mr8_nr16_mrxncxkc_f16(
     float16_t* NNOPS_RESTRICT c6_ptr = (mr > 6) ? C + 6 * ldc : c5_ptr;
     float16_t* NNOPS_RESTRICT c7_ptr = (mr > 7) ? C + 7 * ldc : c6_ptr;
 
-    const int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
+    const int ldb_panel =
+        static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
     const int row_step = (ldb < 0) ? 16 : ldb;
     const float16_t cmin = static_cast<float16_t>(clamp_min);
     const float16_t cmax = static_cast<float16_t>(clamp_max);
@@ -289,9 +292,13 @@ inline void mma_direct_mr8_nr16_mrxncxkc_f16(
     int n = 0;
 
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f16(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f16(bias + n + off); }
-        else { return vdupq_n_f16(0.0f16); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f16(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f16(bias + n + off);
+        } else {
+            return vdupq_n_f16(0.0f16);
+        }
     };
     for (; n < nc - 15; n += 16) {
         float16x8_t c00 = init(0, 0), c01 = init(0, 8);
@@ -503,13 +510,12 @@ inline void mma_direct_mr8_nr16_mrxncxkc_f16(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_pack_mr4_nr16_mrxncxkc_f16(
-    int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc,
-    const float16_t* NNOPS_RESTRICT A,
-    const float16_t* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept {
-
+inline void mma_pack_mr4_nr16_mrxncxkc_f16(int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C,
+                                           int ldc, const float16_t* NNOPS_RESTRICT A,
+                                           const float16_t* NNOPS_RESTRICT B, float clamp_min,
+                                           float clamp_max,
+                                           const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     float16_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
     float16_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
     float16_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
@@ -519,7 +525,8 @@ inline void mma_pack_mr4_nr16_mrxncxkc_f16(
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
 
-    const int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
+    const int ldb_panel =
+        static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
     const float16_t cmin = static_cast<float16_t>(clamp_min);
     const float16_t cmax = static_cast<float16_t>(clamp_max);
     const float16x8_t vmin = vdupq_n_f16(cmin);
@@ -529,9 +536,13 @@ inline void mma_pack_mr4_nr16_mrxncxkc_f16(
 
     // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f16(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f16(bias + n + off); }
-        else { return vdupq_n_f16(0.0f16); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f16(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f16(bias + n + off);
+        } else {
+            return vdupq_n_f16(0.0f16);
+        }
     };
 
     for (; n < nc - 15; n += 16) {
@@ -631,7 +642,10 @@ inline void mma_pack_mr4_nr16_mrxncxkc_f16(
         }
 
         const float16x8_t acc[4][2] = {
-            {c00, c01}, {c10, c11}, {c20, c21}, {c30, c31},
+            {c00, c01},
+            {c10, c11},
+            {c20, c21},
+            {c30, c31},
         };
         float16_t* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
         for (int r = 0; r < mr; ++r) {
@@ -663,12 +677,10 @@ inline void mma_pack_mr4_nr16_mrxncxkc_f16(
 
 template <bool zero_mode = false, int seed = 0>
 inline void mma_direct_mr4_nr16_mrxncxkc_f16(
-    int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc,
-    const float16_t* NNOPS_RESTRICT A, int lda,
-    const float16_t* NNOPS_RESTRICT B, int ldb,
-    float clamp_min, float clamp_max,
-    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept {
-
+    int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc, const float16_t* NNOPS_RESTRICT A,
+    int lda, const float16_t* NNOPS_RESTRICT B, int ldb, float clamp_min, float clamp_max,
+    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -678,7 +690,8 @@ inline void mma_direct_mr4_nr16_mrxncxkc_f16(
     float16_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
     float16_t* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
 
-    const int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
+    const int ldb_panel =
+        static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
     const int row_step = (ldb < 0) ? 16 : ldb;
     const float16_t cmin = static_cast<float16_t>(clamp_min);
     const float16_t cmax = static_cast<float16_t>(clamp_max);
@@ -688,9 +701,13 @@ inline void mma_direct_mr4_nr16_mrxncxkc_f16(
     int n = 0;
 
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f16(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f16(bias + n + off); }
-        else { return vdupq_n_f16(0.0f16); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f16(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f16(bias + n + off);
+        } else {
+            return vdupq_n_f16(0.0f16);
+        }
     };
     for (; n < nc - 15; n += 16) {
         float16x8_t c00 = init(0, 0), c01 = init(0, 8);
@@ -801,7 +818,10 @@ inline void mma_direct_mr4_nr16_mrxncxkc_f16(
         }
 
         const float16x8_t acc[4][2] = {
-            {c00, c01}, {c10, c11}, {c20, c21}, {c30, c31},
+            {c00, c01},
+            {c10, c11},
+            {c20, c21},
+            {c30, c31},
         };
         float16_t* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
         for (int r = 0; r < mr; ++r) {
@@ -832,17 +852,18 @@ inline void mma_direct_mr4_nr16_mrxncxkc_f16(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_pack_mr1_nr16_mrxncxkc_f16(
-    int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc,
-    const float16_t* NNOPS_RESTRICT A,
-    const float16_t* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept {
+inline void mma_pack_mr1_nr16_mrxncxkc_f16(int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C,
+                                           int ldc, const float16_t* NNOPS_RESTRICT A,
+                                           const float16_t* NNOPS_RESTRICT B, float clamp_min,
+                                           float clamp_max,
+                                           const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     (void)mr;
 
     float16_t* NNOPS_RESTRICT c0_ptr = C;
 
-    const int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
+    const int ldb_panel =
+        static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
     const float16_t cmin = static_cast<float16_t>(clamp_min);
     const float16_t cmax = static_cast<float16_t>(clamp_max);
     const float16x8_t vmin = vdupq_n_f16(cmin);
@@ -851,9 +872,13 @@ inline void mma_pack_mr1_nr16_mrxncxkc_f16(
     int n = 0;
 
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f16(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f16(bias + n + off); }
-        else { return vdupq_n_f16(0.0f16); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f16(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f16(bias + n + off);
+        } else {
+            return vdupq_n_f16(0.0f16);
+        }
     };
 
     for (; n < nc - 15; n += 16) {
@@ -940,18 +965,18 @@ inline void mma_pack_mr1_nr16_mrxncxkc_f16(
 
 template <bool zero_mode = false, int seed = 0>
 inline void mma_direct_mr1_nr16_mrxncxkc_f16(
-    int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc,
-    const float16_t* NNOPS_RESTRICT A, int lda,
-    const float16_t* NNOPS_RESTRICT B, int ldb,
-    float clamp_min, float clamp_max,
-    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept {
+    int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc, const float16_t* NNOPS_RESTRICT A,
+    int lda, const float16_t* NNOPS_RESTRICT B, int ldb, float clamp_min, float clamp_max,
+    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     (void)mr;
     (void)lda;
     (void)ldc;
 
     float16_t* NNOPS_RESTRICT c0_ptr = C;
 
-    const int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
+    const int ldb_panel =
+        static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
     const int row_step = (ldb < 0) ? 16 : ldb;
     // Below -1 a negative ldb is how far apart the caller's packed panels sit;
     // without one the panels are this call's own and the aligned slot is right.
@@ -964,9 +989,13 @@ inline void mma_direct_mr1_nr16_mrxncxkc_f16(
     int n = 0;
 
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f16(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f16(bias + n + off); }
-        else { return vdupq_n_f16(0.0f16); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f16(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f16(bias + n + off);
+        } else {
+            return vdupq_n_f16(0.0f16);
+        }
     };
     // Two packed panels per pass: at one row the loop is nothing but weight
     // stream, and its scalar A load costs a whole load slot of its own, so one
@@ -1094,15 +1123,13 @@ inline void mma_direct_mr1_nr16_mrxncxkc_f16(
 
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
 template <bool Z, int Seed = 0>
-inline constexpr auto mma_pack_fns_f16 = std::array{
-    &mma_pack_mr8_nr16_mrxncxkc_f16<Z, Seed>,
-    &mma_pack_mr4_nr16_mrxncxkc_f16<Z, Seed>,
-    &mma_pack_mr1_nr16_mrxncxkc_f16<Z, Seed>};
+inline constexpr auto mma_pack_fns_f16 =
+    std::array{&mma_pack_mr8_nr16_mrxncxkc_f16<Z, Seed>, &mma_pack_mr4_nr16_mrxncxkc_f16<Z, Seed>,
+               &mma_pack_mr1_nr16_mrxncxkc_f16<Z, Seed>};
 
 template <bool Z, int Seed = 0>
-inline constexpr auto mma_direct_fns_f16 = std::array{
-    &mma_direct_mr8_nr16_mrxncxkc_f16<Z, Seed>,
-    &mma_direct_mr4_nr16_mrxncxkc_f16<Z, Seed>,
-    &mma_direct_mr1_nr16_mrxncxkc_f16<Z, Seed>};
+inline constexpr auto mma_direct_fns_f16 = std::array{&mma_direct_mr8_nr16_mrxncxkc_f16<Z, Seed>,
+                                                      &mma_direct_mr4_nr16_mrxncxkc_f16<Z, Seed>,
+                                                      &mma_direct_mr1_nr16_mrxncxkc_f16<Z, Seed>};
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

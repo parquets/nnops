@@ -41,22 +41,18 @@ namespace quant_kernel = nnops::backend::cpu::aarch64;
 namespace {
 
 template <typename T>
-void embed_direct_impl(const EmbedAttributes& /*attrs*/,
-                        TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx)
+void embed_direct_impl(const EmbedAttributes& /*attrs*/, TensorView& output,
+                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& weight  = inputs[0];
+    const auto& weight = inputs[0];
     const auto& indices = inputs[1];
 
-    const int64_t V   = weight.shape(0);
+    const int64_t V = weight.shape(0);
     const int64_t dim = weight.shape(1);
     const int64_t num_indices = indices.numel();
 
     const T* weight_ptr = weight.ptr<T>();
-    const int64_t w_row_stride = (weight.rank() == 2)
-        ? dim
-        : weight.row_stride_elems();
+    const int64_t w_row_stride = (weight.rank() == 2) ? dim : weight.row_stride_elems();
 
     T* out_ptr = output.ptr<T>();
     const int64_t out_row_stride = output.row_stride_elems();
@@ -78,26 +74,22 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
             idx = V - 1;
         }
 
-        std::memcpy(out_ptr + n * out_row_stride,
-                    weight_ptr + idx * w_row_stride,
-                    row_bytes);
+        std::memcpy(out_ptr + n * out_row_stride, weight_ptr + idx * w_row_stride, row_bytes);
     };
 
     ctx.cpu.run(0, num_indices, body);
 }
 
-template <typename T>  // T = weight storage type (int8_t / uint8_t)
-void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
-                              TensorView& output,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx)
+template <typename T> // T = weight storage type (int8_t / uint8_t)
+void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/, TensorView& output,
+                             std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& weight  = inputs[0];
+    const auto& weight = inputs[0];
     const auto& indices = inputs[1];
 
     const auto& qp = weight.quant_params();
-    const bool per_row = (qp.granularity == QuantGranularity::PerToken)
-                      || (qp.granularity == QuantGranularity::PerChannel);
+    const bool per_row = (qp.granularity == QuantGranularity::PerToken) ||
+                         (qp.granularity == QuantGranularity::PerChannel);
     NNOPS_ASSERT(per_row);
     const bool has_zp = (qp.zero_point_data != nullptr);
 
@@ -106,7 +98,7 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
     const int64_t num_indices = indices.numel();
 
     const T* weight_ptr = weight.ptr<T>();
-    const int64_t w_row_elems = dim;  // int8/uint8: 1 byte per element
+    const int64_t w_row_elems = dim; // int8/uint8: 1 byte per element
 
     const bool out_f16 = (output.data_type() == DataType::f16);
     const bool is_i64 = (indices.data_type() == DataType::s64);
@@ -115,11 +107,14 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
     const int dim_i = static_cast<int>(dim);
 
     const auto resolve_idx = [&](int64_t n) -> int64_t {
-        int64_t idx = is_i64
-            ? static_cast<const int64_t*>(indices.ptr<void>())[n]
-            : static_cast<const int32_t*>(indices.ptr<void>())[n];
-        if (idx < 0) { idx = 0; }
-        if (idx >= V) { idx = V - 1; }
+        int64_t idx = is_i64 ? static_cast<const int64_t*>(indices.ptr<void>())[n] :
+                               static_cast<const int32_t*>(indices.ptr<void>())[n];
+        if (idx < 0) {
+            idx = 0;
+        }
+        if (idx >= V) {
+            idx = V - 1;
+        }
         return idx;
     };
 
@@ -132,8 +127,7 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
 
         if (out_f16) {
             half* dst = output.ptr<half>() + n * out_row_stride;
-            quant_kernel::dequantization<T>(1, dim_i, dst, dim_i,
-                                            w_row, dim_i, &s_val, &zp_val);
+            quant_kernel::dequantization<T>(1, dim_i, dst, dim_i, w_row, dim_i, &s_val, &zp_val);
         } else if (output.data_type() == DataType::bf16) {
             // The arch kernel has f32 and f16 stores only, so a bf16 row
             // dequantizes through a stack chunk and narrows on the way out.
@@ -142,27 +136,24 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
             float tmp[kChunk];
             for (int64_t off = 0; off < dim; off += kChunk) {
                 const int c = static_cast<int>(std::min<int64_t>(kChunk, dim - off));
-                quant_kernel::dequantization<T>(1, c, tmp, c, w_row + off, c,
-                                                &s_val, &zp_val);
-                for (int i = 0; i < c; ++i) { simd::s_store(&dst[off + i], tmp[i]); }
+                quant_kernel::dequantization<T>(1, c, tmp, c, w_row + off, c, &s_val, &zp_val);
+                for (int i = 0; i < c; ++i) {
+                    simd::s_store(&dst[off + i], tmp[i]);
+                }
             }
         } else {
             float* dst = output.ptr<float>() + n * out_row_stride;
-            quant_kernel::dequantization<T>(1, dim_i, dst, dim_i,
-                                            w_row, dim_i, &s_val, &zp_val);
+            quant_kernel::dequantization<T>(1, dim_i, dst, dim_i, w_row, dim_i, &s_val, &zp_val);
         }
     };
 
     ctx.cpu.run(0, num_indices, body);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status embed_cpu(const EmbedAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* /*workspace*/)
+Status embed_cpu(const EmbedAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
     const auto w_dtype = inputs[0].data_type();
     const auto o_dtype = output.data_type();
@@ -193,4 +184,4 @@ Status embed_cpu(const EmbedAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

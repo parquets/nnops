@@ -54,17 +54,15 @@ namespace k = nnops::kernel;
 namespace {
 
 template <bool IsMax, typename T>
-void pooling_channel_first_impl(const PoolingAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx)
+void pooling_channel_first_impl(const PoolingAttributes& attrs, TensorView& output,
+                                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
-    const int64_t rank  = input.rank();
+    const int64_t rank = input.rank();
     const int64_t srank = PoolingAttributes::spatial_rank(rank);
 
     // One "block" per channel: a channel-first tensor has no channel vector.
-    const int64_t N      = input.shape(0);
+    const int64_t N = input.shape(0);
     const int64_t blocks = input.num_channel_blocks();
 
     const int64_t ID = (srank == 3) ? input.shape(2) : 1;
@@ -84,8 +82,8 @@ void pooling_channel_first_impl(const PoolingAttributes& attrs,
     const int64_t SW = attrs.stride[2];
 
     const int64_t DD_ = (srank == 3) ? attrs.dilation[0] : 1;
-    const int64_t DH  = attrs.dilation[1];
-    const int64_t DW  = attrs.dilation[2];
+    const int64_t DH = attrs.dilation[1];
+    const int64_t DW = attrs.dilation[2];
 
     const int64_t PD = (srank == 3) ? attrs.padding[0] : 0;
     const int64_t PH = attrs.padding[1];
@@ -95,18 +93,29 @@ void pooling_channel_first_impl(const PoolingAttributes& attrs,
     const auto* in_ptr = input.ptr<T>();
 
     k::PoolingKernelParams p{};
-    p.ID = ID; p.IH = IH; p.IW = IW;
-    p.OH = OH; p.OW = OW;
-    p.KD = KD; p.KH = KH; p.KW = KW;
-    p.SD = SD; p.SH = SH; p.SW = SW;
-    p.DD = DD_; p.DH = DH; p.DW = DW;
-    p.PD = PD; p.PH = PH; p.PW = PW;
+    p.ID = ID;
+    p.IH = IH;
+    p.IW = IW;
+    p.OH = OH;
+    p.OW = OW;
+    p.KD = KD;
+    p.KH = KH;
+    p.KW = KW;
+    p.SD = SD;
+    p.SH = SH;
+    p.SW = SW;
+    p.DD = DD_;
+    p.DH = DH;
+    p.DW = DW;
+    p.PD = PD;
+    p.PH = PH;
+    p.PW = PW;
     p.out_row_stride = output.row_stride_elems();
-    p.in_d_stride    = IH * input.row_stride_elems();
-    p.in_row_stride  = input.row_stride_elems();
-    p.exclude_pad    = attrs.exclude_pad;
+    p.in_d_stride = IH * input.row_stride_elems();
+    p.in_row_stride = input.row_stride_elems();
+    p.exclude_pad = attrs.exclude_pad;
 
-    const int64_t in_ch_stride  = input.channel_block_stride_elems();
+    const int64_t in_ch_stride = input.channel_block_stride_elems();
     const int64_t out_ch_stride = output.channel_block_stride_elems();
     const float avg_scale = 1.0f / static_cast<float>(KD * KH * KW);
 
@@ -114,7 +123,7 @@ void pooling_channel_first_impl(const PoolingAttributes& attrs,
     // h4 form. Max/avg is a compile-time arm, like the channel-last route.
 
     const auto compute_block = [&](int64_t n, int64_t blk) {
-        const T* in_base  = in_ptr + n * blocks * in_ch_stride + blk * in_ch_stride;
+        const T* in_base = in_ptr + n * blocks * in_ch_stride + blk * in_ch_stride;
         T* out_base = out_ptr + n * blocks * out_ch_stride + blk * out_ch_stride;
 
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
@@ -126,14 +135,13 @@ void pooling_channel_first_impl(const PoolingAttributes& attrs,
             for (int64_t oh = 0; oh < OH; ++oh) {
                 pc.od = od;
                 pc.oh = oh;
-                k::pool_channel_first<IsMax>(out_d + oh * pc.out_row_stride, in_base,
-                                             pc, avg_scale, attrs.add_to);
+                k::pool_channel_first<IsMax>(out_d + oh * pc.out_row_stride, in_base, pc, avg_scale,
+                                             attrs.add_to);
             }
         }
     };
 
-    ctx.cpu.run(0, N * blocks,
-            [&](int64_t tid) { compute_block(tid / blocks, tid % blocks); });
+    ctx.cpu.run(0, N * blocks, [&](int64_t tid) { compute_block(tid / blocks, tid % blocks); });
 }
 
 // ============================================================
@@ -141,10 +149,8 @@ void pooling_channel_first_impl(const PoolingAttributes& attrs,
 // ============================================================
 
 template <bool IsMax, typename T>
-void pooling_channel_last_impl(const PoolingAttributes& attrs,
-                       TensorView& output,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx)
+void pooling_channel_last_impl(const PoolingAttributes& attrs, TensorView& output,
+                               std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
@@ -164,8 +170,11 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs,
     const int64_t OW = output.shape(srank + 1);
 
     k::PoolingKernelParams p{};
-    p.ID = ID; p.IH = IH; p.IW = IW;
-    p.OH = OH; p.OW = OW;
+    p.ID = ID;
+    p.IH = IH;
+    p.IW = IW;
+    p.OH = OH;
+    p.OW = OW;
     p.KD = (srank == 3) ? attrs.kernel_shape[0] : 1;
     p.KH = attrs.kernel_shape[1];
     p.KW = attrs.kernel_shape[2];
@@ -179,10 +188,10 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs,
     p.PH = attrs.padding[1];
     p.PW = attrs.padding[2];
     p.out_row_stride = output.row_stride_elems();
-    p.in_row_stride  = input.row_stride_elems();
-    p.in_d_stride    = IH * p.in_row_stride;
-    p.pix_stride     = C;   // a pixel is C channels wide
-    p.exclude_pad    = attrs.exclude_pad;
+    p.in_row_stride = input.row_stride_elems();
+    p.in_d_stride = IH * p.in_row_stride;
+    p.pix_stride = C; // a pixel is C channels wide
+    p.exclude_pad = attrs.exclude_pad;
 
     const float avg_scale = 1.0f / static_cast<float>(p.KD * p.KH * p.KW);
 
@@ -192,7 +201,7 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs,
     // A task is a strip of four output rows: the group's window is
     // 4*SH + (KH-1)*DH input rows of IW*C elements and every channel chunk walks
     // it again, so the width is cut to fit L2 and stay resident across the sweep.
-    const int64_t hgroups = (OH + 3) / 4;   // four output rows per task
+    const int64_t hgroups = (OH + 3) / 4; // four output rows per task
     const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH;
     constexpr int64_t kStripBytes = 128 * 1024;
     int64_t strip = OW;
@@ -205,7 +214,7 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs,
         }
     }
     const int64_t strips = (OW + strip - 1) / strip;
-    const int64_t groups  = N * OD * hgroups * strips;
+    const int64_t groups = N * OD * hgroups * strips;
     const int64_t nt = ctx.cpu.thread_count();
     int64_t cchunks = 1;
     if (groups < nt && nblocks > 1) {
@@ -224,11 +233,11 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs,
 
     ctx.cpu.run(0, groups * cchunks, [&](int64_t tid) {
         const int64_t cc = tid % cchunks;
-        const int64_t g  = tid / cchunks;
+        const int64_t g = tid / cchunks;
         const int64_t st = g % strips;
         const int64_t hg = (g / strips) % hgroups;
         const int64_t od = (g / (strips * hgroups)) % OD;
-        const int64_t n  = g / (strips * hgroups * OD);
+        const int64_t n = g / (strips * hgroups * OD);
 
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
         k::PoolingKernelParams pc = p;
@@ -240,8 +249,8 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs,
         const T* in_img = in_ptr + n * ID * p.in_d_stride;
         // The kernel indexes the store by the absolute column, so the base stays
         // at the row start even though the loop covers only this strip.
-        T* out_row = out_ptr + n * OD * OH * p.out_row_stride
-                   + od * OH * p.out_row_stride + pc.oh * p.out_row_stride;
+        T* out_row = out_ptr + n * OD * OH * p.out_row_stride + od * OH * p.out_row_stride +
+                     pc.oh * p.out_row_stride;
 
         const int64_t blk0 = cc * blocks_per;
         const int64_t blk1 = std::min(blk0 + blocks_per, nblocks);
@@ -263,11 +272,11 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs,
             for (int s = 0; s < nseg; ++s) {
                 const int64_t co = c0 + seg_off[s];
                 if constexpr (IsMax) {
-                    k::pool_channel_last<true>(out_row + co, in_img + co, pc, 0.0f,
-                                       attrs.add_to, seg_lanes[s]);
+                    k::pool_channel_last<true>(out_row + co, in_img + co, pc, 0.0f, attrs.add_to,
+                                               seg_lanes[s]);
                 } else {
                     k::pool_channel_last<false>(out_row + co, in_img + co, pc, avg_scale,
-                                        attrs.add_to, seg_lanes[s]);
+                                                attrs.add_to, seg_lanes[s]);
                 }
             }
         }
@@ -279,64 +288,59 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs,
 // ============================================================
 
 template <bool IsMax, typename T>
-void pooling_global_impl(const PoolingAttributes& attrs,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx)
+void pooling_global_impl(const PoolingAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
-    const int64_t N      = input.shape(0);
-    const int64_t C      = input.shape(1);
-    const bool last      = is_channel_last(input.layout());
+    const int64_t N = input.shape(0);
+    const int64_t C = input.shape(1);
+    const bool last = is_channel_last(input.layout());
     // Blocks: one per channel plane for channel-first, ceil(C/16) for channel-last.
     // A channel-last task reads sixteen channels — one 64-byte line of f32 — per
     // pixel, so the plane is fetched once and still splits across the pool.
     constexpr int64_t kGlobalCh = 16;
-    const int64_t blocks = last ? (C + kGlobalCh - 1) / kGlobalCh
-                                : input.num_channel_blocks();
+    const int64_t blocks = last ? (C + kGlobalCh - 1) / kGlobalCh : input.num_channel_blocks();
 
     k::PoolingKernelParams p{};
     p.ID = (srank == 3) ? input.shape(2) : 1;
     p.IH = input.shape(srank);
     p.IW = input.shape(srank + 1);
-    p.in_d_stride   = p.IH * input.row_stride_elems();
+    p.in_d_stride = p.IH * input.row_stride_elems();
     p.in_row_stride = input.row_stride_elems();
-    p.pix_stride    = last ? C : 8;
+    p.pix_stride = last ? C : 8;
 
     const double count = static_cast<double>(p.ID) * p.IH * p.IW;
     const float scale = (count > 0.0) ? static_cast<float>(1.0 / count) : 0.0f;
 
     // The global output is one pixel per (n, channel), so a channel-last
     // image's stride is its whole plane — which is what the block stride is.
-    const int64_t in_ch_stride  = last ? static_cast<int64_t>(p.ID) * p.in_d_stride
-                                       : input.channel_block_stride_elems();
+    const int64_t in_ch_stride =
+        last ? static_cast<int64_t>(p.ID) * p.in_d_stride : input.channel_block_stride_elems();
     const int64_t out_ch_stride = output.channel_block_stride_elems();
     const auto* in_ptr = input.ptr<T>();
     auto* out_ptr = output.ptr<T>();
 
     ctx.cpu.run(0, N * blocks, [&](int64_t tid) {
-        const int64_t n   = tid / blocks;
+        const int64_t n = tid / blocks;
         const int64_t blk = tid % blocks;
 
         if (last) {
             // A full sixteen lanes load unmasked; 9..15 mask the second vector;
             // eight or fewer take one.
-            const int64_t c0    = blk * kGlobalCh;
+            const int64_t c0 = blk * kGlobalCh;
             const int64_t lanes = std::min<int64_t>(kGlobalCh, C - c0);
-            const T* in_base  = in_ptr + n * in_ch_stride + c0;
+            const T* in_base = in_ptr + n * in_ch_stride + c0;
             T* out_base = out_ptr + n * out_ch_stride + c0;
             if (lanes == 16) {
-                k::global_channel_last_vec<IsMax, T, 2>(out_base, in_base, p, scale,
-                                                   attrs.add_to, lanes);
+                k::global_channel_last_vec<IsMax, T, 2>(out_base, in_base, p, scale, attrs.add_to,
+                                                        lanes);
             } else if (lanes > 8) {
-                k::global_channel_last_vec<IsMax, T, 2, 4, false>(out_base, in_base, p,
-                                                             scale, attrs.add_to,
-                                                             lanes);
+                k::global_channel_last_vec<IsMax, T, 2, 4, false>(out_base, in_base, p, scale,
+                                                                  attrs.add_to, lanes);
             } else {
                 k::global_store_lanes(out_base,
-                                      k::global_channel_last<IsMax>(in_base, p, scale,
-                                                               lanes),
+                                      k::global_channel_last<IsMax>(in_base, p, scale, lanes),
                                       attrs.add_to, lanes);
             }
             return;
@@ -345,8 +349,7 @@ void pooling_global_impl(const PoolingAttributes& attrs,
         const T* in_base = in_ptr + tid * in_ch_stride;
         T* out_base = out_ptr + tid * out_ch_stride;
 
-        s_store_add(out_base, k::global_channel_first<IsMax>(in_base, p, scale),
-                    attrs.add_to);
+        s_store_add(out_base, k::global_channel_first<IsMax>(in_base, p, scale), attrs.add_to);
     });
 }
 
@@ -375,16 +378,15 @@ inline int64_t adaptive_end(int64_t o, int64_t in, int64_t out) noexcept
 /// vector-friendly axis), so a window is a scalar-seeded reduction per output
 /// element. The task grid is (n, channel plane).
 template <bool IsMax, typename T>
-void pooling_adaptive_channel_first_impl(const PoolingAttributes& attrs,
-                                  TensorView& output,
-                                  std::span<const TensorView> inputs,
-                                  const ComputeContext& ctx)
+void pooling_adaptive_channel_first_impl(const PoolingAttributes& attrs, TensorView& output,
+                                         std::span<const TensorView> inputs,
+                                         const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
-    const int64_t rank  = input.rank();
+    const int64_t rank = input.rank();
     const int64_t srank = PoolingAttributes::spatial_rank(rank);
 
-    const int64_t N      = input.shape(0);
+    const int64_t N = input.shape(0);
     const int64_t blocks = input.num_channel_blocks();
     const int64_t ID = (srank == 3) ? input.shape(2) : 1;
     const int64_t IH = input.shape(srank);
@@ -393,13 +395,13 @@ void pooling_adaptive_channel_first_impl(const PoolingAttributes& attrs,
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    const int64_t in_c  = input.channel_block_stride_elems();
+    const int64_t in_c = input.channel_block_stride_elems();
     const int64_t out_c = output.channel_block_stride_elems();
-    const int64_t in_d  = (srank == 3) ? input.stride_elems(2) : 0;
+    const int64_t in_d = (srank == 3) ? input.stride_elems(2) : 0;
     const int64_t out_d = (srank == 3) ? output.stride_elems(2) : 0;
-    const int64_t in_h  = input.stride_elems(srank);
+    const int64_t in_h = input.stride_elems(srank);
     const int64_t out_h = output.stride_elems(srank);
-    const int64_t in_w  = input.stride_elems(srank + 1);
+    const int64_t in_w = input.stride_elems(srank + 1);
     const int64_t out_w = output.stride_elems(srank + 1);
 
     const auto* in_ptr = input.ptr<T>();
@@ -407,9 +409,9 @@ void pooling_adaptive_channel_first_impl(const PoolingAttributes& attrs,
     const float low = -std::numeric_limits<float>::infinity();
 
     ctx.cpu.run(0, N * blocks, [&](int64_t tid) {
-        const int64_t n   = tid / blocks;
+        const int64_t n = tid / blocks;
         const int64_t blk = tid % blocks;
-        const T* in_plane  = in_ptr + n * blocks * in_c + blk * in_c;
+        const T* in_plane = in_ptr + n * blocks * in_c + blk * in_c;
         T* out_plane = out_ptr + n * blocks * out_c + blk * out_c;
 
         for (int64_t od = 0; od < OD; ++od) {
@@ -425,8 +427,7 @@ void pooling_adaptive_channel_first_impl(const PoolingAttributes& attrs,
 
                     // f16 AvgPool accumulates in half lanes, matching the
                     // window and global kernels; MaxPool keeps f32 (no rounding).
-                    using AccT = std::conditional_t<
-                        std::is_same_v<T, half> && !IsMax, half, float>;
+                    using AccT = std::conditional_t<std::is_same_v<T, half> && !IsMax, half, float>;
                     AccT acc = IsMax ? static_cast<AccT>(low) : AccT{};
                     for (int64_t d = d0; d < d1; ++d) {
                         for (int64_t h = h0; h < h1; ++h) {
@@ -445,8 +446,8 @@ void pooling_adaptive_channel_first_impl(const PoolingAttributes& attrs,
                     if (!IsMax) {
                         result /= static_cast<float>((d1 - d0) * (h1 - h0) * (w1 - w0));
                     }
-                    s_store_add(out_plane + od * out_d + oh * out_h + ow * out_w,
-                                result, attrs.add_to);
+                    s_store_add(out_plane + od * out_d + oh * out_h + ow * out_w, result,
+                                attrs.add_to);
                 }
             }
         }
@@ -456,17 +457,16 @@ void pooling_adaptive_channel_first_impl(const PoolingAttributes& attrs,
 /// Channel-last adaptive: the lane is the channel, so the window walk is a
 /// vector min/add over whole pixels and only the channel tail runs scalar.
 template <bool IsMax, typename T>
-void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs,
-                                TensorView& output,
-                                std::span<const TensorView> inputs,
-                                const ComputeContext& ctx)
+void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs, TensorView& output,
+                                        std::span<const TensorView> inputs,
+                                        const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
-    const int64_t rank  = input.rank();
+    const int64_t rank = input.rank();
     const int64_t srank = PoolingAttributes::spatial_rank(rank);
 
-    const int64_t N  = input.shape(0);
-    const int64_t C  = input.shape(1);
+    const int64_t N = input.shape(0);
+    const int64_t C = input.shape(1);
     const int64_t ID = (srank == 3) ? input.shape(2) : 1;
     const int64_t IH = input.shape(srank);
     const int64_t IW = input.shape(srank + 1);
@@ -474,14 +474,14 @@ void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs,
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    const int64_t in_n  = input.stride_elems(0);
+    const int64_t in_n = input.stride_elems(0);
     const int64_t out_n = output.stride_elems(0);
-    const int64_t in_d  = (srank == 3) ? input.stride_elems(2) : 0;
+    const int64_t in_d = (srank == 3) ? input.stride_elems(2) : 0;
     const int64_t out_d = (srank == 3) ? output.stride_elems(2) : 0;
-    const int64_t in_h  = input.stride_elems(srank);
+    const int64_t in_h = input.stride_elems(srank);
     const int64_t out_h = output.stride_elems(srank);
     // A pixel step is the channel count in this layout.
-    const int64_t in_pix  = input.stride_elems(rank - 1);
+    const int64_t in_pix = input.stride_elems(rank - 1);
     const int64_t out_pix = output.stride_elems(rank - 1);
 
     const auto* in_ptr = input.ptr<T>();
@@ -492,7 +492,7 @@ void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs,
     // One task per output row: every output column re-walks a window of the
     // same rows, and the row's channels are the vector.
     ctx.cpu.run(0, N * OD * OH, [&](int64_t tid) {
-        const int64_t n  = tid / (OD * OH);
+        const int64_t n = tid / (OD * OH);
         const int64_t od = (tid / OH) % OD;
         const int64_t oh = tid % OH;
 
@@ -502,8 +502,7 @@ void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs,
         const int64_t h1 = adaptive_end(oh, IH, OH);
         const T* in_base = in_ptr + n * in_n + d0 * in_d + h0 * in_h;
         T* out_row = out_ptr + n * out_n + od * out_d + oh * out_h;
-        const float inv_count = 1.0f / static_cast<float>(
-            (d1 - d0) * (h1 - h0));
+        const float inv_count = 1.0f / static_cast<float>((d1 - d0) * (h1 - h0));
 
         for (int64_t ow = 0; ow < OW; ++ow) {
             const int64_t w0 = adaptive_begin(ow, IW, OW);
@@ -524,12 +523,13 @@ void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs,
                         }
                     }
                 }
-                if (!IsMax) { acc = v_mul(acc, v_set1(in_ptr, inv)); }
+                if (!IsMax) {
+                    acc = v_mul(acc, v_set1(in_ptr, inv));
+                }
                 v_store_add(dst + c, acc, attrs.add_to);
             }
             for (; c < C; ++c) {
-                using AccT = std::conditional_t<
-                    std::is_same_v<T, half> && !IsMax, half, float>;
+                using AccT = std::conditional_t<std::is_same_v<T, half> && !IsMax, half, float>;
                 AccT acc = IsMax ? static_cast<AccT>(low) : AccT{};
                 for (int64_t d = d0; d < d1; ++d) {
                     for (int64_t h = h0; h < h1; ++h) {
@@ -545,7 +545,9 @@ void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs,
                     }
                 }
                 float result = s_load(&acc);
-                if (!IsMax) { result *= inv; }
+                if (!IsMax) {
+                    result *= inv;
+                }
                 s_store_add(dst + c, result, attrs.add_to);
             }
         }
@@ -554,10 +556,8 @@ void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs,
 
 /// The fp driver: a native plane scan when global, the window walk otherwise.
 template <typename T>
-void pooling_fp(const PoolingAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx)
+void pooling_fp(const PoolingAttributes& attrs, TensorView& output,
+                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const bool last = is_channel_last(inputs[0].layout());
     // global wins over adaptive: an all-ones adaptive output is resolved to
@@ -572,11 +572,11 @@ void pooling_fp(const PoolingAttributes& attrs,
     }
     if (attrs.adaptive()) {
         if (attrs.type == PoolingType::Max) {
-            return last ? pooling_adaptive_channel_last_impl<true, T>(attrs, output, inputs, ctx)
-                        : pooling_adaptive_channel_first_impl<true, T>(attrs, output, inputs, ctx);
+            return last ? pooling_adaptive_channel_last_impl<true, T>(attrs, output, inputs, ctx) :
+                          pooling_adaptive_channel_first_impl<true, T>(attrs, output, inputs, ctx);
         }
-        return last ? pooling_adaptive_channel_last_impl<false, T>(attrs, output, inputs, ctx)
-                    : pooling_adaptive_channel_first_impl<false, T>(attrs, output, inputs, ctx);
+        return last ? pooling_adaptive_channel_last_impl<false, T>(attrs, output, inputs, ctx) :
+                      pooling_adaptive_channel_first_impl<false, T>(attrs, output, inputs, ctx);
     }
     if (!last) {
         if (attrs.type == PoolingType::Max) {
@@ -593,15 +593,14 @@ void pooling_fp(const PoolingAttributes& attrs,
 
 /// A global window spelled out as the full extent: the quantized kernels have no
 /// whole-plane form, so the full window is walked instead.
-inline PoolingAttributes full_extent_window(PoolingAttributes attrs,
-                                            const TensorView& in)
+inline PoolingAttributes full_extent_window(PoolingAttributes attrs, const TensorView& in)
 {
     const int64_t srank = PoolingAttributes::spatial_rank(in.rank());
     const auto first = static_cast<size_t>(3 - srank);
     for (int64_t d = 0; d < srank; ++d) {
         attrs.kernel_shape[first + static_cast<size_t>(d)] = in.shape(2 + d);
-        attrs.stride[first + static_cast<size_t>(d)]   = 1;
-        attrs.padding[first + static_cast<size_t>(d)]  = 0;
+        attrs.stride[first + static_cast<size_t>(d)] = 1;
+        attrs.padding[first + static_cast<size_t>(d)] = 0;
         attrs.dilation[first + static_cast<size_t>(d)] = 1;
     }
     attrs.global = false;
@@ -621,10 +620,8 @@ inline PoolingAttributes full_extent_window(PoolingAttributes attrs,
 /// strip, over dequantize/requantize kernels; full blocks keep the raw-integer
 /// max (exact when scales and zero points match).
 template <bool IsMax, typename InT, typename OutT>
-void pooling_channel_last_quant_impl(const PoolingAttributes& attrs,
-                             TensorView& output,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx)
+void pooling_channel_last_quant_impl(const PoolingAttributes& attrs, TensorView& output,
+                                     std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
@@ -640,16 +637,19 @@ void pooling_channel_last_quant_impl(const PoolingAttributes& attrs,
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    const auto& in_qp  = input.quant_params();
+    const auto& in_qp = input.quant_params();
     const auto& out_qp = output.quant_params();
-    const float in_scale  = in_qp.scale;
-    const float in_zero   = static_cast<float>(in_qp.zero_point);
+    const float in_scale = in_qp.scale;
+    const float in_zero = static_cast<float>(in_qp.zero_point);
     const float out_scale = out_qp.scale;
-    const float out_zero  = static_cast<float>(out_qp.zero_point);
+    const float out_zero = static_cast<float>(out_qp.zero_point);
 
     k::PoolingKernelParams p{};
-    p.ID = ID; p.IH = IH; p.IW = IW;
-    p.OH = OH; p.OW = OW;
+    p.ID = ID;
+    p.IH = IH;
+    p.IW = IW;
+    p.OH = OH;
+    p.OW = OW;
     p.KD = (srank == 3) ? attrs.kernel_shape[0] : 1;
     p.KH = attrs.kernel_shape[1];
     p.KW = attrs.kernel_shape[2];
@@ -663,23 +663,21 @@ void pooling_channel_last_quant_impl(const PoolingAttributes& attrs,
     p.PH = attrs.padding[1];
     p.PW = attrs.padding[2];
     p.out_row_stride = output.row_stride_elems();
-    p.in_row_stride  = input.row_stride_elems();
-    p.in_d_stride    = IH * p.in_row_stride;
-    p.pix_stride     = C;
-    p.exclude_pad    = attrs.exclude_pad;
+    p.in_row_stride = input.row_stride_elems();
+    p.in_d_stride = IH * p.in_row_stride;
+    p.pix_stride = C;
+    p.exclude_pad = attrs.exclude_pad;
 
     const float avg_scale = 1.0f / static_cast<float>(p.KD * p.KH * p.KW);
 
-    const bool use_fast = IsMax && std::is_same_v<InT, OutT>
-                       && !attrs.add_to
-                       && (in_qp.scale == out_qp.scale)
-                       && (in_qp.zero_point == out_qp.zero_point);
+    const bool use_fast = IsMax && std::is_same_v<InT, OutT> && !attrs.add_to &&
+                          (in_qp.scale == out_qp.scale) && (in_qp.zero_point == out_qp.zero_point);
 
     auto* out_ptr = output.ptr<OutT>();
     const auto* in_ptr = input.ptr<InT>();
 
     const int64_t hgroups = (OH + 3) / 4;
-    const int64_t groups  = N * OD * hgroups;
+    const int64_t groups = N * OD * hgroups;
     const int64_t nt = ctx.cpu.thread_count();
     int64_t cchunks = 1;
     if (groups < nt && nblocks > 1) {
@@ -689,18 +687,18 @@ void pooling_channel_last_quant_impl(const PoolingAttributes& attrs,
 
     ctx.cpu.run(0, groups * cchunks, [&](int64_t tid) {
         const int64_t cc = tid % cchunks;
-        const int64_t g  = tid / cchunks;
+        const int64_t g = tid / cchunks;
         const int64_t hg = g % hgroups;
         const int64_t od = (g / hgroups) % OD;
-        const int64_t n  = g / (hgroups * OD);
+        const int64_t n = g / (hgroups * OD);
 
         k::PoolingKernelParams pc = p;
         pc.od = od;
         pc.oh = hg * 4;
 
         const InT* in_img = in_ptr + n * ID * p.in_d_stride;
-        OutT* out_row = out_ptr + n * OD * OH * p.out_row_stride
-                      + od * OH * p.out_row_stride + pc.oh * p.out_row_stride;
+        OutT* out_row = out_ptr + n * OD * OH * p.out_row_stride + od * OH * p.out_row_stride +
+                        pc.oh * p.out_row_stride;
 
         const int64_t blk0 = cc * blocks_per;
         const int64_t blk1 = std::min(blk0 + blocks_per, nblocks);
@@ -710,17 +708,18 @@ void pooling_channel_last_quant_impl(const PoolingAttributes& attrs,
             if constexpr (IsMax) {
                 if constexpr (std::is_same_v<InT, OutT>) {
                     if (use_fast && lanes == k::kChannelLanes) {
-                        k::maxpool_channel_last_quant_fast<4>(out_row + c0, in_img + c0, pc, out_zero);
+                        k::maxpool_channel_last_quant_fast<4>(out_row + c0, in_img + c0, pc,
+                                                              out_zero);
                         continue;
                     }
                 }
-                k::pool_channel_last_quant<true, InT, OutT>(
-                    out_row + c0, in_img + c0, pc, 0.0f, in_scale, in_zero,
-                    out_scale, out_zero, attrs.add_to, lanes);
+                k::pool_channel_last_quant<true, InT, OutT>(out_row + c0, in_img + c0, pc, 0.0f,
+                                                            in_scale, in_zero, out_scale, out_zero,
+                                                            attrs.add_to, lanes);
             } else {
                 k::pool_channel_last_quant<false, InT, OutT>(
-                    out_row + c0, in_img + c0, pc, avg_scale, in_scale, in_zero,
-                    out_scale, out_zero, attrs.add_to, lanes);
+                    out_row + c0, in_img + c0, pc, avg_scale, in_scale, in_zero, out_scale,
+                    out_zero, attrs.add_to, lanes);
             }
         }
     });
@@ -728,10 +727,8 @@ void pooling_channel_last_quant_impl(const PoolingAttributes& attrs,
 
 /// Dispatch the one quantized route over max/avg.
 template <typename InT, typename OutT>
-void pooling_quant(const PoolingAttributes& attrs,
-                   TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx)
+void pooling_quant(const PoolingAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     if (attrs.type == PoolingType::Max) {
         pooling_channel_last_quant_impl<true, InT, OutT>(attrs, output, inputs, ctx);
@@ -740,15 +737,13 @@ void pooling_quant(const PoolingAttributes& attrs,
     }
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status pooling_cpu(const PoolingAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
-                  void* /*workspace*/)
+Status pooling_cpu(const PoolingAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx,
+                   void* /*workspace*/)
 {
-    const auto dtype  = inputs[0].data_type();
+    const auto dtype = inputs[0].data_type();
     const auto odtype = output.data_type();
     const bool quant = (dtype == DataType::s8 || dtype == DataType::u8);
 
@@ -761,9 +756,13 @@ Status pooling_cpu(const PoolingAttributes& attrs,
         const size_t first = static_cast<size_t>(3 - srank);
         bool all_ones = true;
         for (int64_t d = 0; d < srank; ++d) {
-            if (a.output_size[first + static_cast<size_t>(d)] != 1) { all_ones = false; }
+            if (a.output_size[first + static_cast<size_t>(d)] != 1) {
+                all_ones = false;
+            }
         }
-        if (all_ones) { a.global = true; }
+        if (all_ones) {
+            a.global = true;
+        }
     }
 
     // Quantized pooling needs a channel lane: channel-last only, and the
@@ -773,8 +772,7 @@ Status pooling_cpu(const PoolingAttributes& attrs,
     }
     // ...and with no whole-plane form, a global request is walked as the full
     // extent window.
-    const PoolingAttributes qattrs =
-        (quant && a.global) ? full_extent_window(a, inputs[0]) : a;
+    const PoolingAttributes qattrs = (quant && a.global) ? full_extent_window(a, inputs[0]) : a;
 
     switch (dtype) {
     case DataType::f32:
@@ -818,39 +816,34 @@ Status pooling_cpu(const PoolingAttributes& attrs,
 /// the per-axis spans, [1] and [2], and skips [0]). auto_pad is resolved here
 /// because the kernel only sees an explicit pad; quantized pooling stays
 /// channel-last and has no adaptive form, both inherited from the 2D kernel.
-Status pool1d_cpu(const Pool1DAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
-                  void* workspace)
+Status pool1d_cpu(const Pool1DAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx, void* workspace)
 {
     const auto& input = inputs[0];
 
     PoolingAttributes a{};
-    a.type        = (attrs.type == Pool1DType::Max) ? PoolingType::Max
-                                                    : PoolingType::Average;
+    a.type = (attrs.type == Pool1DType::Max) ? PoolingType::Max : PoolingType::Average;
     a.kernel_shape = {1, 1, attrs.kernel_shape};
-    a.stride       = {1, 1, attrs.stride};
-    a.padding      = {0, 0, attrs.padding};
-    a.dilation     = {1, 1, attrs.dilation};
-    a.exclude_pad  = attrs.exclude_pad;
-    a.add_to       = attrs.add_to;
-    a.global       = attrs.global;
+    a.stride = {1, 1, attrs.stride};
+    a.padding = {0, 0, attrs.padding};
+    a.dilation = {1, 1, attrs.dilation};
+    a.exclude_pad = attrs.exclude_pad;
+    a.add_to = attrs.add_to;
+    a.global = attrs.global;
     // A 2D activation reads output_size's H and W slots; H stays 1.
-    a.output_size  = {0, 1, attrs.output_size};
+    a.output_size = {0, 1, attrs.output_size};
 
-    if (!a.global && !a.adaptive() &&
-        attrs.auto_pad != Pool1DAttributes::AutoPad::NOTSET) {
-        a.padding[2] = resolve_leading_padding(
-            input.shape(2), attrs.kernel_shape, attrs.stride, attrs.dilation,
-            attrs.padding, static_cast<int>(attrs.auto_pad));
+    if (!a.global && !a.adaptive() && attrs.auto_pad != Pool1DAttributes::AutoPad::NOTSET) {
+        a.padding[2] = resolve_leading_padding(input.shape(2), attrs.kernel_shape, attrs.stride,
+                                               attrs.dilation, attrs.padding,
+                                               static_cast<int>(attrs.auto_pad));
     }
     a.auto_pad = PoolingAttributes::AutoPad::NOTSET;
 
     TensorView out4 = lift_wide(output);
-    TensorView in4  = lift_wide(input);
+    TensorView in4 = lift_wide(input);
     const TensorView ins[1] = {in4};
     return pooling_cpu(a, out4, std::span<const TensorView>(ins, 1), ctx, workspace);
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

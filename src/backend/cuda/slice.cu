@@ -19,12 +19,14 @@ namespace nnops::backend::cuda {
 namespace {
 
 template <class T>
-Status slice_entry(const SliceAttributes& attrs, TensorView& output,
-                   const TensorView& input, cudaStream_t stream)
+Status slice_entry(const SliceAttributes& attrs, TensorView& output, const TensorView& input,
+                   cudaStream_t stream)
 {
     const int64_t rank = input.rank();
     const int64_t total = output.numel();
-    if (total == 0) { return Status::ok; }
+    if (total == 0) {
+        return Status::ok;
+    }
 
     int64_t dims[8], src_strides[8], dst_strides[8];
     fill_output_dims(output, dims);
@@ -36,7 +38,9 @@ Status slice_entry(const SliceAttributes& attrs, TensorView& output,
         int64_t ax = attrs.axes[a] < 0 ? attrs.axes[a] + rank : attrs.axes[a];
         const int64_t n = input.shape(ax);
         int64_t s = attrs.starts[a];
-        if (s < 0) { s += n; }
+        if (s < 0) {
+            s += n;
+        }
         s = std::clamp<int64_t>(s, 0, n);
         const int64_t step = (a < attrs.steps.size()) ? attrs.steps[a] : 1;
         base += s * input.stride_elems(ax);
@@ -60,11 +64,11 @@ Status slice_entry(const SliceAttributes& attrs, TensorView& output,
     return launch_move(input.ptr<T>(), output.ptr<T>(), p, stream);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 Status slice_cuda(const SliceAttributes& attrs, TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx, void* /*workspace*/)
+                  std::span<const TensorView> inputs, const ComputeContext& ctx,
+                  void* /*workspace*/)
 {
     const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     switch (inputs[0].data_type()) {
@@ -79,4 +83,4 @@ Status slice_cuda(const SliceAttributes& attrs, TensorView& output,
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

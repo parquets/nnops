@@ -11,15 +11,13 @@ namespace nnops {
 NNOPS_DECLARE_CPU(ResizeAttributes, resize_cpu)
 NNOPS_DECLARE_CUDA(ResizeAttributes, resize_cuda)
 
-NNOPS_OP_BOILERPLATE(Resize, ResizeAttributes,
-        backend::cpu::resize_cpu, NNOPS_IF_CUDA(backend::cuda::resize_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(Resize, ResizeAttributes, backend::cpu::resize_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::resize_cuda), nullptr)
 
-std::vector<TensorDesc> Resize::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Resize::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     std::array<int64_t, 3> os = attrs_.output_size;
-    return {resize_output_shape(
-        std::span<const int64_t>(os.data(), os.size()), inputs)};
+    return {resize_output_shape(std::span<const int64_t>(os.data(), os.size()), inputs)};
 }
 
 Status Resize::validate(std::span<const TensorDesc> inputs,
@@ -30,15 +28,15 @@ Status Resize::validate(std::span<const TensorDesc> inputs,
         is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOrChannelLast));
 }
 
-Status Resize::compute(std::span<TensorView> outputs,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace)
+Status Resize::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                       const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

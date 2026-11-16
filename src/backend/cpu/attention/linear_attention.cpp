@@ -136,16 +136,14 @@ inline v_f32x8 vload_f32(const bfloat16* p) { return v_load(p); }
 
 /// Narrow an f32 vector back to T and store it.
 inline void vstore_f32(float* p, const v_f32x8& v) { v_store(p, v); }
-inline void vstore_f32(half* p, const v_f32x8& v)  { v_store(p, v_cvt_f32_to_f16(v)); }
+inline void vstore_f32(half* p, const v_f32x8& v) { v_store(p, v_cvt_f32_to_f16(v)); }
 #ifdef NNOPS_ARCH_AARCH64
 inline void vstore_f32(bfloat16* p, const v_f32x8& v) { v_store(p, v); }
 #endif
 
 template <typename T>
-void linear_attention_impl(const LinearAttentionAttributes& attrs,
-                           std::span<TensorView> outputs,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx)
+void linear_attention_impl(const LinearAttentionAttributes& attrs, std::span<TensorView> outputs,
+                           std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     constexpr int L = simd_lane_for<T>;
 
@@ -153,34 +151,33 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
     const TensorView& K = inputs[1];
     const TensorView& V = inputs[2];
     const TensorView& G = inputs[3];
-    TensorView& O  = outputs[0];
+    TensorView& O = outputs[0];
     TensorView& St = outputs[1];
 
-    const int64_t B  = Q.shape(0);
+    const int64_t B = Q.shape(0);
     const int64_t Hq = Q.shape(1);
-    const int64_t S  = Q.shape(2);
+    const int64_t S = Q.shape(2);
     const int64_t Dk = Q.shape(3);
     const int64_t Hk = attrs.num_kv_heads > 0 ? attrs.num_kv_heads : Hq;
-    const int64_t Hv = V.shape(1);   // the value head owns the state
-    const int64_t Dv = V.shape(3);   // the state's column / output width
+    const int64_t Hv = V.shape(1); // the value head owns the state
+    const int64_t Dv = V.shape(3); // the state's column / output width
 
     // Q is per value head: the expansion from the key heads to the value heads
     // (FLA's repeat_interleave) happens on the caller's side, because the state
     // and therefore the readout belong to the value head — a query head shared
     // by several states would have several outputs and no place to put them.
-    const int64_t Gqq = Hq / Hv;   // query heads per value head
-    const int64_t Gvk = Hv / Hk;   // value heads per key head
+    const int64_t Gqq = Hq / Hv; // query heads per value head
+    const int64_t Gvk = Hv / Hk; // value heads per key head
 
     NNOPS_ASSERT(Gqq > 0 && Gqq * Hv == Hq);
     NNOPS_ASSERT(Hk > 0 && Gvk * Hk == Hv);
 
     const bool has_conv = inputs.size() > 4 && !inputs[4].is_empty();
     const bool has_beta = inputs.size() > 5 && !inputs[5].is_empty();
-    const int64_t CK    = has_conv ? inputs[4].shape(2) : 0;
+    const int64_t CK = has_conv ? inputs[4].shape(2) : 0;
 
-    const float scale = attrs.scale != 0.0f
-        ? attrs.scale
-        : 1.0f / std::sqrt(static_cast<float>(Dk));
+    const float scale =
+        attrs.scale != 0.0f ? attrs.scale : 1.0f / std::sqrt(static_cast<float>(Dk));
 
     // Element strides (channel-first; the trailing dim is contiguous).
     const int64_t qs0 = Q.stride_elems(0), qs1 = Q.stride_elems(1), qs2 = Q.stride_elems(2);
@@ -188,20 +185,20 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
     const int64_t vs0 = V.stride_elems(0), vs1 = V.stride_elems(1), vs2 = V.stride_elems(2);
     const int64_t gs0 = G.stride_elems(0), gs1 = G.stride_elems(1), gs2 = G.stride_elems(2);
     const int64_t os0 = O.stride_elems(0), os1 = O.stride_elems(1), os2 = O.stride_elems(2);
-    const int64_t ts0 = St.stride_elems(0), ts1 = St.stride_elems(1),
-                  ts2 = St.stride_elems(2), ts3 = St.stride_elems(3);
+    const int64_t ts0 = St.stride_elems(0), ts1 = St.stride_elems(1), ts2 = St.stride_elems(2),
+                  ts3 = St.stride_elems(3);
     const int64_t cws0 = has_conv ? inputs[4].stride_elems(0) : 0;
     const int64_t cws2 = has_conv ? inputs[4].stride_elems(2) : 0;
-    const int64_t bs2  = has_beta ? inputs[5].stride_elems(2) : 0;
-    const int64_t bs0  = has_beta ? inputs[5].stride_elems(0) : 0;
-    const int64_t bs1  = has_beta ? inputs[5].stride_elems(1) : 0;
+    const int64_t bs2 = has_beta ? inputs[5].stride_elems(2) : 0;
+    const int64_t bs0 = has_beta ? inputs[5].stride_elems(0) : 0;
+    const int64_t bs1 = has_beta ? inputs[5].stride_elems(1) : 0;
 
     const T* qp = Q.ptr<T>();
     const T* kp = K.ptr<T>();
     const T* vp = V.ptr<T>();
     const T* gp = G.ptr<T>();
-    T*       op = O.ptr<T>();
-    T*       sp = St.ptr<T>();
+    T* op = O.ptr<T>();
+    T* sp = St.ptr<T>();
 
     // Convolution channel bases: the packed weights lay Q out first, then K, then
     // V — the query block over its expanded heads, each at its own row width.
@@ -222,7 +219,9 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
     if (const int64_t workers = ctx.cpu.worker_count(); workers > n_state) {
         int64_t want = (workers + n_state - 1) / n_state;
         const int64_t max_slabs = Dv / L > 0 ? Dv / L : 1;
-        if (want > max_slabs) { want = max_slabs; }
+        if (want > max_slabs) {
+            want = max_slabs;
+        }
         if (want > 1) {
             slab = ((Dv + want - 1) / want + L - 1) / L * L;
             n_slabs = (Dv + slab - 1) / slab;
@@ -231,21 +230,19 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
 
     const int64_t NTasks = n_state * n_slabs;
     ctx.cpu.run(0, NTasks, [&](int64_t task) {
-        const int64_t js  = task % n_slabs;
-        const int64_t hv  = (task / n_slabs) % Hv;
-        const int64_t b   = task / (n_slabs * Hv);
-        const int64_t j0  = js * slab;
-        const int64_t j1  = (j0 + slab < Dv) ? j0 + slab : Dv;
-        const int64_t hk  = hv / Gvk;
+        const int64_t js = task % n_slabs;
+        const int64_t hv = (task / n_slabs) % Hv;
+        const int64_t b = task / (n_slabs * Hv);
+        const int64_t j0 = js * slab;
+        const int64_t j1 = (j0 + slab < Dv) ? j0 + slab : Dv;
+        const int64_t hk = hv / Gvk;
         const int64_t hq0 = hv * Gqq;
 
         // Per-task scratch, all f32: the state matrix, the per-token key / value
         // / gate rows, the gate-folded key, the delta, and one query row plus
         // its q·k for each query head under this value head.
-        PoolPtr state_owner(sizeof(float) * static_cast<size_t>(Dk) *
-                            static_cast<size_t>(Dv));
-        PoolPtr rows_owner(sizeof(float) * static_cast<size_t>(
-            4 * Dk + 2 * Dv + Gqq * (Dk + 1)));
+        PoolPtr state_owner(sizeof(float) * static_cast<size_t>(Dk) * static_cast<size_t>(Dv));
+        PoolPtr rows_owner(sizeof(float) * static_cast<size_t>(4 * Dk + 2 * Dv + Gqq * (Dk + 1)));
         float* Sf = state_owner.as<float>();
         float* kc = rows_owner.as<float>();
         float* vc = kc + Dk;
@@ -294,14 +291,17 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
         // Fill dst[0..len) with the columns [off, off+len) of `src`'s row at
         // time t, convolved against the [tap][W] weights `wch` when has_conv.
         // W is the source's full row width; a value-column slab passes off/len.
-        auto fetch_row = [&](const T* src, int64_t src_ts, const float* wch,
-                             int64_t W, int64_t off, int64_t len, int64_t t,
-                             float* dst) {
+        auto fetch_row = [&](const T* src, int64_t src_ts, const float* wch, int64_t W, int64_t off,
+                             int64_t len, int64_t t, float* dst) {
             if (!has_conv) {
                 const T* row = src + t * src_ts + off;
                 int64_t d = 0;
-                for (; d + L <= len; d += L) { vstore_f32(dst + d, vload_f32(row + d)); }
-                for (; d < len; ++d) { dst[d] = s_load(row + d); }
+                for (; d + L <= len; d += L) {
+                    vstore_f32(dst + d, vload_f32(row + d));
+                }
+                for (; d < len; ++d) {
+                    dst[d] = s_load(row + d);
+                }
                 return;
             }
             // y[t] = sum_k w[:, k] * x[t - (K-1) + k], x = 0 for t < 0.
@@ -310,10 +310,11 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                 v_f32x8 acc = v_zero_f32x8();
                 for (int64_t k = 0; k < CK; ++k) {
                     const int64_t tt = t - (CK - 1) + k;
-                    if (tt < 0) { continue; }   // causal left zero-pad
+                    if (tt < 0) {
+                        continue;
+                    } // causal left zero-pad
                     acc = v_fmadd(vload_f32(src + tt * src_ts + off + d),
-                                  v_load(wch + k * W + off + d),
-                                  acc);
+                                  v_load(wch + k * W + off + d), acc);
                 }
                 v_store(dst + d, acc);
             }
@@ -321,7 +322,9 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                 float acc = 0.0f;
                 for (int64_t k = 0; k < CK; ++k) {
                     const int64_t tt = t - (CK - 1) + k;
-                    if (tt < 0) { continue; }
+                    if (tt < 0) {
+                        continue;
+                    }
                     acc += wch[k * W + off + d] * s_load(src + tt * src_ts + off + d);
                 }
                 dst[d] = acc;
@@ -332,8 +335,12 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
             const T* srow = sp + b * ts0 + hv * ts1 + i * ts2;
             float* drow = Sf + i * Dv;
             int64_t j = j0;
-            for (; j + L <= j1; j += L) { vstore_f32(drow + j, vload_f32(srow + j * ts3)); }
-            for (; j < j1; ++j) { drow[j] = s_load(srow + j * ts3); }
+            for (; j + L <= j1; j += L) {
+                vstore_f32(drow + j, vload_f32(srow + j * ts3));
+            }
+            for (; j < j1; ++j) {
+                drow[j] = s_load(srow + j * ts3);
+            }
         }
 
         const T* k_base = kp + b * ks0 + hk * ks1;
@@ -364,9 +371,15 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
             // would outweigh the Dk*Dv/L vector ops they feed.
             const T* g_row = g_base + t * gs2;
             int64_t i = 0;
-            for (; i + L <= Dk; i += L) { v_store(gv + i, v_exp(vload_f32(g_row + i))); }
-            for (; i < Dk; ++i) { gv[i] = std::exp(s_load(g_row + i)); }
-            for (i = 0; i < Dk; ++i) { kg[i] = kc[i] * gv[i]; }
+            for (; i + L <= Dk; i += L) {
+                v_store(gv + i, v_exp(vload_f32(g_row + i)));
+            }
+            for (; i < Dk; ++i) {
+                gv[i] = std::exp(s_load(g_row + i));
+            }
+            for (i = 0; i < Dk; ++i) {
+                kg[i] = kc[i] * gv[i];
+            }
 
             // One query row per query head, its q·k, and the gate folded in so
             // the shared product below carries one broadcast per head.
@@ -380,13 +393,17 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                     acc = v_fmadd(v_load(qrow + ii), v_load(kc + ii), acc);
                 }
                 float qk = v_reduce_sum(acc);
-                for (; ii < Dk; ++ii) { qk += qrow[ii] * kc[ii]; }
+                for (; ii < Dk; ++ii) {
+                    qk += qrow[ii] * kc[ii];
+                }
                 qk_h[g] = qk;
-                for (ii = 0; ii < Dk; ++ii) { qrow[ii] *= gv[ii]; }
+                for (ii = 0; ii < Dk; ++ii) {
+                    qrow[ii] *= gv[ii];
+                }
             }
 
             const float beta = has_beta ? s_load(b_base + t * bs2) : 1.0f;
-            const v_f32x8 vbeta  = v_set1_f32x8(beta);
+            const v_f32x8 vbeta = v_set1_f32x8(beta);
             const v_f32x8 vscale = v_set1_f32x8(scale);
 
             // One block of NJ vectors for a group of NH query heads. NJ trades
@@ -399,9 +416,13 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                 const bool first = (g0 == 0);
                 v_f32x8 accK[NJ];
                 v_f32x8 accQ[NH][NJ];
-                for (int jj = 0; jj < NJ; ++jj) { accK[jj] = v_zero_f32x8(); }
+                for (int jj = 0; jj < NJ; ++jj) {
+                    accK[jj] = v_zero_f32x8();
+                }
                 for (int h = 0; h < NH; ++h) {
-                    for (int jj = 0; jj < NJ; ++jj) { accQ[h][jj] = v_zero_f32x8(); }
+                    for (int jj = 0; jj < NJ; ++jj) {
+                        accQ[h][jj] = v_zero_f32x8();
+                    }
                 }
                 for (int64_t ii = 0; ii < Dk; ++ii) {
                     v_f32x8 s[NJ];
@@ -424,19 +445,15 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                 for (int jj = 0; jj < NJ; ++jj) {
                     v_f32x8 dvec;
                     if (first) {
-                        dvec = v_mul(vbeta,
-                                     v_sub(v_load(vc + j + jj * L), accK[jj]));
+                        dvec = v_mul(vbeta, v_sub(v_load(vc + j + jj * L), accK[jj]));
                         v_store(dv + j + jj * L, dvec);
                     } else {
                         dvec = v_load(dv + j + jj * L);
                     }
                     for (int h = 0; h < NH; ++h) {
-                        const v_f32x8 o = v_mul(
-                            vscale,
-                            v_fmadd(v_set1_f32x8(qk_h[g0 + h]), dvec, accQ[h][jj]));
-                        vstore_f32(op + b * os0 + (hq0 + g0 + h) * os1 + t * os2 +
-                                       j + jj * L,
-                                   o);
+                        const v_f32x8 o =
+                            v_mul(vscale, v_fmadd(v_set1_f32x8(qk_h[g0 + h]), dvec, accQ[h][jj]));
+                        vstore_f32(op + b * os0 + (hq0 + g0 + h) * os1 + t * os2 + j + jj * L, o);
                     }
                 }
             };
@@ -448,10 +465,14 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                 for (int64_t j = jstart; j < j1; ++j) {
                     float accK = 0.0f;
                     float accQ[NH];
-                    for (int h = 0; h < NH; ++h) { accQ[h] = 0.0f; }
+                    for (int h = 0; h < NH; ++h) {
+                        accQ[h] = 0.0f;
+                    }
                     for (int64_t ii = 0; ii < Dk; ++ii) {
                         const float s = Sf[ii * Dv + j];
-                        if (first) { accK += kg[ii] * s; }
+                        if (first) {
+                            accK += kg[ii] * s;
+                        }
                         for (int h = 0; h < NH; ++h) {
                             accQ[h] += qbuf[(g0 + h) * Dk + ii] * s;
                         }
@@ -509,10 +530,11 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                 float* row = Sf + ii * Dv;
                 int64_t j = j0;
                 for (; j + L <= j1; j += L) {
-                    v_store(row + j, v_fmadd(vk, v_load(dv + j),
-                                             v_mul(vg, v_load(row + j))));
+                    v_store(row + j, v_fmadd(vk, v_load(dv + j), v_mul(vg, v_load(row + j))));
                 }
-                for (; j < j1; ++j) { row[j] = gv[ii] * row[j] + kc[ii] * dv[j]; }
+                for (; j < j1; ++j) {
+                    row[j] = gv[ii] * row[j] + kc[ii] * dv[j];
+                }
             }
         };
 
@@ -522,22 +544,22 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
         // the first chunk whose cumulative decay left f32's exponent range.
         auto chunk_route = [&]() -> int64_t {
             constexpr int64_t C = kChunk;
-            constexpr int NV = static_cast<int>((C + L - 1) / L);   // a C×C row
+            constexpr int NV = static_cast<int>((C + L - 1) / L); // a C×C row
             const int64_t W = Dk > Dv ? Dk : Dv;
-            PoolPtr ck_owner(sizeof(float) * static_cast<size_t>(
-                C * Dk * 6 + C * C + C * Dv * 2 + C + 2 * W));
-            float* cum = ck_owner.as<float>();   // [C][Dk] log decay, then Qe
-            float* ep  = cum + C * Dk;           // [C][Dk] exp(+cum)
-            float* em  = ep + C * Dk;            // [C][Dk] exp(-cum)
-            float* ke  = em + C * Dk;            // [C][Dk] Ke = k ⊙ ep
-            float* ka  = ke + C * Dk;            // [C][Dk] Ka = k ⊙ em
-            float* kat = ka + C * Dk;            // [Dk][C] Ka transposed
-            float* am  = kat + C * Dk;           // [C][C] A, then Aq
-            float* dl  = am + C * C;             // [C][Dv] deltas
-            float* vb  = dl + C * Dv;            // [C][Dv] beta ⊙ V
-            float* bt  = vb + C * Dv;            // [C] beta
-            float* ra  = bt + C;                 // [W] row buffer
-            float* rb  = ra + W;                 // [W] row buffer
+            PoolPtr ck_owner(sizeof(float) *
+                             static_cast<size_t>(C * Dk * 6 + C * C + C * Dv * 2 + C + 2 * W));
+            float* cum = ck_owner.as<float>(); // [C][Dk] log decay, then Qe
+            float* ep = cum + C * Dk;          // [C][Dk] exp(+cum)
+            float* em = ep + C * Dk;           // [C][Dk] exp(-cum)
+            float* ke = em + C * Dk;           // [C][Dk] Ke = k ⊙ ep
+            float* ka = ke + C * Dk;           // [C][Dk] Ka = k ⊙ em
+            float* kat = ka + C * Dk;          // [Dk][C] Ka transposed
+            float* am = kat + C * Dk;          // [C][C] A, then Aq
+            float* dl = am + C * C;            // [C][Dv] deltas
+            float* vb = dl + C * Dv;           // [C][Dv] beta ⊙ V
+            float* bt = vb + C * Dv;           // [C] beta
+            float* ra = bt + C;                // [W] row buffer
+            float* rb = ra + W;                // [W] row buffer
             const v_f32x8 vs = v_set1_f32x8(scale);
 
             int64_t t0 = 0;
@@ -563,7 +585,9 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                         worst = a > worst ? a : worst;
                     }
                 }
-                if (worst > kChunkSafeLog) { break; }
+                if (worst > kChunkSafeLog) {
+                    break;
+                }
 
                 for (int64_t r = 0; r < ct; ++r) {
                     const float* c_row = cum + r * Dk;
@@ -598,7 +622,9 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                 // whatever the pool had; every reader stays inside ct, but a
                 // zero keeps the unused lanes from carrying a NaN.
                 for (int64_t i = 0; i < Dk && ct < C; ++i) {
-                    for (int64_t s = ct; s < C; ++s) { kat[i * C + s] = 0.0f; }
+                    for (int64_t s = ct; s < C; ++s) {
+                        kat[i * C + s] = 0.0f;
+                    }
                 }
 
                 // A[r][s] = Ke[r] · Ka[s]; only r > s is read back. Four rows
@@ -609,7 +635,9 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                     for (; ra + NA <= ct; ra += NA) {
                         v_f32x8 acc[NA][NV];
                         for (int rr = 0; rr < NA; ++rr) {
-                            for (int nv = 0; nv < NV; ++nv) { acc[rr][nv] = v_zero_f32x8(); }
+                            for (int nv = 0; nv < NV; ++nv) {
+                                acc[rr][nv] = v_zero_f32x8();
+                            }
                         }
                         for (int64_t i = 0; i < Dk; ++i) {
                             v_f32x8 kv[NV];
@@ -632,7 +660,9 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                     for (; ra < ct; ++ra) {
                         const float* e_row = ke + ra * Dk;
                         v_f32x8 acc[NV];
-                        for (int nv = 0; nv < NV; ++nv) { acc[nv] = v_zero_f32x8(); }
+                        for (int nv = 0; nv < NV; ++nv) {
+                            acc[nv] = v_zero_f32x8();
+                        }
                         for (int64_t i = 0; i < Dk; ++i) {
                             const v_f32x8 b = v_set1_f32x8(e_row[i]);
                             for (int nv = 0; nv < NV; ++nv) {
@@ -654,7 +684,9 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                     fetch_row(v_base, vs2, wv, Dv, j0, j1 - j0, t0 + r, rb);
                     const float b = bt[r];
                     float* vrow = vb + r * Dv;
-                    for (int64_t d = 0; d < j1 - j0; ++d) { vrow[j0 + d] = b * rb[d]; }
+                    for (int64_t d = 0; d < j1 - j0; ++d) {
+                        vrow[j0 + d] = b * rb[d];
+                    }
                 }
 
                 // X = beta ⊙ (V - Ke · S_in), into the delta block. Rows share
@@ -666,19 +698,19 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                     int64_t j = j0;
                     for (; j + L <= j1; j += L) {
                         v_f32x8 acc[NR];
-                        for (int rr = 0; rr < NR; ++rr) { acc[rr] = v_zero_f32x8(); }
+                        for (int rr = 0; rr < NR; ++rr) {
+                            acc[rr] = v_zero_f32x8();
+                        }
                         for (int64_t i = 0; i < Dk; ++i) {
                             const v_f32x8 s = v_load(Sf + i * Dv + j);
                             for (int rr = 0; rr < NR; ++rr) {
-                                acc[rr] = v_fmadd(
-                                    v_set1_f32x8(ke[(r0 + rr) * Dk + i]), s, acc[rr]);
+                                acc[rr] = v_fmadd(v_set1_f32x8(ke[(r0 + rr) * Dk + i]), s, acc[rr]);
                             }
                         }
                         for (int rr = 0; rr < NR; ++rr) {
                             const int64_t r = r0 + rr;
-                            v_store(dl + r * Dv + j,
-                                    v_sub(v_load(vb + r * Dv + j),
-                                          v_mul(v_set1_f32x8(bt[r]), acc[rr])));
+                            v_store(dl + r * Dv + j, v_sub(v_load(vb + r * Dv + j),
+                                                           v_mul(v_set1_f32x8(bt[r]), acc[rr])));
                         }
                     }
                     for (; j < j1; ++j) {
@@ -705,14 +737,15 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                     for (; j + L <= j1; j += L) {
                         v_f32x8 acc = v_zero_f32x8();
                         for (int64_t i = 0; i < Dk; ++i) {
-                            acc = v_fmadd(v_set1_f32x8(e_row[i]),
-                                          v_load(Sf + i * Dv + j), acc);
+                            acc = v_fmadd(v_set1_f32x8(e_row[i]), v_load(Sf + i * Dv + j), acc);
                         }
                         v_store(x_row + j, v_sub(v_load(v_row + j), v_mul(v_set1_f32x8(b), acc)));
                     }
                     for (; j < j1; ++j) {
                         float acc = 0.0f;
-                        for (int64_t i = 0; i < Dk; ++i) { acc += e_row[i] * Sf[i * Dv + j]; }
+                        for (int64_t i = 0; i < Dk; ++i) {
+                            acc += e_row[i] * Sf[i * Dv + j];
+                        }
                         x_row[j] = v_row[j] - b * acc;
                     }
                 }
@@ -727,10 +760,11 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                         const float* d_row = dl + s * Dv;
                         int64_t j = j0;
                         for (; j + L <= j1; j += L) {
-                            v_store(x_row + j,
-                                    v_fmadd(c, v_load(d_row + j), v_load(x_row + j)));
+                            v_store(x_row + j, v_fmadd(c, v_load(d_row + j), v_load(x_row + j)));
                         }
-                        for (; j < j1; ++j) { x_row[j] -= beta * a_row[s] * d_row[j]; }
+                        for (; j < j1; ++j) {
+                            x_row[j] -= beta * a_row[s] * d_row[j];
+                        }
                     }
                 }
 
@@ -740,11 +774,13 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                     const int64_t hq = hq0 + g;
                     const T* q_base = qp + b * qs0 + hq * qs1;
                     for (int64_t r = 0; r < ct; ++r) {
-                        fetch_row(q_base, qs2, has_conv ? wq + g * CK * Dk : nullptr,
-                                  Dk, 0, Dk, t0 + r, ra);
+                        fetch_row(q_base, qs2, has_conv ? wq + g * CK * Dk : nullptr, Dk, 0, Dk,
+                                  t0 + r, ra);
                         const float* p_row = ep + r * Dk;
-                        float* q_row = cum + r * Dk;   // the log decay is dead here
-                        for (int64_t i = 0; i < Dk; ++i) { q_row[i] = ra[i] * p_row[i]; }
+                        float* q_row = cum + r * Dk; // the log decay is dead here
+                        for (int64_t i = 0; i < Dk; ++i) {
+                            q_row[i] = ra[i] * p_row[i];
+                        }
                     }
 
                     // Aq[r][s] = Qe[r] · Ka[s], the same four-row blocking.
@@ -764,8 +800,7 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                                     kv[nv] = v_load(kat + i * C + nv * L);
                                 }
                                 for (int rr = 0; rr < NA; ++rr) {
-                                    const v_f32x8 bq =
-                                        v_set1_f32x8(cum[(ra + rr) * Dk + i]);
+                                    const v_f32x8 bq = v_set1_f32x8(cum[(ra + rr) * Dk + i]);
                                     for (int nv = 0; nv < NV; ++nv) {
                                         acc[rr][nv] = v_fmadd(bq, kv[nv], acc[rr][nv]);
                                     }
@@ -780,12 +815,13 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                         for (; ra < ct; ++ra) {
                             const float* q_row = cum + ra * Dk;
                             v_f32x8 acc[NV];
-                            for (int nv = 0; nv < NV; ++nv) { acc[nv] = v_zero_f32x8(); }
+                            for (int nv = 0; nv < NV; ++nv) {
+                                acc[nv] = v_zero_f32x8();
+                            }
                             for (int64_t i = 0; i < Dk; ++i) {
                                 const v_f32x8 bq = v_set1_f32x8(q_row[i]);
                                 for (int nv = 0; nv < NV; ++nv) {
-                                    acc[nv] = v_fmadd(bq, v_load(kat + i * C + nv * L),
-                                                      acc[nv]);
+                                    acc[nv] = v_fmadd(bq, v_load(kat + i * C + nv * L), acc[nv]);
                                 }
                             }
                             for (int nv = 0; nv < NV; ++nv) {
@@ -803,26 +839,28 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                         int64_t j = j0;
                         for (; j + L <= j1; j += L) {
                             v_f32x8 acc[NR];
-                            for (int rr = 0; rr < NR; ++rr) { acc[rr] = v_zero_f32x8(); }
+                            for (int rr = 0; rr < NR; ++rr) {
+                                acc[rr] = v_zero_f32x8();
+                            }
                             for (int64_t i = 0; i < Dk; ++i) {
                                 const v_f32x8 s = v_load(Sf + i * Dv + j);
                                 for (int rr = 0; rr < NR; ++rr) {
-                                    acc[rr] = v_fmadd(
-                                        v_set1_f32x8(cum[(r0 + rr) * Dk + i]), s, acc[rr]);
+                                    acc[rr] =
+                                        v_fmadd(v_set1_f32x8(cum[(r0 + rr) * Dk + i]), s, acc[rr]);
                                 }
                             }
                             for (int64_t s = 0; s < r0; ++s) {
                                 const v_f32x8 d = v_load(dl + s * Dv + j);
                                 for (int rr = 0; rr < NR; ++rr) {
-                                    acc[rr] = v_fmadd(
-                                        v_set1_f32x8(am[(r0 + rr) * C + s]), d, acc[rr]);
+                                    acc[rr] =
+                                        v_fmadd(v_set1_f32x8(am[(r0 + rr) * C + s]), d, acc[rr]);
                                 }
                             }
                             for (int64_t s = r0; s < r0 + NR; ++s) {
                                 const v_f32x8 d = v_load(dl + s * Dv + j);
                                 for (int64_t rr = s - r0; rr < NR; ++rr) {
-                                    acc[rr] = v_fmadd(
-                                        v_set1_f32x8(am[(r0 + rr) * C + s]), d, acc[rr]);
+                                    acc[rr] =
+                                        v_fmadd(v_set1_f32x8(am[(r0 + rr) * C + s]), d, acc[rr]);
                                 }
                             }
                             for (int rr = 0; rr < NR; ++rr) {
@@ -862,19 +900,21 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                         for (; j + L <= j1; j += L) {
                             v_f32x8 acc = v_zero_f32x8();
                             for (int64_t i = 0; i < Dk; ++i) {
-                                acc = v_fmadd(v_set1_f32x8(q_row[i]),
-                                              v_load(Sf + i * Dv + j), acc);
+                                acc = v_fmadd(v_set1_f32x8(q_row[i]), v_load(Sf + i * Dv + j), acc);
                             }
                             for (int64_t s = 0; s < ns; ++s) {
-                                acc = v_fmadd(v_set1_f32x8(a_row[s]),
-                                              v_load(dl + s * Dv + j), acc);
+                                acc = v_fmadd(v_set1_f32x8(a_row[s]), v_load(dl + s * Dv + j), acc);
                             }
                             vstore_f32(o_row + j, v_mul(acc, vs));
                         }
                         for (; j < j1; ++j) {
                             float acc = 0.0f;
-                            for (int64_t i = 0; i < Dk; ++i) { acc += q_row[i] * Sf[i * Dv + j]; }
-                            for (int64_t s = 0; s < ns; ++s) { acc += a_row[s] * dl[s * Dv + j]; }
+                            for (int64_t i = 0; i < Dk; ++i) {
+                                acc += q_row[i] * Sf[i * Dv + j];
+                            }
+                            for (int64_t s = 0; s < ns; ++s) {
+                                acc += a_row[s] * dl[s * Dv + j];
+                            }
                             s_store(o_row + j, scale * acc);
                         }
                     }
@@ -892,31 +932,32 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
                         int64_t j = j0;
                         for (; j + NJU * L <= j1; j += NJU * L) {
                             v_f32x8 acc[NJU];
-                            for (int jj = 0; jj < NJU; ++jj) { acc[jj] = v_zero_f32x8(); }
+                            for (int jj = 0; jj < NJU; ++jj) {
+                                acc[jj] = v_zero_f32x8();
+                            }
                             for (int64_t s = 0; s < ct; ++s) {
                                 const v_f32x8 b = v_set1_f32x8(k_row[s]);
                                 for (int jj = 0; jj < NJU; ++jj) {
-                                    acc[jj] = v_fmadd(
-                                        b, v_load(dl + s * Dv + j + jj * L), acc[jj]);
+                                    acc[jj] = v_fmadd(b, v_load(dl + s * Dv + j + jj * L), acc[jj]);
                                 }
                             }
                             for (int jj = 0; jj < NJU; ++jj) {
                                 v_store(s_row + j + jj * L,
-                                        v_mul(v_add(v_load(s_row + j + jj * L), acc[jj]),
-                                              lam));
+                                        v_mul(v_add(v_load(s_row + j + jj * L), acc[jj]), lam));
                             }
                         }
                         for (; j + L <= j1; j += L) {
                             v_f32x8 acc = v_zero_f32x8();
                             for (int64_t s = 0; s < ct; ++s) {
-                                acc = v_fmadd(v_set1_f32x8(k_row[s]),
-                                              v_load(dl + s * Dv + j), acc);
+                                acc = v_fmadd(v_set1_f32x8(k_row[s]), v_load(dl + s * Dv + j), acc);
                             }
                             v_store(s_row + j, v_mul(v_add(v_load(s_row + j), acc), lam));
                         }
                         for (; j < j1; ++j) {
                             float acc = 0.0f;
-                            for (int64_t s = 0; s < ct; ++s) { acc += k_row[s] * dl[s * Dv + j]; }
+                            for (int64_t s = 0; s < ct; ++s) {
+                                acc += k_row[s] * dl[s * Dv + j];
+                            }
                             s_row[j] = (s_row[j] + acc) * ep[(ct - 1) * Dk + i];
                         }
                     }
@@ -928,36 +969,49 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
 
         const int route = route_override();
         int64_t t_done = 0;
-        if (route > 0 || (route == 0 && S >= kChunkMinSeq)) { t_done = chunk_route(); }
-        for (int64_t t = t_done; t < S; ++t) { token_step(t); }
+        if (route > 0 || (route == 0 && S >= kChunkMinSeq)) {
+            t_done = chunk_route();
+        }
+        for (int64_t t = t_done; t < S; ++t) {
+            token_step(t);
+        }
 
         for (int64_t i = 0; i < Dk; ++i) {
             T* srow = sp + b * ts0 + hv * ts1 + i * ts2;
             const float* drow = Sf + i * Dv;
             int64_t j = j0;
-            for (; j + L <= j1; j += L) { vstore_f32(srow + j * ts3, v_load(drow + j)); }
-            for (; j < j1; ++j) { s_store(srow + j * ts3, drow[j]); }
+            for (; j + L <= j1; j += L) {
+                vstore_f32(srow + j * ts3, v_load(drow + j));
+            }
+            for (; j < j1; ++j) {
+                s_store(srow + j * ts3, drow[j]);
+            }
         }
     });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status linear_attention_cpu(const LinearAttentionAttributes& attrs,
-                          std::span<TensorView> outputs,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx,
-                          void* workspace)
+Status linear_attention_cpu(const LinearAttentionAttributes& attrs, std::span<TensorView> outputs,
+                            std::span<const TensorView> inputs, const ComputeContext& ctx,
+                            void* workspace)
 {
     switch (inputs[0].data_type()) {
-    case DataType::f32: linear_attention_impl<float>(attrs, outputs, inputs, ctx); return Status::ok;
-    case DataType::f16: linear_attention_impl<half>(attrs, outputs, inputs, ctx);  return Status::ok;
+    case DataType::f32:
+        linear_attention_impl<float>(attrs, outputs, inputs, ctx);
+        return Status::ok;
+    case DataType::f16:
+        linear_attention_impl<half>(attrs, outputs, inputs, ctx);
+        return Status::ok;
 #ifdef NNOPS_ARCH_AARCH64
-    case DataType::bf16: linear_attention_impl<bfloat16>(attrs, outputs, inputs, ctx); return Status::ok;
+    case DataType::bf16:
+        linear_attention_impl<bfloat16>(attrs, outputs, inputs, ctx);
+        return Status::ok;
 #endif
-    default: break;
+    default:
+        break;
     }
     return Status::unsupported;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

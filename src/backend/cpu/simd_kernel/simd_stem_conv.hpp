@@ -48,23 +48,23 @@ namespace nnops::kernel {
 constexpr int kStemSpanCols = 24;
 
 /// Eight output channels as f32 lanes, whatever the plane's element type is.
-template <typename T>
-inline simd::v_f32x8 stem_load_oc(const T* p)
+template <typename T> inline simd::v_f32x8 stem_load_oc(const T* p)
 {
-    if constexpr (std::is_same_v<T, half>) { return simd::v_cvt_f16_to_f32(p); }
-    else { return simd::v_load(p); }
+    if constexpr (std::is_same_v<T, half>) {
+        return simd::v_cvt_f16_to_f32(p);
+    } else {
+        return simd::v_load(p);
+    }
 }
 
 /// One input element, widened. Only the fallback path takes a tap scalar: x86's
 /// `half_to_float` is the MLAS software routine, and even F16C's single
 /// instruction cannot pay for one convert per (pixel, tap).
-template <typename T>
-inline float stem_scalar(const T* p)
+template <typename T> inline float stem_scalar(const T* p)
 {
     if constexpr (std::is_same_v<T, half>) {
 #if defined(__F16C__)
-        return _mm_cvtss_f32(_mm_cvtph_ps(
-            _mm_cvtsi32_si128(static_cast<int>(half_to_bits(*p)))));
+        return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(half_to_bits(*p)))));
 #else
         return ::nnops::backend::cpu::half_to_float(*p);
 #endif
@@ -74,8 +74,7 @@ inline float stem_scalar(const T* p)
 }
 
 /// Store f32 accumulators into an element of either type.
-template <typename T>
-inline void stem_store(T* p, const simd::v_f32x8& v)
+template <typename T> inline void stem_store(T* p, const simd::v_f32x8& v)
 {
     if constexpr (std::is_same_v<T, half>) {
         simd::v_store(p, simd::v_cvt_f32_to_f16(v));
@@ -88,12 +87,11 @@ inline void stem_store(T* p, const simd::v_f32x8& v)
 /// channels. `c` is the tap *column*, so the element is `c·IC + ic`
 /// (channel-last).
 template <typename T, int IC, bool Fast>
-inline void stem_px(simd::v_f32x8& a0, simd::v_f32x8& a1,
-                    const T* NNOPS_RESTRICT r, int64_t c, int64_t iw, int ic,
-                    const simd::v_f32x8& w0, const simd::v_f32x8& w1) noexcept
+inline void stem_px(simd::v_f32x8& a0, simd::v_f32x8& a1, const T* NNOPS_RESTRICT r, int64_t c,
+                    int64_t iw, int ic, const simd::v_f32x8& w0, const simd::v_f32x8& w1) noexcept
 {
-    const float xv = Fast ? stem_scalar(r + c * IC + ic)
-                          : ((c >= 0 && c < iw) ? stem_scalar(r + c * IC + ic) : 0.0f);
+    const float xv = Fast ? stem_scalar(r + c * IC + ic) :
+                            ((c >= 0 && c < iw) ? stem_scalar(r + c * IC + ic) : 0.0f);
     const simd::v_f32x8 xb = simd::v_set1_f32x8(xv);
     a0 = simd::v_fmadd(xb, w0, a0);
     a1 = simd::v_fmadd(xb, w1, a1);
@@ -102,8 +100,7 @@ inline void stem_px(simd::v_f32x8& a0, simd::v_f32x8& a1,
 /// The same tap out of the staged span: already widened, already zeroed for the
 /// padding, so no test and no convert.
 template <int IC>
-inline void stem_px_s(simd::v_f32x8& a0, simd::v_f32x8& a1,
-                      const float* NNOPS_RESTRICT s, int ic,
+inline void stem_px_s(simd::v_f32x8& a0, simd::v_f32x8& a1, const float* NNOPS_RESTRICT s, int ic,
                       const simd::v_f32x8& w0, const simd::v_f32x8& w1) noexcept
 {
     const simd::v_f32x8 xb = simd::v_set1_f32x8(s[ic]);
@@ -118,15 +115,17 @@ inline void stem_px_s(simd::v_f32x8& a0, simd::v_f32x8& a1,
 /// no index arithmetic, and the four pixels are written out so their accumulators
 /// are indexed by a constant and stay in registers.
 template <typename T, int IC, int K, bool Fast>
-inline void stem_taps(simd::v_f32x8 (&acc)[4][2],
-                      const T* const (&rows)[K], const T* NNOPS_RESTRICT w,
-                      int64_t OC, int64_t oc0, int64_t ow0,
-                      int SW, int PW, int DW, int64_t IW) noexcept
+inline void stem_taps(simd::v_f32x8 (&acc)[4][2], const T* const (&rows)[K],
+                      const T* NNOPS_RESTRICT w, int64_t OC, int64_t oc0, int64_t ow0, int SW,
+                      int PW, int DW, int64_t IW) noexcept
 {
     const T* wp = w + oc0;
     for (int kh = 0; kh < K; ++kh) {
         const T* const r = rows[kh];
-        if (r == nullptr) { wp += K * IC * OC; continue; }
+        if (r == nullptr) {
+            wp += K * IC * OC;
+            continue;
+        }
         for (int kw = 0; kw < K; ++kw) {
             const int64_t c = ow0 * SW - PW + kw * DW;
             for (int ic = 0; ic < IC; ++ic) {
@@ -145,14 +144,16 @@ inline void stem_taps(simd::v_f32x8 (&acc)[4][2],
 /// The staged twin. `span[kh]` starts at the block's leftmost tap column, so the
 /// k-th filter column is `kw·DW·IC` in and the j-th pixel `j·SW·IC` further.
 template <typename T, int IC, int K>
-inline void stem_taps_s(simd::v_f32x8 (&acc)[4][2],
-                        const float* const (&span)[K], const T* NNOPS_RESTRICT w,
-                        int64_t OC, int64_t oc0, int SW, int DW) noexcept
+inline void stem_taps_s(simd::v_f32x8 (&acc)[4][2], const float* const (&span)[K],
+                        const T* NNOPS_RESTRICT w, int64_t OC, int64_t oc0, int SW, int DW) noexcept
 {
     const T* wp = w + oc0;
     for (int kh = 0; kh < K; ++kh) {
         const float* const s = span[kh];
-        if (s == nullptr) { wp += K * IC * OC; continue; }
+        if (s == nullptr) {
+            wp += K * IC * OC;
+            continue;
+        }
         for (int kw = 0; kw < K; ++kw) {
             const float* const sc = s + kw * DW * IC;
             for (int ic = 0; ic < IC; ++ic) {
@@ -172,12 +173,10 @@ inline void stem_taps_s(simd::v_f32x8 (&acc)[4][2],
 /// pure Relu/Relu6 is the store's clamp — the same two savings the MMA route
 /// makes, here for free.
 template <typename T, int IC, int K>
-void stem_conv_row(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in,
-                   const T* NNOPS_RESTRICT w, const T* NNOPS_RESTRICT bias,
-                   int64_t IH, int64_t IW, int64_t OW, int64_t OC,
-                   int64_t in_rs, int64_t out_rs, int64_t oh,
-                   int SH, int SW, int PH, int PW, int DH, int DW,
-                   bool clamp, float lo, float hi) noexcept
+void stem_conv_row(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in, const T* NNOPS_RESTRICT w,
+                   const T* NNOPS_RESTRICT bias, int64_t IH, int64_t IW, int64_t OW, int64_t OC,
+                   int64_t in_rs, int64_t out_rs, int64_t oh, int SH, int SW, int PH, int PW,
+                   int DH, int DW, bool clamp, float lo, float hi) noexcept
 {
     constexpr int64_t L = simd::simd_default_lane_f32;
     constexpr bool kStage = std::is_same_v<T, half>;
@@ -216,7 +215,9 @@ void stem_conv_row(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in,
                 for (int kh = 0; kh < K; ++kh) {
                     float* const d = sx + kh * kSpan;
                     span[kh] = rows[kh] ? d : nullptr;
-                    if (rows[kh] == nullptr) { continue; }
+                    if (rows[kh] == nullptr) {
+                        continue;
+                    }
                     std::fill(d, d + cols * IC, 0.0f);
                     const T* const src = rows[kh] + lo * IC;
                     float* const dst = d + (lo - c0) * IC;
@@ -228,21 +229,17 @@ void stem_conv_row(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in,
         }
 
         for (int64_t oc0 = 0; oc0 < OC; oc0 += 2 * L) {
-            const simd::v_f32x8 b0 = bias ? stem_load_oc(bias + oc0)
-                                          : simd::v_zero_f32x8();
-            const simd::v_f32x8 b1 = bias ? stem_load_oc(bias + oc0 + L)
-                                          : simd::v_zero_f32x8();
+            const simd::v_f32x8 b0 = bias ? stem_load_oc(bias + oc0) : simd::v_zero_f32x8();
+            const simd::v_f32x8 b1 = bias ? stem_load_oc(bias + oc0 + L) : simd::v_zero_f32x8();
             simd::v_f32x8 acc[4][2] = {{b0, b1}, {b0, b1}, {b0, b1}, {b0, b1}};
 
             if constexpr (kStage) {
                 if (staged) {
                     stem_taps_s<T, IC, K>(acc, span, w, OC, oc0, SW, DW);
                 } else if (fast) {
-                    stem_taps<T, IC, K, true>(acc, rows, w, OC, oc0, ow0,
-                                              SW, PW, DW, IW);
+                    stem_taps<T, IC, K, true>(acc, rows, w, OC, oc0, ow0, SW, PW, DW, IW);
                 } else {
-                    stem_taps<T, IC, K, false>(acc, rows, w, OC, oc0, ow0,
-                                               SW, PW, DW, IW);
+                    stem_taps<T, IC, K, false>(acc, rows, w, OC, oc0, ow0, SW, PW, DW, IW);
                 }
             } else if (fast) {
                 stem_taps<T, IC, K, true>(acc, rows, w, OC, oc0, ow0, SW, PW, DW, IW);
@@ -265,4 +262,4 @@ void stem_conv_row(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in,
     }
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

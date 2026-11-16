@@ -48,21 +48,21 @@ using namespace simd;
 // --- Kernel parameters: set once, od/oh updated per call ---
 
 struct PoolingKernelParams {
-    int64_t ID, IH, IW;          // input spatial dims
-    int64_t OH, OW;              // output spatial dims (for store bounds)
-    int64_t od, oh;              // current output position (set before call)
-    int64_t KD, KH, KW;          // kernel shape
-    int64_t SD, SH, SW;          // stride
-    int64_t DD, DH, DW;          // dilation
-    int64_t PD, PH, PW;          // padding
-    int64_t out_row_stride;      // output row stride (elems)
-    int64_t in_d_stride;         // input depth stride (elems)
-    int64_t in_row_stride;       // input row stride (elems)
-    bool exclude_pad = false;    // AvgPool: divide by valid count instead of K_total
-    int64_t pix_stride = 8;      // elems between adjacent pixels: the channel
-                                 // count on a channel-last plane
-    int64_t ow0 = 0;             // first output column this call covers
-    int64_t ow_end = -1;         // one past the last; negative means OW
+    int64_t ID, IH, IW;       // input spatial dims
+    int64_t OH, OW;           // output spatial dims (for store bounds)
+    int64_t od, oh;           // current output position (set before call)
+    int64_t KD, KH, KW;       // kernel shape
+    int64_t SD, SH, SW;       // stride
+    int64_t DD, DH, DW;       // dilation
+    int64_t PD, PH, PW;       // padding
+    int64_t out_row_stride;   // output row stride (elems)
+    int64_t in_d_stride;      // input depth stride (elems)
+    int64_t in_row_stride;    // input row stride (elems)
+    bool exclude_pad = false; // AvgPool: divide by valid count instead of K_total
+    int64_t pix_stride = 8;   // elems between adjacent pixels: the channel
+                              // count on a channel-last plane
+    int64_t ow0 = 0;          // first output column this call covers
+    int64_t ow_end = -1;      // one past the last; negative means OW
 };
 
 // --- The channel driver: R output rows per call, IsMax picks the accumulate ---
@@ -72,7 +72,9 @@ struct PoolingKernelParams {
 /// window that starts beyond the plane, is the only way it happens.
 inline bool pooling_counts_taps(const PoolingKernelParams& p, bool is_max)
 {
-    if (!is_max) { return p.exclude_pad; }
+    if (!is_max) {
+        return p.exclude_pad;
+    }
     return p.PH > (p.KH - 1) * p.DH || p.PW > (p.KW - 1) * p.DW ||
            (p.OH > 0 && (p.OH - 1) * p.SH - p.PH >= p.IH) ||
            (p.OW > 0 && (p.OW - 1) * p.SW - p.PW >= p.IW);
@@ -80,7 +82,7 @@ inline bool pooling_counts_taps(const PoolingKernelParams& p, bool is_max)
 
 template <int R, int NV, bool IsMax, bool COUNT, typename Src, typename Dst>
 inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale,
-                      const Src (&srcs)[NV], const Dst (&dsts)[NV])
+                                   const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
     using V = decltype(srcs[0].zero());
     using InPtr = const typename Src::elem*;
@@ -111,8 +113,7 @@ inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale
             for (int64_t kh = 0; kh < p.KH; ++kh) {
                 for (int r = 0; r < R; ++r) {
                     const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
-                    const bool ok = d_ok && (p.oh + r < p.OH) &&
-                                    ih >= 0 && ih < p.IH;
+                    const bool ok = d_ok && (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
                     row_base[t++] = ok ? in_d + ih * p.in_row_stride : nullptr;
                     all_rows = all_rows && ok;
                 }
@@ -124,15 +125,17 @@ inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale
     const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
     const int64_t last_hi = p.IW - 1 + p.PW - (p.KW - 1) * p.DW;
     const int64_t ow_hi = (last_hi >= 0) ? last_hi / p.SW : -1;
-    const int64_t off_ok_lo = p.PW;             // tap offsets are measured from
-    const int64_t off_ok_hi = p.IW + p.PW;      // the padded row start
+    const int64_t off_ok_lo = p.PW;        // tap offsets are measured from
+    const int64_t off_ok_hi = p.IW + p.PW; // the padded row start
 
     const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
     for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
         V acc[R][NV];
         int64_t cnt[R] = {};
         for (int r = 0; r < R; ++r) {
-            for (int k = 0; k < NV; ++k) { acc[r][k] = vinit; }
+            for (int k = 0; k < NV; ++k) {
+                acc[r][k] = vinit;
+            }
         }
 
         const bool interior = all_rows && ow >= ow_lo && ow <= ow_hi;
@@ -143,10 +146,14 @@ inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale
                 InPtr row[R];
                 if (have_tab) {
                     const int64_t t = (kd * p.KH + kh) * R;
-                    for (int64_t r = 0; r < R; ++r) { row[r] = row_base[t + r]; }
+                    for (int64_t r = 0; r < R; ++r) {
+                        row[r] = row_base[t + r];
+                    }
                 } else {
                     const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-                    if (id < 0 || id >= p.ID) { continue; }
+                    if (id < 0 || id >= p.ID) {
+                        continue;
+                    }
                     const InPtr in_d = srcs[0].ptr_at(id * p.in_d_stride - p.PW * pix);
                     for (int64_t r = 0; r < R; ++r) {
                         const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
@@ -161,14 +168,15 @@ inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale
                         for (int k = 0; k < NV; ++k) {
                             for (int r = 0; r < R; ++r) {
                                 const V v = srcs[k].load_ptr(row[r] + at + k * kVec);
-                                acc[r][k] = IsMax ? v_max(acc[r][k], v)
-                                                  : v_add(acc[r][k], v);
+                                acc[r][k] = IsMax ? v_max(acc[r][k], v) : v_add(acc[r][k], v);
                             }
                         }
                     }
                     // Counted even for max: an all-pad window stores zero, not -inf.
                     if constexpr (COUNT) {
-                        for (int r = 0; r < R; ++r) { cnt[r] += p.KW; }
+                        for (int r = 0; r < R; ++r) {
+                            cnt[r] += p.KW;
+                        }
                     }
                     continue;
                 }
@@ -187,14 +195,15 @@ inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale
                                 continue;
                             }
                             const V v = srcs[k].load_ptr(row[r] + at + k * kVec);
-                            acc[r][k] = IsMax ? v_max(acc[r][k], v)
-                                              : v_add(acc[r][k], v);
+                            acc[r][k] = IsMax ? v_max(acc[r][k], v) : v_add(acc[r][k], v);
                         }
                     }
                 }
                 for (int r = 0; r < R; ++r) {
                     if constexpr (COUNT) {
-                        if (row[r] != nullptr) { cnt[r] += valid_kw; }
+                        if (row[r] != nullptr) {
+                            cnt[r] += valid_kw;
+                        }
                     }
                 }
             }
@@ -208,7 +217,9 @@ inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale
                 V v = acc[r][k];
                 if constexpr (IsMax) {
                     if constexpr (COUNT) {
-                        if (cnt[r] == 0) { v = vzero; }
+                        if (cnt[r] == 0) {
+                            v = vzero;
+                        }
                     }
                 } else if (p.exclude_pad) {
                     if constexpr (COUNT) {
@@ -230,10 +241,11 @@ inline void pool_channel_last_rows(const PoolingKernelParams& p, float avg_scale
 /// The value a padded lane contributes: the max's identity, or zero for the sum.
 /// `half` is a struct with no numeric_limits specialization on x86, so its
 /// lowest() is 0 — which would clamp any window that touches padding at zero.
-template <typename T>
-inline T pooling_fill(bool is_max) noexcept
+template <typename T> inline T pooling_fill(bool is_max) noexcept
 {
-    if (!is_max) { return T{}; }
+    if (!is_max) {
+        return T{};
+    }
     if constexpr (std::is_same_v<T, half>) {
         return ::nnops::backend::cpu::float_to_half(-65504.0f);
 #ifdef NNOPS_ARCH_AARCH64
@@ -248,8 +260,8 @@ inline T pooling_fill(bool is_max) noexcept
 }
 
 template <bool IsMax, typename T>
-inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p,
-                        float avg_scale, bool add_to)
+inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p, float avg_scale,
+                               bool add_to)
 {
     constexpr int64_t L = simd_lane_for<T>;
     const T fill = pooling_fill<T>(IsMax);
@@ -258,10 +270,14 @@ inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p
     int64_t row_taps = 0;
     for (int64_t kd = 0; kd < p.KD; ++kd) {
         const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-        if (id < 0 || id >= p.ID) { continue; }
+        if (id < 0 || id >= p.ID) {
+            continue;
+        }
         for (int64_t kh = 0; kh < p.KH; ++kh) {
             const int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-            if (ih >= 0 && ih < p.IH) { ++row_taps; }
+            if (ih >= 0 && ih < p.IH) {
+                ++row_taps;
+            }
         }
     }
 
@@ -270,10 +286,11 @@ inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p
     // off the right edge, which PW cannot see: a SAME-style pad is leading-only
     // and its trailing half is implicit, so PW == 0 with the last window past
     // IW would divide by taps that were never read.
-    const bool cols_inside = p.PW == 0 &&
-        (p.OW - 1) * p.SW + (p.KW - 1) * p.DW < p.IW;
+    const bool cols_inside = p.PW == 0 && (p.OW - 1) * p.SW + (p.KW - 1) * p.DW < p.IW;
     const auto taps_of = [&](int64_t col) {
-        if (cols_inside) { return row_taps * p.KW; }
+        if (cols_inside) {
+            return row_taps * p.KW;
+        }
         const int64_t iw_first = col * p.SW - p.PW;
         int64_t n = 0;
         for (int64_t kw = 0; kw < p.KW; ++kw) {
@@ -286,23 +303,25 @@ inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p
     // Max: an all-pad window is 0 (the channel kernel zeroes it too).
     // Avg: exclude_pad divides by the tap count; with no padding the count is
     // uniform and this is a single scale.
-    const bool count_taps = IsMax
-        ? (p.PH > (p.KH - 1) * p.DH || p.PW > (p.KW - 1) * p.DW ||
-           (p.OH > 0 && (p.OH - 1) * p.SH - p.PH >= p.IH) ||
-           (p.OW > 0 && (p.OW - 1) * p.SW - p.PW >= p.IW))
-        : p.exclude_pad;
+    const bool count_taps = IsMax ? (p.PH > (p.KH - 1) * p.DH || p.PW > (p.KW - 1) * p.DW ||
+                                     (p.OH > 0 && (p.OH - 1) * p.SH - p.PH >= p.IH) ||
+                                     (p.OW > 0 && (p.OW - 1) * p.SW - p.PW >= p.IW)) :
+                                    p.exclude_pad;
 
     for (int64_t ow = 0; ow < p.OW; ow += L) {
-        auto acc = IsMax ? v_set1(out, -std::numeric_limits<float>::infinity())
-                         : v_zero(out);
+        auto acc = IsMax ? v_set1(out, -std::numeric_limits<float>::infinity()) : v_zero(out);
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
             const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) { continue; }
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
 
             for (int64_t kh = 0; kh < p.KH; ++kh) {
                 const int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) { continue; }
+                if (ih < 0 || ih >= p.IH) {
+                    continue;
+                }
                 const T* row = in + id * p.in_d_stride + ih * p.in_row_stride;
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
@@ -318,8 +337,8 @@ inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p
             alignas(32) T scale[L];
             for (int64_t l = 0; l < L; ++l) {
                 const int64_t cnt = (l < lanes) ? taps_of(ow + l) : 1;
-                const float s = IsMax ? (cnt > 0 ? 1.0f : 0.0f)
-                                      : (cnt > 0 ? 1.0f / static_cast<float>(cnt) : 0.0f);
+                const float s = IsMax ? (cnt > 0 ? 1.0f : 0.0f) :
+                                        (cnt > 0 ? 1.0f / static_cast<float>(cnt) : 0.0f);
                 s_store(&scale[l], s);
             }
             acc = v_mul(acc, v_load(scale));
@@ -341,21 +360,20 @@ inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p
 
 // --- Global pooling: the window is the whole extent, so a contiguous plane is one scan ---
 
-template <bool IsMax, class V>
-inline V global_op(const V& a, const V& b)
+template <bool IsMax, class V> inline V global_op(const V& a, const V& b)
 {
-    if constexpr (IsMax) { return v_max(a, b); }
+    if constexpr (IsMax) {
+        return v_max(a, b);
+    }
     return v_add(a, b);
 }
 
-template <bool IsMax>
-inline float global_op(float a, float b)
+template <bool IsMax> inline float global_op(float a, float b)
 {
     return IsMax ? std::max(a, b) : a + b;
 }
 
-template <typename T>
-inline v_f32x8 global_load(const T* p)
+template <typename T> inline v_f32x8 global_load(const T* p)
 {
     if constexpr (std::is_same_v<T, half>) {
         return v_cvt_f16_to_f32(p);
@@ -366,10 +384,11 @@ inline v_f32x8 global_load(const T* p)
 
 /// Widened load of a short channel vector; zero-filled past @p lanes, and only
 /// the live lanes are ever stored.
-template <typename T>
-inline v_f32x8 global_load_lanes(const T* p, int64_t lanes)
+template <typename T> inline v_f32x8 global_load_lanes(const T* p, int64_t lanes)
 {
-    if (lanes == kChannelLanes) { return global_load(p); }
+    if (lanes == kChannelLanes) {
+        return global_load(p);
+    }
     T tmp[kChannelLanes] = {};
     std::memcpy(tmp, p, static_cast<size_t>(lanes) * sizeof(T));
     return global_load(tmp);
@@ -379,35 +398,37 @@ inline v_f32x8 global_load_lanes(const T* p, int64_t lanes)
 /// the same accumulation the window kernels do — while MaxPool (whose result
 /// does not round) and every other storage type use f32.
 template <typename T, bool IsMax>
-using GlobalAcc = std::conditional_t<std::is_same_v<T, half> && !IsMax,
-                                     v_f16x8, v_f32x8>;
+using GlobalAcc = std::conditional_t<std::is_same_v<T, half> && !IsMax, v_f16x8, v_f32x8>;
 
-template <typename T, bool IsMax>
-inline GlobalAcc<T, IsMax> global_acc_init(const T* tag)
+template <typename T, bool IsMax> inline GlobalAcc<T, IsMax> global_acc_init(const T* tag)
 {
     using V = GlobalAcc<T, IsMax>;
     if constexpr (std::is_same_v<V, v_f16x8>) {
         return v_zero(tag);
     } else {
-        return IsMax ? v_set1_f32x8(-std::numeric_limits<float>::infinity())
-                     : v_zero_f32x8();
+        return IsMax ? v_set1_f32x8(-std::numeric_limits<float>::infinity()) : v_zero_f32x8();
     }
 }
 
-template <typename T, bool IsMax>
-inline GlobalAcc<T, IsMax> global_acc_load(const T* p)
+template <typename T, bool IsMax> inline GlobalAcc<T, IsMax> global_acc_load(const T* p)
 {
     using V = GlobalAcc<T, IsMax>;
-    if constexpr (std::is_same_v<V, v_f16x8>) { return v_load(p); }
-    else { return global_load(p); }
+    if constexpr (std::is_same_v<V, v_f16x8>) {
+        return v_load(p);
+    } else {
+        return global_load(p);
+    }
 }
 
 template <typename T, bool IsMax>
 inline GlobalAcc<T, IsMax> global_acc_load_lanes(const T* p, int64_t lanes)
 {
     using V = GlobalAcc<T, IsMax>;
-    if constexpr (std::is_same_v<V, v_f16x8>) { return load_lanes(p, lanes); }
-    else { return global_load_lanes(p, lanes); }
+    if constexpr (std::is_same_v<V, v_f16x8>) {
+        return load_lanes(p, lanes);
+    } else {
+        return global_load_lanes(p, lanes);
+    }
 }
 
 /// The accumulation lanes back to f32 for the final fold and store.
@@ -433,10 +454,8 @@ inline float global_fold(const v_f16x8& v, bool is_max)
 
 /// Fold @p n contiguous elements into the four accumulators and the scalar tail.
 template <bool IsMax, typename T>
-inline void global_accumulate(GlobalAcc<T, IsMax>& acc0,
-                              GlobalAcc<T, IsMax>& acc1,
-                              GlobalAcc<T, IsMax>& acc2,
-                              GlobalAcc<T, IsMax>& acc3, float& tail,
+inline void global_accumulate(GlobalAcc<T, IsMax>& acc0, GlobalAcc<T, IsMax>& acc1,
+                              GlobalAcc<T, IsMax>& acc2, GlobalAcc<T, IsMax>& acc3, float& tail,
                               const T* p, int64_t n)
 {
     int64_t i = 0;
@@ -464,23 +483,20 @@ inline float global_channel_first(const T* in, const PoolingKernelParams& p, flo
     V acc0 = init, acc1 = init, acc2 = init, acc3 = init;
     float tail = IsMax ? -std::numeric_limits<float>::infinity() : 0.0f;
 
-    const bool flat = (p.in_row_stride == p.IW) &&
-                      (p.in_d_stride == p.IH * p.in_row_stride);
+    const bool flat = (p.in_row_stride == p.IW) && (p.in_d_stride == p.IH * p.in_row_stride);
     if (flat) {
-        global_accumulate<IsMax>(acc0, acc1, acc2, acc3, tail, in,
-                                 p.ID * p.IH * p.IW);
+        global_accumulate<IsMax>(acc0, acc1, acc2, acc3, tail, in, p.ID * p.IH * p.IW);
     } else {
         for (int64_t d = 0; d < p.ID; ++d) {
             const T* plane = in + d * p.in_d_stride;
             for (int64_t h = 0; h < p.IH; ++h) {
-                global_accumulate<IsMax>(acc0, acc1, acc2, acc3, tail,
-                                         plane + h * p.in_row_stride, p.IW);
+                global_accumulate<IsMax>(acc0, acc1, acc2, acc3, tail, plane + h * p.in_row_stride,
+                                         p.IW);
             }
         }
     }
 
-    acc0 = global_op<IsMax>(global_op<IsMax>(acc0, acc1),
-                            global_op<IsMax>(acc2, acc3));
+    acc0 = global_op<IsMax>(global_op<IsMax>(acc0, acc1), global_op<IsMax>(acc2, acc3));
     const float v = global_op<IsMax>(global_fold(acc0, IsMax), tail);
     return IsMax ? v : v * scale;
 }
@@ -492,15 +508,17 @@ inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t la
 /// @c pix_stride-th vector on a channel-last tensor. NV vectors per pass; a
 /// short last block takes masked loads and stores only its live lanes.
 template <bool IsMax, typename T, int NV, int U = 4, bool Full = true>
-inline void global_channel_last_vec(T* out, const T* in, const PoolingKernelParams& p,
-                               float scale, bool add_to, int64_t lanes)
+inline void global_channel_last_vec(T* out, const T* in, const PoolingKernelParams& p, float scale,
+                                    bool add_to, int64_t lanes)
 {
     constexpr int64_t kVec = kChannelLanes;
     using V = GlobalAcc<T, IsMax>;
     const V init = global_acc_init<T, IsMax>(in);
     V acc[NV][U];
     for (int k = 0; k < NV; ++k) {
-        for (int u = 0; u < U; ++u) { acc[k][u] = init; }
+        for (int u = 0; u < U; ++u) {
+            acc[k][u] = init;
+        }
     }
 
     // Live lanes of vector k: a ragged tail leaves the later vectors short.
@@ -515,8 +533,8 @@ inline void global_channel_last_vec(T* out, const T* in, const PoolingKernelPara
             return global_acc_load<T, IsMax>(px);
         } else {
             const int64_t l = live(k);
-            return (l >= kVec) ? global_acc_load<T, IsMax>(px)
-                               : global_acc_load_lanes<T, IsMax>(px, l);
+            return (l >= kVec) ? global_acc_load<T, IsMax>(px) :
+                                 global_acc_load_lanes<T, IsMax>(px, l);
         }
     };
 
@@ -529,15 +547,15 @@ inline void global_channel_last_vec(T* out, const T* in, const PoolingKernelPara
                 for (int k = 0; k < NV; ++k) {
                     const int64_t ko = k * kVec;
                     for (int u = 0; u < U; ++u) {
-                        acc[k][u] = global_op<IsMax>(
-                            acc[k][u], load(row + (w + u) * p.pix_stride + ko, k));
+                        acc[k][u] =
+                            global_op<IsMax>(acc[k][u], load(row + (w + u) * p.pix_stride + ko, k));
                     }
                 }
             }
             for (; w < p.IW; ++w) {
                 for (int k = 0; k < NV; ++k) {
-                    acc[k][0] = global_op<IsMax>(
-                        acc[k][0], load(row + w * p.pix_stride + k * kVec, k));
+                    acc[k][0] =
+                        global_op<IsMax>(acc[k][0], load(row + w * p.pix_stride + k * kVec, k));
                 }
             }
         }
@@ -545,9 +563,13 @@ inline void global_channel_last_vec(T* out, const T* in, const PoolingKernelPara
 
     for (int k = 0; k < NV; ++k) {
         V v = acc[k][0];
-        for (int u = 1; u < U; ++u) { v = global_op<IsMax>(v, acc[k][u]); }
+        for (int u = 1; u < U; ++u) {
+            v = global_op<IsMax>(v, acc[k][u]);
+        }
         v_f32x8 f = global_acc_to_f32(v);
-        if constexpr (!IsMax) { f = v_mul(f, v_set1_f32x8(scale)); }
+        if constexpr (!IsMax) {
+            f = v_mul(f, v_set1_f32x8(scale));
+        }
         global_store_lanes(out + k * kVec, f, add_to, live(k));
     }
 }
@@ -555,7 +577,7 @@ inline void global_channel_last_vec(T* out, const T* in, const PoolingKernelPara
 /// Single-vector form for the short last block of a channel-last task.
 template <bool IsMax, typename T>
 inline v_f32x8 global_channel_last(const T* in, const PoolingKernelParams& p, float scale,
-                              int64_t lanes)
+                                   int64_t lanes)
 {
     constexpr int64_t kVec = kChannelLanes;
     using V = GlobalAcc<T, IsMax>;
@@ -563,8 +585,8 @@ inline v_f32x8 global_channel_last(const T* in, const PoolingKernelParams& p, fl
     V acc0 = init, acc1 = init, acc2 = init, acc3 = init;
 
     const auto load = [&](const T* px) {
-        return (lanes >= kVec) ? global_acc_load<T, IsMax>(px)
-                               : global_acc_load_lanes<T, IsMax>(px, lanes);
+        return (lanes >= kVec) ? global_acc_load<T, IsMax>(px) :
+                                 global_acc_load_lanes<T, IsMax>(px, lanes);
     };
 
     for (int64_t d = 0; d < p.ID; ++d) {
@@ -584,15 +606,13 @@ inline v_f32x8 global_channel_last(const T* in, const PoolingKernelParams& p, fl
         }
     }
 
-    const V v = global_op<IsMax>(global_op<IsMax>(acc0, acc1),
-                                 global_op<IsMax>(acc2, acc3));
+    const V v = global_op<IsMax>(global_op<IsMax>(acc0, acc1), global_op<IsMax>(acc2, acc3));
     const v_f32x8 f = global_acc_to_f32(v);
     return IsMax ? f : v_mul(f, v_set1_f32x8(scale));
 }
 
 /// Store a reduced channel vector, narrowing for f16.
-template <typename T>
-inline void global_store(T* out, const v_f32x8& v, bool add_to)
+template <typename T> inline void global_store(T* out, const v_f32x8& v, bool add_to)
 {
     if constexpr (std::is_same_v<T, half>) {
         v_store_add(out, v_cvt_f32_to_f16(v), add_to);
@@ -604,8 +624,8 @@ inline void global_store(T* out, const v_f32x8& v, bool add_to)
 // --- MaxPool raw-integer fast path (input and output share scale + zero_point) ---
 
 template <int R, typename T>
-inline void maxpool_channel_last_quant_fast(T* output, const T* input,
-                         const PoolingKernelParams& p, float out_zero)
+inline void maxpool_channel_last_quant_fast(T* output, const T* input, const PoolingKernelParams& p,
+                                            float out_zero)
 {
     constexpr T min_val = std::numeric_limits<T>::lowest();
     const T z = static_cast<T>(out_zero);
@@ -644,7 +664,8 @@ inline void maxpool_channel_last_quant_fast(T* output, const T* input,
                             continue;
                         }
                         quant_kernel::max_8<T>(acc[r], acc[r],
-                                input + d_off + ih[r] * p.in_row_stride + iw * p.pix_stride);
+                                               input + d_off + ih[r] * p.in_row_stride +
+                                                   iw * p.pix_stride);
                         any[r] = true;
                     }
                 }
@@ -668,18 +689,16 @@ inline void maxpool_channel_last_quant_fast(T* output, const T* input,
 // --- Channel-last wrappers ---
 
 template <bool IsMax, typename T>
-inline void pool_channel_last(T* output, const T* input, const PoolingKernelParams& p,
-                      float scale, bool add_to, int64_t lanes)
+inline void pool_channel_last(T* output, const T* input, const PoolingKernelParams& p, float scale,
+                              bool add_to, int64_t lanes)
 {
     if (lanes > kChannelLanes) {
-        const FpSrc<T, true> src[2] = {
-            FpSrc<T, true>{input, kChannelLanes},
-            FpSrc<T, true>{input + kChannelLanes, kChannelLanes}};
+        const FpSrc<T, true> src[2] = {FpSrc<T, true>{input, kChannelLanes},
+                                       FpSrc<T, true>{input + kChannelLanes, kChannelLanes}};
         const FpDst<T, true> dst[2] = {
-            FpDst<T, true>{output, p.out_row_stride, add_to, p.pix_stride,
-                           kChannelLanes},
-            FpDst<T, true>{output + kChannelLanes, p.out_row_stride, add_to,
-                           p.pix_stride, kChannelLanes}};
+            FpDst<T, true>{output, p.out_row_stride, add_to, p.pix_stride, kChannelLanes},
+            FpDst<T, true>{output + kChannelLanes, p.out_row_stride, add_to, p.pix_stride,
+                           kChannelLanes}};
         pool_channel_last_rows_counted<2, IsMax>(p, scale, src, dst);
         return;
     }
@@ -704,43 +723,46 @@ inline void pool_channel_last(T* output, const T* input, const PoolingKernelPara
 // plane are compile-time guards (`TOP_OK` / `BOT_OK`), so a masked tap costs no
 // branch. Token-pasted row names are the point: an indexed `acc[r][k]` array is
 // what the per-row kernel spills.
-#define NNOPS_POOL3X3X4_ROW(R, KH, OFF)                                       \
-    if constexpr ((TOP_OK || (R) != 0 || (KH) != 0) &&                        \
-                  (BOT_OK || (R) != 3 || (KH) != 2)) {                        \
-        {                                                                     \
-            const V x0 = srcs[0].load_ptr(row[(R) * S + (KH)] + (OFF));       \
-            a##R##0 = IsMax ? v_max(a##R##0, x0) : v_add(a##R##0, x0);        \
-        }                                                                     \
-        if constexpr (NV == 2) {                                              \
-            const V x1 = srcs[1].load_ptr(row[(R) * S + (KH)] + (OFF) + kL);  \
-            a##R##1 = IsMax ? v_max(a##R##1, x1) : v_add(a##R##1, x1);        \
-        }                                                                     \
+#define NNOPS_POOL3X3X4_ROW(R, KH, OFF)                                                     \
+    if constexpr ((TOP_OK || (R) != 0 || (KH) != 0) && (BOT_OK || (R) != 3 || (KH) != 2)) { \
+        {                                                                                   \
+            const V x0 = srcs[0].load_ptr(row[(R) * S + (KH)] + (OFF));                     \
+            a##R##0 = IsMax ? v_max(a##R##0, x0) : v_add(a##R##0, x0);                      \
+        }                                                                                   \
+        if constexpr (NV == 2) {                                                            \
+            const V x1 = srcs[1].load_ptr(row[(R) * S + (KH)] + (OFF) + kL);                \
+            a##R##1 = IsMax ? v_max(a##R##1, x1) : v_add(a##R##1, x1);                      \
+        }                                                                                   \
     }
 
-#define NNOPS_POOL3X3X4_TAP(KH, OFF)                                          \
-    NNOPS_POOL3X3X4_ROW(0, KH, OFF)                                           \
-    NNOPS_POOL3X3X4_ROW(1, KH, OFF)                                           \
-    NNOPS_POOL3X3X4_ROW(2, KH, OFF)                                           \
+#define NNOPS_POOL3X3X4_TAP(KH, OFF) \
+    NNOPS_POOL3X3X4_ROW(0, KH, OFF)  \
+    NNOPS_POOL3X3X4_ROW(1, KH, OFF)  \
+    NNOPS_POOL3X3X4_ROW(2, KH, OFF)  \
     NNOPS_POOL3X3X4_ROW(3, KH, OFF)
 
-#define NNOPS_POOL3X3X4_STORE(OW)                                             \
-    do {                                                                      \
-        if constexpr (!IsMax) {                                               \
-            a00 = v_mul(a00, vs); a01 = v_mul(a01, vs);                       \
-            a10 = v_mul(a10, vs); a11 = v_mul(a11, vs);                       \
-            a20 = v_mul(a20, vs); a21 = v_mul(a21, vs);                       \
-            a30 = v_mul(a30, vs); a31 = v_mul(a31, vs);                       \
-        }                                                                     \
-        dsts[0].store(0, (OW), a00);                                          \
-        dsts[0].store(1, (OW), a10);                                          \
-        dsts[0].store(2, (OW), a20);                                          \
-        dsts[0].store(3, (OW), a30);                                          \
-        if constexpr (NV == 2) {                                              \
-            dsts[1].store(0, (OW), a01);                                      \
-            dsts[1].store(1, (OW), a11);                                      \
-            dsts[1].store(2, (OW), a21);                                      \
-            dsts[1].store(3, (OW), a31);                                      \
-        }                                                                     \
+#define NNOPS_POOL3X3X4_STORE(OW)        \
+    do {                                 \
+        if constexpr (!IsMax) {          \
+            a00 = v_mul(a00, vs);        \
+            a01 = v_mul(a01, vs);        \
+            a10 = v_mul(a10, vs);        \
+            a11 = v_mul(a11, vs);        \
+            a20 = v_mul(a20, vs);        \
+            a21 = v_mul(a21, vs);        \
+            a30 = v_mul(a30, vs);        \
+            a31 = v_mul(a31, vs);        \
+        }                                \
+        dsts[0].store(0, (OW), a00);     \
+        dsts[0].store(1, (OW), a10);     \
+        dsts[0].store(2, (OW), a20);     \
+        dsts[0].store(3, (OW), a30);     \
+        if constexpr (NV == 2) {         \
+            dsts[1].store(0, (OW), a01); \
+            dsts[1].store(1, (OW), a11); \
+            dsts[1].store(2, (OW), a21); \
+            dsts[1].store(3, (OW), a31); \
+        }                                \
     } while (0)
 
 /// Four output rows at once, straight-line. Every row of the group gets its own
@@ -754,8 +776,7 @@ inline void pool_channel_last(T* output, const T* input, const PoolingKernelPara
 /// a branch on every tap. `row[]` is indexed by literals, so it stays in
 /// general-purpose registers, where the per-row kernel's `rp0` recomputation
 /// put it in memory.
-template <int NV, bool IsMax, int S, bool TOP_OK, bool BOT_OK, typename Src,
-          typename Dst>
+template <int NV, bool IsMax, int S, bool TOP_OK, bool BOT_OK, typename Src, typename Dst>
 inline void pool_channel_last_3x3x4(const PoolingKernelParams& p, float avg_scale,
                                     const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
@@ -763,8 +784,7 @@ inline void pool_channel_last_3x3x4(const PoolingKernelParams& p, float avg_scal
     using InPtr = const typename Src::elem*;
     constexpr int64_t kL = kChannelLanes;
     constexpr int kRows = 3 * S + 3;
-    const V vinit = IsMax ? srcs[0].set1(-std::numeric_limits<float>::infinity())
-                          : srcs[0].zero();
+    const V vinit = IsMax ? srcs[0].set1(-std::numeric_limits<float>::infinity()) : srcs[0].zero();
     const V vs = srcs[0].set1(avg_scale);
     const int64_t pix = p.pix_stride;
     const int64_t rs = p.in_row_stride;
@@ -793,7 +813,9 @@ inline void pool_channel_last_3x3x4(const PoolingKernelParams& p, float avg_scal
         const int64_t ow_off = ow * S;
         for (int64_t kw = 0; kw < 3; ++kw) {
             const int64_t off = ow_off + kw;
-            if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+            if (off < off_ok_lo || off >= off_ok_hi) {
+                continue;
+            }
             const int64_t at = off * pix;
             NNOPS_POOL3X3X4_TAP(0, at)
             NNOPS_POOL3X3X4_TAP(1, at)
@@ -804,7 +826,9 @@ inline void pool_channel_last_3x3x4(const PoolingKernelParams& p, float avg_scal
 
     const int64_t iw_lo = (ow_lo > p.ow0) ? ow_lo : p.ow0;
     const int64_t iw_hi = (ow_hi + 1 < ow_end) ? ow_hi + 1 : ow_end;
-    for (int64_t ow = p.ow0; ow < iw_lo; ++ow) { masked_col(ow); }
+    for (int64_t ow = p.ow0; ow < iw_lo; ++ow) {
+        masked_col(ow);
+    }
 
     // Three walking source offsets, one per `kw`, so the column index disappears
     // from the tap addresses and no tap costs an address multiply.
@@ -812,20 +836,19 @@ inline void pool_channel_last_3x3x4(const PoolingKernelParams& p, float avg_scal
     int64_t o0 = iw_lo * step;
     int64_t o1 = o0 + pix;
     int64_t o2 = o1 + pix;
-    for (int64_t ow = iw_lo; ow < iw_hi;
-         ++ow, o0 += step, o1 += step, o2 += step) {
+    for (int64_t ow = iw_lo; ow < iw_hi; ++ow, o0 += step, o1 += step, o2 += step) {
         V a00 = vinit, a01 = vinit, a10 = vinit, a11 = vinit;
         V a20 = vinit, a21 = vinit, a30 = vinit, a31 = vinit;
-        NNOPS_POOL3X3X4_TAP(0, o0) NNOPS_POOL3X3X4_TAP(0, o1)
-        NNOPS_POOL3X3X4_TAP(0, o2) NNOPS_POOL3X3X4_TAP(1, o0)
-        NNOPS_POOL3X3X4_TAP(1, o1) NNOPS_POOL3X3X4_TAP(1, o2)
-        NNOPS_POOL3X3X4_TAP(2, o0) NNOPS_POOL3X3X4_TAP(2, o1)
-        NNOPS_POOL3X3X4_TAP(2, o2)
-        NNOPS_POOL3X3X4_STORE(ow);
+        NNOPS_POOL3X3X4_TAP(0, o0)
+        NNOPS_POOL3X3X4_TAP(0, o1) NNOPS_POOL3X3X4_TAP(0, o2) NNOPS_POOL3X3X4_TAP(1, o0)
+            NNOPS_POOL3X3X4_TAP(1, o1) NNOPS_POOL3X3X4_TAP(1, o2) NNOPS_POOL3X3X4_TAP(2, o0)
+                NNOPS_POOL3X3X4_TAP(2, o1) NNOPS_POOL3X3X4_TAP(2, o2) NNOPS_POOL3X3X4_STORE(ow);
     }
 
     const int64_t iw_tail = (iw_hi > iw_lo) ? iw_hi : iw_lo;
-    for (int64_t ow = iw_tail; ow < ow_end; ++ow) { masked_col(ow); }
+    for (int64_t ow = iw_tail; ow < ow_end; ++ow) {
+        masked_col(ow);
+    }
 }
 
 #undef NNOPS_POOL3X3X4_ROW
@@ -846,13 +869,12 @@ inline void pool_channel_last_3x3x4(const PoolingKernelParams& p, float avg_scal
 /// gives it the fallback path's masked pass.
 template <int R, int NV, bool IsMax, int S, typename Src, typename Dst>
 inline void pool_channel_last_rows_3x3(const PoolingKernelParams& p, float avg_scale,
-                          const Src (&srcs)[NV], const Dst (&dsts)[NV])
+                                       const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
     using V = decltype(srcs[0].zero());
     using InPtr = const typename Src::elem*;
     constexpr int64_t kL = kChannelLanes;
-    const V vinit = IsMax ? srcs[0].set1(-std::numeric_limits<float>::infinity())
-                          : srcs[0].zero();
+    const V vinit = IsMax ? srcs[0].set1(-std::numeric_limits<float>::infinity()) : srcs[0].zero();
     const int64_t pix = p.pix_stride;
     const int64_t rs = p.in_row_stride;
 
@@ -868,18 +890,14 @@ inline void pool_channel_last_rows_3x3(const PoolingKernelParams& p, float avg_s
             const bool bot_ok = ih_max < p.IH;
             if (top_ok) {
                 if (bot_ok) {
-                    pool_channel_last_3x3x4<NV, IsMax, S, true, true>(
-                        p, avg_scale, srcs, dsts);
+                    pool_channel_last_3x3x4<NV, IsMax, S, true, true>(p, avg_scale, srcs, dsts);
                 } else {
-                    pool_channel_last_3x3x4<NV, IsMax, S, true, false>(
-                        p, avg_scale, srcs, dsts);
+                    pool_channel_last_3x3x4<NV, IsMax, S, true, false>(p, avg_scale, srcs, dsts);
                 }
             } else if (bot_ok) {
-                pool_channel_last_3x3x4<NV, IsMax, S, false, true>(
-                    p, avg_scale, srcs, dsts);
+                pool_channel_last_3x3x4<NV, IsMax, S, false, true>(p, avg_scale, srcs, dsts);
             } else {
-                pool_channel_last_3x3x4<NV, IsMax, S, false, false>(
-                    p, avg_scale, srcs, dsts);
+                pool_channel_last_3x3x4<NV, IsMax, S, false, false>(p, avg_scale, srcs, dsts);
             }
             return;
         }
@@ -892,13 +910,16 @@ inline void pool_channel_last_rows_3x3(const PoolingKernelParams& p, float avg_s
     const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
 
     // One input row's three horizontally adjacent taps into `acc`.
-    const auto tap3 = [&](const Src& src, const InPtr rp, int64_t o0,
-                          int64_t o1, int64_t o2, V& acc) {
+    const auto tap3 = [&](const Src& src, const InPtr rp, int64_t o0, int64_t o1, int64_t o2,
+                          V& acc) {
         const V a = src.load_ptr(rp + o0);
         const V b = src.load_ptr(rp + o1);
         const V c = src.load_ptr(rp + o2);
-        if constexpr (IsMax) { acc = v_max(v_max(v_max(acc, a), b), c); }
-        else { acc = v_add(v_add(v_add(acc, a), b), c); }
+        if constexpr (IsMax) {
+            acc = v_max(v_max(v_max(acc, a), b), c);
+        } else {
+            acc = v_add(v_add(v_add(acc, a), b), c);
+        }
     };
 
     // Row outer: its valid tap range and base pointer are fixed for the whole
@@ -907,7 +928,9 @@ inline void pool_channel_last_rows_3x3(const PoolingKernelParams& p, float avg_s
     // rebuilt that setup once per output pixel).
     for (int r = 0; r < R; ++r) {
         const int64_t oh_r = p.oh + r;
-        if (oh_r >= p.OH) { continue; }
+        if (oh_r >= p.OH) {
+            continue;
+        }
         const int64_t ihb = oh_r * S - p.PH;
         const int64_t kh_lo = ihb >= 0 ? 0 : -ihb;
         const int64_t kh_hi = std::min<int64_t>(3, p.IH - ihb);
@@ -955,21 +978,27 @@ inline void pool_channel_last_rows_3x3(const PoolingKernelParams& p, float avg_s
 
             if constexpr (!IsMax) {
                 a0 = v_mul(a0, vs);
-                if constexpr (NV == 2) { a1 = v_mul(a1, vs); }
+                if constexpr (NV == 2) {
+                    a1 = v_mul(a1, vs);
+                }
             }
             dsts[0].store(r, ow, a0);
-            if constexpr (NV == 2) { dsts[1].store(r, ow, a1); }
+            if constexpr (NV == 2) {
+                dsts[1].store(r, ow, a1);
+            }
         }
     }
 }
 
 template <int NV, bool IsMax, typename Src, typename Dst>
 inline bool pool_channel_last_try_3x3(const PoolingKernelParams& p, float scale,
-                         const Src (&srcs)[NV], const Dst (&dsts)[NV])
+                                      const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
-    if constexpr (!Src::full) { return false; }
-    if (p.KD != 1 || p.KH != 3 || p.KW != 3 || p.DH != 1 || p.DW != 1 ||
-        p.SH != p.SW || pooling_counts_taps(p, IsMax)) {
+    if constexpr (!Src::full) {
+        return false;
+    }
+    if (p.KD != 1 || p.KH != 3 || p.KW != 3 || p.DH != 1 || p.DW != 1 || p.SH != p.SW ||
+        pooling_counts_taps(p, IsMax)) {
         return false;
     }
     if (p.SH == 1) {
@@ -995,10 +1024,9 @@ inline bool pool_3x3_route_enabled()
 
 template <int NV, bool IsMax, typename Src, typename Dst>
 inline void pool_channel_last_rows_counted(const PoolingKernelParams& p, float scale,
-                              const Src (&srcs)[NV], const Dst (&dsts)[NV])
+                                           const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
-    if (pool_3x3_route_enabled() &&
-        pool_channel_last_try_3x3<NV, IsMax>(p, scale, srcs, dsts)) {
+    if (pool_3x3_route_enabled() && pool_channel_last_try_3x3<NV, IsMax>(p, scale, srcs, dsts)) {
         return;
     }
     if (pooling_counts_taps(p, IsMax)) {
@@ -1009,39 +1037,31 @@ inline void pool_channel_last_rows_counted(const PoolingKernelParams& p, float s
 }
 
 template <bool IsMax, typename InT, typename OutT>
-inline void pool_channel_last_quant(OutT* output, const InT* input,
-                            const PoolingKernelParams& p, float scale,
-                            float in_scale, float in_zero,
-                            float out_scale, float out_zero,
-                            bool add_to, int64_t lanes)
+inline void pool_channel_last_quant(OutT* output, const InT* input, const PoolingKernelParams& p,
+                                    float scale, float in_scale, float in_zero, float out_scale,
+                                    float out_zero, bool add_to, int64_t lanes)
 {
     if (lanes > kChannelLanes) {
         const QuantSrc<InT, true> src[2] = {
             QuantSrc<InT, true>{input, in_scale, in_zero, kChannelLanes},
-            QuantSrc<InT, true>{input + kChannelLanes, in_scale, in_zero,
-                                kChannelLanes}};
+            QuantSrc<InT, true>{input + kChannelLanes, in_scale, in_zero, kChannelLanes}};
         const QuantDst<OutT, true> dst[2] = {
-            QuantDst<OutT, true>{output, p.out_row_stride, out_scale, out_zero,
-                                 add_to, p.pix_stride, kChannelLanes},
-            QuantDst<OutT, true>{output + kChannelLanes, p.out_row_stride,
-                                 out_scale, out_zero, add_to, p.pix_stride,
-                                 kChannelLanes}};
+            QuantDst<OutT, true>{output, p.out_row_stride, out_scale, out_zero, add_to,
+                                 p.pix_stride, kChannelLanes},
+            QuantDst<OutT, true>{output + kChannelLanes, p.out_row_stride, out_scale, out_zero,
+                                 add_to, p.pix_stride, kChannelLanes}};
         pool_channel_last_rows_counted<2, IsMax>(p, scale, src, dst);
         return;
     }
     if (lanes == kChannelLanes) {
-        const QuantSrc<InT, true> src[1] = {
-            QuantSrc<InT, true>{input, in_scale, in_zero, lanes}};
-        const QuantDst<OutT, true> dst[1] = {
-            QuantDst<OutT, true>{output, p.out_row_stride, out_scale, out_zero,
-                                 add_to, p.pix_stride, lanes}};
+        const QuantSrc<InT, true> src[1] = {QuantSrc<InT, true>{input, in_scale, in_zero, lanes}};
+        const QuantDst<OutT, true> dst[1] = {QuantDst<OutT, true>{
+            output, p.out_row_stride, out_scale, out_zero, add_to, p.pix_stride, lanes}};
         pool_channel_last_rows_counted<1, IsMax>(p, scale, src, dst);
     } else {
-        const QuantSrc<InT, false> src[1] = {
-            QuantSrc<InT, false>{input, in_scale, in_zero, lanes}};
-        const QuantDst<OutT, false> dst[1] = {
-            QuantDst<OutT, false>{output, p.out_row_stride, out_scale, out_zero,
-                                  add_to, p.pix_stride, lanes}};
+        const QuantSrc<InT, false> src[1] = {QuantSrc<InT, false>{input, in_scale, in_zero, lanes}};
+        const QuantDst<OutT, false> dst[1] = {QuantDst<OutT, false>{
+            output, p.out_row_stride, out_scale, out_zero, add_to, p.pix_stride, lanes}};
         pool_channel_last_rows_counted<1, IsMax>(p, scale, src, dst);
     }
 }
@@ -1061,4 +1081,4 @@ inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t la
     }
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

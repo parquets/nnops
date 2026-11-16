@@ -38,18 +38,18 @@ namespace nnops::backend::cpu::x86_64 {
 //  Transpose pack (f32)  —  source rows at ir_step, k contiguous
 // =========================================================================
 
-inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 1) noexcept {
+inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 1) noexcept
+{
     for (int k = 0; k < K; ++k) {
         *output++ = input[0] * scale;
-        input += 1;  // consecutive k within the M×K source row
+        input += 1; // consecutive k within the M×K source row
     }
 }
 
-inline void pack_trans_n2_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 2) noexcept {
+inline void pack_trans_n2_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 2) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const float* NNOPS_RESTRICT p0 = input;
     const float* NNOPS_RESTRICT p1 = input + r1 * ir_step;
@@ -59,7 +59,8 @@ inline void pack_trans_n2_f32(float* NNOPS_RESTRICT output,
     for (; k <= K - 4; k += 4) {
         const __m128 a = _mm_loadu_ps(p0);
         const __m128 b = _mm_loadu_ps(p1);
-        p0 += 4; p1 += 4;
+        p0 += 4;
+        p1 += 4;
         _mm_storeu_ps(output + 0, _mm_mul_ps(_mm_unpacklo_ps(a, b), v_scale));
         _mm_storeu_ps(output + 4, _mm_mul_ps(_mm_unpackhi_ps(a, b), v_scale));
         output += 8;
@@ -71,9 +72,9 @@ inline void pack_trans_n2_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 4) noexcept {
+inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 4) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -85,10 +86,14 @@ inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
     const __m256 v_scale = _mm256_set1_ps(scale);
     int k = 0;
     for (; k <= K - 8; k += 8) {
-        __m256 v0 = _mm256_loadu_ps(p0); p0 += 8;
-        __m256 v1 = _mm256_loadu_ps(p1); p1 += 8;
-        __m256 v2 = _mm256_loadu_ps(p2); p2 += 8;
-        __m256 v3 = _mm256_loadu_ps(p3); p3 += 8;
+        __m256 v0 = _mm256_loadu_ps(p0);
+        p0 += 8;
+        __m256 v1 = _mm256_loadu_ps(p1);
+        p1 += 8;
+        __m256 v2 = _mm256_loadu_ps(p2);
+        p2 += 8;
+        __m256 v3 = _mm256_loadu_ps(p3);
+        p3 += 8;
 
         transpose_4x8_f32(v0, v1, v2, v3);
 
@@ -112,9 +117,9 @@ inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 6) noexcept {
+inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 6) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -130,12 +135,18 @@ inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
     const __m256 v_scale = _mm256_set1_ps(scale);
     int k = 0;
     for (; k <= K - 8; k += 8) {
-        __m256 v0 = _mm256_loadu_ps(p0); p0 += 8;
-        __m256 v1 = _mm256_loadu_ps(p1); p1 += 8;
-        __m256 v2 = _mm256_loadu_ps(p2); p2 += 8;
-        __m256 v3 = _mm256_loadu_ps(p3); p3 += 8;
-        __m256 v4 = _mm256_loadu_ps(p4); p4 += 8;
-        __m256 v5 = _mm256_loadu_ps(p5); p5 += 8;
+        __m256 v0 = _mm256_loadu_ps(p0);
+        p0 += 8;
+        __m256 v1 = _mm256_loadu_ps(p1);
+        p1 += 8;
+        __m256 v2 = _mm256_loadu_ps(p2);
+        p2 += 8;
+        __m256 v3 = _mm256_loadu_ps(p3);
+        p3 += 8;
+        __m256 v4 = _mm256_loadu_ps(p4);
+        p4 += 8;
+        __m256 v5 = _mm256_loadu_ps(p5);
+        p5 += 8;
 
         transpose_6x8_f32(v0, v1, v2, v3, v4, v5);
 
@@ -165,9 +176,9 @@ inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 8) noexcept {
+inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 8) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -187,14 +198,22 @@ inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
     const __m256 v_scale = _mm256_set1_ps(scale);
     int k = 0;
     for (; k <= K - 8; k += 8) {
-        __m256 v0 = _mm256_loadu_ps(p0); p0 += 8;
-        __m256 v1 = _mm256_loadu_ps(p1); p1 += 8;
-        __m256 v2 = _mm256_loadu_ps(p2); p2 += 8;
-        __m256 v3 = _mm256_loadu_ps(p3); p3 += 8;
-        __m256 v4 = _mm256_loadu_ps(p4); p4 += 8;
-        __m256 v5 = _mm256_loadu_ps(p5); p5 += 8;
-        __m256 v6 = _mm256_loadu_ps(p6); p6 += 8;
-        __m256 v7 = _mm256_loadu_ps(p7); p7 += 8;
+        __m256 v0 = _mm256_loadu_ps(p0);
+        p0 += 8;
+        __m256 v1 = _mm256_loadu_ps(p1);
+        p1 += 8;
+        __m256 v2 = _mm256_loadu_ps(p2);
+        p2 += 8;
+        __m256 v3 = _mm256_loadu_ps(p3);
+        p3 += 8;
+        __m256 v4 = _mm256_loadu_ps(p4);
+        p4 += 8;
+        __m256 v5 = _mm256_loadu_ps(p5);
+        p5 += 8;
+        __m256 v6 = _mm256_loadu_ps(p6);
+        p6 += 8;
+        __m256 v7 = _mm256_loadu_ps(p7);
+        p7 += 8;
 
         transpose_8x8_f32(v0, v1, v2, v3, v4, v5, v6, v7);
 
@@ -230,9 +249,9 @@ inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
-                               const float* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale, int mr = 16) noexcept {
+inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                               int ir_step, int K, float scale, int mr = 16) noexcept
+{
     const int last = (mr > 1) ? mr - 1 : 0;
     const float* NNOPS_RESTRICT p[16];
     for (int i = 0; i < 16; ++i) {
@@ -244,12 +263,12 @@ inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
     for (; k <= K - 8; k += 8) {
         __m256 v[16];
         for (int i = 0; i < 16; ++i) {
-            v[i] = _mm256_loadu_ps(p[i]); p[i] += 8;
+            v[i] = _mm256_loadu_ps(p[i]);
+            p[i] += 8;
         }
 
-        transpose_16x8_f32(
-            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-            v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+        transpose_16x8_f32(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11],
+                           v[12], v[13], v[14], v[15]);
 
         for (int i = 0; i < 16; ++i) {
             v[i] = _mm256_mul_ps(v[i], v_scale);
@@ -269,56 +288,58 @@ inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
 //  Copy pack (f32)  —  source k rows at ir_step, lanes contiguous
 // =========================================================================
 
-inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output,
-                             const float* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 1) noexcept {
+inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 1) noexcept
+{
     for (int k = 0; k < K; ++k) {
         *output++ = (nr > 0) ? input[0] * scale : 0.0f;
         input += ir_step;
     }
 }
 
-inline void pack_copy_n2_f32(float* NNOPS_RESTRICT output,
-                             const float* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 2) noexcept {
+inline void pack_copy_n2_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 2) noexcept
+{
     const __m128 v_scale = _mm_set1_ps(scale);
     for (int k = 0; k < K; ++k) {
         __m128 v = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(input)));
-        if (nr < 2) { v = _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 0, 0, 0)); }
+        if (nr < 2) {
+            v = _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 0, 0, 0));
+        }
         _mm_storel_epi64(reinterpret_cast<__m128i*>(output),
                          _mm_castps_si128(_mm_mul_ps(v, v_scale)));
         output += 2;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
-inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output,
-                             const float* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 4) noexcept {
+inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 4) noexcept
+{
     const __m128 v_scale = _mm_set1_ps(scale);
     const __m128i v_idx = _mm_set_epi32(3, 2, 1, 0);
     const __m128i v_read = _mm_cmpgt_epi32(_mm_set1_epi32(nr), v_idx);
     int k = 0;
     for (; k <= K - 2; k += 2) {
         const __m128 a0 = (nr >= 4) ? _mm_loadu_ps(input) : _mm_maskload_ps(input, v_read);
-        const __m128 a1 = (nr >= 4) ? _mm_loadu_ps(input + ir_step)
-                                    : _mm_maskload_ps(input + ir_step, v_read);
+        const __m128 a1 =
+            (nr >= 4) ? _mm_loadu_ps(input + ir_step) : _mm_maskload_ps(input + ir_step, v_read);
         _mm_storeu_ps(output + 0, _mm_mul_ps(a0, v_scale));
         _mm_storeu_ps(output + 4, _mm_mul_ps(a1, v_scale));
         output += 2 * 4;
-        input  += 2 * ir_step;
+        input += 2 * ir_step;
     }
     for (; k < K; ++k) {
         const __m128 v = (nr >= 4) ? _mm_loadu_ps(input) : _mm_maskload_ps(input, v_read);
         _mm_storeu_ps(output, _mm_mul_ps(v, v_scale));
         output += 4;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
-inline void pack_copy_n6_f32(float* NNOPS_RESTRICT output,
-                             const float* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 6) noexcept {
+inline void pack_copy_n6_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 6) noexcept
+{
     const __m128 v_scale = _mm_set1_ps(scale);
     const __m128i v_idx4 = _mm_set_epi32(3, 2, 1, 0);
     const __m128i v_idx2 = _mm_set_epi32(0x7fffffff, 0x7fffffff, 5, 4);
@@ -327,15 +348,15 @@ inline void pack_copy_n6_f32(float* NNOPS_RESTRICT output,
     int k = 0;
     for (; k <= K - 2; k += 2) {
         const __m128 a0 = (nr >= 6) ? _mm_loadu_ps(input) : _mm_maskload_ps(input, v_read4);
-        const __m128 a1 = (nr >= 6)
-            ? _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + 4)))
-            : _mm_maskload_ps(input + 4, v_read2);
-        const __m128 b0 = (nr >= 6) ? _mm_loadu_ps(input + ir_step)
-                                    : _mm_maskload_ps(input + ir_step, v_read4);
-        const __m128 b1 = (nr >= 6)
-            ? _mm_castsi128_ps(
-                  _mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + ir_step + 4)))
-            : _mm_maskload_ps(input + ir_step + 4, v_read2);
+        const __m128 a1 =
+            (nr >= 6) ?
+                _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + 4))) :
+                _mm_maskload_ps(input + 4, v_read2);
+        const __m128 b0 =
+            (nr >= 6) ? _mm_loadu_ps(input + ir_step) : _mm_maskload_ps(input + ir_step, v_read4);
+        const __m128 b1 = (nr >= 6) ? _mm_castsi128_ps(_mm_loadl_epi64(
+                                          reinterpret_cast<const __m128i*>(input + ir_step + 4))) :
+                                      _mm_maskload_ps(input + ir_step + 4, v_read2);
         _mm_storeu_ps(output + 0, _mm_mul_ps(a0, v_scale));
         _mm_storel_epi64(reinterpret_cast<__m128i*>(output + 4),
                          _mm_castps_si128(_mm_mul_ps(a1, v_scale)));
@@ -343,50 +364,49 @@ inline void pack_copy_n6_f32(float* NNOPS_RESTRICT output,
         _mm_storel_epi64(reinterpret_cast<__m128i*>(output + 10),
                          _mm_castps_si128(_mm_mul_ps(b1, v_scale)));
         output += 2 * 6;
-        input  += 2 * ir_step;
+        input += 2 * ir_step;
     }
     for (; k < K; ++k) {
         const __m128 v0 = (nr >= 6) ? _mm_loadu_ps(input) : _mm_maskload_ps(input, v_read4);
-        const __m128 v1 = (nr >= 6)
-            ? _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + 4)))
-            : _mm_maskload_ps(input + 4, v_read2);
+        const __m128 v1 =
+            (nr >= 6) ?
+                _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + 4))) :
+                _mm_maskload_ps(input + 4, v_read2);
         _mm_storeu_ps(output, _mm_mul_ps(v0, v_scale));
         _mm_storel_epi64(reinterpret_cast<__m128i*>(output + 4),
                          _mm_castps_si128(_mm_mul_ps(v1, v_scale)));
         output += 6;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
-inline void pack_copy_n8_f32(float* NNOPS_RESTRICT output,
-                             const float* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 8) noexcept {
+inline void pack_copy_n8_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 8) noexcept
+{
     const __m256 v_scale = _mm256_set1_ps(scale);
     const __m256i v_idx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     const __m256i v_read = _mm256_cmpgt_epi32(_mm256_set1_epi32(nr), v_idx);
     int k = 0;
     for (; k <= K - 2; k += 2) {
-        const __m256 a0 = (nr >= 8) ? _mm256_loadu_ps(input)
-                                    : _mm256_maskload_ps(input, v_read);
-        const __m256 a1 = (nr >= 8) ? _mm256_loadu_ps(input + ir_step)
-                                    : _mm256_maskload_ps(input + ir_step, v_read);
+        const __m256 a0 = (nr >= 8) ? _mm256_loadu_ps(input) : _mm256_maskload_ps(input, v_read);
+        const __m256 a1 = (nr >= 8) ? _mm256_loadu_ps(input + ir_step) :
+                                      _mm256_maskload_ps(input + ir_step, v_read);
         _mm256_storeu_ps(output + 0, _mm256_mul_ps(a0, v_scale));
         _mm256_storeu_ps(output + 8, _mm256_mul_ps(a1, v_scale));
         output += 2 * 8;
-        input  += 2 * ir_step;
+        input += 2 * ir_step;
     }
     for (; k < K; ++k) {
-        const __m256 v = (nr >= 8) ? _mm256_loadu_ps(input)
-                                   : _mm256_maskload_ps(input, v_read);
+        const __m256 v = (nr >= 8) ? _mm256_loadu_ps(input) : _mm256_maskload_ps(input, v_read);
         _mm256_storeu_ps(output, _mm256_mul_ps(v, v_scale));
         output += 8;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
-inline void pack_copy_n12_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int nr = 12) noexcept {
+inline void pack_copy_n12_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int nr = 12) noexcept
+{
     const __m128 v_scale = _mm_set1_ps(scale);
     const __m128i v_idx = _mm_set_epi32(3, 2, 1, 0);
     const __m128i v_read0 = _mm_cmpgt_epi32(_mm_set1_epi32(nr), v_idx);
@@ -407,13 +427,13 @@ inline void pack_copy_n12_f32(float* NNOPS_RESTRICT output,
         _mm_storeu_ps(output + 4, _mm_mul_ps(v1, v_scale));
         _mm_storeu_ps(output + 8, _mm_mul_ps(v2, v_scale));
         output += 12;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
-inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
-                              const float* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int nr = 16) noexcept {
+inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output, const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int nr = 16) noexcept
+{
     const __m256 v_scale = _mm256_set1_ps(scale);
     const __m256i v_idx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     const __m256i v_read_lo = _mm256_cmpgt_epi32(_mm256_set1_epi32(nr), v_idx);
@@ -430,7 +450,7 @@ inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
         _mm256_storeu_ps(output + 0, _mm256_mul_ps(v0, v_scale));
         _mm256_storeu_ps(output + 8, _mm256_mul_ps(v1, v_scale));
         output += 16;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
@@ -441,4 +461,4 @@ inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
 inline constexpr int mr_f32[4] = {6, 4, 2, 1};
 inline constexpr int nr_f32[3] = {16, 8, 1};
 
-}  // namespace nnops::backend::cpu::x86_64
+} // namespace nnops::backend::cpu::x86_64

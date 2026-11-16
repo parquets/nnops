@@ -10,11 +10,9 @@ namespace nnops {
 
 NNOPS_DECLARE_CPU(EmbedAttributes, embed_cpu)
 
-NNOPS_OP_BOILERPLATE(Embed, EmbedAttributes,
-        backend::cpu::embed_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Embed, EmbedAttributes, backend::cpu::embed_cpu, nullptr, nullptr)
 
-std::vector<TensorDesc> Embed::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Embed::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     return embed_output_shape(inputs);
 }
@@ -39,7 +37,9 @@ Status Embed::validate(std::span<const TensorDesc> inputs,
     if (!detail::dtype_in<DataType::s64, DataType::s32>(backend_, indices.dtype)) {
         return Status::invalid_argument;
     }
-    if (weight.rank < 2) { return Status::invalid_argument; }
+    if (weight.rank < 2) {
+        return Status::invalid_argument;
+    }
     if (!is_layout_supported(weight.layout, LayoutSupport::ChannelFirstOnly) ||
         !is_layout_supported(indices.layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::invalid_argument;
@@ -51,16 +51,13 @@ Status Embed::validate(std::span<const TensorDesc> inputs,
     if (detail::dtype_in<DataType::s8, DataType::u8>(backend_, weight.dtype)) {
         // The output of a quantized weight is always float; the dequant params
         // themselves live on the view and are checked in compute().
-        return detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16>(backend_, out.dtype));
+        return detail::require(detail::dtype_in<DataType::f32, DataType::f16>(backend_, out.dtype));
     }
     return Status::unsupported;
 }
 
-Status Embed::compute(std::span<TensorView> outputs,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace)
+Status Embed::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                      const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
@@ -69,8 +66,10 @@ Status Embed::compute(std::span<TensorView> outputs,
         !inputs[0].is_quantized()) {
         return Status::invalid_argument;
     }
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

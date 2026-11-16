@@ -28,22 +28,23 @@ namespace nnops::backend::vulkan {
 
 constexpr int kVulkanWorkgroupSize = 256;
 
-template <typename T, typename U>
-constexpr auto ceil_div(T a, U b) noexcept {
+template <typename T, typename U> constexpr auto ceil_div(T a, U b) noexcept
+{
     return (a + b - 1) / b;
 }
 
 /// Holds pre-compiled SPIR-V binary for a compute shader.
 struct SpirvBlob {
     const uint32_t* data;
-    size_t          size_bytes;
+    size_t size_bytes;
 };
 
 struct ComputePushConstants {
-    int32_t total;  // total number of elements to process
+    int32_t total; // total number of elements to process
 };
 
-inline void vk_check(VkResult res, const char* file, int line, const char* expr) {
+inline void vk_check(VkResult res, const char* file, int line, const char* expr)
+{
     if (res != VK_SUCCESS) {
         fprintf(stderr, "[%s:%d] VK_CHECK(%s) failed: %d\n", file, line, expr, res);
         std::abort();
@@ -53,31 +54,30 @@ inline void vk_check(VkResult res, const char* file, int line, const char* expr)
 #define VK_CHECK(expr) nnops::backend::vulkan::vk_check(expr, __FILE__, __LINE__, #expr)
 
 struct VulkanPipeline {
-    VkPipeline            pipeline = VK_NULL_HANDLE;
-    VkPipelineLayout      layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
 };
 
 struct PipelineKey {
-    VkDevice        device;
+    VkDevice device;
     const uint32_t* spirv_data;
-    size_t          spirv_size;
-    uint32_t        spec_op;      // specialization constant: OP type
-    uint32_t        spec_add_to;  // specialization constant: ADD_TO flag
-    uint32_t        num_bindings; // number of descriptor set bindings
+    size_t spirv_size;
+    uint32_t spec_op;      // specialization constant: OP type
+    uint32_t spec_add_to;  // specialization constant: ADD_TO flag
+    uint32_t num_bindings; // number of descriptor set bindings
 
-    bool operator==(const PipelineKey& other) const noexcept {
-        return device == other.device
-            && spirv_data == other.spirv_data
-            && spirv_size == other.spirv_size
-            && spec_op == other.spec_op
-            && spec_add_to == other.spec_add_to
-            && num_bindings == other.num_bindings;
+    bool operator==(const PipelineKey& other) const noexcept
+    {
+        return device == other.device && spirv_data == other.spirv_data &&
+               spirv_size == other.spirv_size && spec_op == other.spec_op &&
+               spec_add_to == other.spec_add_to && num_bindings == other.num_bindings;
     }
 };
 
 struct PipelineKeyHash {
-    size_t operator()(const PipelineKey& k) const noexcept {
+    size_t operator()(const PipelineKey& k) const noexcept
+    {
         size_t h = reinterpret_cast<size_t>(k.device);
         h ^= reinterpret_cast<size_t>(k.spirv_data) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= k.spirv_size + 0x9e3779b9 + (h << 6) + (h >> 2);
@@ -88,8 +88,9 @@ struct PipelineKeyHash {
 };
 
 class VulkanPipelineCache {
-public:
-    static VulkanPipelineCache& instance() {
+  public:
+    static VulkanPipelineCache& instance()
+    {
         static VulkanPipelineCache cache;
         return cache;
     }
@@ -102,7 +103,7 @@ public:
 
     void clear();
 
-private:
+  private:
     VulkanPipelineCache() = default;
     ~VulkanPipelineCache();
     VulkanPipelineCache(const VulkanPipelineCache&) = delete;
@@ -116,15 +117,9 @@ private:
 
 /// Allocate a descriptor set from @p pool, bind @p buffers with @p
 /// push_constants, and dispatch over @p total_elements.
-void vulkan_record_dispatch(
-    VkCommandBuffer        cmd,
-    VkDevice               device,
-    VkDescriptorPool       pool,
-    const VulkanPipeline&  pipeline,
-    const VkBuffer*        buffers,
-    uint32_t               num_buffers,
-    const void*            push_constants,
-    uint32_t               pc_size,
-    uint32_t               total_elements);
+void vulkan_record_dispatch(VkCommandBuffer cmd, VkDevice device, VkDescriptorPool pool,
+                            const VulkanPipeline& pipeline, const VkBuffer* buffers,
+                            uint32_t num_buffers, const void* push_constants, uint32_t pc_size,
+                            uint32_t total_elements);
 
-}  // namespace nnops::backend::vulkan
+} // namespace nnops::backend::vulkan

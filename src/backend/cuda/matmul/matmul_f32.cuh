@@ -34,12 +34,11 @@
 namespace nnops::backend::cuda {
 
 /// One instantiation of the f32 kernel.
-template <int LaneRow_, int LaneCol_, int WarpsM_, int WarpsN_, int BK_, int ST_,
-          int KU_ = 4, int Raster_ = 8, int Pad_ = 4, int MinBlocks_ = 1>
-struct ManualFShape
-{
-    static constexpr int LaneRow = LaneRow_;  ///< rows one thread owns
-    static constexpr int LaneCol = LaneCol_;  ///< columns one thread owns
+template <int LaneRow_, int LaneCol_, int WarpsM_, int WarpsN_, int BK_, int ST_, int KU_ = 4,
+          int Raster_ = 8, int Pad_ = 4, int MinBlocks_ = 1>
+struct ManualFShape {
+    static constexpr int LaneRow = LaneRow_; ///< rows one thread owns
+    static constexpr int LaneCol = LaneCol_; ///< columns one thread owns
     /// A warp is 32 lanes as an 8x4 grid: 8 lanes down the rows, 4 across.
     static constexpr int warpRows = 8 * LaneRow;
     static constexpr int warpCols = 4 * LaneCol;
@@ -50,7 +49,7 @@ struct ManualFShape
     static constexpr int BN = wn * warpCols;
     static constexpr int BK = BK_;
     static constexpr int stages = ST_;
-    static constexpr int KU = KU_;  ///< k values per panel vector
+    static constexpr int KU = KU_; ///< k values per panel vector
     /// L2 rasterization strip: the grid is walked in groups of this many m tiles,
     /// stepping n inside a group. 0 disables it. Without it the block order is
     /// plain row-major, and at 4096^3 that alone cost 13% -- the tiles that
@@ -69,23 +68,22 @@ struct ManualFShape
     /// `__launch_bounds__` minimum blocks: it caps the register count, which is
     /// what stands between the wide tiles and a fourth resident block.
     static constexpr int MinBlocks = MinBlocks_;
-    static constexpr int LDA = BK + Pad;   ///< A as `[m][k]`
-    static constexpr int LDAt = BM + Pad;  ///< A as `[k][m]`
-    static constexpr int LDN = BN + Pad;   ///< B as `[k][n]`
-    static constexpr int LDk = BK + Pad;   ///< B as `[n][k]`
+    static constexpr int LDA = BK + Pad;  ///< A as `[m][k]`
+    static constexpr int LDAt = BM + Pad; ///< A as `[k][m]`
+    static constexpr int LDN = BN + Pad;  ///< B as `[k][n]`
+    static constexpr int LDk = BK + Pad;  ///< B as `[n][k]`
     static constexpr int kKSteps = BK / KU;
     static constexpr int kVecPerRow = BK / KU;
     static constexpr int kRowsPerPass = threads / kVecPerRow;
     /// One buffer serves every pose: each panel is sized to the larger of its
     /// two orders.
-    static constexpr int kAMax = BM * LDA > BK * LDAt ? BM * LDA : BK * LDAt;
-    static constexpr int kBMax = BN * LDk > BK * LDN ? BN * LDk : BK * LDN;
+    static constexpr int kAMax = BM * LDA > BK* LDAt ? BM* LDA : BK* LDAt;
+    static constexpr int kBMax = BN * LDk > BK* LDN ? BN* LDk : BK* LDN;
     static constexpr int kPanelFloats = stages * (kAMax + kBMax);
     static constexpr int kSmemBytes = kPanelFloats * int(sizeof(float));
 
     static_assert(BK % KU == 0, "the k unroll must divide the stage depth");
-    static_assert(LaneCol % 4 == 0,
-                  "a lane's columns fill whole 16 B vectors in the n-major pose");
+    static_assert(LaneCol % 4 == 0, "a lane's columns fill whole 16 B vectors in the n-major pose");
     static_assert(BK % 4 == 0, "a panel row must hold whole 16 B vectors");
     static_assert(BM % kRowsPerPass == 0 && BN % kRowsPerPass == 0,
                   "a fill pass must divide both panels into whole row blocks");
@@ -116,8 +114,7 @@ struct ManualFParams {
 
 /// The f32 tile: 8x8 per thread, cp.async ring, padded panels.
 template <class S, bool TransA, bool TransB>
-__global__ __launch_bounds__(S::threads, S::MinBlocks)
-void manual_gemm_f_kernel(ManualFParams p)
+__global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_f_kernel(ManualFParams p)
 {
     constexpr int BM = S::BM, BN = S::BN, BK = S::BK, ST = S::stages;
     constexpr int KU = S::KU, LR = S::LaneRow, LC = S::LaneCol;
@@ -163,18 +160,17 @@ void manual_gemm_f_kernel(ManualFParams p)
     const int batch = splits > 0 ? z / splits : 0;
     const int split = splits > 0 ? z - batch * splits : 0;
     const int kt_begin = int(int64_t(k_tiles) * split / (splits > 0 ? splits : 1));
-    const int kt_end =
-        int(int64_t(k_tiles) * (split + 1) / (splits > 0 ? splits : 1));
-    if (kt_begin >= kt_end) { return; }
+    const int kt_end = int(int64_t(k_tiles) * (split + 1) / (splits > 0 ? splits : 1));
+    if (kt_begin >= kt_end) {
+        return;
+    }
 
     const float* const A = static_cast<const float*>(p.a) +
-                           manual_batch_offset(p.bsize, p.a_bstr, p.batch_rank,
-                                                 batch);
+                           manual_batch_offset(p.bsize, p.a_bstr, p.batch_rank, batch);
     const float* const B = static_cast<const float*>(p.b) +
-                           manual_batch_offset(p.bsize, p.b_bstr, p.batch_rank,
-                                                 batch);
-    float* const C = static_cast<float*>(p.c) +
-                     manual_batch_offset(p.bsize, p.c_bstr, p.batch_rank, batch);
+                           manual_batch_offset(p.bsize, p.b_bstr, p.batch_rank, batch);
+    float* const C =
+        static_cast<float*>(p.c) + manual_batch_offset(p.bsize, p.c_bstr, p.batch_rank, batch);
 
     const int vrow = tid / S::kVecPerRow;
     const int vcol = (tid % S::kVecPerRow) * KU;
@@ -224,25 +220,21 @@ void manual_gemm_f_kernel(ManualFParams p)
                 for (int i = tid; i < BN * S::kVecPerRow; i += S::threads) {
                     const int row = i / S::kVecPerRow;
                     const int kk = (i % S::kVecPerRow) * KU;
-                    cp_async_ca_16B(&sB[row * LDK + kk],
-                                    B + (n_tile + row) * ldb_i + k0 + kk);
+                    cp_async_ca_16B(&sB[row * LDK + kk], B + (n_tile + row) * ldb_i + k0 + kk);
                 }
             } else {
-            for (int i = tid; i < BN * S::kVecPerRow; i += S::threads) {
-                const int row = i / S::kVecPerRow;
-                const int kk = (i % S::kVecPerRow) * KU;
-                const int an = n_tile + row;
-                if (an < N && k0 + kk + KU <= K) {
-                    cp_async_ca_16B(&sB[row * LDK + kk],
-                                    B + an * ldb_i + k0 + kk);
-                } else {
-                    for (int t = 0; t < KU; ++t) {
-                        sB[row * LDK + kk + t] =
-                            (an < N && k0 + kk + t < K)
-                                ? B[an * ldb_i + k0 + kk + t]
-                                : 0.0f;
+                for (int i = tid; i < BN * S::kVecPerRow; i += S::threads) {
+                    const int row = i / S::kVecPerRow;
+                    const int kk = (i % S::kVecPerRow) * KU;
+                    const int an = n_tile + row;
+                    if (an < N && k0 + kk + KU <= K) {
+                        cp_async_ca_16B(&sB[row * LDK + kk], B + an * ldb_i + k0 + kk);
+                    } else {
+                        for (int t = 0; t < KU; ++t) {
+                            sB[row * LDK + kk + t] =
+                                (an < N && k0 + kk + t < K) ? B[an * ldb_i + k0 + kk + t] : 0.0f;
+                        }
                     }
-                }
                 }
             }
         } else {
@@ -257,71 +249,62 @@ void manual_gemm_f_kernel(ManualFParams p)
                                     B + (k0 + kr) * ldb_i + n_tile + bColOff);
                 }
             } else
-            for (int kr = bRow0; kr < BK; kr += kBStep) {
-                const int nn = bColOff;
-                const int kk = k0 + kr;
-                const int gn = n_tile + nn;
-                if (kk < K && gn + KU <= N) {
-                    cp_async_ca_16B(&sB[kr * LDK + nn], B + kk * ldb_i + gn);
-                } else {
-                    for (int t = 0; t < KU; ++t) {
-                        sB[kr * LDK + nn + t] =
-                            (kk < K && gn + t < N)
-                                ? B[kk * ldb_i + gn + t]
-                                : 0.0f;
+                for (int kr = bRow0; kr < BK; kr += kBStep) {
+                    const int nn = bColOff;
+                    const int kk = k0 + kr;
+                    const int gn = n_tile + nn;
+                    if (kk < K && gn + KU <= N) {
+                        cp_async_ca_16B(&sB[kr * LDK + nn], B + kk * ldb_i + gn);
+                    } else {
+                        for (int t = 0; t < KU; ++t) {
+                            sB[kr * LDK + nn + t] =
+                                (kk < K && gn + t < N) ? B[kk * ldb_i + gn + t] : 0.0f;
+                        }
                     }
                 }
-            }
         }
         if constexpr (!TransA) {
             if (aFull) {
 #pragma unroll
                 for (int r = 0; r < kAPass; ++r) {
-                    cp_async_ca_16B(
-                        &sA[(vrow + r * S::kRowsPerPass) * LDA + vcol],
-                        aFill[r] + k0 + vcol);
+                    cp_async_ca_16B(&sA[(vrow + r * S::kRowsPerPass) * LDA + vcol],
+                                    aFill[r] + k0 + vcol);
                 }
             } else
 #pragma unroll
-            for (int r = 0; r < kAPass; ++r) {
-                const int row = vrow + r * S::kRowsPerPass;
-                const int am = m_tile + row;
-                if (am < M && k0 + vcol + KU <= K) {
-                    cp_async_ca_16B(&sA[row * LDA + vcol],
-                                    aFill[r] + k0 + vcol);
-                } else {
-                    for (int t = 0; t < KU; ++t) {
-                        sA[row * LDA + vcol + t] =
-                            (am < M && k0 + vcol + t < K)
-                                ? aFill[r][k0 + vcol + t]
-                                : 0.0f;
+                for (int r = 0; r < kAPass; ++r) {
+                    const int row = vrow + r * S::kRowsPerPass;
+                    const int am = m_tile + row;
+                    if (am < M && k0 + vcol + KU <= K) {
+                        cp_async_ca_16B(&sA[row * LDA + vcol], aFill[r] + k0 + vcol);
+                    } else {
+                        for (int t = 0; t < KU; ++t) {
+                            sA[row * LDA + vcol + t] =
+                                (am < M && k0 + vcol + t < K) ? aFill[r][k0 + vcol + t] : 0.0f;
+                        }
                     }
                 }
-            }
         } else {
             // A arrives `[k][m]`: a vector is four consecutive m of one k row,
             // and the panel keeps that order, so the copy is async here too.
             if (aFull) {
                 for (int kr = aRow0; kr < BK; kr += kAStep) {
-                    cp_async_ca_16B(&sA[kr * LDA + aCol],
-                                    A + (k0 + kr) * lda_i + m_tile + aCol);
+                    cp_async_ca_16B(&sA[kr * LDA + aCol], A + (k0 + kr) * lda_i + m_tile + aCol);
                 }
             } else
-            for (int kr = aRow0; kr < BK; kr += kAStep) {
-                const int mm = aCol;
-                const int kk = k0 + kr;
-                const int gm = m_tile + mm;
-                if (kk < K && gm + KU <= M) {
-                    cp_async_ca_16B(&sA[kr * LDA + mm], A + kk * lda_i + gm);
-                } else {
-                    for (int t = 0; t < KU; ++t) {
-                        sA[kr * LDA + mm + t] =
-                            (kk < K && gm + t < M)
-                                ? A[kk * lda_i + gm + t]
-                                : 0.0f;
+                for (int kr = aRow0; kr < BK; kr += kAStep) {
+                    const int mm = aCol;
+                    const int kk = k0 + kr;
+                    const int gm = m_tile + mm;
+                    if (kk < K && gm + KU <= M) {
+                        cp_async_ca_16B(&sA[kr * LDA + mm], A + kk * lda_i + gm);
+                    } else {
+                        for (int t = 0; t < KU; ++t) {
+                            sA[kr * LDA + mm + t] =
+                                (kk < K && gm + t < M) ? A[kk * lda_i + gm + t] : 0.0f;
+                        }
                     }
                 }
-            }
         }
         cp_async_commit_group();
     };
@@ -330,7 +313,9 @@ void manual_gemm_f_kernel(ManualFParams p)
 #pragma unroll
     for (int r = 0; r < LR; ++r)
 #pragma unroll
-        for (int c = 0; c < LC; ++c) { acc[r][c] = 0.0f; }
+        for (int c = 0; c < LC; ++c) {
+            acc[r][c] = 0.0f;
+        }
 
     // A warp is eight lane-rows by four lane-cols. A k-major A panel hands a
     // lane the rows eight apart (one per vector); a transposed one hands it four
@@ -383,15 +368,14 @@ void manual_gemm_f_kernel(ManualFParams p)
                 for (int t = 0; t < KU; ++t) {
 #pragma unroll
                     for (int g = 0; g < G; ++g) {
-                        af[t * G + g] = *reinterpret_cast<const float4*>(
-                            &sA_m[(kv + t) * LDA + 32 * g]);
+                        af[t * G + g] =
+                            *reinterpret_cast<const float4*>(&sA_m[(kv + t) * LDA + 32 * g]);
                     }
                 }
             } else {
 #pragma unroll
                 for (int r = 0; r < LR; ++r) {
-                    af[r] = *reinterpret_cast<const float4*>(
-                        &aRow[(r * 8) * LDA + kv]);
+                    af[r] = *reinterpret_cast<const float4*>(&aRow[(r * 8) * LDA + kv]);
                 }
             }
             if constexpr (TransB) {
@@ -399,8 +383,7 @@ void manual_gemm_f_kernel(ManualFParams p)
                 float4 bv[LC];
 #pragma unroll
                 for (int c = 0; c < LC; ++c) {
-                    bv[c] = *reinterpret_cast<const float4*>(
-                        &bCol[c * LDK + kv]);
+                    bv[c] = *reinterpret_cast<const float4*>(&bCol[c * LDK + kv]);
                 }
 #pragma unroll
                 for (int c = 0; c < LC; ++c) {
@@ -449,8 +432,7 @@ void manual_gemm_f_kernel(ManualFParams p)
                 for (int t = 0; t < KU; ++t) {
 #pragma unroll
                     for (int g = 0; g < LC / 4; ++g) {
-                        bv[t][g] = *reinterpret_cast<const float4*>(
-                            &sB_k[(kv + t) * LDK + 4 * g]);
+                        bv[t][g] = *reinterpret_cast<const float4*>(&sB_k[(kv + t) * LDK + 4 * g]);
                     }
                 }
                 static_assert(KU == 4, "the n-major inner loop is a four-deep unroll");
@@ -485,70 +467,134 @@ void manual_gemm_f_kernel(ManualFParams p)
                     for (int g = 0; g < LR / 4; ++g) {
 #pragma unroll
                         for (int h = 0; h < LC / 4; ++h) {
-                            acc[4 * g + 0][4 * h + 0] = fmaf(af[0 * G + g].x, bv[0][h].x, acc[4 * g + 0][4 * h + 0]);
-                            acc[4 * g + 0][4 * h + 0] = fmaf(af[1 * G + g].x, bv[1][h].x, acc[4 * g + 0][4 * h + 0]);
-                            acc[4 * g + 0][4 * h + 0] = fmaf(af[2 * G + g].x, bv[2][h].x, acc[4 * g + 0][4 * h + 0]);
-                            acc[4 * g + 0][4 * h + 0] = fmaf(af[3 * G + g].x, bv[3][h].x, acc[4 * g + 0][4 * h + 0]);
-                            acc[4 * g + 0][4 * h + 1] = fmaf(af[0 * G + g].x, bv[0][h].y, acc[4 * g + 0][4 * h + 1]);
-                            acc[4 * g + 0][4 * h + 1] = fmaf(af[1 * G + g].x, bv[1][h].y, acc[4 * g + 0][4 * h + 1]);
-                            acc[4 * g + 0][4 * h + 1] = fmaf(af[2 * G + g].x, bv[2][h].y, acc[4 * g + 0][4 * h + 1]);
-                            acc[4 * g + 0][4 * h + 1] = fmaf(af[3 * G + g].x, bv[3][h].y, acc[4 * g + 0][4 * h + 1]);
-                            acc[4 * g + 0][4 * h + 2] = fmaf(af[0 * G + g].x, bv[0][h].z, acc[4 * g + 0][4 * h + 2]);
-                            acc[4 * g + 0][4 * h + 2] = fmaf(af[1 * G + g].x, bv[1][h].z, acc[4 * g + 0][4 * h + 2]);
-                            acc[4 * g + 0][4 * h + 2] = fmaf(af[2 * G + g].x, bv[2][h].z, acc[4 * g + 0][4 * h + 2]);
-                            acc[4 * g + 0][4 * h + 2] = fmaf(af[3 * G + g].x, bv[3][h].z, acc[4 * g + 0][4 * h + 2]);
-                            acc[4 * g + 0][4 * h + 3] = fmaf(af[0 * G + g].x, bv[0][h].w, acc[4 * g + 0][4 * h + 3]);
-                            acc[4 * g + 0][4 * h + 3] = fmaf(af[1 * G + g].x, bv[1][h].w, acc[4 * g + 0][4 * h + 3]);
-                            acc[4 * g + 0][4 * h + 3] = fmaf(af[2 * G + g].x, bv[2][h].w, acc[4 * g + 0][4 * h + 3]);
-                            acc[4 * g + 0][4 * h + 3] = fmaf(af[3 * G + g].x, bv[3][h].w, acc[4 * g + 0][4 * h + 3]);
-                            acc[4 * g + 1][4 * h + 0] = fmaf(af[0 * G + g].y, bv[0][h].x, acc[4 * g + 1][4 * h + 0]);
-                            acc[4 * g + 1][4 * h + 0] = fmaf(af[1 * G + g].y, bv[1][h].x, acc[4 * g + 1][4 * h + 0]);
-                            acc[4 * g + 1][4 * h + 0] = fmaf(af[2 * G + g].y, bv[2][h].x, acc[4 * g + 1][4 * h + 0]);
-                            acc[4 * g + 1][4 * h + 0] = fmaf(af[3 * G + g].y, bv[3][h].x, acc[4 * g + 1][4 * h + 0]);
-                            acc[4 * g + 1][4 * h + 1] = fmaf(af[0 * G + g].y, bv[0][h].y, acc[4 * g + 1][4 * h + 1]);
-                            acc[4 * g + 1][4 * h + 1] = fmaf(af[1 * G + g].y, bv[1][h].y, acc[4 * g + 1][4 * h + 1]);
-                            acc[4 * g + 1][4 * h + 1] = fmaf(af[2 * G + g].y, bv[2][h].y, acc[4 * g + 1][4 * h + 1]);
-                            acc[4 * g + 1][4 * h + 1] = fmaf(af[3 * G + g].y, bv[3][h].y, acc[4 * g + 1][4 * h + 1]);
-                            acc[4 * g + 1][4 * h + 2] = fmaf(af[0 * G + g].y, bv[0][h].z, acc[4 * g + 1][4 * h + 2]);
-                            acc[4 * g + 1][4 * h + 2] = fmaf(af[1 * G + g].y, bv[1][h].z, acc[4 * g + 1][4 * h + 2]);
-                            acc[4 * g + 1][4 * h + 2] = fmaf(af[2 * G + g].y, bv[2][h].z, acc[4 * g + 1][4 * h + 2]);
-                            acc[4 * g + 1][4 * h + 2] = fmaf(af[3 * G + g].y, bv[3][h].z, acc[4 * g + 1][4 * h + 2]);
-                            acc[4 * g + 1][4 * h + 3] = fmaf(af[0 * G + g].y, bv[0][h].w, acc[4 * g + 1][4 * h + 3]);
-                            acc[4 * g + 1][4 * h + 3] = fmaf(af[1 * G + g].y, bv[1][h].w, acc[4 * g + 1][4 * h + 3]);
-                            acc[4 * g + 1][4 * h + 3] = fmaf(af[2 * G + g].y, bv[2][h].w, acc[4 * g + 1][4 * h + 3]);
-                            acc[4 * g + 1][4 * h + 3] = fmaf(af[3 * G + g].y, bv[3][h].w, acc[4 * g + 1][4 * h + 3]);
-                            acc[4 * g + 2][4 * h + 0] = fmaf(af[0 * G + g].z, bv[0][h].x, acc[4 * g + 2][4 * h + 0]);
-                            acc[4 * g + 2][4 * h + 0] = fmaf(af[1 * G + g].z, bv[1][h].x, acc[4 * g + 2][4 * h + 0]);
-                            acc[4 * g + 2][4 * h + 0] = fmaf(af[2 * G + g].z, bv[2][h].x, acc[4 * g + 2][4 * h + 0]);
-                            acc[4 * g + 2][4 * h + 0] = fmaf(af[3 * G + g].z, bv[3][h].x, acc[4 * g + 2][4 * h + 0]);
-                            acc[4 * g + 2][4 * h + 1] = fmaf(af[0 * G + g].z, bv[0][h].y, acc[4 * g + 2][4 * h + 1]);
-                            acc[4 * g + 2][4 * h + 1] = fmaf(af[1 * G + g].z, bv[1][h].y, acc[4 * g + 2][4 * h + 1]);
-                            acc[4 * g + 2][4 * h + 1] = fmaf(af[2 * G + g].z, bv[2][h].y, acc[4 * g + 2][4 * h + 1]);
-                            acc[4 * g + 2][4 * h + 1] = fmaf(af[3 * G + g].z, bv[3][h].y, acc[4 * g + 2][4 * h + 1]);
-                            acc[4 * g + 2][4 * h + 2] = fmaf(af[0 * G + g].z, bv[0][h].z, acc[4 * g + 2][4 * h + 2]);
-                            acc[4 * g + 2][4 * h + 2] = fmaf(af[1 * G + g].z, bv[1][h].z, acc[4 * g + 2][4 * h + 2]);
-                            acc[4 * g + 2][4 * h + 2] = fmaf(af[2 * G + g].z, bv[2][h].z, acc[4 * g + 2][4 * h + 2]);
-                            acc[4 * g + 2][4 * h + 2] = fmaf(af[3 * G + g].z, bv[3][h].z, acc[4 * g + 2][4 * h + 2]);
-                            acc[4 * g + 2][4 * h + 3] = fmaf(af[0 * G + g].z, bv[0][h].w, acc[4 * g + 2][4 * h + 3]);
-                            acc[4 * g + 2][4 * h + 3] = fmaf(af[1 * G + g].z, bv[1][h].w, acc[4 * g + 2][4 * h + 3]);
-                            acc[4 * g + 2][4 * h + 3] = fmaf(af[2 * G + g].z, bv[2][h].w, acc[4 * g + 2][4 * h + 3]);
-                            acc[4 * g + 2][4 * h + 3] = fmaf(af[3 * G + g].z, bv[3][h].w, acc[4 * g + 2][4 * h + 3]);
-                            acc[4 * g + 3][4 * h + 0] = fmaf(af[0 * G + g].w, bv[0][h].x, acc[4 * g + 3][4 * h + 0]);
-                            acc[4 * g + 3][4 * h + 0] = fmaf(af[1 * G + g].w, bv[1][h].x, acc[4 * g + 3][4 * h + 0]);
-                            acc[4 * g + 3][4 * h + 0] = fmaf(af[2 * G + g].w, bv[2][h].x, acc[4 * g + 3][4 * h + 0]);
-                            acc[4 * g + 3][4 * h + 0] = fmaf(af[3 * G + g].w, bv[3][h].x, acc[4 * g + 3][4 * h + 0]);
-                            acc[4 * g + 3][4 * h + 1] = fmaf(af[0 * G + g].w, bv[0][h].y, acc[4 * g + 3][4 * h + 1]);
-                            acc[4 * g + 3][4 * h + 1] = fmaf(af[1 * G + g].w, bv[1][h].y, acc[4 * g + 3][4 * h + 1]);
-                            acc[4 * g + 3][4 * h + 1] = fmaf(af[2 * G + g].w, bv[2][h].y, acc[4 * g + 3][4 * h + 1]);
-                            acc[4 * g + 3][4 * h + 1] = fmaf(af[3 * G + g].w, bv[3][h].y, acc[4 * g + 3][4 * h + 1]);
-                            acc[4 * g + 3][4 * h + 2] = fmaf(af[0 * G + g].w, bv[0][h].z, acc[4 * g + 3][4 * h + 2]);
-                            acc[4 * g + 3][4 * h + 2] = fmaf(af[1 * G + g].w, bv[1][h].z, acc[4 * g + 3][4 * h + 2]);
-                            acc[4 * g + 3][4 * h + 2] = fmaf(af[2 * G + g].w, bv[2][h].z, acc[4 * g + 3][4 * h + 2]);
-                            acc[4 * g + 3][4 * h + 2] = fmaf(af[3 * G + g].w, bv[3][h].z, acc[4 * g + 3][4 * h + 2]);
-                            acc[4 * g + 3][4 * h + 3] = fmaf(af[0 * G + g].w, bv[0][h].w, acc[4 * g + 3][4 * h + 3]);
-                            acc[4 * g + 3][4 * h + 3] = fmaf(af[1 * G + g].w, bv[1][h].w, acc[4 * g + 3][4 * h + 3]);
-                            acc[4 * g + 3][4 * h + 3] = fmaf(af[2 * G + g].w, bv[2][h].w, acc[4 * g + 3][4 * h + 3]);
-                            acc[4 * g + 3][4 * h + 3] = fmaf(af[3 * G + g].w, bv[3][h].w, acc[4 * g + 3][4 * h + 3]);
+                            acc[4 * g + 0][4 * h + 0] =
+                                fmaf(af[0 * G + g].x, bv[0][h].x, acc[4 * g + 0][4 * h + 0]);
+                            acc[4 * g + 0][4 * h + 0] =
+                                fmaf(af[1 * G + g].x, bv[1][h].x, acc[4 * g + 0][4 * h + 0]);
+                            acc[4 * g + 0][4 * h + 0] =
+                                fmaf(af[2 * G + g].x, bv[2][h].x, acc[4 * g + 0][4 * h + 0]);
+                            acc[4 * g + 0][4 * h + 0] =
+                                fmaf(af[3 * G + g].x, bv[3][h].x, acc[4 * g + 0][4 * h + 0]);
+                            acc[4 * g + 0][4 * h + 1] =
+                                fmaf(af[0 * G + g].x, bv[0][h].y, acc[4 * g + 0][4 * h + 1]);
+                            acc[4 * g + 0][4 * h + 1] =
+                                fmaf(af[1 * G + g].x, bv[1][h].y, acc[4 * g + 0][4 * h + 1]);
+                            acc[4 * g + 0][4 * h + 1] =
+                                fmaf(af[2 * G + g].x, bv[2][h].y, acc[4 * g + 0][4 * h + 1]);
+                            acc[4 * g + 0][4 * h + 1] =
+                                fmaf(af[3 * G + g].x, bv[3][h].y, acc[4 * g + 0][4 * h + 1]);
+                            acc[4 * g + 0][4 * h + 2] =
+                                fmaf(af[0 * G + g].x, bv[0][h].z, acc[4 * g + 0][4 * h + 2]);
+                            acc[4 * g + 0][4 * h + 2] =
+                                fmaf(af[1 * G + g].x, bv[1][h].z, acc[4 * g + 0][4 * h + 2]);
+                            acc[4 * g + 0][4 * h + 2] =
+                                fmaf(af[2 * G + g].x, bv[2][h].z, acc[4 * g + 0][4 * h + 2]);
+                            acc[4 * g + 0][4 * h + 2] =
+                                fmaf(af[3 * G + g].x, bv[3][h].z, acc[4 * g + 0][4 * h + 2]);
+                            acc[4 * g + 0][4 * h + 3] =
+                                fmaf(af[0 * G + g].x, bv[0][h].w, acc[4 * g + 0][4 * h + 3]);
+                            acc[4 * g + 0][4 * h + 3] =
+                                fmaf(af[1 * G + g].x, bv[1][h].w, acc[4 * g + 0][4 * h + 3]);
+                            acc[4 * g + 0][4 * h + 3] =
+                                fmaf(af[2 * G + g].x, bv[2][h].w, acc[4 * g + 0][4 * h + 3]);
+                            acc[4 * g + 0][4 * h + 3] =
+                                fmaf(af[3 * G + g].x, bv[3][h].w, acc[4 * g + 0][4 * h + 3]);
+                            acc[4 * g + 1][4 * h + 0] =
+                                fmaf(af[0 * G + g].y, bv[0][h].x, acc[4 * g + 1][4 * h + 0]);
+                            acc[4 * g + 1][4 * h + 0] =
+                                fmaf(af[1 * G + g].y, bv[1][h].x, acc[4 * g + 1][4 * h + 0]);
+                            acc[4 * g + 1][4 * h + 0] =
+                                fmaf(af[2 * G + g].y, bv[2][h].x, acc[4 * g + 1][4 * h + 0]);
+                            acc[4 * g + 1][4 * h + 0] =
+                                fmaf(af[3 * G + g].y, bv[3][h].x, acc[4 * g + 1][4 * h + 0]);
+                            acc[4 * g + 1][4 * h + 1] =
+                                fmaf(af[0 * G + g].y, bv[0][h].y, acc[4 * g + 1][4 * h + 1]);
+                            acc[4 * g + 1][4 * h + 1] =
+                                fmaf(af[1 * G + g].y, bv[1][h].y, acc[4 * g + 1][4 * h + 1]);
+                            acc[4 * g + 1][4 * h + 1] =
+                                fmaf(af[2 * G + g].y, bv[2][h].y, acc[4 * g + 1][4 * h + 1]);
+                            acc[4 * g + 1][4 * h + 1] =
+                                fmaf(af[3 * G + g].y, bv[3][h].y, acc[4 * g + 1][4 * h + 1]);
+                            acc[4 * g + 1][4 * h + 2] =
+                                fmaf(af[0 * G + g].y, bv[0][h].z, acc[4 * g + 1][4 * h + 2]);
+                            acc[4 * g + 1][4 * h + 2] =
+                                fmaf(af[1 * G + g].y, bv[1][h].z, acc[4 * g + 1][4 * h + 2]);
+                            acc[4 * g + 1][4 * h + 2] =
+                                fmaf(af[2 * G + g].y, bv[2][h].z, acc[4 * g + 1][4 * h + 2]);
+                            acc[4 * g + 1][4 * h + 2] =
+                                fmaf(af[3 * G + g].y, bv[3][h].z, acc[4 * g + 1][4 * h + 2]);
+                            acc[4 * g + 1][4 * h + 3] =
+                                fmaf(af[0 * G + g].y, bv[0][h].w, acc[4 * g + 1][4 * h + 3]);
+                            acc[4 * g + 1][4 * h + 3] =
+                                fmaf(af[1 * G + g].y, bv[1][h].w, acc[4 * g + 1][4 * h + 3]);
+                            acc[4 * g + 1][4 * h + 3] =
+                                fmaf(af[2 * G + g].y, bv[2][h].w, acc[4 * g + 1][4 * h + 3]);
+                            acc[4 * g + 1][4 * h + 3] =
+                                fmaf(af[3 * G + g].y, bv[3][h].w, acc[4 * g + 1][4 * h + 3]);
+                            acc[4 * g + 2][4 * h + 0] =
+                                fmaf(af[0 * G + g].z, bv[0][h].x, acc[4 * g + 2][4 * h + 0]);
+                            acc[4 * g + 2][4 * h + 0] =
+                                fmaf(af[1 * G + g].z, bv[1][h].x, acc[4 * g + 2][4 * h + 0]);
+                            acc[4 * g + 2][4 * h + 0] =
+                                fmaf(af[2 * G + g].z, bv[2][h].x, acc[4 * g + 2][4 * h + 0]);
+                            acc[4 * g + 2][4 * h + 0] =
+                                fmaf(af[3 * G + g].z, bv[3][h].x, acc[4 * g + 2][4 * h + 0]);
+                            acc[4 * g + 2][4 * h + 1] =
+                                fmaf(af[0 * G + g].z, bv[0][h].y, acc[4 * g + 2][4 * h + 1]);
+                            acc[4 * g + 2][4 * h + 1] =
+                                fmaf(af[1 * G + g].z, bv[1][h].y, acc[4 * g + 2][4 * h + 1]);
+                            acc[4 * g + 2][4 * h + 1] =
+                                fmaf(af[2 * G + g].z, bv[2][h].y, acc[4 * g + 2][4 * h + 1]);
+                            acc[4 * g + 2][4 * h + 1] =
+                                fmaf(af[3 * G + g].z, bv[3][h].y, acc[4 * g + 2][4 * h + 1]);
+                            acc[4 * g + 2][4 * h + 2] =
+                                fmaf(af[0 * G + g].z, bv[0][h].z, acc[4 * g + 2][4 * h + 2]);
+                            acc[4 * g + 2][4 * h + 2] =
+                                fmaf(af[1 * G + g].z, bv[1][h].z, acc[4 * g + 2][4 * h + 2]);
+                            acc[4 * g + 2][4 * h + 2] =
+                                fmaf(af[2 * G + g].z, bv[2][h].z, acc[4 * g + 2][4 * h + 2]);
+                            acc[4 * g + 2][4 * h + 2] =
+                                fmaf(af[3 * G + g].z, bv[3][h].z, acc[4 * g + 2][4 * h + 2]);
+                            acc[4 * g + 2][4 * h + 3] =
+                                fmaf(af[0 * G + g].z, bv[0][h].w, acc[4 * g + 2][4 * h + 3]);
+                            acc[4 * g + 2][4 * h + 3] =
+                                fmaf(af[1 * G + g].z, bv[1][h].w, acc[4 * g + 2][4 * h + 3]);
+                            acc[4 * g + 2][4 * h + 3] =
+                                fmaf(af[2 * G + g].z, bv[2][h].w, acc[4 * g + 2][4 * h + 3]);
+                            acc[4 * g + 2][4 * h + 3] =
+                                fmaf(af[3 * G + g].z, bv[3][h].w, acc[4 * g + 2][4 * h + 3]);
+                            acc[4 * g + 3][4 * h + 0] =
+                                fmaf(af[0 * G + g].w, bv[0][h].x, acc[4 * g + 3][4 * h + 0]);
+                            acc[4 * g + 3][4 * h + 0] =
+                                fmaf(af[1 * G + g].w, bv[1][h].x, acc[4 * g + 3][4 * h + 0]);
+                            acc[4 * g + 3][4 * h + 0] =
+                                fmaf(af[2 * G + g].w, bv[2][h].x, acc[4 * g + 3][4 * h + 0]);
+                            acc[4 * g + 3][4 * h + 0] =
+                                fmaf(af[3 * G + g].w, bv[3][h].x, acc[4 * g + 3][4 * h + 0]);
+                            acc[4 * g + 3][4 * h + 1] =
+                                fmaf(af[0 * G + g].w, bv[0][h].y, acc[4 * g + 3][4 * h + 1]);
+                            acc[4 * g + 3][4 * h + 1] =
+                                fmaf(af[1 * G + g].w, bv[1][h].y, acc[4 * g + 3][4 * h + 1]);
+                            acc[4 * g + 3][4 * h + 1] =
+                                fmaf(af[2 * G + g].w, bv[2][h].y, acc[4 * g + 3][4 * h + 1]);
+                            acc[4 * g + 3][4 * h + 1] =
+                                fmaf(af[3 * G + g].w, bv[3][h].y, acc[4 * g + 3][4 * h + 1]);
+                            acc[4 * g + 3][4 * h + 2] =
+                                fmaf(af[0 * G + g].w, bv[0][h].z, acc[4 * g + 3][4 * h + 2]);
+                            acc[4 * g + 3][4 * h + 2] =
+                                fmaf(af[1 * G + g].w, bv[1][h].z, acc[4 * g + 3][4 * h + 2]);
+                            acc[4 * g + 3][4 * h + 2] =
+                                fmaf(af[2 * G + g].w, bv[2][h].z, acc[4 * g + 3][4 * h + 2]);
+                            acc[4 * g + 3][4 * h + 2] =
+                                fmaf(af[3 * G + g].w, bv[3][h].z, acc[4 * g + 3][4 * h + 2]);
+                            acc[4 * g + 3][4 * h + 3] =
+                                fmaf(af[0 * G + g].w, bv[0][h].w, acc[4 * g + 3][4 * h + 3]);
+                            acc[4 * g + 3][4 * h + 3] =
+                                fmaf(af[1 * G + g].w, bv[1][h].w, acc[4 * g + 3][4 * h + 3]);
+                            acc[4 * g + 3][4 * h + 3] =
+                                fmaf(af[2 * G + g].w, bv[2][h].w, acc[4 * g + 3][4 * h + 3]);
+                            acc[4 * g + 3][4 * h + 3] =
+                                fmaf(af[3 * G + g].w, bv[3][h].w, acc[4 * g + 3][4 * h + 3]);
                         }
                     }
                 }
@@ -563,11 +609,15 @@ void manual_gemm_f_kernel(ManualFParams p)
 #pragma unroll
         for (int r = 0; r < LR; ++r) {
             const int gm = m_tile + acc_row(r);
-            if (gm >= M) { continue; }
+            if (gm >= M) {
+                continue;
+            }
 #pragma unroll
             for (int c = 0; c < LC; ++c) {
                 const int gn = n_tile + col0 + c;
-                if (gn < N) { part[int64_t(gm) * N + gn] = acc[r][c]; }
+                if (gn < N) {
+                    part[int64_t(gm) * N + gn] = acc[r][c];
+                }
             }
         }
         return;
@@ -579,7 +629,9 @@ void manual_gemm_f_kernel(ManualFParams p)
 #pragma unroll
     for (int r = 0; r < LR; ++r) {
         const int gm = m_tile + acc_row(r);
-        if (gm >= M) { continue; }
+        if (gm >= M) {
+            continue;
+        }
         float* const crow = C + int64_t(gm) * p.ldc;
 #pragma unroll
         for (int g = 0; g < LC / 4; ++g) {
@@ -593,12 +645,13 @@ void manual_gemm_f_kernel(ManualFParams p)
                 v[q] = manual_epilogue<float>(p.epi, acc[r][c + q], gm, gn + q, crow);
             }
             if (vec4 && gn + 4 <= N) {
-                *reinterpret_cast<float4*>(crow + gn) =
-                    make_float4(v[0], v[1], v[2], v[3]);
+                *reinterpret_cast<float4*>(crow + gn) = make_float4(v[0], v[1], v[2], v[3]);
             } else {
 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
-                    if (gn + q < N) { crow[gn + q] = v[q]; }
+                    if (gn + q < N) {
+                        crow[gn + q] = v[q];
+                    }
                 }
             }
         }
@@ -611,17 +664,21 @@ __global__ void manual_gemm_f_reduce_kernel(ManualFParams p)
     const int64_t plane = int64_t(p.m) * p.n;
     const int splits = int(gridDim.y);
     const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= plane) { return; }
+    if (idx >= plane) {
+        return;
+    }
     for (int64_t b = 0; b < p.batch; ++b) {
         const float* base = p.partial + (b * splits) * plane + idx;
         float sum = 0.0f;
-        for (int s = 0; s < splits; ++s) { sum += base[s * plane]; }
+        for (int s = 0; s < splits; ++s) {
+            sum += base[s * plane];
+        }
         const int m = int(idx / p.n);
         const int n = int(idx - int64_t(m) * p.n);
-        static_cast<float*>(p.c)[manual_batch_offset(p.bsize, p.c_bstr,
-                                                      p.batch_rank, b) +
-                                 int64_t(m) * p.ldc + n] = p.alpha * sum;
+        static_cast<float*>(
+            p.c)[manual_batch_offset(p.bsize, p.c_bstr, p.batch_rank, b) + int64_t(m) * p.ldc + n] =
+            p.alpha * sum;
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

@@ -20,7 +20,9 @@ namespace nnops::backend::cpu {
 /// Logical element strides of a view, in elements.
 inline void logical_strides(const TensorView& v, int64_t (&s)[8])
 {
-    for (int64_t d = 0; d < v.rank(); ++d) { s[d] = v.stride_elems(d); }
+    for (int64_t d = 0; d < v.rank(); ++d) {
+        s[d] = v.stride_elems(d);
+    }
 }
 
 /// Call `body(idx)` for every logical index of `rank` dims, in row-major order,
@@ -30,27 +32,31 @@ template <class F>
 inline void walk_logical(const int64_t* dims, int64_t rank, int64_t numel,
                          const ComputeContext& ctx, F&& body)
 {
-    if (numel <= 0) { return; }
+    if (numel <= 0) {
+        return;
+    }
 
     constexpr int64_t kChunk = 1 << 16;
     const int64_t chunks = (numel + kChunk - 1) / kChunk;
 
     ctx.cpu.run(0, chunks, [&](int64_t ci) {
         const int64_t begin = ci * kChunk;
-        const int64_t end   = std::min(begin + kChunk, numel);
+        const int64_t end = std::min(begin + kChunk, numel);
 
         int64_t idx[8] = {};
         int64_t rem = begin;
         for (int64_t d = rank - 1; d >= 0; --d) {
             idx[d] = (dims[d] > 0) ? rem % dims[d] : 0;
-            rem    = (dims[d] > 0) ? rem / dims[d] : 0;
+            rem = (dims[d] > 0) ? rem / dims[d] : 0;
         }
 
         for (int64_t n = begin; n < end; ++n) {
             body(idx);
             for (int64_t d = rank - 1; d >= 0; --d) {
                 ++idx[d];
-                if (idx[d] < dims[d]) { break; }
+                if (idx[d] < dims[d]) {
+                    break;
+                }
                 idx[d] = 0;
             }
         }
@@ -61,8 +67,10 @@ inline void walk_logical(const int64_t* dims, int64_t rank, int64_t numel,
 inline int64_t flat_offset(const int64_t* idx, const int64_t* strides, int64_t n)
 {
     int64_t off = 0;
-    for (int64_t d = 0; d < n; ++d) { off += idx[d] * strides[d]; }
+    for (int64_t d = 0; d < n; ++d) {
+        off += idx[d] * strides[d];
+    }
     return off;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

@@ -32,12 +32,12 @@
 /// matmul_internal.h).
 
 #include "matmul.h"
-#include "matmul_internal.h"      // dims / batch walk shared with the small routes
+#include "matmul_internal.h" // dims / batch walk shared with the small routes
 #include "matmul_helper.h"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
 #include "backend/cpu/simd_kernel/simd_int8_reduce.hpp"
 #include "backend/cpu/simd_kernel/simd_quant.hpp"
-#include "backend/cpu/common/memory_pool.hpp"           // internal scratch-memory pool
+#include "backend/cpu/common/memory_pool.hpp" // internal scratch-memory pool
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"
 
@@ -68,54 +68,58 @@ struct NoEpilogueParams {};
 /// a kernel pitch — the two routes disagree on both.
 struct PackedBView {
     const void* base = nullptr;
-    int64_t ldd = 0;   // panel pitch: elements for fp, bytes for int8
-    int64_t np = 0;    // panels per segment (int8 only)
-    int64_t seg = 0;   // k segment length (int8 only; 0 = the whole K)
+    int64_t ldd = 0; // panel pitch: elements for fp, bytes for int8
+    int64_t np = 0;  // panels per segment (int8 only)
+    int64_t seg = 0; // k segment length (int8 only; 0 = the whole K)
 
     bool ok() const noexcept { return base != nullptr; }
 };
 
-template <class T>
-struct FpRoute {
-    using Elem  = T;
-    using AElem = T;   // A's element type; differs from Elem only on the fused dq route
-    using Acc   = T;
+template <class T> struct FpRoute {
+    using Elem = T;
+    using AElem = T; // A's element type; differs from Elem only on the fused dq route
+    using Acc = T;
     using Clamp = float;
 
-    static constexpr bool is_fp            = true;
-    static constexpr bool is_dq            = false;
-    static constexpr bool fused_a          = false;
+    static constexpr bool is_fp = true;
+    static constexpr bool is_dq = false;
+    static constexpr bool fused_a = false;
     // A may be read through lda — except for bf16, whose GEOM packs it always.
-    static constexpr bool has_direct_a =
-        !std::is_same_v<T, bfloat16>;
-    static constexpr bool hoists_b_m_split = false;  // B packs inside each block
+    static constexpr bool has_direct_a = !std::is_same_v<T, bfloat16>;
+    static constexpr bool hoists_b_m_split = false; // B packs inside each block
 
     using EpilogueParams = NoEpilogueParams;
 
-    static constexpr const MatmulGeom& geom() {
-        if constexpr (std::is_same_v<T, float>) { return GEOM_F32; }
+    static constexpr const MatmulGeom& geom()
+    {
+        if constexpr (std::is_same_v<T, float>) {
+            return GEOM_F32;
+        }
 #ifdef NNOPS_ARCH_AARCH64
-        else if constexpr (std::is_same_v<T, bfloat16>) { return GEOM_BF16; }
+        else if constexpr (std::is_same_v<T, bfloat16>) {
+            return GEOM_BF16;
+        }
 #endif
-        else { return GEOM_F16; }
+        else {
+            return GEOM_F16;
+        }
     }
 
     /// One batch element's B: a dense view, or a Q4_1 block stream.
     struct B {
         const void* ptr;
         int ldb;
-        DataType block_dt;   ///< f32/f16 for a dense view
+        DataType block_dt; ///< f32/f16 for a dense view
         int64_t row_blocks;
 
         bool blocked() const noexcept { return is_block_packed_dtype(block_dt); }
     };
 
-    static B b_source(const TensorView& b, int64_t b_off, int ldb,
-                      DataType block_dt) {
+    static B b_source(const TensorView& b, int64_t b_off, int ldb, DataType block_dt)
+    {
         if (is_block_packed_dtype(block_dt)) {
-            return {block_rhs_at(static_cast<const uint8_t*>(b.ptr<void>()), b_off,
-                                 block_dt),
-                    ldb, block_dt, static_cast<int64_t>(ldb)};
+            return {block_rhs_at(static_cast<const uint8_t*>(b.ptr<void>()), b_off, block_dt), ldb,
+                    block_dt, static_cast<int64_t>(ldb)};
         }
         return {static_cast<const void*>(b.ptr<T>() + b_off), ldb,
                 std::is_same_v<T, float> ? DataType::f32 : DataType::f16, 0};
@@ -133,39 +137,41 @@ struct FpRoute {
 
     /// The blob's panel for (k block, panel) and the pitch to walk it: the
     /// k-block's slice of a k-major panel, panels `ldd` apart.
-    static std::pair<const T*, int64_t> prepacked_addr(const PackedBView& pb,
-                                                       int64_t panel0, int k) {
-        return {static_cast<const T*>(pb.base) + panel0 * pb.ldd
-                    + static_cast<int64_t>(k) * b_panel_w(),
+    static std::pair<const T*, int64_t> prepacked_addr(const PackedBView& pb, int64_t panel0, int k)
+    {
+        return {static_cast<const T*>(pb.base) + panel0 * pb.ldd +
+                    static_cast<int64_t>(k) * b_panel_w(),
                 -pb.ldd};
     }
 
-    static std::pair<Clamp, Clamp> clamp(const MatMulAttributes& attrs, bool last_k) {
+    static std::pair<Clamp, Clamp> clamp(const MatMulAttributes& attrs, bool last_k)
+    {
         return kblock_clamp(attrs, last_k);
     }
 
-    static void pack_a(bool trans, int mc, int kc, Elem* dst, int ldd,
-                       const AElem* src, int lds, bool /*a_biased*/,
-                       const EpilogueParams* /*ip*/, int /*m*/) {
+    static void pack_a(bool trans, int mc, int kc, Elem* dst, int ldd, const AElem* src, int lds,
+                       bool /*a_biased*/, const EpilogueParams* /*ip*/, int /*m*/)
+    {
         tile_pack_lhs(trans, mc, kc, dst, ldd, src, lds, 1.0f);
     }
 
-    static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc,
-                       int n_start, int nc, Elem* dst, int ldd, bool /*a_biased*/) {
+    static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc, int n_start,
+                       int nc, Elem* dst, int ldd, bool /*a_biased*/)
+    {
         // k and n_start are element indices even for a block-packed B; only
         // its row stride counts blocks.
         if (b.blocked()) {
             // The destination type picks the panel layout: f32/f16 the uniform
             // [k][nr] rectangle, bf16 the BFMMLA operand layout (see
             // pack_q4_1_rhs).
-            tile_pack_rhs_q4_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd,
-                               b.ptr, b.row_blocks, attrs.alpha);
+            tile_pack_rhs_q4_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd, b.ptr, b.row_blocks,
+                               attrs.alpha);
             return;
         }
         const Elem* base = static_cast<const Elem*>(b.ptr);
-        const Elem* src = attrs.transpose_b
-            ? base + n_start * b.ldb + k     // N×K: row n, col k
-            : base + k * b.ldb + n_start;    // K×N: row k, col n
+        const Elem* src = attrs.transpose_b ? base + n_start * b.ldb + k // N×K: row n, col k
+                                              :
+                                              base + k * b.ldb + n_start; // K×N: row k, col n
         // alpha rides the RHS pack: every k-block scales, so the sum does too.
         tile_pack_rhs(attrs.transpose_b, nc, kc, dst, ldd, src, b.ldb, attrs.alpha);
     }
@@ -175,71 +181,75 @@ struct FpRoute {
     /// no MatMul route does). @p col_bias, when set, becomes the accumulator's
     /// initial value instead of C being read: the first k-block builds the tile
     /// from it.
-    static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
-                         const Elem* pa, const Elem* pb, Clamp lo, Clamp hi,
-                         bool zero_mode, int64_t ldb = -1,
-                         const Elem* col_bias = nullptr) {
-        tile_mma_pack(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi, zero_mode,
-                      nullptr, col_bias);
+    static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc, const Elem* pa, const Elem* pb,
+                         Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = -1,
+                         const Elem* col_bias = nullptr)
+    {
+        tile_mma_pack(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi, zero_mode, nullptr, col_bias);
     }
 
-    static void mma_direct(int mc, int nc, int kc, Acc* c, int ldc,
-                           const Elem* a, int lda, const Elem* pb,
-                           Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = -1,
-                           const Elem* col_bias = nullptr) {
-        tile_mma_direct(mc, nc, kc, c, ldc, a, lda, pb, ldb, nullptr, lo, hi,
-                        zero_mode, nullptr, col_bias);
+    static void mma_direct(int mc, int nc, int kc, Acc* c, int ldc, const Elem* a, int lda,
+                           const Elem* pb, Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = -1,
+                           const Elem* col_bias = nullptr)
+    {
+        tile_mma_direct(mc, nc, kc, c, ldc, a, lda, pb, ldb, nullptr, lo, hi, zero_mode, nullptr,
+                        col_bias);
     }
 
     /// The output is C itself: nothing is appended to the plan's scratch.
     static constexpr size_t extra_workspace(const TensorView&) { return 0; }
 
     /// C row of a batch element plus the two fp-only in-place passes.
-    static Acc* c_base(TensorView& output, int64_t c_off, void* /*accum*/) {
+    static Acc* c_base(TensorView& output, int64_t c_off, void* /*accum*/)
+    {
         return output.ptr<T>() + c_off;
     }
-    static void scale(Acc* c, int ldc, float beta, int mc, int nc) {
+    static void scale(Acc* c, int ldc, float beta, int mc, int nc)
+    {
         tile_scale(c, ldc, beta, mc, nc);
     }
-    static void scale_add_bias(Acc* c, int ldc, float beta, const Elem* bias,
-                               int mc, int nc) {
+    static void scale_add_bias(Acc* c, int ldc, float beta, const Elem* bias, int mc, int nc)
+    {
         tile_scale_add_bias(c, ldc, beta, bias, mc, nc);
     }
-    static void epilogue(const MatMulAttributes& attrs, Acc* c, int ldc, int mc, int nc) {
-        epilogue_inplace(mc, nc, c, ldc, static_cast<const Elem*>(nullptr),
-                         attrs.epilogue);
+    static void epilogue(const MatMulAttributes& attrs, Acc* c, int ldc, int mc, int nc)
+    {
+        epilogue_inplace(mc, nc, c, ldc, static_cast<const Elem*>(nullptr), attrs.epilogue);
     }
 };
 
 /// Bytes of the compact M×N int32 accumulator an int8 output pass reads.
-inline size_t accum_bytes(const TensorView& output) noexcept {
+inline size_t accum_bytes(const TensorView& output) noexcept
+{
     const auto od = output.desc();
-    return static_cast<size_t>(od.dims[static_cast<size_t>(od.rank - 2)])
-         * static_cast<size_t>(od.dims[static_cast<size_t>(od.rank - 1)])
-         * sizeof(int32_t);
+    return static_cast<size_t>(od.dims[static_cast<size_t>(od.rank - 2)]) *
+           static_cast<size_t>(od.dims[static_cast<size_t>(od.rank - 1)]) * sizeof(int32_t);
 }
 
 /// int8 (s8|u8 A × s8 B): A always packed, raw int32 C, one output pass.
 struct I8Route {
-    using Elem  = int8_t;
+    using Elem = int8_t;
     using AElem = int8_t;
-    using Acc   = int32_t;
+    using Acc = int32_t;
     using Clamp = int32_t;
 
-    static constexpr bool is_fp            = false;
-    static constexpr bool is_dq            = false;
-    static constexpr bool fused_a          = false;
-    static constexpr bool has_direct_a     = false;
-    static constexpr bool hoists_b_m_split = true;  // one B pack per k-block
+    static constexpr bool is_fp = false;
+    static constexpr bool is_dq = false;
+    static constexpr bool fused_a = false;
+    static constexpr bool has_direct_a = false;
+    static constexpr bool hoists_b_m_split = true; // one B pack per k-block
 
     using EpilogueParams = Int8EpilogueParams;
 
     static const MatmulGeom& geom() { return GEOM_I8; }
 
-    struct B { const int8_t* ptr; int ldb; };
+    struct B {
+        const int8_t* ptr;
+        int ldb;
+    };
 
-    static B b_source(const TensorView& b, int64_t b_off, int ldb,
-                      DataType /*block_dt*/) {
+    static B b_source(const TensorView& b, int64_t b_off, int ldb, DataType /*block_dt*/)
+    {
         return {b.ptr<int8_t>() + b_off, ldb};
     }
 
@@ -255,116 +265,122 @@ struct I8Route {
     /// The blob's panel for (k block, panel) and the pitch to walk it: segment
     /// `k / seg` owns a contiguous run of np panels, because the correction
     /// block a kernel reads at kc = seg lives inside each panel.
-    static std::pair<const int8_t*, int64_t> prepacked_addr(const PackedBView& pb,
-                                                            int64_t panel0, int k) {
+    static std::pair<const int8_t*, int64_t> prepacked_addr(const PackedBView& pb, int64_t panel0,
+                                                            int k)
+    {
         const int64_t seg = k / pb.seg;
-        return {static_cast<const int8_t*>(pb.base) + (seg * pb.np + panel0) * pb.ldd,
-                pb.ldd};
+        return {static_cast<const int8_t*>(pb.base) + (seg * pb.np + panel0) * pb.ldd, pb.ldd};
     }
 
-    static std::pair<Clamp, Clamp> clamp(const MatMulAttributes&, bool) {
+    static std::pair<Clamp, Clamp> clamp(const MatMulAttributes&, bool)
+    {
         return {INT32_MIN, INT32_MAX};
     }
 
-    static void pack_a(bool trans, int mc, int kc, Elem* dst, int ldd,
-                       const AElem* src, int lds, bool a_biased,
-                       const EpilogueParams* /*ip*/, int /*m*/) {
+    static void pack_a(bool trans, int mc, int kc, Elem* dst, int ldd, const AElem* src, int lds,
+                       bool a_biased, const EpilogueParams* /*ip*/, int /*m*/)
+    {
         tile_pack_lhs_i8(trans, mc, kc, dst, ldd, src, lds, a_biased);
     }
 
     /// The A dtype the int8 kernels see; only the fused dq route differs.
-    static DataType a_eff_type(const MatMulAttributes& /*attrs*/, const TensorView& a) {
+    static DataType a_eff_type(const MatMulAttributes& /*attrs*/, const TensorView& a)
+    {
         return a.data_type();
     }
 
-    static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc,
-                       int n_start, int nc, Elem* dst, int ldd, bool a_biased) {
-        const Elem* src = attrs.transpose_b
-            ? b.ptr + n_start * b.ldb + k
-            : b.ptr + k * b.ldb + n_start;
+    static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc, int n_start,
+                       int nc, Elem* dst, int ldd, bool a_biased)
+    {
+        const Elem* src =
+            attrs.transpose_b ? b.ptr + n_start * b.ldb + k : b.ptr + k * b.ldb + n_start;
         tile_pack_rhs_i8(attrs.transpose_b, nc, kc, dst, ldd, src, b.ldb, a_biased);
     }
 
-    static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
-                         const Elem* pa, const Elem* pb, Clamp lo, Clamp hi,
-                         bool zero_mode, int64_t ldb = 0,
-                         const Elem* /*col_bias*/ = nullptr) {
-        tile_mma_pack_i8(mc, nc, kc, c, ldc, pa, pb, static_cast<int>(ldb), lo, hi,
-                         zero_mode);
+    static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc, const Elem* pa, const Elem* pb,
+                         Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = 0,
+                         const Elem* /*col_bias*/ = nullptr)
+    {
+        tile_mma_pack_i8(mc, nc, kc, c, ldc, pa, pb, static_cast<int>(ldb), lo, hi, zero_mode);
     }
 
     /// The s32 output, or the M×N temporary an s8/u8 output requantizes from.
-    static Acc* c_base(TensorView& output, int64_t c_off, void* accum) {
+    static Acc* c_base(TensorView& output, int64_t c_off, void* accum)
+    {
         const DataType dt = output.data_type();
-        return (dt == DataType::s8 || dt == DataType::u8)
-            ? static_cast<Acc*>(accum) : output.ptr<Acc>() + c_off;
+        return (dt == DataType::s8 || dt == DataType::u8) ? static_cast<Acc*>(accum) :
+                                                            output.ptr<Acc>() + c_off;
     }
 
-    static void zero_c(Acc* c, int ldc, int M, int N) {
+    static void zero_c(Acc* c, int ldc, int M, int N)
+    {
         for (int m = 0; m < M; ++m) {
             std::fill(c + m * ldc, c + m * ldc + N, 0);
         }
     }
 
     /// An s8/u8 output only: the accumulator appended after the plan's scratch.
-    static size_t extra_workspace(const TensorView& output) {
+    static size_t extra_workspace(const TensorView& output)
+    {
         const DataType dt = output.data_type();
         return (dt == DataType::s8 || dt == DataType::u8) ? accum_bytes(output) : 0;
     }
 
-    static void epilogue_tile(const EpilogueParams& p, Acc* c, int ldc,
-                              int64_t m0, int n0, int64_t mc, int64_t nc) {
+    static void epilogue_tile(const EpilogueParams& p, Acc* c, int ldc, int64_t m0, int n0,
+                              int64_t mc, int64_t nc)
+    {
         int8_epilogue_tile(p, c, ldc, m0, n0, mc, nc);
     }
 };
 
 /// The int8 GEMM with a dequantizing fp output pass.
-template <class TOut, class AIn = int8_t>
-struct DqRoute : I8Route {
+template <class TOut, class AIn = int8_t> struct DqRoute : I8Route {
     static constexpr bool is_dq = true;
 
     /// A arrives as fp and is quantised in the pack, so no A_q is materialised.
     static constexpr bool fused_a = !std::is_same_v<AIn, int8_t>;
 
     using OutElem = TOut;
-    using AElem   = AIn;
+    using AElem = AIn;
     using EpilogueParams = DqEpilogueParams<TOut>;
 
-    static DataType a_eff_type(const MatMulAttributes& attrs, const TensorView& a) {
-        if constexpr (fused_a) { return attrs.act_quant_dtype; }
-        else { return a.data_type(); }
+    static DataType a_eff_type(const MatMulAttributes& attrs, const TensorView& a)
+    {
+        if constexpr (fused_a) {
+            return attrs.act_quant_dtype;
+        } else {
+            return a.data_type();
+        }
     }
 
     /// Fused: quantise each panel row from fp with its offline parameters.
-    static void pack_a(bool trans, int mc, int kc, int8_t* dst, int ldd,
-                       const AElem* src, int lds, bool a_biased,
-                       const EpilogueParams* ip, int m) {
+    static void pack_a(bool trans, int mc, int kc, int8_t* dst, int ldd, const AElem* src, int lds,
+                       bool a_biased, const EpilogueParams* ip, int m)
+    {
         if constexpr (fused_a) {
             NNOPS_ASSERT(!trans);
-            tile_pack_quant_lhs_i8(
-                mc, kc, dst, ldd, src, lds,
-                ip->s_a ? ip->s_a + m : nullptr,
-                ip->zp_a ? ip->zp_a + m : nullptr,
-                ip->s_a_scalar, ip->zp_a_scalar, ip->act_u8, a_biased);
+            tile_pack_quant_lhs_i8(mc, kc, dst, ldd, src, lds, ip->s_a ? ip->s_a + m : nullptr,
+                                   ip->zp_a ? ip->zp_a + m : nullptr, ip->s_a_scalar,
+                                   ip->zp_a_scalar, ip->act_u8, a_biased);
         } else {
             tile_pack_lhs_i8(trans, mc, kc, dst, ldd, src, lds, a_biased);
         }
     }
 
     /// Always the compact accumulator: the fp output is written, not accumulated.
-    static Acc* c_base(TensorView& /*output*/, int64_t /*c_off*/, void* accum) {
+    static Acc* c_base(TensorView& /*output*/, int64_t /*c_off*/, void* accum)
+    {
         return static_cast<Acc*>(accum);
     }
 
     /// The dequant pass is unconditional — it is what produces the output.
     static constexpr bool always_epilogue = true;
 
-    static size_t extra_workspace(const TensorView& output) {
-        return accum_bytes(output);
-    }
+    static size_t extra_workspace(const TensorView& output) { return accum_bytes(output); }
 
-    static void epilogue_tile(const EpilogueParams& p, Acc* c, int ldc,
-                              int64_t m0, int n0, int64_t mc, int64_t nc) {
+    static void epilogue_tile(const EpilogueParams& p, Acc* c, int ldc, int64_t m0, int n0,
+                              int64_t mc, int64_t nc)
+    {
         dq_epilogue_tile<TOut>(p, c, ldc, m0, n0, mc, nc);
     }
 };
@@ -373,50 +389,54 @@ struct DqRoute : I8Route {
 //  Tile-block kernels
 // =========================================================================
 
-struct BlockRange { int start; int count; };
+struct BlockRange {
+    int start;
+    int count;
+};
 
-inline BlockRange m_range(const MatMulPlan& plan, int64_t blk, int64_t num_blocks,
-                          int M) noexcept {
-    if (plan.split_n) { return {0, M}; }
+inline BlockRange m_range(const MatMulPlan& plan, int64_t blk, int64_t num_blocks, int M) noexcept
+{
+    if (plan.split_n) {
+        return {0, M};
+    }
     const int start = static_cast<int>(blk * M / num_blocks);
     return {start, static_cast<int>((blk + 1) * M / num_blocks) - start};
 }
 
-inline BlockRange n_range(const MatMulPlan& plan, int64_t blk, int N) noexcept {
-    if (!plan.split_n) { return {0, N}; }
+inline BlockRange n_range(const MatMulPlan& plan, int64_t blk, int N) noexcept
+{
+    if (!plan.split_n) {
+        return {0, N};
+    }
     const int start = static_cast<int>(blk) * static_cast<int>(plan.nc);
     return {start, std::min(static_cast<int>(plan.nc), N - start)};
 }
 
 /// Scratch slot: per worker thread when slots < blocks, else per block.
 inline int64_t block_slot(int64_t num_slots, int64_t num_blocks, int64_t blk,
-                          const ComputeContext& ctx) noexcept {
-    return (num_slots < num_blocks)
-        ? static_cast<int64_t>(ctx.cpu.current_thread_id())
-        : blk;
+                          const ComputeContext& ctx) noexcept
+{
+    return (num_slots < num_blocks) ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : blk;
 }
 
 /// Packed-A slot of a block, or null when A is read raw; uses num_slots_a.
 template <class Elem>
 inline Elem* pack_a_slot(const MatMulPlan& plan, int64_t num_blocks, int64_t blk,
-                         const ComputeContext& ctx, Elem* base) noexcept {
-    if (!plan.pack_a) { return nullptr; }
-    return base + block_slot(plan.num_slots_a, num_blocks, blk, ctx)
-                * plan.np_a * plan.ldd_a;
+                         const ComputeContext& ctx, Elem* base) noexcept
+{
+    if (!plan.pack_a) {
+        return nullptr;
+    }
+    return base + block_slot(plan.num_slots_a, num_blocks, blk, ctx) * plan.np_a * plan.ldd_a;
 }
 
 template <class R>
-void matmul_tile(const MatMulAttributes& attrs,
-                 typename R::Acc* c_ptr, int ldc,
-                 const typename R::AElem* a_ptr, int lda,
-                 int m_start, int m_count, int mc,
-                 int n_start, int n_count,
-                 int k, int actual_kc, bool last_k,
-                 bool pack_a, const typename R::Elem* packed_b,
-                 typename R::Elem* pack_a_slice, bool a_biased,
-                 const typename R::EpilogueParams* ip,
-                 const typename R::Elem* bias, const typename R::Elem* col_bias,
-                 const PackedBView& prepacked)
+void matmul_tile(const MatMulAttributes& attrs, typename R::Acc* c_ptr, int ldc,
+                 const typename R::AElem* a_ptr, int lda, int m_start, int m_count, int mc,
+                 int n_start, int n_count, int k, int actual_kc, bool last_k, bool pack_a,
+                 const typename R::Elem* packed_b, typename R::Elem* pack_a_slice, bool a_biased,
+                 const typename R::EpilogueParams* ip, const typename R::Elem* bias,
+                 const typename R::Elem* col_bias, const PackedBView& prepacked)
 {
     using Acc = typename R::Acc;
 
@@ -435,16 +455,13 @@ void matmul_tile(const MatMulAttributes& attrs,
     // seeding the accumulator, which would drop the residual. The int8 routes
     // keep beta out of it: their accumulator is not C, and the dequant pass
     // adds C_old itself.
-    const float beta = (R::is_fp && attrs.residual_pre_activation) ? 1.0f
-                                                                   : attrs.beta;
-    const bool seed_bias = R::is_fp && k == 0 && col_bias != nullptr &&
-                           beta == 0.0f;
+    const float beta = (R::is_fp && attrs.residual_pre_activation) ? 1.0f : attrs.beta;
+    const bool seed_bias = R::is_fp && k == 0 && col_bias != nullptr && beta == 0.0f;
     const bool prime_c = R::is_fp && k == 0 && bias != nullptr && !seed_bias;
     const bool zero_mode = (k == 0 && beta == 0.0f && bias == nullptr);
     const auto [cmin, cmax] = R::clamp(attrs, last_k);
     // fp-only; compile out of the int8 instantiation.
-    const bool scale_c  = R::is_fp && k == 0 && bias == nullptr &&
-                          beta != 1.0f && beta != 0.0f;
+    const bool scale_c = R::is_fp && k == 0 && bias == nullptr && beta != 1.0f && beta != 0.0f;
     const bool epilogue = R::is_fp && last_k && has_inplace_epilogue(attrs);
     const bool int8_ep = !R::is_fp && last_k && (ip != nullptr);
 
@@ -452,14 +469,14 @@ void matmul_tile(const MatMulAttributes& attrs,
         const int actual_mc = std::min(mc, m_start + m_count - m);
         Acc* c_tile = c_ptr + m * ldc + n_start;
 
-        const typename R::AElem* a_src = attrs.transpose_a
-            ? a_ptr + k * lda + m    // A phys is K×M, row k, col m
-            : a_ptr + m * lda + k;   // A phys is M×K, row m, col k
+        const typename R::AElem* a_src = attrs.transpose_a ?
+                                             a_ptr + k * lda + m // A phys is K×M, row k, col m
+                                             :
+                                             a_ptr + m * lda + k; // A phys is M×K, row m, col k
 
         if constexpr (R::is_fp) {
             if (prime_c) {
-                R::scale_add_bias(c_tile, ldc, beta, bias + n_start,
-                                  actual_mc, n_count);
+                R::scale_add_bias(c_tile, ldc, beta, bias + n_start, actual_mc, n_count);
             } else if (scale_c) {
                 R::scale(c_tile, ldc, beta, actual_mc, n_count);
             }
@@ -476,24 +493,23 @@ void matmul_tile(const MatMulAttributes& attrs,
         }
 
         if (pack_a) {
-            R::pack_a(attrs.transpose_a, actual_mc, actual_kc,
-                      pack_a_slice, ldd_a, a_src, lda, a_biased, ip, m);
-            R::mma_pack(actual_mc, n_count, actual_kc,
-                        c_tile, ldc, pack_a_slice, b_tile, cmin, cmax, zero_mode,
-                        b_ldb, seed_bias ? col_bias + n_start : nullptr);
+            R::pack_a(attrs.transpose_a, actual_mc, actual_kc, pack_a_slice, ldd_a, a_src, lda,
+                      a_biased, ip, m);
+            R::mma_pack(actual_mc, n_count, actual_kc, c_tile, ldc, pack_a_slice, b_tile, cmin,
+                        cmax, zero_mode, b_ldb, seed_bias ? col_bias + n_start : nullptr);
         } else if constexpr (R::has_direct_a) {
-            R::mma_direct(actual_mc, n_count, actual_kc,
-                          c_tile, ldc, a_src, lda, b_tile, cmin, cmax, zero_mode,
-                          b_ldb, seed_bias ? col_bias + n_start : nullptr);
+            R::mma_direct(actual_mc, n_count, actual_kc, c_tile, ldc, a_src, lda, b_tile, cmin,
+                          cmax, zero_mode, b_ldb, seed_bias ? col_bias + n_start : nullptr);
         }
         if constexpr (R::is_fp) {
-            if (epilogue) { R::epilogue(attrs, c_tile, ldc, actual_mc, n_count); }
+            if (epilogue) {
+                R::epilogue(attrs, c_tile, ldc, actual_mc, n_count);
+            }
         } else {
             // From column 0 of C, not from the tile: the kernels index the row
             // by the absolute output column (they read r_b[n] the same way).
             if (int8_ep) {
-                R::epilogue_tile(*ip, c_ptr + m * ldc, ldc, m, n_start,
-                                 actual_mc, n_count);
+                R::epilogue_tile(*ip, c_ptr + m * ldc, ldc, m, n_start, actual_mc, n_count);
             }
         }
     }
@@ -501,18 +517,12 @@ void matmul_tile(const MatMulAttributes& attrs,
 
 /// One block over all K: pack B per k-block, accumulate every m-panel.
 template <class R>
-void matmul_block(const MatMulAttributes& attrs,
-                  typename R::Acc* c_ptr, int ldc,
-                  const typename R::AElem* a_ptr, int lda,
-                  const typename R::B& b_src,
-                  int K, int kc, int mc,
-                  int m_start, int m_count, int n_start, int n_count,
-                  typename R::Elem* pack_b_slice,
-                  typename R::Elem* pack_a_slice,
-                  bool pack_a, bool a_biased,
-                  const typename R::EpilogueParams* ip,
-                  const typename R::Elem* bias, const typename R::Elem* col_bias,
-                  const PackedBView& prepacked)
+void matmul_block(const MatMulAttributes& attrs, typename R::Acc* c_ptr, int ldc,
+                  const typename R::AElem* a_ptr, int lda, const typename R::B& b_src, int K,
+                  int kc, int mc, int m_start, int m_count, int n_start, int n_count,
+                  typename R::Elem* pack_b_slice, typename R::Elem* pack_a_slice, bool pack_a,
+                  bool a_biased, const typename R::EpilogueParams* ip, const typename R::Elem* bias,
+                  const typename R::Elem* col_bias, const PackedBView& prepacked)
 {
     for (int k = 0; k < K; k += kc) {
         const int actual_kc = std::min(kc, K - k);
@@ -520,13 +530,11 @@ void matmul_block(const MatMulAttributes& attrs,
         // A prepacked RHS is already packed for every k-block: no pack here.
         if (!prepacked.ok()) {
             const int ldd_b = R::ldd_b(actual_kc);
-            R::pack_b(attrs, b_src, k, actual_kc, n_start, n_count,
-                      pack_b_slice, ldd_b, a_biased);
+            R::pack_b(attrs, b_src, k, actual_kc, n_start, n_count, pack_b_slice, ldd_b, a_biased);
         }
-        matmul_tile<R>(attrs, c_ptr, ldc, a_ptr, lda,
-                       m_start, m_count, mc, n_start, n_count,
-                       k, actual_kc, last_k, pack_a, pack_b_slice, pack_a_slice,
-                       a_biased, ip, bias, col_bias, prepacked);
+        matmul_tile<R>(attrs, c_ptr, ldc, a_ptr, lda, m_start, m_count, mc, n_start, n_count, k,
+                       actual_kc, last_k, pack_a, pack_b_slice, pack_a_slice, a_biased, ip, bias,
+                       col_bias, prepacked);
     }
 }
 
@@ -538,76 +546,85 @@ void matmul_block(const MatMulAttributes& attrs,
 /// Σ_k B[k,n] (the transposes mirror them). Disjoint slabs, so no atomics; the
 /// kernels are in simd_int8_reduce.hpp. @p a_u8 sums A unsigned; a null
 /// @p r_a / @p r_b skips that sweep.
-void compute_int8_reductions(const int8_t* a_ptr, bool a_u8, int64_t lda,
-                             const int8_t* b_ptr, int64_t ldb,
-                             const MatMulAttributes& attrs,
-                             int64_t M, int64_t N, int64_t K,
-                             int32_t* r_a, int32_t* r_b,
-                             const ComputeContext& ctx) {
+void compute_int8_reductions(const int8_t* a_ptr, bool a_u8, int64_t lda, const int8_t* b_ptr,
+                             int64_t ldb, const MatMulAttributes& attrs, int64_t M, int64_t N,
+                             int64_t K, int32_t* r_a, int32_t* r_b, const ComputeContext& ctx)
+{
     // `rows` is the reduction direction: r[i] = Σ_j p[i*ld+j] when the K axis
     // is contiguous (the transposed layout), else a column slab.
-    const auto reduce = [&](const void* p, bool u8, int64_t ld, int64_t n_out,
-                            bool rows, int32_t* r) {
-        const int64_t tasks = std::min<int64_t>(
-            n_out, std::max<int64_t>(ctx.cpu.thread_count(), 1));
+    const auto reduce = [&](const void* p, bool u8, int64_t ld, int64_t n_out, bool rows,
+                            int32_t* r) {
+        const int64_t tasks =
+            std::min<int64_t>(n_out, std::max<int64_t>(ctx.cpu.thread_count(), 1));
         ctx.cpu.run(0, tasks, [&](int64_t t) {
             const int64_t i0 = t * n_out / tasks;
             const int64_t i1 = (t + 1) * n_out / tasks;
             if (rows) {
                 for (int64_t i = i0; i < i1; ++i) {
-                    r[i] = u8
-                        ? kernel::int8_row_sum(
-                              static_cast<const uint8_t*>(p) + i * ld, K)
-                        : kernel::int8_row_sum(
-                              static_cast<const int8_t*>(p) + i * ld, K);
+                    r[i] = u8 ? kernel::int8_row_sum(static_cast<const uint8_t*>(p) + i * ld, K) :
+                                kernel::int8_row_sum(static_cast<const int8_t*>(p) + i * ld, K);
                 }
             } else {
-                for (int64_t i = i0; i < i1; ++i) { r[i] = 0; }
+                for (int64_t i = i0; i < i1; ++i) {
+                    r[i] = 0;
+                }
                 if (u8) {
-                    kernel::int8_col_sum_slab(static_cast<const uint8_t*>(p), ld,
-                                              i0, i1, K, r);
+                    kernel::int8_col_sum_slab(static_cast<const uint8_t*>(p), ld, i0, i1, K, r);
                 } else {
-                    kernel::int8_col_sum_slab(static_cast<const int8_t*>(p), ld,
-                                              i0, i1, K, r);
+                    kernel::int8_col_sum_slab(static_cast<const int8_t*>(p), ld, i0, i1, K, r);
                 }
             }
         });
     };
 
-    if (r_a != nullptr) { reduce(a_ptr, a_u8, lda, M, /*rows=*/!attrs.transpose_a, r_a); }
-    if (r_b != nullptr) { reduce(b_ptr, /*u8=*/false, ldb, N, /*rows=*/attrs.transpose_b, r_b); }
+    if (r_a != nullptr) {
+        reduce(a_ptr, a_u8, lda, M, /*rows=*/!attrs.transpose_a, r_a);
+    }
+    if (r_b != nullptr) {
+        reduce(b_ptr, /*u8=*/false, ldb, N, /*rows=*/attrs.transpose_b, r_b);
+    }
 }
 
 /// True when some zero point is non-zero; @p n is the extent when @p num_scales
 /// is 0.
 inline bool any_zp_nonzero(const int32_t* zp, int32_t scalar, int64_t num_scales,
-                           int64_t n) noexcept {
-    if (zp == nullptr) { return scalar != 0; }
+                           int64_t n) noexcept
+{
+    if (zp == nullptr) {
+        return scalar != 0;
+    }
     const int64_t count = num_scales > 0 ? num_scales : n;
     for (int64_t i = 0; i < count; ++i) {
-        if (zp[i] != 0) { return true; }
+        if (zp[i] != 0) {
+            return true;
+        }
     }
     return false;
 }
 
 /// True when some zero point differs from @p v, i.e. whether r_b is live.
-inline bool any_zp_differs(const int32_t* zp, int32_t scalar, int64_t num_scales,
-                           int64_t n, int32_t v) noexcept {
-    if (zp == nullptr) { return scalar != v; }
+inline bool any_zp_differs(const int32_t* zp, int32_t scalar, int64_t num_scales, int64_t n,
+                           int32_t v) noexcept
+{
+    if (zp == nullptr) {
+        return scalar != v;
+    }
     const int64_t count = num_scales > 0 ? num_scales : n;
     for (int64_t i = 0; i < count; ++i) {
-        if (zp[i] != v) { return true; }
+        if (zp[i] != v) {
+            return true;
+        }
     }
     return false;
 }
 
 /// Whether the dq compensation is not the identity, i.e. the sweep must run.
-inline bool dq_needs_compensation(const TensorView& a, const TensorView& b,
-                                  int32_t a_bias_offset, int64_t M, int64_t N) noexcept {
+inline bool dq_needs_compensation(const TensorView& a, const TensorView& b, int32_t a_bias_offset,
+                                  int64_t M, int64_t N) noexcept
+{
     const QuantParams& qa = a.quant_params();
     const QuantParams& qb = b.quant_params();
-    return any_zp_differs(qa.zero_point_data, qa.zero_point, qa.num_scales, M,
-                          -a_bias_offset) ||
+    return any_zp_differs(qa.zero_point_data, qa.zero_point, qa.num_scales, M, -a_bias_offset) ||
            any_zp_nonzero(qb.zero_point_data, qb.zero_point, qb.num_scales, N);
 }
 
@@ -620,14 +637,12 @@ inline bool dq_needs_compensation(const TensorView& a, const TensorView& b,
 // a route property.
 
 template <class R>
-Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
-                           TensorView& output,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx,
-                           const MatMulPlan& plan, void* workspace)
+Status matmul_dispatch_tiled(const MatMulAttributes& attrs, TensorView& output,
+                             std::span<const TensorView> inputs, const ComputeContext& ctx,
+                             const MatMulPlan& plan, void* workspace)
 {
     using Elem = typename R::Elem;
-    using Acc  = typename R::Acc;
+    using Acc = typename R::Acc;
 
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -647,7 +662,9 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
         if (inputs.size() > 2) {
             bias = inputs[2].ptr<typename R::Elem>();
             const int64_t pw = nr_max_flt<typename R::Elem>();
-            if (attrs.beta == 0.0f && N % pw == 0) { col_bias = bias; }
+            if (attrs.beta == 0.0f && N % pw == 0) {
+                col_bias = bias;
+            }
         }
     }
 
@@ -695,7 +712,9 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     // bias is the fp-typed inputs[2].
     [[maybe_unused]] const int32_t* int_bias = nullptr;
     if constexpr (!R::is_fp && !R::is_dq) {
-        if (inputs.size() > 2) { int_bias = inputs[2].ptr<int32_t>(); }
+        if (inputs.size() > 2) {
+            int_bias = inputs[2].ptr<int32_t>();
+        }
     }
 
     // plan.ldd_b is the full-Kc stride used for *sizing*; each k-block packs at
@@ -708,8 +727,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
 
     // Workspace: packed-B panels, then packed A, then the compact accumulator.
     Elem* pack_b_base = static_cast<Elem*>(workspace);
-    auto* pack_a_base = reinterpret_cast<Elem*>(
-        static_cast<char*>(workspace) + plan.pack_a_offset);
+    auto* pack_a_base = reinterpret_cast<Elem*>(static_cast<char*>(workspace) + plan.pack_a_offset);
     Acc* accum = nullptr;
     if constexpr (!R::is_fp) {
         if (compact_acc) {
@@ -724,8 +742,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
 
     // A block owns an n-block on an N-split or an m-block on an M-split.
     const bool split_n = plan.split_n;
-    const int64_t num_blocks = split_n ? split_block_count(Ni, nc)
-                                       : split_block_count(Mi, mc);
+    const int64_t num_blocks = split_n ? split_block_count(Ni, nc) : split_block_count(Mi, mc);
 
     // The reduction sweep and the output pass exist only to apply quantization.
     // With no zero point, no activation, no integer destination and no A shift
@@ -744,18 +761,17 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     // is the dequant multiply and always runs, so a sweep is paid only when its
     // half is live.
     bool int8_ep = false;
-    bool col_term = false;       // the column half is non-zero for some row
-    bool sweep_a = false;        // Σ_k A[m,k] is needed
-    bool sweep_b = false;        // Σ_k B[k,n] is needed
-    bool fold_row = false;       // the row half is folded into r_fold
+    bool col_term = false; // the column half is non-zero for some row
+    bool sweep_a = false;  // Σ_k A[m,k] is needed
+    bool sweep_b = false;  // Σ_k B[k,n] is needed
+    bool fold_row = false; // the row half is folded into r_fold
     PoolArray<int32_t> r_a, r_b, r_fold;
     if constexpr (!R::is_fp) {
         const QuantParams& qa = a.quant_params();
         const QuantParams& qb = b.quant_params();
-        col_term = any_zp_differs(qa.zero_point_data, qa.zero_point, qa.num_scales,
-                                  Mi, -a_bias_offset);
-        const bool row_half = any_zp_nonzero(qb.zero_point_data, qb.zero_point,
-                                             qb.num_scales, Ni);
+        col_term =
+            any_zp_differs(qa.zero_point_data, qa.zero_point, qa.num_scales, Mi, -a_bias_offset);
+        const bool row_half = any_zp_nonzero(qb.zero_point_data, qb.zero_point, qb.num_scales, Ni);
         // One int32 per row needs one zp_b: a per-channel array folds only when
         // every channel shares its value, which is not worth scanning for.
         fold_row = row_half && qb.zero_point_data == nullptr;
@@ -776,9 +792,15 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
             int8_ep = sweep_a || sweep_b || out_q || int_bias != nullptr ||
                       epilogue_is_active(attrs.epilogue);
         }
-        if (sweep_a) { r_a.reset(static_cast<size_t>(Mi)); }
-        if (sweep_b) { r_b.reset(static_cast<size_t>(Ni)); }
-        if (fold_row) { r_fold.reset(static_cast<size_t>(Mi)); }
+        if (sweep_a) {
+            r_a.reset(static_cast<size_t>(Mi));
+        }
+        if (sweep_b) {
+            r_b.reset(static_cast<size_t>(Ni));
+        }
+        if (fold_row) {
+            r_fold.reset(static_cast<size_t>(Mi));
+        }
     }
 
     // The int8 output pass rides on the last k-block's tile, exactly where fp
@@ -804,7 +826,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
             ip.k = Ki;
             ip.ldc_out = ldc_out;
             if constexpr (R::is_dq) {
-                ip.compensate = sweep_a && !fold_row;  // row half, per element
+                ip.compensate = sweep_a && !fold_row; // row half, per element
                 ip.col_term = col_term;
                 ip.row_off = fold_row ? r_fold.data() : nullptr;
                 ip.act_u8 = R::a_eff_type(attrs, a) == DataType::u8;
@@ -819,7 +841,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 }
             } else {
                 const QuantParams& qc = output.quant_params();
-                ip.out_scale = quant_scale_at(qc, 0);  // requant only
+                ip.out_scale = quant_scale_at(qc, 0); // requant only
                 ip.zp_out = quant_zp_at(qc, 0);
                 // The epilogue's Requantize stage carries a per-row table; it
                 // overrides the destination's per-tensor parameters.
@@ -831,9 +853,9 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                     ip.zp_out = epilogue_quant_zero(attrs.epilogue, 0);
                 }
                 ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
-                ip.compensate = sweep_a && !fold_row;  // row half, per element
+                ip.compensate = sweep_a && !fold_row; // row half, per element
                 ip.col_term = col_term;
-                ip.col_bias = int_bias;   // per-column: MatMul's [N] bias
+                ip.col_bias = int_bias; // per-column: MatMul's [N] bias
                 // The folded row half is an int32 added before the requant —
                 // exactly the per-row bias slot, free here because MatMul's own
                 // bias is per-column.
@@ -866,8 +888,8 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
             R::zero_c(c_p, ldc, Mi, Ni);
             if constexpr (!R::fused_a) {
                 if (sweep_a || sweep_b_raw) {
-                    compute_int8_reductions(a_p, R::a_eff_type(attrs, a) == DataType::u8,
-                                            lda, b_src.ptr, ldb, attrs, M, N, K,
+                    compute_int8_reductions(a_p, R::a_eff_type(attrs, a) == DataType::u8, lda,
+                                            b_src.ptr, ldb, attrs, M, N, K,
                                             sweep_a ? r_a.data() : nullptr,
                                             sweep_b_raw ? r_b.data() : nullptr, ctx);
                 }
@@ -882,8 +904,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                     const QuantParams& qa_b = a.quant_params();
                     const int64_t row_base = (a_offset > 0 && lda > 0) ? a_offset / lda : 0;
                     ip.s_a = qa_b.scale_data ? qa_b.scale_data + row_base : nullptr;
-                    ip.zp_a = qa_b.zero_point_data ? qa_b.zero_point_data + row_base
-                                                   : nullptr;
+                    ip.zp_a = qa_b.zero_point_data ? qa_b.zero_point_data + row_base : nullptr;
                 } else if (out_q) {
                     const bool as_u8 = (odt_t == DataType::u8);
                     ip.out = as_u8 ? nullptr : output.ptr<int8_t>() + c_offset;
@@ -897,8 +918,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                     for (int64_t m = 0; m < Mi; ++m) {
                         const int32_t zp_a_m = int8_zp_at(ip.zp_a, ip.zp_a_scalar, m);
                         r_fold[static_cast<size_t>(m)] =
-                            -ip.zp_b_scalar *
-                            (r_a[static_cast<size_t>(m)] - ip.k * zp_a_m);
+                            -ip.zp_b_scalar * (r_a[static_cast<size_t>(m)] - ip.k * zp_a_m);
                     }
                 }
             }
@@ -909,12 +929,10 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
             ctx.cpu.run(0, num_blocks, [&](int64_t blk) {
                 const auto nr = n_range(plan, blk, Ni);
                 const int64_t slot = block_slot(plan.num_slots, num_blocks, blk, ctx);
-                matmul_block<R>(attrs, c_p, ldc, a_p, lda, b_src,
-                                Ki, kc, mc, 0, Mi, nr.start, nr.count,
-                                pack_b_base + slot * np_full * ldd_b_full,
-                                pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                plan.pack_a, a_biased,
-                                ip_or_null, bias, col_bias, prepacked);
+                matmul_block<R>(attrs, c_p, ldc, a_p, lda, b_src, Ki, kc, mc, 0, Mi, nr.start,
+                                nr.count, pack_b_base + slot * np_full * ldd_b_full,
+                                pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base), plan.pack_a,
+                                a_biased, ip_or_null, bias, col_bias, prepacked);
             });
         } else if constexpr (R::hoists_b_m_split) {
             // MKN, hoisted: pack the full-N B once per k-block, then split the
@@ -923,16 +941,15 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 const int actual_kc = std::min(kc, Ki - k);
                 const bool last_k = (k + kc >= Ki);
                 if (!prepacked.ok()) {
-                    R::pack_b(attrs, b_src, k, actual_kc, 0, Ni,
-                              pack_b_base, R::ldd_b(actual_kc), a_biased);
+                    R::pack_b(attrs, b_src, k, actual_kc, 0, Ni, pack_b_base, R::ldd_b(actual_kc),
+                              a_biased);
                 }
                 ctx.cpu.run(0, num_blocks, [&](int64_t blk) {
                     const auto mr = m_range(plan, blk, num_blocks, Mi);
-                    matmul_tile<R>(attrs, c_p, ldc, a_p, lda,
-                                   mr.start, mr.count, mc, 0, Ni,
-                                   k, actual_kc, last_k, plan.pack_a, pack_b_base,
-                                   pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                   a_biased, ip_or_null, bias, col_bias, prepacked);
+                    matmul_tile<R>(attrs, c_p, ldc, a_p, lda, mr.start, mr.count, mc, 0, Ni, k,
+                                   actual_kc, last_k, plan.pack_a, pack_b_base,
+                                   pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base), a_biased,
+                                   ip_or_null, bias, col_bias, prepacked);
                 });
             }
         } else {
@@ -940,12 +957,10 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
             ctx.cpu.run(0, num_blocks, [&](int64_t blk) {
                 const auto mr = m_range(plan, blk, num_blocks, Mi);
                 const int64_t slot = block_slot(plan.num_slots, num_blocks, blk, ctx);
-                matmul_block<R>(attrs, c_p, ldc, a_p, lda, b_src,
-                                Ki, kc, mc, mr.start, mr.count, 0, Ni,
-                                pack_b_base + slot * np_full * ldd_b_full,
-                                pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                plan.pack_a, a_biased,
-                                ip_or_null, bias, col_bias, prepacked);
+                matmul_block<R>(attrs, c_p, ldc, a_p, lda, b_src, Ki, kc, mc, mr.start, mr.count, 0,
+                                Ni, pack_b_base + slot * np_full * ldd_b_full,
+                                pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base), plan.pack_a,
+                                a_biased, ip_or_null, bias, col_bias, prepacked);
             });
         }
     }
@@ -961,13 +976,15 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
 /// materialized per call from a per-token int32 array or PerTensor's scalar;
 /// rows split across the pool.
 template <class AT>
-void quantize_activation(const TensorView& a, TensorView& aq,
-                         const ComputeContext& ctx) {
+void quantize_activation(const TensorView& a, TensorView& aq, const ComputeContext& ctx)
+{
     const QuantParams& qp = a.quant_params();
     const int64_t rows = a.total_rows();
     const int64_t lda = a.row_stride_elems();
     const int64_t K = a.shape(a.rank() - 1);
-    if (rows <= 0 || K <= 0) { return; }
+    if (rows <= 0 || K <= 0) {
+        return;
+    }
 
     PoolArray<float> scale_buf, zero_buf;
     const float* scale_arr = qp.scale_data;
@@ -979,8 +996,7 @@ void quantize_activation(const TensorView& a, TensorView& aq,
     if (qp.zero_point_data != nullptr) {
         zero_buf.reset(static_cast<size_t>(rows));
         for (int64_t i = 0; i < rows; ++i) {
-            zero_buf[static_cast<size_t>(i)] =
-                static_cast<float>(qp.zero_point_data[i]);
+            zero_buf[static_cast<size_t>(i)] = static_cast<float>(qp.zero_point_data[i]);
         }
         zero_arr = zero_buf.data();
     } else if (qp.zero_point != 0) {
@@ -992,23 +1008,25 @@ void quantize_activation(const TensorView& a, TensorView& aq,
     const int n = static_cast<int>(K);
     const int sr = static_cast<int>(lda);
     const bool u8 = aq.data_type() == DataType::u8;
-    uint8_t*  d8  = u8 ? aq.ptr<uint8_t>() : nullptr;
-    int8_t*   ds8 = u8 ? nullptr : aq.ptr<int8_t>();
+    uint8_t* d8 = u8 ? aq.ptr<uint8_t>() : nullptr;
+    int8_t* ds8 = u8 ? nullptr : aq.ptr<int8_t>();
 
     const int64_t tasks = std::min<int64_t>(rows, std::max<int64_t>(ctx.cpu.thread_count(), 1));
     ctx.cpu.run(0, tasks, [&](int64_t t) {
         const int64_t r0 = t * rows / tasks;
         const int64_t r1 = (t + 1) * rows / tasks;
-        if (r1 <= r0) { return; }
+        if (r1 <= r0) {
+            return;
+        }
         const int m = static_cast<int>(r1 - r0);
         const float* scale = scale_arr + r0;
         const float* zero = zero_arr ? zero_arr + r0 : nullptr;
         if (u8) {
-            kernel::quant_kernel::quantization<uint8_t>(
-                m, n, d8 + r0 * K, n, src + r0 * lda, sr, scale, zero);
+            kernel::quant_kernel::quantization<uint8_t>(m, n, d8 + r0 * K, n, src + r0 * lda, sr,
+                                                        scale, zero);
         } else {
-            kernel::quant_kernel::quantization<int8_t>(
-                m, n, ds8 + r0 * K, n, src + r0 * lda, sr, scale, zero);
+            kernel::quant_kernel::quantization<int8_t>(m, n, ds8 + r0 * K, n, src + r0 * lda, sr,
+                                                       scale, zero);
         }
     });
 }
@@ -1025,20 +1043,18 @@ void quantize_activation(const TensorView& a, TensorView& aq,
 /// N-split re-packs A per n-block and keeps the materialised form.
 template <class T>
 Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
-               std::span<const TensorView> inputs, const ComputeContext& ctx)
+                 std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
 
-    NNOPS_ASSERT(attrs.act_quant_dtype == DataType::s8 ||
-                 attrs.act_quant_dtype == DataType::u8);
+    NNOPS_ASSERT(attrs.act_quant_dtype == DataType::s8 || attrs.act_quant_dtype == DataType::u8);
 
     // A_q's shape and parameters with no storage: the plan reads only the
     // description, and the target dtype picks the int8 geometry.
-    const TensorView aq_shape(a.shape_span(), attrs.act_quant_dtype, nullptr,
-                              TensorLayout::NCHW, a.quant_params());
-    auto plan = get_matmul_plan(attrs, aq_shape.desc(), b.desc(),
-                                ctx.cpu.worker_count(),
+    const TensorView aq_shape(a.shape_span(), attrs.act_quant_dtype, nullptr, TensorLayout::NCHW,
+                              a.quant_params());
+    auto plan = get_matmul_plan(attrs, aq_shape.desc(), b.desc(), ctx.cpu.worker_count(),
                                 ctx.cpu.thread_slot_count() > 0);
     NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
 
@@ -1046,32 +1062,28 @@ Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
     const int32_t a_bias_offset = int8_epilogue_offset(attrs.act_quant_dtype);
     // The optional bias rides `inputs` through both branches: the fused one
     // passes the array through, the materialised one substitutes A_q for A.
-    if (!plan.split_n && !attrs.transpose_a &&
-        !dq_needs_compensation(a, b, a_bias_offset, M, N)) {
-        PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
-                        + DqRoute<T, T>::extra_workspace(output));
-        return matmul_dispatch_tiled<DqRoute<T, T>>(attrs, output, inputs, ctx,
-                                                    plan, scratch.get());
+    if (!plan.split_n && !attrs.transpose_a && !dq_needs_compensation(a, b, a_bias_offset, M, N)) {
+        PoolPtr scratch(static_cast<size_t>(plan.workspace_size) +
+                        DqRoute<T, T>::extra_workspace(output));
+        return matmul_dispatch_tiled<DqRoute<T, T>>(attrs, output, inputs, ctx, plan,
+                                                    scratch.get());
     }
 
     PoolPtr aq_buf(static_cast<size_t>(a.numel()));
-    TensorView aq(a.shape_span(), attrs.act_quant_dtype, aq_buf.get(),
-                  TensorLayout::NCHW, a.quant_params());
+    TensorView aq(a.shape_span(), attrs.act_quant_dtype, aq_buf.get(), TensorLayout::NCHW,
+                  a.quant_params());
     quantize_activation<T>(a, aq, ctx);
 
-    PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
-                    + DqRoute<T>::extra_workspace(output));
+    PoolPtr scratch(static_cast<size_t>(plan.workspace_size) + DqRoute<T>::extra_workspace(output));
     if (inputs.size() > 2) {
         const TensorView ins[] = {aq, b, inputs[2]};
-        return matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan,
-                                                 scratch.get());
+        return matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan, scratch.get());
     }
     const TensorView ins[] = {aq, b};
-    return matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan,
-                                             scratch.get());
+    return matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan, scratch.get());
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // =========================================================================
 //  Public API
@@ -1093,16 +1105,14 @@ Status run_route(const MatMulAttributes& attrs, TensorView& output,
                  std::span<const TensorView> inputs, const ComputeContext& ctx,
                  const MatMulPlan& plan)
 {
-    PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
-                    + R::extra_workspace(output));
-    return matmul_dispatch_tiled<R>(attrs, output, inputs, ctx, plan,
-                                    scratch.get());
+    PoolPtr scratch(static_cast<size_t>(plan.workspace_size) + R::extra_workspace(output));
+    return matmul_dispatch_tiled<R>(attrs, output, inputs, ctx, plan, scratch.get());
 }
 
 /// The plan for one call: worker ids turn scratch slots per m-block into slots
 /// per thread.
-inline MatMulPlan make_plan(const MatMulAttributes& attrs, const TensorView& a,
-                            const TensorView& b, const ComputeContext& ctx)
+inline MatMulPlan make_plan(const MatMulAttributes& attrs, const TensorView& a, const TensorView& b,
+                            const ComputeContext& ctx)
 {
     return get_matmul_plan(attrs, a.desc(), b.desc(), ctx.cpu.worker_count(),
                            ctx.cpu.thread_slot_count() > 0);
@@ -1114,20 +1124,21 @@ inline MatMulPlan make_plan(const MatMulAttributes& attrs, const TensorView& a,
 /// A is not a quantized tensor to dequantize — so it is rejected rather than
 /// reading the int8 weights as floats.
 Status matmul_dq_from_fp(const MatMulAttributes& attrs, TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx)
+                         std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
     const QuantParams& qp = a.quant_params();
-    const bool quantized = qp.is_active() &&
-                           (qp.granularity == QuantGranularity::PerTensor ||
-                            qp.granularity == QuantGranularity::PerToken);
-    if (!quantized) { return Status::invalid_argument; }
-    if (attrs.transpose_a) { return Status::unsupported; }
+    const bool quantized = qp.is_active() && (qp.granularity == QuantGranularity::PerTensor ||
+                                              qp.granularity == QuantGranularity::PerToken);
+    if (!quantized) {
+        return Status::invalid_argument;
+    }
+    if (attrs.transpose_a) {
+        return Status::unsupported;
+    }
     NNOPS_ASSERT(output.data_type() == a.data_type());
-    return a.data_type() == DataType::f32
-        ? matmul_dq<float>(attrs, output, inputs, ctx)
-        : matmul_dq<half>(attrs, output, inputs, ctx);
+    return a.data_type() == DataType::f32 ? matmul_dq<float>(attrs, output, inputs, ctx) :
+                                            matmul_dq<half>(attrs, output, inputs, ctx);
 }
 
 /// s8/u8 activations × s8 weights. The destination alone picks the variant: raw
@@ -1135,22 +1146,28 @@ Status matmul_dq_from_fp(const MatMulAttributes& attrs, TensorView& output,
 /// compact accumulator after the scratch), or the same accumulate dequantized
 /// into fp — DqRoute's A is already s8, so only the output type differs.
 Status matmul_int8_tiled(const MatMulAttributes& attrs, TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx, const MatMulPlan& plan)
+                         std::span<const TensorView> inputs, const ComputeContext& ctx,
+                         const MatMulPlan& plan)
 {
     const DataType odt = output.data_type();
     const bool out_fp = odt == DataType::f32 || odt == DataType::f16;
     // The residual folds into the fp output pass; an integral destination has no
     // fp sum to add it to.
-    if (attrs.residual_pre_activation && !out_fp) { return Status::unsupported; }
+    if (attrs.residual_pre_activation && !out_fp) {
+        return Status::unsupported;
+    }
     NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
     switch (odt) {
-    case DataType::f32: return run_route<DqRoute<float>>(attrs, output, inputs, ctx, plan);
-    case DataType::f16: return run_route<DqRoute<half>>(attrs, output, inputs, ctx, plan);
+    case DataType::f32:
+        return run_route<DqRoute<float>>(attrs, output, inputs, ctx, plan);
+    case DataType::f16:
+        return run_route<DqRoute<half>>(attrs, output, inputs, ctx, plan);
     case DataType::s32:
     case DataType::s8:
-    case DataType::u8:  return run_route<I8Route>(attrs, output, inputs, ctx, plan);
-    default:            return Status::unsupported;
+    case DataType::u8:
+        return run_route<I8Route>(attrs, output, inputs, ctx, plan);
+    default:
+        return Status::unsupported;
     }
 }
 
@@ -1161,17 +1178,20 @@ Status matmul_int8_tiled(const MatMulAttributes& attrs, TensorView& output,
 /// neither a u8 activation nor a fused fp one would reproduce. Its numel is the
 /// one thing that can be wrong — a blob packed against another K — so it is
 /// checked rather than trusted.
-Status check_packed_b(const MatMulAttributes& attrs, const TensorView& a,
-                      const TensorView& b)
+Status check_packed_b(const MatMulAttributes& attrs, const TensorView& a, const TensorView& b)
 {
     const DataType dt_a = a.data_type();
     const bool int8_blob = dt_a == DataType::s8 && b.data_type() == DataType::s8;
     if (!int8_blob) {
-        const bool float_blob = dt_a == b.data_type() &&
-                                (dt_a == DataType::f32 || dt_a == DataType::f16 ||
-                                 (nnops::detail::bf16_cpu_enabled && dt_a == DataType::bf16));
-        if (!float_blob) { return Status::unsupported; }
-        if (attrs.alpha != 1.0f) { return Status::unsupported; }
+        const bool float_blob =
+            dt_a == b.data_type() && (dt_a == DataType::f32 || dt_a == DataType::f16 ||
+                                      (nnops::detail::bf16_cpu_enabled && dt_a == DataType::bf16));
+        if (!float_blob) {
+            return Status::unsupported;
+        }
+        if (attrs.alpha != 1.0f) {
+            return Status::unsupported;
+        }
     }
     if (!matmul_packed_b_matches(b.desc(), matmul_dims(attrs, a, b).K)) {
         return Status::invalid_argument;
@@ -1184,13 +1204,17 @@ Status check_packed_b(const MatMulAttributes& attrs, const TensorView& a,
 /// apply. Every other pair runs the fp kernels, or has no kernel at all.
 inline bool is_quantized_pair(DataType dt_a, DataType dt_b) noexcept
 {
-    if (dt_b != DataType::s8) { return false; }
+    if (dt_b != DataType::s8) {
+        return false;
+    }
     switch (dt_a) {
     case DataType::f32:
     case DataType::f16:
     case DataType::s8:
-    case DataType::u8:  return true;
-    default:            return false;
+    case DataType::u8:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -1199,8 +1223,7 @@ inline bool is_quantized_pair(DataType dt_a, DataType dt_b) noexcept
 /// the A pack applies on the fly — so both ends of the chain may be fp while the
 /// arithmetic is int8.
 Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx)
+                             std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
     const DataType dt_a = a.data_type();
@@ -1219,8 +1242,7 @@ Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
 /// Two routes here never build a plan — the fused Q4_1 decode and the
 /// small-product sweep.
 Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx)
+                          std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -1251,11 +1273,15 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
     // A dense f32/f16 product that is small enough (or narrow enough) skips the
     // plan: no pack, no tiles, no scratch. The thresholds live with the kernels,
     // and the route rejects every operand pair that is not a same-type fp one.
-    if (matmul_small_fp(attrs, output, inputs, ctx)) { return Status::ok; }
+    if (matmul_small_fp(attrs, output, inputs, ctx)) {
+        return Status::ok;
+    }
 
     // Past those, only f32/f16 have a fused kernel, plus a block-packed B, whose
     // blocks decode to A's type in the RHS pack.
-    if (!float_a || (!same_type && !block_b)) { return Status::unsupported; }
+    if (!float_a || (!same_type && !block_b)) {
+        return Status::unsupported;
+    }
 
     const auto plan = make_plan(attrs, a, b, ctx);
     if (dt_a == DataType::f32) {
@@ -1278,10 +1304,8 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
 /// the attributes, pick a family. Each family owns its operands, its plan-free
 /// routes and its own rejections: matmul_dispatch_quant and
 /// matmul_dispatch_fp above.
-Status matmul_dispatch_impl(const MatMulAttributes& attrs,
-                            TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx,
+Status matmul_dispatch_impl(const MatMulAttributes& attrs, TensorView& output,
+                            std::span<const TensorView> inputs, const ComputeContext& ctx,
                             void* /*workspace*/)
 {
     const auto& a = inputs[0];
@@ -1293,7 +1317,9 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
 
     if (is_packed_matmul_b(b.layout())) {
         const Status st = check_packed_b(attrs, a, b);
-        if (!is_ok(st)) { return st; }
+        if (!is_ok(st)) {
+            return st;
+        }
     }
 
     // Fold pure-clamp activations into min_clip/max_clip, which kblock_clamp
@@ -1301,26 +1327,29 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     // that every route shares, so it happens before the family is picked.
     MatMulAttributes attrs_n = attrs;
     switch (attrs_n.epilogue.type) {
-    case EpilogueActivateType::Relu:  attrs_n.epilogue.min_clip = 0.0f; break;
-    case EpilogueActivateType::Relu6: attrs_n.epilogue.min_clip = 0.0f; attrs_n.epilogue.max_clip = 6.0f; break;
-    default: break;
+    case EpilogueActivateType::Relu:
+        attrs_n.epilogue.min_clip = 0.0f;
+        break;
+    case EpilogueActivateType::Relu6:
+        attrs_n.epilogue.min_clip = 0.0f;
+        attrs_n.epilogue.max_clip = 6.0f;
+        break;
+    default:
+        break;
     }
 
     // The only fork left: quantized compute or float compute. s8 weights are the
     // whole of the first family — the activation may be integer or fp, so the
     // dtype pair alone does not say where the arithmetic happens.
-    return is_quantized_pair(a.data_type(), b.data_type())
-        ? matmul_dispatch_quant(attrs_n, output, inputs, ctx)
-        : matmul_dispatch_fp(attrs_n, output, inputs, ctx);
+    return is_quantized_pair(a.data_type(), b.data_type()) ?
+               matmul_dispatch_quant(attrs_n, output, inputs, ctx) :
+               matmul_dispatch_fp(attrs_n, output, inputs, ctx);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status matmul_cpu(const MatMulAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx,
-                void* workspace)
+Status matmul_cpu(const MatMulAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx, void* workspace)
 {
     NNOPS_ASSERT(inputs.size() >= 2 && inputs.size() <= 3);
     if (inputs.size() < 3) {
@@ -1335,14 +1364,12 @@ Status matmul_cpu(const MatMulAttributes& attrs,
     // scaled by alpha, which only rides the RHS pack.
     const TensorView& bias = inputs[2];
     const DataType odt = output.data_type();
-    const bool int_out = odt == DataType::s32 || odt == DataType::s8 ||
-                         odt == DataType::u8;
+    const bool int_out = odt == DataType::s32 || odt == DataType::s8 || odt == DataType::u8;
     if (int_out) {
         NNOPS_ASSERT_MSG(bias.data_type() == DataType::s32,
                          "MatMul: an integer output (s32/s8/u8) takes an int32 bias");
     } else {
-        NNOPS_ASSERT_MSG(odt == DataType::f32 || odt == DataType::f16 ||
-                             odt == DataType::bf16,
+        NNOPS_ASSERT_MSG(odt == DataType::f32 || odt == DataType::f16 || odt == DataType::bf16,
                          "MatMul: the bias needs an fp or integer output");
         NNOPS_ASSERT(bias.data_type() == odt);
     }
@@ -1351,4 +1378,4 @@ Status matmul_cpu(const MatMulAttributes& attrs,
     return matmul_dispatch_impl(attrs, output, inputs, ctx, workspace);
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

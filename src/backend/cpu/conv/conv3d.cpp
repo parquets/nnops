@@ -78,8 +78,7 @@ constexpr int64_t kTileCapBytes = 4 << 20;
 /// over pixels inside one output channel, so the quant stage indexes @p oc
 /// throughout.
 template <typename T>
-void write_tile(T* dst, const T* src, int64_t len, const T* bias, int64_t oc,
-                const Geom& gm)
+void write_tile(T* dst, const T* src, int64_t len, const T* bias, int64_t oc, const Geom& gm)
 {
     apply_epilogue_row<T>(dst, src, len, bias, /*bias_step=*/0, gm.epilogue, oc,
                           /*quant_step=*/0, gm.add_to, /*pre_act=*/false);
@@ -88,19 +87,19 @@ void write_tile(T* dst, const T* src, int64_t len, const T* bias, int64_t oc,
 /// im2col → GEMM. Returns false when the operands cannot be read as flat
 /// matrices, leaving the caller its gather.
 template <typename T>
-bool conv3d_im2col_gemm(const Geom& gm,
-                        TensorView& output,
-                        std::span<const TensorView> inputs,
+bool conv3d_im2col_gemm(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
                         const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
     const int64_t karea = gm.karea();
-    const int64_t kdim  = gm.IC_per_G * karea;
-    const int64_t npix  = gm.npix();
-    if (kdim <= 0 || npix <= 0 || gm.OC_per_G <= 0) { return false; }
+    const int64_t kdim = gm.IC_per_G * karea;
+    const int64_t npix = gm.npix();
+    if (kdim <= 0 || npix <= 0 || gm.OC_per_G <= 0) {
+        return false;
+    }
     // A is the filter itself, so [OC/G][IC/G·KD·KH·KW] must be one dense
     // matrix: each k row back to back, and each OC row a whole k row further.
     if (weight.stride_elems(3) != gm.KW || weight.stride_elems(1) != karea) {
@@ -111,24 +110,22 @@ bool conv3d_im2col_gemm(const Geom& gm,
     const int64_t in_c_stride = input.stride_elems(1);
     const int64_t in_d_stride = input.stride_elems(2);
     const int64_t in_h_stride = input.row_stride_elems();
-    const int64_t out_n_stride   = output.stride_elems(0);
-    const int64_t out_c_stride   = output.stride_elems(1);
+    const int64_t out_n_stride = output.stride_elems(0);
+    const int64_t out_c_stride = output.stride_elems(1);
     const int64_t out_row_stride = output.row_stride_elems();
 
     // A 1x1x1 stride-1 convolution is a plain GEMM over the input plane: one
     // pixel step is one element on both sides, so no column has to be gathered.
-    const bool pointwise =
-        gm.KD == 1 && gm.KH == 1 && gm.KW == 1 &&
-        gm.SD == 1 && gm.SH == 1 && gm.SW == 1 &&
-        gm.PD == 0 && gm.PH == 0 && gm.PW == 0 &&
-        in_h_stride == gm.IW && in_d_stride == gm.IH * gm.IW;
+    const bool pointwise = gm.KD == 1 && gm.KH == 1 && gm.KW == 1 && gm.SD == 1 && gm.SH == 1 &&
+                           gm.SW == 1 && gm.PD == 0 && gm.PH == 0 && gm.PW == 0 &&
+                           in_h_stride == gm.IW && in_d_stride == gm.IH * gm.IW;
 
     const int64_t cap = kColCapBytes / static_cast<int64_t>(sizeof(T));
     const int64_t slice = gm.OH * gm.OW;
 
     // One rectangle per block, whole depth slices while the col fits one.
     int64_t od_chunk = 1;
-    int64_t roi_h    = gm.OH;
+    int64_t roi_h = gm.OH;
     if (kdim * slice <= cap) {
         od_chunk = std::max<int64_t>(1, std::min(gm.OD, cap / (kdim * slice)));
     } else {
@@ -139,41 +136,43 @@ bool conv3d_im2col_gemm(const Geom& gm,
     // The GEMM writes into the destination unless a residual has to survive it
     // or the destination's rows are not back to back.
     const bool dense_out = (out_row_stride == gm.OW);
-    const bool in_place  = dense_out && !gm.add_to;
+    const bool in_place = dense_out && !gm.add_to;
     const bool write_pass = has_bias || gm.add_to || epilogue_is_active(gm.epilogue);
 
-    const int64_t tile_cap = (kTileCapBytes / static_cast<int64_t>(sizeof(T))) /
-                             std::max<int64_t>(1, nblk_max);
-    const int64_t cc = in_place ? gm.OC_per_G
-                                : std::min(gm.OC_per_G, std::max<int64_t>(1, tile_cap));
+    const int64_t tile_cap =
+        (kTileCapBytes / static_cast<int64_t>(sizeof(T))) / std::max<int64_t>(1, nblk_max);
+    const int64_t cc =
+        in_place ? gm.OC_per_G : std::min(gm.OC_per_G, std::max<int64_t>(1, tile_cap));
 
     PoolArray<T> col(pointwise ? 0 : static_cast<size_t>(kdim * nblk_max));
     PoolArray<T> stage(in_place ? 0 : static_cast<size_t>(cc * nblk_max));
-    if ((!pointwise && !col) || (!in_place && !stage)) { return false; }
+    if ((!pointwise && !col) || (!in_place && !stage)) {
+        return false;
+    }
 
     const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr  = weight.ptr<T>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const auto* w_ptr = weight.ptr<T>();
+    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     auto* out_ptr = output.ptr<T>();
     const DataType vdt = input.data_type();
 
-    const int pw = gm.PW;  // the roi starts at ow = 0, so only PW can cut it
+    const int pw = gm.PW; // the roi starts at ow = 0, so only PW can cut it
 
     for (int64_t n = 0; n < gm.N; ++n) {
-        const T* in_n  = in_ptr + n * in_n_stride;
-        T* out_n       = out_ptr + n * out_n_stride;
+        const T* in_n = in_ptr + n * in_n_stride;
+        T* out_n = out_ptr + n * out_n_stride;
 
         for (int64_t g = 0; g < gm.G; ++g) {
-            const T* in_g  = in_n + g * gm.IC_per_G * in_c_stride;
-            const T* w_g   = w_ptr + g * gm.OC_per_G * kdim;
-            T* out_g       = out_n + g * gm.OC_per_G * out_c_stride;
+            const T* in_g = in_n + g * gm.IC_per_G * in_c_stride;
+            const T* w_g = w_ptr + g * gm.OC_per_G * kdim;
+            T* out_g = out_n + g * gm.OC_per_G * out_c_stride;
 
             for (int64_t od0 = 0; od0 < gm.OD; od0 += od_chunk) {
                 const int64_t nd = std::min(od_chunk, gm.OD - od0);
                 for (int64_t oh0 = 0; oh0 < gm.OH; oh0 += roi_h) {
-                    const int64_t nh   = std::min(roi_h, gm.OH - oh0);
+                    const int64_t nh = std::min(roi_h, gm.OH - oh0);
                     const int64_t nblk = nd * nh * gm.OW;
-                    const int64_t p0   = (od0 * gm.OH + oh0) * gm.OW;
+                    const int64_t p0 = (od0 * gm.OH + oh0) * gm.OW;
 
                     if (pointwise) {
                         // Nothing to gather: the input plane is B.
@@ -183,26 +182,22 @@ bool conv3d_im2col_gemm(const Geom& gm,
                         // origin itself, so a start pad has to include it.
                         const int64_t id = od0 * gm.SD - gm.PD;
                         const int64_t ih = oh0 * gm.SH - gm.PH;
-                        const int pd = id < 0 ? static_cast<int>(-id)
-                                              : (id >= gm.ID ? static_cast<int>(id - gm.ID) : 0);
-                        const int ph = ih < 0 ? static_cast<int>(-ih)
-                                              : (ih >= gm.IH ? static_cast<int>(ih - gm.IH) : 0);
+                        const int pd = id < 0 ? static_cast<int>(-id) :
+                                                (id >= gm.ID ? static_cast<int>(id - gm.ID) : 0);
+                        const int ph = ih < 0 ? static_cast<int>(-ih) :
+                                                (ih >= gm.IH ? static_cast<int>(ih - gm.IH) : 0);
                         nnops::kernel::tiled_im2col_3d<T>(
-                            col.data(), in_g,
-                            static_cast<int>(od0), static_cast<int>(oh0), 0,
+                            col.data(), in_g, static_cast<int>(od0), static_cast<int>(oh0), 0,
                             static_cast<int>(nd), static_cast<int>(nh), static_cast<int>(gm.OW),
-                            pd + static_cast<int>(od0 * gm.SD),
-                            ph + static_cast<int>(oh0 * gm.SH), pw,
-                            static_cast<int>(gm.PD), static_cast<int>(gm.PH),
-                            static_cast<int>(gm.PW),
-                            static_cast<int>(gm.IC_per_G), static_cast<int>(gm.ID),
-                            static_cast<int>(gm.IH), static_cast<int>(gm.IW),
-                            static_cast<int>(in_c_stride), static_cast<int>(in_d_stride),
-                            static_cast<int>(in_h_stride),
+                            pd + static_cast<int>(od0 * gm.SD), ph + static_cast<int>(oh0 * gm.SH),
+                            pw, static_cast<int>(gm.PD), static_cast<int>(gm.PH),
+                            static_cast<int>(gm.PW), static_cast<int>(gm.IC_per_G),
+                            static_cast<int>(gm.ID), static_cast<int>(gm.IH),
+                            static_cast<int>(gm.IW), static_cast<int>(in_c_stride),
+                            static_cast<int>(in_d_stride), static_cast<int>(in_h_stride),
                             static_cast<int>(gm.KD), static_cast<int>(gm.KH),
-                            static_cast<int>(gm.KW),
-                            static_cast<int>(gm.SD), static_cast<int>(gm.SH),
-                            static_cast<int>(gm.SW),
+                            static_cast<int>(gm.KW), static_cast<int>(gm.SD),
+                            static_cast<int>(gm.SH), static_cast<int>(gm.SW),
                             static_cast<int>(gm.DD), static_cast<int>(gm.DH),
                             static_cast<int>(gm.DW));
                     }
@@ -210,20 +205,18 @@ bool conv3d_im2col_gemm(const Geom& gm,
                     const int64_t bshape[] = {kdim, nblk};
                     TensorView bm(std::span<const int64_t>(bshape, 2), vdt,
                                   const_cast<T*>(pointwise ? in_g + p0 : col.data()),
-                                  (pointwise ? in_c_stride : nblk) * static_cast<int64_t>(sizeof(T)),
+                                  (pointwise ? in_c_stride : nblk) *
+                                      static_cast<int64_t>(sizeof(T)),
                                   TensorLayout::NCDHW);
 
                     for (int64_t oc0 = 0; oc0 < gm.OC_per_G; oc0 += cc) {
                         const int64_t ncc = std::min(cc, gm.OC_per_G - oc0);
-                        T* ctile = in_place
-                            ? out_g + oc0 * out_c_stride + p0
-                            : stage.data();
+                        T* ctile = in_place ? out_g + oc0 * out_c_stride + p0 : stage.data();
 
                         const int64_t ashape[] = {ncc, kdim};
                         TensorView am(std::span<const int64_t>(ashape, 2), vdt,
                                       const_cast<T*>(w_g + oc0 * kdim),
-                                      static_cast<int64_t>(kdim * sizeof(T)),
-                                      TensorLayout::NCDHW);
+                                      static_cast<int64_t>(kdim * sizeof(T)), TensorLayout::NCDHW);
                         const int64_t cshape[] = {ncc, nblk};
                         TensorView cm(std::span<const int64_t>(cshape, 2), vdt, ctile,
                                       (in_place ? out_c_stride : nblk) *
@@ -234,7 +227,9 @@ bool conv3d_im2col_gemm(const Geom& gm,
                         const MatMulAttributes mm{};
                         matmul_cpu(mm, cm, mins, ctx, nullptr);
 
-                        if (in_place && !write_pass) { continue; }
+                        if (in_place && !write_pass) {
+                            continue;
+                        }
 
                         const int64_t crow = in_place ? out_c_stride : nblk;
                         ctx.cpu.run(0, ncc, [&](int64_t oc_l) {
@@ -266,12 +261,10 @@ bool conv3d_im2col_gemm(const Geom& gm,
 /// The output-driven gather: every output voxel walks its own taps. Correct for
 /// every geometry and layout, and the route a shape too odd for the col takes.
 template <typename T>
-void conv3d_gather(const Geom& gm,
-                   TensorView& output,
-                   std::span<const TensorView> inputs,
+void conv3d_gather(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
                    const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
@@ -279,21 +272,21 @@ void conv3d_gather(const Geom& gm,
     const int64_t in_c_stride = input.stride_elems(1);
     const int64_t in_d_stride = input.stride_elems(2);
     const int64_t in_h_stride = input.row_stride_elems();
-    const int64_t out_n_stride   = output.stride_elems(0);
-    const int64_t out_c_stride   = output.stride_elems(1);
-    const int64_t out_d_stride   = output.stride_elems(2);
+    const int64_t out_n_stride = output.stride_elems(0);
+    const int64_t out_c_stride = output.stride_elems(1);
+    const int64_t out_d_stride = output.stride_elems(2);
     const int64_t out_row_stride = output.row_stride_elems();
 
     // This route exists for layouts the flat operand views cannot describe, so
     // the filter is walked by its own strides rather than as one k block.
     const int64_t w_oc_stride = weight.stride_elems(0);
     const int64_t w_ic_stride = weight.stride_elems(1);
-    const int64_t w_d_stride  = weight.stride_elems(2);
-    const int64_t w_h_stride  = weight.stride_elems(3);
+    const int64_t w_d_stride = weight.stride_elems(2);
+    const int64_t w_h_stride = weight.stride_elems(3);
 
     const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr  = weight.ptr<T>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const auto* w_ptr = weight.ptr<T>();
+    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     auto* out_ptr = output.ptr<T>();
 
     ctx.cpu.run(0, gm.N, [&](int64_t n) {
@@ -310,29 +303,33 @@ void conv3d_gather(const Geom& gm,
                             float sum = 0.0f;
                             for (int64_t ic = 0; ic < gm.IC_per_G; ++ic) {
                                 const int64_t ic_global = g * gm.IC_per_G + ic;
-                                const T* in_c = in_ptr + n * in_n_stride +
-                                                ic_global * in_c_stride;
+                                const T* in_c = in_ptr + n * in_n_stride + ic_global * in_c_stride;
                                 const T* w_ic = w_oc + ic * w_ic_stride;
                                 for (int64_t kd = 0; kd < gm.KD; ++kd) {
                                     const int64_t id = od * gm.SD + kd * gm.DD - gm.PD;
-                                    if (id < 0 || id >= gm.ID) { continue; }
+                                    if (id < 0 || id >= gm.ID) {
+                                        continue;
+                                    }
                                     for (int64_t kh = 0; kh < gm.KH; ++kh) {
                                         const int64_t ih = oh * gm.SH + kh * gm.DH - gm.PH;
-                                        if (ih < 0 || ih >= gm.IH) { continue; }
-                                        const T* in_row = in_c + id * in_d_stride +
-                                                          ih * in_h_stride;
-                                        const T* w_row = w_ic + kd * w_d_stride +
-                                                         kh * w_h_stride;
+                                        if (ih < 0 || ih >= gm.IH) {
+                                            continue;
+                                        }
+                                        const T* in_row =
+                                            in_c + id * in_d_stride + ih * in_h_stride;
+                                        const T* w_row = w_ic + kd * w_d_stride + kh * w_h_stride;
                                         for (int64_t kw = 0; kw < gm.KW; ++kw) {
                                             const int64_t iw = ow * gm.SW + kw * gm.DW - gm.PW;
-                                            if (iw < 0 || iw >= gm.IW) { continue; }
+                                            if (iw < 0 || iw >= gm.IW) {
+                                                continue;
+                                            }
                                             sum += s_load(&in_row[iw]) * s_load(&w_row[kw]);
                                         }
                                     }
                                 }
                             }
-                            apply_epilogue_store<T>(&orow[ow], sum + bv, gm.epilogue,
-                                                    oc, gm.add_to, /*pre_act=*/false);
+                            apply_epilogue_store<T>(&orow[ow], sum + bv, gm.epilogue, oc, gm.add_to,
+                                                    /*pre_act=*/false);
                         }
                     }
                 }
@@ -342,39 +339,39 @@ void conv3d_gather(const Geom& gm,
 }
 
 template <typename T>
-void conv3d_impl(const Geom& gm,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
+void conv3d_impl(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
                  const ComputeContext& ctx)
 {
-    if (gm.N == 0 || gm.OC == 0 || gm.OD == 0 || gm.OH == 0 || gm.OW == 0) { return; }
-    if (conv3d_im2col_gemm<T>(gm, output, inputs, ctx)) { return; }
+    if (gm.N == 0 || gm.OC == 0 || gm.OD == 0 || gm.OH == 0 || gm.OW == 0) {
+        return;
+    }
+    if (conv3d_im2col_gemm<T>(gm, output, inputs, ctx)) {
+        return;
+    }
     conv3d_gather<T>(gm, output, inputs, ctx);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status conv3d_cpu(const Conv3DAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
+Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx,
                   void* /*workspace*/)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
     Geom gm{};
-    gm.N  = input.shape(0);
+    gm.N = input.shape(0);
     gm.IC = input.shape(1);
     gm.ID = input.shape(2);
     gm.IH = input.shape(3);
     gm.IW = input.shape(4);
-    gm.OC       = weight.shape(0);
+    gm.OC = weight.shape(0);
     gm.IC_per_G = weight.shape(1);
     gm.KD = attrs.kernel_size[0];
     gm.KH = attrs.kernel_size[1];
     gm.KW = attrs.kernel_size[2];
-    gm.G  = attrs.groups;
+    gm.G = attrs.groups;
     gm.OC_per_G = gm.OC / gm.G;
     gm.OD = output.shape(2);
     gm.OH = output.shape(3);
@@ -398,4 +395,4 @@ Status conv3d_cpu(const Conv3DAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

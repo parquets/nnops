@@ -28,8 +28,7 @@ namespace nnops::kernel {
 using namespace simd;
 
 /// Re-export of row_reduce_sum_sq (simd_reduce_primitive.hpp).
-template <typename T>
-inline std::pair<float, float> norm_reduce_sum_sq(const T* x, int64_t n)
+template <typename T> inline std::pair<float, float> norm_reduce_sum_sq(const T* x, int64_t n)
 {
     return row_reduce_sum_sq<T>(x, n);
 }
@@ -51,8 +50,8 @@ inline std::pair<float, float> norm_reduce_sum_sq_add(const T* x, const T* r, in
         v_f32x8 v_sum = v_set1_f32x8(0.0f);
         v_f32x8 v_sq = v_set1_f32x8(0.0f);
         for (; i + L <= n; i += L) {
-            const v_f32x8 v = v_add(v_cvt_f16_to_f32(v_load(x + i)),
-                                    v_cvt_f16_to_f32(v_load(r + i)));
+            const v_f32x8 v =
+                v_add(v_cvt_f16_to_f32(v_load(x + i)), v_cvt_f16_to_f32(v_load(r + i)));
             v_sum = v_add(v_sum, v);
             v_sq = v_fmadd(v, v, v_sq);
         }
@@ -80,18 +79,16 @@ inline std::pair<float, float> norm_reduce_sum_sq_add(const T* x, const T* r, in
 /// (x - mean) * inv_std * scale + bias with broadcast scale/bias — GroupNorm,
 /// where a row within a channel shares one scale/bias pair.
 template <typename T>
-inline void norm_apply_affine_row(const T* x, T* y, int64_t n,
-                                   float mean, float inv_std,
-                                   float scale_val, float bias_val,
-                                   bool add_to)
+inline void norm_apply_affine_row(const T* x, T* y, int64_t n, float mean, float inv_std,
+                                  float scale_val, float bias_val, bool add_to)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
 
-    const auto v_mean    = v_set1(x, mean);
+    const auto v_mean = v_set1(x, mean);
     const auto v_inv_std = v_set1(x, inv_std);
-    const auto v_scale   = v_set1(x, scale_val);
-    const auto v_bias    = v_set1(x, bias_val);
+    const auto v_scale = v_set1(x, scale_val);
+    const auto v_bias = v_set1(x, bias_val);
 
     for (; i + L <= n; i += L) {
         auto xv = v_load(x + i);
@@ -109,27 +106,24 @@ inline void norm_apply_affine_row(const T* x, T* y, int64_t n,
 /// Identity for the plain forms; RMSNormGated passes one that multiplies by
 /// act(gate), which folds the gate into the same pass that writes the row.
 struct IdentityPost {
-    template <class V>
-    V vec(const V& v, int64_t) const noexcept { return v; }
+    template <class V> V vec(const V& v, int64_t) const noexcept { return v; }
     float scalar(float v, int64_t) const noexcept { return v; }
 };
 
 /// norm_apply_row over the pre-added row (x + r) — the write side of the fused
 /// `norm(x + r)`. `post` runs after the norm's scale/bias and before the store.
-template <typename T, bool HasMean, bool HasScale, bool HasBias,
-          bool ScaleOnePlus = false, class Post = IdentityPost>
-inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
-                               float mean_val, float inv_std,
-                               const T* scale, const T* bias,
-                               bool scale_is_scalar, bool add_to,
-                               Post post = Post{})
+template <typename T, bool HasMean, bool HasScale, bool HasBias, bool ScaleOnePlus = false,
+          class Post = IdentityPost>
+inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n, float mean_val,
+                               float inv_std, const T* scale, const T* bias, bool scale_is_scalar,
+                               bool add_to, Post post = Post{})
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
 
-    const auto v_mean    = v_set1(x, mean_val);
+    const auto v_mean = v_set1(x, mean_val);
     const auto v_inv_std = v_set1(x, inv_std);
-    const auto v_one     = v_set1(x, 1.0f);
+    const auto v_one = v_set1(x, 1.0f);
 
     for (; i + L <= n; i += L) {
         auto rv = v_add(v_load(x + i), v_load(r + i));
@@ -175,20 +169,18 @@ inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
 /// 1-centered: the effective scale is (1 + w), as Gemma's zero-centered norms
 /// and Qwen3-Next/4's need. Folding the +1 in here keeps it out of the stored
 /// weight, which in bf16 would otherwise lose the small-|w| correction.
-template <typename T, bool HasMean, bool HasScale, bool HasBias,
-          bool ScaleOnePlus = false, class Post = IdentityPost>
-inline void norm_apply_row(const T* x, T* y, int64_t n,
-                            float mean_val, float inv_std,
-                            const T* scale, const T* bias,
-                            bool scale_is_scalar, bool add_to,
-                            Post post = Post{})
+template <typename T, bool HasMean, bool HasScale, bool HasBias, bool ScaleOnePlus = false,
+          class Post = IdentityPost>
+inline void norm_apply_row(const T* x, T* y, int64_t n, float mean_val, float inv_std,
+                           const T* scale, const T* bias, bool scale_is_scalar, bool add_to,
+                           Post post = Post{})
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
 
-    const auto v_mean    = v_set1(x, mean_val);
+    const auto v_mean = v_set1(x, mean_val);
     const auto v_inv_std = v_set1(x, inv_std);
-    const auto v_one     = v_set1(x, 1.0f);
+    const auto v_one = v_set1(x, 1.0f);
 
     for (; i + L <= n; i += L) {
         auto xv = v_load(x + i);
@@ -234,30 +226,26 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
 /// Runtime dispatch over ScaleOnePlus for norm_apply_row, so the operators keep
 /// one call per (HasMean, HasScale, HasBias) shape.
 template <typename T, bool HasMean, bool HasScale, bool HasBias>
-inline void norm_apply_row_dispatch(const T* x, T* y, int64_t n,
-                                    float mean_val, float inv_std,
-                                    const T* scale, const T* bias,
-                                    bool scale_is_scalar, bool add_to,
-                                    bool one_plus_weight)
+inline void norm_apply_row_dispatch(const T* x, T* y, int64_t n, float mean_val, float inv_std,
+                                    const T* scale, const T* bias, bool scale_is_scalar,
+                                    bool add_to, bool one_plus_weight)
 {
     if constexpr (HasScale) {
         if (one_plus_weight) {
-            norm_apply_row<T, HasMean, HasScale, HasBias, true>(
-                x, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to);
+            norm_apply_row<T, HasMean, HasScale, HasBias, true>(x, y, n, mean_val, inv_std, scale,
+                                                                bias, scale_is_scalar, add_to);
             return;
         }
     }
-    norm_apply_row<T, HasMean, HasScale, HasBias, false>(
-        x, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to);
+    norm_apply_row<T, HasMean, HasScale, HasBias, false>(x, y, n, mean_val, inv_std, scale, bias,
+                                                         scale_is_scalar, add_to);
 }
 
 /// Runtime dispatch over ScaleOnePlus for norm_apply_row_add.
 template <typename T, bool HasMean, bool HasScale, bool HasBias>
-inline void norm_apply_row_add_dispatch(const T* x, const T* r, T* y, int64_t n,
-                                        float mean_val, float inv_std,
-                                        const T* scale, const T* bias,
-                                        bool scale_is_scalar, bool add_to,
-                                        bool one_plus_weight)
+inline void norm_apply_row_add_dispatch(const T* x, const T* r, T* y, int64_t n, float mean_val,
+                                        float inv_std, const T* scale, const T* bias,
+                                        bool scale_is_scalar, bool add_to, bool one_plus_weight)
 {
     if constexpr (HasScale) {
         if (one_plus_weight) {
@@ -266,17 +254,15 @@ inline void norm_apply_row_add_dispatch(const T* x, const T* r, T* y, int64_t n,
             return;
         }
     }
-    norm_apply_row_add<T, HasMean, HasScale, HasBias, false>(
-        x, r, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to);
+    norm_apply_row_add<T, HasMean, HasScale, HasBias, false>(x, r, y, n, mean_val, inv_std, scale,
+                                                             bias, scale_is_scalar, add_to);
 }
 
 /// ScaleOnePlus dispatch with a post step (the gated forms).
 template <typename T, bool HasMean, bool HasScale, bool HasBias, class Post>
-inline void norm_apply_row_post_dispatch(const T* x, T* y, int64_t n,
-                                         float mean_val, float inv_std,
-                                         const T* scale, const T* bias,
-                                         bool scale_is_scalar, bool add_to,
-                                         bool one_plus_weight, Post post)
+inline void norm_apply_row_post_dispatch(const T* x, T* y, int64_t n, float mean_val, float inv_std,
+                                         const T* scale, const T* bias, bool scale_is_scalar,
+                                         bool add_to, bool one_plus_weight, Post post)
 {
     if constexpr (HasScale) {
         if (one_plus_weight) {
@@ -285,15 +271,14 @@ inline void norm_apply_row_post_dispatch(const T* x, T* y, int64_t n,
             return;
         }
     }
-    norm_apply_row<T, HasMean, HasScale, HasBias, false>(
-        x, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to, post);
+    norm_apply_row<T, HasMean, HasScale, HasBias, false>(x, y, n, mean_val, inv_std, scale, bias,
+                                                         scale_is_scalar, add_to, post);
 }
 
 template <typename T, bool HasMean, bool HasScale, bool HasBias, class Post>
 inline void norm_apply_row_add_post_dispatch(const T* x, const T* r, T* y, int64_t n,
-                                             float mean_val, float inv_std,
-                                             const T* scale, const T* bias,
-                                             bool scale_is_scalar, bool add_to,
+                                             float mean_val, float inv_std, const T* scale,
+                                             const T* bias, bool scale_is_scalar, bool add_to,
                                              bool one_plus_weight, Post post)
 {
     if constexpr (HasScale) {
@@ -303,30 +288,28 @@ inline void norm_apply_row_add_post_dispatch(const T* x, const T* r, T* y, int64
             return;
         }
     }
-    norm_apply_row_add<T, HasMean, HasScale, HasBias, false>(
-        x, r, y, n, mean_val, inv_std, scale, bias, scale_is_scalar, add_to, post);
+    norm_apply_row_add<T, HasMean, HasScale, HasBias, false>(x, r, y, n, mean_val, inv_std, scale,
+                                                             bias, scale_is_scalar, add_to, post);
 }
 
 /// Channel-first layout: 4-wide unrolled SIMD fmadd per row.
 template <typename T>
-inline void batch_norm_process_channel_first_row(
-    const T* x_row, T* y_row,
-    int64_t last_dim,
-    float ns, float nb, bool add_to)
+inline void batch_norm_process_channel_first_row(const T* x_row, T* y_row, int64_t last_dim,
+                                                 float ns, float nb, bool add_to)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
 
     const auto scale8 = v_set1(x_row, ns);
-    const auto bias8  = v_set1(x_row, nb);
+    const auto bias8 = v_set1(x_row, nb);
 
     for (; i + 4 * L <= last_dim; i += 4 * L) {
         auto x0 = v_load(x_row + i);
         auto x1 = v_load(x_row + i + L);
         auto x2 = v_load(x_row + i + 2 * L);
         auto x3 = v_load(x_row + i + 3 * L);
-        v_store_add(y_row + i,       v_fmadd(scale8, x0, bias8), add_to);
-        v_store_add(y_row + i + L,     v_fmadd(scale8, x1, bias8), add_to);
+        v_store_add(y_row + i, v_fmadd(scale8, x0, bias8), add_to);
+        v_store_add(y_row + i + L, v_fmadd(scale8, x1, bias8), add_to);
         v_store_add(y_row + i + 2 * L, v_fmadd(scale8, x2, bias8), add_to);
         v_store_add(y_row + i + 3 * L, v_fmadd(scale8, x3, bias8), add_to);
     }
@@ -342,12 +325,9 @@ inline void batch_norm_process_channel_first_row(
 
 /// Non-spatial mode: full per-element scale/bias/mean/var arrays.
 template <typename T>
-inline void batch_norm_process_nonspatial_block(
-    const T* x, T* y,
-    const T* scale, const T* bias,
-    const T* mean, const T* var,
-    int64_t i_begin, int64_t i_end,
-    float epsilon, bool add_to)
+inline void batch_norm_process_nonspatial_block(const T* x, T* y, const T* scale, const T* bias,
+                                                const T* mean, const T* var, int64_t i_begin,
+                                                int64_t i_end, float epsilon, bool add_to)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = i_begin;
@@ -357,14 +337,14 @@ inline void batch_norm_process_nonspatial_block(
     for (; i + 4 * L <= i_end; i += 4 * L) {
         for (int k = 0; k < 4; ++k) {
             int64_t off = i + k * L;
-            auto xv  = v_load(x + off);
-            auto sv  = v_load(scale + off);
-            auto bv  = v_load(bias + off);
-            auto mv  = v_load(mean + off);
-            auto vv  = v_load(var + off);
+            auto xv = v_load(x + off);
+            auto sv = v_load(scale + off);
+            auto bv = v_load(bias + off);
+            auto mv = v_load(mean + off);
+            auto vv = v_load(var + off);
             auto inv = v_div(one8, v_sqrt(v_add(vv, eps8)));
-            auto ns  = v_mul(inv, sv);
-            auto nb  = v_sub(bv, v_mul(mv, ns));
+            auto ns = v_mul(inv, sv);
+            auto nb = v_sub(bv, v_mul(mv, ns));
             v_store_add(y + off, v_fmadd(ns, xv, nb), add_to);
         }
     }
@@ -389,4 +369,4 @@ inline void batch_norm_process_nonspatial_block(
     }
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

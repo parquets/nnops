@@ -11,11 +11,10 @@ namespace nnops {
 NNOPS_DECLARE_CPU(SoftmaxAttributes, softmax_cpu)
 NNOPS_DECLARE_CUDA(SoftmaxAttributes, softmax_cuda)
 
-NNOPS_OP_BOILERPLATE(Softmax, SoftmaxAttributes,
-        backend::cpu::softmax_cpu, NNOPS_IF_CUDA(backend::cuda::softmax_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(Softmax, SoftmaxAttributes, backend::cpu::softmax_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::softmax_cuda), nullptr)
 
-std::vector<TensorDesc> Softmax::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Softmax::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     auto out = identity_output_shape(inputs);
     // Quantized input (s8/u8): softmax output is dequantized float (default f32),
@@ -40,7 +39,9 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
     NNOPS_TRY(detail::check_rank(inputs[0].rank, 1));
-    if (!(attrs_.temperature > 0.0f)) { return Status::invalid_argument; }
+    if (!(attrs_.temperature > 0.0f)) {
+        return Status::invalid_argument;
+    }
 
     // The axis walk reads the tensor through stride_elems(), which describes the
     // two regular image layouts; the opaque weight tags have no axis semantics
@@ -62,15 +63,15 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
     return Status::ok;
 }
 
-Status Softmax::compute(std::span<TensorView> outputs,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx,
-                        void* workspace)
+Status Softmax::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

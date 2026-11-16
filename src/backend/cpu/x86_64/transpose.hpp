@@ -22,14 +22,16 @@
 
 namespace nnops::backend::cpu::x86_64 {
 
-inline void transpose_2x4_f32(__m128& v_r0, __m128& v_r1) noexcept {
+inline void transpose_2x4_f32(__m128& v_r0, __m128& v_r1) noexcept
+{
     const __m128 tmp0 = _mm_unpacklo_ps(v_r0, v_r1);
     const __m128 tmp1 = _mm_unpackhi_ps(v_r0, v_r1);
     v_r0 = _mm_shuffle_ps(tmp0, tmp1, _MM_SHUFFLE(1, 0, 1, 0));
     v_r1 = _mm_shuffle_ps(tmp0, tmp1, _MM_SHUFFLE(3, 2, 3, 2));
 }
 
-inline void transpose_4x4_f32(__m128& v_r0, __m128& v_r1, __m128& v_r2, __m128& v_r3) noexcept {
+inline void transpose_4x4_f32(__m128& v_r0, __m128& v_r1, __m128& v_r2, __m128& v_r3) noexcept
+{
     const __m128 tmp0 = _mm_unpacklo_ps(v_r0, v_r1);
     const __m128 tmp1 = _mm_unpackhi_ps(v_r0, v_r1);
     const __m128 tmp2 = _mm_unpacklo_ps(v_r2, v_r3);
@@ -41,8 +43,9 @@ inline void transpose_4x4_f32(__m128& v_r0, __m128& v_r1, __m128& v_r2, __m128& 
     v_r3 = _mm_movehl_ps(tmp3, tmp1);
 }
 
-inline void transpose_6x4_f32(__m128& v_a, __m128& v_b, __m128& v_c,
-                               __m128& v_d, __m128& v_e, __m128& v_f) noexcept {
+inline void transpose_6x4_f32(__m128& v_a, __m128& v_b, __m128& v_c, __m128& v_d, __m128& v_e,
+                              __m128& v_f) noexcept
+{
     const __m128 tmp0 = _mm_unpacklo_ps(v_a, v_b);
     const __m128 tmp1 = _mm_unpacklo_ps(v_c, v_d);
     const __m128 tmp2 = _mm_unpacklo_ps(v_e, v_f);
@@ -58,8 +61,9 @@ inline void transpose_6x4_f32(__m128& v_a, __m128& v_b, __m128& v_c,
     v_f = _mm_shuffle_ps(tmp4, tmp5, _MM_SHUFFLE(3, 2, 3, 2));
 }
 
-inline void transpose_8x4_f32(__m128& v_a, __m128& v_b, __m128& v_c, __m128& v_d,
-                               __m128& v_e, __m128& v_f, __m128& v_g, __m128& v_h) noexcept {
+inline void transpose_8x4_f32(__m128& v_a, __m128& v_b, __m128& v_c, __m128& v_d, __m128& v_e,
+                              __m128& v_f, __m128& v_g, __m128& v_h) noexcept
+{
     const __m128 t0 = _mm_unpacklo_ps(v_a, v_b);
     const __m128 t1 = _mm_unpackhi_ps(v_a, v_b);
     const __m128 t2 = _mm_unpacklo_ps(v_c, v_d);
@@ -79,11 +83,10 @@ inline void transpose_8x4_f32(__m128& v_a, __m128& v_b, __m128& v_c, __m128& v_d
     v_h = _mm_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
 }
 
-inline void transpose_12x4_f32(
-    __m128& v_r0, __m128& v_r1, __m128& v_r2, __m128& v_r3,
-    __m128& v_r4, __m128& v_r5, __m128& v_r6, __m128& v_r7,
-    __m128& v_r8, __m128& v_r9, __m128& v_ra, __m128& v_rb) noexcept {
-
+inline void transpose_12x4_f32(__m128& v_r0, __m128& v_r1, __m128& v_r2, __m128& v_r3, __m128& v_r4,
+                               __m128& v_r5, __m128& v_r6, __m128& v_r7, __m128& v_r8, __m128& v_r9,
+                               __m128& v_ra, __m128& v_rb) noexcept
+{
     const __m128 t0 = _mm_unpacklo_ps(v_r0, v_r1);
     const __m128 t1 = _mm_unpacklo_ps(v_r2, v_r3);
     const __m128 t2 = _mm_unpacklo_ps(v_r4, v_r5);
@@ -112,12 +115,11 @@ inline void transpose_12x4_f32(
     v_rb = _mm_shuffle_ps(ta, tb, _MM_SHUFFLE(3, 2, 3, 2));
 }
 
-inline void transpose_16x4_f32(
-    __m128& v_r0, __m128& v_r1, __m128& v_r2, __m128& v_r3,
-    __m128& v_r4, __m128& v_r5, __m128& v_r6, __m128& v_r7,
-    __m128& v_r8, __m128& v_r9, __m128& v_ra, __m128& v_rb,
-    __m128& v_rc, __m128& v_rd, __m128& v_re, __m128& v_rf) noexcept {
-
+inline void transpose_16x4_f32(__m128& v_r0, __m128& v_r1, __m128& v_r2, __m128& v_r3, __m128& v_r4,
+                               __m128& v_r5, __m128& v_r6, __m128& v_r7, __m128& v_r8, __m128& v_r9,
+                               __m128& v_ra, __m128& v_rb, __m128& v_rc, __m128& v_rd, __m128& v_re,
+                               __m128& v_rf) noexcept
+{
     const __m128 t0 = _mm_unpacklo_ps(v_r0, v_r1);
     const __m128 t1 = _mm_unpacklo_ps(v_r2, v_r3);
     const __m128 t2 = _mm_unpacklo_ps(v_r4, v_r5);
@@ -127,14 +129,14 @@ inline void transpose_16x4_f32(
     const __m128 t6 = _mm_unpacklo_ps(v_rc, v_rd);
     const __m128 t7 = _mm_unpacklo_ps(v_re, v_rf);
 
-    const __m128 t8  = _mm_unpackhi_ps(v_r0, v_r1);
-    const __m128 t9  = _mm_unpackhi_ps(v_r2, v_r3);
-    const __m128 ta  = _mm_unpackhi_ps(v_r4, v_r5);
-    const __m128 tb  = _mm_unpackhi_ps(v_r6, v_r7);
-    const __m128 tc  = _mm_unpackhi_ps(v_r8, v_r9);
-    const __m128 td  = _mm_unpackhi_ps(v_ra, v_rb);
-    const __m128 te  = _mm_unpackhi_ps(v_rc, v_rd);
-    const __m128 tf  = _mm_unpackhi_ps(v_re, v_rf);
+    const __m128 t8 = _mm_unpackhi_ps(v_r0, v_r1);
+    const __m128 t9 = _mm_unpackhi_ps(v_r2, v_r3);
+    const __m128 ta = _mm_unpackhi_ps(v_r4, v_r5);
+    const __m128 tb = _mm_unpackhi_ps(v_r6, v_r7);
+    const __m128 tc = _mm_unpackhi_ps(v_r8, v_r9);
+    const __m128 td = _mm_unpackhi_ps(v_ra, v_rb);
+    const __m128 te = _mm_unpackhi_ps(v_rc, v_rd);
+    const __m128 tf = _mm_unpackhi_ps(v_re, v_rf);
 
     v_r0 = _mm_shuffle_ps(t0, t1, _MM_SHUFFLE(1, 0, 1, 0));
     v_r1 = _mm_shuffle_ps(t2, t3, _MM_SHUFFLE(1, 0, 1, 0));
@@ -154,14 +156,16 @@ inline void transpose_16x4_f32(
     v_rf = _mm_shuffle_ps(te, tf, _MM_SHUFFLE(3, 2, 3, 2));
 }
 
-inline void transpose_2x8_f32(__m256& v_r0, __m256& v_r1) noexcept {
+inline void transpose_2x8_f32(__m256& v_r0, __m256& v_r1) noexcept
+{
     const __m256 tmp0 = _mm256_unpacklo_ps(v_r0, v_r1);
     const __m256 tmp1 = _mm256_unpackhi_ps(v_r0, v_r1);
     v_r0 = _mm256_permute2f128_ps(tmp0, tmp1, _MM_SHUFFLE(0, 2, 0, 0));
     v_r1 = _mm256_permute2f128_ps(tmp0, tmp1, _MM_SHUFFLE(0, 3, 0, 1));
 }
 
-inline void transpose_4x8_f32(__m256& v_r0, __m256& v_r1, __m256& v_r2, __m256& v_r3) noexcept {
+inline void transpose_4x8_f32(__m256& v_r0, __m256& v_r1, __m256& v_r2, __m256& v_r3) noexcept
+{
     const __m256 tmp0 = _mm256_unpacklo_ps(v_r0, v_r1);
     const __m256 tmp1 = _mm256_unpackhi_ps(v_r0, v_r1);
     const __m256 tmp2 = _mm256_unpacklo_ps(v_r2, v_r3);
@@ -178,8 +182,9 @@ inline void transpose_4x8_f32(__m256& v_r0, __m256& v_r1, __m256& v_r2, __m256& 
     v_r3 = _mm256_permute2f128_ps(tmp6, tmp7, _MM_SHUFFLE(0, 3, 0, 1));
 }
 
-inline void transpose_6x8_f32(__m256& v_a, __m256& v_b, __m256& v_c,
-                               __m256& v_d, __m256& v_e, __m256& v_f) noexcept {
+inline void transpose_6x8_f32(__m256& v_a, __m256& v_b, __m256& v_c, __m256& v_d, __m256& v_e,
+                              __m256& v_f) noexcept
+{
     const __m256 t0 = _mm256_unpacklo_ps(v_a, v_b);
     const __m256 t1 = _mm256_unpackhi_ps(v_a, v_b);
     const __m256 t2 = _mm256_unpacklo_ps(v_c, v_d);
@@ -202,8 +207,9 @@ inline void transpose_6x8_f32(__m256& v_a, __m256& v_b, __m256& v_c,
     v_f = _mm256_permute2f128_ps(u3, u5, _MM_SHUFFLE(0, 3, 0, 1));
 }
 
-inline void transpose_8x8_f32(__m256& v_a, __m256& v_b, __m256& v_c, __m256& v_d,
-                               __m256& v_e, __m256& v_f, __m256& v_g, __m256& v_h) noexcept {
+inline void transpose_8x8_f32(__m256& v_a, __m256& v_b, __m256& v_c, __m256& v_d, __m256& v_e,
+                              __m256& v_f, __m256& v_g, __m256& v_h) noexcept
+{
     const __m256 t0 = _mm256_unpacklo_ps(v_a, v_b);
     const __m256 t1 = _mm256_unpackhi_ps(v_a, v_b);
     const __m256 t2 = _mm256_unpacklo_ps(v_c, v_d);
@@ -232,11 +238,10 @@ inline void transpose_8x8_f32(__m256& v_a, __m256& v_b, __m256& v_c, __m256& v_d
     v_h = _mm256_permute2f128_ps(u3, u7, _MM_SHUFFLE(0, 3, 0, 1));
 }
 
-inline void transpose_12x8_f32(
-    __m256& v_r0, __m256& v_r1, __m256& v_r2, __m256& v_r3,
-    __m256& v_r4, __m256& v_r5, __m256& v_r6, __m256& v_r7,
-    __m256& v_r8, __m256& v_r9, __m256& v_ra, __m256& v_rb) noexcept {
-
+inline void transpose_12x8_f32(__m256& v_r0, __m256& v_r1, __m256& v_r2, __m256& v_r3, __m256& v_r4,
+                               __m256& v_r5, __m256& v_r6, __m256& v_r7, __m256& v_r8, __m256& v_r9,
+                               __m256& v_ra, __m256& v_rb) noexcept
+{
     const __m256 t0 = _mm256_unpacklo_ps(v_r0, v_r1);
     const __m256 t1 = _mm256_unpackhi_ps(v_r0, v_r1);
     const __m256 t2 = _mm256_unpacklo_ps(v_r2, v_r3);
@@ -250,16 +255,16 @@ inline void transpose_12x8_f32(
     const __m256 ta = _mm256_unpacklo_ps(v_ra, v_rb);
     const __m256 tb = _mm256_unpackhi_ps(v_ra, v_rb);
 
-    const __m256 u0  = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u1  = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
-    const __m256 u2  = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u3  = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
-    const __m256 u4  = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u5  = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
-    const __m256 u6  = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u7  = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
-    const __m256 u8  = _mm256_shuffle_ps(t8, ta, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u9  = _mm256_shuffle_ps(t8, ta, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u8 = _mm256_shuffle_ps(t8, ta, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u9 = _mm256_shuffle_ps(t8, ta, _MM_SHUFFLE(3, 2, 3, 2));
     const __m256 u10 = _mm256_shuffle_ps(t9, tb, _MM_SHUFFLE(1, 0, 1, 0));
     const __m256 u11 = _mm256_shuffle_ps(t9, tb, _MM_SHUFFLE(3, 2, 3, 2));
 
@@ -277,39 +282,38 @@ inline void transpose_12x8_f32(
     v_rb = _mm256_permute2f128_ps(u7, u11, _MM_SHUFFLE(0, 3, 0, 1));
 }
 
-inline void transpose_16x8_f32(
-    __m256& v_r0, __m256& v_r1, __m256& v_r2, __m256& v_r3,
-    __m256& v_r4, __m256& v_r5, __m256& v_r6, __m256& v_r7,
-    __m256& v_r8, __m256& v_r9, __m256& v_ra, __m256& v_rb,
-    __m256& v_rc, __m256& v_rd, __m256& v_re, __m256& v_rf) noexcept {
+inline void transpose_16x8_f32(__m256& v_r0, __m256& v_r1, __m256& v_r2, __m256& v_r3, __m256& v_r4,
+                               __m256& v_r5, __m256& v_r6, __m256& v_r7, __m256& v_r8, __m256& v_r9,
+                               __m256& v_ra, __m256& v_rb, __m256& v_rc, __m256& v_rd, __m256& v_re,
+                               __m256& v_rf) noexcept
+{
+    const __m256 t0 = _mm256_unpacklo_ps(v_r0, v_r1);
+    const __m256 t1 = _mm256_unpackhi_ps(v_r0, v_r1);
+    const __m256 t2 = _mm256_unpacklo_ps(v_r2, v_r3);
+    const __m256 t3 = _mm256_unpackhi_ps(v_r2, v_r3);
+    const __m256 t4 = _mm256_unpacklo_ps(v_r4, v_r5);
+    const __m256 t5 = _mm256_unpackhi_ps(v_r4, v_r5);
+    const __m256 t6 = _mm256_unpacklo_ps(v_r6, v_r7);
+    const __m256 t7 = _mm256_unpackhi_ps(v_r6, v_r7);
+    const __m256 t8 = _mm256_unpacklo_ps(v_r8, v_r9);
+    const __m256 t9 = _mm256_unpackhi_ps(v_r8, v_r9);
+    const __m256 ta = _mm256_unpacklo_ps(v_ra, v_rb);
+    const __m256 tb = _mm256_unpackhi_ps(v_ra, v_rb);
+    const __m256 tc = _mm256_unpacklo_ps(v_rc, v_rd);
+    const __m256 td = _mm256_unpackhi_ps(v_rc, v_rd);
+    const __m256 te = _mm256_unpacklo_ps(v_re, v_rf);
+    const __m256 tf = _mm256_unpackhi_ps(v_re, v_rf);
 
-    const __m256 t0  = _mm256_unpacklo_ps(v_r0, v_r1);
-    const __m256 t1  = _mm256_unpackhi_ps(v_r0, v_r1);
-    const __m256 t2  = _mm256_unpacklo_ps(v_r2, v_r3);
-    const __m256 t3  = _mm256_unpackhi_ps(v_r2, v_r3);
-    const __m256 t4  = _mm256_unpacklo_ps(v_r4, v_r5);
-    const __m256 t5  = _mm256_unpackhi_ps(v_r4, v_r5);
-    const __m256 t6  = _mm256_unpacklo_ps(v_r6, v_r7);
-    const __m256 t7  = _mm256_unpackhi_ps(v_r6, v_r7);
-    const __m256 t8  = _mm256_unpacklo_ps(v_r8, v_r9);
-    const __m256 t9  = _mm256_unpackhi_ps(v_r8, v_r9);
-    const __m256 ta  = _mm256_unpacklo_ps(v_ra, v_rb);
-    const __m256 tb  = _mm256_unpackhi_ps(v_ra, v_rb);
-    const __m256 tc  = _mm256_unpacklo_ps(v_rc, v_rd);
-    const __m256 td  = _mm256_unpackhi_ps(v_rc, v_rd);
-    const __m256 te  = _mm256_unpacklo_ps(v_re, v_rf);
-    const __m256 tf  = _mm256_unpackhi_ps(v_re, v_rf);
-
-    const __m256 u0  = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u1  = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
-    const __m256 u2  = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u3  = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
-    const __m256 u4  = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u5  = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
-    const __m256 u6  = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u7  = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
-    const __m256 u8  = _mm256_shuffle_ps(t8, ta, _MM_SHUFFLE(1, 0, 1, 0));
-    const __m256 u9  = _mm256_shuffle_ps(t8, ta, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u8 = _mm256_shuffle_ps(t8, ta, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u9 = _mm256_shuffle_ps(t8, ta, _MM_SHUFFLE(3, 2, 3, 2));
     const __m256 u10 = _mm256_shuffle_ps(t9, tb, _MM_SHUFFLE(1, 0, 1, 0));
     const __m256 u11 = _mm256_shuffle_ps(t9, tb, _MM_SHUFFLE(3, 2, 3, 2));
     const __m256 u12 = _mm256_shuffle_ps(tc, te, _MM_SHUFFLE(1, 0, 1, 0));
@@ -339,7 +343,8 @@ inline void transpose_16x8_f32(
 ///
 /// Transposes four __m128i registers each holding 16 int8 elements. Operates
 /// on raw bytes; used by the int8 pack_copy_n16 pipeline.
-inline void transpose_4x16_i8(__m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m128i& v_r3) noexcept {
+inline void transpose_4x16_i8(__m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m128i& v_r3) noexcept
+{
     const __m128i plo01 = _mm_unpacklo_epi8(v_r0, v_r1);
     const __m128i phi01 = _mm_unpackhi_epi8(v_r0, v_r1);
     const __m128i plo23 = _mm_unpacklo_epi8(v_r2, v_r3);
@@ -351,4 +356,4 @@ inline void transpose_4x16_i8(__m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m12
     v_r3 = _mm_unpackhi_epi16(phi01, phi23);
 }
 
-}  // namespace nnops::backend::cpu::x86_64
+} // namespace nnops::backend::cpu::x86_64

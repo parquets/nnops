@@ -18,12 +18,11 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 
 template <typename T>
-void flatten_impl(const FlattenAttributes& /*attrs*/,
-                   TensorView& output,
-                   std::span<const TensorView> inputs)
+void flatten_impl(const FlattenAttributes& /*attrs*/, TensorView& output,
+                  std::span<const TensorView> inputs)
 {
     const auto& input = inputs[0];
-    const int64_t rank  = input.rank();
+    const int64_t rank = input.rank();
     constexpr int L = simd_lane_for<T>;
 
     // Output is always dense channel-first
@@ -67,7 +66,7 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
         } else {
             // Channel-last input: strided element access
             for (; w + L <= oW; w += L) {
-                T tmp[16];  // max simd lane width
+                T tmp[16]; // max simd lane width
                 for (int k = 0; k < L; ++k) {
                     s_store(&tmp[k], s_load(&i_ptr[i_off + (w + k) * i_w_stride]));
                 }
@@ -81,11 +80,9 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
     }
 }
 
-Status flatten_cpu(const FlattenAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& /*ctx*/,
-                  void* /*workspace*/)
+Status flatten_cpu(const FlattenAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& /*ctx*/,
+                   void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "flatten_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -94,4 +91,4 @@ Status flatten_cpu(const FlattenAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

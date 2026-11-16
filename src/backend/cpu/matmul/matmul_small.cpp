@@ -14,7 +14,7 @@
 /// The batch walk shared with the driver lives in matmul_internal.h.
 
 #include "matmul_internal.h"
-#include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // apply_epilogue
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp" // apply_epilogue
 #include "nnops/detail/half.hpp"
 
 #include <algorithm>
@@ -35,15 +35,13 @@ constexpr int64_t GEMV_M_MAX = 4;
 /// then adds the product with beta = 1, and the bias — unscaled by alpha, added
 /// before clamp and activation — is already in place.
 template <typename T>
-void prime_bias_pass(const MatMulAttributes& attrs, TensorView& output,
-                     const BatchWalk& batch, T* c_base, int ldc,
-                     int M, int N, const T* bias, const ComputeContext& ctx)
+void prime_bias_pass(const MatMulAttributes& attrs, TensorView& output, const BatchWalk& batch,
+                     T* c_base, int ldc, int M, int N, const T* bias, const ComputeContext& ctx)
 {
     const auto prime = [&](int64_t bi) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
-        tile_scale_add_bias(c_base + c_off, ldc,
-                            attrs.residual_pre_activation ? 1.0f : attrs.beta,
+        tile_scale_add_bias(c_base + c_off, ldc, attrs.residual_pre_activation ? 1.0f : attrs.beta,
                             bias, M, N);
     };
     if (batch.total > 1) {
@@ -56,14 +54,15 @@ void prime_bias_pass(const MatMulAttributes& attrs, TensorView& output,
 /// Apply the clamp and activation epilogue in place over each batch element's
 /// M×N output, the same order the tiled route folds into its last k-block.
 template <typename T>
-void apply_epilogue_pass(const MatMulAttributes& attrs, TensorView& output,
-                         const BatchWalk& batch, T* c_base, int ldc,
-                         int M, int N)
+void apply_epilogue_pass(const MatMulAttributes& attrs, TensorView& output, const BatchWalk& batch,
+                         T* c_base, int ldc, int M, int N)
 {
     const Epilogue& ep = attrs.epilogue;
     const float inf = std::numeric_limits<float>::infinity();
     const bool clamp = ep.min_clip > -inf || ep.max_clip < inf;
-    if (ep.type == EpilogueActivateType::None && !clamp) { return; }
+    if (ep.type == EpilogueActivateType::None && !clamp) {
+        return;
+    }
     for (int64_t bi = 0; bi < batch.total; ++bi) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
@@ -92,8 +91,7 @@ void apply_epilogue_pass(const MatMulAttributes& attrs, TensorView& output,
 /// split over N on a single batch element, else over the batch.
 template <typename T>
 void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx)
+                 std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -121,32 +119,35 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
         prime_bias_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni, bias, ctx);
     }
     // With a bias primed, or a residual in C, the kernel must accumulate.
-    const float beta = (bias != nullptr || attrs.residual_pre_activation)
-                           ? 1.0f : attrs.beta;
+    const float beta = (bias != nullptr || attrs.residual_pre_activation) ? 1.0f : attrs.beta;
     const auto block = [&](int64_t bi, int nb) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
         const int n0 = static_cast<int>(nb) * span;
         const int n1 = std::min(n0 + span, Ni);
-        arch::matmul_gemv(Mi, Ni, Ki,
-                          a_base + a_off, lda, attrs.transpose_a,
-                          b_base + b_off, ldb, attrs.transpose_b,
-                          c_base + c_off, ldc, attrs.alpha, beta, n0, n1);
+        arch::matmul_gemv(Mi, Ni, Ki, a_base + a_off, lda, attrs.transpose_a, b_base + b_off, ldb,
+                          attrs.transpose_b, c_base + c_off, ldc, attrs.alpha, beta, n0, n1);
     };
 
     if (batch.total > 1) {
         const auto element = [&](int64_t bi) {
-            for (int nb = 0; nb < blocks; ++nb) { block(bi, nb); }
+            for (int nb = 0; nb < blocks; ++nb) {
+                block(bi, nb);
+            }
         };
         if (batch.total * M * N * K >= NAIVE_PARALLEL_MACS) {
             ctx.cpu.run(0, batch.total, element);
         } else {
-            for (int64_t bi = 0; bi < batch.total; ++bi) { element(bi); }
+            for (int64_t bi = 0; bi < batch.total; ++bi) {
+                element(bi);
+            }
         }
     } else if (M * N * K >= NAIVE_PARALLEL_MACS) {
         ctx.cpu.run(0, blocks, [&](int64_t nb) { block(0, nb); });
     } else {
-        for (int nb = 0; nb < blocks; ++nb) { block(0, nb); }
+        for (int nb = 0; nb < blocks; ++nb) {
+            block(0, nb);
+        }
     }
 
     apply_epilogue_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni);
@@ -154,8 +155,7 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
 
 template <typename T>
 void matmul_naive_small(const MatMulAttributes& attrs, TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx)
+                        std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -179,41 +179,42 @@ void matmul_naive_small(const MatMulAttributes& attrs, TensorView& output,
         prime_bias_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni, bias, ctx);
     }
     // With a bias primed, or a residual in C, the kernel must accumulate.
-    const float beta = (bias != nullptr || attrs.residual_pre_activation)
-                           ? 1.0f : attrs.beta;
+    const float beta = (bias != nullptr || attrs.residual_pre_activation) ? 1.0f : attrs.beta;
     const auto gemm = [&](int64_t bi) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
-        arch::matmul_naive(Mi, Ni, Ki,
-                           a_base + a_off, lda, attrs.transpose_a,
-                           b_base + b_off, ldb, attrs.transpose_b,
-                           c_base + c_off, ldc, attrs.alpha, beta);
+        arch::matmul_naive(Mi, Ni, Ki, a_base + a_off, lda, attrs.transpose_a, b_base + b_off, ldb,
+                           attrs.transpose_b, c_base + c_off, ldc, attrs.alpha, beta);
     };
 
     if (batch.total > 1 && batch.total * M * N * K >= NAIVE_PARALLEL_MACS) {
         ctx.cpu.run(0, batch.total, gemm);
     } else {
-        for (int64_t bi = 0; bi < batch.total; ++bi) { gemm(bi); }
+        for (int64_t bi = 0; bi < batch.total; ++bi) {
+            gemm(bi);
+        }
     }
 
     apply_epilogue_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni);
 }
 
-}  // namespace
+} // namespace
 
-bool matmul_small_fp(const MatMulAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx)
+bool matmul_small_fp(const MatMulAttributes& attrs, TensorView& output,
+                     std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
     const DataType dt_a = a.data_type();
     const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16;
-    if (!float_a || b.data_type() != dt_a) { return false; }
+    if (!float_a || b.data_type() != dt_a) {
+        return false;
+    }
     // A prepacked RHS is panel-formatted, not a row-major matrix, and both small
     // routes here read B as rows of N: it goes to the tiled route instead.
-    if (is_packed_matmul_b(b.layout())) { return false; }
+    if (is_packed_matmul_b(b.layout())) {
+        return false;
+    }
 
     const auto [M, N, K] = matmul_dims(attrs, a, b);
 
@@ -240,4 +241,4 @@ bool matmul_small_fp(const MatMulAttributes& attrs,
     return false;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

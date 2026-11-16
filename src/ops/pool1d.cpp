@@ -19,24 +19,22 @@ NNOPS_DECLARE_CPU(Pool1DAttributes, pool1d_cpu)
 
 NNOPS_OP_BOILERPLATE(Pool1D, Pool1DAttributes, backend::cpu::pool1d_cpu, nullptr, nullptr)
 
-std::vector<TensorDesc> Pool1D::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Pool1D::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     if (attrs_.global || attrs_.adaptive()) {
         const auto& in = inputs[0];
         TensorDesc out;
-        out.rank   = 3;
+        out.rank = 3;
         out.layout = in.layout;
-        out.dtype  = in.dtype;
+        out.dtype = in.dtype;
         out.dims.resize(3);
         out.dims[0] = in.dims[0];
         out.dims[1] = in.dims[1];
         out.dims[2] = attrs_.global ? 1 : attrs_.output_size;
         return {out};
     }
-    return {pool1d_output_shape(
-        attrs_.kernel_shape, attrs_.stride, attrs_.dilation, attrs_.padding,
-        static_cast<int>(attrs_.auto_pad), inputs)};
+    return {pool1d_output_shape(attrs_.kernel_shape, attrs_.stride, attrs_.dilation, attrs_.padding,
+                                static_cast<int>(attrs_.auto_pad), inputs)};
 }
 
 Status Pool1D::validate(std::span<const TensorDesc> inputs,
@@ -48,34 +46,32 @@ Status Pool1D::validate(std::span<const TensorDesc> inputs,
     const auto& in = inputs[0];
 
     if (is_channel_first_spatial(in.layout)) {
-        return detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype),
-            Status::unsupported);
+        return detail::require(detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype),
+                               Status::unsupported);
     }
     // Adaptive pooling walks the window per output position; the quantized
     // channel-lane kernel has no such form, so it stays float.
-    if (attrs_.adaptive() &&
-        detail::dtype_in<DataType::s8, DataType::u8>(backend_, in.dtype)) {
+    if (attrs_.adaptive() && detail::dtype_in<DataType::s8, DataType::u8>(backend_, in.dtype)) {
         return Status::unsupported;
     }
     if (is_channel_last(in.layout)) {
         return detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16,
-                             DataType::s8, DataType::u8>(backend_, in.dtype));
+            detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8>(backend_,
+                                                                                       in.dtype));
     }
     return Status::unsupported;
 }
 
-Status Pool1D::compute(std::span<TensorView> outputs,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace)
+Status Pool1D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                       const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
 
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

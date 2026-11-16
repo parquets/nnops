@@ -67,9 +67,10 @@ int manual_sm_count()
     static const int count = [] {
         int dev = 0;
         int n = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) { return 0; }
-        if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) !=
-            cudaSuccess) {
+        if (cudaGetDevice(&dev) != cudaSuccess) {
+            return 0;
+        }
+        if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
             return 0;
         }
         return n;
@@ -82,7 +83,9 @@ int64_t manual_l2_bytes()
     static const int64_t bytes = [] {
         int dev = 0;
         int n = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) { return int64_t{0}; }
+        if (cudaGetDevice(&dev) != cudaSuccess) {
+            return int64_t{0};
+        }
         if (cudaDeviceGetAttribute(&n, cudaDevAttrL2CacheSize, dev) != cudaSuccess) {
             return int64_t{0};
         }
@@ -97,7 +100,9 @@ cudaMemPool_t manual_pool()
 {
     static const cudaMemPool_t pool = [] {
         int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) { return cudaMemPool_t{}; }
+        if (cudaGetDevice(&dev) != cudaSuccess) {
+            return cudaMemPool_t{};
+        }
         cudaMemPoolProps props{};
         props.allocType = cudaMemAllocationTypePinned;
         props.handleTypes = cudaMemHandleTypeNone;
@@ -117,7 +122,9 @@ cudaMemPool_t manual_pool()
 
 void* manual_alloc(int64_t bytes, cudaStream_t stream)
 {
-    if (bytes <= 0) { return nullptr; }
+    if (bytes <= 0) {
+        return nullptr;
+    }
     void* ptr = nullptr;
     const cudaMemPool_t pool = manual_pool();
     if (pool != nullptr &&
@@ -134,8 +141,12 @@ void* manual_alloc(int64_t bytes, cudaStream_t stream)
 
 void manual_free(void* ptr, cudaStream_t stream)
 {
-    if (ptr == nullptr) { return; }
-    if (cudaFreeAsync(ptr, stream) == cudaSuccess) { return; }
+    if (ptr == nullptr) {
+        return;
+    }
+    if (cudaFreeAsync(ptr, stream) == cudaSuccess) {
+        return;
+    }
     cudaGetLastError();
     cudaFree(ptr);
 }
@@ -151,8 +162,12 @@ int manual_splits(const ManualHCall& call, const TileDesc& tile)
     const int64_t blocks = m_tiles * n_tiles;
     const int64_t k_tiles = (call.k + tile.bk - 1) / tile.bk;
     const int sm = manual_sm_count();
-    if (sm <= 0 || blocks <= 0 || k_tiles < 2) { return 1; }
-    if (blocks * 4 >= int64_t(sm)) { return 1; }
+    if (sm <= 0 || blocks <= 0 || k_tiles < 2) {
+        return 1;
+    }
+    if (blocks * 4 >= int64_t(sm)) {
+        return 1;
+    }
 
     int64_t splits = std::min<int64_t>((int64_t(sm) * 4 + blocks - 1) / blocks, 16);
     splits = std::min<int64_t>(splits, k_tiles / 2);
@@ -161,7 +176,9 @@ int manual_splits(const ManualHCall& call, const TileDesc& tile)
     if (l2 > 0) {
         splits = std::min<int64_t>(splits, std::max<int64_t>(l2 * 9 / 8 / plane, 1));
     }
-    while (splits > 1 && splits * plane > kMaxPlaneBytes) { splits /= 2; }
+    while (splits > 1 && splits * plane > kMaxPlaneBytes) {
+        splits /= 2;
+    }
     return int(std::max<int64_t>(splits, 1));
 }
 
@@ -174,32 +191,27 @@ int manual_splits(const ManualHCall& call, const TileDesc& tile)
 bool manual_grid_fills(const ManualHCall& call, const TileDesc& tile)
 {
     const int sm = manual_sm_count();
-    if (sm <= 0) { return true; }
-    const int64_t blocks = ((call.m + tile.bm - 1) / tile.bm) *
-                           ((call.n + tile.bn - 1) / tile.bn);
+    if (sm <= 0) {
+        return true;
+    }
+    const int64_t blocks = ((call.m + tile.bm - 1) / tile.bm) * ((call.n + tile.bn - 1) / tile.bn);
     return blocks >= int64_t(sm);
 }
 
 /// A dynamic shared memory request above 48 KB needs the opt-in, once per
 /// instantiation; a static `__shared__` array could not carry these tiles.
-template <class S, class Elem>
-bool manual_prepare()
+template <class S, class Elem> bool manual_prepare()
 {
     static const bool ok = [] {
         const int bytes = S::kSmemBytes;
         const auto set = [bytes](const void* fn) {
-            return cudaFuncSetAttribute(
-                       fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) ==
+            return cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) ==
                    cudaSuccess;
         };
-        if (!set(reinterpret_cast<const void*>(
-                &manual_gemm_h_kernel<S, Elem, true, true>)) ||
-            !set(reinterpret_cast<const void*>(
-                &manual_gemm_h_kernel<S, Elem, true, false>)) ||
-            !set(reinterpret_cast<const void*>(
-                &manual_gemm_h_kernel<S, Elem, false, true>)) ||
-            !set(reinterpret_cast<const void*>(
-                &manual_gemm_h_kernel<S, Elem, false, false>))) {
+        if (!set(reinterpret_cast<const void*>(&manual_gemm_h_kernel<S, Elem, true, true>)) ||
+            !set(reinterpret_cast<const void*>(&manual_gemm_h_kernel<S, Elem, true, false>)) ||
+            !set(reinterpret_cast<const void*>(&manual_gemm_h_kernel<S, Elem, false, true>)) ||
+            !set(reinterpret_cast<const void*>(&manual_gemm_h_kernel<S, Elem, false, false>))) {
             cudaGetLastError();
             return false;
         }
@@ -208,10 +220,11 @@ bool manual_prepare()
     return ok;
 }
 
-template <class S, class Elem>
-bool manual_run(const ManualHCall& call, cudaStream_t stream)
+template <class S, class Elem> bool manual_run(const ManualHCall& call, cudaStream_t stream)
 {
-    if (!manual_prepare<S, Elem>()) { return false; }
+    if (!manual_prepare<S, Elem>()) {
+        return false;
+    }
 
     ManualHParams q;
     q.a = call.a;
@@ -244,33 +257,29 @@ bool manual_run(const ManualHCall& call, cudaStream_t stream)
         q.c_bstr[d] = call.c_bstr[d];
     }
 
-    const dim3 grid(unsigned((call.m + S::BM - 1) / S::BM),
-                    unsigned((call.n + S::BN - 1) / S::BN), 1);
+    const dim3 grid(unsigned((call.m + S::BM - 1) / S::BM), unsigned((call.n + S::BN - 1) / S::BN),
+                    1);
     constexpr int kLaunchSmem = S::kSmemBytes;
     const TileDesc tile{S::BM, S::BN, S::BK, S::threads, S::kSmemBytes};
     int splits = manual_splits(call, tile);
     float* partial = nullptr;
     if (splits > 1) {
-        partial = static_cast<float*>(
-            manual_alloc(int64_t(splits) * q.batch * call.m * call.n *
-                             int64_t(sizeof(float)),
-                         stream));
-        if (partial == nullptr) { splits = 1; }
+        partial = static_cast<float*>(manual_alloc(
+            int64_t(splits) * q.batch * call.m * call.n * int64_t(sizeof(float)), stream));
+        if (partial == nullptr) {
+            splits = 1;
+        }
     }
 
     const auto launch = [&](const dim3& g) {
         if (call.trans_a && call.trans_b) {
-            manual_gemm_h_kernel<S, Elem, true, true>
-                <<<g, S::threads, kLaunchSmem, stream>>>(q);
+            manual_gemm_h_kernel<S, Elem, true, true><<<g, S::threads, kLaunchSmem, stream>>>(q);
         } else if (call.trans_a) {
-            manual_gemm_h_kernel<S, Elem, true, false>
-                <<<g, S::threads, kLaunchSmem, stream>>>(q);
+            manual_gemm_h_kernel<S, Elem, true, false><<<g, S::threads, kLaunchSmem, stream>>>(q);
         } else if (call.trans_b) {
-            manual_gemm_h_kernel<S, Elem, false, true>
-                <<<g, S::threads, kLaunchSmem, stream>>>(q);
+            manual_gemm_h_kernel<S, Elem, false, true><<<g, S::threads, kLaunchSmem, stream>>>(q);
         } else {
-            manual_gemm_h_kernel<S, Elem, false, false>
-                <<<g, S::threads, kLaunchSmem, stream>>>(q);
+            manual_gemm_h_kernel<S, Elem, false, false><<<g, S::threads, kLaunchSmem, stream>>>(q);
         }
     };
     if (splits > 1) {
@@ -279,8 +288,7 @@ bool manual_run(const ManualHCall& call, cudaStream_t stream)
         launch(sgrid);
         constexpr int kThreads = 256;
         const int64_t plane = int64_t(call.m) * call.n;
-        const dim3 rgrid(unsigned((plane + kThreads - 1) / kThreads),
-                         unsigned(splits), 1);
+        const dim3 rgrid(unsigned((plane + kThreads - 1) / kThreads), unsigned(splits), 1);
         manual_gemm_h_reduce_kernel<Elem><<<rgrid, kThreads, 0, stream>>>(q);
         manual_free(partial, stream);
         return cudaGetLastError() == cudaSuccess;
@@ -295,28 +303,38 @@ template <class Elem>
 bool manual_dispatch_tile(const ManualHCall& call, int tile, cudaStream_t stream)
 {
     switch (tile) {
-        case 0: return manual_run<Tile0, Elem>(call, stream);
-        case 1: return manual_run<Tile1, Elem>(call, stream);
-        case 2: return manual_run<Tile2, Elem>(call, stream);
-        case 3: return manual_run<Tile3, Elem>(call, stream);
-        case 4: return manual_run<Tile4, Elem>(call, stream);
-        default: return manual_run<Tile5, Elem>(call, stream);
+    case 0:
+        return manual_run<Tile0, Elem>(call, stream);
+    case 1:
+        return manual_run<Tile1, Elem>(call, stream);
+    case 2:
+        return manual_run<Tile2, Elem>(call, stream);
+    case 3:
+        return manual_run<Tile3, Elem>(call, stream);
+    case 4:
+        return manual_run<Tile4, Elem>(call, stream);
+    default:
+        return manual_run<Tile5, Elem>(call, stream);
     }
 }
 
-}  // namespace
+} // namespace
 
 bool manual_dense_h_call(const ManualHCall& call, cudaStream_t stream)
 {
     // A transposed is supported: the panel keeps the `[k][m]` arrival order and
     // the fragment loads go through ldmatrix.trans.
-    if (call.m <= 0 || call.n <= 0 || call.k <= 0) { return false; }
-    if (call.alpha != 1.0f) { return false; }
+    if (call.m <= 0 || call.n <= 0 || call.k <= 0) {
+        return false;
+    }
+    if (call.alpha != 1.0f) {
+        return false;
+    }
     // cp.async needs both row pitches and the base pointers 16 B aligned.
     if ((reinterpret_cast<uintptr_t>(call.a) % 16) != 0 ||
         (reinterpret_cast<uintptr_t>(call.b) % 16) != 0 ||
-        (reinterpret_cast<uintptr_t>(call.c) % 16) != 0 ||
-        (call.lda % 8) != 0 || (call.ldb % 8) != 0) {
+        (reinterpret_cast<uintptr_t>(call.c) % 16) != 0 || (call.lda % 8) != 0 ||
+        (call.ldb % 8) != 0) {
         return false;
     }
 
@@ -324,16 +342,19 @@ bool manual_dense_h_call(const ManualHCall& call, cudaStream_t stream)
     // bench does when it wants the PTX arm on every shape. It does not pick a
     // tile -- an unnamed tile still means the default row.
     const bool named = call.tile >= 0 && call.tile < kTileCount;
-    const bool forced = named || ::nnops::detail::cuda_ptx_h.load(
-                                     std::memory_order_relaxed) == 1;
+    const bool forced = named || ::nnops::detail::cuda_ptx_h.load(std::memory_order_relaxed) == 1;
     // The k-major pose wants the epilogue that writes straight out of the
     // accumulators: 4096^3 4.38 against 5.00 ms for the staged one. The n-major
     // pose is the other way round (3.96 against 4.05), so the pose picks.
     const int pick = (!call.trans_b) ? kDefaultTile : 4;
     const int tile = named ? call.tile : pick;
-    if (!forced && !manual_grid_fills(call, kTileTable[tile])) { return false; }
-    if (call.bf16) { return manual_dispatch_tile<__nv_bfloat16>(call, tile, stream); }
+    if (!forced && !manual_grid_fills(call, kTileTable[tile])) {
+        return false;
+    }
+    if (call.bf16) {
+        return manual_dispatch_tile<__nv_bfloat16>(call, tile, stream);
+    }
     return manual_dispatch_tile<__half>(call, tile, stream);
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

@@ -15,51 +15,44 @@ NNOPS_DECLARE_CUDA(GatherAttributes, gather_cuda)
 NNOPS_DECLARE_CUDA(GatherElementsAttributes, gather_elements_cuda)
 NNOPS_DECLARE_CUDA(GatherNDAttributes, gather_nd_cuda)
 
-NNOPS_OP_BOILERPLATE(Gather, GatherAttributes,
-        backend::cpu::gather_cpu, NNOPS_IF_CUDA(backend::cuda::gather_cuda),
-        nullptr)
-NNOPS_OP_BOILERPLATE(GatherElements, GatherElementsAttributes,
-        backend::cpu::gather_elements_cpu,
-        NNOPS_IF_CUDA(backend::cuda::gather_elements_cuda), nullptr)
-NNOPS_OP_BOILERPLATE(GatherND, GatherNDAttributes,
-        backend::cpu::gather_nd_cpu, NNOPS_IF_CUDA(backend::cuda::gather_nd_cuda),
-        nullptr)
+NNOPS_OP_BOILERPLATE(Gather, GatherAttributes, backend::cpu::gather_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::gather_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(GatherElements, GatherElementsAttributes, backend::cpu::gather_elements_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::gather_elements_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(GatherND, GatherNDAttributes, backend::cpu::gather_nd_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::gather_nd_cuda), nullptr)
 
 namespace {
 
-Status check_gather_dtypes(Backend be, const TensorDesc& data,
-                           const TensorDesc& indices)
+Status check_gather_dtypes(Backend be, const TensorDesc& data, const TensorDesc& indices)
 {
-    if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
-                          DataType::u8, DataType::s32, DataType::s64>(be, data.dtype)) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8, DataType::s32,
+                          DataType::s64>(be, data.dtype)) {
         return Status::unsupported;
     }
-    return detail::require(
-        detail::dtype_in<DataType::s64, DataType::s32>(be, indices.dtype));
+    return detail::require(detail::dtype_in<DataType::s64, DataType::s32>(be, indices.dtype));
 }
 
 Status check_gather_layouts(const TensorDesc& data, const TensorDesc& indices)
 {
-    return detail::require(
-        is_layout_supported(data.layout, LayoutSupport::ChannelFirstOnly) &&
-        is_layout_supported(indices.layout, LayoutSupport::ChannelFirstOnly));
+    return detail::require(is_layout_supported(data.layout, LayoutSupport::ChannelFirstOnly) &&
+                           is_layout_supported(indices.layout, LayoutSupport::ChannelFirstOnly));
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // ============================================================
 // Gather
 // ============================================================
 
-std::vector<TensorDesc> Gather::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Gather::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
     const int64_t axis = resolve_axis(attrs_.axis, data.rank);
 
     TensorDesc out;
-    out.dtype  = data.dtype;
+    out.dtype = data.dtype;
     out.layout = data.layout;
     for (int64_t d = 0; d < axis; ++d) {
         out.dims.push_back(data.dims[static_cast<size_t>(d)]);
@@ -81,20 +74,24 @@ Status Gather::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(check_gather_dtypes(backend_, inputs[0], inputs[1]));
     NNOPS_TRY(check_gather_layouts(inputs[0], inputs[1]));
     const auto& data = inputs[0];
-    if (data.rank < 1) { return Status::invalid_argument; }
+    if (data.rank < 1) {
+        return Status::invalid_argument;
+    }
     const int64_t axis = resolve_axis(attrs_.axis, data.rank);
-    if (axis < 0 || axis >= data.rank) { return Status::invalid_argument; }
+    if (axis < 0 || axis >= data.rank) {
+        return Status::invalid_argument;
+    }
     return detail::require(outputs[0].dtype == data.dtype);
 }
 
-Status Gather::compute(std::span<TensorView> outputs,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace)
+Status Gather::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                       const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
@@ -102,11 +99,11 @@ Status Gather::compute(std::span<TensorView> outputs,
 // GatherElements
 // ============================================================
 
-std::vector<TensorDesc> GatherElements::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc>
+GatherElements::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     TensorDesc out = inputs[1];
-    out.dtype  = inputs[0].dtype;
+    out.dtype = inputs[0].dtype;
     out.layout = inputs[0].layout;
     return {out};
 }
@@ -123,25 +120,28 @@ Status GatherElements::validate(std::span<const TensorDesc> inputs,
         return Status::invalid_argument;
     }
     const int64_t axis = resolve_axis(attrs_.axis, data.rank);
-    if (axis < 0 || axis >= data.rank) { return Status::invalid_argument; }
+    if (axis < 0 || axis >= data.rank) {
+        return Status::invalid_argument;
+    }
     for (int64_t d = 0; d < data.rank; ++d) {
-        if (d == axis) { continue; }
-        if (data.dims[static_cast<size_t>(d)] !=
-            indices.dims[static_cast<size_t>(d)]) {
+        if (d == axis) {
+            continue;
+        }
+        if (data.dims[static_cast<size_t>(d)] != indices.dims[static_cast<size_t>(d)]) {
             return Status::invalid_argument;
         }
     }
     return detail::require(outputs[0].dtype == data.dtype);
 }
 
-Status GatherElements::compute(std::span<TensorView> outputs,
-                               std::span<const TensorView> inputs,
-                               const ComputeContext& ctx,
-                               void* workspace)
+Status GatherElements::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                               const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
@@ -149,8 +149,7 @@ Status GatherElements::compute(std::span<TensorView> outputs,
 // GatherND
 // ============================================================
 
-std::vector<TensorDesc> GatherND::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> GatherND::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
@@ -159,7 +158,7 @@ std::vector<TensorDesc> GatherND::getOutputTensorDesc(
     const int64_t b = attrs_.batch_dims;
 
     TensorDesc out;
-    out.dtype  = data.dtype;
+    out.dtype = data.dtype;
     out.layout = data.layout;
     for (int64_t d = 0; d + 1 < qr; ++d) {
         out.dims.push_back(indices.dims[static_cast<size_t>(d)]);
@@ -179,32 +178,35 @@ Status GatherND::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(check_gather_layouts(inputs[0], inputs[1]));
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
-    if (indices.rank < 1) { return Status::invalid_argument; }
+    if (indices.rank < 1) {
+        return Status::invalid_argument;
+    }
     const int64_t k = indices.dims[static_cast<size_t>(indices.rank - 1)];
     const int64_t b = attrs_.batch_dims;
     if (b < 0 || b >= data.rank || b >= indices.rank) {
         return Status::invalid_argument;
     }
-    if (k < 1 || b + k > data.rank) { return Status::invalid_argument; }
+    if (k < 1 || b + k > data.rank) {
+        return Status::invalid_argument;
+    }
     // The batch axes are shared, so their extents must agree.
     for (int64_t d = 0; d < b; ++d) {
-        if (indices.dims[static_cast<size_t>(d)] !=
-            data.dims[static_cast<size_t>(d)]) {
+        if (indices.dims[static_cast<size_t>(d)] != data.dims[static_cast<size_t>(d)]) {
             return Status::invalid_argument;
         }
     }
     return detail::require(outputs[0].dtype == data.dtype);
 }
 
-Status GatherND::compute(std::span<TensorView> outputs,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         void* workspace)
+Status GatherND::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                         const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

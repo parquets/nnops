@@ -32,82 +32,73 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-template <typename V>
-inline V v_relu(V x, V vzero) {
-    return v_max(x, vzero);
-}
+template <typename V> inline V v_relu(V x, V vzero) { return v_max(x, vzero); }
 
-template <typename V>
-inline V v_leaky_relu(V x, V vzero, V valpha) {
+template <typename V> inline V v_leaky_relu(V x, V vzero, V valpha)
+{
     return v_add(v_max(x, vzero), v_mul(valpha, v_min(x, vzero)));
 }
 
-template <typename V>
-inline V v_sigmoid(V x, V v1) {
+template <typename V> inline V v_sigmoid(V x, V v1)
+{
     return v_div(v1, v_add(v1, v_exp(v_neg(x))));
 }
 
-template <typename V>
-inline V v_tanh(V x) {
-    return v_tanh(x);
-}
+template <typename V> inline V v_tanh(V x) { return v_tanh(x); }
 
-template <typename V>
-inline V v_gelu(V x, V v0_5, V v1, V vc, V vcoeff) {
+template <typename V> inline V v_gelu(V x, V v0_5, V v1, V vc, V vcoeff)
+{
     auto x3 = v_mul(v_mul(x, x), x);
     auto inner = v_mul(vc, v_add(x, v_mul(vcoeff, x3)));
     return v_mul(v_mul(v0_5, x), v_add(v1, v_tanh(inner)));
 }
 
-template <typename V>
-inline V v_silu(V x, V v1) {
-    return v_div(x, v_add(v1, v_exp(v_neg(x))));
-}
+template <typename V> inline V v_silu(V x, V v1) { return v_div(x, v_add(v1, v_exp(v_neg(x)))); }
 
-template <typename V>
-inline V v_hard_swish(V x, V vzero, V v3, V v6, V vscale) {
+template <typename V> inline V v_hard_swish(V x, V vzero, V v3, V v6, V vscale)
+{
     auto relu6 = v_min(v_max(v_add(x, v3), vzero), v6);
     return v_mul(v_mul(x, relu6), vscale);
 }
 
-template <typename V>
-inline V v_elu(V x, V vzero, V valpha, V v1) {
+template <typename V> inline V v_elu(V x, V vzero, V valpha, V v1)
+{
     auto neg_part = v_mul(valpha, v_sub(v_exp(v_min(x, vzero)), v1));
     return v_add(v_max(x, vzero), neg_part);
 }
 
 /// clamp(alpha·x + beta, 0, 1).
-template <typename V>
-inline V v_hard_sigmoid(V x, V vzero, V vone, V valpha, V vbeta) {
+template <typename V> inline V v_hard_sigmoid(V x, V vzero, V vone, V valpha, V vbeta)
+{
     return v_min(v_max(v_add(v_mul(valpha, x), vbeta), vzero), vone);
 }
 
 /// max(x, 0) + log(1 + exp(-|x|)) — the shifted form, so exp never overflows.
-template <typename V>
-inline V v_softplus(V x, V vzero, V vone) {
+template <typename V> inline V v_softplus(V x, V vzero, V vone)
+{
     auto tail = v_log(v_add(vone, v_exp(v_neg(v_abs(x)))));
     return v_add(v_max(x, vzero), tail);
 }
 
 /// scale · (max(x, 0) + alpha · (exp(min(x, 0)) - 1)).
-template <typename V>
-inline V v_selu(V x, V vzero, V valpha, V vscale, V v1) {
+template <typename V> inline V v_selu(V x, V vzero, V valpha, V vscale, V v1)
+{
     auto pos = v_max(x, vzero);
     auto neg = v_mul(valpha, v_sub(v_exp(v_min(x, vzero)), v1));
     return v_mul(vscale, v_add(pos, neg));
 }
 
 /// x · tanh(softplus(x)).
-template <typename V>
-inline V v_mish(V x, V vzero, V vone) {
+template <typename V> inline V v_mish(V x, V vzero, V vone)
+{
     return v_mul(x, v_tanh(v_softplus(x, vzero, vone)));
 }
 
 /// x · sigmoid(alpha·x).
-template <typename V>
-inline V v_quick_gelu(V x, V vone, V valpha) {
+template <typename V> inline V v_quick_gelu(V x, V vone, V valpha)
+{
     auto ax = v_mul(valpha, x);
     return v_div(v_mul(x, vone), v_add(vone, v_exp(v_neg(ax))));
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

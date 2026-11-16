@@ -19,15 +19,13 @@ namespace nnops::kernel {
 using namespace simd;
 
 template <typename T>
-inline constexpr bool layout_convert_simd8 =
-    std::is_same_v<T, float> || std::is_same_v<T, half>;
+inline constexpr bool layout_convert_simd8 = std::is_same_v<T, float> || std::is_same_v<T, half>;
 
 /// Copy one 8-channel block of a channel-first row into channel-last rows:
 /// `out[w*C + c_base + lane] = in[(c_base + lane)*ch_stride + w]`.
 template <typename T>
-inline void layout_channel_first_to_cl_block(const T* in_row, T* out_row,
-                                      int64_t W, int64_t C, int64_t ch_stride,
-                                      int64_t c_base, int64_t valid_lanes)
+inline void layout_channel_first_to_cl_block(const T* in_row, T* out_row, int64_t W, int64_t C,
+                                             int64_t ch_stride, int64_t c_base, int64_t valid_lanes)
 {
     if constexpr (layout_convert_simd8<T>) {
         if (valid_lanes == 8) {
@@ -55,8 +53,7 @@ inline void layout_channel_first_to_cl_block(const T* in_row, T* out_row,
             }
             for (; w < W; ++w) {
                 for (int64_t lane = 0; lane < 8; ++lane) {
-                    out_row[w * C + c_base + lane] =
-                        in_row[(c_base + lane) * ch_stride + w];
+                    out_row[w * C + c_base + lane] = in_row[(c_base + lane) * ch_stride + w];
                 }
             }
             return;
@@ -65,8 +62,7 @@ inline void layout_channel_first_to_cl_block(const T* in_row, T* out_row,
 
     for (int64_t w = 0; w < W; ++w) {
         for (int64_t lane = 0; lane < valid_lanes; ++lane) {
-            out_row[w * C + c_base + lane] =
-                in_row[(c_base + lane) * ch_stride + w];
+            out_row[w * C + c_base + lane] = in_row[(c_base + lane) * ch_stride + w];
         }
     }
 }
@@ -74,9 +70,8 @@ inline void layout_channel_first_to_cl_block(const T* in_row, T* out_row,
 /// The reverse: gather one 8-channel block of a channel-last row back into
 /// Channel-first channel rows.
 template <typename T>
-inline void layout_cl_to_channel_first_block(const T* in_row, T* out_row,
-                                      int64_t W, int64_t C, int64_t ch_stride,
-                                      int64_t c_base, int64_t valid_lanes)
+inline void layout_cl_to_channel_first_block(const T* in_row, T* out_row, int64_t W, int64_t C,
+                                             int64_t ch_stride, int64_t c_base, int64_t valid_lanes)
 {
     if constexpr (layout_convert_simd8<T>) {
         if (valid_lanes == 8) {
@@ -104,8 +99,7 @@ inline void layout_cl_to_channel_first_block(const T* in_row, T* out_row,
             }
             for (; w < W; ++w) {
                 for (int64_t lane = 0; lane < 8; ++lane) {
-                    out_row[(c_base + lane) * ch_stride + w] =
-                        in_row[w * C + c_base + lane];
+                    out_row[(c_base + lane) * ch_stride + w] = in_row[w * C + c_base + lane];
                 }
             }
             return;
@@ -114,10 +108,9 @@ inline void layout_cl_to_channel_first_block(const T* in_row, T* out_row,
 
     for (int64_t w = 0; w < W; ++w) {
         for (int64_t lane = 0; lane < valid_lanes; ++lane) {
-            out_row[(c_base + lane) * ch_stride + w] =
-                in_row[w * C + c_base + lane];
+            out_row[(c_base + lane) * ch_stride + w] = in_row[w * C + c_base + lane];
         }
     }
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

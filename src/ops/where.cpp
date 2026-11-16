@@ -10,11 +10,9 @@ namespace nnops {
 
 NNOPS_DECLARE_CPU(WhereAttributes, where_cpu)
 
-NNOPS_OP_BOILERPLATE(Where, WhereAttributes,
-        backend::cpu::where_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Where, WhereAttributes, backend::cpu::where_cpu, nullptr, nullptr)
 
-std::vector<TensorDesc> Where::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Where::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     const auto& cond = inputs[0];
     const auto& x = inputs[1];
@@ -27,10 +25,10 @@ std::vector<TensorDesc> Where::getOutputTensorDesc(
         std::span<const int64_t>(y.dims.data(), static_cast<size_t>(y.rank)));
 
     TensorDesc out;
-    out.rank   = static_cast<int64_t>(bc.size());
-    out.dtype  = x.dtype;
+    out.rank = static_cast<int64_t>(bc.size());
+    out.dtype = x.dtype;
     out.layout = (out.rank == x.rank) ? x.layout : TensorLayout::NCHW;
-    out.dims   = bc;
+    out.dims = bc;
     return {out};
 }
 
@@ -48,8 +46,8 @@ Status Where::validate(std::span<const TensorDesc> inputs,
     if (x.dtype != y.dtype || outputs[0].dtype != x.dtype) {
         return Status::invalid_argument;
     }
-    if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
-                          DataType::u8, DataType::s32, DataType::s64>(backend_, x.dtype)) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8, DataType::s32,
+                          DataType::s64>(backend_, x.dtype)) {
         return Status::unsupported;
     }
     if (!is_layout_supported(cond.layout, LayoutSupport::ChannelFirstOnly) ||
@@ -58,23 +56,23 @@ Status Where::validate(std::span<const TensorDesc> inputs,
         return Status::unsupported;
     }
 
-    return detail::require(broadcast_compatible(
-        std::span<const int64_t>(cond.dims.data(), static_cast<size_t>(cond.rank)),
-        std::span<const int64_t>(x.dims.data(), static_cast<size_t>(x.rank))) &&
+    return detail::require(
         broadcast_compatible(
-        std::span<const int64_t>(x.dims.data(), static_cast<size_t>(x.rank)),
-        std::span<const int64_t>(y.dims.data(), static_cast<size_t>(y.rank))));
+            std::span<const int64_t>(cond.dims.data(), static_cast<size_t>(cond.rank)),
+            std::span<const int64_t>(x.dims.data(), static_cast<size_t>(x.rank))) &&
+        broadcast_compatible(std::span<const int64_t>(x.dims.data(), static_cast<size_t>(x.rank)),
+                             std::span<const int64_t>(y.dims.data(), static_cast<size_t>(y.rank))));
 }
 
-Status Where::compute(std::span<TensorView> outputs,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace)
+Status Where::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                      const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 3, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

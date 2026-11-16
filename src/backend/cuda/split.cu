@@ -56,11 +56,11 @@ Status split_entry(const SplitAttributes& attrs, std::span<TensorView> outputs,
     return Status::ok;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 Status split_cuda(const SplitAttributes& attrs, std::span<TensorView> outputs,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx, void* /*workspace*/)
+                  std::span<const TensorView> inputs, const ComputeContext& ctx,
+                  void* /*workspace*/)
 {
     const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     switch (inputs[0].data_type()) {
@@ -75,4 +75,4 @@ Status split_cuda(const SplitAttributes& attrs, std::span<TensorView> outputs,
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

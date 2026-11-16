@@ -26,14 +26,15 @@ namespace nnops::backend::cuda {
 /// axes (rank above six) or when the flattened batch outgrows a 16-bit grid
 /// axis: the batch rides blockIdx.z in the tile kernels, multiplied by the k
 /// splits, and blockIdx.y in the split-K reduce pass.
-inline bool gemm_batch_layout(const TensorView& a, const TensorView& b,
-                              const TensorView& c, const TensorView* r,
-                              GemmParams& p)
+inline bool gemm_batch_layout(const TensorView& a, const TensorView& b, const TensorView& c,
+                              const TensorView* r, GemmParams& p)
 {
     const int64_t al = a.rank() - 2;
     const int64_t bl = b.rank() - 2;
     const int64_t rank = std::max<int64_t>(al, bl);
-    if (rank > kGemmMaxBatchRank) { return false; }
+    if (rank > kGemmMaxBatchRank) {
+        return false;
+    }
 
     p.batch_rank = static_cast<int>(rank);
     int64_t count = 1;
@@ -42,7 +43,9 @@ inline bool gemm_batch_layout(const TensorView& a, const TensorView& b,
         const int64_t bi = bl - 1 - d;
         const int64_t ad = ai >= 0 ? a.shape(ai) : 1;
         const int64_t bd = bi >= 0 ? b.shape(bi) : 1;
-        if (ad != bd && ad != 1 && bd != 1) { return false; }
+        if (ad != bd && ad != 1 && bd != 1) {
+            return false;
+        }
 
         const int64_t slot = rank - 1 - d;
         p.batch_size[slot] = std::max(ad, bd);
@@ -55,9 +58,13 @@ inline bool gemm_batch_layout(const TensorView& a, const TensorView& b,
 
         // Capping each axis first keeps the running product inside int64 and
         // makes the two checks below the same bound.
-        if (p.batch_size[slot] > kGemmMaxGridAxis) { return false; }
+        if (p.batch_size[slot] > kGemmMaxGridAxis) {
+            return false;
+        }
         count *= p.batch_size[slot];
-        if (count > kGemmMaxGridAxis) { return false; }
+        if (count > kGemmMaxGridAxis) {
+            return false;
+        }
     }
     return true;
 }
@@ -69,24 +76,23 @@ inline bool gemm_vectorizable(const GemmParams& p, int64_t elem_size)
 {
     const int64_t vec = 16 / elem_size;
     return (reinterpret_cast<uintptr_t>(p.a) % 16 == 0) &&
-           (reinterpret_cast<uintptr_t>(p.b) % 16 == 0) &&
-           (p.lda % vec == 0) && (p.ldb % vec == 0);
+           (reinterpret_cast<uintptr_t>(p.b) % 16 == 0) && (p.lda % vec == 0) && (p.ldb % vec == 0);
 }
 
 /// Launch a fully configured dense GEMM; f32, f16 and bf16 only.
-inline Status dense_gemm_status(const GemmParams& p, DataType dtype,
-                                bool transpose_a, bool transpose_b,
-                                cudaStream_t stream)
+inline Status dense_gemm_status(const GemmParams& p, DataType dtype, bool transpose_a,
+                                bool transpose_b, cudaStream_t stream)
 {
-    const GemmElem elem = dtype == DataType::f32  ? GemmElem::F32
-                          : dtype == DataType::f16 ? GemmElem::F16
-                          : dtype == DataType::bf16 ? GemmElem::BF16
-                                                    : GemmElem::F32;
-    if (dtype != DataType::f32 && dtype != DataType::f16 &&
-        dtype != DataType::bf16) {
+    const GemmElem elem = dtype == DataType::f32  ? GemmElem::F32 :
+                          dtype == DataType::f16  ? GemmElem::F16 :
+                          dtype == DataType::bf16 ? GemmElem::BF16 :
+                                                    GemmElem::F32;
+    if (dtype != DataType::f32 && dtype != DataType::f16 && dtype != DataType::bf16) {
         return Status::unsupported;
     }
-    if (p.m <= 0 || p.n <= 0 || p.k <= 0) { return Status::unsupported; }
+    if (p.m <= 0 || p.n <= 0 || p.k <= 0) {
+        return Status::unsupported;
+    }
     // The f32 tile walks the n axis on blockIdx.y, which is 16-bit. 64 is the
     // narrowest n tile, so this bound covers both of them (and the f16 tile,
     // whose grid is flat along x, never hits it).
@@ -95,12 +101,11 @@ inline Status dense_gemm_status(const GemmParams& p, DataType dtype,
     }
 
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
-    if (!dense_gemm_launch(p, elem, transpose_a,
-                           transpose_b, gemm_vectorizable(p, elem_size),
+    if (!dense_gemm_launch(p, elem, transpose_a, transpose_b, gemm_vectorizable(p, elem_size),
                            stream)) {
         return Status::unsupported;
     }
     return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

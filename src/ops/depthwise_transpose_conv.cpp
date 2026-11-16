@@ -24,21 +24,20 @@ NNOPS_DECLARE_CPU(DepthwiseTransposeConv2DAttributes, depthwise_transpose_conv_c
 NNOPS_DECLARE_CUDA(DepthwiseTransposeConv2DAttributes, depthwise_transpose_conv_cuda)
 
 NNOPS_OP_BOILERPLATE(DepthwiseTransposeConv2D, DepthwiseTransposeConv2DAttributes,
-        backend::cpu::depthwise_transpose_conv_cpu,
-        NNOPS_IF_CUDA(backend::cuda::depthwise_transpose_conv_cuda), nullptr)
+                     backend::cpu::depthwise_transpose_conv_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::depthwise_transpose_conv_cuda), nullptr)
 
-std::vector<TensorDesc> DepthwiseTransposeConv2D::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc>
+DepthwiseTransposeConv2D::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
-    std::vector<TensorDesc> outs = depthwise_transpose_conv_output_shape(
-        attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
-        attrs_.output_padding, inputs);
+    std::vector<TensorDesc> outs =
+        depthwise_transpose_conv_output_shape(attrs_.kernel_size, attrs_.stride, attrs_.dilation,
+                                              attrs_.padding, attrs_.output_padding, inputs);
 
     // The quantized route writes s8/u8 when output_dtype says so, else the fp
     // activation's dtype (output_dtype for a pre-quantized one); an unsupported
     // request passes through for the kernel to refuse.
-    if (inputs.size() > 1 &&
-        is_quantized_depthwise_transpose_conv2d(inputs[1].dtype)) {
+    if (inputs.size() > 1 && is_quantized_depthwise_transpose_conv2d(inputs[1].dtype)) {
         const DataType act = inputs[0].dtype;
         const bool fp_act = (act == DataType::f32 || act == DataType::f16);
         const DataType odt = attrs_.output_dtype;
@@ -68,21 +67,20 @@ Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
         // is quantized inside, or already quantized; the bias is int32 on an
         // integer destination and the output dtype otherwise.
         NNOPS_TRY(detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
-                             DataType::u8>(backend_, in.dtype),
+            detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8>(backend_,
+                                                                                       in.dtype),
             Status::unsupported));
         if (inputs.size() > 2) {
             const DataType odt = outputs[0].dtype;
             const bool int_out = odt == DataType::s8 || odt == DataType::u8;
-            NNOPS_TRY(detail::require(
-                inputs[2].dtype == (int_out ? DataType::s32 : odt),
-                Status::unsupported));
+            NNOPS_TRY(detail::require(inputs[2].dtype == (int_out ? DataType::s32 : odt),
+                                      Status::unsupported));
         }
     } else {
-        NNOPS_TRY(detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) &&
-            weight.dtype == in.dtype,
-            Status::unsupported));
+        NNOPS_TRY(
+            detail::require(detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) &&
+                                weight.dtype == in.dtype,
+                            Status::unsupported));
         if (inputs.size() > 2 && inputs[2].dtype != in.dtype) {
             return Status::unsupported;
         }
@@ -97,18 +95,15 @@ Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
         if (weight.layout == TensorLayout::HWCM && weight.rank == 3) {
             return detail::require(weight.dims[2] == in.dims[1]);
         }
-        NNOPS_TRY(detail::require(
-            !is_quantized_depthwise_transpose_conv2d(weight.dtype),
-            Status::unsupported));
-        NNOPS_TRY(detail::require(
-            is_channel_first_spatial(weight.layout) && weight.rank == 4,
-            Status::unsupported));
+        NNOPS_TRY(detail::require(!is_quantized_depthwise_transpose_conv2d(weight.dtype),
+                                  Status::unsupported));
+        NNOPS_TRY(detail::require(is_channel_first_spatial(weight.layout) && weight.rank == 4,
+                                  Status::unsupported));
         return detail::require(weight.dims[1] == 1 && weight.dims[0] == in.dims[1]);
     }
     if (is_channel_first_spatial(in.layout)) {
-        NNOPS_TRY(detail::require(
-            is_channel_first_spatial(weight.layout) && weight.rank == 4,
-            Status::unsupported));
+        NNOPS_TRY(detail::require(is_channel_first_spatial(weight.layout) && weight.rank == 4,
+                                  Status::unsupported));
         return detail::require(weight.dims[0] == in.dims[1]);
     }
     return Status::unsupported;
@@ -116,13 +111,14 @@ Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
 
 Status DepthwiseTransposeConv2D::compute(std::span<TensorView> outputs,
                                          std::span<const TensorView> inputs,
-                                         const ComputeContext& ctx,
-                                         void* workspace)
+                                         const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

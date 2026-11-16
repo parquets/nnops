@@ -40,31 +40,33 @@ namespace nnops::backend::cuda {
 // ============================================================
 
 /// One runtime layout, rank 8 (unused modes: extent 1, stride 0).
-using MoveShape  = cute::Shape<int64_t, int64_t, int64_t, int64_t,
-                               int64_t, int64_t, int64_t, int64_t>;
-using MoveStride = cute::Stride<int64_t, int64_t, int64_t, int64_t,
-                                int64_t, int64_t, int64_t, int64_t>;
+using MoveShape =
+    cute::Shape<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
+using MoveStride =
+    cute::Stride<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
 using MoveLayout = cute::Layout<MoveShape, MoveStride>;
 
 /// CuTe's flat coordinate runs mode 0 fastest, which is the tensor's *last*
 /// axis, so the modes are filled in reverse axis order; the extent-1 modes the
 /// padding adds end up in front, where they contribute nothing.
-inline MoveLayout make_move_layout(const int64_t (&dims)[8],
-                                   const int64_t (&strides)[8])
+inline MoveLayout make_move_layout(const int64_t (&dims)[8], const int64_t (&strides)[8])
 {
     return cute::make_layout(
-        cute::make_shape(dims[7], dims[6], dims[5], dims[4],
-                         dims[3], dims[2], dims[1], dims[0]),
-        cute::make_stride(strides[7], strides[6], strides[5], strides[4],
-                          strides[3], strides[2], strides[1], strides[0]));
+        cute::make_shape(dims[7], dims[6], dims[5], dims[4], dims[3], dims[2], dims[1], dims[0]),
+        cute::make_stride(strides[7], strides[6], strides[5], strides[4], strides[3], strides[2],
+                          strides[1], strides[0]));
 }
 
 /// `view`'s logical strides as the layout's stride array, padded to rank 8.
 inline void fill_view_strides(const TensorView& view, int64_t (&strides)[8])
 {
     const int64_t rank = view.rank();
-    for (int64_t d = 0; d < rank; ++d) { strides[d] = view.stride_elems(d); }
-    for (int64_t d = rank; d < 8; ++d) { strides[d] = 0; }
+    for (int64_t d = 0; d < rank; ++d) {
+        strides[d] = view.stride_elems(d);
+    }
+    for (int64_t d = rank; d < 8; ++d) {
+        strides[d] = 0;
+    }
 }
 
 /// Whether `view` is laid out densely (pitch padding absent), which is what
@@ -73,7 +75,9 @@ inline bool view_is_compact(const TensorView& view)
 {
     int64_t want = 1;
     for (int64_t d = view.rank() - 1; d >= 0; --d) {
-        if (view.shape(d) != 1 && view.stride_elems(d) != want) { return false; }
+        if (view.shape(d) != 1 && view.stride_elems(d) != want) {
+            return false;
+        }
         want *= view.shape(d);
     }
     return true;
@@ -83,8 +87,12 @@ inline bool view_is_compact(const TensorView& view)
 inline void fill_output_dims(const TensorView& view, int64_t (&dims)[8])
 {
     const int64_t rank = view.rank();
-    for (int64_t d = 0; d < rank; ++d) { dims[d] = view.shape(d); }
-    for (int64_t d = rank; d < 8; ++d) { dims[d] = 1; }
+    for (int64_t d = 0; d < rank; ++d) {
+        dims[d] = view.shape(d);
+    }
+    for (int64_t d = rank; d < 8; ++d) {
+        dims[d] = 1;
+    }
 }
 
 // ============================================================
@@ -92,14 +100,14 @@ inline void fill_output_dims(const TensorView& view, int64_t (&dims)[8])
 // ============================================================
 
 struct MovePlan {
-    MoveLayout src;              ///< output flat index -> source element offset
-    MoveLayout dst;              ///< output flat index -> destination offset
+    MoveLayout src; ///< output flat index -> source element offset
+    MoveLayout dst; ///< output flat index -> destination offset
     int64_t src_base = 0;
     int64_t dst_base = 0;
-    int64_t rows = 0;            ///< output extent over axes 0..rank-2
-    int64_t cols = 0;            ///< output extent over the last axis
-    int64_t src_step = 1;        ///< source stride along the last axis
-    int64_t dst_step = 1;        ///< destination stride along the last axis
+    int64_t rows = 0;     ///< output extent over axes 0..rank-2
+    int64_t cols = 0;     ///< output extent over the last axis
+    int64_t src_step = 1; ///< source stride along the last axis
+    int64_t dst_step = 1; ///< destination stride along the last axis
     /// The destination strides are the compact ones, so `dst(flat) == flat`.
     bool dst_compact = true;
     int64_t rank = 0;
@@ -111,10 +119,14 @@ struct MovePlan {
 /// is what a single `cudaMemcpyAsync` does better than any kernel.
 inline bool move_plan_is_linear(const MovePlan& p)
 {
-    if (!p.dst_compact || p.src_base != 0 || p.dst_base != 0) { return false; }
+    if (!p.dst_compact || p.src_base != 0 || p.dst_base != 0) {
+        return false;
+    }
     int64_t want = 1;
     for (int64_t d = p.rank - 1; d >= 0; --d) {
-        if (p.dims[d] != 1 && p.src_strides[d] != want) { return false; }
+        if (p.dims[d] != 1 && p.src_strides[d] != want) {
+            return false;
+        }
         want *= p.dims[d];
     }
     return true;
@@ -130,8 +142,7 @@ inline bool move_plan_is_linear(const MovePlan& p)
 /// otherwise every thread loads and stores one element per iteration, which
 /// still coalesces on whichever side is contiguous.
 template <class T>
-__device__ inline void copy_run(T* dst, const T* src, int64_t n,
-                                int64_t src_step, int64_t dst_step)
+__device__ inline void copy_run(T* dst, const T* src, int64_t n, int64_t src_step, int64_t dst_step)
 {
     const int64_t tid = int64_t(threadIdx.x);
     const int64_t nth = int64_t(blockDim.x);
@@ -139,18 +150,20 @@ __device__ inline void copy_run(T* dst, const T* src, int64_t n,
     if (src_step == 1 && dst_step == 1) {
         constexpr int64_t kVec = 16 / int64_t(sizeof(T));
         const bool aligned =
-            ((reinterpret_cast<uintptr_t>(dst) |
-              reinterpret_cast<uintptr_t>(src)) & 15u) == 0;
+            ((reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src)) & 15u) == 0;
         if (aligned) {
             const int64_t nvec = (n / kVec) * kVec;
             for (int64_t i = tid * kVec; i < nvec; i += nth * kVec) {
-                *reinterpret_cast<uint4*>(dst + i) =
-                    *reinterpret_cast<const uint4*>(src + i);
+                *reinterpret_cast<uint4*>(dst + i) = *reinterpret_cast<const uint4*>(src + i);
             }
-            for (int64_t i = nvec + tid; i < n; i += nth) { dst[i] = src[i]; }
+            for (int64_t i = nvec + tid; i < n; i += nth) {
+                dst[i] = src[i];
+            }
             return;
         }
-        for (int64_t i = tid; i < n; i += nth) { dst[i] = src[i]; }
+        for (int64_t i = tid; i < n; i += nth) {
+            dst[i] = src[i];
+        }
         return;
     }
 
@@ -164,37 +177,34 @@ __device__ inline void copy_run(T* dst, const T* src, int64_t n,
 // ============================================================
 
 template <class T>
-__global__ void move_rows_kernel(const T* __restrict__ src,
-                                 T* __restrict__ dst, MovePlan p)
+__global__ void move_rows_kernel(const T* __restrict__ src, T* __restrict__ dst, MovePlan p)
 {
     // The row base is the only place the layouts are evaluated: inside a row
     // both operands advance by a constant stride.
     for (int64_t r = blockIdx.x; r < p.rows; r += gridDim.x) {
         const int64_t flat = r * p.cols;
         const int64_t so = p.src_base + p.src(flat);
-        const int64_t dof = p.dst_base +
-                            (p.dst_compact ? flat : p.dst(flat));
+        const int64_t dof = p.dst_base + (p.dst_compact ? flat : p.dst(flat));
         copy_run(dst + dof, src + so, p.cols, p.src_step, p.dst_step);
     }
 }
 
 template <class T>
-Status launch_move(const T* src, T* dst, const MovePlan& plan,
-                   cudaStream_t stream)
+Status launch_move(const T* src, T* dst, const MovePlan& plan, cudaStream_t stream)
 {
-    if (plan.rows <= 0 || plan.cols <= 0) { return Status::ok; }
-
-    if (move_plan_is_linear(plan)) {
-        const size_t bytes = static_cast<size_t>(plan.rows * plan.cols) * sizeof(T);
-        CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
-                                   stream));
+    if (plan.rows <= 0 || plan.cols <= 0) {
         return Status::ok;
     }
 
-    const unsigned grid =
-        static_cast<unsigned>(std::min<int64_t>(plan.rows, int64_t(1) << 20));
+    if (move_plan_is_linear(plan)) {
+        const size_t bytes = static_cast<size_t>(plan.rows * plan.cols) * sizeof(T);
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream));
+        return Status::ok;
+    }
+
+    const unsigned grid = static_cast<unsigned>(std::min<int64_t>(plan.rows, int64_t(1) << 20));
     move_rows_kernel<T><<<grid, kCudaBlockSize, 0, stream>>>(src, dst, plan);
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

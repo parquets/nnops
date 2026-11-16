@@ -30,14 +30,18 @@ Lstm::~Lstm() = default;
 
 namespace {
 
-auto resolve_lstm_kernel(Backend backend) -> Lstm::Impl::KernelFn {
+auto resolve_lstm_kernel(Backend backend) -> Lstm::Impl::KernelFn
+{
     switch (backend) {
-    case Backend::CPU: return backend::cpu::recurrent_cpu;
-    default:           return nullptr;
+    case Backend::CPU:
+        return backend::cpu::recurrent_cpu;
+    default:
+        return nullptr;
     }
 }
 
-detail::RecurrentSpec lstm_spec(const LstmAttributes& a) {
+detail::RecurrentSpec lstm_spec(const LstmAttributes& a)
+{
     detail::RecurrentSpec s;
     s.mode = RecurrentMode::Lstm;
     s.hidden_size = a.hidden_size;
@@ -57,7 +61,7 @@ detail::RecurrentSpec lstm_spec(const LstmAttributes& a) {
     return s;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 NNOPS_OP_CREATE(Lstm, LstmAttributes)
 
@@ -67,39 +71,37 @@ Lstm::Lstm(const LstmAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_lstm_kernel(backend);
 }
 
-std::vector<TensorDesc> Lstm::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Lstm::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
-    if (inputs.size() < 3) { return {}; }
-    return recurrent_output_shape(attrs_.hidden_size,
-                                  rnn_num_directions(attrs_.direction),
+    if (inputs.size() < 3) {
+        return {};
+    }
+    return recurrent_output_shape(attrs_.hidden_size, rnn_num_directions(attrs_.direction),
                                   /*with_cell=*/true, inputs);
 }
 
-Status Lstm::validate(std::span<const TensorDesc> inputs,
-                      std::span<const TensorDesc> outputs) const
+Status Lstm::validate(std::span<const TensorDesc> inputs, std::span<const TensorDesc> outputs) const
 {
-    if (attrs_.layout != 0) { return Status::unsupported; }
+    if (attrs_.layout != 0) {
+        return Status::unsupported;
+    }
     return detail::recurrent_check(backend_, lstm_spec(attrs_), inputs, outputs,
                                    /*with_cell=*/true);
 }
 
-Status Lstm::compute(std::span<TensorView> outputs,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace)
+Status Lstm::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                     const ComputeContext& ctx, void* workspace)
 {
     (void)workspace;
     NNOPS_TRY(validate_views(outputs, inputs));
-    return detail::recurrent_run(backend_, lstm_spec(attrs_), impl_->kernel_fn, outputs,
-                                 inputs, ctx);
+    return detail::recurrent_run(backend_, lstm_spec(attrs_), impl_->kernel_fn, outputs, inputs,
+                                 ctx);
 }
 
-void Lstm::prepackWeights(std::span<const TensorView> inputs,
-                        std::span<TensorView> outputs,
-                        const ComputeContext& ctx)
+void Lstm::prepackWeights(std::span<const TensorView> inputs, std::span<TensorView> outputs,
+                          const ComputeContext& ctx)
 {
     detail::recurrent_prepack(backend_, lstm_spec(attrs_), inputs, outputs, ctx);
 }
 
-}  // namespace nnops
+} // namespace nnops

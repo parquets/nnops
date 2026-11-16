@@ -22,17 +22,17 @@ namespace {
 inline int64_t plan_slot_count(int num_threads, bool use_thread_slots, int64_t tasks)
 {
     const int64_t nt = std::max<int64_t>(num_threads, 1);
-    if (use_thread_slots && nt < tasks) { return nt; }
+    if (use_thread_slots && nt < tasks) {
+        return nt;
+    }
     return nt <= 1 ? 1 : tasks;
 }
 
 /// Per-dtype plan resolution, shared by get_attention_plan's dispatch below.
 /// f32 and f16 differ in NR, Kc and element size, exactly as in matmul.
 template <class T>
-AttentionPlan attention_plan_for(const AttentionConfig& cfg,
-                                 std::span<const TensorDesc> inputs,
-                                 int num_threads,
-                                 bool use_thread_slots)
+AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const TensorDesc> inputs,
+                                 int num_threads, bool use_thread_slots)
 {
     const auto& q = inputs[0];
     const auto& k = inputs[1];
@@ -43,12 +43,12 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg,
     const bool merged = (q.rank == 3);
     int64_t B, Sq, Sk_new, Dqk;
     if (merged) {
-        B  = q.dims[0];
+        B = q.dims[0];
         Sq = q.dims[1];
         Sk_new = k.dims[1];
         Dqk = q.dims[2] / H;
     } else {
-        B  = q.dims[0];
+        B = q.dims[0];
         Sq = q.dims[2];
         Sk_new = k.dims[2];
         Dqk = q.dims[3];
@@ -103,14 +103,13 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg,
         const int64_t tasks = units * splits;
         // Both dispatches draw slots from the same pool: the slice kernel and
         // the (batch, query head) merge pass after it.
-        plan.num_slots = plan_slot_count(num_threads, use_thread_slots,
-                                         std::max(tasks, B * H));
-        size_t bytes = static_cast<size_t>(plan.num_slots)
-                     * static_cast<size_t>(plan.decode_elems) * sizeof(float);
+        plan.num_slots = plan_slot_count(num_threads, use_thread_slots, std::max(tasks, B * H));
+        size_t bytes = static_cast<size_t>(plan.num_slots) *
+                       static_cast<size_t>(plan.decode_elems) * sizeof(float);
         if (splits > 1) {
             // One partial per (task, batched head): output, max, sum.
-            bytes += static_cast<size_t>(tasks) * static_cast<size_t>(hb)
-                   * static_cast<size_t>(Dv + 2) * sizeof(float);
+            bytes += static_cast<size_t>(tasks) * static_cast<size_t>(hb) *
+                     static_cast<size_t>(Dv + 2) * sizeof(float);
         }
         plan.workspace_size = bytes;
         return plan;
@@ -128,49 +127,48 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg,
         const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv);
         const int64_t NQ = (Sq + Br - 1) / Br;
         plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H * NQ);
-        plan.workspace_size = static_cast<size_t>(plan.num_slots)
-                            * static_cast<size_t>(per_task) * sizeof(T);
+        plan.workspace_size =
+            static_cast<size_t>(plan.num_slots) * static_cast<size_t>(per_task) * sizeof(T);
         return plan;
     }
 
     constexpr int mr_max = std::is_same_v<T, half> ? MR_MAX_F16 : MR_MAX_F32;
     constexpr int nr_max = nr_max_flt<T>();
-    constexpr int kc     = static_cast<int>(kc_for<T>());
-    constexpr int esz    = static_cast<int>(sizeof(T));
+    constexpr int kc = static_cast<int>(kc_for<T>());
+    constexpr int esz = static_cast<int>(sizeof(T));
 
     int mc1, nc1;
-    resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(Sk),
-                       mr_max, nr_max, kc, esz, num_threads, mc1, nc1);
+    resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(Sk), mr_max, nr_max, kc, esz,
+                       num_threads, mc1, nc1);
     int mc2, nc2;
-    resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(Dv),
-                       mr_max, nr_max, kc, esz, num_threads, mc2, nc2);
-    plan.mc1 = mc1; plan.nc1 = nc1;
-    plan.mc2 = mc2; plan.nc2 = nc2;
+    resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(Dv), mr_max, nr_max, kc, esz,
+                       num_threads, mc2, nc2);
+    plan.mc1 = mc1;
+    plan.nc1 = nc1;
+    plan.mc2 = mc2;
+    plan.nc2 = nc2;
 
     // One packed-B slot for both GEMMs: stride from the longer k-block, panels
     // from the wider n-block.
     const int ldd_b_full = static_cast<int>(
-        mma_pack_align(nr_max * static_cast<int>(
-            kc_pack_bound<T>(std::max(Dqk, Sk))) * esz) / esz);
-    const int np_full = std::max(panels_for_pack<T>(nc1),
-                                 panels_for_pack<T>(std::min<int64_t>(Dv, nc2)));
+        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(std::max(Dqk, Sk))) * esz) / esz);
+    const int np_full =
+        std::max(panels_for_pack<T>(nc1), panels_for_pack<T>(std::min<int64_t>(Dv, nc2)));
 
     const int64_t scores_elems = Sq * Sk;
-    const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;
-    const int64_t per_head     = scores_elems + pack_elems;
+    const int64_t pack_elems = static_cast<int64_t>(np_full) * ldd_b_full;
+    const int64_t per_head = scores_elems + pack_elems;
 
     plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H);
-    plan.workspace_size = static_cast<size_t>(plan.num_slots)
-                        * static_cast<size_t>(per_head) * sizeof(T);
+    plan.workspace_size =
+        static_cast<size_t>(plan.num_slots) * static_cast<size_t>(per_head) * sizeof(T);
     return plan;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-AttentionPlan get_attention_plan(const AttentionConfig& cfg,
-                                 std::span<const TensorDesc> inputs,
-                                 std::span<const TensorDesc> /*outputs*/,
-                                 int num_threads,
+AttentionPlan get_attention_plan(const AttentionConfig& cfg, std::span<const TensorDesc> inputs,
+                                 std::span<const TensorDesc> /*outputs*/, int num_threads,
                                  bool use_thread_slots)
 {
     NNOPS_ASSERT(inputs.size() >= 2);
@@ -179,7 +177,9 @@ AttentionPlan get_attention_plan(const AttentionConfig& cfg,
 
     // f32 and f16 take the tiled path; any other dtype, or a Q/K dtype
     // mismatch, returns a zeroed plan.
-    if (inputs[1].dtype != dt) { return AttentionPlan{}; }
+    if (inputs[1].dtype != dt) {
+        return AttentionPlan{};
+    }
     if (!cfg.v_is_k && inputs.size() > 2 && inputs[2].dtype != dt) {
         return AttentionPlan{};
     }
@@ -197,4 +197,4 @@ AttentionPlan get_attention_plan(const AttentionConfig& cfg,
     return AttentionPlan{};
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

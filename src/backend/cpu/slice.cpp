@@ -21,10 +21,8 @@ namespace nnops::backend::cpu {
 namespace {
 
 template <typename T>
-void slice_impl(const SliceAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx)
+void slice_impl(const SliceAttributes& attrs, TensorView& output,
+                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
@@ -40,7 +38,7 @@ void slice_impl(const SliceAttributes& attrs,
     int64_t eff_step[TensorDesc::kMaxRank];
     for (int64_t d = 0; d < rank; ++d) {
         eff_start[d] = 0;
-        eff_step[d]  = 1;
+        eff_step[d] = 1;
     }
     for (size_t a = 0; a < n_axes; ++a) {
         int64_t ax = attrs.axes[a];
@@ -55,14 +53,15 @@ void slice_impl(const SliceAttributes& attrs,
             s += dim;
         }
         eff_start[static_cast<size_t>(ax)] = std::clamp<int64_t>(s, 0, dim);
-        eff_step[static_cast<size_t>(ax)]  =
-            (a < attrs.steps.size()) ? attrs.steps[a] : int64_t(1);
+        eff_step[static_cast<size_t>(ax)] = (a < attrs.steps.size()) ? attrs.steps[a] : int64_t(1);
     }
 
     // The view's own strides, so a pitched row and a channel-last view both read
     // what the buffer actually holds.
     int64_t in_strides[TensorDesc::kMaxRank];
-    for (int64_t d = 0; d < rank; ++d) { in_strides[d] = input.stride_elems(d); }
+    for (int64_t d = 0; d < rank; ++d) {
+        in_strides[d] = input.stride_elems(d);
+    }
 
     // Outer-only strides (for decomposing outer_idx over dims 0..rank-2)
     int64_t outer_strides[TensorDesc::kMaxRank];
@@ -73,15 +72,14 @@ void slice_impl(const SliceAttributes& attrs,
         }
     }
 
-    const T* in_ptr  = input.ptr<T>();
-    T*       out_ptr = output.ptr<T>();
+    const T* in_ptr = input.ptr<T>();
+    T* out_ptr = output.ptr<T>();
 
     const int64_t inner_dim = output.shape(rank - 1);
     const int64_t outer_total = total / inner_dim;
 
     // Input stride delta when innermost output dim increments by 1
-    const int64_t in_inner_step =
-        eff_step[static_cast<size_t>(rank - 1)] * in_strides[rank - 1];
+    const int64_t in_inner_step = eff_step[static_cast<size_t>(rank - 1)] * in_strides[rank - 1];
 
     auto body = [&](int64_t outer_idx) {
         // Decompose outer_idx into multi-index for dims 0..rank-2
@@ -90,8 +88,8 @@ void slice_impl(const SliceAttributes& attrs,
         for (int64_t d = 0; d < rank - 1; ++d) {
             int64_t coord = tmp / outer_strides[d];
             tmp %= outer_strides[d];
-            int64_t in_coord = eff_start[static_cast<size_t>(d)]
-                             + coord * eff_step[static_cast<size_t>(d)];
+            int64_t in_coord =
+                eff_start[static_cast<size_t>(d)] + coord * eff_step[static_cast<size_t>(d)];
             in_base += in_coord * in_strides[d];
         }
 
@@ -101,8 +99,7 @@ void slice_impl(const SliceAttributes& attrs,
 
         if (in_inner_step == 1) {
             // Contiguous in both input and output: memcpy
-            std::memcpy(out_row, in_ptr + in_base,
-                        static_cast<size_t>(inner_dim) * sizeof(T));
+            std::memcpy(out_row, in_ptr + in_base, static_cast<size_t>(inner_dim) * sizeof(T));
         } else {
             for (int64_t i = 0; i < inner_dim; ++i) {
                 out_row[i] = in_ptr[in_base + i * in_inner_step];
@@ -113,13 +110,10 @@ void slice_impl(const SliceAttributes& attrs,
     ctx.cpu.run(0, outer_total, body);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status slice_cpu(const SliceAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx,
-                void* /*workspace*/)
+Status slice_cpu(const SliceAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "slice_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -128,4 +122,4 @@ Status slice_cpu(const SliceAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

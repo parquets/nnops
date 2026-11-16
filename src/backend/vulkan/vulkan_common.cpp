@@ -15,7 +15,8 @@
 
 namespace nnops::backend::vulkan {
 
-VulkanPipeline VulkanPipelineCache::get_or_create(const PipelineKey& key) {
+VulkanPipeline VulkanPipelineCache::get_or_create(const PipelineKey& key)
+{
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = cache_.find(key);
@@ -42,7 +43,8 @@ VulkanPipeline VulkanPipelineCache::get_or_create(const PipelineKey& key) {
     }
 }
 
-VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
+VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key)
+{
     VulkanPipeline result = {};
 
     VkDevice device = key.device;
@@ -59,8 +61,7 @@ VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
         return result;
     }
 
-    VkDescriptorSetLayoutBinding* bindings =
-        new VkDescriptorSetLayoutBinding[key.num_bindings]();
+    VkDescriptorSetLayoutBinding* bindings = new VkDescriptorSetLayoutBinding[key.num_bindings]();
 
     for (uint32_t i = 0; i < key.num_bindings; ++i) {
         bindings[i].binding = i;
@@ -110,7 +111,7 @@ VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
     spec_entries[1].offset = sizeof(uint32_t);
     spec_entries[1].size = sizeof(uint32_t);
 
-    uint32_t spec_data[2] = { key.spec_op, key.spec_add_to };
+    uint32_t spec_data[2] = {key.spec_op, key.spec_add_to};
 
     VkSpecializationInfo spec_info = {};
     spec_info.mapEntryCount = 2;
@@ -130,8 +131,8 @@ VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
     pipeline_ci.stage = stage_ci;
     pipeline_ci.layout = result.layout;
 
-    res = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_ci,
-                                   nullptr, &result.pipeline);
+    res = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_ci, nullptr,
+                                   &result.pipeline);
 
     // A shader module may be destroyed once the pipeline that used it exists.
     vkDestroyShaderModule(device, shader_module, nullptr);
@@ -148,7 +149,8 @@ VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
     return result;
 }
 
-void VulkanPipelineCache::destroy_device_pipelines(VkDevice device) {
+void VulkanPipelineCache::destroy_device_pipelines(VkDevice device)
+{
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = cache_.begin();
     while (it != cache_.end()) {
@@ -164,7 +166,8 @@ void VulkanPipelineCache::destroy_device_pipelines(VkDevice device) {
     }
 }
 
-void VulkanPipelineCache::clear() {
+void VulkanPipelineCache::clear()
+{
     std::lock_guard<std::mutex> lock(mutex_);
     // Each key carries its own device, so those devices must still be alive.
     for (auto& [key, p] : cache_) {
@@ -175,20 +178,12 @@ void VulkanPipelineCache::clear() {
     cache_.clear();
 }
 
-VulkanPipelineCache::~VulkanPipelineCache() {
-    clear();
-}
+VulkanPipelineCache::~VulkanPipelineCache() { clear(); }
 
-void vulkan_record_dispatch(
-    VkCommandBuffer        cmd,
-    VkDevice               device,
-    VkDescriptorPool       pool,
-    const VulkanPipeline&  pipeline,
-    const VkBuffer*        buffers,
-    uint32_t               num_buffers,
-    const void*            push_constants,
-    uint32_t               pc_size,
-    uint32_t               total_elements)
+void vulkan_record_dispatch(VkCommandBuffer cmd, VkDevice device, VkDescriptorPool pool,
+                            const VulkanPipeline& pipeline, const VkBuffer* buffers,
+                            uint32_t num_buffers, const void* push_constants, uint32_t pc_size,
+                            uint32_t total_elements)
 {
     VkDescriptorSetAllocateInfo alloc_info = {};
     alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -225,14 +220,14 @@ void vulkan_record_dispatch(
     delete[] buf_infos;
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline.layout, 0, 1, &desc_set, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &desc_set,
+                            0, nullptr);
 
-    vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, pc_size, push_constants);
+    vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_size,
+                       push_constants);
 
     uint32_t group_count = ceil_div(total_elements, static_cast<uint32_t>(kVulkanWorkgroupSize));
     vkCmdDispatch(cmd, group_count, 1, 1);
 }
 
-}  // namespace nnops::backend::vulkan
+} // namespace nnops::backend::vulkan

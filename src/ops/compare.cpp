@@ -11,15 +11,13 @@ namespace nnops {
 NNOPS_DECLARE_CPU(CompareAttributes, compare_cpu)
 NNOPS_DECLARE_CPU(LogicalAttributes, logical_cpu)
 
-NNOPS_OP_BOILERPLATE(Compare, CompareAttributes,
-        backend::cpu::compare_cpu, nullptr, nullptr)
-NNOPS_OP_BOILERPLATE(Logical, LogicalAttributes,
-        backend::cpu::logical_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Compare, CompareAttributes, backend::cpu::compare_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Logical, LogicalAttributes, backend::cpu::logical_cpu, nullptr, nullptr)
 
 namespace {
 
-template <size_t N>
-bool all_channel_first(const TensorDesc* d) {
+template <size_t N> bool all_channel_first(const TensorDesc* d)
+{
     for (size_t i = 0; i < N; ++i) {
         if (!is_layout_supported(d[i].layout, LayoutSupport::ChannelFirstOnly)) {
             return false;
@@ -35,14 +33,13 @@ std::vector<TensorDesc> broadcast_bool_shape(std::span<const TensorDesc> inputs)
     return out;
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Compare
 // ---------------------------------------------------------------------------
 
-std::vector<TensorDesc> Compare::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Compare::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     return broadcast_bool_shape(inputs);
 }
@@ -54,27 +51,33 @@ Status Compare::validate(std::span<const TensorDesc> inputs,
     const auto& a = inputs[0];
     const auto& b = inputs[1];
 
-    if (a.dtype != b.dtype) { return Status::invalid_argument; }
-    if (!detail::dtype_in<DataType::f32, DataType::f16,
-                          DataType::s32, DataType::s64>(backend_, a.dtype)) {
+    if (a.dtype != b.dtype) {
+        return Status::invalid_argument;
+    }
+    if (!detail::dtype_in<DataType::f32, DataType::f16, DataType::s32, DataType::s64>(backend_,
+                                                                                      a.dtype)) {
         return Status::unsupported;
     }
-    if (outputs[0].dtype != DataType::u8) { return Status::invalid_argument; }
-    if (!all_channel_first<2>(inputs.data())) { return Status::unsupported; }
+    if (outputs[0].dtype != DataType::u8) {
+        return Status::invalid_argument;
+    }
+    if (!all_channel_first<2>(inputs.data())) {
+        return Status::unsupported;
+    }
 
-    return detail::require(broadcast_compatible(
-        std::span<const int64_t>(a.dims.data(), static_cast<size_t>(a.rank)),
-        std::span<const int64_t>(b.dims.data(), static_cast<size_t>(b.rank))));
+    return detail::require(
+        broadcast_compatible(std::span<const int64_t>(a.dims.data(), static_cast<size_t>(a.rank)),
+                             std::span<const int64_t>(b.dims.data(), static_cast<size_t>(b.rank))));
 }
 
-Status Compare::compute(std::span<TensorView> outputs,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx,
-                        void* workspace)
+Status Compare::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
@@ -82,8 +85,7 @@ Status Compare::compute(std::span<TensorView> outputs,
 // Logical
 // ---------------------------------------------------------------------------
 
-std::vector<TensorDesc> Logical::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Logical::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     if (attrs_.type == LogicalType::Not) {
         auto out = identity_output_shape(inputs);
@@ -102,38 +104,42 @@ Status Logical::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), n_in, n_in, 1));
 
     for (size_t i = 0; i < n_in; ++i) {
-        if (!detail::dtype_in<DataType::s8, DataType::u8,
-                              DataType::s32, DataType::s64>(backend_, inputs[i].dtype)) {
+        if (!detail::dtype_in<DataType::s8, DataType::u8, DataType::s32, DataType::s64>(
+                backend_, inputs[i].dtype)) {
             return Status::unsupported;
         }
         if (i > 0 && inputs[i].dtype != inputs[0].dtype) {
             return Status::invalid_argument;
         }
     }
-    if (outputs[0].dtype != DataType::u8) { return Status::invalid_argument; }
+    if (outputs[0].dtype != DataType::u8) {
+        return Status::invalid_argument;
+    }
     for (size_t i = 0; i < n_in; ++i) {
         if (!is_layout_supported(inputs[i].layout, LayoutSupport::ChannelFirstOnly)) {
             return Status::unsupported;
         }
     }
 
-    if (unary) { return Status::ok; }
+    if (unary) {
+        return Status::ok;
+    }
 
     return detail::require(broadcast_compatible(
         std::span<const int64_t>(inputs[0].dims.data(), static_cast<size_t>(inputs[0].rank)),
         std::span<const int64_t>(inputs[1].dims.data(), static_cast<size_t>(inputs[1].rank))));
 }
 
-Status Logical::compute(std::span<TensorView> outputs,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx,
-                        void* workspace)
+Status Logical::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, void* workspace)
 {
     const size_t n_in = (attrs_.type == LogicalType::Not) ? 1 : 2;
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, n_in, n_in, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

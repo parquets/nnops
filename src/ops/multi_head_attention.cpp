@@ -19,10 +19,10 @@ namespace nnops {
 NNOPS_DECLARE_CPU(MultiHeadAttentionAttributes, multi_head_attention_cpu)
 
 NNOPS_OP_BOILERPLATE(MultiHeadAttention, MultiHeadAttentionAttributes,
-        backend::cpu::multi_head_attention_cpu, nullptr, nullptr)
+                     backend::cpu::multi_head_attention_cpu, nullptr, nullptr)
 
-std::vector<TensorDesc> MultiHeadAttention::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc>
+MultiHeadAttention::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     return {attention_output_shape(inputs)};
 }
@@ -55,24 +55,37 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
         return Status::unsupported;
     }
     for (size_t i = 1; i <= 2; ++i) {
-        if (inputs[i].dtype != dt) { return Status::invalid_argument; }
+        if (inputs[i].dtype != dt) {
+            return Status::invalid_argument;
+        }
     }
-    if (outputs[0].dtype != dt) { return Status::invalid_argument; }
+    if (outputs[0].dtype != dt) {
+        return Status::invalid_argument;
+    }
     // Slot 6 onwards is int32 metadata — run lengths, then the two varlen
     // offset vectors — not activations.
     constexpr size_t kSeqlensSlot = 6;
     for (size_t i = 3; i < inputs.size(); ++i) {
-        if (i >= kSeqlensSlot || inputs[i].rank == 0) { continue; }
-        if (inputs[i].dtype != dt) { return Status::invalid_argument; }
+        if (i >= kSeqlensSlot || inputs[i].rank == 0) {
+            continue;
+        }
+        if (inputs[i].dtype != dt) {
+            return Status::invalid_argument;
+        }
     }
     const auto& q = inputs[0];
     const auto& k = inputs[1];
     const auto& v = inputs[2];
-    if (q.rank != 3 && q.rank != 4) { return Status::invalid_argument; }
-    if (k.rank != q.rank || v.rank != q.rank) { return Status::invalid_argument; }
-    if (attrs_.num_heads <= 0) { return Status::invalid_argument; }
-    if (!(attrs_.softcap >= 0.0f) || !std::isfinite(attrs_.softcap) ||
-        attrs_.window < 0) {
+    if (q.rank != 3 && q.rank != 4) {
+        return Status::invalid_argument;
+    }
+    if (k.rank != q.rank || v.rank != q.rank) {
+        return Status::invalid_argument;
+    }
+    if (attrs_.num_heads <= 0) {
+        return Status::invalid_argument;
+    }
+    if (!(attrs_.softcap >= 0.0f) || !std::isfinite(attrs_.softcap) || attrs_.window < 0) {
         return Status::invalid_argument;
     }
     if (inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0) {
@@ -85,19 +98,28 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
     if (q.rank == 3) {
         // [B, S, H*D]: every head shares the row, so K and V must be as wide.
         const int64_t hd = q.dims[2];
-        if (hd <= 0 || hd % attrs_.num_heads != 0) { return Status::invalid_argument; }
-        if (k.dims[0] != q.dims[0] || k.dims[2] != hd) { return Status::invalid_argument; }
-        if (v.dims[0] != q.dims[0] || v.dims[2] != hd) { return Status::invalid_argument; }
-        if (v.dims[1] != k.dims[1]) { return Status::invalid_argument; }
-    } else {
-        const int64_t d = q.dims[3];
-        if (d <= 0) { return Status::invalid_argument; }
-        if (k.dims[0] != q.dims[0] || k.dims[1] != attrs_.num_heads ||
-            k.dims[3] != d) {
+        if (hd <= 0 || hd % attrs_.num_heads != 0) {
             return Status::invalid_argument;
         }
-        if (v.dims[0] != q.dims[0] || v.dims[1] != attrs_.num_heads ||
-            v.dims[2] != k.dims[2] || v.dims[3] != d) {
+        if (k.dims[0] != q.dims[0] || k.dims[2] != hd) {
+            return Status::invalid_argument;
+        }
+        if (v.dims[0] != q.dims[0] || v.dims[2] != hd) {
+            return Status::invalid_argument;
+        }
+        if (v.dims[1] != k.dims[1]) {
+            return Status::invalid_argument;
+        }
+    } else {
+        const int64_t d = q.dims[3];
+        if (d <= 0) {
+            return Status::invalid_argument;
+        }
+        if (k.dims[0] != q.dims[0] || k.dims[1] != attrs_.num_heads || k.dims[3] != d) {
+            return Status::invalid_argument;
+        }
+        if (v.dims[0] != q.dims[0] || v.dims[1] != attrs_.num_heads || v.dims[2] != k.dims[2] ||
+            v.dims[3] != d) {
             return Status::invalid_argument;
         }
     }
@@ -111,7 +133,9 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
     // per-batch run length (seqlens_k), checked above.
     const bool has_past_k = inputs.size() > 4 && inputs[4].rank != 0;
     const bool has_past_v = inputs.size() > 5 && inputs[5].rank != 0;
-    if (has_past_k != has_past_v) { return Status::invalid_argument; }
+    if (has_past_k != has_past_v) {
+        return Status::invalid_argument;
+    }
     int64_t sk_past = 0;
     if (has_past_k) {
         const auto& pk = inputs[4];
@@ -120,7 +144,9 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
             return Status::invalid_argument;
         }
         for (int64_t i = 0; i < pk.rank; ++i) {
-            if (i == seq_dim) { continue; }
+            if (i == seq_dim) {
+                continue;
+            }
             if (pk.dims[i] != k.dims[i] || pv.dims[i] != v.dims[i]) {
                 return Status::invalid_argument;
             }
@@ -141,8 +167,8 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
                 return Status::invalid_argument;
             }
         } else if (m.rank == 4) {
-            if (m.dims[0] != q.dims[0] || m.dims[1] != attrs_.num_heads ||
-                m.dims[2] != sq || m.dims[3] != sk_all) {
+            if (m.dims[0] != q.dims[0] || m.dims[1] != attrs_.num_heads || m.dims[2] != sq ||
+                m.dims[3] != sk_all) {
                 return Status::invalid_argument;
             }
         } else {
@@ -153,20 +179,22 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
     // Varlen: the int32 [segments + 1] prefix offsets of a packed batch, after
     // seqlens_k. Exclusive with the mask, the past pair, seqlens_k and a global
     // position_offset — the segments are independent documents.
-    const bool has_seqlens =
-        inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0;
+    const bool has_seqlens = inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0;
     const bool has_cu_q = inputs.size() > 7 && inputs[7].rank != 0;
     const bool has_cu_k = inputs.size() > 8 && inputs[8].rank != 0;
-    if (has_cu_q != has_cu_k) { return Status::invalid_argument; }
+    if (has_cu_q != has_cu_k) {
+        return Status::invalid_argument;
+    }
     if (has_cu_q) {
         const auto& cq = inputs[7];
         const auto& ck = inputs[8];
-        if (cq.dtype != DataType::s32 || ck.dtype != DataType::s32 ||
-            cq.rank != 1 || ck.rank != 1 || cq.dims[0] != ck.dims[0] ||
-            cq.dims[0] < 2) {
+        if (cq.dtype != DataType::s32 || ck.dtype != DataType::s32 || cq.rank != 1 ||
+            ck.rank != 1 || cq.dims[0] != ck.dims[0] || cq.dims[0] < 2) {
             return Status::invalid_argument;
         }
-        if (q.rank != 3 || q.dims[0] != 1) { return Status::invalid_argument; }
+        if (q.rank != 3 || q.dims[0] != 1) {
+            return Status::invalid_argument;
+        }
         if (has_past_k || has_seqlens || attrs_.position_offset >= 0) {
             return Status::invalid_argument;
         }
@@ -180,40 +208,52 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
     constexpr size_t kGateSlot = 9;
     const bool has_gate = inputs.size() > kGateSlot && inputs[kGateSlot].rank != 0;
     if (attrs_.output_gate != EpilogueActivateType::None) {
-        if (!has_gate) { return Status::invalid_argument; }
+        if (!has_gate) {
+            return Status::invalid_argument;
+        }
         const auto& g = inputs[kGateSlot];
-        if (g.dtype != dt) { return Status::invalid_argument; }
-        if (g.rank != q.rank) { return Status::invalid_argument; }
+        if (g.dtype != dt) {
+            return Status::invalid_argument;
+        }
+        if (g.rank != q.rank) {
+            return Status::invalid_argument;
+        }
         for (int64_t i = 0; i < q.rank; ++i) {
-            if (g.dims[i] != q.dims[i]) { return Status::invalid_argument; }
+            if (g.dims[i] != q.dims[i]) {
+                return Status::invalid_argument;
+            }
         }
     } else if (has_gate) {
         return Status::invalid_argument;
     }
 
     // Every query row must sit inside the run it attends to.
-    if (attrs_.causal && attrs_.position_offset >= 0 &&
-        attrs_.position_offset + sq > sk_all) {
+    if (attrs_.causal && attrs_.position_offset >= 0 && attrs_.position_offset + sq > sk_all) {
         return Status::invalid_argument;
     }
     return Status::ok;
 }
 
 Status MultiHeadAttention::compute(std::span<TensorView> outputs,
-                                   std::span<const TensorView> inputs,
-                                   const ComputeContext& ctx,
+                                   std::span<const TensorView> inputs, const ComputeContext& ctx,
                                    void* workspace)
 {
     // The optional mask and past segments are allowed to arrive as empty views
     // (meaning absent), so only the three required inputs are checked for data.
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 10, 1));
     for (size_t i = 0; i < 3; ++i) {
-        if (inputs[i].is_empty()) { return Status::invalid_argument; }
+        if (inputs[i].is_empty()) {
+            return Status::invalid_argument;
+        }
     }
-    if (outputs[0].is_empty()) { return Status::invalid_argument; }
+    if (outputs[0].is_empty()) {
+        return Status::invalid_argument;
+    }
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

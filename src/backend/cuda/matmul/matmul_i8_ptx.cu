@@ -35,14 +35,12 @@ constexpr int kI8DefaultTile = 0;
 /// A dynamic shared memory request above 48 KB needs the opt-in, once per
 /// instantiation; these tiles fit under it, and setting it is still the contract
 /// the other hand-written GEMMs share.
-template <class S, class AElem, bool Dequant>
-bool i8_prepare()
+template <class S, class AElem, bool Dequant> bool i8_prepare()
 {
     static const bool ok = [] {
         const int bytes = S::kSmemBytes;
         const auto set = [bytes](const void* fn) {
-            return cudaFuncSetAttribute(
-                       fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) ==
+            return cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) ==
                    cudaSuccess;
         };
         if (!set(reinterpret_cast<const void*>(
@@ -62,15 +60,15 @@ bool i8_prepare()
 }
 
 template <class S, class AElem, bool Dequant>
-bool i8_run(GemmI8Params q, bool trans_a, bool trans_b, int batch,
-            cudaStream_t stream)
+bool i8_run(GemmI8Params q, bool trans_a, bool trans_b, int batch, cudaStream_t stream)
 {
-    if (!i8_prepare<S, AElem, Dequant>()) { return false; }
+    if (!i8_prepare<S, AElem, Dequant>()) {
+        return false;
+    }
     // One dimensional in (m, n): the kernel's L2 raster decodes the pair, so a
     // wave shares an operand band instead of walking the n axis.
-    const dim3 grid(unsigned(((q.g.m + S::BM - 1) / S::BM) *
-                             ((q.g.n + S::BN - 1) / S::BN)),
-                    1, unsigned(batch));
+    const dim3 grid(unsigned(((q.g.m + S::BM - 1) / S::BM) * ((q.g.n + S::BN - 1) / S::BN)), 1,
+                    unsigned(batch));
     constexpr int kSmem = S::kSmemBytes;
     if (trans_a && trans_b) {
         manual_gemm_i8_kernel<S, AElem, true, true, Dequant>
@@ -89,20 +87,20 @@ bool i8_run(GemmI8Params q, bool trans_a, bool trans_b, int batch,
 }
 
 template <class AElem, bool Dequant>
-bool i8_run_tile(GemmI8Params q, bool trans_a, bool trans_b, int batch,
-                 cudaStream_t stream, int tile)
+bool i8_run_tile(GemmI8Params q, bool trans_a, bool trans_b, int batch, cudaStream_t stream,
+                 int tile)
 {
     switch (tile) {
-    case 0: return i8_run<I8Tile0, AElem, Dequant>(q, trans_a, trans_b, batch,
-                                                   stream);
-    case 1: return i8_run<I8Tile1, AElem, Dequant>(q, trans_a, trans_b, batch,
-                                                   stream);
-    default: return i8_run<I8Tile2, AElem, Dequant>(q, trans_a, trans_b, batch,
-                                                    stream);
+    case 0:
+        return i8_run<I8Tile0, AElem, Dequant>(q, trans_a, trans_b, batch, stream);
+    case 1:
+        return i8_run<I8Tile1, AElem, Dequant>(q, trans_a, trans_b, batch, stream);
+    default:
+        return i8_run<I8Tile2, AElem, Dequant>(q, trans_a, trans_b, batch, stream);
     }
 }
 
-}  // namespace detail
+} // namespace detail
 
 /// Which menu row the automatic path takes. Both choices are the fill's: the two
 /// poses differ in which operand arrives along the wrong axis, and a transposed
@@ -127,13 +125,19 @@ int i8_auto_tile(const GemmParams& g, bool trans_b)
 /// The hand-written int8 tile. `tile` picks a candidate explicitly (-1 takes the
 /// default row); false means the caller keeps its own engine, which is the
 /// contract for a pose this kernel does not cover.
-bool manual_dense_i8_tile(GemmI8Params q, DataType a_dt, bool trans_a,
-                          bool trans_b, cudaStream_t stream, int tile)
+bool manual_dense_i8_tile(GemmI8Params q, DataType a_dt, bool trans_a, bool trans_b,
+                          cudaStream_t stream, int tile)
 {
-    if (a_dt != DataType::s8 && a_dt != DataType::u8) { return false; }
+    if (a_dt != DataType::s8 && a_dt != DataType::u8) {
+        return false;
+    }
     const GemmParams& g = q.g;
-    if (g.m <= 0 || g.n <= 0 || g.k <= 0) { return false; }
-    if (q.r_a == nullptr || q.r_b == nullptr) { return false; }
+    if (g.m <= 0 || g.n <= 0 || g.k <= 0) {
+        return false;
+    }
+    if (q.r_a == nullptr || q.r_b == nullptr) {
+        return false;
+    }
     // The transposed-side fills read 4-byte words out of a source whose
     // contiguous run is along the other axis, so both the base and the row pitch
     // have to be word-addressable. The k-contiguous fills have their own byte
@@ -141,24 +145,29 @@ bool manual_dense_i8_tile(GemmI8Params q, DataType a_dt, bool trans_a,
     const auto word_ok = [](const void* p, int64_t ld) {
         return (reinterpret_cast<uintptr_t>(p) % 4 == 0) && (ld % 4 == 0);
     };
-    if (trans_a && !word_ok(g.a, g.lda)) { return false; }
-    if (!trans_b && !word_ok(g.b, g.ldb)) { return false; }
+    if (trans_a && !word_ok(g.a, g.lda)) {
+        return false;
+    }
+    if (!trans_b && !word_ok(g.b, g.ldb)) {
+        return false;
+    }
     const int batch = detail::gemm_batch_count(g);
-    if (batch <= 0) { return false; }
-    if (tile < 0) { tile = i8_auto_tile(g, trans_b); }
-    if (tile >= detail::kI8TileCount) { tile = detail::kI8DefaultTile; }
+    if (batch <= 0) {
+        return false;
+    }
+    if (tile < 0) {
+        tile = i8_auto_tile(g, trans_b);
+    }
+    if (tile >= detail::kI8TileCount) {
+        tile = detail::kI8DefaultTile;
+    }
     const bool dequant = q.out == I8OutKind::F32 || q.out == I8OutKind::F16;
     if (a_dt == DataType::u8) {
-        return dequant
-                   ? detail::i8_run_tile<uint8_t, true>(q, trans_a, trans_b,
-                                                        batch, stream, tile)
-                   : detail::i8_run_tile<uint8_t, false>(q, trans_a, trans_b,
-                                                         batch, stream, tile);
+        return dequant ?
+                   detail::i8_run_tile<uint8_t, true>(q, trans_a, trans_b, batch, stream, tile) :
+                   detail::i8_run_tile<uint8_t, false>(q, trans_a, trans_b, batch, stream, tile);
     }
-    return dequant
-               ? detail::i8_run_tile<int8_t, true>(q, trans_a, trans_b, batch,
-                                                   stream, tile)
-               : detail::i8_run_tile<int8_t, false>(q, trans_a, trans_b, batch,
-                                                    stream, tile);
+    return dequant ? detail::i8_run_tile<int8_t, true>(q, trans_a, trans_b, batch, stream, tile) :
+                     detail::i8_run_tile<int8_t, false>(q, trans_a, trans_b, batch, stream, tile);
 }
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

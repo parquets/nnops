@@ -44,8 +44,8 @@ constexpr int kSmallMRows = 16;
 constexpr int kSmallMThreads = 128;
 constexpr int kSmallMVec = 4;
 constexpr int kSmallMBn = kSmallMThreads * kSmallMVec;
-constexpr int kSmallMK = 32;       ///< k per staged A chunk
-constexpr int kSmallMUnroll = 16;  ///< rows of B in flight before the converts
+constexpr int kSmallMK = 32;      ///< k per staged A chunk
+constexpr int kSmallMUnroll = 16; ///< rows of B in flight before the converts
 
 /// The transposed-operand loop keeps the thread count and the k chunk, but a
 /// thread owns one column instead of four, so a block is 128 columns wide.
@@ -76,7 +76,9 @@ __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(Gemm
     int kt_begin = 0;
     int kt_count = 0;
     gemm_split_range(p, KC, split, kt_begin, kt_count);
-    if (kt_count <= 0) { return; }
+    if (kt_count <= 0) {
+        return;
+    }
     const int k_begin = kt_begin * KC;
     const int k_end = min(K, (kt_begin + kt_count) * KC);
 
@@ -86,7 +88,9 @@ __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(Gemm
 #pragma unroll
     for (int m = 0; m < BM; ++m) {
 #pragma unroll
-        for (int v = 0; v < VEC; ++v) { acc[m][v] = 0.0f; }
+        for (int v = 0; v < VEC; ++v) {
+            acc[m][v] = 0.0f;
+        }
     }
 
     for (int k0 = k_begin; k0 < k_end; k0 += KC) {
@@ -114,12 +118,12 @@ __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(Gemm
                     b[j][3] = v.w;
                 } else {
                     const uint2 raw = *reinterpret_cast<const uint2*>(src);
-                    const float2 f0 = __half22float2(__halves2half2(
-                        __ushort_as_half(uint16_t(raw.x)),
-                        __ushort_as_half(uint16_t(raw.x >> 16))));
-                    const float2 f1 = __half22float2(__halves2half2(
-                        __ushort_as_half(uint16_t(raw.y)),
-                        __ushort_as_half(uint16_t(raw.y >> 16))));
+                    const float2 f0 =
+                        __half22float2(__halves2half2(__ushort_as_half(uint16_t(raw.x)),
+                                                      __ushort_as_half(uint16_t(raw.x >> 16))));
+                    const float2 f1 =
+                        __half22float2(__halves2half2(__ushort_as_half(uint16_t(raw.y)),
+                                                      __ushort_as_half(uint16_t(raw.y >> 16))));
                     b[j][0] = f0.x;
                     b[j][1] = f0.y;
                     b[j][2] = f1.x;
@@ -152,11 +156,9 @@ __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(Gemm
             } else {
                 const uint2 raw = *reinterpret_cast<const uint2*>(src);
                 const float2 f0 = __half22float2(__halves2half2(
-                    __ushort_as_half(uint16_t(raw.x)),
-                    __ushort_as_half(uint16_t(raw.x >> 16))));
+                    __ushort_as_half(uint16_t(raw.x)), __ushort_as_half(uint16_t(raw.x >> 16))));
                 const float2 f1 = __half22float2(__halves2half2(
-                    __ushort_as_half(uint16_t(raw.y)),
-                    __ushort_as_half(uint16_t(raw.y >> 16))));
+                    __ushort_as_half(uint16_t(raw.y)), __ushort_as_half(uint16_t(raw.y >> 16))));
                 b[0] = f0.x;
                 b[1] = f0.y;
                 b[2] = f1.x;
@@ -166,29 +168,36 @@ __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(Gemm
             for (int m = 0; m < BM; ++m) {
                 const float a = sA[m][kk];
 #pragma unroll
-                for (int v = 0; v < VEC; ++v) { acc[m][v] += a * b[v]; }
+                for (int v = 0; v < VEC; ++v) {
+                    acc[m][v] += a * b[v];
+                }
             }
         }
     }
 
-    float* part = p.partial +
-                  (static_cast<int64_t>(gemm_block_batch(p)) * p.k_splits + split) *
-                      static_cast<int64_t>(M) * N;
-    if (ncol >= N) { return; }
+    float* part = p.partial + (static_cast<int64_t>(gemm_block_batch(p)) * p.k_splits + split) *
+                                  static_cast<int64_t>(M) * N;
+    if (ncol >= N) {
+        return;
+    }
     const int lim = min(VEC, N - ncol);
 #pragma unroll
     for (int m = 0; m < BM; ++m) {
-        if (m >= M) { continue; }
+        if (m >= M) {
+            continue;
+        }
         const int64_t base = static_cast<int64_t>(m) * N + ncol;
-        for (int v = 0; v < lim; ++v) { part[base + v] = acc[m][v]; }
+        for (int v = 0; v < lim; ++v) {
+            part[base + v] = acc[m][v];
+        }
     }
 }
 
 /// True when the narrow-m loop owns this product. It reads A as [m][k] and B as
 /// [k][n], both row-major, one matrix at a time, and hands the epilogue to the
 /// split reduction; every other layout and shape stays on the tiled path.
-inline bool small_m_applies(const GemmParams& p, GemmElem elem, bool trans_a,
-                            bool trans_b, bool vectorized)
+inline bool small_m_applies(const GemmParams& p, GemmElem elem, bool trans_a, bool trans_b,
+                            bool vectorized)
 {
     return vectorized && !trans_a && !trans_b && p.m >= 1 && p.m <= kSmallMRows &&
            p.n >= kSmallMVec && p.k >= 1024 && gemm_batch_count(p) == 1 &&
@@ -216,29 +225,35 @@ inline bool small_m_applies(const GemmParams& p, GemmElem elem, bool trans_a,
 inline int small_m_splits(const GemmParams& p)
 {
     const int forced = splitk_env();
-    if (forced == 0) { return 1; }
+    if (forced == 0) {
+        return 1;
+    }
     const int k_tiles = int((p.k + kSmallMK - 1) / kSmallMK);
-    if (forced > 1) { return std::max(1, std::min({forced, k_tiles, 16})); }
+    if (forced > 1) {
+        return std::max(1, std::min({forced, k_tiles, 16}));
+    }
 
     const int64_t plane = int64_t(p.m) * p.n * int64_t(sizeof(float));
     int splits = int(std::min<int64_t>(std::max<int64_t>(p.k * 3 / 1024, 1), 16));
     const int64_t l2 = device_l2_bytes();
     if (l2 > 0) {
-        splits = int(std::min<int64_t>(
-            splits, std::max<int64_t>(l2 * 9 / 8 / plane, 1)));
+        splits = int(std::min<int64_t>(splits, std::max<int64_t>(l2 * 9 / 8 / plane, 1)));
     }
     splits = std::min(splits, k_tiles);
-    while (splits > 1 && int64_t(splits) * plane > kSplitKMaxBytes) { splits /= 2; }
+    while (splits > 1 && int64_t(splits) * plane > kSplitKMaxBytes) {
+        splits /= 2;
+    }
     return splits;
 }
 
-template <class Elem>
-inline bool launch_small_m(const GemmParams& p, cudaStream_t stream)
+template <class Elem> inline bool launch_small_m(const GemmParams& p, cudaStream_t stream)
 {
     const int splits = small_m_splits(p);
     const int64_t bytes = int64_t(splits) * p.m * p.n * int64_t(sizeof(float));
     const GemmWorkspace ws = gemm_workspace_alloc(bytes, stream);
-    if (ws.ptr == nullptr) { return false; }
+    if (ws.ptr == nullptr) {
+        return false;
+    }
 
     GemmParams q = p;
     q.k_splits = splits;
@@ -283,15 +298,14 @@ inline bool launch_small_m(const GemmParams& p, cudaStream_t stream)
 /// one `half2`. The 34-half row is 17 words, still coprime with the 32 banks,
 /// so the column walk stays conflict-free either way.
 template <class Elem, int BM>
-__global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(
-    GemmParams p)
+__global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(GemmParams p)
 {
     constexpr int THREADS = kSmallNTCols;
     constexpr int COLS = THREADS;
     constexpr int ES = int(sizeof(Elem));
     constexpr int KC = kSmallNTK;
-    constexpr int VE = 16 / ES;  ///< elements per staged load
-    constexpr int NG = KC / VE;  ///< staged loads per column
+    constexpr int VE = 16 / ES; ///< elements per staged load
+    constexpr int NG = KC / VE; ///< staged loads per column
     constexpr int BPAD = ES == 2 ? 2 : 1;
     constexpr int APAD = (BM + 3) & ~3;
 
@@ -309,7 +323,9 @@ __global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(
     int kt_begin = 0;
     int kt_count = 0;
     gemm_split_range(p, KC, split, kt_begin, kt_count);
-    if (kt_count <= 0) { return; }
+    if (kt_count <= 0) {
+        return;
+    }
     const int k_begin = kt_begin * KC;
     const int k_end = min(K, (kt_begin + kt_count) * KC);
 
@@ -318,9 +334,11 @@ __global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(
 
     float acc[BM];
 #pragma unroll
-    for (int m = 0; m < BM; ++m) { acc[m] = 0.0f; }
+    for (int m = 0; m < BM; ++m) {
+        acc[m] = 0.0f;
+    }
 
-    constexpr int AR = (BM * KC + THREADS - 1) / THREADS;  ///< A per thread
+    constexpr int AR = (BM * KC + THREADS - 1) / THREADS; ///< A per thread
     constexpr int NA = BM * KC;
 
     uint4 rb[NG];
@@ -352,8 +370,7 @@ __global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(
 #pragma unroll
                 for (int t = 0; t < VE; ++t) {
                     const int kk = kb + t;
-                    e[t] = (g < N && kk < kc) ? B[int64_t(g) * ldb + k0 + kk]
-                                              : Elem(0);
+                    e[t] = (g < N && kk < kc) ? B[int64_t(g) * ldb + k0 + kk] : Elem(0);
                 }
             }
         }
@@ -362,9 +379,7 @@ __global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(
             const int i = tid + j * THREADS;
             const int m = i / KC;
             const int kk = i - m * KC;
-            ra[j] = (i < NA && m < M && kk < kc)
-                        ? A[int64_t(m) * lda + k0 + kk]
-                        : Elem(0);
+            ra[j] = (i < NA && m < M && kk < kc) ? A[int64_t(m) * lda + k0 + kk] : Elem(0);
         }
     };
 
@@ -384,7 +399,9 @@ __global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(
             } else {
                 const Elem* e = reinterpret_cast<const Elem*>(&rb[j]);
 #pragma unroll
-                for (int t = 0; t < VE; ++t) { sB[c][kb + t] = e[t]; }
+                for (int t = 0; t < VE; ++t) {
+                    sB[c][kb + t] = e[t];
+                }
             }
         }
 #pragma unroll
@@ -397,15 +414,21 @@ __global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(
         }
     };
 
-    if constexpr (kPrefetch) { fetch(k_begin); }
+    if constexpr (kPrefetch) {
+        fetch(k_begin);
+    }
     for (int k0 = k_begin; k0 < k_end; k0 += KC) {
         const int kc = min(KC, k_end - k0);
         __syncthreads();
-        if constexpr (!kPrefetch) { fetch(k0); }
+        if constexpr (!kPrefetch) {
+            fetch(k0);
+        }
         store();
         __syncthreads();
         if constexpr (kPrefetch) {
-            if (k0 + KC < k_end) { fetch(k0 + KC); }
+            if (k0 + KC < k_end) {
+                fetch(k0 + KC);
+            }
         }
 
         const auto rank1 = [&](int kk, float b) {
@@ -419,30 +442,35 @@ __global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(
                 av[m + 3] = v.w;
             }
 #pragma unroll
-            for (int m = 0; m < BM; ++m) { acc[m] += av[m] * b; }
+            for (int m = 0; m < BM; ++m) {
+                acc[m] += av[m] * b;
+            }
         };
 
         int kk = 0;
         if constexpr (ES == 2) {
             for (; kk + 1 < kc; kk += 2) {
-                const uint32_t w =
-                    *reinterpret_cast<const uint32_t*>(&sB[tid][kk]);
-                const float2 b2 =
-                    __half22float2(*reinterpret_cast<const __half2*>(&w));
+                const uint32_t w = *reinterpret_cast<const uint32_t*>(&sB[tid][kk]);
+                const float2 b2 = __half22float2(*reinterpret_cast<const __half2*>(&w));
                 rank1(kk, b2.x);
                 rank1(kk + 1, b2.y);
             }
         }
-        for (; kk < kc; ++kk) { rank1(kk, float(sB[tid][kk])); }
+        for (; kk < kc; ++kk) {
+            rank1(kk, float(sB[tid][kk]));
+        }
     }
 
-    float* part = p.partial +
-                  (static_cast<int64_t>(gemm_block_batch(p)) * p.k_splits + split) *
-                      static_cast<int64_t>(M) * N;
-    if (col >= N) { return; }
+    float* part = p.partial + (static_cast<int64_t>(gemm_block_batch(p)) * p.k_splits + split) *
+                                  static_cast<int64_t>(M) * N;
+    if (col >= N) {
+        return;
+    }
 #pragma unroll
     for (int m = 0; m < BM; ++m) {
-        if (m < M) { part[static_cast<int64_t>(m) * N + col] = acc[m]; }
+        if (m < M) {
+            part[static_cast<int64_t>(m) * N + col] = acc[m];
+        }
     }
 }
 
@@ -457,12 +485,18 @@ __global__ __launch_bounds__(kSmallNTCols) void dense_gemm_small_nt_kernel(
 /// 1024 columns, because a 64-row mma block's wasted rows cost nothing when the
 /// B stream is the limit. At one row the tiles do pay for them, 0.136 against
 /// this loop's 0.110, so the GEMV stays here.
-inline bool small_nt_applies(const GemmParams& p, GemmElem elem, bool trans_a,
-                             bool trans_b, bool vectorized)
+inline bool small_nt_applies(const GemmParams& p, GemmElem elem, bool trans_a, bool trans_b,
+                             bool vectorized)
 {
-    if (!vectorized || trans_a || !trans_b) { return false; }
-    if (p.m < 1 || p.m > kSmallMRows || p.n < 1 || p.k < 1024) { return false; }
-    if (gemm_batch_count(p) != 1) { return false; }
+    if (!vectorized || trans_a || !trans_b) {
+        return false;
+    }
+    if (p.m < 1 || p.m > kSmallMRows || p.n < 1 || p.k < 1024) {
+        return false;
+    }
+    if (gemm_batch_count(p) != 1) {
+        return false;
+    }
     return elem == GemmElem::F32 || (elem == GemmElem::F16 && p.m == 1);
 }
 
@@ -475,29 +509,35 @@ inline bool small_nt_applies(const GemmParams& p, GemmElem elem, bool trans_a,
 inline int small_nt_splits(const GemmParams& p)
 {
     const int forced = splitk_env();
-    if (forced == 0) { return 1; }
+    if (forced == 0) {
+        return 1;
+    }
     const int k_tiles = int((p.k + kSmallNTK - 1) / kSmallNTK);
-    if (forced > 1) { return std::max(1, std::min({forced, k_tiles, 16})); }
+    if (forced > 1) {
+        return std::max(1, std::min({forced, k_tiles, 16}));
+    }
 
     const int64_t plane = int64_t(p.m) * p.n * int64_t(sizeof(float));
     int splits = int(std::min<int64_t>(std::max<int64_t>(p.k / 512, 1), 8));
     const int64_t l2 = device_l2_bytes();
     if (l2 > 0) {
-        splits = int(std::min<int64_t>(
-            splits, std::max<int64_t>(l2 * 9 / 8 / plane, 1)));
+        splits = int(std::min<int64_t>(splits, std::max<int64_t>(l2 * 9 / 8 / plane, 1)));
     }
     splits = std::min(splits, k_tiles);
-    while (splits > 1 && int64_t(splits) * plane > kSplitKMaxBytes) { splits /= 2; }
+    while (splits > 1 && int64_t(splits) * plane > kSplitKMaxBytes) {
+        splits /= 2;
+    }
     return splits;
 }
 
-template <class Elem>
-inline bool launch_small_nt(const GemmParams& p, cudaStream_t stream)
+template <class Elem> inline bool launch_small_nt(const GemmParams& p, cudaStream_t stream)
 {
     const int splits = small_nt_splits(p);
     const int64_t bytes = int64_t(splits) * p.m * p.n * int64_t(sizeof(float));
     const GemmWorkspace ws = gemm_workspace_alloc(bytes, stream);
-    if (ws.ptr == nullptr) { return false; }
+    if (ws.ptr == nullptr) {
+        return false;
+    }
 
     GemmParams q = p;
     q.k_splits = splits;
@@ -509,14 +549,13 @@ inline bool launch_small_nt(const GemmParams& p, cudaStream_t stream)
     } else if (p.m <= 4) {
         dense_gemm_small_nt_kernel<Elem, 4><<<grid, kSmallNTCols, 0, stream>>>(q);
     } else {
-        dense_gemm_small_nt_kernel<Elem, kSmallMRows>
-            <<<grid, kSmallNTCols, 0, stream>>>(q);
+        dense_gemm_small_nt_kernel<Elem, kSmallMRows><<<grid, kSmallNTCols, 0, stream>>>(q);
     }
     launch_splitk_reduce<Elem>(q, stream);
     gemm_workspace_free(ws, stream);
     return true;
 }
 
-}  // namespace detail
+} // namespace detail
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

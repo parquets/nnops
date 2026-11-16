@@ -19,9 +19,8 @@ namespace nnops::backend::cpu {
 /// Decompose a row-major flat index over [dim_lo, dim_hi] (dim_hi innermost)
 /// into a strided element offset; `skip_dim` (-1 = none) excludes one dimension,
 /// letting axis-wise operators flatten "all dims except `axis`".
-inline int64_t decompose_flat_offset(int64_t flat, const TensorView& t,
-                                     int64_t dim_lo, int64_t dim_hi,
-                                     int64_t skip_dim = -1)
+inline int64_t decompose_flat_offset(int64_t flat, const TensorView& t, int64_t dim_lo,
+                                     int64_t dim_hi, int64_t skip_dim = -1)
 {
     int64_t off = 0;
     int64_t rem = flat;
@@ -38,16 +37,14 @@ inline int64_t decompose_flat_offset(int64_t flat, const TensorView& t,
 
 /// Offset table for `count` consecutive flat indices over [dim_lo, dim_hi]
 /// (see decompose_flat_offset); the general non-contiguous paths build it once.
-inline PoolArray<int64_t> build_offsets(const TensorView& t,
-                                        int64_t dim_lo, int64_t dim_hi,
+inline PoolArray<int64_t> build_offsets(const TensorView& t, int64_t dim_lo, int64_t dim_hi,
                                         int64_t count)
 {
     PoolArray<int64_t> offs(static_cast<size_t>(count));
     for (int64_t flat = 0; flat < count; ++flat) {
-        offs[static_cast<size_t>(flat)] =
-            decompose_flat_offset(flat, t, dim_lo, dim_hi);
+        offs[static_cast<size_t>(flat)] = decompose_flat_offset(flat, t, dim_lo, dim_hi);
     }
     return offs;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

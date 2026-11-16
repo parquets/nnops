@@ -26,11 +26,8 @@ using nnops::simd::s_load;
 using nnops::simd::s_store;
 
 template <typename T>
-void topk_impl(const TopKAttributes& attrs,
-                TensorView& values_out,
-                TensorView& indices_out,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx)
+void topk_impl(const TopKAttributes& attrs, TensorView& values_out, TensorView& indices_out,
+               std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& in = inputs[0];
     const int64_t rank = in.rank();
@@ -78,9 +75,7 @@ void topk_impl(const TopKAttributes& attrs,
         int64_t index;
     };
 
-    auto worst_cmp = [is_max](float a, float b) {
-        return is_max ? (a < b) : (a > b);
-    };
+    auto worst_cmp = [is_max](float a, float b) { return is_max ? (a < b) : (a > b); };
 
     // Process each (outer, inner) position. Parallelize over outer dims
     // when there are enough positions.
@@ -89,18 +84,15 @@ void topk_impl(const TopKAttributes& attrs,
         PoolArray<Pair> heap(static_cast<size_t>(k));
 
         for (int64_t inner = 0; inner < inner_size; ++inner) {
-            const int64_t i_base = detail::axis_group_offset(outer, pre) +
-                                   detail::axis_group_offset(inner, post);
+            const int64_t i_base =
+                detail::axis_group_offset(outer, pre) + detail::axis_group_offset(inner, post);
 
             for (int64_t j = 0; j < k; ++j) {
-                heap[static_cast<size_t>(j)] = {
-                    s_load(i_ptr + i_base + j * axis_stride), j};
+                heap[static_cast<size_t>(j)] = {s_load(i_ptr + i_base + j * axis_stride), j};
             }
 
             std::sort(heap.begin(), heap.end(),
-                [&](const Pair& a, const Pair& b) {
-                    return worst_cmp(a.value, b.value);
-                });
+                      [&](const Pair& a, const Pair& b) { return worst_cmp(a.value, b.value); });
 
             for (int64_t j = k; j < axis_dim; ++j) {
                 float val = s_load(i_ptr + i_base + j * axis_stride);
@@ -108,24 +100,19 @@ void topk_impl(const TopKAttributes& attrs,
                     heap[0] = {val, j};
                     // Re-sort: heap[0] is the worst candidate (easiest to replace).
                     // After replacement the heap may be out of order — re-sort.
-                    std::sort(heap.begin(), heap.end(),
-                        [&](const Pair& a, const Pair& b) {
-                            return worst_cmp(a.value, b.value);
-                        });
+                    std::sort(heap.begin(), heap.end(), [&](const Pair& a, const Pair& b) {
+                        return worst_cmp(a.value, b.value);
+                    });
                 }
             }
 
             if (sorted_opt) {
                 if (is_max) {
                     std::sort(heap.begin(), heap.end(),
-                        [](const Pair& a, const Pair& b) {
-                            return a.value > b.value;
-                        });
+                              [](const Pair& a, const Pair& b) { return a.value > b.value; });
                 } else {
                     std::sort(heap.begin(), heap.end(),
-                        [](const Pair& a, const Pair& b) {
-                            return a.value < b.value;
-                        });
+                              [](const Pair& a, const Pair& b) { return a.value < b.value; });
                 }
             }
 
@@ -140,12 +127,8 @@ void topk_impl(const TopKAttributes& attrs,
     ctx.cpu.run(0, outer_dims, process_outer);
 }
 
-Status topk_cpu(const TopKAttributes& attrs,
-               TensorView& values,
-               TensorView& indices,
-               std::span<const TensorView> inputs,
-               const ComputeContext& ctx,
-               void* /*workspace*/)
+Status topk_cpu(const TopKAttributes& attrs, TensorView& values, TensorView& indices,
+                std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "topk_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -154,4 +137,4 @@ Status topk_cpu(const TopKAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

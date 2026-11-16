@@ -28,10 +28,13 @@
 
 namespace nnops::backend::cuda {
 
-
 /// The dense GEMM's element formats: the f32 SIMT tile, or one of the two
 /// 2-byte tensor-core formats (same MMA shape, different operand format).
-enum class GemmElem { F32, F16, BF16 };
+enum class GemmElem {
+    F32,
+    F16,
+    BF16
+};
 
 /// The batch axes a kernel carries: with the two matrix axes a CUDA MatMul or
 /// Linear is rank six at most. `GemmParams::batch_size` is sized by this.
@@ -74,7 +77,7 @@ struct GemmParams {
     // second kernel sums the planes and applies the epilogue once. 1 means the
     // plain single-pass kernel and `partial` unused.
     int k_splits = 1;
-    float* partial = nullptr;  ///< [batch][split][m][n], row-major
+    float* partial = nullptr; ///< [batch][split][m][n], row-major
 
     int batch_rank = 0;
     int64_t batch_size[4] = {1, 1, 1, 1};
@@ -88,8 +91,8 @@ struct GemmParams {
 // Epilogue
 // ============================================================
 
-__device__ inline float gemm_apply_epilogue(
-    EpilogueActivateType ep, float alpha, float beta, float x)
+__device__ inline float gemm_apply_epilogue(EpilogueActivateType ep, float alpha, float beta,
+                                            float x)
 {
     switch (ep) {
     case EpilogueActivateType::None:
@@ -120,11 +123,9 @@ __device__ inline float gemm_apply_epilogue(
     return x;
 }
 
-template <class Elem>
-__device__ inline float gemm_to_float(Elem x) { return float(x); }
+template <class Elem> __device__ inline float gemm_to_float(Elem x) { return float(x); }
 
-template <>
-__device__ inline float gemm_to_float<float>(float x) { return x; }
+template <> __device__ inline float gemm_to_float<float>(float x) { return x; }
 
 // ============================================================
 // Shapes
@@ -138,15 +139,14 @@ constexpr int kGemmThreads = 128;
 /// the L1 carveout). A tile's `blocks` target has to fit under it.
 constexpr int kSmemPerSm = 100 * 1024;
 
-inline constexpr auto kGemmAtomK = cute::composition(
-    cute::Swizzle<3, 3, 3>{},
-    cute::Layout<cute::Shape<cute::_8, cute::Shape<cute::_8, cute::_8>>,
-                 cute::Stride<cute::_8, cute::Stride<cute::_1, cute::_64>>>{});
+inline constexpr auto kGemmAtomK =
+    cute::composition(cute::Swizzle<3, 3, 3>{},
+                      cute::Layout<cute::Shape<cute::_8, cute::Shape<cute::_8, cute::_8>>,
+                                   cute::Stride<cute::_8, cute::Stride<cute::_1, cute::_64>>>{});
 
 inline constexpr auto kGemmAtomMN = cute::composition(
     cute::Swizzle<3, 3, 3>{},
-    cute::Layout<cute::Shape<cute::_64, cute::_8>,
-                 cute::Stride<cute::_1, cute::_64>>{});
+    cute::Layout<cute::Shape<cute::_64, cute::_8>, cute::Stride<cute::_1, cute::_64>>{});
 
 /// A k tile narrower than the swizzle atom's 64 halves cannot use the XOR
 /// layout -- the atom would not divide it. An 8-half pad serves the same end by
@@ -162,8 +162,7 @@ constexpr auto gemm_smem_layout(BM bm, BK bk, P p)
             return cute::tile_to_shape(
                 cute::make_layout(
                     cute::make_shape(bm, bk),
-                    cute::make_stride(cute::Int<int(BK{}) + kGemmPadK>{},
-                                      cute::_1{})),
+                    cute::make_stride(cute::Int<int(BK{}) + kGemmPadK>{}, cute::_1{})),
                 cute::make_shape(bm, bk, p));
         } else {
             return cute::tile_to_shape(kGemmAtomK, cute::make_shape(bm, bk, p));
@@ -187,8 +186,7 @@ __device__ inline int gemm_block_split(const GemmParams& p)
     return p.k_splits > 1 ? int(blockIdx.z) % p.k_splits : 0;
 }
 
-__device__ inline int64_t gemm_batch_offset(const GemmParams& p,
-                                            const int64_t* strides,
+__device__ inline int64_t gemm_batch_offset(const GemmParams& p, const int64_t* strides,
                                             int64_t idx)
 {
     int64_t off = 0;
@@ -203,8 +201,8 @@ __device__ inline int64_t gemm_batch_offset(const GemmParams& p,
 /// The k-tile range a split owns, as [begin, begin + count). The bounds are
 /// proportional cuts of the tile count, so with `k_splits <= k_tiles` every
 /// split is non-empty and the ranges differ by at most one tile.
-__device__ inline void gemm_split_range(const GemmParams& p, int bK, int split,
-                                        int& kt_begin, int& kt_count)
+__device__ inline void gemm_split_range(const GemmParams& p, int bK, int split, int& kt_begin,
+                                        int& kt_count)
 {
     const int k_tiles = (p.k + bK - 1) / bK;
     if (p.k_splits <= 1) {
@@ -217,14 +215,16 @@ __device__ inline void gemm_split_range(const GemmParams& p, int bK, int split,
     kt_count = int(tiles * (split + 1) / p.k_splits) - kt_begin;
 }
 
-}  // namespace detail
+} // namespace detail
 
 namespace detail {
 
 inline int gemm_batch_count(const GemmParams& p)
 {
     int count = 1;
-    for (int d = 0; d < p.batch_rank; ++d) { count *= int(p.batch_size[d]); }
+    for (int d = 0; d < p.batch_rank; ++d) {
+        count *= int(p.batch_size[d]);
+    }
     return count;
 }
 
@@ -234,7 +234,9 @@ inline int device_sm_count()
     static const int count = [] {
         int dev = 0;
         int n = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) { return 0; }
+        if (cudaGetDevice(&dev) != cudaSuccess) {
+            return 0;
+        }
         if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
             return 0;
         }
@@ -249,7 +251,9 @@ inline int64_t device_l2_bytes()
     static const int64_t bytes = [] {
         int dev = 0;
         int n = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) { return int64_t{0}; }
+        if (cudaGetDevice(&dev) != cudaSuccess) {
+            return int64_t{0};
+        }
         if (cudaDeviceGetAttribute(&n, cudaDevAttrL2CacheSize, dev) != cudaSuccess) {
             return int64_t{0};
         }
@@ -258,6 +262,6 @@ inline int64_t device_l2_bytes()
     return bytes;
 }
 
-}  // namespace detail
+} // namespace detail
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

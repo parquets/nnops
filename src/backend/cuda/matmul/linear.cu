@@ -16,7 +16,7 @@
 #include "nnops/detail/bench_knobs.hpp"
 #include "matmul_op.cuh"
 #include "nnops/ops/linear.hpp"
-#include "nnops/ops/matmul.hpp"  // is_int8_matmul
+#include "nnops/ops/matmul.hpp" // is_int8_matmul
 
 namespace nnops::backend::cuda {
 
@@ -25,19 +25,22 @@ namespace {
 /// The integer route: x [.., M, K] × w [N, K]ᵀ, MatMulInteger semantics. The
 /// residual (add_to) is not folded into an integer destination yet.
 Status linear_i8_cuda(const LinearAttributes& attrs, TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx, I8OutKind kind)
+                      std::span<const TensorView> inputs, const ComputeContext& ctx, I8OutKind kind)
 {
     const TensorView& x = inputs[0];
     const TensorView& w = inputs[1];
     const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
 
-    if (attrs.add_to) { return Status::unsupported; }
+    if (attrs.add_to) {
+        return Status::unsupported;
+    }
 
     const int64_t M = x.shape(x.rank() - 2);
     const int64_t K = x.shape(x.rank() - 1);
     const int64_t N = w.shape(0);
-    if (w.shape(1) != K) { return Status::invalid_argument; }
+    if (w.shape(1) != K) {
+        return Status::invalid_argument;
+    }
 
     GemmI8Params q;
     q.g.a = x.ptr<void>();
@@ -71,39 +74,39 @@ Status linear_i8_cuda(const LinearAttributes& attrs, TensorView& output,
     q.sc_b_scalar = qw.scale;
 
     q.out = kind;
-    const bool int_out = kind == I8OutKind::S32 || kind == I8OutKind::S8 ||
-                         kind == I8OutKind::U8;
+    const bool int_out = kind == I8OutKind::S32 || kind == I8OutKind::S8 || kind == I8OutKind::U8;
     q.relu = int_out && attrs.epilogue.type == EpilogueActivateType::Relu;
     if (int_out) {
         const QuantParams& qc = output.quant_params();
         q.out_scale = qc.scale_data != nullptr ? qc.scale_data[0] : qc.scale;
-        q.out_zp = qc.zero_point_data != nullptr ? qc.zero_point_data[0]
-                                                 : qc.zero_point;
+        q.out_zp = qc.zero_point_data != nullptr ? qc.zero_point_data[0] : qc.zero_point;
     }
     if (bias != nullptr) {
         q.bias = int_out ? bias->ptr<int32_t>() : bias->ptr<void>();
     }
 
-    return dense_gemm_i8_status(
-        q, x.data_type(), /*transpose_a=*/false, /*transpose_b=*/true,
-        static_cast<cudaStream_t>(ctx.cuda_stream));
+    return dense_gemm_i8_status(q, x.data_type(), /*transpose_a=*/false, /*transpose_b=*/true,
+                                static_cast<cudaStream_t>(ctx.cuda_stream));
 }
 
-}  // namespace
+} // namespace
 
 Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx, void*)
+                   std::span<const TensorView> inputs, const ComputeContext& ctx, void*)
 {
     const TensorView& x = inputs[0];
     const TensorView& w = inputs[1];
     const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
 
     // The SwiGLU combine has no CUDA route yet; the op is CPU-only in that form.
-    if (attrs.gated) { return Status::unsupported; }
+    if (attrs.gated) {
+        return Status::unsupported;
+    }
     const DataType dt = x.data_type();
     if (is_int8_matmul(dt, w.data_type())) {
-        if (output.numel() == 0) { return Status::ok; }
+        if (output.numel() == 0) {
+            return Status::ok;
+        }
         I8OutKind kind;
         if (!i8_out_kind(output.data_type(), kind)) {
             return Status::unsupported;
@@ -114,12 +117,16 @@ Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
         w.data_type() != dt) {
         return Status::unsupported;
     }
-    if (output.numel() == 0) { return Status::ok; }
+    if (output.numel() == 0) {
+        return Status::ok;
+    }
 
     const int64_t M = x.shape(x.rank() - 2);
     const int64_t K = x.shape(x.rank() - 1);
     const int64_t N = w.shape(0);
-    if (w.shape(1) != K) { return Status::invalid_argument; }
+    if (w.shape(1) != K) {
+        return Status::invalid_argument;
+    }
 
     GemmParams p;
     p.a = x.ptr<void>();
@@ -181,8 +188,7 @@ Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
             call.b_bstr[d] = p.b_batch[d];
             call.c_bstr[d] = p.c_batch[d];
         }
-        if (manual_dense_h_call(call,
-                                static_cast<cudaStream_t>(ctx.cuda_stream))) {
+        if (manual_dense_h_call(call, static_cast<cudaStream_t>(ctx.cuda_stream))) {
             return Status::ok;
         }
     }
@@ -228,4 +234,4 @@ Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
                              static_cast<cudaStream_t>(ctx.cuda_stream));
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

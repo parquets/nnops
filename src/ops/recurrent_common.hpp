@@ -28,7 +28,7 @@ namespace nnops::detail {
 /// A recurrent op's attributes, reduced to what the kernel and the checks read.
 struct RecurrentSpec {
     RecurrentMode mode = RecurrentMode::Rnn;
-    int64_t hidden_size = 0;  ///< 0 infers from R's last axis
+    int64_t hidden_size = 0; ///< 0 infers from R's last axis
     int64_t directions = 1;
     RnnDirection direction = RnnDirection::Forward;
 
@@ -46,17 +46,18 @@ struct RecurrentSpec {
 
 /// The kernel an op's Impl resolves for its backend. `nullptr` is "no kernel on
 /// this backend", which compute() reports as Status::unsupported.
-using RecurrentKernelFn = Status (*)(const backend::cpu::RecurrentParams&,
-                                     std::span<TensorView>,
-                                     std::span<const TensorView>,
-                                     const ComputeContext&);
+using RecurrentKernelFn = Status (*)(const backend::cpu::RecurrentParams&, std::span<TensorView>,
+                                     std::span<const TensorView>, const ComputeContext&);
 
 /// Hidden width: the attribute when set, else R's last axis.
-inline int64_t recurrent_hidden(const RecurrentSpec& s,
-                                std::span<const TensorDesc> inputs) noexcept
+inline int64_t recurrent_hidden(const RecurrentSpec& s, std::span<const TensorDesc> inputs) noexcept
 {
-    if (s.hidden_size > 0) { return s.hidden_size; }
-    if (inputs.size() < 3 || inputs[2].rank < 3) { return 0; }
+    if (s.hidden_size > 0) {
+        return s.hidden_size;
+    }
+    if (inputs.size() < 3 || inputs[2].rank < 3) {
+        return 0;
+    }
     return inputs[2].dims[static_cast<size_t>(inputs[2].rank - 1)];
 }
 
@@ -64,25 +65,33 @@ inline int64_t recurrent_hidden(const RecurrentSpec& s,
 /// quantized, and then the compute dtype — the gate math, the state and every
 /// output — is the activation's floating type, f32 for an s8 activation.
 /// `weight_dtype` is anything else for the plain floating route.
-inline bool recurrent_is_quantized(DataType wdtype) noexcept {
-    return wdtype == DataType::s8;
-}
+inline bool recurrent_is_quantized(DataType wdtype) noexcept { return wdtype == DataType::s8; }
 
-inline DataType recurrent_compute_dtype(DataType xdtype, DataType wdtype) noexcept {
-    if (!recurrent_is_quantized(wdtype)) { return xdtype; }
-    return (xdtype == DataType::f16)  ? DataType::f16
-         : (xdtype == DataType::bf16) ? DataType::bf16
-                                      : DataType::f32;
+inline DataType recurrent_compute_dtype(DataType xdtype, DataType wdtype) noexcept
+{
+    if (!recurrent_is_quantized(wdtype)) {
+        return xdtype;
+    }
+    return (xdtype == DataType::f16)  ? DataType::f16 :
+           (xdtype == DataType::bf16) ? DataType::bf16 :
+                                        DataType::f32;
 }
 
 /// The quantized route's activation requirement. A floating activation is
 /// quantized per row inside the kernel, so it needs nothing; an s8 one carries
 /// its own per-row (or per-tensor) symmetric scale.
-inline bool recurrent_activation_quant_ok(const TensorView& x) noexcept {
-    if (x.data_type() != DataType::s8) { return true; }
+inline bool recurrent_activation_quant_ok(const TensorView& x) noexcept
+{
+    if (x.data_type() != DataType::s8) {
+        return true;
+    }
     const QuantParams& q = x.quant_params();
-    if (q.zero_point != 0 || q.zero_point_data != nullptr) { return false; }
-    if (q.granularity == QuantGranularity::PerChannel) { return false; }
+    if (q.zero_point != 0 || q.zero_point_data != nullptr) {
+        return false;
+    }
+    if (q.granularity == QuantGranularity::PerChannel) {
+        return false;
+    }
     const int64_t rows = x.shape(0) * x.shape(1);
     return q.num_scales == 0 || q.num_scales >= rows ||
            q.granularity == QuantGranularity::PerTensor;
@@ -91,11 +100,18 @@ inline bool recurrent_activation_quant_ok(const TensorView& x) noexcept {
 /// A weight's per-row symmetric scales: per row of the whole [D, G·H, K]
 /// tensor, or one table of G·H rows shared by every direction.
 inline bool recurrent_weight_quant_ok(const TensorView& w, int64_t rows,
-                                      int64_t per_direction) noexcept {
+                                      int64_t per_direction) noexcept
+{
     const QuantParams& q = w.quant_params();
-    if (q.zero_point != 0 || q.zero_point_data != nullptr) { return false; }
-    if (q.granularity == QuantGranularity::PerChannel) { return false; }
-    if (q.granularity == QuantGranularity::PerTensor) { return true; }
+    if (q.zero_point != 0 || q.zero_point_data != nullptr) {
+        return false;
+    }
+    if (q.granularity == QuantGranularity::PerChannel) {
+        return false;
+    }
+    if (q.granularity == QuantGranularity::PerTensor) {
+        return true;
+    }
     return q.num_scales >= rows || q.num_scales >= per_direction;
 }
 
@@ -104,12 +120,14 @@ inline bool recurrent_weight_quant_ok(const TensorView& w, int64_t rows,
 inline const float* recurrent_scale_table(const QuantParams& q, int64_t d,
                                           int64_t per_direction) noexcept
 {
-    if (q.scale_data == nullptr) { return nullptr; }
-    return (q.num_scales > per_direction) ? q.scale_data + d * per_direction
-                                          : q.scale_data;
+    if (q.scale_data == nullptr) {
+        return nullptr;
+    }
+    return (q.num_scales > per_direction) ? q.scale_data + d * per_direction : q.scale_data;
 }
 
-inline bool recurrent_activation_ok(RnnActivation a) noexcept {
+inline bool recurrent_activation_ok(RnnActivation a) noexcept
+{
     return rnn_activation_supported(a);
 }
 
@@ -118,8 +136,7 @@ inline bool recurrent_activation_ok(RnnActivation a) noexcept {
 /// peepholes unsupported). An absent optional is a rank-0 descriptor.
 inline Status recurrent_check(Backend be, const RecurrentSpec& s,
                               std::span<const TensorDesc> inputs,
-                              std::span<const TensorDesc> outputs,
-                              bool with_cell)
+                              std::span<const TensorDesc> outputs, bool with_cell)
 {
     const size_t n_in_max = with_cell ? 8 : 6;
     NNOPS_TRY(check_counts(inputs.size(), outputs.size(), 3, n_in_max, 1));
@@ -150,9 +167,10 @@ inline Status recurrent_check(Backend be, const RecurrentSpec& s,
     const bool quantized = recurrent_is_quantized(w.dtype);
     const DataType cdtype = recurrent_compute_dtype(x.dtype, w.dtype);
 
-    if (H <= 0 || D <= 0) { return Status::invalid_argument; }
-    if (quantized ? (r.dtype != DataType::s8)
-                  : (w.dtype != x.dtype || r.dtype != x.dtype)) {
+    if (H <= 0 || D <= 0) {
+        return Status::invalid_argument;
+    }
+    if (quantized ? (r.dtype != DataType::s8) : (w.dtype != x.dtype || r.dtype != x.dtype)) {
         return Status::invalid_argument;
     }
     if (!is_layout_supported(x.layout, LayoutSupport::ChannelFirstOnly)) {
@@ -185,7 +203,9 @@ inline Status recurrent_check(Backend be, const RecurrentSpec& s,
     const size_t n_state = std::min<size_t>(inputs.size(), with_cell ? 7 : 6);
     for (size_t i = 5; i < n_state; ++i) {
         const auto& t = inputs[i];
-        if (t.rank == 0) { continue; }
+        if (t.rank == 0) {
+            continue;
+        }
         NNOPS_TRY(check_rank(t.rank, 3));
         if (t.dtype != cdtype || t.dims[0] != D || t.dims[1] != B || t.dims[2] != H) {
             return Status::invalid_argument;
@@ -214,14 +234,15 @@ inline Status recurrent_check(Backend be, const RecurrentSpec& s,
     if (!outputs.empty() && outputs[0].rank > 0) {
         const auto& y = outputs[0];
         NNOPS_TRY(check_rank(y.rank, 4));
-        if (y.dims[0] != x.dims[0] || y.dims[1] != D || y.dims[2] != B ||
-            y.dims[3] != H) {
+        if (y.dims[0] != x.dims[0] || y.dims[1] != D || y.dims[2] != B || y.dims[3] != H) {
             return Status::invalid_argument;
         }
     }
     for (size_t i = 1; i < outputs.size(); ++i) {
         const auto& t = outputs[i];
-        if (t.rank == 0) { continue; }
+        if (t.rank == 0) {
+            continue;
+        }
         NNOPS_TRY(check_rank(t.rank, 3));
         if (t.dims[0] != D || t.dims[1] != B || t.dims[2] != H) {
             return Status::invalid_argument;
@@ -232,11 +253,9 @@ inline Status recurrent_check(Backend be, const RecurrentSpec& s,
 
 /// The kernel's parameter block: the attributes plus the geometry, which the
 /// caller reads off X (the sequence) or off W (the pack).
-inline backend::cpu::RecurrentParams recurrent_params(const RecurrentSpec& s,
-                                                      int64_t seq, int64_t batch,
-                                                      int64_t input, int64_t hidden,
-                                                      DataType dtype,
-                                                      DataType weight_dtype)
+inline backend::cpu::RecurrentParams recurrent_params(const RecurrentSpec& s, int64_t seq,
+                                                      int64_t batch, int64_t input, int64_t hidden,
+                                                      DataType dtype, DataType weight_dtype)
 {
     backend::cpu::RecurrentParams p;
     p.mode = s.mode;
@@ -270,19 +289,24 @@ inline backend::cpu::RecurrentParams recurrent_params(const RecurrentSpec& s,
 /// rebuilding them per call. Only the CPU kernel packs; every other backend
 /// leaves the query empty, which is the documented "no packed form" answer.
 inline void recurrent_prepack(Backend backend, const RecurrentSpec& s,
-                              std::span<const TensorView> inputs,
-                              std::span<TensorView> outputs,
+                              std::span<const TensorView> inputs, std::span<TensorView> outputs,
                               const ComputeContext& ctx)
 {
     NNOPS_ASSERT(inputs.size() >= 3);
     NNOPS_ASSERT(!outputs.empty());
-    if (backend != Backend::CPU) { return; }
+    if (backend != Backend::CPU) {
+        return;
+    }
 
     const auto& w = inputs[1];
     const auto& r = inputs[2];
-    if (w.is_empty() || r.is_empty() || is_packed_recurrent(w.layout())) { return; }
+    if (w.is_empty() || r.is_empty() || is_packed_recurrent(w.layout())) {
+        return;
+    }
     const DataType dt = w.data_type();
-    if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(backend, dt)) { return; }
+    if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(backend, dt)) {
+        return;
+    }
     if (w.rank() != 3 || r.rank() != 3 ||
         r.data_type() != (recurrent_is_quantized(dt) ? DataType::s8 : dt)) {
         return;
@@ -291,8 +315,8 @@ inline void recurrent_prepack(Backend backend, const RecurrentSpec& s,
     const int64_t G = recurrent_gates(s.mode);
     const int64_t I = w.shape(2);
     const int64_t H = s.hidden_size > 0 ? s.hidden_size : r.shape(2);
-    if (H <= 0 || w.shape(0) != s.directions || w.shape(1) != G * H ||
-        r.shape(0) != s.directions || r.shape(1) != G * H || r.shape(2) != H) {
+    if (H <= 0 || w.shape(0) != s.directions || w.shape(1) != G * H || r.shape(0) != s.directions ||
+        r.shape(1) != G * H || r.shape(2) != H) {
         return;
     }
     // A blob bakes the scales in and hides the weight from compute()'s checks,
@@ -319,12 +343,10 @@ inline void recurrent_prepack(Backend backend, const RecurrentSpec& s,
                  outputs[0].data_type() == dt && outputs[0].numel() >= numel &&
                  "recurrent prepackWeights: the buffer does not match the geometry");
 
-    const TensorView* bias =
-        (inputs.size() > 3 && !inputs[3].is_empty()) ? &inputs[3] : nullptr;
+    const TensorView* bias = (inputs.size() > 3 && !inputs[3].is_empty()) ? &inputs[3] : nullptr;
     // Called, not asserted-call: NNOPS_ASSERT is ((void)0) under NDEBUG, which
     // would make the whole pack a release-build no-op.
-    const Status packed = backend::cpu::recurrent_pack_weights(p, w, r, bias,
-                                                              outputs[0], ctx);
+    const Status packed = backend::cpu::recurrent_pack_weights(p, w, r, bias, outputs[0], ctx);
     NNOPS_ASSERT(is_ok(packed));
     (void)packed;
 }
@@ -335,15 +357,14 @@ inline void recurrent_prepack(Backend backend, const RecurrentSpec& s,
 /// carry (per-row weight sums, per-step activation row sums, a column term), so
 /// it is refused rather than silently dropped.
 inline Status recurrent_q8_check(Backend be, std::span<TensorView> outputs,
-                                 std::span<const TensorView> inputs,
-                                 int64_t directions)
+                                 std::span<const TensorView> inputs, int64_t directions)
 {
     const auto& x = inputs[0];
     const auto& w = inputs[1];
     const auto& r = inputs[2];
     const bool w_packed = is_packed_recurrent(w.layout());
-    const DataType cdtype = recurrent_compute_dtype(
-        x.data_type(), w_packed ? DataType::s8 : w.data_type());
+    const DataType cdtype =
+        recurrent_compute_dtype(x.data_type(), w_packed ? DataType::s8 : w.data_type());
 
     if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(be, x.data_type())) {
         return Status::unsupported;
@@ -354,18 +375,25 @@ inline Status recurrent_q8_check(Backend be, std::span<TensorView> outputs,
             return Status::unsupported;
         }
     }
-    if (!recurrent_weight_quant_ok(r, directions * r.shape(r.rank() - 2),
-                                   r.shape(r.rank() - 2))) {
+    if (!recurrent_weight_quant_ok(r, directions * r.shape(r.rank() - 2), r.shape(r.rank() - 2))) {
         return Status::unsupported;
     }
-    if (!recurrent_activation_quant_ok(x)) { return Status::unsupported; }
+    if (!recurrent_activation_quant_ok(x)) {
+        return Status::unsupported;
+    }
 
     const auto dtype_ok = [&](const TensorView& t) {
         return t.is_empty() || t.data_type() == cdtype;
     };
-    if (inputs.size() > 3 && !dtype_ok(inputs[3])) { return Status::invalid_argument; }
-    if (inputs.size() > 5 && !dtype_ok(inputs[5])) { return Status::invalid_argument; }
-    if (inputs.size() > 6 && !dtype_ok(inputs[6])) { return Status::invalid_argument; }
+    if (inputs.size() > 3 && !dtype_ok(inputs[3])) {
+        return Status::invalid_argument;
+    }
+    if (inputs.size() > 5 && !dtype_ok(inputs[5])) {
+        return Status::invalid_argument;
+    }
+    if (inputs.size() > 6 && !dtype_ok(inputs[6])) {
+        return Status::invalid_argument;
+    }
     for (const auto& out : outputs) {
         if (!out.is_empty() && out.data_type() != cdtype) {
             return Status::invalid_argument;
@@ -378,14 +406,17 @@ inline Status recurrent_q8_check(Backend be, std::span<TensorView> outputs,
 /// required three by hand (check_views would reject an empty optional), then
 /// hands the resolved numbers to the backend kernel.
 inline Status recurrent_run(Backend be, const RecurrentSpec& s, RecurrentKernelFn fn,
-                            std::span<TensorView> outputs,
-                            std::span<const TensorView> inputs,
+                            std::span<TensorView> outputs, std::span<const TensorView> inputs,
                             const ComputeContext& ctx)
 {
-    if (!fn) { return Status::unsupported; }
+    if (!fn) {
+        return Status::unsupported;
+    }
     NNOPS_TRY(check_counts(inputs.size(), outputs.size(), 3, size_t(-1), 1));
     for (size_t i = 0; i < 3; ++i) {
-        if (inputs[i].is_empty()) { return Status::invalid_argument; }
+        if (inputs[i].is_empty()) {
+            return Status::invalid_argument;
+        }
     }
     if (outputs.empty() || (outputs[0].is_empty() && outputs[1].is_empty())) {
         return Status::invalid_argument;
@@ -399,11 +430,9 @@ inline Status recurrent_run(Backend be, const RecurrentSpec& s, RecurrentKernelF
     }
 
     auto p = recurrent_params(s, x.shape(0), x.shape(1), x.shape(2),
-                              s.hidden_size > 0 ? s.hidden_size
-                                                : r.shape(r.rank() - 1),
-                              recurrent_compute_dtype(x.data_type(), w.data_type()),
-                              w.data_type());
+                              s.hidden_size > 0 ? s.hidden_size : r.shape(r.rank() - 1),
+                              recurrent_compute_dtype(x.data_type(), w.data_type()), w.data_type());
     return fn(p, outputs, inputs, ctx);
 }
 
-}  // namespace nnops::detail
+} // namespace nnops::detail

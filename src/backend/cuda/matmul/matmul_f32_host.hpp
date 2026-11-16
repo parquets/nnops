@@ -53,4 +53,4 @@ struct ManualFCall {
 /// count overflows an int32 is refused here and left to the CuTe engine.
 bool manual_dense_f_call(const ManualFCall& call, cudaStream_t stream);
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

@@ -28,7 +28,7 @@ enum class KernelFn : uint8_t {
 /// from `ctx.metal_buffers` (inputs first, output last). Returns
 /// Status::unsupported when Metal is unavailable or the context carries no
 /// buffers, so a Metal op degrades instead of aborting the process.
-Status dispatch(KernelFn fn, int32_t op, bool add_to, const ComputeContext& ctx,
-                int64_t total, int n_tensor_buffers);
+Status dispatch(KernelFn fn, int32_t op, bool add_to, const ComputeContext& ctx, int64_t total,
+                int n_tensor_buffers);
 
-}  // namespace nnops::backend::metal
+} // namespace nnops::backend::metal

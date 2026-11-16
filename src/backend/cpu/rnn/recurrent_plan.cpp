@@ -14,14 +14,17 @@ namespace nnops::backend::cpu {
 
 namespace {
 
-int64_t gcd64(int64_t a, int64_t b) noexcept {
-    while (b != 0) { const int64_t t = a % b; a = b; b = t; }
+int64_t gcd64(int64_t a, int64_t b) noexcept
+{
+    while (b != 0) {
+        const int64_t t = a % b;
+        a = b;
+        b = t;
+    }
     return a;
 }
 
-int64_t lcm64(int64_t a, int64_t b) noexcept {
-    return (a / gcd64(a, b)) * b;
-}
+int64_t lcm64(int64_t a, int64_t b) noexcept { return (a / gcd64(a, b)) * b; }
 
 /// The input projection's column tile. int8 has no prepacked B, so the panels
 /// are addressed per k-block slab; a ~512-wide column tile keeps one task's
@@ -39,14 +42,16 @@ constexpr int64_t kMinTileMacs = int64_t{1} << 16;
 /// Per-timestep tile grid: split B and the phase width so the padded cell count
 /// per busy worker is smallest. A single column block takes the whole width even
 /// when that is not a multiple of the grid; every other block starts on it.
-void solve_tiles(int64_t rows, int64_t cols, int64_t k, int64_t n_align,
-                 int64_t threads, PhaseGeom& g)
+void solve_tiles(int64_t rows, int64_t cols, int64_t k, int64_t n_align, int64_t threads,
+                 PhaseGeom& g)
 {
     threads = std::max<int64_t>(threads, 1);
-    g.m_blocks = 1; g.n_blocks = 1; g.mc = rows; g.nc = cols;
+    g.m_blocks = 1;
+    g.n_blocks = 1;
+    g.mc = rows;
+    g.nc = cols;
 
-    const int64_t max_tasks =
-        std::max<int64_t>(1, rows * cols * k / kMinTileMacs);
+    const int64_t max_tasks = std::max<int64_t>(1, rows * cols * k / kMinTileMacs);
 
     int64_t best_pad = -1, best_used = 1;
     const int64_t max_nb = std::max<int64_t>(
@@ -56,14 +61,12 @@ void solve_tiles(int64_t rows, int64_t cols, int64_t k, int64_t n_align,
         int64_t nc_t = cols;
         if (nb > 1) {
             const int64_t share = (cols + nb - 1) / nb;
-            nc_t = std::min<int64_t>(
-                ((share + n_align - 1) / n_align) * n_align, cols);
+            nc_t = std::min<int64_t>(((share + n_align - 1) / n_align) * n_align, cols);
         }
         const int64_t nblk = (nc_t >= cols) ? 1 : (cols + nc_t - 1) / nc_t;
 
         const int64_t mb = std::max<int64_t>(
-            1, std::min<int64_t>(std::min<int64_t>(threads / nblk, rows),
-                                 max_tasks / nblk));
+            1, std::min<int64_t>(std::min<int64_t>(threads / nblk, rows), max_tasks / nblk));
         const int64_t mc_t = (rows + mb - 1) / mb;
         const int64_t mblk = (rows + mc_t - 1) / mc_t;
 
@@ -71,13 +74,17 @@ void solve_tiles(int64_t rows, int64_t cols, int64_t k, int64_t n_align,
         const int64_t pad = (mblk * mc_t) * (nblk * nc_t);
 
         if (best_pad < 0 || pad * best_used < best_pad * used) {
-            best_pad = pad; best_used = used;
-            g.m_blocks = mblk; g.n_blocks = nblk; g.mc = mc_t; g.nc = nc_t;
+            best_pad = pad;
+            best_used = used;
+            g.m_blocks = mblk;
+            g.n_blocks = nblk;
+            g.mc = mc_t;
+            g.nc = nc_t;
         }
     }
 }
 
-}  // namespace
+} // namespace
 
 Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& plan)
 {
@@ -86,11 +93,10 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
     const int64_t H = p.hidden;
     plan.q8 = p.weight_dtype == DataType::s8;
     const int64_t nr = plan.q8 ? NR_MAX_I8 : nr_max_dt(p.dtype);
-    const int64_t kc_cap =
-        plan.q8 ? kQ8Kc
-                : (p.dtype == DataType::f16  ? KC_CAP_F16
-                 : p.dtype == DataType::bf16 ? KC_CAP_BF16
-                                             : KC_CAP_F32);
+    const int64_t kc_cap = plan.q8 ? kQ8Kc :
+                                     (p.dtype == DataType::f16  ? KC_CAP_F16 :
+                                      p.dtype == DataType::bf16 ? KC_CAP_BF16 :
+                                                                  KC_CAP_F32);
 
     const bool lbr = p.mode == RecurrentMode::Gru && p.linear_before_reset;
     plan.nphases = num_phases(p.mode, lbr);
@@ -106,7 +112,9 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
         g.n_align = lcm64(g.q, nr);
         if (!plan.q8) {
             g.rgeo = matmul_packed_b_geom(g.cols, H, p.dtype);
-            if (!g.rgeo.ok()) { return Status::invalid_argument; }
+            if (!g.rgeo.ok()) {
+                return Status::invalid_argument;
+            }
         }
         plan.col_base[ph] = plan.total_cols;
         plan.total_cols += g.cols;
@@ -115,7 +123,9 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
 
     if (!plan.q8) {
         plan.wgeo = matmul_packed_b_geom(plan.total_cols, p.input, p.dtype);
-        if (!plan.wgeo.ok()) { return Status::invalid_argument; }
+        if (!plan.wgeo.ok()) {
+            return Status::invalid_argument;
+        }
     }
 
     plan.kc = std::max<int64_t>(1, std::min<int64_t>(H, kc_cap));
@@ -129,8 +139,8 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
 
     // Chunk the input projection so its buffer stays inside a shared L3.
     const int64_t budget = int64_t{8} << 20;
-    plan.chunk = std::max<int64_t>(
-        1, budget / (std::max<int64_t>(p.batch, 1) * plan.total_cols * esz));
+    plan.chunk =
+        std::max<int64_t>(1, budget / (std::max<int64_t>(p.batch, 1) * plan.total_cols * esz));
     plan.chunk = std::min(plan.chunk, std::max<int64_t>(p.seq, 1));
 
     if (plan.q8) {
@@ -141,7 +151,9 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
         int64_t mc = 64;
         for (;;) {
             const int64_t mb = (rows + mc - 1) / mc;
-            if (mb >= threads_n || mc <= 8) { break; }
+            if (mb >= threads_n || mc <= 8) {
+                break;
+            }
             mc -= 8;
         }
         plan.proj_mc = std::min<int64_t>(mc, std::max<int64_t>(rows, 1));
@@ -156,17 +168,18 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
         const int64_t proj_n_blocks = (plan.total_cols + plan.proj_nc - 1) / plan.proj_nc;
         int64_t tasks_max = (rows + plan.proj_mc - 1) / plan.proj_mc * proj_n_blocks;
         for (int64_t ph = 0; ph < plan.nphases; ++ph) {
-            tasks_max = std::max<int64_t>(
-                tasks_max, plan.phase[ph].m_blocks * plan.phase[ph].n_blocks);
+            tasks_max =
+                std::max<int64_t>(tasks_max, plan.phase[ph].m_blocks * plan.phase[ph].n_blocks);
         }
         const int64_t workers = std::max<int64_t>(ctx.cpu.worker_count(), 1);
-        plan.slots = (ctx.cpu.thread_slot_count() > 0 && workers < tasks_max)
-                         ? workers : std::max<int64_t>(tasks_max, 1);
+        plan.slots = (ctx.cpu.thread_slot_count() > 0 && workers < tasks_max) ?
+                         workers :
+                         std::max<int64_t>(tasks_max, 1);
         plan.a_bytes = num_panels_max(static_cast<int>(plan.proj_mc), MR_I8, 3) *
                        geom_ldd_i8_a(std::min<int64_t>(kQ8Kc, std::max<int64_t>(p.input, 1)));
-        plan.a_bytes = std::max<int64_t>(
-            plan.a_bytes, num_panels_max(static_cast<int>(p.batch), MR_I8, 3) *
-                          geom_ldd_i8_a(std::min<int64_t>(kQ8Kc, H)));
+        plan.a_bytes =
+            std::max<int64_t>(plan.a_bytes, num_panels_max(static_cast<int>(p.batch), MR_I8, 3) *
+                                                geom_ldd_i8_a(std::min<int64_t>(kQ8Kc, H)));
         plan.c_elems = plan.proj_mc * plan.proj_nc;
         plan.s_elems = plan.proj_mc;
         for (int64_t ph = 0; ph < plan.nphases; ++ph) {
@@ -178,4 +191,4 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

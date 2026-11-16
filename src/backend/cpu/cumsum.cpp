@@ -18,17 +18,17 @@ namespace nnops::backend::cpu {
 /// The running sum lives in f32 whatever T is, so a bf16 or f16 run does not
 /// accumulate the rounding of every step into the next.
 template <typename T>
-Status cumsum_impl(const CumSumAttributes& attrs,
-                   TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx)
+Status cumsum_impl(const CumSumAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
     NNOPS_ASSERT(rank >= 1);
 
     int64_t axis = attrs.axis;
-    if (axis < 0) { axis += rank; }
+    if (axis < 0) {
+        axis += rank;
+    }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     const int64_t dim = input.shape(axis);
@@ -43,7 +43,7 @@ Status cumsum_impl(const CumSumAttributes& attrs,
         lower_dim_size *= input.shape(i);
     }
 
-    const auto* in_ptr  = input.ptr<T>();
+    const auto* in_ptr = input.ptr<T>();
     auto* out_ptr = output.ptr<T>();
 
     // Pitch-aware: the axis step can exceed lower_dim_size.
@@ -96,10 +96,8 @@ Status cumsum_impl(const CumSumAttributes& attrs,
     return Status::ok;
 }
 
-Status cumsum_cpu(const CumSumAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
+Status cumsum_cpu(const CumSumAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx,
                   void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "cumsum_cpu", [&](auto tag) {
@@ -109,4 +107,4 @@ Status cumsum_cpu(const CumSumAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

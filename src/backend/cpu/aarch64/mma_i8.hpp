@@ -69,7 +69,8 @@
 namespace nnops::backend::cpu::aarch64 {
 
 /// One row's four k bytes splatted into every 4-byte lane; the raw-A kernels only.
-inline int8x16_t mma_i8_bcast_group(const int8_t* p) noexcept {
+inline int8x16_t mma_i8_bcast_group(const int8_t* p) noexcept
+{
     return vreinterpretq_s8_s32(vdupq_n_s32(*reinterpret_cast<const int32_t*>(p)));
 }
 
@@ -81,7 +82,8 @@ inline constexpr int mma_i8_b_panel_tail = 0;
 
 /// A packed-B panel's byte pitch: the caller's `ldb` when it gave one (a
 /// prepacked blob's own), else the uniform slot `k` int8 k-values take.
-inline constexpr int mma_i8_panel_stride(int ldb, int k) noexcept {
+inline constexpr int mma_i8_panel_stride(int ldb, int k) noexcept
+{
     return (ldb > 0) ? ldb : static_cast<int>(mma_pack_align(12 * k));
 }
 
@@ -96,12 +98,11 @@ inline void mma_i8_b_panel_sums(int8_t* /*panel*/, int /*kbytes*/, bool /*a_bias
 // =========================================================================
 
 template <bool zero_mode = false>
-inline void mma_pack_mr8_nr12_mrxncxkc_i8(
-    int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-    const int8_t* NNOPS_RESTRICT A,
-    const int8_t* NNOPS_RESTRICT B, int ldb,
-    int32_t clamp_min, int32_t clamp_max) noexcept {
-
+inline void mma_pack_mr8_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                          int ldc, const int8_t* NNOPS_RESTRICT A,
+                                          const int8_t* NNOPS_RESTRICT B, int ldb,
+                                          int32_t clamp_min, int32_t clamp_max) noexcept
+{
     int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
     int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
     int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
@@ -314,9 +315,8 @@ inline void mma_pack_mr8_nr12_mrxncxkc_i8(
         }
 
         const int32x4_t acc[8][3] = {
-            {v_c00, v_c01, v_c02}, {v_c10, v_c11, v_c12},
-            {v_c20, v_c21, v_c22}, {v_c30, v_c31, v_c32},
-            {v_c40, v_c41, v_c42}, {v_c50, v_c51, v_c52},
+            {v_c00, v_c01, v_c02}, {v_c10, v_c11, v_c12}, {v_c20, v_c21, v_c22},
+            {v_c30, v_c31, v_c32}, {v_c40, v_c41, v_c42}, {v_c50, v_c51, v_c52},
             {v_c60, v_c61, v_c62}, {v_c70, v_c71, v_c72},
         };
         int32_t* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
@@ -350,12 +350,11 @@ inline void mma_pack_mr8_nr12_mrxncxkc_i8(
 }
 
 template <bool zero_mode = false>
-inline void mma_pack_mr4_nr12_mrxncxkc_i8(
-    int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-    const int8_t* NNOPS_RESTRICT A,
-    const int8_t* NNOPS_RESTRICT B, int ldb,
-    int32_t clamp_min, int32_t clamp_max) noexcept {
-
+inline void mma_pack_mr4_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                          int ldc, const int8_t* NNOPS_RESTRICT A,
+                                          const int8_t* NNOPS_RESTRICT B, int ldb,
+                                          int32_t clamp_min, int32_t clamp_max) noexcept
+{
     int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
     int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
     int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
@@ -494,8 +493,10 @@ inline void mma_pack_mr4_nr12_mrxncxkc_i8(
         }
 
         const int32x4_t acc[4][3] = {
-            {v_c00, v_c01, v_c02}, {v_c10, v_c11, v_c12},
-            {v_c20, v_c21, v_c22}, {v_c30, v_c31, v_c32},
+            {v_c00, v_c01, v_c02},
+            {v_c10, v_c11, v_c12},
+            {v_c20, v_c21, v_c22},
+            {v_c30, v_c31, v_c32},
         };
         int32_t* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
         for (int r = 0; r < mr; ++r) {
@@ -526,13 +527,13 @@ inline void mma_pack_mr4_nr12_mrxncxkc_i8(
 }
 
 template <bool zero_mode = false>
-inline void mma_pack_mr1_nr12_mrxncxkc_i8(
-    int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-    const int8_t* NNOPS_RESTRICT A,
-    const int8_t* NNOPS_RESTRICT B, int ldb,
-    int32_t clamp_min, int32_t clamp_max) noexcept {
-    (void)mr;   // one row, so the row count never varies
-    (void)ldc;  // one row, so the C row stride never applies
+inline void mma_pack_mr1_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                          int ldc, const int8_t* NNOPS_RESTRICT A,
+                                          const int8_t* NNOPS_RESTRICT B, int ldb,
+                                          int32_t clamp_min, int32_t clamp_max) noexcept
+{
+    (void)mr;  // one row, so the row count never varies
+    (void)ldc; // one row, so the C row stride never applies
 
     int32_t* NNOPS_RESTRICT c0_ptr = C;
 
@@ -642,12 +643,11 @@ inline void mma_pack_mr1_nr12_mrxncxkc_i8(
 // =========================================================================
 
 template <bool zero_mode = false>
-inline void mma_direct_mr8_nr12_mrxncxkc_i8(
-    int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-    const int8_t* NNOPS_RESTRICT A, int lda,
-    const int8_t* NNOPS_RESTRICT B, int ldb,
-    int32_t clamp_min, int32_t clamp_max) noexcept {
-
+inline void mma_direct_mr8_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                            int ldc, const int8_t* NNOPS_RESTRICT A, int lda,
+                                            const int8_t* NNOPS_RESTRICT B, int ldb,
+                                            int32_t clamp_min, int32_t clamp_max) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -910,9 +910,8 @@ inline void mma_direct_mr8_nr12_mrxncxkc_i8(
         }
 
         const int32x4_t acc[8][3] = {
-            {v_c00, v_c01, v_c02}, {v_c10, v_c11, v_c12},
-            {v_c20, v_c21, v_c22}, {v_c30, v_c31, v_c32},
-            {v_c40, v_c41, v_c42}, {v_c50, v_c51, v_c52},
+            {v_c00, v_c01, v_c02}, {v_c10, v_c11, v_c12}, {v_c20, v_c21, v_c22},
+            {v_c30, v_c31, v_c32}, {v_c40, v_c41, v_c42}, {v_c50, v_c51, v_c52},
             {v_c60, v_c61, v_c62}, {v_c70, v_c71, v_c72},
         };
         int32_t* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
@@ -945,12 +944,11 @@ inline void mma_direct_mr8_nr12_mrxncxkc_i8(
 }
 
 template <bool zero_mode = false>
-inline void mma_direct_mr4_nr12_mrxncxkc_i8(
-    int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-    const int8_t* NNOPS_RESTRICT A, int lda,
-    const int8_t* NNOPS_RESTRICT B, int ldb,
-    int32_t clamp_min, int32_t clamp_max) noexcept {
-
+inline void mma_direct_mr4_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                            int ldc, const int8_t* NNOPS_RESTRICT A, int lda,
+                                            const int8_t* NNOPS_RESTRICT B, int ldb,
+                                            int32_t clamp_min, int32_t clamp_max) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -1105,8 +1103,10 @@ inline void mma_direct_mr4_nr12_mrxncxkc_i8(
         }
 
         const int32x4_t acc[4][3] = {
-            {v_c00, v_c01, v_c02}, {v_c10, v_c11, v_c12},
-            {v_c20, v_c21, v_c22}, {v_c30, v_c31, v_c32},
+            {v_c00, v_c01, v_c02},
+            {v_c10, v_c11, v_c12},
+            {v_c20, v_c21, v_c22},
+            {v_c30, v_c31, v_c32},
         };
         int32_t* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
         for (int r = 0; r < mr; ++r) {
@@ -1137,14 +1137,14 @@ inline void mma_direct_mr4_nr12_mrxncxkc_i8(
 }
 
 template <bool zero_mode = false>
-inline void mma_direct_mr1_nr12_mrxncxkc_i8(
-    int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-    const int8_t* NNOPS_RESTRICT A, int lda,
-    const int8_t* NNOPS_RESTRICT B, int ldb,
-    int32_t clamp_min, int32_t clamp_max) noexcept {
-    (void)mr;   // one row, so the row count never varies
-    (void)lda;  // A is read consecutively along its single row
-    (void)ldc;  // one row, so the C row stride never applies
+inline void mma_direct_mr1_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                            int ldc, const int8_t* NNOPS_RESTRICT A, int lda,
+                                            const int8_t* NNOPS_RESTRICT B, int ldb,
+                                            int32_t clamp_min, int32_t clamp_max) noexcept
+{
+    (void)mr;  // one row, so the row count never varies
+    (void)lda; // A is read consecutively along its single row
+    (void)ldc; // one row, so the C row stride never applies
 
     int32_t* NNOPS_RESTRICT c0_ptr = C;
 
@@ -1250,16 +1250,14 @@ inline void mma_direct_mr1_nr12_mrxncxkc_i8(
 
 // Dispatch tables, consumed by matmul_helper.cpp; rows are the MR levels {8,4,1}.
 template <bool Z>
-inline constexpr auto mma_pack_fns_i8 = std::array{
-    &mma_pack_mr8_nr12_mrxncxkc_i8<Z>,
-    &mma_pack_mr4_nr12_mrxncxkc_i8<Z>,
-    &mma_pack_mr1_nr12_mrxncxkc_i8<Z>};
+inline constexpr auto mma_pack_fns_i8 =
+    std::array{&mma_pack_mr8_nr12_mrxncxkc_i8<Z>, &mma_pack_mr4_nr12_mrxncxkc_i8<Z>,
+               &mma_pack_mr1_nr12_mrxncxkc_i8<Z>};
 
 // Row-major A (`lda` in int8 elements, kc % 4 == 0), same MR levels.
 template <bool Z>
-inline constexpr auto mma_direct_fns_i8 = std::array{
-    &mma_direct_mr8_nr12_mrxncxkc_i8<Z>,
-    &mma_direct_mr4_nr12_mrxncxkc_i8<Z>,
-    &mma_direct_mr1_nr12_mrxncxkc_i8<Z>};
+inline constexpr auto mma_direct_fns_i8 =
+    std::array{&mma_direct_mr8_nr12_mrxncxkc_i8<Z>, &mma_direct_mr4_nr12_mrxncxkc_i8<Z>,
+               &mma_direct_mr1_nr12_mrxncxkc_i8<Z>};
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

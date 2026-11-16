@@ -10,8 +10,7 @@ namespace nnops {
 
 NNOPS_DECLARE_CPU(CastAttributes, cast_cpu)
 
-NNOPS_OP_BOILERPLATE(Cast, CastAttributes,
-        backend::cpu::cast_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Cast, CastAttributes, backend::cpu::cast_cpu, nullptr, nullptr)
 
 namespace {
 
@@ -19,26 +18,27 @@ namespace {
 /// detail::dtype_in's per-backend gate.
 constexpr Status cast_dtype_ok(Backend be, DataType d)
 {
-    return detail::dtype_in<DataType::f32, DataType::f16, DataType::s32,
-                            DataType::s64, DataType::s8, DataType::u8>(be, d)
-        ? Status::ok : Status::unsupported;
+    return detail::dtype_in<DataType::f32, DataType::f16, DataType::s32, DataType::s64,
+                            DataType::s8, DataType::u8>(be, d) ?
+               Status::ok :
+               Status::unsupported;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-std::vector<TensorDesc> Cast::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Cast::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     auto out = identity_output_shape(inputs);
     out[0].dtype = attrs_.to;
     return out;
 }
 
-Status Cast::validate(std::span<const TensorDesc> inputs,
-                      std::span<const TensorDesc> outputs) const
+Status Cast::validate(std::span<const TensorDesc> inputs, std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
-    if (outputs[0].dtype != attrs_.to) { return Status::invalid_argument; }
+    if (outputs[0].dtype != attrs_.to) {
+        return Status::invalid_argument;
+    }
     NNOPS_TRY(cast_dtype_ok(backend_, inputs[0].dtype));
     NNOPS_TRY(cast_dtype_ok(backend_, attrs_.to));
 
@@ -50,19 +50,23 @@ Status Cast::validate(std::span<const TensorDesc> inputs,
     return Status::ok;
 }
 
-Status Cast::compute(std::span<TensorView> outputs,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace)
+Status Cast::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                     const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (outputs[0].data_type() != attrs_.to) { return Status::invalid_argument; }
+    if (outputs[0].data_type() != attrs_.to) {
+        return Status::invalid_argument;
+    }
     NNOPS_TRY(cast_dtype_ok(backend_, inputs[0].data_type()));
     NNOPS_TRY(cast_dtype_ok(backend_, outputs[0].data_type()));
-    if (inputs[0].numel() != outputs[0].numel()) { return Status::invalid_argument; }
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (inputs[0].numel() != outputs[0].numel()) {
+        return Status::invalid_argument;
+    }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

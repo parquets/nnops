@@ -29,7 +29,8 @@
 
 namespace {
 
-bool cpuid_bit(unsigned int leaf, unsigned int subleaf, unsigned int reg, unsigned int bit) {
+bool cpuid_bit(unsigned int leaf, unsigned int subleaf, unsigned int reg, unsigned int bit)
+{
 #if defined(_MSC_VER)
     int cpu_info[4] = {0};
     __cpuidex(cpu_info, leaf, subleaf);
@@ -42,9 +43,10 @@ bool cpuid_bit(unsigned int leaf, unsigned int subleaf, unsigned int reg, unsign
 #endif
 }
 
-bool os_avx_support() {
+bool os_avx_support()
+{
 #if defined(_MSC_VER)
-    return (_xgetbv(0) & 0x6) == 0x6;  // bits 1 (SSE) and 2 (AVX) set
+    return (_xgetbv(0) & 0x6) == 0x6; // bits 1 (SSE) and 2 (AVX) set
 #else
     unsigned int eax = 0, edx = 0;
     __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
@@ -52,7 +54,8 @@ bool os_avx_support() {
 #endif
 }
 
-bool os_avx512_support() {
+bool os_avx512_support()
+{
     // Check XCR0 bits: 1(SSE), 2(AVX), 5(OPMASK), 6(ZMM_HI256), 7(HI16_ZMM)
 #if defined(_MSC_VER)
     uint64_t xcr0 = _xgetbv(0);
@@ -69,36 +72,43 @@ bool os_avx512_support() {
 // cache it can use — the enumeration is not guaranteed to be level-ordered.
 // Leaf 4 is absent before Nehalem/Bulldozer; cache_type 0 then ends the walk and
 // both outputs keep their defaults.
-inline void cpuid_cache_sizes(size_t& l1_data_bytes, size_t& l2_bytes) {
-    for (int subleaf = 0; ; ++subleaf) {
+inline void cpuid_cache_sizes(size_t& l1_data_bytes, size_t& l2_bytes)
+{
+    for (int subleaf = 0;; ++subleaf) {
         int info[4] = {0};
-    #if defined(_MSC_VER)
+#if defined(_MSC_VER)
         __cpuidex(info, 4, subleaf);
-    #else
+#else
         unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
         __cpuid_count(4, subleaf, eax, ebx, ecx, edx);
         info[0] = static_cast<int>(eax);
         info[1] = static_cast<int>(ebx);
         info[2] = static_cast<int>(ecx);
         info[3] = static_cast<int>(edx);
-    #endif
+#endif
         const int cache_type = info[0] & 0x1F;
-        if (cache_type == 0) { break; }  // no more caches
+        if (cache_type == 0) {
+            break;
+        } // no more caches
 
         const int cache_level = (info[0] >> 5) & 0x7;
         // type 1 = data cache, type 3 = unified cache
         const bool is_l1_data = (cache_level == 1 && cache_type == 1);
-        const bool is_l2      = (cache_level == 2 && (cache_type == 1 || cache_type == 3));
-        if (!is_l1_data && !is_l2) { continue; }
+        const bool is_l2 = (cache_level == 2 && (cache_type == 1 || cache_type == 3));
+        if (!is_l1_data && !is_l2) {
+            continue;
+        }
 
-        const int line_size  = (info[1] & 0xFFF) + 1;
+        const int line_size = (info[1] & 0xFFF) + 1;
         const int partitions = ((info[1] >> 12) & 0x3FF) + 1;
-        const int ways       = ((info[1] >> 22) & 0x3FF) + 1;
-        const int sets       = info[2] + 1;
-        const size_t bytes =
-            static_cast<size_t>(ways) * partitions * line_size * sets;
-        if (is_l1_data) { l1_data_bytes = bytes; }
-        else            { l2_bytes = bytes; }
+        const int ways = ((info[1] >> 22) & 0x3FF) + 1;
+        const int sets = info[2] + 1;
+        const size_t bytes = static_cast<size_t>(ways) * partitions * line_size * sets;
+        if (is_l1_data) {
+            l1_data_bytes = bytes;
+        } else {
+            l2_bytes = bytes;
+        }
     }
 }
 
@@ -121,9 +131,12 @@ namespace {
 // leaving the caller's default. cpu0 rather than a sum: every core this targets
 // has the same L1 and L2. index1 is the data cache, index2 the unified one
 // (index0 is L1I).
-size_t read_sysfs_cache_size(const char* path) {
+size_t read_sysfs_cache_size(const char* path)
+{
     std::FILE* fp = std::fopen(path, "r");
-    if (!fp) { return 0; }
+    if (!fp) {
+        return 0;
+    }
     char buf[32] = {};
     size_t out = 0;
     if (std::fgets(buf, sizeof(buf), fp)) {
@@ -151,7 +164,7 @@ size_t read_sysfs_cache_size(const char* path) {
 #include <sys/sysctl.h>
 #endif
 
-#endif  // NNOPS_ARCH_AARCH64
+#endif // NNOPS_ARCH_AARCH64
 
 // ---- Topology: is this a hybrid part, and how many cores run at full speed? ----
 #if defined(_WIN32)
@@ -165,25 +178,29 @@ namespace {
 /// Fast-class core count, or 0 on a single class. Windows publishes one
 /// EfficiencyClass per core; macOS exposes the P cluster as
 /// hw.perflevel0.physicalcpu.
-int detect_fast_cores() {
+int detect_fast_cores()
+{
 #if defined(_WIN32)
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-    if (len == 0) { return 0; }
+    if (len == 0) {
+        return 0;
+    }
     std::vector<char> buf(static_cast<size_t>(len));
     if (!GetLogicalProcessorInformationEx(
             RelationProcessorCore,
-            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()),
-            &len)) {
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
         return 0;
     }
     int best = -1;
     int best_count = 0;
     int total = 0;
     for (DWORD off = 0; off < len;) {
-        const auto* e = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
-            buf.data() + off);
-        if (e->Size == 0) { break; }
+        const auto* e =
+            reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+        if (e->Size == 0) {
+            break;
+        }
         const int cls = static_cast<int>(e->Processor.EfficiencyClass);
         ++total;
         if (cls > best) {
@@ -198,16 +215,14 @@ int detect_fast_cores() {
 #elif defined(__APPLE__)
     int32_t perf = 0;
     size_t len = sizeof(perf);
-    if (sysctlbyname("hw.perflevel0.physicalcpu", &perf, &len, nullptr, 0) != 0 ||
-        perf <= 0) {
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &perf, &len, nullptr, 0) != 0 || perf <= 0) {
         return 0;
     }
     // A single-perflevel Mac answers perflevel0 with the whole CPU, so only a
     // machine with a second level has a fast class.
     int32_t cores = 0;
     len = sizeof(cores);
-    if (sysctlbyname("hw.physicalcpu", &cores, &len, nullptr, 0) == 0 &&
-        cores <= perf) {
+    if (sysctlbyname("hw.physicalcpu", &cores, &len, nullptr, 0) == 0 && cores <= perf) {
         return 0;
     }
     return perf;
@@ -221,7 +236,8 @@ int detect_fast_cores() {
 namespace nnops {
 namespace simd {
 
-void CpuFeatures::detect() {
+void CpuFeatures::detect()
+{
     features_ = 0;
 
 #if defined(NNOPS_ARCH_X86_64)
@@ -263,23 +279,23 @@ void CpuFeatures::detect() {
     if (hwcap & HWCAP_ASIMDDP) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_DOT);
     }
-    #ifdef HWCAP_FPHP
+#ifdef HWCAP_FPHP
     if (hwcap & HWCAP_FPHP) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_FP16);
     }
-    #endif
-    // FEAT_BF16: HWCAP2 bit 14 (defined by the kernel as HWCAP2_BF16; spelled
-    // numerically so old headers still compile).
-    #ifndef HWCAP2_BF16
-    #define HWCAP2_BF16 (1L << 14)
-    #endif
+#endif
+// FEAT_BF16: HWCAP2 bit 14 (defined by the kernel as HWCAP2_BF16; spelled
+// numerically so old headers still compile).
+#ifndef HWCAP2_BF16
+#define HWCAP2_BF16 (1L << 14)
+#endif
     if (hwcap2 & HWCAP2_BF16) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_BF16);
     }
-    // FEAT_I8MM: HWCAP2 bit 13, spelled numerically for the same reason.
-    #ifndef HWCAP2_I8MM
-    #define HWCAP2_I8MM (1L << 13)
-    #endif
+// FEAT_I8MM: HWCAP2 bit 13, spelled numerically for the same reason.
+#ifndef HWCAP2_I8MM
+#define HWCAP2_I8MM (1L << 13)
+#endif
     if (hwcap2 & HWCAP2_I8MM) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_I8MM);
     }
@@ -302,16 +318,16 @@ void CpuFeatures::detect() {
     {
         int32_t has_bf16 = 0;
         size_t len = sizeof(has_bf16);
-        if (sysctlbyname("hw.optional.arm.FEAT_BF16", &has_bf16, &len,
-                         nullptr, 0) == 0 && has_bf16 != 0) {
+        if (sysctlbyname("hw.optional.arm.FEAT_BF16", &has_bf16, &len, nullptr, 0) == 0 &&
+            has_bf16 != 0) {
             features_ |= static_cast<uint32_t>(CpuIsa::NEON_BF16);
         }
     }
     {
         int32_t has_i8mm = 0;
         size_t len = sizeof(has_i8mm);
-        if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &has_i8mm, &len,
-                         nullptr, 0) == 0 && has_i8mm != 0) {
+        if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &has_i8mm, &len, nullptr, 0) == 0 &&
+            has_i8mm != 0) {
             features_ |= static_cast<uint32_t>(CpuIsa::NEON_I8MM);
         }
     }
@@ -331,26 +347,29 @@ void CpuFeatures::detect() {
     {
         // sysfs only: there is no getauxval(AT_L1D_CACHESIZE), and HWCAP does
         // not describe cache geometry at all.
-        const size_t l1 = read_sysfs_cache_size(
-            "/sys/devices/system/cpu/cpu0/cache/index1/size");
-        if (l1 > 0) { l1_cache_size_ = l1; }
+        const size_t l1 = read_sysfs_cache_size("/sys/devices/system/cpu/cpu0/cache/index1/size");
+        if (l1 > 0) {
+            l1_cache_size_ = l1;
+        }
     }
 #endif
 
 #if defined(__linux__)
     {
-        // getauxval(AT_L2_CACHESIZE) exists since Linux 6.6; the header may not
-        // define the macro yet.
-        #ifndef AT_L2_CACHESIZE
-        #define AT_L2_CACHESIZE 43
-        #endif
+// getauxval(AT_L2_CACHESIZE) exists since Linux 6.6; the header may not
+// define the macro yet.
+#ifndef AT_L2_CACHESIZE
+#define AT_L2_CACHESIZE 43
+#endif
         long aux_l2 = getauxval(AT_L2_CACHESIZE);
         if (aux_l2 > 0) {
             l2_cache_size_ = static_cast<size_t>(aux_l2);
         } else {
-            const size_t l2 = read_sysfs_cache_size(
-                "/sys/devices/system/cpu/cpu0/cache/index2/size");
-            if (l2 > 0) { l2_cache_size_ = l2; }
+            const size_t l2 =
+                read_sysfs_cache_size("/sys/devices/system/cpu/cpu0/cache/index2/size");
+            if (l2 > 0) {
+                l2_cache_size_ = l2;
+            }
         }
     }
 #elif defined(_WIN32)
@@ -365,7 +384,9 @@ void CpuFeatures::detect() {
             bool have_l1 = false;
             bool have_l2 = false;
             for (DWORD i = 0; i < count; ++i) {
-                if (buf[i].Relationship != RelationCache) { continue; }
+                if (buf[i].Relationship != RelationCache) {
+                    continue;
+                }
                 const CACHE_DESCRIPTOR& c = buf[i].Cache;
                 if (c.Level == 1 && c.Type == CacheData && !have_l1) {
                     l1_cache_size_ = c.Size;
@@ -381,15 +402,13 @@ void CpuFeatures::detect() {
     {
         int64_t l1_size = 0;
         size_t len = sizeof(l1_size);
-        if (sysctlbyname("hw.l1dcachesize", &l1_size, &len, nullptr, 0) == 0 &&
-            l1_size > 0) {
+        if (sysctlbyname("hw.l1dcachesize", &l1_size, &len, nullptr, 0) == 0 && l1_size > 0) {
             l1_cache_size_ = static_cast<size_t>(l1_size);
         }
 
         int64_t l2_size = 0;
         len = sizeof(l2_size);
-        if (sysctlbyname("hw.l2cachesize", &l2_size, &len, nullptr, 0) == 0 &&
-            l2_size > 0) {
+        if (sysctlbyname("hw.l2cachesize", &l2_size, &len, nullptr, 0) == 0 && l2_size > 0) {
             l2_cache_size_ = static_cast<size_t>(l2_size);
         }
     }
@@ -409,7 +428,7 @@ void CpuFeatures::detect() {
     }
 #endif
 
-#endif  // NNOPS_ARCH_AARCH64
+#endif // NNOPS_ARCH_AARCH64
 
     fast_cores_ = detect_fast_cores();
 }

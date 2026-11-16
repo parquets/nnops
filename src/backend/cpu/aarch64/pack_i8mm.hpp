@@ -47,20 +47,21 @@ inline constexpr int i8mm_nr = 12;
 inline constexpr int i8mm_group_bytes = i8mm_nr * i8mm_k_group;
 
 /// Two rows' low eight bytes into one 16-byte group fragment: [a][b].
-inline int8x16_t i8mm_pair_lo(int8x16_t a, int8x16_t b) noexcept {
+inline int8x16_t i8mm_pair_lo(int8x16_t a, int8x16_t b) noexcept
+{
     return vcombine_s8(vget_low_s8(a), vget_low_s8(b));
 }
 
 /// The same for the high halves: the next k group's eight bytes.
-inline int8x16_t i8mm_pair_hi(int8x16_t a, int8x16_t b) noexcept {
+inline int8x16_t i8mm_pair_hi(int8x16_t a, int8x16_t b) noexcept
+{
     return vcombine_s8(vget_high_s8(a), vget_high_s8(b));
 }
 
-inline void i8mm_copy8(int8_t* dst, const int8_t* src) noexcept {
-    std::memcpy(dst, src, 8);
-}
+inline void i8mm_copy8(int8_t* dst, const int8_t* src) noexcept { std::memcpy(dst, src, 8); }
 
-inline void i8mm_row8(int8_t* dst, const int8_t* src, int live) noexcept {
+inline void i8mm_row8(int8_t* dst, const int8_t* src, int live) noexcept
+{
     if (live >= i8mm_k_group) {
         i8mm_copy8(dst, src);
     } else {
@@ -73,20 +74,19 @@ inline void i8mm_row8(int8_t* dst, const int8_t* src, int live) noexcept {
 //  LHS packs (A)  —  [ceil(K/8)][rows][8] bytes
 // =========================================================================
 
-inline void pack_trans_n1_i8mm(void* NNOPS_RESTRICT output,
-                               const void* NNOPS_RESTRICT input,
-                               int /*ir_step*/, int K, float scale) noexcept {
+inline void pack_trans_n1_i8mm(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                               int /*ir_step*/, int K, float scale) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT out = static_cast<int8_t*>(output);
     // One row: the packed groups are the source row, padded to whole groups.
     std::memcpy(out, input, static_cast<size_t>(K));
-    std::memset(out + K, 0,
-                static_cast<size_t>((((K + 7) >> 3) * i8mm_k_group) - K));
+    std::memset(out + K, 0, static_cast<size_t>((((K + 7) >> 3) * i8mm_k_group) - K));
 }
 
-inline void pack_trans_n4_i8mm(void* NNOPS_RESTRICT output,
-                               const void* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale) noexcept {
+inline void pack_trans_n4_i8mm(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                               int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT out = static_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = static_cast<const int8_t*>(input);
@@ -109,7 +109,10 @@ inline void pack_trans_n4_i8mm(void* NNOPS_RESTRICT output,
         vst1q_s8(out + 2 * 16, i8mm_pair_hi(r0, r1));
         vst1q_s8(out + 3 * 16, i8mm_pair_hi(r2, r3));
 
-        p0 += 16; p1 += 16; p2 += 16; p3 += 16;
+        p0 += 16;
+        p1 += 16;
+        p2 += 16;
+        p3 += 16;
         out += 4 * 16;
     }
     for (; g < kgroups; ++g) {
@@ -118,14 +121,17 @@ inline void pack_trans_n4_i8mm(void* NNOPS_RESTRICT output,
         i8mm_row8(out + 1 * 8, p1, live);
         i8mm_row8(out + 2 * 8, p2, live);
         i8mm_row8(out + 3 * 8, p3, live);
-        p0 += live; p1 += live; p2 += live; p3 += live;
+        p0 += live;
+        p1 += live;
+        p2 += live;
+        p3 += live;
         out += 4 * 8;
     }
 }
 
-inline void pack_trans_n8_i8mm(void* NNOPS_RESTRICT output,
-                               const void* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale) noexcept {
+inline void pack_trans_n8_i8mm(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                               int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT out = static_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = static_cast<const int8_t*>(input);
@@ -160,8 +166,14 @@ inline void pack_trans_n8_i8mm(void* NNOPS_RESTRICT output,
         vst1q_s8(out + 6 * 16, i8mm_pair_hi(r4, r5));
         vst1q_s8(out + 7 * 16, i8mm_pair_hi(r6, r7));
 
-        p0 += 16; p1 += 16; p2 += 16; p3 += 16;
-        p4 += 16; p5 += 16; p6 += 16; p7 += 16;
+        p0 += 16;
+        p1 += 16;
+        p2 += 16;
+        p3 += 16;
+        p4 += 16;
+        p5 += 16;
+        p6 += 16;
+        p7 += 16;
         out += 8 * 16;
     }
     for (; g < kgroups; ++g) {
@@ -174,17 +186,23 @@ inline void pack_trans_n8_i8mm(void* NNOPS_RESTRICT output,
         i8mm_row8(out + 5 * 8, p5, live);
         i8mm_row8(out + 6 * 8, p6, live);
         i8mm_row8(out + 7 * 8, p7, live);
-        p0 += live; p1 += live; p2 += live; p3 += live;
-        p4 += live; p5 += live; p6 += live; p7 += live;
+        p0 += live;
+        p1 += live;
+        p2 += live;
+        p3 += live;
+        p4 += live;
+        p5 += live;
+        p6 += live;
+        p7 += live;
         out += 8 * 8;
     }
 }
 
 /// The transposed-source LHS variants: A is [K][rows].
 template <int ROWS>
-inline void pack_copy_nN_i8mm(void* NNOPS_RESTRICT output,
-                              const void* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale) noexcept {
+inline void pack_copy_nN_i8mm(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT out = static_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT in = static_cast<const int8_t*>(input);
@@ -207,13 +225,16 @@ inline void pack_copy_nN_i8mm(void* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_copy_n8_i8mm(void* o, const void* i, int s, int K, float sc) noexcept {
+inline void pack_copy_n8_i8mm(void* o, const void* i, int s, int K, float sc) noexcept
+{
     pack_copy_nN_i8mm<8>(o, i, s, K, sc);
 }
-inline void pack_copy_n4_i8mm(void* o, const void* i, int s, int K, float sc) noexcept {
+inline void pack_copy_n4_i8mm(void* o, const void* i, int s, int K, float sc) noexcept
+{
     pack_copy_nN_i8mm<4>(o, i, s, K, sc);
 }
-inline void pack_copy_n1_i8mm(void* o, const void* i, int s, int K, float sc) noexcept {
+inline void pack_copy_n1_i8mm(void* o, const void* i, int s, int K, float sc) noexcept
+{
     pack_copy_nN_i8mm<1>(o, i, s, K, sc);
 }
 
@@ -221,10 +242,9 @@ inline void pack_copy_n1_i8mm(void* o, const void* i, int s, int K, float sc) no
 //  RHS transpose pack (B stored [N][K])  —  8-int8 run per column per group
 // =========================================================================
 
-inline void pack_trans_n12_i8mm(void* NNOPS_RESTRICT output,
-                                const void* NNOPS_RESTRICT input,
-                                int ir_step, int K, float scale,
-                                int nr = 12) noexcept {
+inline void pack_trans_n12_i8mm(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                int ir_step, int K, float scale, int nr = 12) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT out = static_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = static_cast<const int8_t*>(input);
@@ -274,9 +294,18 @@ inline void pack_trans_n12_i8mm(void* NNOPS_RESTRICT output,
             vst1q_s8(out + 10 * 16, i8mm_pair_hi(r8, r9));
             vst1q_s8(out + 11 * 16, i8mm_pair_hi(ra, rb));
 
-            p0 += 16; p1 += 16; p2 += 16; p3 += 16;
-            p4 += 16; p5 += 16; p6 += 16; p7 += 16;
-            p8 += 16; p9 += 16; pa += 16; pb += 16;
+            p0 += 16;
+            p1 += 16;
+            p2 += 16;
+            p3 += 16;
+            p4 += 16;
+            p5 += 16;
+            p6 += 16;
+            p7 += 16;
+            p8 += 16;
+            p9 += 16;
+            pa += 16;
+            pb += 16;
             out += 2 * i8mm_group_bytes;
         }
     }
@@ -299,24 +328,55 @@ inline void pack_trans_n12_i8mm(void* NNOPS_RESTRICT output,
         } else {
             // Short panel: the columns past `nr` were never loaded.
             i8mm_row8(dst + 0 * 8, p0, nr > 0 ? live : 0);
-            if (nr > 1)  { i8mm_row8(dst + 1 * 8, p1, live); }
-            if (nr > 2)  { i8mm_row8(dst + 2 * 8, p2, live); }
-            if (nr > 3)  { i8mm_row8(dst + 3 * 8, p3, live); }
-            if (nr > 4)  { i8mm_row8(dst + 4 * 8, p4, live); }
-            if (nr > 5)  { i8mm_row8(dst + 5 * 8, p5, live); }
-            if (nr > 6)  { i8mm_row8(dst + 6 * 8, p6, live); }
-            if (nr > 7)  { i8mm_row8(dst + 7 * 8, p7, live); }
-            if (nr > 8)  { i8mm_row8(dst + 8 * 8, p8, live); }
-            if (nr > 9)  { i8mm_row8(dst + 9 * 8, p9, live); }
-            if (nr > 10) { i8mm_row8(dst + 10 * 8, pa, live); }
-            if (nr > 11) { i8mm_row8(dst + 11 * 8, pb, live); }
+            if (nr > 1) {
+                i8mm_row8(dst + 1 * 8, p1, live);
+            }
+            if (nr > 2) {
+                i8mm_row8(dst + 2 * 8, p2, live);
+            }
+            if (nr > 3) {
+                i8mm_row8(dst + 3 * 8, p3, live);
+            }
+            if (nr > 4) {
+                i8mm_row8(dst + 4 * 8, p4, live);
+            }
+            if (nr > 5) {
+                i8mm_row8(dst + 5 * 8, p5, live);
+            }
+            if (nr > 6) {
+                i8mm_row8(dst + 6 * 8, p6, live);
+            }
+            if (nr > 7) {
+                i8mm_row8(dst + 7 * 8, p7, live);
+            }
+            if (nr > 8) {
+                i8mm_row8(dst + 8 * 8, p8, live);
+            }
+            if (nr > 9) {
+                i8mm_row8(dst + 9 * 8, p9, live);
+            }
+            if (nr > 10) {
+                i8mm_row8(dst + 10 * 8, pa, live);
+            }
+            if (nr > 11) {
+                i8mm_row8(dst + 11 * 8, pb, live);
+            }
             for (int c = nr; c < i8mm_nr; ++c) {
                 std::memset(dst + c * 8, 0, 8);
             }
         }
-        p0 += live; p1 += live; p2 += live; p3 += live;
-        p4 += live; p5 += live; p6 += live; p7 += live;
-        p8 += live; p9 += live; pa += live; pb += live;
+        p0 += live;
+        p1 += live;
+        p2 += live;
+        p3 += live;
+        p4 += live;
+        p5 += live;
+        p6 += live;
+        p7 += live;
+        p8 += live;
+        p9 += live;
+        pa += live;
+        pb += live;
         out += i8mm_group_bytes;
     }
 }
@@ -325,10 +385,9 @@ inline void pack_trans_n12_i8mm(void* NNOPS_RESTRICT output,
 //  RHS copy pack (B stored [K][N])  —  two 4-row interleaves per group
 // =========================================================================
 
-inline void pack_copy_n12_i8mm(void* NNOPS_RESTRICT output,
-                               const void* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale,
-                               int nr = 12) noexcept {
+inline void pack_copy_n12_i8mm(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                               int ir_step, int K, float scale, int nr = 12) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT out = static_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = static_cast<const int8_t*>(input);
@@ -343,14 +402,10 @@ inline void pack_copy_n12_i8mm(void* NNOPS_RESTRICT output,
             const int8_t* NNOPS_RESTRICT r = input_i8 + g * i8mm_k_group * ir_step;
             alignas(16) int8_t half[2][i8mm_group_bytes / 2];
 
-            const int8x8x4_t lo0 = {vld1_s8(r + 0 * ir_step),
-                                    vld1_s8(r + 1 * ir_step),
-                                    vld1_s8(r + 2 * ir_step),
-                                    vld1_s8(r + 3 * ir_step)};
-            const int8x8x4_t lo1 = {vld1_s8(r + 4 * ir_step),
-                                    vld1_s8(r + 5 * ir_step),
-                                    vld1_s8(r + 6 * ir_step),
-                                    vld1_s8(r + 7 * ir_step)};
+            const int8x8x4_t lo0 = {vld1_s8(r + 0 * ir_step), vld1_s8(r + 1 * ir_step),
+                                    vld1_s8(r + 2 * ir_step), vld1_s8(r + 3 * ir_step)};
+            const int8x8x4_t lo1 = {vld1_s8(r + 4 * ir_step), vld1_s8(r + 5 * ir_step),
+                                    vld1_s8(r + 6 * ir_step), vld1_s8(r + 7 * ir_step)};
             vst4_s8(half[0], lo0);
             vst4_s8(half[1], lo1);
 
@@ -419,4 +474,4 @@ inline void pack_copy_n12_i8mm(void* NNOPS_RESTRICT output,
     }
 }
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

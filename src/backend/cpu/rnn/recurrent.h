@@ -59,11 +59,11 @@ namespace nnops::backend::cpu {
 struct RecurrentParams {
     RecurrentMode mode = RecurrentMode::Rnn;
 
-    int64_t seq = 0;         ///< T
-    int64_t batch = 0;       ///< B
-    int64_t input = 0;       ///< I
-    int64_t hidden = 0;      ///< H
-    int64_t directions = 1;  ///< D
+    int64_t seq = 0;        ///< T
+    int64_t batch = 0;      ///< B
+    int64_t input = 0;      ///< I
+    int64_t hidden = 0;     ///< H
+    int64_t directions = 1; ///< D
     /// Only one direction is ambiguous about its timeline: with D = 2 the first
     /// is forward and the second reverse by ONNX's rule, but with D = 1 this is
     /// the answer.
@@ -90,10 +90,8 @@ struct RecurrentParams {
     bool linear_before_reset = false; ///< GRU: see gru.hpp
 };
 
-Status recurrent_cpu(const RecurrentParams& params,
-                     std::span<TensorView> outputs,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx);
+Status recurrent_cpu(const RecurrentParams& params, std::span<TensorView> outputs,
+                     std::span<const TensorView> inputs, const ComputeContext& ctx);
 
 /// Element count of the blob recurrent_pack_weights() produces for these
 /// parameters — what a prepack query answers with. Independent of the batch, the
@@ -104,9 +102,8 @@ int64_t recurrent_packed_numel(const RecurrentParams& params);
 /// @p dst, which must hold recurrent_packed_numel() elements. A later
 /// recurrent_cpu() handed the blob as its W skips the interleave and both pack
 /// passes and reads them in place.
-Status recurrent_pack_weights(const RecurrentParams& params,
-                              const TensorView& w, const TensorView& r,
-                              const TensorView* bias, TensorView& dst,
+Status recurrent_pack_weights(const RecurrentParams& params, const TensorView& w,
+                              const TensorView& r, const TensorView* bias, TensorView& dst,
                               const ComputeContext& ctx);
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

@@ -19,8 +19,8 @@ using namespace simd;
 
 /// Returns {sum, sum_sq} of `out` over n contiguous elements, both float.
 template <typename T>
-inline std::pair<float, float> mul_add_reduce_square_sum(
-    const T* a, const T* b, float scale, T* out, int64_t n)
+inline std::pair<float, float> mul_add_reduce_square_sum(const T* a, const T* b, float scale,
+                                                         T* out, int64_t n)
 {
     constexpr int L = simd_lane_for<T>;
     const auto v_scale = v_set1(a, scale);
@@ -57,8 +57,7 @@ inline std::pair<float, float> mul_add_reduce_square_sum(
             v_sum_sq3 = v_fmadd(v3, v3, v_sum_sq3);
         }
         auto v_sum = v_add(v_add(v_sum0, v_sum1), v_add(v_sum2, v_sum3));
-        auto v_sum_sq = v_add(v_add(v_sum_sq0, v_sum_sq1),
-                              v_add(v_sum_sq2, v_sum_sq3));
+        auto v_sum_sq = v_add(v_add(v_sum_sq0, v_sum_sq1), v_add(v_sum_sq2, v_sum_sq3));
 
         auto v_sum4 = v_zero(a);
         auto v_sum_sq4 = v_zero(a);
@@ -98,4 +97,4 @@ inline std::pair<float, float> mul_add_reduce_square_sum(
     return {sum, sum_sq};
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

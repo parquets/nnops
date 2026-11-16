@@ -29,13 +29,13 @@ namespace nnops::kernel {
 using namespace simd;
 
 template <typename T>
-inline void softmax_per_lane(
-    const T* x, T* y,
-    int64_t D, int64_t stride,
-    bool log_softmax, float inv_T, int64_t stride_y = -1)
+inline void softmax_per_lane(const T* x, T* y, int64_t D, int64_t stride, bool log_softmax,
+                             float inv_T, int64_t stride_y = -1)
 {
     // The output may be laid out differently from the input; -1 keeps the input's.
-    if (stride_y < 0) { stride_y = stride; }
+    if (stride_y < 0) {
+        stride_y = stride;
+    }
 
     auto v_inv_T = v_set1(x, inv_T);
 
@@ -52,15 +52,16 @@ inline void softmax_per_lane(
             v = v_mul(v, v_inv_T);
         }
         v = v_exp(v);
-        if (!log_softmax) { v_store(y + k * stride_y, v); }
+        if (!log_softmax) {
+            v_store(y + k * stride_y, v);
+        }
         v_sum_vec = v_add(v_sum_vec, v);
     }
 
     if (log_softmax) {
         auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
         for (int64_t k = 0; k < D; ++k) {
-            v_store(y + k * stride_y,
-                    v_add(v_mul(v_load(x + k * stride), v_inv_T), v_bias));
+            v_store(y + k * stride_y, v_add(v_mul(v_load(x + k * stride), v_inv_T), v_bias));
         }
     } else {
         auto v_inv = v_div(v_set1(x, 1.0f), v_sum_vec);
@@ -70,8 +71,8 @@ inline void softmax_per_lane(
     }
 }
 
-template <typename T, bool HasMask>
-inline auto softmax_xm(const T* x, const T* mask, int64_t i) {
+template <typename T, bool HasMask> inline auto softmax_xm(const T* x, const T* mask, int64_t i)
+{
     if constexpr (HasMask) {
         return v_add(v_load(x + i), v_load(mask + i));
     } else {
@@ -80,7 +81,8 @@ inline auto softmax_xm(const T* x, const T* mask, int64_t i) {
 }
 
 template <typename T, bool HasMask>
-inline float softmax_xm_scalar(const T* x, const T* mask, int64_t i) {
+inline float softmax_xm_scalar(const T* x, const T* mask, int64_t i)
+{
     if constexpr (HasMask) {
         return s_load(&x[i]) + s_load(&mask[i]);
     } else {
@@ -89,10 +91,8 @@ inline float softmax_xm_scalar(const T* x, const T* mask, int64_t i) {
 }
 
 template <typename T, bool HasMask>
-inline void softmax_process_standard_row_impl(
-    const T* x, const T* mask, T* y,
-    int64_t D, bool log_softmax,
-    float inv_T)
+inline void softmax_process_standard_row_impl(const T* x, const T* mask, T* y, int64_t D,
+                                              bool log_softmax, float inv_T)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
@@ -107,7 +107,9 @@ inline void softmax_process_standard_row_impl(
     }
     for (; i < D; ++i) {
         float xv = softmax_xm_scalar<T, HasMask>(x, mask, i);
-        if (xv > max_val) { max_val = xv; }
+        if (xv > max_val) {
+            max_val = xv;
+        }
     }
 
     const float neg_max = -max_val;
@@ -126,14 +128,18 @@ inline void softmax_process_standard_row_impl(
                 v = v_mul(v, v_inv_T);
             }
             v = v_exp(v);
-            if (store_exp) { v_store(y + i, v); }
+            if (store_exp) {
+                v_store(y + i, v);
+            }
             v_sum = v_add(v_sum, v);
         }
         sum_exp = v_reduce_sum(v_sum);
     }
     for (; i < D; ++i) {
         float val = std::exp((softmax_xm_scalar<T, HasMask>(x, mask, i) - max_val) * inv_T);
-        if (store_exp) { s_store(&y[i], val); }
+        if (store_exp) {
+            s_store(&y[i], val);
+        }
         sum_exp += val;
     }
 
@@ -169,25 +175,20 @@ inline void softmax_process_standard_row_impl(
 }
 
 template <typename T>
-inline void softmax_process_standard_row(
-    const T* x, T* y,
-    int64_t D, bool log_softmax,
-    float inv_T = 1.0f)
+inline void softmax_process_standard_row(const T* x, T* y, int64_t D, bool log_softmax,
+                                         float inv_T = 1.0f)
 {
     softmax_process_standard_row_impl<T, false>(x, nullptr, y, D, log_softmax, inv_T);
 }
 
 template <typename T>
-inline void mask_softmax_process_standard_row(
-    const T* x, const T* mask, T* y,
-    int64_t D, bool log_softmax,
-    float inv_T = 1.0f)
+inline void mask_softmax_process_standard_row(const T* x, const T* mask, T* y, int64_t D,
+                                              bool log_softmax, float inv_T = 1.0f)
 {
     softmax_process_standard_row_impl<T, true>(x, mask, y, D, log_softmax, inv_T);
 }
 
-template <typename T>
-inline float softmax_row_max(const T* x, int64_t n)
+template <typename T> inline float softmax_row_max(const T* x, int64_t n)
 {
     return row_reduce<T, ReduceMax>(x, n);
 }
@@ -205,7 +206,9 @@ inline float softmax_row_exp_sum(const T* x, T* y, int64_t n, float ref_max, flo
         auto v_inv_T = v_set1(x, inv_T);
         for (; i + L <= n; i += L) {
             auto v = v_add(v_load(x + i), v_neg_ref);
-            if (inv_T != 1.0f) { v = v_mul(v, v_inv_T); }
+            if (inv_T != 1.0f) {
+                v = v_mul(v, v_inv_T);
+            }
             v = v_exp(v);
             v_store(y + i, v);
             v_sum = v_add(v_sum, v);
@@ -220,4 +223,4 @@ inline float softmax_row_exp_sum(const T* x, T* y, int64_t n, float ref_max, flo
     return sum;
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

@@ -52,14 +52,23 @@ struct ArgPair {
 
 constexpr int64_t kNoIdx = -1;
 
-template <bool IsMax>
-__device__ inline bool arg_beats(const ArgPair& cand, const ArgPair& cur)
+template <bool IsMax> __device__ inline bool arg_beats(const ArgPair& cand, const ArgPair& cur)
 {
-    if (cand.idx == kNoIdx) { return false; }
-    if (cur.idx == kNoIdx) { return true; }
-    if (isnan(cand.val)) { return isnan(cur.val) && cand.idx < cur.idx; }
-    if (isnan(cur.val)) { return true; }
-    if (IsMax ? (cand.val > cur.val) : (cand.val < cur.val)) { return true; }
+    if (cand.idx == kNoIdx) {
+        return false;
+    }
+    if (cur.idx == kNoIdx) {
+        return true;
+    }
+    if (isnan(cand.val)) {
+        return isnan(cur.val) && cand.idx < cur.idx;
+    }
+    if (isnan(cur.val)) {
+        return true;
+    }
+    if (IsMax ? (cand.val > cur.val) : (cand.val < cur.val)) {
+        return true;
+    }
     return cand.val == cur.val && cand.idx < cur.idx;
 }
 
@@ -68,8 +77,8 @@ __device__ inline bool arg_beats(const ArgPair& cand, const ArgPair& cur)
 // ============================================================
 
 template <class T, bool IsMax>
-__global__ void arg_axis_last_kernel(const T* __restrict__ in,
-                                     int64_t* __restrict__ out, AxisWalk w)
+__global__ void arg_axis_last_kernel(const T* __restrict__ in, int64_t* __restrict__ out,
+                                     AxisWalk w)
 {
     const int lane = int(threadIdx.x) & (kCudaWarpSize - 1);
     const int warps = int(blockDim.x) >> 5;
@@ -83,10 +92,11 @@ __global__ void arg_axis_last_kernel(const T* __restrict__ in,
         if (lane < w.axis_dim) {
             best.val = s_load(&p[int64_t(lane) * w.axis_stride]);
             best.idx = lane;
-            for (int64_t k = int64_t(lane) + kCudaWarpSize; k < w.axis_dim;
-                 k += kCudaWarpSize) {
+            for (int64_t k = int64_t(lane) + kCudaWarpSize; k < w.axis_dim; k += kCudaWarpSize) {
                 const ArgPair cand{s_load(&p[k * w.axis_stride]), k};
-                if (arg_beats<IsMax>(cand, best)) { best = cand; }
+                if (arg_beats<IsMax>(cand, best)) {
+                    best = cand;
+                }
             }
         }
 
@@ -94,12 +104,13 @@ __global__ void arg_axis_last_kernel(const T* __restrict__ in,
         for (int off = kCudaWarpSize / 2; off > 0; off >>= 1) {
             const ArgPair cand{__shfl_down_sync(0xffffffffu, best.val, off),
                                __shfl_down_sync(0xffffffffu, best.idx, off)};
-            if (arg_beats<IsMax>(cand, best)) { best = cand; }
+            if (arg_beats<IsMax>(cand, best)) {
+                best = cand;
+            }
         }
 
         if (lane == 0) {
-            out[axis_group_offset(r, w.out_pre)] =
-                isnan(s_load(p)) ? int64_t(0) : best.idx;
+            out[axis_group_offset(r, w.out_pre)] = isnan(s_load(p)) ? int64_t(0) : best.idx;
         }
     }
 }
@@ -109,13 +120,11 @@ __global__ void arg_axis_last_kernel(const T* __restrict__ in,
 // ============================================================
 
 template <class T, bool IsMax>
-__global__ void arg_strided_kernel(const T* __restrict__ in,
-                                   int64_t* __restrict__ out, AxisWalk w,
+__global__ void arg_strided_kernel(const T* __restrict__ in, int64_t* __restrict__ out, AxisWalk w,
                                    int64_t count)
 {
     const int64_t step = int64_t(gridDim.x) * blockDim.x;
-    for (int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; t < count;
-         t += step) {
+    for (int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; t < count; t += step) {
         const int64_t o = t / w.inner;
         const int64_t i = t - o * w.inner;
         const T* p = in + axis_group_offset(o, w.pre) + axis_group_offset(i, w.post);
@@ -124,7 +133,9 @@ __global__ void arg_strided_kernel(const T* __restrict__ in,
         ArgPair best{first, 0};
         for (int64_t k = 1; k < w.axis_dim; ++k) {
             const ArgPair cand{s_load(p + k * w.axis_stride), k};
-            if (arg_beats<IsMax>(cand, best)) { best = cand; }
+            if (arg_beats<IsMax>(cand, best)) {
+                best = cand;
+            }
         }
         out[axis_group_offset(o, w.out_pre) + axis_group_offset(i, w.out_post)] =
             isnan(first) ? int64_t(0) : best.idx;
@@ -140,28 +151,28 @@ void launch_arg(const AxisWalk& w, const T* in, int64_t* out, cudaStream_t strea
 {
     if (w.inner == 1) {
         constexpr int kWarps = kCudaBlockSize / kCudaWarpSize;
-        const unsigned grid = static_cast<unsigned>(
-            std::min<int64_t>(ceil_div(w.outer, kWarps), 65535));
-        arg_axis_last_kernel<T, IsMax>
-            <<<grid, kCudaBlockSize, 0, stream>>>(in, out, w);
+        const unsigned grid =
+            static_cast<unsigned>(std::min<int64_t>(ceil_div(w.outer, kWarps), 65535));
+        arg_axis_last_kernel<T, IsMax><<<grid, kCudaBlockSize, 0, stream>>>(in, out, w);
         return;
     }
     const int64_t count = w.outer * w.inner;
-    const unsigned grid = static_cast<unsigned>(
-        std::min<int64_t>(ceil_div(count, kCudaBlockSize), 65535));
-    arg_strided_kernel<T, IsMax>
-        <<<grid, kCudaBlockSize, 0, stream>>>(in, out, w, count);
+    const unsigned grid =
+        static_cast<unsigned>(std::min<int64_t>(ceil_div(count, kCudaBlockSize), 65535));
+    arg_strided_kernel<T, IsMax><<<grid, kCudaBlockSize, 0, stream>>>(in, out, w, count);
 }
 
 template <class T>
-void argminmax_impl(const ArgMinMaxAttributes& attrs, TensorView& output,
-                    const TensorView& input, cudaStream_t stream)
+void argminmax_impl(const ArgMinMaxAttributes& attrs, TensorView& output, const TensorView& input,
+                    cudaStream_t stream)
 {
     const int64_t rank = input.rank();
     const int64_t ax = attrs.axis < 0 ? attrs.axis + rank : attrs.axis;
     const AxisWalk w = detail::make_axis_walk(input, output, ax, attrs.keepdims);
 
-    if (w.axis_dim == 0 || w.outer == 0 || w.inner == 0) { return; }
+    if (w.axis_dim == 0 || w.outer == 0 || w.inner == 0) {
+        return;
+    }
 
     const T* in = input.ptr<T>();
     int64_t* out = output.ptr<int64_t>();
@@ -174,19 +185,19 @@ void argminmax_impl(const ArgMinMaxAttributes& attrs, TensorView& output,
 
 template <class T>
 Status argminmax_entry(const ArgMinMaxAttributes& attrs, TensorView& output,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx)
+                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
     const int64_t ax = attrs.axis < 0 ? attrs.axis + rank : attrs.axis;
-    if (rank == 0 || ax < 0 || ax >= rank) { return Status::invalid_argument; }
-    argminmax_impl<T>(attrs, output, input,
-                      static_cast<cudaStream_t>(ctx.cuda_stream));
+    if (rank == 0 || ax < 0 || ax >= rank) {
+        return Status::invalid_argument;
+    }
+    argminmax_impl<T>(attrs, output, input, static_cast<cudaStream_t>(ctx.cuda_stream));
     return Status::ok;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // ============================================================
 // Entry points
@@ -209,12 +220,11 @@ Status argmax_cuda(const ArgMinMaxAttributes& attrs, TensorView& output,
 }
 
 Status argmin_cuda(const ArgMinMaxAttributes& attrs, TensorView& output,
-                   std::span<const TensorView> inputs, const ComputeContext& ctx,
-                   void* workspace)
+                   std::span<const TensorView> inputs, const ComputeContext& ctx, void* workspace)
 {
     ArgMinMaxAttributes a = attrs;
     a.type = ArgMinMaxType::Min;
     return argmax_cuda(a, output, inputs, ctx, workspace);
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

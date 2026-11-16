@@ -23,30 +23,37 @@
 
 namespace nnops::backend::vulkan {
 
-static constexpr uint32_t eltwise_op_to_spec(EltwiseType type) noexcept {
+static constexpr uint32_t eltwise_op_to_spec(EltwiseType type) noexcept
+{
     switch (type) {
-    case EltwiseType::Add: return 0;
-    case EltwiseType::Sub: return 1;
-    case EltwiseType::Mul: return 2;
-    case EltwiseType::Div: return 3;
-    case EltwiseType::Min: return 4;
-    case EltwiseType::Max: return 5;
-    case EltwiseType::Pow: return 6;
+    case EltwiseType::Add:
+        return 0;
+    case EltwiseType::Sub:
+        return 1;
+    case EltwiseType::Mul:
+        return 2;
+    case EltwiseType::Div:
+        return 3;
+    case EltwiseType::Min:
+        return 4;
+    case EltwiseType::Max:
+        return 5;
+    case EltwiseType::Pow:
+        return 6;
     }
     return 0;
 }
 
-void eltwise_vulkan(
-    const EltwiseAttributes& attrs,
-    TensorView& /*output*/,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx,
-    void* /*workspace*/)
+void eltwise_vulkan(const EltwiseAttributes& attrs, TensorView& /*output*/,
+                    std::span<const TensorView> inputs, const ComputeContext& ctx,
+                    void* /*workspace*/)
 {
     const auto& A = inputs[0];
     const auto& B = inputs[1];
     const int64_t total = A.numel();
-    if (total == 0) { return; }
+    if (total == 0) {
+        return;
+    }
     NNOPS_ASSERT(A.numel() == B.numel());
 
     const auto dtype = A.data_type();
@@ -67,21 +74,21 @@ void eltwise_vulkan(
         return;
     }
 
-    VkCommandBuffer  cmd    = static_cast<VkCommandBuffer>(ctx.vulkan_cmd_buffer);
-    VkDevice         device = static_cast<VkDevice>(ctx.vulkan_device);
-    VkDescriptorPool pool   = static_cast<VkDescriptorPool>(ctx.vulkan_descriptor_pool);
+    VkCommandBuffer cmd = static_cast<VkCommandBuffer>(ctx.vulkan_cmd_buffer);
+    VkDevice device = static_cast<VkDevice>(ctx.vulkan_device);
+    VkDescriptorPool pool = static_cast<VkDescriptorPool>(ctx.vulkan_descriptor_pool);
 
     NNOPS_ASSERT(ctx.vulkan_buffers_count >= 3);
     const VkBuffer* bufs = static_cast<const VkBuffer*>(ctx.vulkan_buffers);
 
     auto& cache = VulkanPipelineCache::instance();
     PipelineKey key = {};
-    key.device       = device;
-    key.spirv_data   = spirv_data;
-    key.spirv_size   = spirv_size;
-    key.spec_op      = eltwise_op_to_spec(attrs.type);
-    key.spec_add_to  = attrs.add_to ? 1u : 0u;
-    key.num_bindings = 3;  // A, B, C
+    key.device = device;
+    key.spirv_data = spirv_data;
+    key.spirv_size = spirv_size;
+    key.spec_op = eltwise_op_to_spec(attrs.type);
+    key.spec_add_to = attrs.add_to ? 1u : 0u;
+    key.num_bindings = 3; // A, B, C
 
     VulkanPipeline pipeline = cache.get_or_create(key);
     if (pipeline.pipeline == VK_NULL_HANDLE) {
@@ -92,12 +99,10 @@ void eltwise_vulkan(
     ComputePushConstants pc = {};
     pc.total = static_cast<int32_t>(total);
 
-    VkBuffer dispatch_buffers[3] = { bufs[0], bufs[1], bufs[2] };
+    VkBuffer dispatch_buffers[3] = {bufs[0], bufs[1], bufs[2]};
 
-    vulkan_record_dispatch(cmd, device, pool, pipeline,
-                           dispatch_buffers, 3,
-                           &pc, sizeof(pc),
+    vulkan_record_dispatch(cmd, device, pool, pipeline, dispatch_buffers, 3, &pc, sizeof(pc),
                            static_cast<uint32_t>(total));
 }
 
-}  // namespace nnops::backend::vulkan
+} // namespace nnops::backend::vulkan

@@ -30,18 +30,20 @@ namespace nnops::backend::cpu::aarch64 {
 // =========================================================================
 
 inline void pack_trans_n1_f16(float16_t* NNOPS_RESTRICT output,
-                              const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 1) noexcept {
+                              const float16_t* NNOPS_RESTRICT input, int ir_step, int K,
+                              float scale, int mr = 1) noexcept
+{
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         *output++ = input[0] * s;
-        input += 1;  // consecutive k within the M×K source row
+        input += 1; // consecutive k within the M×K source row
     }
 }
 
 inline void pack_trans_n4_f16(float16_t* NNOPS_RESTRICT output,
-                              const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 4) noexcept {
+                              const float16_t* NNOPS_RESTRICT input, int ir_step, int K,
+                              float scale, int mr = 4) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -53,10 +55,14 @@ inline void pack_trans_n4_f16(float16_t* NNOPS_RESTRICT output,
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float16x4_t v0 = vmul_n_f16(vld1_f16(p0), s); p0 += 4;
-        float16x4_t v1 = vmul_n_f16(vld1_f16(p1), s); p1 += 4;
-        float16x4_t v2 = vmul_n_f16(vld1_f16(p2), s); p2 += 4;
-        float16x4_t v3 = vmul_n_f16(vld1_f16(p3), s); p3 += 4;
+        float16x4_t v0 = vmul_n_f16(vld1_f16(p0), s);
+        p0 += 4;
+        float16x4_t v1 = vmul_n_f16(vld1_f16(p1), s);
+        p1 += 4;
+        float16x4_t v2 = vmul_n_f16(vld1_f16(p2), s);
+        p2 += 4;
+        float16x4_t v3 = vmul_n_f16(vld1_f16(p3), s);
+        p3 += 4;
 
         transpose_4x4_f16(v0, v1, v2, v3);
 
@@ -76,8 +82,9 @@ inline void pack_trans_n4_f16(float16_t* NNOPS_RESTRICT output,
 }
 
 inline void pack_trans_n8_f16(float16_t* NNOPS_RESTRICT output,
-                              const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int mr = 8) noexcept {
+                              const float16_t* NNOPS_RESTRICT input, int ir_step, int K,
+                              float scale, int mr = 8) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -97,14 +104,22 @@ inline void pack_trans_n8_f16(float16_t* NNOPS_RESTRICT output,
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
     for (; k <= K - 8; k += 8) {
-        float16x8_t v0 = vmulq_n_f16(vld1q_f16(p0), s); p0 += 8;
-        float16x8_t v1 = vmulq_n_f16(vld1q_f16(p1), s); p1 += 8;
-        float16x8_t v2 = vmulq_n_f16(vld1q_f16(p2), s); p2 += 8;
-        float16x8_t v3 = vmulq_n_f16(vld1q_f16(p3), s); p3 += 8;
-        float16x8_t v4 = vmulq_n_f16(vld1q_f16(p4), s); p4 += 8;
-        float16x8_t v5 = vmulq_n_f16(vld1q_f16(p5), s); p5 += 8;
-        float16x8_t v6 = vmulq_n_f16(vld1q_f16(p6), s); p6 += 8;
-        float16x8_t v7 = vmulq_n_f16(vld1q_f16(p7), s); p7 += 8;
+        float16x8_t v0 = vmulq_n_f16(vld1q_f16(p0), s);
+        p0 += 8;
+        float16x8_t v1 = vmulq_n_f16(vld1q_f16(p1), s);
+        p1 += 8;
+        float16x8_t v2 = vmulq_n_f16(vld1q_f16(p2), s);
+        p2 += 8;
+        float16x8_t v3 = vmulq_n_f16(vld1q_f16(p3), s);
+        p3 += 8;
+        float16x8_t v4 = vmulq_n_f16(vld1q_f16(p4), s);
+        p4 += 8;
+        float16x8_t v5 = vmulq_n_f16(vld1q_f16(p5), s);
+        p5 += 8;
+        float16x8_t v6 = vmulq_n_f16(vld1q_f16(p6), s);
+        p6 += 8;
+        float16x8_t v7 = vmulq_n_f16(vld1q_f16(p7), s);
+        p7 += 8;
 
         transpose_8x8_f16(v0, v1, v2, v3, v4, v5, v6, v7);
 
@@ -132,8 +147,9 @@ inline void pack_trans_n8_f16(float16_t* NNOPS_RESTRICT output,
 }
 
 inline void pack_trans_n12_f16(float16_t* NNOPS_RESTRICT output,
-                               const float16_t* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale, int mr = 12) noexcept {
+                               const float16_t* NNOPS_RESTRICT input, int ir_step, int K,
+                               float scale, int mr = 12) noexcept
+{
     const int last = (mr > 1) ? mr - 1 : 0;
     const float16_t* NNOPS_RESTRICT p[12];
     for (int i = 0; i < 12; ++i) {
@@ -145,11 +161,12 @@ inline void pack_trans_n12_f16(float16_t* NNOPS_RESTRICT output,
     for (; k <= K - 8; k += 8) {
         float16x8_t v[12];
         for (int i = 0; i < 12; ++i) {
-            v[i] = vmulq_n_f16(vld1q_f16(p[i]), s); p[i] += 8;
+            v[i] = vmulq_n_f16(vld1q_f16(p[i]), s);
+            p[i] += 8;
         }
 
-        transpose_12x8_f16(v[0], v[1], v[2], v[3], v[4], v[5],
-                           v[6], v[7], v[8], v[9], v[10], v[11]);
+        transpose_12x8_f16(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10],
+                           v[11]);
 
         for (int i = 0; i < 12; ++i) {
             vst1q_f16(output + i * 8, v[i]);
@@ -165,8 +182,9 @@ inline void pack_trans_n12_f16(float16_t* NNOPS_RESTRICT output,
 }
 
 inline void pack_trans_n16_f16(float16_t* NNOPS_RESTRICT output,
-                               const float16_t* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale, int mr = 16) noexcept {
+                               const float16_t* NNOPS_RESTRICT input, int ir_step, int K,
+                               float scale, int mr = 16) noexcept
+{
     const int last = (mr > 1) ? mr - 1 : 0;
     const float16_t* NNOPS_RESTRICT p[16];
     for (int i = 0; i < 16; ++i) {
@@ -178,11 +196,12 @@ inline void pack_trans_n16_f16(float16_t* NNOPS_RESTRICT output,
     for (; k <= K - 8; k += 8) {
         float16x8_t v[16];
         for (int i = 0; i < 16; ++i) {
-            v[i] = vmulq_n_f16(vld1q_f16(p[i]), s); p[i] += 8;
+            v[i] = vmulq_n_f16(vld1q_f16(p[i]), s);
+            p[i] += 8;
         }
 
-        transpose_16x8_f16(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-                           v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+        transpose_16x8_f16(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11],
+                           v[12], v[13], v[14], v[15]);
 
         for (int i = 0; i < 16; ++i) {
             vst1q_f16(output + i * 8, v[i]);
@@ -202,8 +221,9 @@ inline void pack_trans_n16_f16(float16_t* NNOPS_RESTRICT output,
 // =========================================================================
 
 inline void pack_copy_n1_f16(float16_t* NNOPS_RESTRICT output,
-                             const float16_t* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 1) noexcept {
+                             const float16_t* NNOPS_RESTRICT input, int ir_step, int K, float scale,
+                             int nr = 1) noexcept
+{
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         *output++ = (nr > 0) ? input[0] * s : static_cast<float16_t>(0.0f);
@@ -212,8 +232,9 @@ inline void pack_copy_n1_f16(float16_t* NNOPS_RESTRICT output,
 }
 
 inline void pack_copy_n4_f16(float16_t* NNOPS_RESTRICT output,
-                             const float16_t* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 4) noexcept {
+                             const float16_t* NNOPS_RESTRICT input, int ir_step, int K, float scale,
+                             int nr = 4) noexcept
+{
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
@@ -251,21 +272,22 @@ inline void pack_copy_n4_f16(float16_t* NNOPS_RESTRICT output,
 }
 
 inline void pack_copy_n6_f16(float16_t* NNOPS_RESTRICT output,
-                             const float16_t* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 6) noexcept {
+                             const float16_t* NNOPS_RESTRICT input, int ir_step, int K, float scale,
+                             int nr = 6) noexcept
+{
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         for (int i = 0; i < 6; ++i) {
-            *output++ = (i < nr) ? input[i * ir_step] * s
-                                 : static_cast<float16_t>(0.0f);
+            *output++ = (i < nr) ? input[i * ir_step] * s : static_cast<float16_t>(0.0f);
         }
         input += 1;
     }
 }
 
 inline void pack_copy_n8_f16(float16_t* NNOPS_RESTRICT output,
-                             const float16_t* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale, int nr = 8) noexcept {
+                             const float16_t* NNOPS_RESTRICT input, int ir_step, int K, float scale,
+                             int nr = 8) noexcept
+{
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 8) {
@@ -277,13 +299,14 @@ inline void pack_copy_n8_f16(float16_t* NNOPS_RESTRICT output,
             }
         }
         output += 8;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
 inline void pack_copy_n12_f16(float16_t* NNOPS_RESTRICT output,
-                              const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int nr = 12) noexcept {
+                              const float16_t* NNOPS_RESTRICT input, int ir_step, int K,
+                              float scale, int nr = 12) noexcept
+{
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 12) {
@@ -295,13 +318,14 @@ inline void pack_copy_n12_f16(float16_t* NNOPS_RESTRICT output,
             }
         }
         output += 12;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
 inline void pack_copy_n16_f16(float16_t* NNOPS_RESTRICT output,
-                              const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale, int nr = 16) noexcept {
+                              const float16_t* NNOPS_RESTRICT input, int ir_step, int K,
+                              float scale, int nr = 16) noexcept
+{
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 16) {
@@ -313,7 +337,7 @@ inline void pack_copy_n16_f16(float16_t* NNOPS_RESTRICT output,
             }
         }
         output += 16;
-        input  += ir_step;
+        input += ir_step;
     }
 }
 
@@ -325,4 +349,4 @@ inline constexpr int mr_f16[4] = {8, 4, 1, 0};
 
 inline constexpr int nr_f16[3] = {16, 8, 1};
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

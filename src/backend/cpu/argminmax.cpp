@@ -20,9 +20,8 @@ using detail::AxisWalk;
 using detail::axis_group_offset;
 
 template <typename T>
-void argminmax_impl(const ArgMinMaxAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs)
+void argminmax_impl(const ArgMinMaxAttributes& attrs, TensorView& output,
+                    std::span<const TensorView> inputs)
 {
     const auto& in = inputs[0];
     const int64_t rank = in.rank();
@@ -44,7 +43,7 @@ void argminmax_impl(const ArgMinMaxAttributes& attrs,
             const int64_t base = i_base + axis_group_offset(inner, w.post);
 
             int64_t best_idx = 0;
-            float   best_val = s_load(i_ptr + base);
+            float best_val = s_load(i_ptr + base);
 
             for (int64_t k = 1; k < w.axis_dim; ++k) {
                 float val = s_load(i_ptr + base + k * w.axis_stride);
@@ -60,11 +59,9 @@ void argminmax_impl(const ArgMinMaxAttributes& attrs,
     }
 }
 
-Status argmax_cpu(const ArgMinMaxAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& /*ctx*/,
-                 void* /*workspace*/)
+Status argmax_cpu(const ArgMinMaxAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& /*ctx*/,
+                  void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "argmax_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -73,11 +70,8 @@ Status argmax_cpu(const ArgMinMaxAttributes& attrs,
     return Status::ok;
 }
 
-Status argmin_cpu(const ArgMinMaxAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* workspace)
+Status argmin_cpu(const ArgMinMaxAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx, void* workspace)
 {
     ArgMinMaxAttributes a = attrs;
     a.type = ArgMinMaxType::Min;
@@ -85,4 +79,4 @@ Status argmin_cpu(const ArgMinMaxAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

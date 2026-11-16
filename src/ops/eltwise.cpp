@@ -13,13 +13,12 @@ NNOPS_DECLARE_CUDA(EltwiseAttributes, eltwise_cuda)
 NNOPS_DECLARE_VULKAN(EltwiseAttributes, eltwise_vulkan)
 NNOPS_DECLARE_METAL(EltwiseAttributes, eltwise_metal)
 
-NNOPS_OP_BOILERPLATE_METAL(Eltwise, EltwiseAttributes,
-        backend::cpu::eltwise_cpu, NNOPS_IF_CUDA(backend::cuda::eltwise_cuda),
-        NNOPS_IF_VULKAN(backend::vulkan::eltwise_vulkan),
-        NNOPS_IF_METAL(backend::metal::eltwise_metal))
+NNOPS_OP_BOILERPLATE_METAL(Eltwise, EltwiseAttributes, backend::cpu::eltwise_cpu,
+                           NNOPS_IF_CUDA(backend::cuda::eltwise_cuda),
+                           NNOPS_IF_VULKAN(backend::vulkan::eltwise_vulkan),
+                           NNOPS_IF_METAL(backend::metal::eltwise_metal))
 
-std::vector<TensorDesc> Eltwise::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Eltwise::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     return broadcast_binary_output_shape(inputs);
 }
@@ -39,20 +38,20 @@ Status Eltwise::validate(std::span<const TensorDesc> inputs,
         !(is_channel_first_spatial(b.layout) || is_channel_last(b.layout))) {
         return Status::invalid_argument;
     }
-    return detail::require(broadcast_compatible(
-        std::span<const int64_t>(a.dims.data(), static_cast<size_t>(a.rank)),
-        std::span<const int64_t>(b.dims.data(), static_cast<size_t>(b.rank))));
+    return detail::require(
+        broadcast_compatible(std::span<const int64_t>(a.dims.data(), static_cast<size_t>(a.rank)),
+                             std::span<const int64_t>(b.dims.data(), static_cast<size_t>(b.rank))));
 }
 
-Status Eltwise::compute(std::span<TensorView> outputs,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx,
-                        void* workspace)
+Status Eltwise::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 2, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

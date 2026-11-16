@@ -49,8 +49,11 @@ namespace nnops::backend::cpu {
 namespace {
 
 /// fp keeps X's dtype; the quantized path follows attrs.output_dtype, else f32.
-DataType linear_output_dtype(const LinearAttributes& attrs, DataType x_dt) noexcept {
-    if (is_float_dtype(x_dt)) { return x_dt; }
+DataType linear_output_dtype(const LinearAttributes& attrs, DataType x_dt) noexcept
+{
+    if (is_float_dtype(x_dt)) {
+        return x_dt;
+    }
     switch (attrs.output_dtype) {
     case DataType::f16:
     case DataType::s32:
@@ -63,7 +66,8 @@ DataType linear_output_dtype(const LinearAttributes& attrs, DataType x_dt) noexc
 }
 
 /// Raw data pointer of a view, for building a promoted (rank-1 → rank-2) view.
-void* view_data(const TensorView& t) noexcept {
+void* view_data(const TensorView& t) noexcept
+{
     return const_cast<void*>(static_cast<const void*>(t.ptr<uint8_t>()));
 }
 
@@ -77,9 +81,9 @@ void* view_data(const TensorView& t) noexcept {
 /// GeGLU — the form Gemma's FFN needs. The combine itself is the shared
 /// gate_combine helper, so MoE's experts and this path evaluate one formula.
 template <EpilogueActivateType Act, typename T>
-void gated_combine_act(const T* base, int64_t n2, int64_t n,
-                       T* out, int64_t out_pitch, int64_t rows, bool add_to,
-                       const Epilogue& ep, float alpha, float beta, float limit)
+void gated_combine_act(const T* base, int64_t n2, int64_t n, T* out, int64_t out_pitch,
+                       int64_t rows, bool add_to, const Epilogue& ep, float alpha, float beta,
+                       float limit)
 {
     const auto tag = base;
     const auto vlim = simd::v_set1(tag, limit);
@@ -94,8 +98,7 @@ void gated_combine_act(const T* base, int64_t n2, int64_t n,
             v = simd::v_max(simd::v_min(v, vlim), vnlim);
         }
         return apply_epilogue_vec(
-            ep, tag, simd::v_mul(gate_act_vec<Act>(g, tag, alpha),
-                                 simd::v_add(v, vbeta)));
+            ep, tag, simd::v_mul(gate_act_vec<Act>(g, tag, alpha), simd::v_add(v, vbeta)));
     };
     auto scalar = [=](float g, float v) {
         if (clamp) {
@@ -105,26 +108,27 @@ void gated_combine_act(const T* base, int64_t n2, int64_t n,
         return apply_epilogue(ep, gate_act_scalar<Act>(g, alpha) * (v + beta));
     };
 
-    kernel::tiled_map_simd<T, 2>({base, base + n}, {n2, n2},
-                                 out, out_pitch, rows, n, add_to, vec, scalar);
+    kernel::tiled_map_simd<T, 2>({base, base + n}, {n2, n2}, out, out_pitch, rows, n, add_to, vec,
+                                 scalar);
 }
 
 template <typename T>
 Status linear_gated_impl(const LinearAttributes& attrs, TensorView& output,
-                         std::span<const TensorView> inputs, int64_t rows,
-                         int64_t n2, const ComputeContext& ctx, void* workspace)
+                         std::span<const TensorView> inputs, int64_t rows, int64_t n2,
+                         const ComputeContext& ctx, void* workspace)
 {
     const int64_t n = n2 / 2;
     PoolPtr tmp(static_cast<size_t>(rows) * static_cast<size_t>(n2) * sizeof(T));
-    if (!tmp) { return Status::out_of_memory; }
+    if (!tmp) {
+        return Status::out_of_memory;
+    }
     int64_t tshape[2] = {rows, n2};
-    TensorView mt(std::span<const int64_t>(tshape, 2),
-                  flt_data_type<T>(),
-                  tmp.get(), n2 * static_cast<int64_t>(sizeof(T)));
+    TensorView mt(std::span<const int64_t>(tshape, 2), flt_data_type<T>(), tmp.get(),
+                  n2 * static_cast<int64_t>(sizeof(T)));
 
     MatMulAttributes ma;
     ma.transpose_b = true;
-    ma.epilogue = Epilogue{};   // the combine applies Linear's
+    ma.epilogue = Epilogue{}; // the combine applies Linear's
     NNOPS_TRY(matmul_cpu(ma, mt, inputs, ctx, workspace));
 
     T* base = mt.ptr<T>();
@@ -135,34 +139,34 @@ Status linear_gated_impl(const LinearAttributes& attrs, TensorView& output,
 
     switch (attrs.gate_activation) {
     case EpilogueActivateType::Silu:
-        gated_combine_act<EpilogueActivateType::Silu>(
-            base, n2, n, out, out_pitch, rows, add_to, ep,
-            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        gated_combine_act<EpilogueActivateType::Silu>(base, n2, n, out, out_pitch, rows, add_to, ep,
+                                                      attrs.gate_alpha, attrs.gate_beta,
+                                                      attrs.gate_limit);
         return Status::ok;
     case EpilogueActivateType::Gelu:
-        gated_combine_act<EpilogueActivateType::Gelu>(
-            base, n2, n, out, out_pitch, rows, add_to, ep,
-            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        gated_combine_act<EpilogueActivateType::Gelu>(base, n2, n, out, out_pitch, rows, add_to, ep,
+                                                      attrs.gate_alpha, attrs.gate_beta,
+                                                      attrs.gate_limit);
         return Status::ok;
     case EpilogueActivateType::Relu:
-        gated_combine_act<EpilogueActivateType::Relu>(
-            base, n2, n, out, out_pitch, rows, add_to, ep,
-            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        gated_combine_act<EpilogueActivateType::Relu>(base, n2, n, out, out_pitch, rows, add_to, ep,
+                                                      attrs.gate_alpha, attrs.gate_beta,
+                                                      attrs.gate_limit);
         return Status::ok;
     case EpilogueActivateType::Sigmoid:
-        gated_combine_act<EpilogueActivateType::Sigmoid>(
-            base, n2, n, out, out_pitch, rows, add_to, ep,
-            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        gated_combine_act<EpilogueActivateType::Sigmoid>(base, n2, n, out, out_pitch, rows, add_to,
+                                                         ep, attrs.gate_alpha, attrs.gate_beta,
+                                                         attrs.gate_limit);
         return Status::ok;
     case EpilogueActivateType::Tanh:
-        gated_combine_act<EpilogueActivateType::Tanh>(
-            base, n2, n, out, out_pitch, rows, add_to, ep,
-            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        gated_combine_act<EpilogueActivateType::Tanh>(base, n2, n, out, out_pitch, rows, add_to, ep,
+                                                      attrs.gate_alpha, attrs.gate_beta,
+                                                      attrs.gate_limit);
         return Status::ok;
     case EpilogueActivateType::None:
-        gated_combine_act<EpilogueActivateType::None>(
-            base, n2, n, out, out_pitch, rows, add_to, ep,
-            attrs.gate_alpha, attrs.gate_beta, attrs.gate_limit);
+        gated_combine_act<EpilogueActivateType::None>(base, n2, n, out, out_pitch, rows, add_to, ep,
+                                                      attrs.gate_alpha, attrs.gate_beta,
+                                                      attrs.gate_limit);
         return Status::ok;
     default:
         break;
@@ -178,24 +182,22 @@ void residual_add(TensorView& out, const TensorView& src, const ComputeContext& 
 {
     const int64_t cols = out.shape(out.rank() - 1);
     const int64_t rows = out.total_rows();
-    if (cols <= 0 || rows <= 0) { return; }
+    if (cols <= 0 || rows <= 0) {
+        return;
+    }
 
     ctx.cpu.run(0, rows, [&](int64_t r) {
-        epilogue_inplace<T>(1, static_cast<int>(cols),
-                            out.ptr<T>(static_cast<size_t>(r)),
+        epilogue_inplace<T>(1, static_cast<int>(cols), out.ptr<T>(static_cast<size_t>(r)),
                             static_cast<int>(out.row_stride_elems()),
                             static_cast<const T*>(nullptr), Epilogue{},
                             src.ptr<T>(static_cast<size_t>(r)), true);
     });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status linear_cpu(const LinearAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx,
-                void* workspace)
+Status linear_cpu(const LinearAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx, void* workspace)
 {
     NNOPS_ASSERT(inputs.size() >= 2 && inputs.size() <= 3);
     const auto& x = inputs[0];
@@ -219,10 +221,9 @@ Status linear_cpu(const LinearAttributes& attrs,
                             (nnops::detail::bf16_cpu_enabled && x_dt == DataType::bf16));
     NNOPS_ASSERT(quant || block_rhs || (x_dt == w_dt && is_float_dtype(x_dt)));
     // Integer output -> int32 bias (MatMul's rule).
-    const bool int_out = out_dt == DataType::s32 || out_dt == DataType::s8 ||
-                         out_dt == DataType::u8;
-    NNOPS_ASSERT_MSG(!(attrs.add_to && int_out),
-                     "Linear: add_to needs an fp output");
+    const bool int_out =
+        out_dt == DataType::s32 || out_dt == DataType::s8 || out_dt == DataType::u8;
+    NNOPS_ASSERT_MSG(!(attrs.add_to && int_out), "Linear: add_to needs an fp output");
     if (has_bias) {
         NNOPS_ASSERT(inputs[2].data_type() == (int_out ? DataType::s32 : out_dt));
         NNOPS_ASSERT(inputs[2].numel() >= w.shape(0));
@@ -237,56 +238,54 @@ Status linear_cpu(const LinearAttributes& attrs,
     if (x.rank() == 1) {
         const int64_t xs[2] = {1, K};
         x_row.emplace(std::span<const int64_t>(xs, 2), x_dt, view_data(x),
-                      K * static_cast<int64_t>(data_type_size(x_dt)),
-                      x.layout(), x.quant_params());
+                      K * static_cast<int64_t>(data_type_size(x_dt)), x.layout(), x.quant_params());
         const int64_t os[2] = {1, N};
         // The quant params ride along: an s8/u8 output requantizes with them.
         out_row.emplace(std::span<const int64_t>(os, 2), out_dt, view_data(output),
-                        N * static_cast<int64_t>(data_type_size(out_dt)),
-                        output.layout(), output.quant_params());
+                        N * static_cast<int64_t>(data_type_size(out_dt)), output.layout(),
+                        output.quant_params());
     }
     TensorView& ov = out_row ? *out_row : output;
 
     TensorView minputs[3] = {x_row ? *x_row : x, w, TensorView{}};
-    if (has_bias) { minputs[2] = inputs[2]; }
-    const std::span<const TensorView> min(
-        minputs, has_bias ? size_t{3} : size_t{2});
+    if (has_bias) {
+        minputs[2] = inputs[2];
+    }
+    const std::span<const TensorView> min(minputs, has_bias ? size_t{3} : size_t{2});
 
     if (attrs.gated) {
         if (x_dt == DataType::bf16) {
 #ifdef NNOPS_ARCH_AARCH64
-            return linear_gated_impl<bfloat16>(attrs, ov, min, ov.total_rows(),
-                                               w.shape(0), ctx, workspace);
+            return linear_gated_impl<bfloat16>(attrs, ov, min, ov.total_rows(), w.shape(0), ctx,
+                                               workspace);
 #else
             return Status::unsupported;
 #endif
         }
-        return x_dt == DataType::f32
-                   ? linear_gated_impl<float>(attrs, ov, min, ov.total_rows(),
-                                              w.shape(0), ctx, workspace)
-                   : linear_gated_impl<half>(attrs, ov, min, ov.total_rows(),
-                                             w.shape(0), ctx, workspace);
+        return x_dt == DataType::f32 ? linear_gated_impl<float>(attrs, ov, min, ov.total_rows(),
+                                                                w.shape(0), ctx, workspace) :
+                                       linear_gated_impl<half>(attrs, ov, min, ov.total_rows(),
+                                                               w.shape(0), ctx, workspace);
     }
 
     MatMulAttributes ma;
     ma.transpose_b = true;
-    ma.output_dtype = out_dt;   // read only on the int8 route
+    ma.output_dtype = out_dt; // read only on the int8 route
     ma.epilogue = attrs.epilogue;
 
     // The pre-activation residual folds into the GEMM: every route — fp, q4_1
     // and int8 — adds the destination's old contents to the product before the
     // clamp and the activation. An identity epilogue folds either way, since
     // the two orders then agree.
-    const bool fold = attrs.add_to &&
-                      (attrs.residual_pre_activation ||
-                       !epilogue_is_active(attrs.epilogue));
+    const bool fold =
+        attrs.add_to && (attrs.residual_pre_activation || !epilogue_is_active(attrs.epilogue));
     ma.residual_pre_activation = fold;
 
     if (attrs.add_to && !fold) {
         // MatMul writes a compact temporary; the residual is added after its epilogue.
         const int64_t out_rows = ov.total_rows();
-        PoolPtr tmp(static_cast<size_t>(out_rows) * static_cast<size_t>(N)
-                    * data_type_size(out_dt));
+        PoolPtr tmp(static_cast<size_t>(out_rows) * static_cast<size_t>(N) *
+                    data_type_size(out_dt));
         TensorView mt(ov.shape_span(), out_dt, tmp.get());
         matmul_cpu(ma, mt, min, ctx, workspace);
 
@@ -309,4 +308,4 @@ Status linear_cpu(const LinearAttributes& attrs,
     return matmul_cpu(ma, ov, min, ctx, workspace);
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

@@ -25,8 +25,7 @@ namespace nnops::backend::cpu {
 namespace {
 
 /// Dot product of two n-wide rows, f32 accumulation.
-template <class T>
-inline float dot_row(const T* a, const T* b, int64_t n)
+template <class T> inline float dot_row(const T* a, const T* b, int64_t n)
 {
     constexpr int L = simd::simd_lane_for<T>;
     auto acc = simd::v_zero_f32x8();
@@ -35,7 +34,9 @@ inline float dot_row(const T* a, const T* b, int64_t n)
         acc = simd::v_fmadd(simd::v_load_f32(a + i), simd::v_load_f32(b + i), acc);
     }
     float s = simd::v_reduce_sum(acc);
-    for (; i < n; ++i) { s += simd::s_load(&a[i]) * simd::s_load(&b[i]); }
+    for (; i < n; ++i) {
+        s += simd::s_load(&a[i]) * simd::s_load(&b[i]);
+    }
     return s;
 }
 
@@ -43,8 +44,8 @@ inline float dot_row(const T* a, const T* b, int64_t n)
 /// horizontal reduce costs about as much as the 16 vector FMAs of a 128-wide
 /// row, so four keys per reduce is what keeps the GEMV off the latency floor.
 template <class T>
-inline void dot_row4(const T* q, const T* k0, const T* k1, const T* k2, const T* k3,
-                     int64_t n, float* out)
+inline void dot_row4(const T* q, const T* k0, const T* k1, const T* k2, const T* k3, int64_t n,
+                     float* out)
 {
     constexpr int L = simd::simd_lane_for<T>;
     auto a0 = simd::v_zero_f32x8();
@@ -68,16 +69,16 @@ inline void dot_row4(const T* q, const T* k0, const T* k1, const T* k2, const T*
         s2 += qs * simd::s_load(&k2[i]);
         s3 += qs * simd::s_load(&k3[i]);
     }
-    out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+    out[0] = s0;
+    out[1] = s1;
+    out[2] = s2;
+    out[3] = s3;
 }
 
 template <class T>
-void attention_decode_impl(const AttentionConfig& cfg,
-                           TensorView& output,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx,
-                           const AttentionPlan& plan,
-                           void* workspace)
+void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
+                           std::span<const TensorView> inputs, const ComputeContext& ctx,
+                           const AttentionPlan& plan, void* workspace)
 {
     const auto& Q = inputs[0];
     const auto& K = inputs[1];
@@ -85,20 +86,19 @@ void attention_decode_impl(const AttentionConfig& cfg,
     const bool split = has_past_view(cfg, inputs);
     const auto& Kp = split ? inputs[past_slot(cfg)] : K;
     const auto& Vp = split ? inputs[past_slot(cfg) + (cfg.v_is_k ? 0 : 1)] : V;
-    const int32_t* seqlens = has_seqlens_input(cfg, inputs)
-        ? inputs[seqlens_slot(cfg)].ptr<int32_t>() : nullptr;
+    const int32_t* seqlens =
+        has_seqlens_input(cfg, inputs) ? inputs[seqlens_slot(cfg)].ptr<int32_t>() : nullptr;
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
     const int64_t Sq = hs.Sq, Dqk = hs.Dqk, Dv = hs.Dv;
     const int64_t Sk_new = hs.Sk, Sk_past = hs.Sk_past;
-    const int64_t Sk = Sk_new + Sk_past;   // the whole [past | new] run
+    const int64_t Sk = Sk_new + Sk_past; // the whole [past | new] run
     const bool merged = hs.merged;
     NNOPS_ASSERT(Sq == 1);
 
-    const float scale = (cfg.scale == 0.0f)
-        ? (1.0f / std::sqrt(static_cast<float>(Dqk)))
-        : cfg.scale;
+    const float scale =
+        (cfg.scale == 0.0f) ? (1.0f / std::sqrt(static_cast<float>(Dqk))) : cfg.scale;
     // The scale normally rides through the softmax exponential. A softcap is
     // applied to the scaled logit itself, so in that case it is folded into the
     // cap pass and the exponential runs unscaled.
@@ -122,11 +122,11 @@ void attention_decode_impl(const AttentionConfig& cfg,
     const int64_t G = H / Hkv;
     const int64_t hb = plan.decode_heads;
     const int64_t splits = plan.decode_splits;
-    const int64_t nb = (G + hb - 1) / hb;   // head blocks per KV head
+    const int64_t nb = (G + hb - 1) / hb; // head blocks per KV head
     const int64_t units = B * Hkv * nb;
     const int64_t NG = units * splits;
 
-    const int64_t per_slot = plan.decode_elems;   // f32: [scores][o_acc][max][sum]
+    const int64_t per_slot = plan.decode_elems; // f32: [scores][o_acc][max][sum]
     float* ws = static_cast<float*>(workspace);
     float* partials = ws + plan.num_slots * per_slot;
 
@@ -136,13 +136,13 @@ void attention_decode_impl(const AttentionConfig& cfg,
         // Grid (batch, kv head, head block) × KV slice. A slice is a
         // contiguous span of the run, empty when there are more slices than
         // keys; its head block holds up to hb query heads of one KV head.
-        const int64_t si   = idx % splits;
+        const int64_t si = idx % splits;
         const int64_t unit = idx / splits;
-        const int64_t c    = unit % nb;
-        const int64_t hkv  = (unit / nb) % Hkv;
-        const int64_t b    = (unit / nb) / Hkv;
-        const int64_t h0   = hkv * G + c * hb;
-        const int64_t nh   = std::min(hb, G - c * hb);
+        const int64_t c = unit % nb;
+        const int64_t hkv = (unit / nb) % Hkv;
+        const int64_t b = (unit / nb) / Hkv;
+        const int64_t h0 = hkv * G + c * hb;
+        const int64_t nh = std::min(hb, G - c * hb);
 
         // The batch's valid key run and this row's limit over it: bottom-right
         // alignment reads every valid key, a shorter run or an explicit
@@ -184,10 +184,10 @@ void attention_decode_impl(const AttentionConfig& cfg,
         int64_t seg_lo[2] = {0, 0};
         int64_t seg_hi[2] = {0, Sk};
         if (split) {
-            k_base[0] = merged ? kp_ptr + b * Sk_past * kp_rs + hkv * Dqk
-                               : kp_ptr + (b * Hkv + hkv) * Sk_past * kp_rs;
-            v_base[0] = merged ? vp_ptr + b * Sk_past * vp_rs + hkv * v_head_stride
-                               : vp_ptr + (b * Hkv + hkv) * Sk_past * vp_rs;
+            k_base[0] = merged ? kp_ptr + b * Sk_past * kp_rs + hkv * Dqk :
+                                 kp_ptr + (b * Hkv + hkv) * Sk_past * kp_rs;
+            v_base[0] = merged ? vp_ptr + b * Sk_past * vp_rs + hkv * v_head_stride :
+                                 vp_ptr + (b * Hkv + hkv) * Sk_past * vp_rs;
             k_str[0] = kp_rs;
             v_str[0] = vp_rs;
             seg_lo[1] = Sk_past;
@@ -195,16 +195,18 @@ void attention_decode_impl(const AttentionConfig& cfg,
         }
 
         const int64_t slot = scratch_slot_of(ctx.cpu, NG, idx);
-        float* scores = ws + slot * per_slot;        // [nh][kDecodeChunk]
-        float* o_acc  = scores + hb * kDecodeChunk;  // [nh][Dv]
-        float* mrow   = o_acc + hb * Dv;             // [nh]
-        float* lrow   = mrow + hb;                   // [nh]
+        float* scores = ws + slot * per_slot;      // [nh][kDecodeChunk]
+        float* o_acc = scores + hb * kDecodeChunk; // [nh][Dv]
+        float* mrow = o_acc + hb * Dv;             // [nh]
+        float* lrow = mrow + hb;                   // [nh]
 
         for (int64_t j = 0; j < nh; ++j) {
             mrow[j] = kNegInf;
             lrow[j] = 0.0f;
             float* oa = o_acc + j * Dv;
-            for (int64_t d = 0; d < Dv; ++d) { oa[d] = 0.0f; }
+            for (int64_t d = 0; d < Dv; ++d) {
+                oa[d] = 0.0f;
+            }
         }
 
         // Walk the slice in kDecodeChunk-key blocks, keeping the running max,
@@ -223,15 +225,14 @@ void attention_decode_impl(const AttentionConfig& cfg,
                 const T* q_row = q_base + j * q_step;
                 float* sj = scores + j * kDecodeChunk;
                 for (int s = 0; s < 2; ++s) {
-                    const int64_t a  = std::max(t0, seg_lo[s]);
+                    const int64_t a = std::max(t0, seg_lo[s]);
                     const int64_t b1 = std::min(t1, seg_hi[s]);
                     const T* kb = k_base[s];
                     const int64_t rs = k_str[s];
                     int64_t t = a;
                     for (; t + 4 <= b1; t += 4) {
                         const T* kk = kb + (t - seg_lo[s]) * rs;
-                        dot_row4(q_row, kk, kk + rs, kk + 2 * rs, kk + 3 * rs,
-                                 Dqk, sj + (t - t0));
+                        dot_row4(q_row, kk, kk + rs, kk + 2 * rs, kk + 3 * rs, Dqk, sj + (t - t0));
                     }
                     for (; t < b1; ++t) {
                         sj[t - t0] = dot_row(q_row, kb + (t - seg_lo[s]) * rs, Dqk);
@@ -252,15 +253,17 @@ void attention_decode_impl(const AttentionConfig& cfg,
             for (int64_t j = 0; j < nh; ++j) {
                 float* sj = scores + j * kDecodeChunk;
                 const float rowmax = kernel::softmax_row_max<float>(sj, nc);
-                if (rowmax == kNegInf) { continue; }
+                if (rowmax == kNegInf) {
+                    continue;
+                }
                 const float old_m = mrow[j];
                 const float new_m = std::max(old_m, rowmax);
                 // A first block starts from zero, so the rescale is skipped
                 // rather than evaluated as -inf·0.
                 const float exp_diff = (old_m == kNegInf) ? 0.0f : std::exp(old_m - new_m);
                 mrow[j] = new_m;
-                lrow[j] = exp_diff * lrow[j]
-                        + kernel::softmax_row_exp_sum<float>(sj, sj, nc, new_m, exp_scale);
+                lrow[j] = exp_diff * lrow[j] +
+                          kernel::softmax_row_exp_sum<float>(sj, sj, nc, new_m, exp_scale);
                 if (exp_diff != 1.0f) {
                     float* oa = o_acc + j * Dv;
                     auto v_ed = simd::v_set1(oa, exp_diff);
@@ -268,7 +271,9 @@ void attention_decode_impl(const AttentionConfig& cfg,
                     for (; d + lanes <= Dv; d += lanes) {
                         simd::v_store(oa + d, simd::v_mul(simd::v_load(oa + d), v_ed));
                     }
-                    for (; d < Dv; ++d) { oa[d] *= exp_diff; }
+                    for (; d < Dv; ++d) {
+                        oa[d] *= exp_diff;
+                    }
                 }
             }
 
@@ -277,7 +282,7 @@ void attention_decode_impl(const AttentionConfig& cfg,
             // running sum normalizes once at the end. Four value rows per
             // accumulator pass, as in the unbatched kernel.
             for (int s = 0; s < 2; ++s) {
-                const int64_t a  = std::max(t0, seg_lo[s]);
+                const int64_t a = std::max(t0, seg_lo[s]);
                 const int64_t b1 = std::min(t1, seg_hi[s]);
                 const T* vb = v_base[s];
                 const int64_t rs = v_str[s];
@@ -305,10 +310,10 @@ void attention_decode_impl(const AttentionConfig& cfg,
                             simd::v_store(oa + d, acc);
                         }
                         for (; d < Dv; ++d) {
-                            oa[d] += sj[tt + 0] * simd::s_load(&r0[d])
-                                   + sj[tt + 1] * simd::s_load(&r1[d])
-                                   + sj[tt + 2] * simd::s_load(&r2[d])
-                                   + sj[tt + 3] * simd::s_load(&r3[d]);
+                            oa[d] += sj[tt + 0] * simd::s_load(&r0[d]) +
+                                     sj[tt + 1] * simd::s_load(&r1[d]) +
+                                     sj[tt + 2] * simd::s_load(&r2[d]) +
+                                     sj[tt + 3] * simd::s_load(&r3[d]);
                         }
                     }
                 }
@@ -321,10 +326,12 @@ void attention_decode_impl(const AttentionConfig& cfg,
                         float* oa = o_acc + j * Dv;
                         int64_t d = 0;
                         for (; d + lanes <= Dv; d += lanes) {
-                            simd::v_store(oa + d,
-                                simd::v_fmadd(vp, simd::v_load_f32(vrow + d), simd::v_load(oa + d)));
+                            simd::v_store(oa + d, simd::v_fmadd(vp, simd::v_load_f32(vrow + d),
+                                                                simd::v_load(oa + d)));
                         }
-                        for (; d < Dv; ++d) { oa[d] += p * simd::s_load(&vrow[d]); }
+                        for (; d < Dv; ++d) {
+                            oa[d] += p * simd::s_load(&vrow[d]);
+                        }
                     }
                 }
             }
@@ -343,14 +350,18 @@ void attention_decode_impl(const AttentionConfig& cfg,
                 for (; d + lanes <= Dv; d += lanes) {
                     simd::v_store_f32(o_row + d, simd::v_mul(simd::v_load(oa + d), v_inv));
                 }
-                for (; d < Dv; ++d) { simd::s_store(&o_row[d], oa[d] * inv_l); }
+                for (; d < Dv; ++d) {
+                    simd::s_store(&o_row[d], oa[d] * inv_l);
+                }
             }
         } else {
             // Unnormalized output, max and sum; the merge pass combines them.
             for (int64_t j = 0; j < nh; ++j) {
                 float* pj = partials + idx * hb * (Dv + 2) + j * (Dv + 2);
                 const float* oa = o_acc + j * Dv;
-                for (int64_t d = 0; d < Dv; ++d) { pj[d] = oa[d]; }
+                for (int64_t d = 0; d < Dv; ++d) {
+                    pj[d] = oa[d];
+                }
                 pj[Dv] = mrow[j];
                 pj[Dv + 1] = lrow[j];
             }
@@ -359,7 +370,9 @@ void attention_decode_impl(const AttentionConfig& cfg,
 
     ctx.cpu.run(0, NG, run);
 
-    if (splits == 1) { return; }
+    if (splits == 1) {
+        return;
+    }
 
     // ---- merge the KV slices -----------------------------------------------
     // Each slice left o = Σ e·v, m = its maximum raw score and l = Σ e at that
@@ -368,25 +381,26 @@ void attention_decode_impl(const AttentionConfig& cfg,
     // across blocks within one.
     const int64_t nmerge = B * H;
     const auto merge = [&](int64_t idx) {
-        const int64_t b   = idx / H;
-        const int64_t h   = idx % H;
+        const int64_t b = idx / H;
+        const int64_t h = idx % H;
         const int64_t hkv = h / G;
-        const int64_t g   = h - hkv * G;
-        const int64_t c   = g / hb;
-        const int64_t j   = g - c * hb;
-        const int64_t u   = (b * Hkv + hkv) * nb + c;
+        const int64_t g = h - hkv * G;
+        const int64_t c = g / hb;
+        const int64_t j = g - c * hb;
+        const int64_t u = (b * Hkv + hkv) * nb + c;
         const int64_t pstep = hb * (Dv + 2);
         const float* pj = partials + (u * splits) * pstep + j * (Dv + 2);
 
-        T* o_row = merged ? out_ptr + b * o_rs + h * Dv
-                          : out_ptr + (b * H + h) * o_rs;
+        T* o_row = merged ? out_ptr + b * o_rs + h * Dv : out_ptr + (b * H + h) * o_rs;
 
         float M = kNegInf;
         for (int64_t s = 0; s < splits; ++s) {
             M = std::max(M, pj[s * pstep + Dv]);
         }
         if (M == kNegInf) {
-            for (int64_t d = 0; d < Dv; ++d) { simd::s_store(&o_row[d], 0.0f); }
+            for (int64_t d = 0; d < Dv; ++d) {
+                simd::s_store(&o_row[d], 0.0f);
+            }
             return;
         }
 
@@ -394,21 +408,27 @@ void attention_decode_impl(const AttentionConfig& cfg,
         // live; reuse one as the f32 accumulator.
         const int64_t slot = scratch_slot_of(ctx.cpu, nmerge, idx);
         float* acc = ws + slot * per_slot + hb * kDecodeChunk;
-        for (int64_t d = 0; d < Dv; ++d) { acc[d] = 0.0f; }
+        for (int64_t d = 0; d < Dv; ++d) {
+            acc[d] = 0.0f;
+        }
         float denom = 0.0f;
         for (int64_t s = 0; s < splits; ++s) {
             const float* p = pj + s * pstep;
             const float ms = p[Dv];
-            if (ms == kNegInf) { continue; }
+            if (ms == kNegInf) {
+                continue;
+            }
             const float w = std::exp((ms - M) * exp_scale);
             denom += w * p[Dv + 1];
             auto vw = simd::v_set1(p, w);
             int64_t d = 0;
             for (; d + lanes <= Dv; d += lanes) {
                 simd::v_store(acc + d,
-                    simd::v_fmadd(vw, simd::v_load(p + d), simd::v_load(acc + d)));
+                              simd::v_fmadd(vw, simd::v_load(p + d), simd::v_load(acc + d)));
             }
-            for (; d < Dv; ++d) { acc[d] += w * p[d]; }
+            for (; d < Dv; ++d) {
+                acc[d] += w * p[d];
+            }
         }
         const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
         auto v_inv = simd::v_set1(acc, inv);
@@ -416,22 +436,20 @@ void attention_decode_impl(const AttentionConfig& cfg,
         for (; d + lanes <= Dv; d += lanes) {
             simd::v_store_f32(o_row + d, simd::v_mul(simd::v_load(acc + d), v_inv));
         }
-        for (; d < Dv; ++d) { simd::s_store(&o_row[d], acc[d] * inv); }
+        for (; d < Dv; ++d) {
+            simd::s_store(&o_row[d], acc[d] * inv);
+        }
     };
     ctx.cpu.run(0, nmerge, merge);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-void attention_decode_cpu(const AttentionConfig& cfg,
-                          TensorView& output,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx,
-                          const AttentionPlan& plan,
-                          void* scratch)
+void attention_decode_cpu(const AttentionConfig& cfg, TensorView& output,
+                          std::span<const TensorView> inputs, const ComputeContext& ctx,
+                          const AttentionPlan& plan, void* scratch)
 {
-    NNOPS_ASSERT(inputs[0].data_type() == DataType::f16 ||
-                 inputs[0].data_type() == DataType::f32 ||
+    NNOPS_ASSERT(inputs[0].data_type() == DataType::f16 || inputs[0].data_type() == DataType::f32 ||
                  inputs[0].data_type() == DataType::bf16);
     if (inputs[0].data_type() == DataType::f16) {
         attention_decode_impl<half>(cfg, output, inputs, ctx, plan, scratch);
@@ -444,4 +462,4 @@ void attention_decode_cpu(const AttentionConfig& cfg,
     }
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

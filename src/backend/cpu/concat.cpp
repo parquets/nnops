@@ -23,9 +23,8 @@
 namespace nnops::backend::cpu {
 
 template <typename T>
-void concat_impl(const ConcatAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs)
+void concat_impl(const ConcatAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs)
 {
     const int64_t n_in = static_cast<int64_t>(inputs.size());
     if (n_in == 0) {
@@ -51,13 +50,12 @@ void concat_impl(const ConcatAttributes& attrs,
     std::vector<int64_t> axis_offset(static_cast<size_t>(n_in + 1), 0);
     for (int64_t i = 0; i < n_in; ++i) {
         axis_offset[static_cast<size_t>(i + 1)] =
-            axis_offset[static_cast<size_t>(i)] +
-            inputs[static_cast<size_t>(i)].shape(ax);
+            axis_offset[static_cast<size_t>(i)] + inputs[static_cast<size_t>(i)].shape(ax);
     }
 
     const bool channel_last = is_channel_last(output.layout());
     const int64_t line_axis = channel_last ? 1 : rank - 1;
-    const int64_t line_len  = output.shape(line_axis);
+    const int64_t line_len = output.shape(line_axis);
 
     // Every dimension except the line axis is walked as one output line.
     std::vector<int64_t> walk_dims;
@@ -77,9 +75,11 @@ void concat_impl(const ConcatAttributes& attrs,
     }
 
     const bool axis_is_line = (ax == line_axis);
-    int64_t ax_pos = -1;  // position of the concat axis inside walk_dims
+    int64_t ax_pos = -1; // position of the concat axis inside walk_dims
     for (size_t i = 0; i < walk_dims.size(); ++i) {
-        if (walk_dims[i] == ax) { ax_pos = static_cast<int64_t>(i); }
+        if (walk_dims[i] == ax) {
+            ax_pos = static_cast<int64_t>(i);
+        }
     }
 
     std::vector<int64_t> out_stride(walk_dims.size());
@@ -128,8 +128,8 @@ void concat_impl(const ConcatAttributes& attrs,
 
         // Odometer over the walked dimensions.
         int64_t d = static_cast<int64_t>(idx.size()) - 1;
-        while (d >= 0 && ++idx[static_cast<size_t>(d)] ==
-                                output.shape(walk_dims[static_cast<size_t>(d)])) {
+        while (d >= 0 &&
+               ++idx[static_cast<size_t>(d)] == output.shape(walk_dims[static_cast<size_t>(d)])) {
             idx[static_cast<size_t>(d--)] = 0;
         }
         if (d < 0) {
@@ -138,11 +138,9 @@ void concat_impl(const ConcatAttributes& attrs,
     }
 }
 
-Status concat_cpu(const ConcatAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& /*ctx*/,
-                 void* /*workspace*/)
+Status concat_cpu(const ConcatAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& /*ctx*/,
+                  void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "concat_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -151,4 +149,4 @@ Status concat_cpu(const ConcatAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

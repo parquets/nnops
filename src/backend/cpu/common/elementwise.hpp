@@ -48,8 +48,8 @@ namespace quant_kernel = aarch64;
 
 /// `ctx.cpu.run(0, count, body)`: parallel when a hook is installed, sequential
 /// otherwise.
-inline void run_parallel(const ComputeContext& ctx, int64_t count,
-                         const ParallelForBody& body) {
+inline void run_parallel(const ComputeContext& ctx, int64_t count, const ParallelForBody& body)
+{
     ctx.cpu.run(0, count, body);
 }
 
@@ -62,39 +62,42 @@ struct RowGeometry {
 };
 
 /// Derive the row geometry shared by every element-wise float kernel.
-inline RowGeometry rowwise_geometry(const TensorView& input, const TensorView& output) {
+inline RowGeometry rowwise_geometry(const TensorView& input, const TensorView& output)
+{
     const int64_t total = input.numel();
-    const int64_t rank  = input.rank();
+    const int64_t rank = input.rank();
     int64_t last_dim = 1;
     if (rank >= 1) {
-        last_dim = (rank >= 3 && is_channel_last(input.layout()))
-                       ? input.shape(1) * input.shape(rank - 1)
-                       : input.shape(rank - 1);
+        last_dim = (rank >= 3 && is_channel_last(input.layout())) ?
+                       input.shape(1) * input.shape(rank - 1) :
+                       input.shape(rank - 1);
     }
     const int64_t num_rows = (rank >= 2) ? input.total_rows() : total / last_dim;
-    return { last_dim, num_rows, input.row_stride_elems(), output.row_stride_elems() };
+    return {last_dim, num_rows, input.row_stride_elems(), output.row_stride_elems()};
 }
 
 /// Row-tiled unary float transform: `apply` gets a tile's base pointers and row
 /// strides, and runs the op over it.
 template <typename T, typename ApplyFn>
-void tiled_float_transform(const TensorView& input, TensorView& output,
-                           const ComputeContext& ctx, ApplyFn&& apply,
-                           int64_t tile_m = 32) {
+void tiled_float_transform(const TensorView& input, TensorView& output, const ComputeContext& ctx,
+                           ApplyFn&& apply, int64_t tile_m = 32)
+{
     const int64_t total = input.numel();
-    if (total == 0) { return; }
+    if (total == 0) {
+        return;
+    }
     NNOPS_ASSERT(output.numel() == total);
 
     const RowGeometry g = rowwise_geometry(input, output);
-    const T* in  = input.ptr<T>();
-    T*       out = output.ptr<T>();
+    const T* in = input.ptr<T>();
+    T* out = output.ptr<T>();
 
     const int64_t num_tiles = (g.num_rows + tile_m - 1) / tile_m;
     auto body = [&](int64_t ti) {
         const int64_t r = ti * tile_m;
         const int64_t m = std::min(tile_m, g.num_rows - r);
-        apply(in + r * g.in_stride, out + r * g.out_stride,
-              m, g.last_dim, g.in_stride, g.out_stride);
+        apply(in + r * g.in_stride, out + r * g.out_stride, m, g.last_dim, g.in_stride,
+              g.out_stride);
     };
     run_parallel(ctx, num_tiles, body);
 }
@@ -102,10 +105,12 @@ void tiled_float_transform(const TensorView& input, TensorView& output,
 /// Row-tiled binary float transform (two inputs, independent strides).
 template <typename T, typename ApplyFn>
 void tiled_float_transform2(const TensorView& a, const TensorView& b, TensorView& out,
-                            const ComputeContext& ctx, ApplyFn&& apply,
-                            int64_t tile_m = 32) {
+                            const ComputeContext& ctx, ApplyFn&& apply, int64_t tile_m = 32)
+{
     const int64_t total = a.numel();
-    if (total == 0) { return; }
+    if (total == 0) {
+        return;
+    }
     NNOPS_ASSERT(a.numel() == b.numel());
     NNOPS_ASSERT(out.numel() == total);
 
@@ -113,71 +118,75 @@ void tiled_float_transform2(const TensorView& a, const TensorView& b, TensorView
     const int64_t b_stride = b.row_stride_elems();
     const T* ap = a.ptr<T>();
     const T* bp = b.ptr<T>();
-    T*       op = out.ptr<T>();
+    T* op = out.ptr<T>();
 
     const int64_t num_tiles = (g.num_rows + tile_m - 1) / tile_m;
     auto body = [&](int64_t ti) {
         const int64_t r = ti * tile_m;
         const int64_t m = std::min(tile_m, g.num_rows - r);
-        apply(ap + r * g.in_stride, bp + r * b_stride, op + r * g.out_stride,
-              m, g.last_dim, g.in_stride, b_stride, g.out_stride);
+        apply(ap + r * g.in_stride, bp + r * b_stride, op + r * g.out_stride, m, g.last_dim,
+              g.in_stride, b_stride, g.out_stride);
     };
     run_parallel(ctx, num_tiles, body);
 }
 
 /// Fill per-row scale/zero arrays for a ≤TILE_H-row tile of a quantized tensor.
-inline void fill_quant_row_params(const QuantParams& qp, bool per_token,
-                                  int64_t h0, int cur_h, float* scale, float* zero) {
+inline void fill_quant_row_params(const QuantParams& qp, bool per_token, int64_t h0, int cur_h,
+                                  float* scale, float* zero)
+{
     for (int i = 0; i < cur_h; ++i) {
         const int64_t r = h0 + i;
         scale[i] = per_token ? qp.scale_data[r] : qp.scale;
-        zero[i]  = per_token
-            ? (qp.zero_point_data != nullptr ? static_cast<float>(qp.zero_point_data[r]) : 0.0f)
-            : static_cast<float>(qp.zero_point);
+        zero[i] =
+            per_token ?
+                (qp.zero_point_data != nullptr ? static_cast<float>(qp.zero_point_data[r]) : 0.0f) :
+                static_cast<float>(qp.zero_point);
     }
 }
 
 /// Dequantize an s8/u8 tile to f32, dispatching on the storage dtype.
 inline void dequantize_tile(DataType dt, int h, int w, float* dst, int dst_stride,
-                            const uint8_t* src, int src_stride,
-                            const float* scale, const float* zero) {
+                            const uint8_t* src, int src_stride, const float* scale,
+                            const float* zero)
+{
     if (dt == DataType::s8) {
-        quant_kernel::dequantization<int8_t>(h, w, dst, dst_stride,
-            reinterpret_cast<const int8_t*>(src), src_stride, scale, zero);
+        quant_kernel::dequantization<int8_t>(
+            h, w, dst, dst_stride, reinterpret_cast<const int8_t*>(src), src_stride, scale, zero);
     } else {
-        quant_kernel::dequantization<uint8_t>(h, w, dst, dst_stride,
-            src, src_stride, scale, zero);
+        quant_kernel::dequantization<uint8_t>(h, w, dst, dst_stride, src, src_stride, scale, zero);
     }
 }
 
 /// Quantize an f32 tile to s8/u8, dispatching on the storage dtype.
-inline void quantize_tile(DataType dt, int h, int w, uint8_t* dst, int dst_stride,
-                          const float* src, int src_stride,
-                          const float* scale, const float* zero) {
+inline void quantize_tile(DataType dt, int h, int w, uint8_t* dst, int dst_stride, const float* src,
+                          int src_stride, const float* scale, const float* zero)
+{
     if (dt == DataType::s8) {
-        quant_kernel::quantization<int8_t>(h, w, reinterpret_cast<int8_t*>(dst), dst_stride,
-            src, src_stride, scale, zero);
+        quant_kernel::quantization<int8_t>(h, w, reinterpret_cast<int8_t*>(dst), dst_stride, src,
+                                           src_stride, scale, zero);
     } else {
-        quant_kernel::quantization<uint8_t>(h, w, dst, dst_stride,
-            src, src_stride, scale, zero);
+        quant_kernel::quantization<uint8_t>(h, w, dst, dst_stride, src, src_stride, scale, zero);
     }
 }
 
 /// Fused quantized unary: dequantize input → apply op (f32, in place) → quantize.
 template <typename ApplyFn>
 void quantized_unary_transform(const TensorView& input, TensorView& output,
-                               const ComputeContext& ctx, ApplyFn&& apply) {
+                               const ComputeContext& ctx, ApplyFn&& apply)
+{
     const int64_t numel = input.numel();
-    if (numel == 0) { return; }
+    if (numel == 0) {
+        return;
+    }
 
-    const DataType in_dtype  = input.data_type();
+    const DataType in_dtype = input.data_type();
     const DataType out_dtype = output.data_type();
-    const QuantParams& in_qp  = input.quant_params();
+    const QuantParams& in_qp = input.quant_params();
     const QuantParams& out_qp = output.quant_params();
 
     NNOPS_ASSERT(in_qp.granularity == out_qp.granularity);
-    const bool per_token = in_qp.granularity == QuantGranularity::PerToken
-                        && in_qp.scale_data != nullptr;
+    const bool per_token =
+        in_qp.granularity == QuantGranularity::PerToken && in_qp.scale_data != nullptr;
 
     int64_t M = 1;
     int64_t N = numel;
@@ -186,8 +195,8 @@ void quantized_unary_transform(const TensorView& input, TensorView& output,
         M = (N == 0) ? 0 : (numel / N);
     }
 
-    const uint8_t* in_base  = input.ptr<uint8_t>();
-    uint8_t*       out_base = output.ptr<uint8_t>();
+    const uint8_t* in_base = input.ptr<uint8_t>();
+    uint8_t* out_base = output.ptr<uint8_t>();
 
     constexpr int TILE_H = 8;
     constexpr int TILE_W = 256;
@@ -198,22 +207,22 @@ void quantized_unary_transform(const TensorView& input, TensorView& output,
         const int cur_h = static_cast<int>(std::min<int64_t>(TILE_H, M - h0));
 
         float scratch[TILE_H * TILE_W];
-        float in_scale[TILE_H],  in_zero[TILE_H];
+        float in_scale[TILE_H], in_zero[TILE_H];
         float out_scale[TILE_H], out_zero[TILE_H];
 
-        fill_quant_row_params(in_qp,  per_token, h0, cur_h, in_scale,  in_zero);
+        fill_quant_row_params(in_qp, per_token, h0, cur_h, in_scale, in_zero);
         fill_quant_row_params(out_qp, per_token, h0, cur_h, out_scale, out_zero);
 
         for (int64_t w0 = 0; w0 < N; w0 += TILE_W) {
             const int cur_w = static_cast<int>(std::min<int64_t>(TILE_W, N - w0));
-            const uint8_t* in_tile  = in_base  + (h0 * N + w0);
-            uint8_t*       out_tile = out_base + (h0 * N + w0);
+            const uint8_t* in_tile = in_base + (h0 * N + w0);
+            uint8_t* out_tile = out_base + (h0 * N + w0);
 
-            dequantize_tile(in_dtype, cur_h, cur_w, scratch, cur_w, in_tile,
-                            static_cast<int>(N), in_scale, in_zero);
+            dequantize_tile(in_dtype, cur_h, cur_w, scratch, cur_w, in_tile, static_cast<int>(N),
+                            in_scale, in_zero);
             apply(scratch, cur_h, cur_w);
-            quantize_tile(out_dtype, cur_h, cur_w, out_tile, static_cast<int>(N),
-                          scratch, cur_w, out_scale, out_zero);
+            quantize_tile(out_dtype, cur_h, cur_w, out_tile, static_cast<int>(N), scratch, cur_w,
+                          out_scale, out_zero);
         }
     };
 
@@ -222,11 +231,13 @@ void quantized_unary_transform(const TensorView& input, TensorView& output,
 
 /// Fused quantized binary: dequantize A and B → apply op (f32) → quantize.
 template <typename ApplyFn>
-void quantized_binary_transform(const TensorView& a_in, const TensorView& b_in,
-                                TensorView& output, const ComputeContext& ctx,
-                                ApplyFn&& apply) {
+void quantized_binary_transform(const TensorView& a_in, const TensorView& b_in, TensorView& output,
+                                const ComputeContext& ctx, ApplyFn&& apply)
+{
     const int64_t numel = a_in.numel();
-    if (numel == 0) { return; }
+    if (numel == 0) {
+        return;
+    }
     NNOPS_ASSERT(a_in.numel() == b_in.numel());
 
     const DataType a_dtype = a_in.data_type();
@@ -238,8 +249,8 @@ void quantized_binary_transform(const TensorView& a_in, const TensorView& b_in,
 
     NNOPS_ASSERT(a_qp.granularity == o_qp.granularity);
     NNOPS_ASSERT(b_qp.granularity == o_qp.granularity);
-    const bool per_token = a_qp.granularity == QuantGranularity::PerToken
-                        && a_qp.scale_data != nullptr;
+    const bool per_token =
+        a_qp.granularity == QuantGranularity::PerToken && a_qp.scale_data != nullptr;
 
     int64_t M = 1;
     int64_t N = numel;
@@ -250,7 +261,7 @@ void quantized_binary_transform(const TensorView& a_in, const TensorView& b_in,
 
     const uint8_t* a_base = a_in.ptr<uint8_t>();
     const uint8_t* b_base = b_in.ptr<uint8_t>();
-    uint8_t*       o_base = output.ptr<uint8_t>();
+    uint8_t* o_base = output.ptr<uint8_t>();
 
     constexpr int TILE_H = 8;
     constexpr int TILE_W = 256;
@@ -274,21 +285,21 @@ void quantized_binary_transform(const TensorView& a_in, const TensorView& b_in,
             const int cur_w = static_cast<int>(std::min<int64_t>(TILE_W, N - w0));
             const uint8_t* a_tile = a_base + (h0 * N + w0);
             const uint8_t* b_tile = b_base + (h0 * N + w0);
-            uint8_t*       o_tile = o_base + (h0 * N + w0);
+            uint8_t* o_tile = o_base + (h0 * N + w0);
 
-            dequantize_tile(a_dtype, cur_h, cur_w, a_scratch, cur_w, a_tile,
-                            static_cast<int>(N), a_scale, a_zero);
-            dequantize_tile(b_dtype, cur_h, cur_w, b_scratch, cur_w, b_tile,
-                            static_cast<int>(N), b_scale, b_zero);
+            dequantize_tile(a_dtype, cur_h, cur_w, a_scratch, cur_w, a_tile, static_cast<int>(N),
+                            a_scale, a_zero);
+            dequantize_tile(b_dtype, cur_h, cur_w, b_scratch, cur_w, b_tile, static_cast<int>(N),
+                            b_scale, b_zero);
 
             apply(a_scratch, b_scratch, cur_h, cur_w);
 
-            quantize_tile(o_dtype, cur_h, cur_w, o_tile, static_cast<int>(N),
-                          a_scratch, cur_w, o_scale, o_zero);
+            quantize_tile(o_dtype, cur_h, cur_w, o_tile, static_cast<int>(N), a_scratch, cur_w,
+                          o_scale, o_zero);
         }
     };
 
     run_parallel(ctx, num_tiles, body);
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

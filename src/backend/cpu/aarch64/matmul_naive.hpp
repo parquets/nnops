@@ -67,10 +67,9 @@ inline float hsum(float32x4_t v) noexcept { return vaddvq_f32(v); }
 
 /// Fully scalar fallback: any operand size and layout.
 template <typename T>
-inline void scalar_gemm(int M, int N, int K,
-                        const T* a, int lda, bool ta,
-                        const T* b, int ldb, bool tb,
-                        T* c, int ldc, float alpha, float beta) noexcept {
+inline void scalar_gemm(int M, int N, int K, const T* a, int lda, bool ta, const T* b, int ldb,
+                        bool tb, T* c, int ldc, float alpha, float beta) noexcept
+{
     for (int m = 0; m < M; ++m) {
         for (int n = 0; n < N; ++n) {
             float acc = 0.0f;
@@ -78,7 +77,9 @@ inline void scalar_gemm(int M, int N, int K,
                 acc += to_f32(a + (ta ? k * lda + m : m * lda + k)) *
                        to_f32(b + (tb ? n * ldb + k : k * ldb + n));
             }
-            if (alpha != 1.0f) { acc *= alpha; }
+            if (alpha != 1.0f) {
+                acc *= alpha;
+            }
             T* dst = c + m * ldc + n;
             store1(dst, (beta != 0.0f) ? acc + beta * to_f32(dst) : acc);
         }
@@ -87,10 +88,9 @@ inline void scalar_gemm(int M, int N, int K,
 
 /// The n-vectorized rows loop; B is [K][N] with row stride @p bstride.
 template <typename T>
-inline void rows(int M, int N, int K,
-                 const T* a, int lda, bool ta,
-                 const T* b, int bstride,
-                 T* c, int ldc, float alpha, float beta) noexcept {
+inline void rows(int M, int N, int K, const T* a, int lda, bool ta, const T* b, int bstride, T* c,
+                 int ldc, float alpha, float beta) noexcept
+{
     for (int m = 0; m < M; ++m) {
         // ta: A is [K][M], so row m is column m with stride lda.
         const T* a_row = a + (ta ? m : m * lda);
@@ -101,10 +101,11 @@ inline void rows(int M, int N, int K,
         for (; n + 4 <= N; n += 4) {
             float32x4_t acc = vdupq_n_f32(0.0f);
             for (int k = 0; k < K; ++k) {
-                acc = vfmaq_n_f32(acc, load4(b + k * bstride + n),
-                                  to_f32(a_row + k * a_step));
+                acc = vfmaq_n_f32(acc, load4(b + k * bstride + n), to_f32(a_row + k * a_step));
             }
-            if (alpha != 1.0f) { acc = vmulq_n_f32(acc, alpha); }
+            if (alpha != 1.0f) {
+                acc = vmulq_n_f32(acc, alpha);
+            }
             if (beta != 0.0f) {
                 acc = vfmaq_n_f32(acc, load4(c_row + n), beta);
             }
@@ -115,7 +116,9 @@ inline void rows(int M, int N, int K,
             for (int k = 0; k < K; ++k) {
                 acc += to_f32(a_row + k * a_step) * to_f32(b + k * bstride + n);
             }
-            if (alpha != 1.0f) { acc *= alpha; }
+            if (alpha != 1.0f) {
+                acc *= alpha;
+            }
             store1(c_row + n, (beta != 0.0f) ? acc + beta * to_f32(c_row + n) : acc);
         }
     }
@@ -124,10 +127,9 @@ inline void rows(int M, int N, int K,
 /// Narrow-N companion to rows(): one dot product per output, vectorized over K.
 /// A is [M][K] and B is [N][K], both unit-stride in k.
 template <typename T>
-inline void dots(int M, int N, int K,
-                 const T* a, int astride,
-                 const T* b, int bstride,
-                 T* c, int ldc, float alpha, float beta) noexcept {
+inline void dots(int M, int N, int K, const T* a, int astride, const T* b, int bstride, T* c,
+                 int ldc, float alpha, float beta) noexcept
+{
     for (int m = 0; m < M; ++m) {
         const T* a_row = a + m * astride;
         T* c_row = c + m * ldc;
@@ -139,18 +141,21 @@ inline void dots(int M, int N, int K,
                 acc = vfmaq_f32(acc, load4(a_row + k), load4(b_row + k));
             }
             float sum = hsum(acc);
-            for (; k < K; ++k) { sum += to_f32(a_row + k) * to_f32(b_row + k); }
-            if (alpha != 1.0f) { sum *= alpha; }
+            for (; k < K; ++k) {
+                sum += to_f32(a_row + k) * to_f32(b_row + k);
+            }
+            if (alpha != 1.0f) {
+                sum *= alpha;
+            }
             store1(c_row + n, (beta != 0.0f) ? sum + beta * to_f32(c_row + n) : sum);
         }
     }
 }
 
 template <typename T>
-inline void gemm(int M, int N, int K,
-                 const T* a, int lda, bool ta,
-                 const T* b, int ldb, bool tb,
-                 T* c, int ldc, float alpha, float beta) noexcept {
+inline void gemm(int M, int N, int K, const T* a, int lda, bool ta, const T* b, int ldb, bool tb,
+                 T* c, int ldc, float alpha, float beta) noexcept
+{
     if (N >= lanes) {
         // tb: transpose the [N][K] B into [K][N] scratch first.
         if (!tb) {
@@ -163,7 +168,9 @@ inline void gemm(int M, int N, int K,
         }
         alignas(16) T bt[scratch_elems];
         for (int n = 0; n < N; ++n) {
-            for (int k = 0; k < K; ++k) { bt[k * N + n] = b[n * ldb + k]; }
+            for (int k = 0; k < K; ++k) {
+                bt[k * N + n] = b[n * ldb + k];
+            }
         }
         rows<T>(M, N, K, a, lda, ta, bt, N, c, ldc, alpha, beta);
         return;
@@ -184,14 +191,18 @@ inline void gemm(int M, int N, int K,
     int bkstride = ldb;
     if (ta) {
         for (int m = 0; m < M; ++m) {
-            for (int k = 0; k < K; ++k) { at[m * K + k] = a[k * lda + m]; }
+            for (int k = 0; k < K; ++k) {
+                at[m * K + k] = a[k * lda + m];
+            }
         }
         ak = at;
         akstride = K;
     }
     if (!tb) {
         for (int n = 0; n < N; ++n) {
-            for (int k = 0; k < K; ++k) { bt[n * K + k] = b[k * ldb + n]; }
+            for (int k = 0; k < K; ++k) {
+                bt[n * K + k] = b[k * ldb + n];
+            }
         }
         bk = bt;
         bkstride = K;
@@ -204,27 +215,27 @@ inline void gemm(int M, int N, int K,
 /// Accumulator vectors per n-tile, by row count: M * vecs plus one B vector and
 /// the A broadcasts stay inside the 32 NEON registers. A tile is vecs * lanes
 /// columns wide, so each k contributes a 24-64 element run of B.
-template <int M>
-constexpr int gemv_vecs = (M <= 1) ? 16 : (M == 2 ? 12 : (M == 3 ? 8 : 6));
+template <int M> constexpr int gemv_vecs = (M <= 1) ? 16 : (M == 2 ? 12 : (M == 3 ? 8 : 6));
 
 /// One n-tile of the [K][N] B kernel, exactly @p V vectors wide: the whole k
 /// sweep lives inside it, so the M*V accumulators never leave registers.
 template <typename T, int M, int V>
-inline void gemv_nn_tile(int K,
-                         const T* a, int lda, bool ta,
-                         const T* b, int ldb,
-                         T* c, int ldc, float alpha, float beta, int j0) noexcept {
+inline void gemv_nn_tile(int K, const T* a, int lda, bool ta, const T* b, int ldb, T* c, int ldc,
+                         float alpha, float beta, int j0) noexcept
+{
     float32x4_t acc[M][V];
     for (int m = 0; m < M; ++m) {
-        for (int v = 0; v < V; ++v) { acc[m][v] = vdupq_n_f32(0.0f); }
+        for (int v = 0; v < V; ++v) {
+            acc[m][v] = vdupq_n_f32(0.0f);
+        }
     }
 
     for (int k = 0; k < K; ++k) {
         const T* b_row = b + static_cast<int64_t>(k) * ldb + j0;
         float av[M];
         for (int m = 0; m < M; ++m) {
-            av[m] = to_f32(a + (ta ? static_cast<int64_t>(k) * lda + m
-                                   : static_cast<int64_t>(m) * lda + k));
+            av[m] = to_f32(
+                a + (ta ? static_cast<int64_t>(k) * lda + m : static_cast<int64_t>(m) * lda + k));
         }
         for (int v = 0; v < V; ++v) {
             const float32x4_t bv = load4(b_row + v * lanes);
@@ -237,8 +248,7 @@ inline void gemv_nn_tile(int K,
     for (int m = 0; m < M; ++m) {
         for (int v = 0; v < V; ++v) {
             T* dst = c + static_cast<int64_t>(m) * ldc + j0 + v * lanes;
-            float32x4_t out = (alpha != 1.0f) ? vmulq_n_f32(acc[m][v], alpha)
-                                              : acc[m][v];
+            float32x4_t out = (alpha != 1.0f) ? vmulq_n_f32(acc[m][v], alpha) : acc[m][v];
             store4(dst, (beta != 0.0f) ? vfmaq_n_f32(out, load4(dst), beta) : out);
         }
     }
@@ -247,11 +257,9 @@ inline void gemv_nn_tile(int K,
 /// C[m][n0:n1] += A[m][:] · B[:][n] for a row-major [K][N] B, k inner within
 /// each register-sized n-tile. For a B that is reread per tile out of cache.
 template <typename T, int M>
-inline void gemv_nn_rows(int N, int K,
-                         const T* a, int lda, bool ta,
-                         const T* b, int ldb,
-                         T* c, int ldc, float alpha, float beta,
-                         int n0, int n1) noexcept {
+inline void gemv_nn_rows(int N, int K, const T* a, int lda, bool ta, const T* b, int ldb, T* c,
+                         int ldc, float alpha, float beta, int n0, int n1) noexcept
+{
     (void)N;
     constexpr int V = gemv_vecs<M>;
 
@@ -267,8 +275,9 @@ inline void gemv_nn_rows(int N, int K,
         for (int k = 0; k < K; ++k) {
             const float bj = to_f32(b + static_cast<int64_t>(k) * ldb + j);
             for (int m = 0; m < M; ++m) {
-                sum[m] += to_f32(a + (ta ? static_cast<int64_t>(k) * lda + m
-                                         : static_cast<int64_t>(m) * lda + k)) * bj;
+                sum[m] += to_f32(a + (ta ? static_cast<int64_t>(k) * lda + m :
+                                           static_cast<int64_t>(m) * lda + k)) *
+                          bj;
             }
         }
         for (int m = 0; m < M; ++m) {
@@ -281,8 +290,7 @@ inline void gemv_nn_rows(int N, int K,
 
 /// Columns the streaming kernel accumulates over in one pass, by row count:
 /// sized so the accumulator is an L1-resident 32-64 KB.
-template <int M>
-constexpr int gemv_stream_cap = (M <= 1) ? 8192 : 4096;
+template <int M> constexpr int gemv_stream_cap = (M <= 1) ? 8192 : 4096;
 
 /// k rows one accumulator load/store pair covers. At M = 1 one row of f32 is
 /// the wall, so the depth stays 1; f16 takes 2 there because the widening is
@@ -301,11 +309,9 @@ inline bool gemv_streams(int64_t b_bytes) noexcept { return b_bytes > gemv_strea
 /// accumulator is an L1 slab spanning cap-wide slices of N, so each k reads a
 /// long contiguous run of B and the operand is walked once in address order.
 template <typename T, int M>
-inline void gemv_nn_stream(int K,
-                           const T* a, int lda, bool ta,
-                           const T* b, int ldb,
-                           T* c, int ldc, float alpha, float beta,
-                           int n0, int n1) noexcept {
+inline void gemv_nn_stream(int K, const T* a, int lda, bool ta, const T* b, int ldb, T* c, int ldc,
+                           float alpha, float beta, int n0, int n1) noexcept
+{
     constexpr int CAP = gemv_stream_cap<M>;
     constexpr int U = gemv_stream_unroll<T, M>;
     alignas(16) float acc[gemv_max_m][CAP];
@@ -313,7 +319,9 @@ inline void gemv_nn_stream(int K,
     for (int j0 = n0; j0 < n1; j0 += CAP) {
         const int nb = (n1 - j0 < CAP) ? (n1 - j0) : CAP;
         for (int m = 0; m < M; ++m) {
-            for (int j = 0; j < nb; ++j) { acc[m][j] = 0.0f; }
+            for (int j = 0; j < nb; ++j) {
+                acc[m][j] = 0.0f;
+            }
         }
 
         int k = 0;
@@ -323,18 +331,22 @@ inline void gemv_nn_stream(int K,
             for (int u = 0; u < U; ++u) {
                 b_row[u] = b + static_cast<int64_t>(k + u) * ldb + j0;
                 for (int m = 0; m < M; ++m) {
-                    av[m][u] = to_f32(a + (ta ? static_cast<int64_t>(k + u) * lda + m
-                                              : static_cast<int64_t>(m) * lda + k + u));
+                    av[m][u] = to_f32(a + (ta ? static_cast<int64_t>(k + u) * lda + m :
+                                                static_cast<int64_t>(m) * lda + k + u));
                 }
             }
             int j = 0;
             for (; j + lanes <= nb; j += lanes) {
                 float32x4_t bv[U];
-                for (int u = 0; u < U; ++u) { bv[u] = load4(b_row[u] + j); }
+                for (int u = 0; u < U; ++u) {
+                    bv[u] = load4(b_row[u] + j);
+                }
                 for (int m = 0; m < M; ++m) {
                     float* p = acc[m] + j;
                     float32x4_t s = vld1q_f32(p);
-                    for (int u = 0; u < U; ++u) { s = vfmaq_n_f32(s, bv[u], av[m][u]); }
+                    for (int u = 0; u < U; ++u) {
+                        s = vfmaq_n_f32(s, bv[u], av[m][u]);
+                    }
                     vst1q_f32(p, s);
                 }
             }
@@ -350,8 +362,8 @@ inline void gemv_nn_stream(int K,
             const T* b_row = b + static_cast<int64_t>(k) * ldb + j0;
             float av[M];
             for (int m = 0; m < M; ++m) {
-                av[m] = to_f32(a + (ta ? static_cast<int64_t>(k) * lda + m
-                                       : static_cast<int64_t>(m) * lda + k));
+                av[m] = to_f32(a + (ta ? static_cast<int64_t>(k) * lda + m :
+                                         static_cast<int64_t>(m) * lda + k));
             }
             int j = 0;
             for (; j + lanes <= nb; j += lanes) {
@@ -363,7 +375,9 @@ inline void gemv_nn_stream(int K,
             }
             for (; j < nb; ++j) {
                 const float bj = to_f32(b_row + j);
-                for (int m = 0; m < M; ++m) { acc[m][j] += av[m] * bj; }
+                for (int m = 0; m < M; ++m) {
+                    acc[m][j] += av[m] * bj;
+                }
             }
         }
 
@@ -380,17 +394,14 @@ inline void gemv_nn_stream(int K,
 
 /// Independent accumulators per output row for the [N][K] B kernel: one FMA per
 /// k step, so its latency hides behind its siblings.
-template <int M>
-constexpr int gemv_tn_unroll = (M <= 1) ? 8 : (M == 2 ? 4 : 2);
+template <int M> constexpr int gemv_tn_unroll = (M <= 1) ? 8 : (M == 2 ? 4 : 2);
 
 /// C[m][n0:n1] += A[m][:] · B[n][:] for a [N][K] B: U k-vector accumulators
 /// per output row, B read once and in order. Holds row-major A only.
 template <typename T, int M>
-inline void gemv_tn_rows(int N, int K,
-                         const T* a, int lda,
-                         const T* b, int ldb,
-                         T* c, int ldc, float alpha, float beta,
-                         int n0, int n1) noexcept {
+inline void gemv_tn_rows(int N, int K, const T* a, int lda, const T* b, int ldb, T* c, int ldc,
+                         float alpha, float beta, int n0, int n1) noexcept
+{
     (void)N;
     constexpr int U = gemv_tn_unroll<M>;
 
@@ -398,13 +409,17 @@ inline void gemv_tn_rows(int N, int K,
         const T* b_row = b + static_cast<int64_t>(n) * ldb;
         float32x4_t acc[M][U];
         for (int m = 0; m < M; ++m) {
-            for (int u = 0; u < U; ++u) { acc[m][u] = vdupq_n_f32(0.0f); }
+            for (int u = 0; u < U; ++u) {
+                acc[m][u] = vdupq_n_f32(0.0f);
+            }
         }
 
         int k = 0;
         for (; k + U * lanes <= K; k += U * lanes) {
             float32x4_t bv[U];
-            for (int u = 0; u < U; ++u) { bv[u] = load4(b_row + k + u * lanes); }
+            for (int u = 0; u < U; ++u) {
+                bv[u] = load4(b_row + k + u * lanes);
+            }
             for (int m = 0; m < M; ++m) {
                 const T* a_row = a + static_cast<int64_t>(m) * lda;
                 for (int u = 0; u < U; ++u) {
@@ -415,7 +430,9 @@ inline void gemv_tn_rows(int N, int K,
 
         for (int m = 0; m < M; ++m) {
             float32x4_t v = acc[m][0];
-            for (int u = 1; u < U; ++u) { v = vaddq_f32(v, acc[m][u]); }
+            for (int u = 1; u < U; ++u) {
+                v = vaddq_f32(v, acc[m][u]);
+            }
             float sum = hsum(v);
             for (int t = k; t < K; ++t) {
                 sum += to_f32(a + static_cast<int64_t>(m) * lda + t) * to_f32(b_row + t);
@@ -428,108 +445,120 @@ inline void gemv_tn_rows(int N, int K,
 }
 
 template <typename T>
-inline void gemv_nn(int M, int N, int K,
-                    const T* a, int lda, bool ta,
-                    const T* b, int ldb,
-                    T* c, int ldc, float alpha, float beta,
-                    int n0, int n1) noexcept {
+inline void gemv_nn(int M, int N, int K, const T* a, int lda, bool ta, const T* b, int ldb, T* c,
+                    int ldc, float alpha, float beta, int n0, int n1) noexcept
+{
     if (gemv_streams(static_cast<int64_t>(N) * K * static_cast<int64_t>(sizeof(T)))) {
         switch (M) {
-            case 1: gemv_nn_stream<T, 1>(K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1); break;
-            case 2: gemv_nn_stream<T, 2>(K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1); break;
-            case 3: gemv_nn_stream<T, 3>(K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1); break;
-            default: gemv_nn_stream<T, gemv_max_m>(K, a, lda, ta, b, ldb, c, ldc, alpha, beta,
-                                                   n0, n1); break;
+        case 1:
+            gemv_nn_stream<T, 1>(K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1);
+            break;
+        case 2:
+            gemv_nn_stream<T, 2>(K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1);
+            break;
+        case 3:
+            gemv_nn_stream<T, 3>(K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1);
+            break;
+        default:
+            gemv_nn_stream<T, gemv_max_m>(K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1);
+            break;
         }
         return;
     }
     switch (M) {
-        case 1: gemv_nn_rows<T, 1>(N, K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1); break;
-        case 2: gemv_nn_rows<T, 2>(N, K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1); break;
-        case 3: gemv_nn_rows<T, 3>(N, K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1); break;
-        default: gemv_nn_rows<T, gemv_max_m>(N, K, a, lda, ta, b, ldb, c, ldc, alpha, beta,
-                                             n0, n1); break;
+    case 1:
+        gemv_nn_rows<T, 1>(N, K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1);
+        break;
+    case 2:
+        gemv_nn_rows<T, 2>(N, K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1);
+        break;
+    case 3:
+        gemv_nn_rows<T, 3>(N, K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1);
+        break;
+    default:
+        gemv_nn_rows<T, gemv_max_m>(N, K, a, lda, ta, b, ldb, c, ldc, alpha, beta, n0, n1);
+        break;
     }
 }
 
 template <typename T>
-inline void gemv_tn(int M, int N, int K,
-                    const T* a, int lda,
-                    const T* b, int ldb,
-                    T* c, int ldc, float alpha, float beta,
-                    int n0, int n1) noexcept {
+inline void gemv_tn(int M, int N, int K, const T* a, int lda, const T* b, int ldb, T* c, int ldc,
+                    float alpha, float beta, int n0, int n1) noexcept
+{
     switch (M) {
-        case 1: gemv_tn_rows<T, 1>(N, K, a, lda, b, ldb, c, ldc, alpha, beta, n0, n1); break;
-        case 2: gemv_tn_rows<T, 2>(N, K, a, lda, b, ldb, c, ldc, alpha, beta, n0, n1); break;
-        case 3: gemv_tn_rows<T, 3>(N, K, a, lda, b, ldb, c, ldc, alpha, beta, n0, n1); break;
-        default: gemv_tn_rows<T, gemv_max_m>(N, K, a, lda, b, ldb, c, ldc, alpha, beta,
-                                             n0, n1); break;
+    case 1:
+        gemv_tn_rows<T, 1>(N, K, a, lda, b, ldb, c, ldc, alpha, beta, n0, n1);
+        break;
+    case 2:
+        gemv_tn_rows<T, 2>(N, K, a, lda, b, ldb, c, ldc, alpha, beta, n0, n1);
+        break;
+    case 3:
+        gemv_tn_rows<T, 3>(N, K, a, lda, b, ldb, c, ldc, alpha, beta, n0, n1);
+        break;
+    default:
+        gemv_tn_rows<T, gemv_max_m>(N, K, a, lda, b, ldb, c, ldc, alpha, beta, n0, n1);
+        break;
     }
 }
 
-}  // namespace naive_detail
+} // namespace naive_detail
 
 /// Width of the N slice one GEMV call owns. Streaming accumulates over exactly
 /// one slice, so it wants a wide one; the register tile retiles internally and
 /// keeps the narrow gemv_block, leaving the pool more blocks to spread.
-template <typename T>
-inline int gemv_slice(int M, int64_t N, int64_t K) noexcept {
+template <typename T> inline int gemv_slice(int M, int64_t N, int64_t K) noexcept
+{
     if (!naive_detail::gemv_streams(N * K * static_cast<int64_t>(sizeof(T)))) {
         return gemv_block;
     }
     switch (M) {
-        case 1: return naive_detail::gemv_stream_cap<1>;
-        case 2: return naive_detail::gemv_stream_cap<2>;
-        default: return naive_detail::gemv_stream_cap<gemv_max_m>;
+    case 1:
+        return naive_detail::gemv_stream_cap<1>;
+    case 2:
+        return naive_detail::gemv_stream_cap<2>;
+    default:
+        return naive_detail::gemv_stream_cap<gemv_max_m>;
     }
 }
 
 /// C[m][n_begin:n_end] = alpha·(A·B) + beta·C for M <= gemv_max_m, no packing.
 /// Every layout except a transposed A against a transposed B.
-inline void matmul_gemv(int M, int N, int K,
-                        const float* a, int lda, bool trans_a,
-                        const float* b, int ldb, bool trans_b,
-                        float* c, int ldc, float alpha, float beta,
-                        int n_begin, int n_end) noexcept {
+inline void matmul_gemv(int M, int N, int K, const float* a, int lda, bool trans_a, const float* b,
+                        int ldb, bool trans_b, float* c, int ldc, float alpha, float beta,
+                        int n_begin, int n_end) noexcept
+{
     if (trans_b) {
-        naive_detail::gemv_tn<float>(M, N, K, a, lda, b, ldb, c, ldc, alpha, beta,
-                                     n_begin, n_end);
+        naive_detail::gemv_tn<float>(M, N, K, a, lda, b, ldb, c, ldc, alpha, beta, n_begin, n_end);
     } else {
-        naive_detail::gemv_nn<float>(M, N, K, a, lda, trans_a, b, ldb, c, ldc, alpha, beta,
-                                     n_begin, n_end);
+        naive_detail::gemv_nn<float>(M, N, K, a, lda, trans_a, b, ldb, c, ldc, alpha, beta, n_begin,
+                                     n_end);
     }
 }
 
-inline void matmul_gemv(int M, int N, int K,
-                        const half* a, int lda, bool trans_a,
-                        const half* b, int ldb, bool trans_b,
-                        half* c, int ldc, float alpha, float beta,
-                        int n_begin, int n_end) noexcept {
+inline void matmul_gemv(int M, int N, int K, const half* a, int lda, bool trans_a, const half* b,
+                        int ldb, bool trans_b, half* c, int ldc, float alpha, float beta,
+                        int n_begin, int n_end) noexcept
+{
     if (trans_b) {
-        naive_detail::gemv_tn<half>(M, N, K, a, lda, b, ldb, c, ldc, alpha, beta,
-                                    n_begin, n_end);
+        naive_detail::gemv_tn<half>(M, N, K, a, lda, b, ldb, c, ldc, alpha, beta, n_begin, n_end);
     } else {
-        naive_detail::gemv_nn<half>(M, N, K, a, lda, trans_a, b, ldb, c, ldc, alpha, beta,
-                                    n_begin, n_end);
+        naive_detail::gemv_nn<half>(M, N, K, a, lda, trans_a, b, ldb, c, ldc, alpha, beta, n_begin,
+                                    n_end);
     }
 }
 
 /// C = alpha·(A·B) + beta·C for a small M×N×K, operands in either transpose
 /// layout. The epilogue is the caller's.
-inline void matmul_naive(int M, int N, int K,
-                         const float* a, int lda, bool trans_a,
-                         const float* b, int ldb, bool trans_b,
-                         float* c, int ldc, float alpha, float beta) noexcept {
-    naive_detail::gemm<float>(M, N, K, a, lda, trans_a, b, ldb, trans_b, c, ldc,
-                              alpha, beta);
+inline void matmul_naive(int M, int N, int K, const float* a, int lda, bool trans_a, const float* b,
+                         int ldb, bool trans_b, float* c, int ldc, float alpha, float beta) noexcept
+{
+    naive_detail::gemm<float>(M, N, K, a, lda, trans_a, b, ldb, trans_b, c, ldc, alpha, beta);
 }
 
-inline void matmul_naive(int M, int N, int K,
-                         const half* a, int lda, bool trans_a,
-                         const half* b, int ldb, bool trans_b,
-                         half* c, int ldc, float alpha, float beta) noexcept {
-    naive_detail::gemm<half>(M, N, K, a, lda, trans_a, b, ldb, trans_b, c, ldc,
-                             alpha, beta);
+inline void matmul_naive(int M, int N, int K, const half* a, int lda, bool trans_a, const half* b,
+                         int ldb, bool trans_b, half* c, int ldc, float alpha, float beta) noexcept
+{
+    naive_detail::gemm<half>(M, N, K, a, lda, trans_a, b, ldb, trans_b, c, ldc, alpha, beta);
 }
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

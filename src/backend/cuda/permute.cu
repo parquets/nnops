@@ -30,9 +30,8 @@ constexpr int kTransposeTile = 32;
 constexpr int kTransposeRows = 8;
 
 template <class T>
-__global__ void transpose_tile_kernel(const T* __restrict__ src,
-                                      T* __restrict__ dst,
-                                      int64_t m, int64_t k)
+__global__ void transpose_tile_kernel(const T* __restrict__ src, T* __restrict__ dst, int64_t m,
+                                      int64_t k)
 {
     __shared__ T tile[kTransposeTile][kTransposeTile + 1];
 
@@ -46,49 +45,65 @@ __global__ void transpose_tile_kernel(const T* __restrict__ src,
     for (int j = 0; j < kTransposeTile; j += kTransposeRows) {
         const int64_t r = m0 + ty + j;
         const int64_t c = k0 + tx;
-        if (r < m && c < k) { tile[ty + j][tx] = s[r * k + c]; }
+        if (r < m && c < k) {
+            tile[ty + j][tx] = s[r * k + c];
+        }
     }
     __syncthreads();
 
     for (int j = 0; j < kTransposeTile; j += kTransposeRows) {
         const int64_t r = k0 + ty + j;
         const int64_t c = m0 + tx;
-        if (r < k && c < m) { d[r * m + c] = tile[tx][ty + j]; }
+        if (r < k && c < m) {
+            d[r * m + c] = tile[tx][ty + j];
+        }
     }
 }
 
 /// The last-two-swap route, when both operands are dense and the tile grid
 /// fits CUDA's limits. Returns false to mean "use the layout walk".
 template <class T>
-bool try_transpose(const TensorView& input, TensorView& output,
-                   cudaStream_t stream)
+bool try_transpose(const TensorView& input, TensorView& output, cudaStream_t stream)
 {
     const int64_t rank = input.rank();
-    if (rank < 2) { return false; }
-    if (!view_is_compact(input) || !view_is_compact(output)) { return false; }
+    if (rank < 2) {
+        return false;
+    }
+    if (!view_is_compact(input) || !view_is_compact(output)) {
+        return false;
+    }
 
     const int64_t m = input.shape(rank - 2);
     const int64_t k = input.shape(rank - 1);
-    if (m == 0 || k == 0) { return true; }
+    if (m == 0 || k == 0) {
+        return true;
+    }
 
     int64_t batch = 1;
-    for (int64_t d = 0; d < rank - 2; ++d) { batch *= input.shape(d); }
-    if (batch > 65535) { return false; }
+    for (int64_t d = 0; d < rank - 2; ++d) {
+        batch *= input.shape(d);
+    }
+    if (batch > 65535) {
+        return false;
+    }
 
     const dim3 grid(static_cast<unsigned>(ceil_div(k, int64_t(kTransposeTile))),
                     static_cast<unsigned>(ceil_div(m, int64_t(kTransposeTile))),
                     static_cast<unsigned>(batch));
     const dim3 block(kTransposeTile, kTransposeRows);
-    transpose_tile_kernel<T><<<grid, block, 0, stream>>>(
-        input.ptr<T>(), output.ptr<T>(), m, k);
+    transpose_tile_kernel<T><<<grid, block, 0, stream>>>(input.ptr<T>(), output.ptr<T>(), m, k);
     return true;
 }
 
 bool is_last_two_swap(const PermuteAttributes& attrs, int64_t rank)
 {
-    if (rank < 2) { return false; }
+    if (rank < 2) {
+        return false;
+    }
     for (int64_t i = 0; i < rank - 2; ++i) {
-        if (attrs.perm[static_cast<size_t>(i)] != i) { return false; }
+        if (attrs.perm[static_cast<size_t>(i)] != i) {
+            return false;
+        }
     }
     return attrs.perm[static_cast<size_t>(rank - 2)] == rank - 1 &&
            attrs.perm[static_cast<size_t>(rank - 1)] == rank - 2;
@@ -99,8 +114,8 @@ bool is_last_two_swap(const PermuteAttributes& attrs, int64_t rank)
 // ============================================================
 
 template <class T>
-Status permute_entry(const PermuteAttributes& attrs, TensorView& output,
-                     const TensorView& input, cudaStream_t stream)
+Status permute_entry(const PermuteAttributes& attrs, TensorView& output, const TensorView& input,
+                     cudaStream_t stream)
 {
     const int64_t rank = input.rank();
     if (rank == 1) {
@@ -119,7 +134,9 @@ Status permute_entry(const PermuteAttributes& attrs, TensorView& output,
     int64_t dims[8], src_strides[8], dst_strides[8];
     fill_output_dims(output, dims);
     const int64_t total = output.numel();
-    if (total == 0) { return Status::ok; }
+    if (total == 0) {
+        return Status::ok;
+    }
 
     for (int64_t d = 0; d < rank; ++d) {
         src_strides[d] = input.stride_elems(attrs.perm[static_cast<size_t>(d)]);
@@ -146,11 +163,11 @@ Status permute_entry(const PermuteAttributes& attrs, TensorView& output,
     return launch_move(input.ptr<T>(), output.ptr<T>(), p, stream);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 Status permute_cuda(const PermuteAttributes& attrs, TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx, void* /*workspace*/)
+                    std::span<const TensorView> inputs, const ComputeContext& ctx,
+                    void* /*workspace*/)
 {
     const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     switch (inputs[0].data_type()) {
@@ -165,4 +182,4 @@ Status permute_cuda(const PermuteAttributes& attrs, TensorView& output,
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

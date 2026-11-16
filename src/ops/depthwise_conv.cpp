@@ -20,15 +20,13 @@ namespace nnops {
 NNOPS_DECLARE_CPU(DepthwiseConvAttributes, depthwise_conv_cpu)
 NNOPS_DECLARE_CUDA(DepthwiseConvAttributes, depthwise_conv_cuda)
 
-NNOPS_OP_BOILERPLATE(DepthwiseConv, DepthwiseConvAttributes,
-        backend::cpu::depthwise_conv_cpu, NNOPS_IF_CUDA(backend::cuda::depthwise_conv_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(DepthwiseConv, DepthwiseConvAttributes, backend::cpu::depthwise_conv_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::depthwise_conv_cuda), nullptr)
 
-std::vector<TensorDesc> DepthwiseConv::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> DepthwiseConv::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
-    return {depthwise_conv_output_shape(
-        attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
-        0 /* NOTSET */, inputs)};
+    return {depthwise_conv_output_shape(attrs_.kernel_size, attrs_.stride, attrs_.dilation,
+                                        attrs_.padding, 0 /* NOTSET */, inputs)};
 }
 
 Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
@@ -49,29 +47,28 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
             return Status::unsupported;
         }
         return detail::require(
-            detail::dtype_in<DataType::f32, DataType::f16,
-                             DataType::s8, DataType::u8>(backend_, in.dtype));
+            detail::dtype_in<DataType::f32, DataType::f16, DataType::s8, DataType::u8>(backend_,
+                                                                                       in.dtype));
     }
     // Channel-first reads the raw [C, 1, KH, KW] filter one channel plane at a time,
     // f32/f16 only.
     if (!is_channel_first_spatial(in.layout)) {
         return Status::unsupported;
     }
-    return detail::require(
-        detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) &&
-            is_channel_first_spatial(inputs[1].layout),
-        Status::unsupported);
+    return detail::require(detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) &&
+                               is_channel_first_spatial(inputs[1].layout),
+                           Status::unsupported);
 }
 
-Status DepthwiseConv::compute(std::span<TensorView> outputs,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx,
-                              void* workspace)
+Status DepthwiseConv::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                              const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

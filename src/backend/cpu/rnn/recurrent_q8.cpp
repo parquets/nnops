@@ -23,10 +23,11 @@ namespace {
 /// The direction's slice of a per-row scale table, or null for a per-tensor
 /// one. `rows` is one direction's row count; a table wider than that is per
 /// row, anything narrower is shared by every direction.
-inline const float* q8_scale_rows(const QuantParams& q, int64_t d,
-                                  int64_t rows) noexcept
+inline const float* q8_scale_rows(const QuantParams& q, int64_t d, int64_t rows) noexcept
 {
-    if (q.scale_data == nullptr) { return nullptr; }
+    if (q.scale_data == nullptr) {
+        return nullptr;
+    }
     return (q.num_scales > rows) ? q.scale_data + d * rows : q.scale_data;
 }
 
@@ -39,8 +40,8 @@ inline const float* q8_scale_rows(const QuantParams& q, int64_t d,
 /// gate row in, eight contiguous columns out — so the gates are a straight-line
 /// loop over full-width moves and only the last block, when H is not a multiple
 /// of eight, fills lanes scalar-wise.
-inline void interleave_scales(const float* src, float scalar, int64_t hidden,
-                              int64_t gates, int64_t gate_off, float* dst)
+inline void interleave_scales(const float* src, float scalar, int64_t hidden, int64_t gates,
+                              int64_t gate_off, float* dst)
 {
     const int64_t q = 8 * gates;
     const v_f32x8 fill = v_set1(dst, scalar);
@@ -48,7 +49,9 @@ inline void interleave_scales(const float* src, float scalar, int64_t hidden,
         const int64_t h = hb * 8;
         float* const out = dst + hb * q;
         if (src == nullptr) {
-            for (int64_t g = 0; g < gates; ++g) { v_store(out + g * 8, fill); }
+            for (int64_t g = 0; g < gates; ++g) {
+                v_store(out + g * 8, fill);
+            }
         } else if (h + 8 <= hidden) {
             const float* const row = src + gate_off * hidden + h;
             for (int64_t g = 0; g < gates; ++g) {
@@ -60,7 +63,9 @@ inline void interleave_scales(const float* src, float scalar, int64_t hidden,
                 float tail[8];
                 std::memcpy(tail, src + (gate_off + g) * hidden + h,
                             static_cast<size_t>(live) * sizeof(float));
-                for (int64_t j = live; j < 8; ++j) { tail[j] = scalar; }
+                for (int64_t j = live; j < 8; ++j) {
+                    tail[j] = scalar;
+                }
                 v_store(out + g * 8, v_load(tail));
             }
         }
@@ -69,26 +74,24 @@ inline void interleave_scales(const float* src, float scalar, int64_t hidden,
 
 /// Pack one k-block slab set: `nc` columns of a [nc, K] byte matrix, one
 /// int8_panel_stride slab per k block.
-inline void q8_pack_slabs(int8_t* dst, const int8_t* src, int64_t lds,
-                          int64_t k, int64_t cols, bool a_biased)
+inline void q8_pack_slabs(int8_t* dst, const int8_t* src, int64_t lds, int64_t k, int64_t cols,
+                          bool a_biased)
 {
     int64_t off = 0;
     for (int64_t at = 0; at < k; at += kQ8Kc) {
         const int64_t kc = std::min<int64_t>(kQ8Kc, k - at);
-        tile_pack_rhs_i8(/*trans=*/true, static_cast<int>(cols),
-                         static_cast<int>(kc), dst + off,
-                         static_cast<int>(int8_panel_stride(kc)),
-                         src + at, static_cast<int>(lds), a_biased);
+        tile_pack_rhs_i8(/*trans=*/true, static_cast<int>(cols), static_cast<int>(kc), dst + off,
+                         static_cast<int>(int8_panel_stride(kc)), src + at, static_cast<int>(lds),
+                         a_biased);
         off += q8_slab_bytes(cols, kc);
     }
 }
 
-}  // namespace
+} // namespace
 
-void prepare_q8_direction(const RecurrentParams& p, const RecurrentPackedHeader& h,
-                          int64_t d, const TensorView& w, const TensorView& r,
-                          const TensorView* bias, int8_t* raw, float* bias_f32,
-                          const Q8Regions& dst)
+void prepare_q8_direction(const RecurrentParams& p, const RecurrentPackedHeader& h, int64_t d,
+                          const TensorView& w, const TensorView& r, const TensorView* bias,
+                          int8_t* raw, float* bias_f32, const Q8Regions& dst)
 {
     const int64_t G = h.gates;
     const int64_t H = h.hidden;
@@ -107,8 +110,7 @@ void prepare_q8_direction(const RecurrentParams& p, const RecurrentPackedHeader&
         const int64_t gates = phase_gates(kind);
         const int64_t gate_off = phase_gate_offset(p.mode, lbr, ph);
         interleave_gates<int8_t>(w.ptr<int8_t>(static_cast<size_t>(d * G * H)),
-                                 w.row_stride_elems(), H, I, gates, gate_off,
-                                 raw + col * I);
+                                 w.row_stride_elems(), H, I, gates, gate_off, raw + col * I);
         interleave_scales(sw_rows, qw.scale, H, gates, gate_off, dst.sw + col);
         col += h.phase_cols[ph];
     }
@@ -130,9 +132,9 @@ void prepare_q8_direction(const RecurrentParams& p, const RecurrentPackedHeader&
         float v = 0.0f;
         if (bias != nullptr) {
             const size_t at = static_cast<size_t>(d);
-            v = (bdt == DataType::f16)  ? s_load(bias->ptr<half>(at) + gi)
-              : (bdt == DataType::bf16) ? s_load(bias->ptr<bfloat16>(at) + gi)
-                                        : bias->ptr<float>(at)[gi];
+            v = (bdt == DataType::f16)  ? s_load(bias->ptr<half>(at) + gi) :
+                (bdt == DataType::bf16) ? s_load(bias->ptr<bfloat16>(at) + gi) :
+                                          bias->ptr<float>(at)[gi];
         }
         bias_f32[gi] = v;
     }
@@ -145,15 +147,16 @@ void prepare_q8_direction(const RecurrentParams& p, const RecurrentPackedHeader&
         const int64_t gate_off = phase_gate_offset(p.mode, lbr, ph);
         // Rbh belongs after the recurrent product under linear_before_reset, so
         // the h gate's bias vector takes Wb alone here.
-        const int64_t h_gate = (kind == PhaseKind::GruZr) ? -1
-                             : (kind == PhaseKind::GruAll) ? 2 : 0;
+        const int64_t h_gate = (kind == PhaseKind::GruZr)  ? -1 :
+                               (kind == PhaseKind::GruAll) ? 2 :
+                                                             0;
         const int64_t all_gates = (int64_t{1} << gates) - 1;
         const int64_t h_bit = (h_gate < 0) ? 0 : (int64_t{1} << h_gate);
-        build_bias<float>(wb, rb, H, gates, lbr ? (all_gates & ~h_bit) : all_gates,
-                          gate_off, dst.bias[ph]);
+        build_bias<float>(wb, rb, H, gates, lbr ? (all_gates & ~h_bit) : all_gates, gate_off,
+                          dst.bias[ph]);
         if (lbr) {
-            build_bias<float>(static_cast<const float*>(nullptr), rb, H, gates,
-                              h_bit, gate_off, dst.rh);
+            build_bias<float>(static_cast<const float*>(nullptr), rb, H, gates, h_bit, gate_off,
+                              dst.rh);
         }
     }
 }
@@ -171,12 +174,18 @@ void quant_row_scales(const T* a, int64_t lds, int64_t rows, int64_t k, float* s
         const T* row = a + m * lds;
         v_f32x8 vmax = v_zero_f32x8();
         int64_t j = 0;
-        for (; j + 8 <= k; j += 8) { vmax = v_max(vmax, v_abs(vload8(row + j))); }
+        for (; j + 8 <= k; j += 8) {
+            vmax = v_max(vmax, v_abs(vload8(row + j)));
+        }
         alignas(32) float tmp[8];
         vstore8(tmp, vmax);
         float mx = 0.0f;
-        for (int c = 0; c < 8; ++c) { mx = std::max(mx, tmp[c]); }
-        for (; j < k; ++j) { mx = std::max(mx, std::fabs(s_load(row + j))); }
+        for (int c = 0; c < 8; ++c) {
+            mx = std::max(mx, tmp[c]);
+        }
+        for (; j < k; ++j) {
+            mx = std::max(mx, std::fabs(s_load(row + j)));
+        }
         s[m] = mx > 0.0f ? mx * kInv127 : 1.0f;
     }
 }
@@ -194,9 +203,8 @@ void run_phase_q8_kernel(const StepCtx<T>& s, const ComputeContext& ctx)
     const bool a_biased = int8_a_pack_bias(DataType::s8) != 0;
 
     auto body = [&](int64_t task) {
-        const int64_t slot = (s.qs.slots < tasks)
-                                 ? static_cast<int64_t>(ctx.cpu.current_thread_id())
-                                 : task;
+        const int64_t slot =
+            (s.qs.slots < tasks) ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : task;
         int8_t* pa = s.qs.a + slot * s.qs.a_bytes;
         int32_t* pc = s.qs.c + slot * s.qs.c_elems;
         float* psa = s.qs.s + slot * s.qs.s_elems;
@@ -207,7 +215,9 @@ void run_phase_q8_kernel(const StepCtx<T>& s, const ComputeContext& ctx)
         const int64_t mcnt = std::min<int64_t>(s.mc, s.batch - m0);
         const int64_t n0 = nblk * s.nc;
         const int64_t ncnt = std::min<int64_t>(s.nc, s.cols - n0);
-        if (mcnt <= 0 || ncnt <= 0) { return; }
+        if (mcnt <= 0 || ncnt <= 0) {
+            return;
+        }
 
         const T* a = s.a + m0 * s.hp;
         quant_row_scales(a, s.hp, mcnt, s.hidden, psa);
@@ -215,15 +225,13 @@ void run_phase_q8_kernel(const StepCtx<T>& s, const ComputeContext& ctx)
         int64_t slab = 0;
         for (int64_t k = 0, kb = 0; k < s.hidden; k += s.kc, ++kb) {
             const int64_t kc = std::min<int64_t>(s.kc, s.hidden - k);
-            tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc),
-                                   pa, static_cast<int>(geom_ldd_i8_a(kc)), a + k,
+            tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc), pa,
+                                   static_cast<int>(geom_ldd_i8_a(kc)), a + k,
                                    static_cast<int>(s.hp), psa, nullptr, 1.0f, 0,
                                    /*u8=*/false, a_biased);
-            const int8_t* pb = s.q_r + slab +
-                               (n0 / NR_MAX_I8) * int8_panel_stride(kc);
-            tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
-                             static_cast<int>(kc), pc, static_cast<int>(s.nc),
-                             pa, pb, /*ldb=*/0, INT32_MIN, INT32_MAX,
+            const int8_t* pb = s.q_r + slab + (n0 / NR_MAX_I8) * int8_panel_stride(kc);
+            tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt), static_cast<int>(kc),
+                             pc, static_cast<int>(s.nc), pa, pb, /*ldb=*/0, INT32_MIN, INT32_MAX,
                              /*zero_mode=*/kb == 0);
             slab += q8_slab_bytes(s.cols, kc);
         }
@@ -236,8 +244,8 @@ void run_phase_q8_kernel(const StepCtx<T>& s, const ComputeContext& ctx)
             const v_f32x8 vsa = v_set1_f32x8(psa[m]);
             int64_t n = 0;
             for (; n + 8 <= ncnt; n += 8) {
-                const v_f32x8 v = v_mul(v_mul(kernel::v_cvt_i32_to_f32(crow + n), vsa),
-                                        v_load(sr + n));
+                const v_f32x8 v =
+                    v_mul(v_mul(kernel::v_cvt_i32_to_f32(crow + n), vsa), v_load(sr + n));
                 vstore8(drow + n, fresh ? v : v_add(vload8(drow + n), v));
             }
             for (; n < ncnt; ++n) {
@@ -261,37 +269,69 @@ void run_phase_q8_kernel(const StepCtx<T>& s, const ComputeContext& ctx)
     }
 }
 
-}  // namespace
+} // namespace
 
-void run_phase_q8(const StepCtx<float>& s, PhaseKind kind, const ComputeContext& ctx) {
+void run_phase_q8(const StepCtx<float>& s, PhaseKind kind, const ComputeContext& ctx)
+{
     switch (kind) {
-    case PhaseKind::Rnn:    run_phase_q8_kernel<float, PhaseKind::Rnn>(s, ctx); break;
-    case PhaseKind::Lstm:   run_phase_q8_kernel<float, PhaseKind::Lstm>(s, ctx); break;
-    case PhaseKind::GruAll: run_phase_q8_kernel<float, PhaseKind::GruAll>(s, ctx); break;
-    case PhaseKind::GruZr:  run_phase_q8_kernel<float, PhaseKind::GruZr>(s, ctx); break;
-    case PhaseKind::GruH:   run_phase_q8_kernel<float, PhaseKind::GruH>(s, ctx); break;
+    case PhaseKind::Rnn:
+        run_phase_q8_kernel<float, PhaseKind::Rnn>(s, ctx);
+        break;
+    case PhaseKind::Lstm:
+        run_phase_q8_kernel<float, PhaseKind::Lstm>(s, ctx);
+        break;
+    case PhaseKind::GruAll:
+        run_phase_q8_kernel<float, PhaseKind::GruAll>(s, ctx);
+        break;
+    case PhaseKind::GruZr:
+        run_phase_q8_kernel<float, PhaseKind::GruZr>(s, ctx);
+        break;
+    case PhaseKind::GruH:
+        run_phase_q8_kernel<float, PhaseKind::GruH>(s, ctx);
+        break;
     }
 }
 
-void run_phase_q8(const StepCtx<half>& s, PhaseKind kind, const ComputeContext& ctx) {
+void run_phase_q8(const StepCtx<half>& s, PhaseKind kind, const ComputeContext& ctx)
+{
     switch (kind) {
-    case PhaseKind::Rnn:    run_phase_q8_kernel<half, PhaseKind::Rnn>(s, ctx); break;
-    case PhaseKind::Lstm:   run_phase_q8_kernel<half, PhaseKind::Lstm>(s, ctx); break;
-    case PhaseKind::GruAll: run_phase_q8_kernel<half, PhaseKind::GruAll>(s, ctx); break;
-    case PhaseKind::GruZr:  run_phase_q8_kernel<half, PhaseKind::GruZr>(s, ctx); break;
-    case PhaseKind::GruH:   run_phase_q8_kernel<half, PhaseKind::GruH>(s, ctx); break;
+    case PhaseKind::Rnn:
+        run_phase_q8_kernel<half, PhaseKind::Rnn>(s, ctx);
+        break;
+    case PhaseKind::Lstm:
+        run_phase_q8_kernel<half, PhaseKind::Lstm>(s, ctx);
+        break;
+    case PhaseKind::GruAll:
+        run_phase_q8_kernel<half, PhaseKind::GruAll>(s, ctx);
+        break;
+    case PhaseKind::GruZr:
+        run_phase_q8_kernel<half, PhaseKind::GruZr>(s, ctx);
+        break;
+    case PhaseKind::GruH:
+        run_phase_q8_kernel<half, PhaseKind::GruH>(s, ctx);
+        break;
     }
 }
 
 #ifdef NNOPS_ARCH_AARCH64
-void run_phase_q8(const StepCtx<bfloat16>& s, PhaseKind kind,
-                  const ComputeContext& ctx) {
+void run_phase_q8(const StepCtx<bfloat16>& s, PhaseKind kind, const ComputeContext& ctx)
+{
     switch (kind) {
-    case PhaseKind::Rnn:    run_phase_q8_kernel<bfloat16, PhaseKind::Rnn>(s, ctx); break;
-    case PhaseKind::Lstm:   run_phase_q8_kernel<bfloat16, PhaseKind::Lstm>(s, ctx); break;
-    case PhaseKind::GruAll: run_phase_q8_kernel<bfloat16, PhaseKind::GruAll>(s, ctx); break;
-    case PhaseKind::GruZr:  run_phase_q8_kernel<bfloat16, PhaseKind::GruZr>(s, ctx); break;
-    case PhaseKind::GruH:   run_phase_q8_kernel<bfloat16, PhaseKind::GruH>(s, ctx); break;
+    case PhaseKind::Rnn:
+        run_phase_q8_kernel<bfloat16, PhaseKind::Rnn>(s, ctx);
+        break;
+    case PhaseKind::Lstm:
+        run_phase_q8_kernel<bfloat16, PhaseKind::Lstm>(s, ctx);
+        break;
+    case PhaseKind::GruAll:
+        run_phase_q8_kernel<bfloat16, PhaseKind::GruAll>(s, ctx);
+        break;
+    case PhaseKind::GruZr:
+        run_phase_q8_kernel<bfloat16, PhaseKind::GruZr>(s, ctx);
+        break;
+    case PhaseKind::GruH:
+        run_phase_q8_kernel<bfloat16, PhaseKind::GruH>(s, ctx);
+        break;
     }
 }
 #endif
@@ -301,10 +341,9 @@ void run_phase_q8(const StepCtx<bfloat16>& s, PhaseKind kind,
 /// B is W's per-k-block slabs; the dequant writes the fp chunk buffer.
 template <typename T>
 void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
-                      const int8_t* packed_w, const float* sw, int64_t cols,
-                      int64_t input, int64_t rows, int64_t mc, int64_t nc,
-                      const RowScales& xs, const Q8Scratch& qs,
-                      const ComputeContext& ctx)
+                      const int8_t* packed_w, const float* sw, int64_t cols, int64_t input,
+                      int64_t rows, int64_t mc, int64_t nc, const RowScales& xs,
+                      const Q8Scratch& qs, const ComputeContext& ctx)
 {
     const int64_t n_blocks = (cols + nc - 1) / nc;
     const int64_t m_blocks = (rows + mc - 1) / mc;
@@ -314,9 +353,8 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
     const bool a_biased = int8_a_pack_bias(DataType::s8) != 0;
 
     auto body = [&](int64_t task) {
-        const int64_t slot = (qs.slots < tasks)
-                                 ? static_cast<int64_t>(ctx.cpu.current_thread_id())
-                                 : task;
+        const int64_t slot =
+            (qs.slots < tasks) ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : task;
         int8_t* pa = qs.a + slot * qs.a_bytes;
         int32_t* pc = qs.c + slot * qs.c_elems;
         float* psa = qs.s + slot * qs.s_elems;
@@ -325,7 +363,9 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
         const int64_t n0 = (task % n_blocks) * nc;
         const int64_t mcnt = std::min<int64_t>(mc, rows - m0);
         const int64_t ncnt = std::min<int64_t>(nc, cols - n0);
-        if (mcnt <= 0 || ncnt <= 0) { return; }
+        if (mcnt <= 0 || ncnt <= 0) {
+            return;
+        }
 
         if (x_s8) {
             const float* xt = xs.rows ? xs.rows + x_row0 + m0 : nullptr;
@@ -333,33 +373,27 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
                 psa[r] = xt ? xt[r] : xs.scalar;
             }
         } else {
-            quant_row_scales(x.ptr<T>(static_cast<size_t>(x_row0 + m0)), x_ld,
-                             mcnt, input, psa);
+            quant_row_scales(x.ptr<T>(static_cast<size_t>(x_row0 + m0)), x_ld, mcnt, input, psa);
         }
-        const int8_t* xa8 = x_s8
-            ? x.ptr<int8_t>(static_cast<size_t>(x_row0 + m0)) : nullptr;
-        const T* xa = x_s8 ? nullptr
-                           : x.ptr<T>(static_cast<size_t>(x_row0 + m0));
+        const int8_t* xa8 = x_s8 ? x.ptr<int8_t>(static_cast<size_t>(x_row0 + m0)) : nullptr;
+        const T* xa = x_s8 ? nullptr : x.ptr<T>(static_cast<size_t>(x_row0 + m0));
 
         int64_t slab = 0;
         for (int64_t at = 0, kb = 0; at < input; at += kQ8Kc, ++kb) {
             const int64_t kc = std::min<int64_t>(kQ8Kc, input - at);
             if (x_s8) {
-                tile_pack_lhs_i8(/*trans=*/false, static_cast<int>(mcnt),
-                                 static_cast<int>(kc), pa,
+                tile_pack_lhs_i8(/*trans=*/false, static_cast<int>(mcnt), static_cast<int>(kc), pa,
                                  static_cast<int>(geom_ldd_i8_a(kc)), xa8 + at,
                                  static_cast<int>(x_ld), a_biased);
             } else {
-                tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc),
-                                       pa, static_cast<int>(geom_ldd_i8_a(kc)),
-                                       xa + at, static_cast<int>(x_ld), psa, nullptr,
-                                       1.0f, 0, /*u8=*/false, a_biased);
+                tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc), pa,
+                                       static_cast<int>(geom_ldd_i8_a(kc)), xa + at,
+                                       static_cast<int>(x_ld), psa, nullptr, 1.0f, 0, /*u8=*/false,
+                                       a_biased);
             }
-            const int8_t* pb = packed_w + slab +
-                               (n0 / NR_MAX_I8) * int8_panel_stride(kc);
-            tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
-                             static_cast<int>(kc), pc, static_cast<int>(nc),
-                             pa, pb, /*ldb=*/0, INT32_MIN, INT32_MAX,
+            const int8_t* pb = packed_w + slab + (n0 / NR_MAX_I8) * int8_panel_stride(kc);
+            tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt), static_cast<int>(kc),
+                             pc, static_cast<int>(nc), pa, pb, /*ldb=*/0, INT32_MIN, INT32_MAX,
                              /*zero_mode=*/kb == 0);
             slab += q8_slab_bytes(cols, kc);
         }
@@ -372,8 +406,8 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
             const v_f32x8 vsa = v_set1_f32x8(psa[m]);
             int64_t n = 0;
             for (; n + 8 <= ncnt; n += 8) {
-                vstore8(drow + n, v_mul(v_mul(kernel::v_cvt_i32_to_f32(crow + n), vsa),
-                                        v_load(swp + n)));
+                vstore8(drow + n,
+                        v_mul(v_mul(kernel::v_cvt_i32_to_f32(crow + n), vsa), v_load(swp + n)));
             }
             for (; n < ncnt; ++n) {
                 s_store(drow + n, static_cast<float>(crow[n]) * psa[m] * swp[n]);
@@ -388,20 +422,17 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
     }
 }
 
-template void project_chunk_q8<float>(const TensorView&, int64_t, float*, int64_t,
-                                      const int8_t*, const float*, int64_t, int64_t,
-                                      int64_t, int64_t, int64_t, const RowScales&,
-                                      const Q8Scratch&, const ComputeContext&);
-template void project_chunk_q8<half>(const TensorView&, int64_t, half*, int64_t,
-                                     const int8_t*, const float*, int64_t, int64_t,
-                                     int64_t, int64_t, int64_t, const RowScales&,
-                                     const Q8Scratch&, const ComputeContext&);
+template void project_chunk_q8<float>(const TensorView&, int64_t, float*, int64_t, const int8_t*,
+                                      const float*, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                      const RowScales&, const Q8Scratch&, const ComputeContext&);
+template void project_chunk_q8<half>(const TensorView&, int64_t, half*, int64_t, const int8_t*,
+                                     const float*, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                     const RowScales&, const Q8Scratch&, const ComputeContext&);
 #ifdef NNOPS_ARCH_AARCH64
-template void project_chunk_q8<bfloat16>(const TensorView&, int64_t, bfloat16*,
-                                         int64_t, const int8_t*, const float*,
-                                         int64_t, int64_t, int64_t, int64_t,
-                                         int64_t, const RowScales&,
-                                         const Q8Scratch&, const ComputeContext&);
+template void project_chunk_q8<bfloat16>(const TensorView&, int64_t, bfloat16*, int64_t,
+                                         const int8_t*, const float*, int64_t, int64_t, int64_t,
+                                         int64_t, int64_t, const RowScales&, const Q8Scratch&,
+                                         const ComputeContext&);
 #endif
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

@@ -56,63 +56,72 @@ struct Geom3 {
     int64_t SD, SH, SW, DD, DH, DW, PD, PH, PW;
     Epilogue epilogue;
     bool add_to;
-    bool pre_act;   ///< fold add_to's old value in before the epilogue
+    bool pre_act; ///< fold add_to's old value in before the epilogue
 
     /// The col2im module's view of the same numbers.
     Tconv3dColGeom col_geom() const
     {
-        return make_col3_geom(ID, IH, IW, OW, KD, KH, KW, SD, SH, SW,
-                              DD, DH, DW, PD, PH, PW);
+        return make_col3_geom(ID, IH, IW, OW, KD, KH, KW, SD, SH, SW, DD, DH, DW, PD, PH, PW);
     }
 };
 
 /// The col route. Returns false when the operands cannot be read as flat
 /// matrices, leaving the caller its gather.
 template <typename T>
-bool tconv3d_gemm(const Geom3& gm,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
+bool tconv3d_gemm(const Geom3& gm, TensorView& output, std::span<const TensorView> inputs,
                   const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    if (weight.row_stride_elems() != gm.KW) { return false; }
-    if (input.row_stride_elems() != gm.IW) { return false; }
-    if (gm.KD > kMaxRowTaps || gm.KH > kMaxRowTaps) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
+    if (input.row_stride_elems() != gm.IW) {
+        return false;
+    }
+    if (gm.KD > kMaxRowTaps || gm.KH > kMaxRowTaps) {
+        return false;
+    }
 
     const int64_t karea = gm.KD * gm.KH * gm.KW;
-    const int64_t npix  = gm.ID * gm.IH * gm.IW;
-    const int64_t icg   = gm.IC_per_G;
-    const int64_t ocg   = gm.OC_per_G;
-    if (npix <= 0 || karea <= 0 || icg <= 0) { return false; }
+    const int64_t npix = gm.ID * gm.IH * gm.IW;
+    const int64_t icg = gm.IC_per_G;
+    const int64_t ocg = gm.OC_per_G;
+    if (npix <= 0 || karea <= 0 || icg <= 0) {
+        return false;
+    }
     // The volume view is [IC/G] × [ID·IH·IW], so a channel has to be one whole
     // contiguous volume.
-    if (input.stride_elems(1) != npix) { return false; }
+    if (input.stride_elems(1) != npix) {
+        return false;
+    }
 
-    const int64_t in_n_stride    = input.stride_elems(0);
-    const int64_t out_n_stride   = output.stride_elems(0);
-    const int64_t out_c_stride   = output.stride_elems(1);
-    const int64_t out_d_stride   = output.stride_elems(2);
+    const int64_t in_n_stride = input.stride_elems(0);
+    const int64_t out_n_stride = output.stride_elems(0);
+    const int64_t out_c_stride = output.stride_elems(1);
+    const int64_t out_d_stride = output.stride_elems(2);
     const int64_t out_row_stride = output.row_stride_elems();
 
     const Tconv3dColGeom cg = gm.col_geom();
     const int64_t row_len = cg.w.row_len;
-    const int64_t slots   = std::max(1, ctx.cpu.worker_count());
+    const int64_t slots = std::max(1, ctx.cpu.worker_count());
 
     const int64_t elems_per_oc = karea * npix;
     const int64_t cap = kColCapBytes / static_cast<int64_t>(sizeof(T));
-    const int64_t chunk = std::max<int64_t>(
-        1, std::min(ocg, cap / std::max<int64_t>(elems_per_oc, 1)));
+    const int64_t chunk =
+        std::max<int64_t>(1, std::min(ocg, cap / std::max<int64_t>(elems_per_oc, 1)));
 
     PoolArray<T> col(static_cast<size_t>(chunk * elems_per_oc));
     PoolArray<T> rows(static_cast<size_t>(slots * row_len));
-    if (!col || !rows) { return false; }
+    if (!col || !rows) {
+        return false;
+    }
 
     const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr  = weight.ptr<T>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const auto* w_ptr = weight.ptr<T>();
+    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     auto* out_ptr = output.ptr<T>();
     const DataType vdt = input.data_type();
 
@@ -135,19 +144,17 @@ bool tconv3d_gemm(const Geom3& gm,
 
             for (int64_t oc0 = 0; oc0 < ocg; oc0 += chunk) {
                 const int64_t cc = std::min(chunk, ocg - oc0);
-                const int64_t m  = cc * karea;
+                const int64_t m = cc * karea;
 
                 // A: the filter rows of this oc slice, [IC/G] × [OC/G·KD·KH·KW],
                 // read through the group's own row stride.
                 const int64_t ashape[] = {icg, m};
                 TensorView am(std::span<const int64_t>(ashape, 2), vdt,
                               const_cast<T*>(w_g + oc0 * karea),
-                              static_cast<int64_t>(ocg * karea * sizeof(T)),
-                              TensorLayout::NCHW);
+                              static_cast<int64_t>(ocg * karea * sizeof(T)), TensorLayout::NCHW);
                 const int64_t cshape[] = {m, npix};
-                TensorView cm(std::span<const int64_t>(cshape, 2), vdt,
-                              col.data(), static_cast<int64_t>(npix * sizeof(T)),
-                              TensorLayout::NCHW);
+                TensorView cm(std::span<const int64_t>(cshape, 2), vdt, col.data(),
+                              static_cast<int64_t>(npix * sizeof(T)), TensorLayout::NCHW);
 
                 const TensorView mins[] = {am, bm};
                 matmul_cpu(mm, cm, mins, ctx, nullptr);
@@ -157,30 +164,26 @@ bool tconv3d_gemm(const Geom3& gm,
                 ctx.cpu.run(0, cc * gm.OD * gm.OH, [&](int64_t task) {
                     const int64_t oc_l = task / (gm.OD * gm.OH);
                     const int64_t rest = task % (gm.OD * gm.OH);
-                    const int64_t od   = rest / gm.OH;
-                    const int64_t oh   = rest % gm.OH;
-                    T* row = rows.data() +
-                             static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
+                    const int64_t od = rest / gm.OH;
+                    const int64_t oh = rest % gm.OH;
+                    T* row =
+                        rows.data() + static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
 
                     row_fill(row, row_len, b_g ? s_load(&b_g[oc_l]) : 0.0f);
 
                     tconv3d_col2im_channel_major<T>(
                         cg, col.data() + oc_l * karea * npix, row, od, oh,
-                        [](T* dst, const T* src, int64_t len, int64_t) {
-                            row_add(dst, src, len);
-                        });
+                        [](T* dst, const T* src, int64_t len, int64_t) { row_add(dst, src, len); });
 
                     const int64_t oc = g * ocg + oc0 + oc_l;
-                    T* orow = out_n + oc * out_c_stride + od * out_d_stride +
-                              oh * out_row_stride;
+                    T* orow = out_n + oc * out_c_stride + od * out_d_stride + oh * out_row_stride;
                     for (int64_t r = 0; r < gm.SW && r < gm.OW; ++r) {
                         const int64_t nr = (gm.OW - r + gm.SW - 1) / gm.SW;
                         const T* rp = row + r * cg.w.mic;
                         for (int64_t t = 0; t < nr; ++t) {
                             const int64_t ow = r + t * gm.SW;
-                            apply_epilogue_store<T>(&orow[ow], s_load(&rp[t]),
-                                                    gm.epilogue, oc, gm.add_to,
-                                                    gm.pre_act);
+                            apply_epilogue_store<T>(&orow[ow], s_load(&rp[t]), gm.epilogue, oc,
+                                                    gm.add_to, gm.pre_act);
                         }
                     }
                 });
@@ -212,23 +215,31 @@ bool tconv3d_gemm(const Geom3& gm,
 /// only the walk is 3-D. Returns false when the operands cannot be read as flat
 /// matrices.
 template <typename T>
-bool tconv3d_channel_last_gemm(const Geom3& gm,
-                               TensorView& output,
-                               std::span<const TensorView> inputs,
-                               const ComputeContext& ctx)
+bool tconv3d_channel_last_gemm(const Geom3& gm, TensorView& output,
+                               std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
-    if (weight.row_stride_elems() != gm.KW) { return false; }
-    if (input.row_stride_elems() != gm.IW * gm.IC) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
+    if (input.row_stride_elems() != gm.IW * gm.IC) {
+        return false;
+    }
     // The volume view is [ID·IH·IW] × [IC/G] voxels, so a depth slice has to be
     // one contiguous plane whose stride the H rows already imply.
-    if (input.stride_elems(2) != gm.IH * gm.IW * gm.IC) { return false; }
-    if (gm.KD > kMaxRowTaps || gm.KH > kMaxRowTaps) { return false; }
+    if (input.stride_elems(2) != gm.IH * gm.IW * gm.IC) {
+        return false;
+    }
+    if (gm.KD > kMaxRowTaps || gm.KH > kMaxRowTaps) {
+        return false;
+    }
 
     const int64_t npix = gm.ID * gm.IH * gm.IW;
-    if (npix <= 0 || gm.KD * gm.KH * gm.KW <= 0 || gm.IC_per_G <= 0) { return false; }
+    if (npix <= 0 || gm.KD * gm.KH * gm.KW <= 0 || gm.IC_per_G <= 0) {
+        return false;
+    }
 
     // Two col orientations, exactly as in 2-D: [tap][oc] needs the filter
     // permuted; [oc][tap] lets the raw filter slice be B and pays a transpose
@@ -238,14 +249,11 @@ bool tconv3d_channel_last_gemm(const Geom3& gm,
     const Tconv3dColGeom cg = gm.col_geom();
     const int64_t OH = gm.OH;
     return tconv_cl_route<T>(
-        gm, output, inputs, ctx, npix, gm.OD * gm.OH, gm.KD * gm.KH * gm.KW,
-        direct_w,
+        gm, output, inputs, ctx, npix, gm.OD * gm.OH, gm.KD * gm.KH * gm.KW, direct_w,
         [cg, OH](const T* col, T* row, int64_t task, int64_t m, int64_t nc) {
             tconv3d_col2im_pixel_major<T>(
                 cg, col, m, nc, nc, row, task / OH, task % OH,
-                [](T* dst, const T* src, int64_t len, int64_t) {
-                    row_add(dst, src, len);
-                });
+                [](T* dst, const T* src, int64_t len, int64_t) { row_add(dst, src, len); });
         });
 }
 
@@ -255,72 +263,74 @@ bool tconv3d_channel_last_gemm(const Geom3& gm,
 /// input volume. The skeleton — the repack to [KD·KH·KW][C], the row scratch,
 /// the merge — is tconv_cl.h's; only the walk is 3-D.
 template <typename T>
-bool tconv3d_channel_last_depthwise(const Geom3& gm,
-                                    TensorView& output,
-                                    std::span<const TensorView> inputs,
-                                    const ComputeContext& ctx)
+bool tconv3d_channel_last_depthwise(const Geom3& gm, TensorView& output,
+                                    std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) { return false; }
+    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) {
+        return false;
+    }
 
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
-    if (weight.row_stride_elems() != gm.KW) { return false; }
-    if (input.row_stride_elems() != gm.IW * gm.IC) { return false; }
-    if (input.stride_elems(2) != gm.IH * gm.IW * gm.IC) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
+    if (input.row_stride_elems() != gm.IW * gm.IC) {
+        return false;
+    }
+    if (input.stride_elems(2) != gm.IH * gm.IW * gm.IC) {
+        return false;
+    }
 
     const Tconv3dColGeom cg = gm.col_geom();
     const int64_t OH = gm.OH;
     return tconv_cl_depthwise<T>(
         gm, output, inputs, ctx, gm.OD * gm.OH, gm.KD * gm.KH * gm.KW, gm.IC,
-        [cg, OH](const T* src, T* row, int64_t task, const T* wd, int64_t m,
-                 int64_t nc) {
+        [cg, OH](const T* src, T* row, int64_t task, const T* wd, int64_t m, int64_t nc) {
             // The tap indexes the repacked filter, not a source stride.
-            tconv3d_col2im_pixel_major<T>(
-                cg, src, m, nc, 0, row, task / OH, task % OH,
-                [wd, nc](T* dst, const T* s, int64_t len, int64_t tap) {
-                    row_fma(dst, s, wd + tap * nc, len);
-                });
+            tconv3d_col2im_pixel_major<T>(cg, src, m, nc, 0, row, task / OH, task % OH,
+                                          [wd, nc](T* dst, const T* s, int64_t len, int64_t tap) {
+                                              row_fma(dst, s, wd + tap * nc, len);
+                                          });
         });
 }
 
 /// The output-driven gather: every output voxel walks its own taps. Correct for
 /// every geometry and layout, and the route a shape too odd for the col takes.
 template <typename T>
-void tconv3d_gather(const Geom3& gm,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
+void tconv3d_gather(const Geom3& gm, TensorView& output, std::span<const TensorView> inputs,
                     const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t in_c_stride    = input.stride_elems(1);
-    const int64_t in_d_stride    = input.stride_elems(2);
-    const int64_t in_row_stride  = input.row_stride_elems();
-    const int64_t in_n_stride    = input.stride_elems(0);
-    const int64_t out_c_stride   = output.stride_elems(1);
-    const int64_t out_d_stride   = output.stride_elems(2);
+    const int64_t in_c_stride = input.stride_elems(1);
+    const int64_t in_d_stride = input.stride_elems(2);
+    const int64_t in_row_stride = input.row_stride_elems();
+    const int64_t in_n_stride = input.stride_elems(0);
+    const int64_t out_c_stride = output.stride_elems(1);
+    const int64_t out_d_stride = output.stride_elems(2);
     const int64_t out_row_stride = output.row_stride_elems();
-    const int64_t out_n_stride   = output.stride_elems(0);
+    const int64_t out_n_stride = output.stride_elems(0);
 
     const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr  = weight.ptr<T>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const auto* w_ptr = weight.ptr<T>();
+    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     auto* out_ptr = output.ptr<T>();
 
     // One voxel step is one element channel-first and one channel channel-last;
     // the row and slice strides already carry the rest of either layout.
-    const int64_t in_px  = is_channel_last(input.layout()) ? gm.IC : 1;
+    const int64_t in_px = is_channel_last(input.layout()) ? gm.IC : 1;
     const int64_t out_px = is_channel_last(output.layout()) ? gm.OC : 1;
 
     const int64_t karea = gm.KD * gm.KH * gm.KW;
 
     ctx.cpu.run(0, gm.N * gm.OC, [&](int64_t task) {
-        const int64_t n  = task / gm.OC;
+        const int64_t n = task / gm.OC;
         const int64_t oc = task % gm.OC;
-        const int64_t g  = oc / gm.OC_per_G;
+        const int64_t g = oc / gm.OC_per_G;
         const int64_t oc_l = oc % gm.OC_per_G;
 
         const T* in_n = in_ptr + n * in_n_stride;
@@ -336,28 +346,39 @@ void tconv3d_gather(const Geom3& gm,
 
                     for (int64_t kd = 0; kd < gm.KD; ++kd) {
                         const int64_t num_d = od + gm.PD - kd * gm.DD;
-                        if (num_d < 0 || num_d % gm.SD != 0) { continue; }
+                        if (num_d < 0 || num_d % gm.SD != 0) {
+                            continue;
+                        }
                         const int64_t id = num_d / gm.SD;
-                        if (id >= gm.ID) { continue; }
+                        if (id >= gm.ID) {
+                            continue;
+                        }
 
                         for (int64_t kh = 0; kh < gm.KH; ++kh) {
                             const int64_t num_h = oh + gm.PH - kh * gm.DH;
-                            if (num_h < 0 || num_h % gm.SH != 0) { continue; }
+                            if (num_h < 0 || num_h % gm.SH != 0) {
+                                continue;
+                            }
                             const int64_t ih = num_h / gm.SH;
-                            if (ih >= gm.IH) { continue; }
+                            if (ih >= gm.IH) {
+                                continue;
+                            }
 
                             for (int64_t kw = 0; kw < gm.KW; ++kw) {
                                 const int64_t num_w = ow + gm.PW - kw * gm.DW;
-                                if (num_w < 0 || num_w % gm.SW != 0) { continue; }
+                                if (num_w < 0 || num_w % gm.SW != 0) {
+                                    continue;
+                                }
                                 const int64_t iw = num_w / gm.SW;
-                                if (iw >= gm.IW) { continue; }
+                                if (iw >= gm.IW) {
+                                    continue;
+                                }
 
                                 const T* xp = in_n + (g * gm.IC_per_G) * in_c_stride +
-                                              id * in_d_stride + ih * in_row_stride +
-                                              iw * in_px;
+                                              id * in_d_stride + ih * in_row_stride + iw * in_px;
                                 const T* wp = w_ptr +
-                                    ((g * gm.IC_per_G) * gm.OC_per_G + oc_l) * karea +
-                                    (kd * gm.KH + kh) * gm.KW + kw;
+                                              ((g * gm.IC_per_G) * gm.OC_per_G + oc_l) * karea +
+                                              (kd * gm.KH + kh) * gm.KW + kw;
                                 for (int64_t ic_l = 0; ic_l < gm.IC_per_G; ++ic_l) {
                                     acc += s_load(xp + ic_l * in_c_stride) *
                                            s_load(wp + ic_l * (gm.OC_per_G * karea));
@@ -366,9 +387,10 @@ void tconv3d_gather(const Geom3& gm,
                         }
                     }
 
-                    if (b_ptr) { acc += s_load(&b_ptr[oc]); }
-                    apply_epilogue_store<T>(op, acc, gm.epilogue, oc, gm.add_to,
-                                            gm.pre_act);
+                    if (b_ptr) {
+                        acc += s_load(&b_ptr[oc]);
+                    }
+                    apply_epilogue_store<T>(op, acc, gm.epilogue, oc, gm.add_to, gm.pre_act);
                 }
             }
         }
@@ -376,34 +398,36 @@ void tconv3d_gather(const Geom3& gm,
 }
 
 template <typename T>
-void tconv3d_impl(const Geom3& gm,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
+void tconv3d_impl(const Geom3& gm, TensorView& output, std::span<const TensorView> inputs,
                   const ComputeContext& ctx)
 {
-    if (gm.N == 0 || gm.OC == 0 || gm.OD == 0 || gm.OH == 0 || gm.OW == 0) { return; }
+    if (gm.N == 0 || gm.OC == 0 || gm.OD == 0 || gm.OH == 0 || gm.OW == 0) {
+        return;
+    }
     if (is_channel_last(inputs[0].layout())) {
-        if (tconv3d_channel_last_depthwise<T>(gm, output, inputs, ctx)) { return; }
-        if (tconv3d_channel_last_gemm<T>(gm, output, inputs, ctx)) { return; }
+        if (tconv3d_channel_last_depthwise<T>(gm, output, inputs, ctx)) {
+            return;
+        }
+        if (tconv3d_channel_last_gemm<T>(gm, output, inputs, ctx)) {
+            return;
+        }
     } else if (tconv3d_gemm<T>(gm, output, inputs, ctx)) {
         return;
     }
     tconv3d_gather<T>(gm, output, inputs, ctx);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status transpose_conv3d_cpu(const TransposeConv3DAttributes& attrs,
-                            TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx,
+Status transpose_conv3d_cpu(const TransposeConv3DAttributes& attrs, TensorView& output,
+                            std::span<const TensorView> inputs, const ComputeContext& ctx,
                             void* /*workspace*/)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
     Geom3 gm{};
-    gm.N  = input.shape(0);
+    gm.N = input.shape(0);
     gm.IC = input.shape(1);
     gm.ID = input.shape(2);
     gm.IH = input.shape(3);
@@ -412,7 +436,7 @@ Status transpose_conv3d_cpu(const TransposeConv3DAttributes& attrs,
     gm.KD = attrs.kernel_size[0];
     gm.KH = attrs.kernel_size[1];
     gm.KW = attrs.kernel_size[2];
-    gm.G  = attrs.groups;
+    gm.G = attrs.groups;
     gm.OC = gm.OC_per_G * gm.G;
     gm.IC_per_G = gm.IC / gm.G;
     gm.OD = output.shape(2);
@@ -438,4 +462,4 @@ Status transpose_conv3d_cpu(const TransposeConv3DAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

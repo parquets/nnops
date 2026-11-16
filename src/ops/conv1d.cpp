@@ -20,15 +20,13 @@ NNOPS_DECLARE_CPU(Conv1DAttributes, conv1d_cpu)
 
 NNOPS_OP_BOILERPLATE(Conv1D, Conv1DAttributes, backend::cpu::conv1d_cpu, nullptr, nullptr)
 
-std::vector<TensorDesc> Conv1D::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Conv1D::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     // HWIO's last axis is OC, so the channel count is the weight's last dim.
-    const bool wt_hwio = inputs.size() > 1 &&
-        is_channel_last_weight(inputs[1].layout);
-    std::vector<TensorDesc> outs = conv1d_output_shape(
-        attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
-        static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs, wt_hwio);
+    const bool wt_hwio = inputs.size() > 1 && is_channel_last_weight(inputs[1].layout);
+    std::vector<TensorDesc> outs =
+        conv1d_output_shape(attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
+                            static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs, wt_hwio);
 
     // The quantized route writes s8/u8 when output_dtype says so, else the fp
     // activation's dtype (output_dtype for a pre-quantized one).
@@ -66,22 +64,20 @@ Status Conv1D::validate(std::span<const TensorDesc> inputs,
 
     // A raw filter only: the packed and Winograd forms describe a 2D kernel.
     const TensorLayout wl = inputs[1].layout;
-    NNOPS_TRY(detail::require(is_channel_first_spatial(wl) ||
-                              is_channel_last_weight(wl)));
-    return detail::require(is_channel_last(inputs[0].layout) ==
-                           is_channel_last_weight(wl));
+    NNOPS_TRY(detail::require(is_channel_first_spatial(wl) || is_channel_last_weight(wl)));
+    return detail::require(is_channel_last(inputs[0].layout) == is_channel_last_weight(wl));
 }
 
-Status Conv1D::compute(std::span<TensorView> outputs,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace)
+Status Conv1D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                       const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
 
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

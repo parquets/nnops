@@ -10,8 +10,8 @@
 /// scratch layouts and the numeric-ordering rules.
 
 #include "conv2d_winograd.h"
-#include "backend/cpu/matmul/matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs
-#include "backend/cpu/simd_kernel/simd_winograd.hpp"    // the F(2,3) and F(4,3) transforms
+#include "backend/cpu/matmul/matmul_helper.h"        // tile_mma_direct / tile_pack_rhs
+#include "backend/cpu/simd_kernel/simd_winograd.hpp" // the F(2,3) and F(4,3) transforms
 #include "backend/cpu/common/memory_pool.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
@@ -25,8 +25,8 @@ namespace nnops::backend::cpu {
 
 namespace k = nnops::kernel;
 
-constexpr int kWinoAlpha = 4; // the 4×4 transform domain (F(2,3): 2×2 output)
-constexpr int kWinoPos = kWinoAlpha * kWinoAlpha;  // 16 batched GEMMs
+constexpr int kWinoAlpha = 4;                     // the 4×4 transform domain (F(2,3): 2×2 output)
+constexpr int kWinoPos = kWinoAlpha * kWinoAlpha; // 16 batched GEMMs
 
 // =========================================================================
 //  Channel-first route (channel-first)
@@ -40,19 +40,30 @@ using namespace nnops::simd;
 /// dst[0..n_cols) = src_row[0 .. valid_end−valid_beg) placed at dst[valid_beg],
 /// zero outside that span; @p src_row points at the element for dst[valid_beg].
 template <class T>
-inline void halo_row(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src_row,
-                     int n_cols, int valid_beg, int valid_end) noexcept {
+inline void halo_row(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src_row, int n_cols,
+                     int valid_beg, int valid_end) noexcept
+{
     constexpr int L = simd_lane_for<T>;
     int i = 0;
-    for (; i + L <= valid_beg; i += L) { v_store(dst + i, v_zero(dst + i)); }
-    for (; i < valid_beg; ++i) { s_store(dst + i, 0.0f); }
+    for (; i + L <= valid_beg; i += L) {
+        v_store(dst + i, v_zero(dst + i));
+    }
+    for (; i < valid_beg; ++i) {
+        s_store(dst + i, 0.0f);
+    }
 
     const int len = valid_end - valid_beg;
     int j = 0;
-    for (; j + L <= len; j += L) { v_store(dst + valid_beg + j, v_load(src_row + j)); }
-    for (; j < len; ++j) { s_store(dst + valid_beg + j, s_load(src_row + j)); }
+    for (; j + L <= len; j += L) {
+        v_store(dst + valid_beg + j, v_load(src_row + j));
+    }
+    for (; j < len; ++j) {
+        s_store(dst + valid_beg + j, s_load(src_row + j));
+    }
 
-    for (int t = valid_end; t < n_cols; ++t) { s_store(dst + t, 0.0f); }
+    for (int t = valid_end; t < n_cols; ++t) {
+        s_store(dst + t, 0.0f);
+    }
 }
 
 /// One input channel's padded-halo *strip*: row r is padded row (row0 + r) and
@@ -60,11 +71,10 @@ inline void halo_row(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src_row,
 /// outside, at row stride @p ld. Coordinates are in the global padded grid, so a
 /// task builds only the rows and columns its tiles read and indexes them locally.
 template <class T>
-void build_halo_strip(T* NNOPS_RESTRICT dst, int ld,
-                      const T* NNOPS_RESTRICT in, int in_ld,
-                      int in_h, int in_w,
-                      int row0, int col0, int rows, int n_cols,
-                      int PH, int PW) noexcept {
+void build_halo_strip(T* NNOPS_RESTRICT dst, int ld, const T* NNOPS_RESTRICT in, int in_ld,
+                      int in_h, int in_w, int row0, int col0, int rows, int n_cols, int PH,
+                      int PW) noexcept
+{
     // Padded column c is inside the input iff PW <= c < PW + in_w.
     const int valid_beg = std::max(col0, PW) - col0;
     const int valid_end = std::min(col0 + n_cols, PW + in_w) - col0;
@@ -72,11 +82,12 @@ void build_halo_strip(T* NNOPS_RESTRICT dst, int ld,
         T* d = dst + static_cast<ptrdiff_t>(r) * ld;
         const int src_h = row0 + r - PH;
         if (src_h < 0 || src_h >= in_h || valid_beg >= valid_end) {
-            for (int t = 0; t < n_cols; ++t) { s_store(d + t, 0.0f); }
+            for (int t = 0; t < n_cols; ++t) {
+                s_store(d + t, 0.0f);
+            }
             continue;
         }
-        const T* src_row = in + static_cast<ptrdiff_t>(src_h) * in_ld
-                             + (col0 + valid_beg - PW);
+        const T* src_row = in + static_cast<ptrdiff_t>(src_h) * in_ld + (col0 + valid_beg - PW);
         halo_row<T>(d, src_row, n_cols, valid_beg, valid_end);
     }
 }
@@ -84,29 +95,26 @@ void build_halo_strip(T* NNOPS_RESTRICT dst, int ld,
 // ---- main kernel ----------------------------------------------------------
 
 template <class T, WinoOrder O>
-void conv2d_winograd_impl(const Conv2DAttributes& attrs,
-                          TensorView& output,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx,
-                          const Conv2DWinogradPlan& plan,
-                          void* workspace)
+void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
+                          std::span<const TensorView> inputs, const ComputeContext& ctx,
+                          const Conv2DWinogradPlan& plan, void* workspace)
 {
-    constexpr int64_t kpos  = wino_pos(O);
+    constexpr int64_t kpos = wino_pos(O);
     constexpr int64_t ktile = wino_tile(O);
-    constexpr int64_t kalpha = wino_alpha(O);  // the window: one tile plus the taps
+    constexpr int64_t kalpha = wino_alpha(O); // the window: one tile plus the taps
 
     const auto& input = inputs[0];
-    const auto& u_tensor = inputs[1];  // prepacked transform-domain weight
+    const auto& u_tensor = inputs[1]; // prepacked transform-domain weight
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t N  = input.shape(0);
+    const int64_t N = input.shape(0);
     const int64_t IC = input.shape(1);
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
     const int64_t in_row_stride = input.row_stride_elems();
 
     // U: [pos, OC, IC/G] — OC is the *total* output-channel count.
-    const int64_t OC  = u_tensor.shape(1);
+    const int64_t OC = u_tensor.shape(1);
     const int64_t ICG = u_tensor.shape(2);
     const int64_t u_pitch = u_tensor.row_stride_elems();
     NNOPS_ASSERT(u_pitch == ICG);
@@ -123,40 +131,40 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
     const int64_t PH = attrs.padding[0];
     const int64_t PW = attrs.padding[1];
 
-    const int64_t TH      = plan.num_tile_rows;
-    const int64_t TW_pad  = plan.num_tile_cols_pad;
+    const int64_t TH = plan.num_tile_rows;
+    const int64_t TW_pad = plan.num_tile_cols_pad;
 
-    const int64_t icn_block  = plan.icn_block;
-    const int64_t ocn_block  = plan.ocn_block;
+    const int64_t icn_block = plan.icn_block;
+    const int64_t ocn_block = plan.ocn_block;
     const int64_t tile_block = plan.tile_block;
     const int64_t num_tile_blocks = plan.num_tile_blocks;
-    const int64_t oc_chunks       = plan.oc_chunks;
+    const int64_t oc_chunks = plan.oc_chunks;
 
     T* out_ptr = output.ptr<T>();
     const T* in_ptr = input.ptr<T>();
-    const T* u_ptr  = u_tensor.ptr<T>();
-    const T* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const T* u_ptr = u_tensor.ptr<T>();
+    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
 
     // Element strides.
     const int64_t icn_step = IH * in_row_stride;
-    const int64_t ib_step  = IC * icn_step;
-    const int64_t ig_step  = ic_per_group * icn_step;
+    const int64_t ib_step = IC * icn_step;
+    const int64_t ig_step = ic_per_group * icn_step;
     const int64_t ocn_step = OH * out_row_stride;
-    const int64_t ob_step  = OC * ocn_step;
-    const int64_t og_step  = oc_per_group * ocn_step;
+    const int64_t ob_step = OC * ocn_step;
+    const int64_t og_step = oc_per_group * ocn_step;
 
     const int64_t u_plane_step = OC * u_pitch;
 
     T* slot_base = static_cast<T*>(workspace);
 
     constexpr int nr_max = nr_max_flt<T>();
-    constexpr int esz    = static_cast<int>(sizeof(T));
+    constexpr int esz = static_cast<int>(sizeof(T));
 
     // One slot's scratch: [halo strip][V][M][packed-B], the whole chain a task
     // needs, so no two tasks share scratch and no ordering is required.
-    const int64_t halo_ld = plan.halo_ld;              // tile·tile_block + slack
-    const int64_t halo_ch = plan.halo_rows * halo_ld;  // one channel's strip
-    const int64_t v_p_step = plan.v_p_stride;          // one V position's plane
+    const int64_t halo_ld = plan.halo_ld;             // tile·tile_block + slack
+    const int64_t halo_ch = plan.halo_rows * halo_ld; // one channel's strip
+    const int64_t v_p_step = plan.v_p_stride;         // one V position's plane
 
     const int64_t num_tasks = plan.num_tasks;
     const int nslots = ctx.cpu.thread_slot_count();
@@ -166,27 +174,31 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
     // the halo strip its tiles read, transform it, run the pos GEMMs for its own
     // slice of the filter, and write those tiles back. Rows, blocks and oc
     // ranges are disjoint, so the whole convolution is one dispatch.
-    const int64_t row_group = plan.tile_rows;          // tile rows one task spans
-    const int64_t th_tasks  = (TH + row_group - 1) / row_group;
+    const int64_t row_group = plan.tile_rows; // tile rows one task spans
+    const int64_t th_tasks = (TH + row_group - 1) / row_group;
     const auto run_task = [&](int64_t t) {
         int64_t idx = t;
         // The oc-chunk varies fastest so the chunks of one plane are adjacent in
         // task order: they rebuild the same halo strip, and whichever arrives
         // second finds those input lines in L2. Ordering them apart would turn a
         // shared read into n_planes reads.
-        const int64_t oc_chunk = idx % oc_chunks; idx /= oc_chunks;
-        const int64_t tb = idx % num_tile_blocks; idx /= num_tile_blocks;
-        const int64_t thg = idx % th_tasks;       idx /= th_tasks;
-        const int64_t g  = idx % G;               idx /= G;
-        const int64_t n  = idx;
+        const int64_t oc_chunk = idx % oc_chunks;
+        idx /= oc_chunks;
+        const int64_t tb = idx % num_tile_blocks;
+        idx /= num_tile_blocks;
+        const int64_t thg = idx % th_tasks;
+        idx /= th_tasks;
+        const int64_t g = idx % G;
+        idx /= G;
+        const int64_t n = idx;
 
         const int64_t th0 = thg * row_group;
         const int64_t tw0 = tb * tile_block;
         // A task's live tiles: its tile-row group's columns, or one block of
         // columns when it owns a single row.
         const int64_t rows_here = std::min(row_group, TH - th0);
-        const int64_t nc = (row_group > 1) ? rows_here * TW_pad
-                                           : std::min(tile_block, TW_pad - tw0);
+        const int64_t nc =
+            (row_group > 1) ? rows_here * TW_pad : std::min(tile_block, TW_pad - tw0);
 
         // This task's filter rows, also disjoint, split evenly by row count
         // rather than by oc block: the slowest task sets the barrier, and a block
@@ -194,14 +206,13 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
         const int64_t oc_lo = oc_chunk * oc_per_group / oc_chunks;
         const int64_t oc_hi = (oc_chunk + 1) * oc_per_group / oc_chunks;
 
-        const int64_t slot = per_thread
-            ? static_cast<int64_t>(ctx.cpu.current_thread_id())
-            : std::min(t, plan.num_slots - 1);
+        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) :
+                                          std::min(t, plan.num_slots - 1);
         T* scratch = slot_base + slot * plan.slot_size;
-        T* halo    = scratch;
-        T* v_all   = halo + plan.halo_size;
-        T* m_all_  = v_all + plan.v_size;
-        T* pack_b  = m_all_ + plan.m_size;
+        T* halo = scratch;
+        T* v_all = halo + plan.halo_size;
+        T* m_all_ = v_all + plan.v_size;
+        T* pack_b = m_all_ + plan.m_size;
 
         // Halo strip: the window rows this task's tile rows read, halo_ld
         // columns from the block's first tile. Neighbouring blocks repeat the
@@ -211,10 +222,8 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
             build_halo_strip<T>(halo + ic * halo_ch, static_cast<int>(halo_ld),
                                 task_in + ic * icn_step, static_cast<int>(in_row_stride),
                                 static_cast<int>(IH), static_cast<int>(IW),
-                                static_cast<int>(ktile * th0),
-                                static_cast<int>(ktile * tw0),
-                                static_cast<int>(plan.halo_rows),
-                                static_cast<int>(halo_ld),
+                                static_cast<int>(ktile * th0), static_cast<int>(ktile * tw0),
+                                static_cast<int>(plan.halo_rows), static_cast<int>(halo_ld),
                                 static_cast<int>(PH), static_cast<int>(PW));
         }
 
@@ -253,8 +262,8 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
             for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
                 const int64_t icnc = std::min(icn_block, ic_per_group - icn);
                 for (int p = 0; p < kpos; ++p) {
-                    const T* a = u_ptr + p * u_plane_step
-                                      + (g * oc_per_group + ocn0) * u_pitch + icn;
+                    const T* a =
+                        u_ptr + p * u_plane_step + (g * oc_per_group + ocn0) * u_pitch + icn;
                     const T* b = v_all + p * v_p_step + icn * tile_block;
                     T* c = m_all_ + p * (ocn_block * tile_block);
 
@@ -263,15 +272,13 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
                     // costs 1/ocnc of the GEMM's MACs.
                     const int ldd_b = static_cast<int>(
                         mma_pack_align(nr_max * static_cast<int>(icnc) * esz) / esz);
-                    tile_pack_rhs(false, static_cast<int>(nc), static_cast<int>(icnc),
-                                  pack_b, ldd_b, b, static_cast<int>(tile_block), 1.0f);
+                    tile_pack_rhs(false, static_cast<int>(nc), static_cast<int>(icnc), pack_b,
+                                  ldd_b, b, static_cast<int>(tile_block), 1.0f);
 
                     tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(nc),
-                                    static_cast<int>(icnc),
-                                    c, static_cast<int>(tile_block),
-                                    a, static_cast<int>(u_pitch),
-                                    pack_b, /*ldb=*/-1, /*stage=*/nullptr,
-                                    -std::numeric_limits<float>::infinity(),
+                                    static_cast<int>(icnc), c, static_cast<int>(tile_block), a,
+                                    static_cast<int>(u_pitch), pack_b, /*ldb=*/-1,
+                                    /*stage=*/nullptr, -std::numeric_limits<float>::infinity(),
                                     std::numeric_limits<float>::infinity(),
                                     /*zero_mode=*/icn == 0);
                 }
@@ -285,9 +292,10 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
                 const float bias_oc = b_ptr ? s_load(b_ptr + g * oc_per_group + ocn0 + oc) : 0.0f;
                 for (int64_t r = 0; r < rows_here; ++r) {
                     const int64_t oh0 = ktile * (th0 + r);
-                    if (oh0 >= OH) { break; }
-                    const int rows_ok =
-                        static_cast<int>(std::min<int64_t>(ktile, OH - oh0));
+                    if (oh0 >= OH) {
+                        break;
+                    }
+                    const int rows_ok = static_cast<int>(std::min<int64_t>(ktile, OH - oh0));
                     T* row0 = out_base + (ocn0 + oc) * ocn_step + oh0 * out_row_stride;
                     for (int64_t tl = 0; tl < nc; tl += 8) {
                         // ow0 is an absolute output column while the rows point
@@ -301,10 +309,9 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
                             T* row1 = row1_ok ? row0 + out_row_stride : row0;
                             k::winograd_output_tile8<T>(
                                 m_all_, static_cast<int>(ocn_block * tile_block),
-                                static_cast<int>(tile_block), static_cast<int>(oc),
-                                t0, row0, row1, ow0, static_cast<int>(OW), row1_ok,
-                                attrs.epilogue, bias_oc, attrs.add_to,
-                                attrs.residual_pre_activation);
+                                static_cast<int>(tile_block), static_cast<int>(oc), t0, row0, row1,
+                                ow0, static_cast<int>(OW), row1_ok, attrs.epilogue, bias_oc,
+                                attrs.add_to, attrs.residual_pre_activation);
                         } else {
                             T* rows[4];
                             for (int rr = 0; rr < 4; ++rr) {
@@ -312,10 +319,9 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
                             }
                             k::winograd43_output_tile8<T>(
                                 m_all_, static_cast<int>(ocn_block * tile_block),
-                                static_cast<int>(tile_block), static_cast<int>(oc),
-                                t0, rows, ow0, static_cast<int>(OW), rows_ok,
-                                attrs.epilogue, bias_oc, attrs.add_to,
-                                attrs.residual_pre_activation);
+                                static_cast<int>(tile_block), static_cast<int>(oc), t0, rows, ow0,
+                                static_cast<int>(OW), rows_ok, attrs.epilogue, bias_oc,
+                                attrs.add_to, attrs.residual_pre_activation);
                         }
                     }
                 }
@@ -326,54 +332,75 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
     ctx.cpu.run(0, num_tasks, run_task);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 /// Resolve the channel-first route: U is [pos][OC][IC/G] and the activation
 /// is channel-first.
-Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
-                             std::span<const TensorDesc> inputs,
-                             std::span<const TensorDesc> outputs,
-                             int num_threads,
-                             bool use_thread_slots,
-                             int64_t num_slots)
+Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDesc> inputs,
+                             std::span<const TensorDesc> outputs, int num_threads,
+                             bool use_thread_slots, int64_t num_slots)
 {
     Conv2DWinogradPlan plan;
     plan.route = Conv2DWinogradRoute::ChannelFirst;
-    if (inputs.size() < 2 || outputs.empty()) { return plan; }
+    if (inputs.size() < 2 || outputs.empty()) {
+        return plan;
+    }
 
-    const auto& in  = inputs[0];
-    const auto& u   = inputs[1];
+    const auto& in = inputs[0];
+    const auto& u = inputs[1];
     const auto& out = outputs[0];
 
     const DataType dt = in.dtype;
-    if (dt != DataType::f32 && dt != DataType::f16) { return plan; }
-    if (u.dtype != dt || out.dtype != dt) { return plan; }
-    if (inputs.size() > 2 && inputs[2].dtype != dt) { return plan; }
+    if (dt != DataType::f32 && dt != DataType::f16) {
+        return plan;
+    }
+    if (u.dtype != dt || out.dtype != dt) {
+        return plan;
+    }
+    if (inputs.size() > 2 && inputs[2].dtype != dt) {
+        return plan;
+    }
 
     // k3s1 only — both derivations assume a 3×3, unit-stride, undilated kernel.
-    if (attrs.kernel_size[0] != 3 || attrs.kernel_size[1] != 3) { return plan; }
-    if (attrs.stride[0] != 1 || attrs.stride[1] != 1) { return plan; }
-    if (attrs.dilation[0] != 1 || attrs.dilation[1] != 1) { return plan; }
-    if (in.rank != 4 || out.rank != 4 || u.rank != 3) { return plan; }
+    if (attrs.kernel_size[0] != 3 || attrs.kernel_size[1] != 3) {
+        return plan;
+    }
+    if (attrs.stride[0] != 1 || attrs.stride[1] != 1) {
+        return plan;
+    }
+    if (attrs.dilation[0] != 1 || attrs.dilation[1] != 1) {
+        return plan;
+    }
+    if (in.rank != 4 || out.rank != 4 || u.rank != 3) {
+        return plan;
+    }
 
     // The transform order is the U's leading dimension, as on the channel-last
     // route: 16 positions is F(2,3), 36 is F(4,3).
-    const WinoOrder order = (u.dims[0] == wino_pos(WinoOrder::F43)) ? WinoOrder::F43
-                                                                   : WinoOrder::F23;
+    const WinoOrder order =
+        (u.dims[0] == wino_pos(WinoOrder::F43)) ? WinoOrder::F43 : WinoOrder::F23;
     const int64_t ktile = wino_tile(order);
-    if (u.dims[0] != wino_pos(order)) { return plan; }
+    if (u.dims[0] != wino_pos(order)) {
+        return plan;
+    }
     plan.order = order;
 
     const int64_t IC = in.dims[1];
     const int64_t OC = u.dims[1];
     const int64_t ICG = u.dims[2];
     const int64_t G = attrs.groups;
-    if (G < 1 || IC % G != 0 || OC % G != 0) { return plan; }
-    if (ICG != IC / G) { return plan; }
+    if (G < 1 || IC % G != 0 || OC % G != 0) {
+        return plan;
+    }
+    if (ICG != IC / G) {
+        return plan;
+    }
 
     const int64_t OH = out.dims[2];
     const int64_t OW = out.dims[3];
-    if (OH <= 0 || OW <= 0) { return plan; }
+    if (OH <= 0 || OW <= 0) {
+        return plan;
+    }
 
     const int64_t TH = (OH + ktile - 1) / ktile;
     const int64_t TW = (OW + ktile - 1) / ktile;
@@ -381,17 +408,17 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
 
     const int64_t oc_per_group = OC / G;
 
-    plan.num_tile_rows     = TH;
-    plan.num_tile_cols     = TW;
+    plan.num_tile_rows = TH;
+    plan.num_tile_cols = TW;
     plan.num_tile_cols_pad = TW_pad;
-    plan.num_tiles         = TH * TW_pad;
+    plan.num_tiles = TH * TW_pad;
 
     // K caps at 128 (the f16 accumulate budget, and applied to both dtypes), M at
     // 64 rows so a slot's M stays small; the tile block is 8 or 16 tiles — one or
     // two 8-wide vector groups — balancing task count against the V/M footprint
     // a task carries.
-    plan.icn_block  = std::min<int64_t>(ICG, 128);
-    plan.ocn_block  = std::min<int64_t>(64, oc_per_group);
+    plan.icn_block = std::min<int64_t>(ICG, 128);
+    plan.ocn_block = std::min<int64_t>(64, oc_per_group);
 
     // A task's N side is its tile count, and the MMA runs it in nr_max-wide
     // panels, so N is billed at the next panel boundary: seven tiles a row (a
@@ -423,9 +450,8 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     } else {
         plan.tile_block = std::clamp<int64_t>(TW_pad, 8, 16);
     }
-    plan.num_tile_blocks = (plan.tile_rows > 1)
-        ? 1
-        : (TW_pad + plan.tile_block - 1) / plan.tile_block;
+    plan.num_tile_blocks =
+        (plan.tile_rows > 1) ? 1 : (TW_pad + plan.tile_block - 1) / plan.tile_block;
 
     // One task per (batch, group, tile-row group, tile block): those axes sit in
     // the grid rather than in a serial loop, so N·G also helps fill the pool.
@@ -463,17 +489,17 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
         const int64_t want = (nt + plane_tasks / 2) / plane_tasks;
         plan.oc_chunks = std::clamp<int64_t>(want, 1, max_chunks);
     }
-    plan.num_tasks  = plane_tasks * plan.oc_chunks;
+    plan.num_tasks = plane_tasks * plan.oc_chunks;
     // Padded columns per strip. A group transform reads one 16-wide vector past
     // its last tile — 2 columns on F(2,3) (a deinterleave), 4 on F(4,3) plus the
     // slack the double deinterleave needs. The tail group of a block smaller
     // than its own tile count reads past the strip into the next channel's, and
     // no write-back reaches those tiles (ow_end masks them).
-    plan.halo_ld    = ktile * (plan.tile_rows > 1 ? TW_pad : plan.tile_block)
-                    + (order == WinoOrder::F43 ? 8 : 2);
+    plan.halo_ld =
+        ktile * (plan.tile_rows > 1 ? TW_pad : plan.tile_block) + (order == WinoOrder::F43 ? 8 : 2);
     // The window rows of a task: one tile row's window, plus a tile row per
     // extra row the task spans (each shares the two overlapping window rows).
-    plan.halo_rows  = (plan.tile_rows - 1) * ktile + wino_alpha(order);
+    plan.halo_rows = (plan.tile_rows - 1) * ktile + wino_alpha(order);
 
     plan.halo_size = ICG * plan.halo_rows * plan.halo_ld;
     // One extra vector of slack per transform position: the positions are
@@ -482,13 +508,13 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     // 1x64x56x56 f32 (interleaved A/B): 1.50 -> 1.32 ms at 1 thread, 0.50 ->
     // 0.47 at 4; f16 loses about a point at 1 thread, so the slack still pays.
     plan.v_p_stride = ICG * plan.tile_block + 8;
-    plan.v_size     = wino_pos(order) * plan.v_p_stride;
-    plan.m_size     = wino_pos(order) * plan.ocn_block * plan.tile_block;
+    plan.v_size = wino_pos(order) * plan.v_p_stride;
+    plan.m_size = wino_pos(order) * plan.ocn_block * plan.tile_block;
 
     // Uniform packed-B scratch: one V slice [icn_block][tile_block] per slot.
-    const int64_t esz    = static_cast<int64_t>(data_type_size(dt));
-    const int64_t ldd_b_max = mma_pack_align(
-        static_cast<size_t>(nr_max * plan.icn_block * esz)) / esz;
+    const int64_t esz = static_cast<int64_t>(data_type_size(dt));
+    const int64_t ldd_b_max =
+        mma_pack_align(static_cast<size_t>(nr_max * plan.icn_block * esz)) / esz;
     plan.b_size = ((plan.tile_block + nr_max - 1) / nr_max) * ldd_b_max;
 
     plan.slot_size = plan.halo_size + plan.v_size + plan.m_size + plan.b_size;
@@ -498,23 +524,20 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     // *workers*, not the reported thread count, so an over-subscribed grid (more
     // tasks than workers) does not multiply the arena.
     const int64_t avail = (num_slots > 0) ? num_slots : nt;
-    plan.num_slots = (use_thread_slots && avail < plan.num_tasks) ? avail
-                                                                  : plan.num_tasks;
+    plan.num_slots = (use_thread_slots && avail < plan.num_tasks) ? avail : plan.num_tasks;
 
-    plan.workspace_size = static_cast<size_t>(plan.num_slots * plan.slot_size)
-                        * data_type_size(dt);
+    plan.workspace_size = static_cast<size_t>(plan.num_slots * plan.slot_size) * data_type_size(dt);
     return plan;
 }
 
-}  // namespace channel_first
+} // namespace channel_first
 
 // =========================================================================
 //  Channel-last route (channel-last)
 // =========================================================================
 
-WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_group,
-                          int64_t out_h, int64_t out_w, bool channel_last,
-                          int num_threads) noexcept
+WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_group, int64_t out_h,
+                          int64_t out_w, bool channel_last, int num_threads) noexcept
 {
     // f16 stays on F(2,3) on both routes: Bᵀ scales a window by up to 5 and Aᵀ
     // the products by 8, so the V and M rounds cost three bits on top of an f16
@@ -523,7 +546,9 @@ WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_grou
     // a 32-channel case where the f16 contract holds 0.05 — the speed is there
     // and the accuracy is not.
     // A caller who wants it anyway pins winograd_order = 4.
-    if (dt != DataType::f32) { return WinoOrder::F23; }
+    if (dt != DataType::f32) {
+        return WinoOrder::F23;
+    }
 
     // The U is streamed on every call, and F(4,3)'s is 2.25x the blob — 36
     // transform positions against 16 for the same filter. Past a 32 MB-class L3
@@ -560,37 +585,47 @@ WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_grou
     // 28x28 — and the oc-chunk axis that makes up the difference rebuilds that
     // strip per chunk: 28x28 drifts to 1.04x at six threads and 5.1x at 20, so
     // the floor climbs with the team rather than sitting at the widest case.
-    if (ic_per_group < 64) { return WinoOrder::F23; }
+    if (ic_per_group < 64) {
+        return WinoOrder::F23;
+    }
     const int64_t floor = num_threads <= 4 ? 28 : num_threads <= 8 ? 56 : 112;
-    if (out_h < floor || out_w < floor) { return WinoOrder::F23; }
+    if (out_h < floor || out_w < floor) {
+        return WinoOrder::F23;
+    }
     return WinoOrder::F43;
 }
 
-WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group,
-                                     int64_t groups, DataType dt,
-                                     WinoOrder order) noexcept {
+WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
+                                     DataType dt, WinoOrder order) noexcept
+{
     WinoChannelLastU u;
-    if (ic_per_group <= 0 || oc_per_group <= 0 || groups <= 0) { return u; }
-    if (dt != DataType::f32 && dt != DataType::f16) { return u; }
+    if (ic_per_group <= 0 || oc_per_group <= 0 || groups <= 0) {
+        return u;
+    }
+    if (dt != DataType::f32 && dt != DataType::f16) {
+        return u;
+    }
     u.order = order;
-    u.pos   = wino_pos(order);
+    u.pos = wino_pos(order);
 
     const int64_t esz = static_cast<int64_t>(data_type_size(dt));
     // The MMA's panel width, and the k-block length it will be given. kc divides
     // IC/G exactly, so the panels need no zero-padded k tail; the ceiling is the
     // same f16 accumulate budget MatMul uses (KC_CAP_F16), with f32 allowed to
     // run twice as wide because its accumulator is exact enough for it.
-    const int64_t nr  = (dt == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32;
+    const int64_t nr = (dt == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32;
     const int64_t cap = (dt == DataType::f16) ? 128 : 256;
     int64_t kc = std::min(ic_per_group, cap);
-    while (ic_per_group % kc != 0) { --kc; }
+    while (ic_per_group % kc != 0) {
+        --kc;
+    }
 
-    u.nr    = nr;
-    u.kc    = kc;
-    u.nb    = ic_per_group / kc;
-    u.jb    = (oc_per_group + nr - 1) / nr;
-    u.jbg   = groups * u.jb;
-    u.ldd   = static_cast<int64_t>(
+    u.nr = nr;
+    u.kc = kc;
+    u.nb = ic_per_group / kc;
+    u.jb = (oc_per_group + nr - 1) / nr;
+    u.jbg = groups * u.jb;
+    u.ldd = static_cast<int64_t>(
         mma_pack_align(static_cast<size_t>(nr * kc) * static_cast<size_t>(esz)) / esz);
     u.plane = u.nb * u.jbg * u.ldd;
     u.total = u.pos * u.plane;
@@ -604,9 +639,7 @@ using namespace nnops::simd;
 
 /// Blocks stop shrinking here: below it a task re-reads its whole U slice
 /// (pos·kc·oc) for too few tiles of MACs, and the per-task transform cost shows.
-constexpr int64_t kTileBlockMin(WinoOrder o) noexcept {
-    return o == WinoOrder::F43 ? 6 : 8;
-}
+constexpr int64_t kTileBlockMin(WinoOrder o) noexcept { return o == WinoOrder::F43 ? 6 : 8; }
 /// Output channels per GEMM (the N side), snapped down to whole panels — the
 /// same trade as the channel-first M block: each extra oc block is another pass over
 /// the task's tiles (accumulator traffic plus one more B read).
@@ -617,17 +650,15 @@ constexpr int64_t kOcnBlock = 64;
 /// count, the tile size and the two transforms' shapes — everything else about
 /// the task is order-independent.
 template <class T, WinoOrder O>
-void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
-                               TensorView& output,
-                               std::span<const TensorView> inputs,
-                               const ComputeContext& ctx,
-                               const Conv2DWinogradPlan& plan,
-                               void* workspace)
+void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
+                                       std::span<const TensorView> inputs,
+                                       const ComputeContext& ctx, const Conv2DWinogradPlan& plan,
+                                       void* workspace)
 {
-    constexpr int64_t kpos  = wino_pos(O);
+    constexpr int64_t kpos = wino_pos(O);
     constexpr int64_t ktile = wino_tile(O);
     const auto& input = inputs[0];
-    const auto& u_tensor = inputs[1];  // prepacked transform-domain weight
+    const auto& u_tensor = inputs[1]; // prepacked transform-domain weight
     const bool has_bias = inputs.size() > 2;
 
     // Logical [N, C, H, W]; channel-last stores [N][H][W][C], so a "row" is one spatial
@@ -642,7 +673,7 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
     const int64_t OW = output.shape(3);
     const int64_t out_row = output.row_stride_elems();
 
-    const int64_t G  = attrs.groups;
+    const int64_t G = attrs.groups;
     const int64_t ic_per_group = IC / G;
     const int64_t oc_per_group = OC / G;
     const int64_t PH = attrs.padding[0];
@@ -669,8 +700,8 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
 
     T* out_ptr = output.ptr<T>();
     const T* in_ptr = input.ptr<T>();
-    const T* u_ptr  = u_tensor.ptr<T>();
-    const T* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const T* u_ptr = u_tensor.ptr<T>();
+    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
 
     const int64_t ib_step = IH * in_row;
     const int64_t ob_step = OH * out_row;
@@ -689,22 +720,24 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
         // The oc chunk varies fastest, as in the channel-first route: the chunks of one
         // plane are adjacent in task order and re-read the same input lines, so
         // whichever arrives second finds them in L2.
-        const int64_t chunk = idx % oc_chunks; idx /= oc_chunks;
-        const int64_t tb = idx % num_tile_blocks; idx /= num_tile_blocks;
-        const int64_t g  = idx % G;               idx /= G;
-        const int64_t n  = idx;
+        const int64_t chunk = idx % oc_chunks;
+        idx /= oc_chunks;
+        const int64_t tb = idx % num_tile_blocks;
+        idx /= num_tile_blocks;
+        const int64_t g = idx % G;
+        idx /= G;
+        const int64_t n = idx;
 
         const int64_t tile0 = tb * tile_block;
         const int64_t ntl = std::min(tile_block, tiles - tile0);
 
-        const int64_t slot = per_thread
-            ? static_cast<int64_t>(ctx.cpu.current_thread_id())
-            : std::min(t, plan.num_slots - 1);
+        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) :
+                                          std::min(t, plan.num_slots - 1);
         T* scratch = static_cast<T*>(workspace) + slot * plan.slot_size;
         T* v_all = scratch;
         T* m_all = v_all + plan.v_size;
 
-        const T* task_in  = in_ptr + n * ib_step + g * ic_per_group;
+        const T* task_in = in_ptr + n * ib_step + g * ic_per_group;
         T* task_out = out_ptr + n * ob_step + g * oc_per_group;
 
         // Input transform, tile by tile: the tile's window is swept across the
@@ -721,15 +754,13 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
                 // channel and the activation's channel lane.
                 T* v_tile = v_all + tl * v_lda + ic;
                 if constexpr (O == WinoOrder::F23) {
-                    k::winograd_input_channel_last<T>(task_in + ic, in_row, IC,
-                                              static_cast<int>(ih0), static_cast<int>(iw0),
-                                              static_cast<int>(IH), static_cast<int>(IW),
-                                              v_tile, v_p_stride, lanes);
+                    k::winograd_input_channel_last<T>(
+                        task_in + ic, in_row, IC, static_cast<int>(ih0), static_cast<int>(iw0),
+                        static_cast<int>(IH), static_cast<int>(IW), v_tile, v_p_stride, lanes);
                 } else {
-                    k::winograd43_input_channel_last<T>(task_in + ic, in_row, IC,
-                                                static_cast<int>(ih0), static_cast<int>(iw0),
-                                                static_cast<int>(IH), static_cast<int>(IW),
-                                                v_tile, v_p_stride, lanes);
+                    k::winograd43_input_channel_last<T>(
+                        task_in + ic, in_row, IC, static_cast<int>(ih0), static_cast<int>(iw0),
+                        static_cast<int>(IH), static_cast<int>(IW), v_tile, v_p_stride, lanes);
                 }
             }
         }
@@ -751,12 +782,10 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
                 const T* a_base = v_all + kb * kc;
                 for (int p = 0; p < kpos; ++p) {
                     tile_mma_direct(static_cast<int>(ntl), static_cast<int>(ocnc),
-                                    static_cast<int>(kc),
-                                    m_all + p * m_p_stride,
-                                    static_cast<int>(m_oc_stride),
-                                    a_base + p * v_p_stride, static_cast<int>(v_lda),
-                                    b_base + p * ug.plane, /*ldb=*/-1, /*stage=*/nullptr,
-                                    -std::numeric_limits<float>::infinity(),
+                                    static_cast<int>(kc), m_all + p * m_p_stride,
+                                    static_cast<int>(m_oc_stride), a_base + p * v_p_stride,
+                                    static_cast<int>(v_lda), b_base + p * ug.plane, /*ldb=*/-1,
+                                    /*stage=*/nullptr, -std::numeric_limits<float>::infinity(),
                                     std::numeric_limits<float>::infinity(),
                                     /*zero_mode=*/kb == 0);
                 }
@@ -777,23 +806,20 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
                     T* dst[ktile][ktile];
                     for (int r = 0; r < ktile; ++r) {
                         for (int c = 0; c < ktile; ++c) {
-                            dst[r][c] = (oh + r < OH && ow + c < OW)
-                                      ? base + r * out_row + c * OC : nullptr;
+                            dst[r][c] = (oh + r < OH && ow + c < OW) ? base + r * out_row + c * OC :
+                                                                       nullptr;
                         }
                     }
-                    const T* bias_oc = b_ptr ? b_ptr + g * oc_per_group + ocn0 + oc
-                                             : nullptr;
+                    const T* bias_oc = b_ptr ? b_ptr + g * oc_per_group + ocn0 + oc : nullptr;
                     const T* m_tile = m_all + tl * m_oc_stride + oc;
                     if constexpr (O == WinoOrder::F23) {
-                        k::winograd_output_channel_last<T>(m_tile, m_p_stride, dst,
-                                                   attrs.epilogue, bias_oc,
-                                                   attrs.add_to, lanes,
-                                                   attrs.residual_pre_activation);
+                        k::winograd_output_channel_last<T>(m_tile, m_p_stride, dst, attrs.epilogue,
+                                                           bias_oc, attrs.add_to, lanes,
+                                                           attrs.residual_pre_activation);
                     } else {
                         k::winograd43_output_channel_last<T>(m_tile, m_p_stride, dst,
-                                                     attrs.epilogue, bias_oc,
-                                                     attrs.add_to, lanes,
-                                                     attrs.residual_pre_activation);
+                                                             attrs.epilogue, bias_oc, attrs.add_to,
+                                                             lanes, attrs.residual_pre_activation);
                     }
                 }
             }
@@ -805,83 +831,104 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
 
 /// Resolve the channel-last route: the activation is channel-last and U is prepacked as
 /// B panels (PackedWinoWeightLast).
-Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
-                             std::span<const TensorDesc> inputs,
-                             std::span<const TensorDesc> outputs,
-                             int num_threads,
-                             bool use_thread_slots,
-                             int64_t num_slots)
+Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDesc> inputs,
+                             std::span<const TensorDesc> outputs, int num_threads,
+                             bool use_thread_slots, int64_t num_slots)
 {
     Conv2DWinogradPlan plan;
     plan.route = Conv2DWinogradRoute::ChannelLast;
-    if (inputs.size() < 2 || outputs.empty()) { return plan; }
+    if (inputs.size() < 2 || outputs.empty()) {
+        return plan;
+    }
 
-    const auto& in  = inputs[0];
-    const auto& u   = inputs[1];
+    const auto& in = inputs[0];
+    const auto& u = inputs[1];
     const auto& out = outputs[0];
 
     const DataType dt = in.dtype;
-    if (dt != DataType::f32 && dt != DataType::f16) { return plan; }
-    if (u.dtype != dt || out.dtype != dt) { return plan; }
-    if (inputs.size() > 2 && inputs[2].dtype != dt) { return plan; }
+    if (dt != DataType::f32 && dt != DataType::f16) {
+        return plan;
+    }
+    if (u.dtype != dt || out.dtype != dt) {
+        return plan;
+    }
+    if (inputs.size() > 2 && inputs[2].dtype != dt) {
+        return plan;
+    }
 
     // k3s1 only — the F(2,3) derivation assumes a 3×3, unit-stride, undilated
     // kernel.
-    if (attrs.kernel_size[0] != 3 || attrs.kernel_size[1] != 3) { return plan; }
-    if (attrs.stride[0] != 1 || attrs.stride[1] != 1) { return plan; }
-    if (attrs.dilation[0] != 1 || attrs.dilation[1] != 1) { return plan; }
-    if (in.rank != 4 || out.rank != 4 || u.rank != 4) { return plan; }
-    if (!is_channel_last(in.layout) || !is_channel_last(out.layout)) { return plan; }
-    if (u.layout != TensorLayout::PackedWinoWeightLast) { return plan; }
+    if (attrs.kernel_size[0] != 3 || attrs.kernel_size[1] != 3) {
+        return plan;
+    }
+    if (attrs.stride[0] != 1 || attrs.stride[1] != 1) {
+        return plan;
+    }
+    if (attrs.dilation[0] != 1 || attrs.dilation[1] != 1) {
+        return plan;
+    }
+    if (in.rank != 4 || out.rank != 4 || u.rank != 4) {
+        return plan;
+    }
+    if (!is_channel_last(in.layout) || !is_channel_last(out.layout)) {
+        return plan;
+    }
+    if (u.layout != TensorLayout::PackedWinoWeightLast) {
+        return plan;
+    }
 
     const int64_t IC = in.dims[1];
     const int64_t OC = out.dims[1];
-    const int64_t G  = attrs.groups;
-    if (G < 1 || IC % G != 0 || OC % G != 0) { return plan; }
+    const int64_t G = attrs.groups;
+    if (G < 1 || IC % G != 0 || OC % G != 0) {
+        return plan;
+    }
     const int64_t ic_per_group = IC / G;
     const int64_t oc_per_group = OC / G;
 
     // The transform order is the blob's leading dimension: 16 positions is
     // F(2,3), 36 is F(4,3). Nothing else can tell them apart, and reading it off
     // the U is what lets the same Conv2D compute both.
-    const WinoOrder order = (u.dims[0] == wino_pos(WinoOrder::F43)) ? WinoOrder::F43
-                                                                   : WinoOrder::F23;
+    const WinoOrder order =
+        (u.dims[0] == wino_pos(WinoOrder::F43)) ? WinoOrder::F43 : WinoOrder::F23;
     // The panels' geometry is derived, not read: the same function ran at prepack
     // time, so matching it against the descriptor keeps the two ends from drifting.
-    const WinoChannelLastU ug = wino_channel_last_u(ic_per_group, oc_per_group, G, dt,
-                                                    order);
-    if (ug.total == 0 || u.dims[0] != ug.pos || u.dims[1] != ug.nb ||
-        u.dims[2] != ug.jbg || u.dims[3] != ug.ldd) { return plan; }
+    const WinoChannelLastU ug = wino_channel_last_u(ic_per_group, oc_per_group, G, dt, order);
+    if (ug.total == 0 || u.dims[0] != ug.pos || u.dims[1] != ug.nb || u.dims[2] != ug.jbg ||
+        u.dims[3] != ug.ldd) {
+        return plan;
+    }
     plan.u = ug;
     plan.order = order;
 
     const int64_t OH = out.dims[2];
     const int64_t OW = out.dims[3];
-    if (OH <= 0 || OW <= 0) { return plan; }
+    if (OH <= 0 || OW <= 0) {
+        return plan;
+    }
 
     const int64_t tile = wino_tile(order);
     const int64_t TH = (OH + tile - 1) / tile;
     const int64_t TW = (OW + tile - 1) / tile;
     const int64_t tiles = TH * TW;
 
-    plan.num_tile_rows     = TH;
-    plan.num_tile_cols     = TW;
-    plan.num_tile_cols_pad = tiles;   // the flattened tile count
-    plan.num_tiles         = tiles;
-    plan.icn_block         = ug.kc;
+    plan.num_tile_rows = TH;
+    plan.num_tile_cols = TW;
+    plan.num_tile_cols_pad = tiles; // the flattened tile count
+    plan.num_tiles = tiles;
+    plan.icn_block = ug.kc;
 
     // Whole panels: the U's oc axis is padded to them, and a GEMM's N start must
     // land on one so its B pointer is a panel boundary.
     const int64_t nr = ug.nr;
-    const int64_t ocn_raw = std::min<int64_t>(
-        kOcnBlock, ((oc_per_group + nr - 1) / nr) * nr);
+    const int64_t ocn_raw = std::min<int64_t>(kOcnBlock, ((oc_per_group + nr - 1) / nr) * nr);
     plan.ocn_block = std::max<int64_t>(nr, (ocn_raw / nr) * nr);
 
     // V: one [tile][ic] plane per position, tiles contiguous inside a position
     // (that is the GEMM's A, so lda is a tile row). The row is padded to the
     // vector width so a tail block can be written whole, and the +8 per position
     // keeps the 16 planes off one L1 set — the channel-first route's measurement holds.
-    plan.v_lda      = ((ic_per_group + 7) / 8) * 8;
+    plan.v_lda = ((ic_per_group + 7) / 8) * 8;
     // M: [tile][oc] per position, a whole panel per row so the MMA's widest row
     // read stays inside it.
     plan.m_oc_stride = plan.ocn_block;
@@ -909,17 +956,13 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     const int64_t esz = static_cast<int64_t>(data_type_size(dt));
     const int64_t slots = std::max<int64_t>(1, (num_slots > 0) ? num_slots : nt);
     constexpr int64_t kArena = 24 << 20;
-    const int64_t workset =
-        std::max<int64_t>(2 << 20, std::min<int64_t>(ug.total * esz, 12 << 20));
-    const int64_t slot_cap =
-        std::min<int64_t>(workset / esz, kArena / (esz * slots));
-    const int64_t per_tile = std::max<int64_t>(
-        1, ug.pos * (plan.v_lda + plan.m_oc_stride));
+    const int64_t workset = std::max<int64_t>(2 << 20, std::min<int64_t>(ug.total * esz, 12 << 20));
+    const int64_t slot_cap = std::min<int64_t>(workset / esz, kArena / (esz * slots));
+    const int64_t per_tile = std::max<int64_t>(1, ug.pos * (plan.v_lda + plan.m_oc_stride));
     const int64_t tile_cap = std::max<int64_t>(1, slot_cap / per_tile);
     ntb = std::max<int64_t>(ntb, (tiles + tile_cap - 1) / tile_cap);
     // ... but never past the point where a task's U read stops paying.
-    ntb = std::min<int64_t>(
-        ntb, std::max<int64_t>(1, tiles / kTileBlockMin(order)));
+    ntb = std::min<int64_t>(ntb, std::max<int64_t>(1, tiles / kTileBlockMin(order)));
 
     plan.tile_block = (tiles + ntb - 1) / ntb;
     plan.num_tile_blocks = (tiles + plan.tile_block - 1) / plan.tile_block;
@@ -933,54 +976,49 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     plan.num_tasks = plane_tasks * plan.oc_chunks;
 
     plan.v_p_stride = plan.tile_block * plan.v_lda + 8;
-    plan.v_size     = ug.pos * plan.v_p_stride;
-    plan.m_size     = ug.pos * plan.tile_block * plan.m_oc_stride;
+    plan.v_size = ug.pos * plan.v_p_stride;
+    plan.m_size = ug.pos * plan.tile_block * plan.m_oc_stride;
 
-    plan.halo_size = 0;   // no halo strip on this route
-    plan.b_size    = 0;   // and no packed-B block: U is read in place
+    plan.halo_size = 0; // no halo strip on this route
+    plan.b_size = 0;    // and no packed-B block: U is read in place
     // Round the slot to 16 elements so every slot base keeps the transform's
     // 32-byte f16 stores aligned.
     plan.slot_size = ((plan.v_size + plan.m_size) + 15) / 16 * 16;
     // The slot count follows the *workers*, not the reported thread count: an
     // over-subscribed grid would otherwise multiply the arena for nothing.
     const int64_t avail = (num_slots > 0) ? num_slots : nt;
-    plan.num_slots = (use_thread_slots && avail < plan.num_tasks) ? avail
-                                                                  : plan.num_tasks;
-    plan.workspace_size = static_cast<size_t>(plan.num_slots * plan.slot_size) *
-                          static_cast<size_t>(esz);
+    plan.num_slots = (use_thread_slots && avail < plan.num_tasks) ? avail : plan.num_tasks;
+    plan.workspace_size =
+        static_cast<size_t>(plan.num_slots * plan.slot_size) * static_cast<size_t>(esz);
     return plan;
 }
 
-}  // namespace
-}  // namespace channel_last
+} // namespace
+} // namespace channel_last
 
 Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
                                             std::span<const TensorDesc> inputs,
-                                            std::span<const TensorDesc> outputs,
-                                            int num_threads,
-                                            bool use_thread_slots,
-                                            int64_t num_slots)
+                                            std::span<const TensorDesc> outputs, int num_threads,
+                                            bool use_thread_slots, int64_t num_slots)
 {
     // The activation's layout picks the route. The two U forms are not
     // interchangeable, so a mismatched pair must resolve to a zeroed plan (and
     // the kernel's assert) rather than to a route that would index it wrongly.
     if (!inputs.empty() && is_channel_last(inputs[0].layout)) {
-        return channel_last::make_plan(attrs, inputs, outputs, num_threads,
-                                       use_thread_slots, num_slots);
+        return channel_last::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+                                       num_slots);
     }
     return channel_first::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
-                             num_slots);
+                                    num_slots);
 }
 
 // =========================================================================
 //  Public API
 // =========================================================================
 
-Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
-                            TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx,
-                            void* /*workspace*/)
+Status conv2d_winograd_kernel(const Conv2DAttributes& attrs, TensorView& output,
+                              std::span<const TensorView> inputs, const ComputeContext& ctx,
+                              void* /*workspace*/)
 {
     // Never fall back to the reference conv2d here: U is not an OIHW filter —
     // Channel-first's is rank-3 with dims[0] == 16, which the reference reads as an OC
@@ -988,36 +1026,38 @@ Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
     NNOPS_ASSERT(inputs.size() >= 2);
     const DataType dt = inputs[0].data_type();
     const bool dtypes_ok = (dt == DataType::f32 || dt == DataType::f16) &&
-                           inputs[1].data_type() == dt &&
-                           output.data_type() == dt &&
+                           inputs[1].data_type() == dt && output.data_type() == dt &&
                            (inputs.size() <= 2 || inputs[2].data_type() == dt);
     // bf16 is refused rather than asserted on: the U blob's panels are the
     // dense fp pack layout, and a BFMMLA panel would need its own transform —
     // on top of a transform whose fp16 form is already at the precision limit.
     // The implicit-GEMM route carries bf16.
-    if (!dtypes_ok) { return Status::unsupported; }
+    if (!dtypes_ok) {
+        return Status::unsupported;
+    }
     NNOPS_ASSERT(is_wino_weight(inputs[1].layout()) &&
                  "conv2d_winograd_kernel: inputs[1] must be prepacked U "
                  "(run prepackWeights first)");
 
     std::vector<TensorDesc> descs;
     descs.reserve(inputs.size());
-    for (const auto& t : inputs) { descs.push_back(t.desc()); }
+    for (const auto& t : inputs) {
+        descs.push_back(t.desc());
+    }
     const TensorDesc outs[] = {output.desc()};
     // Slot sizing: per worker when the caller reports worker ids; a single slot
     // when there is no pool (a serial run reuses it task after task); else one per
     // task (see Conv2DWinogradPlan::num_slots).
     const bool serial = !ctx.cpu.parallel_for;
-    const Conv2DWinogradPlan plan =
-        get_conv2d_winograd_plan(attrs, descs, outs, ctx.cpu.thread_count(),
-                                 serial || ctx.cpu.thread_slot_count() > 0,
-                                 ctx.cpu.thread_slot_count());
+    const Conv2DWinogradPlan plan = get_conv2d_winograd_plan(
+        attrs, descs, outs, ctx.cpu.thread_count(), serial || ctx.cpu.thread_slot_count() > 0,
+        ctx.cpu.thread_slot_count());
     NNOPS_ASSERT(plan.workspace_size > 0 &&
                  "conv2d_winograd_kernel: unsupported conv geometry (k3s1 only)");
 
     PoolPtr scratch(plan.workspace_size);
     const bool channel_last = plan.route == Conv2DWinogradRoute::ChannelLast;
-    const bool f43  = plan.order == WinoOrder::F43;
+    const bool f43 = plan.order == WinoOrder::F43;
     if (dt == DataType::f32) {
         if (channel_last) {
             if (f43) {
@@ -1028,11 +1068,11 @@ Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
                     attrs, output, inputs, ctx, plan, scratch.as<float>());
             }
         } else if (f43) {
-            channel_first::conv2d_winograd_impl<float, WinoOrder::F43>(
-                attrs, output, inputs, ctx, plan, scratch.as<float>());
+            channel_first::conv2d_winograd_impl<float, WinoOrder::F43>(attrs, output, inputs, ctx,
+                                                                       plan, scratch.as<float>());
         } else {
-            channel_first::conv2d_winograd_impl<float, WinoOrder::F23>(
-                attrs, output, inputs, ctx, plan, scratch.as<float>());
+            channel_first::conv2d_winograd_impl<float, WinoOrder::F23>(attrs, output, inputs, ctx,
+                                                                       plan, scratch.as<float>());
         }
     } else if (channel_last) {
         if (f43) {
@@ -1043,13 +1083,13 @@ Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
                 attrs, output, inputs, ctx, plan, scratch.as<half>());
         }
     } else if (f43) {
-        channel_first::conv2d_winograd_impl<half, WinoOrder::F43>(
-            attrs, output, inputs, ctx, plan, scratch.as<half>());
+        channel_first::conv2d_winograd_impl<half, WinoOrder::F43>(attrs, output, inputs, ctx, plan,
+                                                                  scratch.as<half>());
     } else {
-        channel_first::conv2d_winograd_impl<half, WinoOrder::F23>(
-            attrs, output, inputs, ctx, plan, scratch.as<half>());
+        channel_first::conv2d_winograd_impl<half, WinoOrder::F23>(attrs, output, inputs, ctx, plan,
+                                                                  scratch.as<half>());
     }
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

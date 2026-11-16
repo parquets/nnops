@@ -53,8 +53,7 @@ namespace nnops::backend::cuda {
 /// of two silently drops it — a 37-wide row gives a 37-thread block, and the
 /// element at index 36 never joins the max or the sum. The trailing barrier
 /// leaves the array free for the next pass.
-template <bool IsMax>
-__device__ inline float block_reduce(float* smem, float v)
+template <bool IsMax> __device__ inline float block_reduce(float* smem, float v)
 {
     const int tid = threadIdx.x;
     const int n_threads = blockDim.x;
@@ -66,14 +65,18 @@ __device__ inline float block_reduce(float* smem, float v)
         const int half = n >> 1;
         if (tid < half) {
             if (IsMax) {
-                if (smem[tid + half] > smem[tid]) { smem[tid] = smem[tid + half]; }
+                if (smem[tid + half] > smem[tid]) {
+                    smem[tid] = smem[tid + half];
+                }
             } else {
                 smem[tid] += smem[tid + half];
             }
         }
         if (tid == 0 && (n & 1) != 0) {
             if (IsMax) {
-                if (smem[n - 1] > smem[0]) { smem[0] = smem[n - 1]; }
+                if (smem[n - 1] > smem[0]) {
+                    smem[0] = smem[n - 1];
+                }
             } else {
                 smem[0] += smem[n - 1];
             }
@@ -96,29 +99,25 @@ __device__ inline float block_reduce(float* smem, float v)
 /// writes. A row too long for the budget keeps the global form, which is the same
 /// script with every `row` dereference replaced by a global one.
 template <typename T>
-__global__ void softmax_kernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    int64_t num_rows,
-    int64_t norm_size,
-    int64_t in_group_stride,   // elements between consecutive input groups
-    int64_t out_group_stride,  // and between consecutive output groups
-    bool log_softmax,
-    bool row_resident,
-    float inv_t)
+__global__ void softmax_kernel(const T* __restrict__ input, T* __restrict__ output,
+                               int64_t num_rows, int64_t norm_size,
+                               int64_t in_group_stride, // elements between consecutive input groups
+                               int64_t out_group_stride, // and between consecutive output groups
+                               bool log_softmax, bool row_resident, float inv_t)
 {
     constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
     extern __shared__ float shared_buf[];
 
     // The row, when it is resident, then the reduction scratch — the scratch is
     // needed either way, so it sits past the row rather than before it.
-    float* row  = row_resident ? shared_buf : nullptr;
+    float* row = row_resident ? shared_buf : nullptr;
     float* smem = shared_buf + (row_resident ? norm_size : 0);
 
     const int tid = threadIdx.x;
     const int blk = blockIdx.x;
 
-    if (blk >= num_rows) return;
+    if (blk >= num_rows)
+        return;
 
     const T* x_row = input + blk * in_group_stride;
     T* y_row = output + blk * out_group_stride;
@@ -135,17 +134,23 @@ __global__ void softmax_kernel(
     for (int64_t i = tid * VEC; i < vec_end; i += int64_t(blockDim.x) * VEC) {
         float v[VEC];
         load_channels<T, VEC>(&x_row[i], v);
-        #pragma unroll
-        for (int k = 0; k < VEC; ++k) { max_val = fmaxf(max_val, v[k]); }
+#pragma unroll
+        for (int k = 0; k < VEC; ++k) {
+            max_val = fmaxf(max_val, v[k]);
+        }
         if (row != nullptr) {
-            #pragma unroll
-            for (int k = 0; k < VEC; ++k) { row[i + k] = v[k]; }
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                row[i + k] = v[k];
+            }
         }
     }
     for (int64_t i = vec_end + tid; i < norm_size; i += blockDim.x) {
         const float x = s_load(&x_row[i]);
         max_val = fmaxf(max_val, x);
-        if (row != nullptr) { row[i] = x; }
+        if (row != nullptr) {
+            row[i] = x;
+        }
     }
 
     max_val = block_reduce<true>(smem, max_val);
@@ -164,21 +169,25 @@ __global__ void softmax_kernel(
     for (int64_t i = tid * VEC; i < vec_end; i += int64_t(blockDim.x) * VEC) {
         float v[VEC];
         if (row != nullptr) {
-            #pragma unroll
-            for (int k = 0; k < VEC; ++k) { v[k] = row[i + k]; }
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                v[k] = row[i + k];
+            }
         } else {
             load_channels<T, VEC>(&x_row[i], v);
         }
         float e[VEC];
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < VEC; ++k) {
             e[k] = expf((v[k] - max_val) * inv_t);
             sum_exp += e[k];
         }
         if (store_exp) {
             if (row != nullptr) {
-                #pragma unroll
-                for (int k = 0; k < VEC; ++k) { row[i + k] = e[k]; }
+#pragma unroll
+                for (int k = 0; k < VEC; ++k) {
+                    row[i + k] = e[k];
+                }
             } else {
                 store_channels<T, VEC>(&y_row[i], e);
             }
@@ -188,7 +197,11 @@ __global__ void softmax_kernel(
         const float x = (row != nullptr) ? row[i] : s_load(&x_row[i]);
         const float e = expf((x - max_val) * inv_t);
         if (store_exp) {
-            if (row != nullptr) { row[i] = e; } else { s_store(&y_row[i], e); }
+            if (row != nullptr) {
+                row[i] = e;
+            } else {
+                s_store(&y_row[i], e);
+            }
         }
         sum_exp += e;
     }
@@ -205,12 +218,14 @@ __global__ void softmax_kernel(
         for (int64_t i = tid * VEC; i < vec_end; i += int64_t(blockDim.x) * VEC) {
             float v[VEC];
             if (row != nullptr) {
-                #pragma unroll
-                for (int k = 0; k < VEC; ++k) { v[k] = row[i + k]; }
+#pragma unroll
+                for (int k = 0; k < VEC; ++k) {
+                    v[k] = row[i + k];
+                }
             } else {
                 load_channels<T, VEC>(&x_row[i], v);
             }
-            #pragma unroll
+#pragma unroll
             for (int k = 0; k < VEC; ++k) {
                 v[k] = (v[k] - max_val) * inv_t - log_sum;
             }
@@ -226,14 +241,18 @@ __global__ void softmax_kernel(
         for (int64_t i = tid * VEC; i < vec_end; i += int64_t(blockDim.x) * VEC) {
             float v[VEC];
             if (row != nullptr) {
-                #pragma unroll
-                for (int k = 0; k < VEC; ++k) { v[k] = row[i + k]; }
+#pragma unroll
+                for (int k = 0; k < VEC; ++k) {
+                    v[k] = row[i + k];
+                }
             } else {
                 // Not resident: pass 2 left the exp values in the output.
                 load_channels<T, VEC>(&y_row[i], v);
             }
-            #pragma unroll
-            for (int k = 0; k < VEC; ++k) { v[k] *= inv_sum; }
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                v[k] *= inv_sum;
+            }
             store_channels<T, VEC>(&y_row[i], v);
         }
         for (int64_t i = vec_end + tid; i < norm_size; i += blockDim.x) {
@@ -254,31 +273,25 @@ __global__ void softmax_kernel(
 // ============================================================
 
 template <typename T>
-__global__ void softmax_general_kernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    int64_t outer_size,
-    int64_t D,
-    int64_t in_axis_stride,
-    int64_t out_axis_stride,
-    int64_t inner_total,
-    const int64_t* __restrict__ outer_offsets,
-    const int64_t* __restrict__ inner_offsets,
-    const int64_t* __restrict__ out_outer_offsets,
-    const int64_t* __restrict__ out_inner_offsets,
-    bool log_softmax,
-    bool row_resident,
-    float inv_t)
+__global__ void softmax_general_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                       int64_t outer_size, int64_t D, int64_t in_axis_stride,
+                                       int64_t out_axis_stride, int64_t inner_total,
+                                       const int64_t* __restrict__ outer_offsets,
+                                       const int64_t* __restrict__ inner_offsets,
+                                       const int64_t* __restrict__ out_outer_offsets,
+                                       const int64_t* __restrict__ out_inner_offsets,
+                                       bool log_softmax, bool row_resident, float inv_t)
 {
     extern __shared__ float shared_buf[];
-    float* row  = row_resident ? shared_buf : nullptr;
+    float* row = row_resident ? shared_buf : nullptr;
     float* smem = shared_buf + (row_resident ? D : 0);
 
     const int tid = threadIdx.x;
     const int outer = static_cast<int>(blockIdx.x / static_cast<unsigned int>(inner_total));
     const int inner_idx = static_cast<int>(blockIdx.x % static_cast<unsigned int>(inner_total));
 
-    if (outer >= outer_size) return;
+    if (outer >= outer_size)
+        return;
 
     const int64_t base = outer_offsets[outer];
     const int64_t inner_off = inner_offsets[inner_idx];
@@ -290,7 +303,9 @@ __global__ void softmax_general_kernel(
     for (int64_t k = tid; k < D; k += blockDim.x) {
         const float x = s_load(&input[base + inner_off + k * in_axis_stride]);
         max_val = fmaxf(max_val, x);
-        if (row != nullptr) { row[k] = x; }
+        if (row != nullptr) {
+            row[k] = x;
+        }
     }
 
     max_val = block_reduce<true>(smem, max_val);
@@ -300,11 +315,12 @@ __global__ void softmax_general_kernel(
     // the raw values again in pass 3, so that pass does not recompute the exp.
     float sum_exp = 0.0f;
     for (int64_t k = tid; k < D; k += blockDim.x) {
-        const float x = (row != nullptr)
-            ? row[k]
-            : s_load(&input[base + inner_off + k * in_axis_stride]);
+        const float x =
+            (row != nullptr) ? row[k] : s_load(&input[base + inner_off + k * in_axis_stride]);
         const float e = expf((x - max_val) * inv_t);
-        if (row != nullptr && !log_softmax) { row[k] = e; }
+        if (row != nullptr && !log_softmax) {
+            row[k] = e;
+        }
         sum_exp += e;
     }
 
@@ -324,9 +340,8 @@ __global__ void softmax_general_kernel(
         for (int64_t k = tid; k < D; k += blockDim.x) {
             const int64_t off = base + inner_off + k * in_axis_stride;
             const int64_t y_off = y_base + y_inner_off + k * out_axis_stride;
-            const float e = (row != nullptr)
-                ? row[k]
-                : expf((s_load(&input[off]) - max_val) * inv_t);
+            const float e =
+                (row != nullptr) ? row[k] : expf((s_load(&input[off]) - max_val) * inv_t);
             s_store(&output[y_off], e * inv_sum);
         }
     }
@@ -337,11 +352,8 @@ __global__ void softmax_general_kernel(
 // ============================================================
 
 template <typename T>
-void softmax_cuda_impl(
-    const SoftmaxAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void softmax_cuda_impl(const SoftmaxAttributes& attrs, TensorView& output,
+                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& X = inputs[0];
     const int64_t rank = X.rank();
@@ -350,10 +362,12 @@ void softmax_cuda_impl(
     const bool log_softmax = attrs.log_softmax;
 
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0)
+        axis += rank;
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
-    if (X.numel() == 0 || X.shape(axis) == 0) return;  // nothing to launch
+    if (X.numel() == 0 || X.shape(axis) == 0)
+        return; // nothing to launch
 
     const auto* x_ptr = X.ptr<T>();
     auto* y_ptr = output.ptr<T>();
@@ -399,16 +413,15 @@ void softmax_cuda_impl(
         // The row is held in shared memory when it fits next to the reduction
         // scratch; a longer one re-reads it from global in the later passes.
         const int64_t row_bytes = norm_size * static_cast<int64_t>(sizeof(float));
-        const bool row_resident = row_resident_worth(
-            norm_size, static_cast<int64_t>(sizeof(T)),
-            block_size * static_cast<int64_t>(sizeof(float)));
-        const int shared_bytes = static_cast<int>(
-            block_size * sizeof(float) + (row_resident ? row_bytes : 0));
+        const bool row_resident =
+            row_resident_worth(norm_size, static_cast<int64_t>(sizeof(T)),
+                               block_size * static_cast<int64_t>(sizeof(float)));
+        const int shared_bytes =
+            static_cast<int>(block_size * sizeof(float) + (row_resident ? row_bytes : 0));
 
         softmax_kernel<<<num_rows, block_size, shared_bytes, stream>>>(
-            x_ptr, y_ptr,
-            num_rows, norm_size, in_group_stride, out_group_stride,
-            log_softmax, row_resident, 1.0f / attrs.temperature);
+            x_ptr, y_ptr, num_rows, norm_size, in_group_stride, out_group_stride, log_softmax,
+            row_resident, 1.0f / attrs.temperature);
         return;
     }
 
@@ -467,29 +480,25 @@ void softmax_cuda_impl(
 
         int64_t* d_offsets = nullptr;
         CUDA_CHECK(cudaMalloc(&d_offsets, offsets.size() * sizeof(int64_t)));
-        CUDA_CHECK(cudaMemcpyAsync(d_offsets, offsets.data(),
-                                     offsets.size() * sizeof(int64_t),
-                                     cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_offsets, offsets.data(), offsets.size() * sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, stream));
 
         // Launch outer_size * inner_total blocks (one per normalization group).
         // Use gridDim.y to carry inner_total so the kernel can decompose blockIdx.x.
         const int block_size = std::min(static_cast<int>(D), kCudaBlockSize);
         const int64_t row_bytes = D * static_cast<int64_t>(sizeof(float));
         const bool row_resident = row_resident_worth(
-            D, static_cast<int64_t>(sizeof(T)),
-            block_size * static_cast<int64_t>(sizeof(float)));
-        const int shared_bytes = static_cast<int>(
-            block_size * sizeof(float) + (row_resident ? row_bytes : 0));
+            D, static_cast<int64_t>(sizeof(T)), block_size * static_cast<int64_t>(sizeof(float)));
+        const int shared_bytes =
+            static_cast<int>(block_size * sizeof(float) + (row_resident ? row_bytes : 0));
 
         const int total_blocks = static_cast<int>(outer_size * inner_total);
         dim3 grid(total_blocks);
 
         softmax_general_kernel<<<grid, block_size, shared_bytes, stream>>>(
-            x_ptr, y_ptr,
-            outer_size, D, in_axis_stride, out_axis_stride, inner_total,
-            d_offsets, d_offsets + outer_size,
-            d_offsets + table, d_offsets + table + outer_size,
-            log_softmax, row_resident, 1.0f / attrs.temperature);
+            x_ptr, y_ptr, outer_size, D, in_axis_stride, out_axis_stride, inner_total, d_offsets,
+            d_offsets + outer_size, d_offsets + table, d_offsets + table + outer_size, log_softmax,
+            row_resident, 1.0f / attrs.temperature);
 
         CUDA_CHECK(cudaFree(d_offsets));
     }
@@ -499,12 +508,9 @@ void softmax_cuda_impl(
 // Entry point (dtype dispatch)
 // ============================================================
 
-Status softmax_cuda(
-    const SoftmaxAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx,
-    void* /*workspace*/)
+Status softmax_cuda(const SoftmaxAttributes& attrs, TensorView& output,
+                    std::span<const TensorView> inputs, const ComputeContext& ctx,
+                    void* /*workspace*/)
 {
     const auto dtype = inputs[0].data_type();
     switch (dtype) {
@@ -523,4 +529,4 @@ Status softmax_cuda(
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

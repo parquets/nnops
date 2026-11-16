@@ -58,7 +58,8 @@ struct AxisDecomp {
     int64_t inner = 1;
 };
 
-inline AxisDecomp decompose_axis(const TensorView& x, int64_t axis) {
+inline AxisDecomp decompose_axis(const TensorView& x, int64_t axis)
+{
     AxisDecomp r;
     const int64_t rank = x.rank();
     r.D = x.shape(axis);
@@ -71,17 +72,15 @@ inline AxisDecomp decompose_axis(const TensorView& x, int64_t axis) {
     return r;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-template <typename T>  // T = float or half (input type)
-void quantize_linear_impl(const QuantLinearAttributes& attrs,
-                          TensorView& output,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx)
+template <typename T> // T = float or half (input type)
+void quantize_linear_impl(const QuantLinearAttributes& attrs, TensorView& output,
+                          std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& X     = inputs[0];
+    const auto& X = inputs[0];
     const auto& scale = inputs[1];
-    const auto& zp    = inputs[2];
+    const auto& zp = inputs[2];
 
     const int64_t rank = X.rank();
     int64_t axis = attrs.axis;
@@ -122,9 +121,8 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
     PoolArray<float> z_f32(static_cast<size_t>(M));
     for (int64_t k = 0; k < M; ++k) {
         s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[k];
-        int32_t z = (zp.data_type() == DataType::s8)
-            ? static_cast<int32_t>(zp.ptr<int8_t>()[k])
-            : static_cast<int32_t>(zp.ptr<uint8_t>()[k]);
+        int32_t z = (zp.data_type() == DataType::s8) ? static_cast<int32_t>(zp.ptr<int8_t>()[k]) :
+                                                       static_cast<int32_t>(zp.ptr<uint8_t>()[k]);
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
@@ -143,17 +141,15 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         U* dst = static_cast<U*>(output.ptr<void>());
 
         if (g == QuantGranularity::PerTensor) {
-            quant_kernel::quantization<U>(1, static_cast<int>(numel),
-                                          dst, static_cast<int>(numel),
-                                          src_ptr, static_cast<int>(numel),
-                                          s_f32.data(), z_f32.data());
+            quant_kernel::quantization<U>(1, static_cast<int>(numel), dst, static_cast<int>(numel),
+                                          src_ptr, static_cast<int>(numel), s_f32.data(),
+                                          z_f32.data());
             return;
         }
 
         if (g == QuantGranularity::PerToken) {
-            quant_kernel::quantization<U>(static_cast<int>(M), static_cast<int>(N),
-                                          dst, static_cast<int>(N),
-                                          src_ptr, static_cast<int>(N),
+            quant_kernel::quantization<U>(static_cast<int>(M), static_cast<int>(N), dst,
+                                          static_cast<int>(N), src_ptr, static_cast<int>(N),
                                           s_f32.data(), z_f32.data());
             return;
         }
@@ -161,8 +157,8 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         const auto process = [&](int64_t o) {
             quant_kernel::quantization<U>(static_cast<int>(dec.D), static_cast<int>(dec.inner),
                                           dst + o * dec.D * dec.inner, static_cast<int>(dec.inner),
-                                          src_ptr + o * dec.D * dec.inner, static_cast<int>(dec.inner),
-                                          s_f32.data(), z_f32.data());
+                                          src_ptr + o * dec.D * dec.inner,
+                                          static_cast<int>(dec.inner), s_f32.data(), z_f32.data());
         };
         ctx.cpu.run(0, dec.outer, process);
     };
@@ -174,15 +170,13 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
     }
 }
 
-template <typename T>  // T = float or half (output type)
-void dequantize_linear_impl(const QuantLinearAttributes& attrs,
-                            TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx)
+template <typename T> // T = float or half (output type)
+void dequantize_linear_impl(const QuantLinearAttributes& attrs, TensorView& output,
+                            std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& X     = inputs[0];  // s8 or u8
-    const auto& scale = inputs[1];  // f32
-    const auto& zp    = inputs[2];  // s8 or u8
+    const auto& X = inputs[0];     // s8 or u8
+    const auto& scale = inputs[1]; // f32
+    const auto& zp = inputs[2];    // s8 or u8
 
     const int64_t rank = X.rank();
     int64_t axis = attrs.axis;
@@ -223,9 +217,8 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
     PoolArray<float> z_f32(static_cast<size_t>(M));
     for (int64_t k = 0; k < M; ++k) {
         s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[k];
-        int32_t z = (zp.data_type() == DataType::s8)
-            ? static_cast<int32_t>(zp.ptr<int8_t>()[k])
-            : static_cast<int32_t>(zp.ptr<uint8_t>()[k]);
+        int32_t z = (zp.data_type() == DataType::s8) ? static_cast<int32_t>(zp.ptr<int8_t>()[k]) :
+                                                       static_cast<int32_t>(zp.ptr<uint8_t>()[k]);
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
@@ -243,26 +236,25 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         const U* src = static_cast<const U*>(X.ptr<void>());
 
         if (g == QuantGranularity::PerTensor) {
-            quant_kernel::dequantization<U>(1, static_cast<int>(numel),
-                                            dst_f32, static_cast<int>(numel),
-                                            src, static_cast<int>(numel),
+            quant_kernel::dequantization<U>(1, static_cast<int>(numel), dst_f32,
+                                            static_cast<int>(numel), src, static_cast<int>(numel),
                                             s_f32.data(), z_f32.data());
             return;
         }
 
         if (g == QuantGranularity::PerToken) {
-            quant_kernel::dequantization<U>(static_cast<int>(M), static_cast<int>(N),
-                                            dst_f32, static_cast<int>(N),
-                                            src, static_cast<int>(N),
+            quant_kernel::dequantization<U>(static_cast<int>(M), static_cast<int>(N), dst_f32,
+                                            static_cast<int>(N), src, static_cast<int>(N),
                                             s_f32.data(), z_f32.data());
             return;
         }
 
         const auto process = [&](int64_t o) {
-            quant_kernel::dequantization<U>(static_cast<int>(dec.D), static_cast<int>(dec.inner),
-                                            dst_f32 + o * dec.D * dec.inner, static_cast<int>(dec.inner),
-                                            src + o * dec.D * dec.inner, static_cast<int>(dec.inner),
-                                            s_f32.data(), z_f32.data());
+            quant_kernel::dequantization<U>(
+                static_cast<int>(dec.D), static_cast<int>(dec.inner),
+                dst_f32 + o * dec.D * dec.inner, static_cast<int>(dec.inner),
+                src + o * dec.D * dec.inner, static_cast<int>(dec.inner), s_f32.data(),
+                z_f32.data());
         };
         ctx.cpu.run(0, dec.outer, process);
     };
@@ -278,11 +270,9 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
     }
 }
 
-Status quantize_linear_cpu(const QuantLinearAttributes& attrs,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         void* /*workspace*/)
+Status quantize_linear_cpu(const QuantLinearAttributes& attrs, TensorView& output,
+                           std::span<const TensorView> inputs, const ComputeContext& ctx,
+                           void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "quantize_linear_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -291,11 +281,9 @@ Status quantize_linear_cpu(const QuantLinearAttributes& attrs,
     return Status::ok;
 }
 
-Status dequantize_linear_cpu(const QuantLinearAttributes& attrs,
-                           TensorView& output,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx,
-                           void* /*workspace*/)
+Status dequantize_linear_cpu(const QuantLinearAttributes& attrs, TensorView& output,
+                             std::span<const TensorView> inputs, const ComputeContext& ctx,
+                             void* /*workspace*/)
 {
     dispatch_f32_f16(output.data_type(), "dequantize_linear_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -304,4 +292,4 @@ Status dequantize_linear_cpu(const QuantLinearAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

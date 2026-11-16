@@ -26,14 +26,12 @@ namespace nnops::backend::cuda {
 // ============================================================
 
 template <typename T>
-__global__ void cumsum_kernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    int64_t dim,                 // axis size
-    int64_t lower_dim_size,     // elements after axis (treated as vector tail)
-    int64_t axis_stride,        // stride_elems(axis)
-    bool exclusive,
-    bool reverse)
+__global__ void
+cumsum_kernel(const T* __restrict__ input, T* __restrict__ output,
+              int64_t dim,            // axis size
+              int64_t lower_dim_size, // elements after axis (treated as vector tail)
+              int64_t axis_stride,    // stride_elems(axis)
+              bool exclusive, bool reverse)
 {
     // Each block: one outer slice
     // Each thread: one lower-dim position, walking the slice in block strides
@@ -53,9 +51,9 @@ __global__ void cumsum_kernel(
                 float running = 0.0f;
                 for (int64_t k = 0; k < dim; ++k) {
                     int64_t idx = slice_start + k * axis_stride + lower;
-                    float val = running;  // exclusive: does not include current element
+                    float val = running; // exclusive: does not include current element
                     s_store(&output[idx], val);
-                    running += s_load(&input[idx]);  // add current to running sum
+                    running += s_load(&input[idx]); // add current to running sum
                 }
             } else {
                 // output[i] = sum(input[0..i])
@@ -73,9 +71,9 @@ __global__ void cumsum_kernel(
                 float running = 0.0f;
                 for (int64_t k = dim - 1; k >= 0; --k) {
                     int64_t idx = slice_start + k * axis_stride + lower;
-                    float val = running;  // exclusive: does not include current element
+                    float val = running; // exclusive: does not include current element
                     s_store(&output[idx], val);
-                    running += s_load(&input[idx]);  // add current to running sum
+                    running += s_load(&input[idx]); // add current to running sum
                 }
             } else {
                 // output[i] = sum(input[i..dim-1])
@@ -95,18 +93,16 @@ __global__ void cumsum_kernel(
 // ============================================================
 
 template <typename T>
-void cumsum_cuda_impl(
-    const CumSumAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void cumsum_cuda_impl(const CumSumAttributes& attrs, TensorView& output,
+                      std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
     NNOPS_ASSERT(rank >= 1);
 
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0)
+        axis += rank;
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     const int64_t dim = input.shape(axis);
@@ -130,22 +126,18 @@ void cumsum_cuda_impl(
     const int block_size = std::min(static_cast<int>(lower_dim_size), kCudaBlockSize);
     const int grid_size = static_cast<int>(upper_dim_count);
 
-    cumsum_kernel<<<grid_size, block_size, 0, stream>>>(
-        input.ptr<T>(), output.ptr<T>(),
-        dim, lower_dim_size, axis_stride,
-        attrs.exclusive, attrs.reverse);
+    cumsum_kernel<<<grid_size, block_size, 0, stream>>>(input.ptr<T>(), output.ptr<T>(), dim,
+                                                        lower_dim_size, axis_stride,
+                                                        attrs.exclusive, attrs.reverse);
 }
 
 // ============================================================
 // Entry point
 // ============================================================
 
-Status cumsum_cuda(
-    const CumSumAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx,
-    void* /*workspace*/)
+Status cumsum_cuda(const CumSumAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx,
+                   void* /*workspace*/)
 {
     const auto dtype = inputs[0].data_type();
     switch (dtype) {
@@ -164,4 +156,4 @@ Status cumsum_cuda(
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

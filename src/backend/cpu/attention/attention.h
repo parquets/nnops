@@ -115,18 +115,18 @@ namespace nnops::backend::cpu {
 
 /// The head geometry and behaviour one attention call is run with.
 struct AttentionConfig {
-    int64_t num_heads = 1;     ///< query heads (H)
-    int64_t num_kv_heads = 0;  ///< key/value heads; 0 means num_heads
-    int64_t v_head_dim = 0;    ///< value width; only read when v_is_k
-    float   scale = 0.0f;      ///< 0 means 1/sqrt(query-key width)
-    bool    causal = false;    ///< causal mask over the run
-    bool    v_is_k = false;    ///< value = leading v_head_dim of the key row
+    int64_t num_heads = 1;    ///< query heads (H)
+    int64_t num_kv_heads = 0; ///< key/value heads; 0 means num_heads
+    int64_t v_head_dim = 0;   ///< value width; only read when v_is_k
+    float scale = 0.0f;       ///< 0 means 1/sqrt(query-key width)
+    bool causal = false;      ///< causal mask over the run
+    bool v_is_k = false;      ///< value = leading v_head_dim of the key row
     /// Absolute position of query row 0; negative (the default) means
     /// bottom-right, q0 = run - Sq. Only consulted when causal.
     int64_t position_offset = -1;
     /// Logit cap (Gemma2/3 softcapping): s = cap·tanh(s/cap), applied after the
     /// scale and before the additive mask. 0 disables.
-    float   softcap = 0.0f;
+    float softcap = 0.0f;
     /// Sliding window: query row i also skips keys older than its position
     /// minus window + 1 (Gemma2/3 local layers). 0 disables.
     int64_t window = 0;
@@ -134,40 +134,36 @@ struct AttentionConfig {
     /// by act(gate) of the trailing input slot. None disables.
     EpilogueActivateType output_gate = EpilogueActivateType::None;
 
-    int64_t kv_heads() const noexcept {
-        return num_kv_heads > 0 ? num_kv_heads : num_heads;
-    }
+    int64_t kv_heads() const noexcept { return num_kv_heads > 0 ? num_kv_heads : num_heads; }
 };
 
 /// Tile sizes + scratch layout, resolved once and shared by the kernels and
 /// the scratch sizing.
 struct AttentionPlan {
-    bool   use_flash = false;   ///< route through the FlashAttention path
-    bool   use_decode = false;  ///< Sq == 1: route through the GEMV decode path
-    int    mc1 = 0, nc1 = 0;    ///< standard-path GEMM1 (Sq × Sk) tiles
-    int    mc2 = 0, nc2 = 0;    ///< standard-path GEMM2 (Sq × Dv) tiles
-    int    Br = 0, Bc = 0;      ///< flash-path query/KV block tiles
+    bool use_flash = false;  ///< route through the FlashAttention path
+    bool use_decode = false; ///< Sq == 1: route through the GEMV decode path
+    int mc1 = 0, nc1 = 0;    ///< standard-path GEMM1 (Sq × Sk) tiles
+    int mc2 = 0, nc2 = 0;    ///< standard-path GEMM2 (Sq × Dv) tiles
+    int Br = 0, Bc = 0;      ///< flash-path query/KV block tiles
     /// Decode head batching: query heads one task serves. Under GQA/MQA the
     /// group's heads share a KV head, so one pass over K/V feeds all of them
     /// instead of each head re-reading the run.
-    int    decode_heads = 1;
+    int decode_heads = 1;
     /// Decode KV splitting: slices of the run handled by independent tasks,
     /// merged with the online-softmax weights. > 1 only when the head-batched
     /// task count would leave workers idle.
-    int    decode_splits = 1;
-    int64_t decode_elems = 0;   ///< decode-path f32 scratch elements per slot
-    int64_t num_slots = 0;      ///< scratch slots (worker threads, else tasks)
-    size_t workspace_size = 0;  ///< pooled scratch bytes (0 → no tiled route)
+    int decode_splits = 1;
+    int64_t decode_elems = 0;  ///< decode-path f32 scratch elements per slot
+    int64_t num_slots = 0;     ///< scratch slots (worker threads, else tasks)
+    size_t workspace_size = 0; ///< pooled scratch bytes (0 → no tiled route)
 };
 
 /// Resolve tile sizes + scratch bytes for f32/f16 (tiles and element size
 /// follow the dtype). Any other dtype, or a Q/K/V dtype mismatch, returns a
 /// zeroed plan (workspace_size 0). @p num_threads and @p use_thread_slots
 /// bound the per-thread scratch slot count; @p outputs is unused.
-AttentionPlan get_attention_plan(const AttentionConfig& cfg,
-                                 std::span<const TensorDesc> inputs,
-                                 std::span<const TensorDesc> outputs,
-                                 int num_threads = 1,
+AttentionPlan get_attention_plan(const AttentionConfig& cfg, std::span<const TensorDesc> inputs,
+                                 std::span<const TensorDesc> outputs, int num_threads = 1,
                                  bool use_thread_slots = false);
 
 /// Tiled attention kernel (f32 / f16), routed standard, flash or decode by the
@@ -178,10 +174,8 @@ AttentionPlan get_attention_plan(const AttentionConfig& cfg,
 /// Returns Status::unsupported unless every input, the output and the optional
 /// mask share one f32 or f16 dtype; a named cfg.output_gate whose slot is not
 /// exactly the output's geometry returns Status::invalid_argument.
-Status attention_cpu(const AttentionConfig& cfg,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
+Status attention_cpu(const AttentionConfig& cfg, TensorView& output,
+                     std::span<const TensorView> inputs, const ComputeContext& ctx,
                      void* workspace);
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

@@ -23,38 +23,49 @@ namespace {
 /// Logical accepts only the integer types; keeping them in their own dispatch
 /// stops the f16 branch from being instantiated, where `half != 0` has no
 /// meaning.
-template <class F>
-void for_each_int_type(DataType t, F&& f)
+template <class F> void for_each_int_type(DataType t, F&& f)
 {
     switch (t) {
-    case DataType::s8:  f(std::type_identity<int8_t>{}); break;
-    case DataType::u8:  f(std::type_identity<uint8_t>{}); break;
-    case DataType::s32: f(std::type_identity<int32_t>{}); break;
-    case DataType::s64: f(std::type_identity<int64_t>{}); break;
-    default: break;
+    case DataType::s8:
+        f(std::type_identity<int8_t>{});
+        break;
+    case DataType::u8:
+        f(std::type_identity<uint8_t>{});
+        break;
+    case DataType::s32:
+        f(std::type_identity<int32_t>{});
+        break;
+    case DataType::s64:
+        f(std::type_identity<int64_t>{});
+        break;
+    default:
+        break;
     }
 }
 
-template <typename T>
-inline T value_at(const T* p, int64_t off) { return p[off]; }
+template <typename T> inline T value_at(const T* p, int64_t off) { return p[off]; }
 inline float value_at(const half* p, int64_t off) { return simd::s_load(p + off); }
 
-template <typename T>
-inline bool relation(CompareType type, T a, T b)
+template <typename T> inline bool relation(CompareType type, T a, T b)
 {
     switch (type) {
-    case CompareType::Equal:        return a == b;
-    case CompareType::Greater:      return a > b;
-    case CompareType::Less:         return a < b;
-    case CompareType::GreaterOrEqual: return a >= b;
-    case CompareType::LessOrEqual:  return a <= b;
+    case CompareType::Equal:
+        return a == b;
+    case CompareType::Greater:
+        return a > b;
+    case CompareType::Less:
+        return a < b;
+    case CompareType::GreaterOrEqual:
+        return a >= b;
+    case CompareType::LessOrEqual:
+        return a <= b;
     }
     return false;
 }
 
 template <typename T>
-void compare_impl(TensorView& out, std::span<const TensorView> inputs,
-                  CompareType type, const ComputeContext& ctx)
+void compare_impl(TensorView& out, std::span<const TensorView> inputs, CompareType type,
+                  const ComputeContext& ctx)
 {
     const auto* ap = inputs[0].ptr<T>();
     const auto* bp = inputs[1].ptr<T>();
@@ -66,8 +77,8 @@ void compare_impl(TensorView& out, std::span<const TensorView> inputs,
 }
 
 template <typename T>
-void logical_binary_impl(TensorView& out, std::span<const TensorView> inputs,
-                         LogicalType type, const ComputeContext& ctx)
+void logical_binary_impl(TensorView& out, std::span<const TensorView> inputs, LogicalType type,
+                         const ComputeContext& ctx)
 {
     const auto* ap = inputs[0].ptr<T>();
     const auto* bp = inputs[1].ptr<T>();
@@ -77,10 +88,18 @@ void logical_binary_impl(TensorView& out, std::span<const TensorView> inputs,
         const bool a = ap[off[0]] != 0;
         const bool b = bp[off[1]] != 0;
         switch (type) {
-        case LogicalType::And: dst[oo] = (a && b) ? 1 : 0; break;
-        case LogicalType::Or:  dst[oo] = (a || b) ? 1 : 0; break;
-        case LogicalType::Xor: dst[oo] = (a != b) ? 1 : 0; break;
-        default: dst[oo] = 0; break;
+        case LogicalType::And:
+            dst[oo] = (a && b) ? 1 : 0;
+            break;
+        case LogicalType::Or:
+            dst[oo] = (a || b) ? 1 : 0;
+            break;
+        case LogicalType::Xor:
+            dst[oo] = (a != b) ? 1 : 0;
+            break;
+        default:
+            dst[oo] = 0;
+            break;
         }
     });
 }
@@ -92,17 +111,14 @@ void logical_not_impl(TensorView& out, std::span<const TensorView> inputs,
     const auto* ap = inputs[0].ptr<T>();
     auto* dst = out.ptr<uint8_t>();
 
-    broadcast_walk<1>(out, inputs.data(), ctx, [&](int64_t oo, const int64_t* off) {
-        dst[oo] = (ap[off[0]] == 0) ? 1 : 0;
-    });
+    broadcast_walk<1>(out, inputs.data(), ctx,
+                      [&](int64_t oo, const int64_t* off) { dst[oo] = (ap[off[0]] == 0) ? 1 : 0; });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status compare_cpu(const CompareAttributes& attrs,
-                   TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx,
+Status compare_cpu(const CompareAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx,
                    void* /*workspace*/)
 {
     for_each_data_type(inputs[0].data_type(), [&](auto tag) {
@@ -112,10 +128,8 @@ Status compare_cpu(const CompareAttributes& attrs,
     return Status::ok;
 }
 
-Status logical_cpu(const LogicalAttributes& attrs,
-                   TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx,
+Status logical_cpu(const LogicalAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx,
                    void* /*workspace*/)
 {
     if (attrs.type == LogicalType::Not) {
@@ -132,4 +146,4 @@ Status logical_cpu(const LogicalAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

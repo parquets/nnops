@@ -71,17 +71,19 @@ struct PoolGeom {
 /// depth plane comes from blockIdx.z, so the kernel never divides a thread's
 /// index into (od, oh, ow) the way the flat script does.
 template <typename T, bool IsMax>
-__global__ void pooling_first_grid_kernel(const T* __restrict__ input,
-                                          T* __restrict__ output, PoolGeom g)
+__global__ void pooling_first_grid_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                          PoolGeom g)
 {
     const int64_t od = int64_t(blockIdx.z) % g.OD;
     const int64_t nc = int64_t(blockIdx.z) / g.OD;
     const int64_t ow = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t oh = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
-    if (ow >= g.OW || oh >= g.OH) { return; }
+    if (ow >= g.OW || oh >= g.OH) {
+        return;
+    }
 
-    const T* in_ch  = input  + nc * g.in_ch_stride;
-    T*       out_ch = output + nc * g.out_ch_stride;
+    const T* in_ch = input + nc * g.in_ch_stride;
+    T* out_ch = output + nc * g.out_ch_stride;
 
     float result = 0.0f;
     int64_t valid = 0;
@@ -89,15 +91,21 @@ __global__ void pooling_first_grid_kernel(const T* __restrict__ input,
 
     for (int64_t kd = 0; kd < g.KD; ++kd) {
         const int64_t id = od * g.SD + kd * g.DD - g.PD;
-        if (id < 0 || id >= g.ID) { continue; }
+        if (id < 0 || id >= g.ID) {
+            continue;
+        }
         const T* in_d = in_ch + id * g.in_d_stride;
         for (int64_t kh = 0; kh < g.KH; ++kh) {
             const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
-            if (ih < 0 || ih >= g.IH) { continue; }
+            if (ih < 0 || ih >= g.IH) {
+                continue;
+            }
             const T* row = in_d + ih * g.in_row_stride;
             for (int64_t kw = 0; kw < g.KW; ++kw) {
                 const int64_t iw = ow * g.SW + kw * g.DW - g.PW;
-                if (iw < 0 || iw >= g.IW) { continue; }
+                if (iw < 0 || iw >= g.IW) {
+                    continue;
+                }
                 const float v = s_load(&row[iw]);
                 acc = IsMax ? fmaxf(acc, v) : acc + v;
                 ++valid;
@@ -125,33 +133,37 @@ __global__ void pooling_first_grid_kernel(const T* __restrict__ input,
 /// the valid-column count is a property of the column set alone, so it is
 /// computed once rather than per tap row.
 template <typename T, int K, int SW_, int VW, bool IsMax>
-__global__ void pooling_first_window_kernel(const T* __restrict__ input,
-                                            T* __restrict__ output, PoolGeom g)
+__global__ void pooling_first_window_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                            PoolGeom g)
 {
     const int64_t od = int64_t(blockIdx.z) % g.OD;
     const int64_t nc = int64_t(blockIdx.z) / g.OD;
     const int64_t ow0 = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) * VW;
-    const int64_t oh  = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
-    if (ow0 >= g.OW || oh >= g.OH) { return; }
+    const int64_t oh = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
+    if (ow0 >= g.OW || oh >= g.OH) {
+        return;
+    }
 
     constexpr int kSpan = (VW - 1) * SW_ + K;
     const int64_t cols = (g.OW - ow0 < int64_t(VW)) ? (g.OW - ow0) : int64_t(VW);
     const int64_t base = ow0 * SW_ - g.PW;
 
     bool ok[kSpan];
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < kSpan; ++j) {
         const int64_t iw = base + j;
         ok[j] = (iw >= 0 && iw < g.IW);
     }
     int colcnt[VW];
-    #pragma unroll
+#pragma unroll
     for (int v = 0; v < VW; ++v) {
         int n = 0;
         if (int64_t(v) < cols) {
-            #pragma unroll
+#pragma unroll
             for (int kw = 0; kw < K; ++kw) {
-                if (ok[v * SW_ + kw]) { ++n; }
+                if (ok[v * SW_ + kw]) {
+                    ++n;
+                }
             }
         }
         colcnt[v] = n;
@@ -159,28 +171,34 @@ __global__ void pooling_first_window_kernel(const T* __restrict__ input,
 
     const T* in_ch = input + nc * g.in_ch_stride;
     float acc[VW];
-    #pragma unroll
-    for (int v = 0; v < VW; ++v) { acc[v] = IsMax ? -1e30f : 0.0f; }
+#pragma unroll
+    for (int v = 0; v < VW; ++v) {
+        acc[v] = IsMax ? -1e30f : 0.0f;
+    }
 
     int64_t rows = 0;
     for (int64_t kd = 0; kd < g.KD; ++kd) {
         const int64_t id = od * g.SD + kd * g.DD - g.PD;
-        if (id < 0 || id >= g.ID) { continue; }
+        if (id < 0 || id >= g.ID) {
+            continue;
+        }
         const T* in_d = in_ch + id * g.in_d_stride;
         for (int64_t kh = 0; kh < g.KH; ++kh) {
             const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
-            if (ih < 0 || ih >= g.IH) { continue; }
+            if (ih < 0 || ih >= g.IH) {
+                continue;
+            }
             ++rows;
             const T* row = in_d + ih * g.in_row_stride;
             float x[kSpan];
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < kSpan; ++j) {
                 const int64_t iw = base + j;
                 x[j] = ok[j] ? s_load(&row[iw]) : (IsMax ? -1e30f : 0.0f);
             }
-            #pragma unroll
+#pragma unroll
             for (int v = 0; v < VW; ++v) {
-                #pragma unroll
+#pragma unroll
                 for (int kw = 0; kw < K; ++kw) {
                     const float t = x[v * SW_ + kw];
                     acc[v] = IsMax ? fmaxf(acc[v], t) : acc[v] + t;
@@ -190,9 +208,11 @@ __global__ void pooling_first_window_kernel(const T* __restrict__ input,
     }
 
     T* out = output + nc * g.out_ch_stride + od * g.out_d_stride + oh * g.out_row_stride + ow0;
-    #pragma unroll
+#pragma unroll
     for (int v = 0; v < VW; ++v) {
-        if (int64_t(v) >= cols) { continue; }
+        if (int64_t(v) >= cols) {
+            continue;
+        }
         float r = acc[v];
         const int64_t taps = int64_t(colcnt[v]) * rows;
         if (IsMax) {
@@ -214,15 +234,15 @@ __global__ void pooling_first_window_kernel(const T* __restrict__ input,
 /// flat spatial index, three divisions per output. Every geometry reaches it —
 /// only the ones the grid axes cannot carry stay here.
 template <typename T>
-__global__ void pooling_first_flat_kernel(const T* __restrict__ input,
-                                          T* __restrict__ output, PoolGeom g)
+__global__ void pooling_first_flat_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                          PoolGeom g)
 {
     const int64_t nc = blockIdx.y;
     const int64_t total_spatial = g.OD * g.OH * g.OW;
     const bool is_max = g.type == PoolingType::Max;
 
-    const T* in_ch  = input  + nc * g.in_ch_stride;
-    T*       out_ch = output + nc * g.out_ch_stride;
+    const T* in_ch = input + nc * g.in_ch_stride;
+    T* out_ch = output + nc * g.out_ch_stride;
 
     for (int64_t sp = threadIdx.x; sp < total_spatial; sp += blockDim.x) {
         const int64_t od = sp / (g.OH * g.OW);
@@ -233,15 +253,21 @@ __global__ void pooling_first_flat_kernel(const T* __restrict__ input,
         int64_t valid = 0;
         for (int64_t kd = 0; kd < g.KD; ++kd) {
             const int64_t id = od * g.SD + kd * g.DD - g.PD;
-            if (id < 0 || id >= g.ID) { continue; }
+            if (id < 0 || id >= g.ID) {
+                continue;
+            }
             const T* in_d = in_ch + id * g.in_d_stride;
             for (int64_t kh = 0; kh < g.KH; ++kh) {
                 const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
-                if (ih < 0 || ih >= g.IH) { continue; }
+                if (ih < 0 || ih >= g.IH) {
+                    continue;
+                }
                 const T* row = in_d + ih * g.in_row_stride;
                 for (int64_t kw = 0; kw < g.KW; ++kw) {
                     const int64_t iw = ow * g.SW + kw * g.DW - g.PW;
-                    if (iw < 0 || iw >= g.IW) { continue; }
+                    if (iw < 0 || iw >= g.IW) {
+                        continue;
+                    }
                     const float v = s_load(&row[iw]);
                     acc = is_max ? fmaxf(acc, v) : acc + v;
                     ++valid;
@@ -273,40 +299,49 @@ __global__ void pooling_first_flat_kernel(const T* __restrict__ input,
 /// One output vector per thread, its position carried by the block axes: x is
 /// the channel chunk, y the output width, z the (image, depth plane, row).
 template <typename T, int Vec, bool IsMax>
-__global__ void pooling_last_flat_kernel(const T* __restrict__ input,
-                                         T* __restrict__ output, PoolGeom g,
-                                         int64_t c_begin, int64_t chunks)
+__global__ void pooling_last_flat_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                         PoolGeom g, int64_t c_begin, int64_t chunks)
 {
     const int64_t oh = int64_t(blockIdx.z) % g.OH;
-    const int64_t p  = int64_t(blockIdx.z) / g.OH;
+    const int64_t p = int64_t(blockIdx.z) / g.OH;
     const int64_t od = p % g.OD;
     const int64_t img = p / g.OD;
     const int64_t chunk = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t ow    = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
-    if (chunk >= chunks || ow >= g.OW) { return; }
+    const int64_t ow = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
+    if (chunk >= chunks || ow >= g.OW) {
+        return;
+    }
 
-    const T* in_img  = input  + img * (g.ID * g.in_d_stride) + c_begin + chunk * Vec;
-    T*       out_img = output + img * (g.OD * g.out_d_stride) + c_begin + chunk * Vec;
+    const T* in_img = input + img * (g.ID * g.in_d_stride) + c_begin + chunk * Vec;
+    T* out_img = output + img * (g.OD * g.out_d_stride) + c_begin + chunk * Vec;
 
     float acc[Vec];
-    #pragma unroll
-    for (int i = 0; i < Vec; ++i) { acc[i] = IsMax ? -1e30f : 0.0f; }
+#pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+        acc[i] = IsMax ? -1e30f : 0.0f;
+    }
 
     int64_t valid = 0;
     for (int64_t kd = 0; kd < g.KD; ++kd) {
         const int64_t id = od * g.SD + kd * g.DD - g.PD;
-        if (id < 0 || id >= g.ID) { continue; }
+        if (id < 0 || id >= g.ID) {
+            continue;
+        }
         const T* in_d = in_img + id * g.in_d_stride;
         for (int64_t kh = 0; kh < g.KH; ++kh) {
             const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
-            if (ih < 0 || ih >= g.IH) { continue; }
+            if (ih < 0 || ih >= g.IH) {
+                continue;
+            }
             const T* row = in_d + ih * g.in_row_stride;
             for (int64_t kw = 0; kw < g.KW; ++kw) {
                 const int64_t iw = ow * g.SW + kw * g.DW - g.PW;
-                if (iw < 0 || iw >= g.IW) { continue; }
+                if (iw < 0 || iw >= g.IW) {
+                    continue;
+                }
                 float v[Vec];
                 load_channels<T, Vec>(row + iw * g.in_pix_stride, v);
-                #pragma unroll
+#pragma unroll
                 for (int i = 0; i < Vec; ++i) {
                     acc[i] = IsMax ? fmaxf(acc[i], v[i]) : acc[i] + v[i];
                 }
@@ -316,23 +351,27 @@ __global__ void pooling_last_flat_kernel(const T* __restrict__ input,
     }
 
     if (IsMax) {
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < Vec; ++i) {
             acc[i] = (valid > 0) ? acc[i] : 0.0f;
         }
     } else {
         const int64_t denom = g.exclude_pad ? valid : g.KD * g.KH * g.KW;
         const float scale = denom > 0 ? 1.0f / static_cast<float>(denom) : 0.0f;
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { acc[i] *= scale; }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] *= scale;
+        }
     }
 
     T* out = out_img + od * g.out_d_stride + oh * g.out_row_stride + ow * g.out_pix_stride;
     if (g.add_to) {
         float prev[Vec];
         load_channels<T, Vec>(out, prev);
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { acc[i] += prev[i]; }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] += prev[i];
+        }
     }
     store_channels<T, Vec>(out, acc);
 }
@@ -342,47 +381,54 @@ __global__ void pooling_last_flat_kernel(const T* __restrict__ input,
 /// row-independent, so the per-row divisor folds into one count multiplied by
 /// the valid row and depth taps.
 template <typename T, int Vec, int K, int ROWS, bool IsMax>
-__global__ void pooling_last_rows_kernel(const T* __restrict__ input,
-                                         T* __restrict__ output, PoolGeom g,
-                                         int64_t c_begin, int64_t chunks)
+__global__ void pooling_last_rows_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                         PoolGeom g, int64_t c_begin, int64_t chunks)
 {
     const int64_t row_blocks = (g.OH + ROWS - 1) / ROWS;
     const int64_t rb = int64_t(blockIdx.z) % row_blocks;
-    const int64_t p  = int64_t(blockIdx.z) / row_blocks;
+    const int64_t p = int64_t(blockIdx.z) / row_blocks;
     const int64_t od = p % g.OD;
     const int64_t img = p / g.OD;
     const int64_t chunk = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t ow    = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
-    if (chunk >= chunks || ow >= g.OW) { return; }
+    const int64_t ow = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
+    if (chunk >= chunks || ow >= g.OW) {
+        return;
+    }
 
-    const T* in_img  = input  + img * (g.ID * g.in_d_stride) + c_begin + chunk * Vec;
-    T*       out_img = output + img * (g.OD * g.out_d_stride) + c_begin + chunk * Vec;
+    const T* in_img = input + img * (g.ID * g.in_d_stride) + c_begin + chunk * Vec;
+    T* out_img = output + img * (g.OD * g.out_d_stride) + c_begin + chunk * Vec;
 
-    const int64_t oh0  = rb * ROWS;
+    const int64_t oh0 = rb * ROWS;
     const int64_t base = ow * g.SW - g.PW;
 
     float acc[ROWS][Vec];
-    #pragma unroll
+#pragma unroll
     for (int r = 0; r < ROWS; ++r) {
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { acc[r][i] = IsMax ? -1e30f : 0.0f; }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[r][i] = IsMax ? -1e30f : 0.0f;
+        }
     }
 
     int colcnt = 0;
-    #pragma unroll
+#pragma unroll
     for (int kw = 0; kw < K; ++kw) {
         const int64_t iw = base + kw;
-        if (iw >= 0 && iw < g.IW) { ++colcnt; }
+        if (iw >= 0 && iw < g.IW) {
+            ++colcnt;
+        }
     }
     int rowcnt[ROWS];
-    #pragma unroll
+#pragma unroll
     for (int r = 0; r < ROWS; ++r) {
         int n = 0;
         if (oh0 + r < g.OH) {
-            #pragma unroll
+#pragma unroll
             for (int kh = 0; kh < K; ++kh) {
                 const int64_t iy = oh0 + r + kh - g.PH;
-                if (iy >= 0 && iy < g.IH) { ++n; }
+                if (iy >= 0 && iy < g.IH) {
+                    ++n;
+                }
             }
         }
         rowcnt[r] = n;
@@ -391,25 +437,33 @@ __global__ void pooling_last_rows_kernel(const T* __restrict__ input,
     int64_t dcount = 0;
     for (int64_t kd = 0; kd < g.KD; ++kd) {
         const int64_t id = od * g.SD + kd * g.DD - g.PD;
-        if (id < 0 || id >= g.ID) { continue; }
+        if (id < 0 || id >= g.ID) {
+            continue;
+        }
         ++dcount;
         const T* in_d = in_img + id * g.in_d_stride;
-        #pragma unroll
+#pragma unroll
         for (int kw = 0; kw < K; ++kw) {
             const int64_t iw = base + kw;
-            if (iw < 0 || iw >= g.IW) { continue; }
+            if (iw < 0 || iw >= g.IW) {
+                continue;
+            }
             const T* col = in_d + iw * g.in_pix_stride;
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < ROWS + K - 1; ++j) {
                 const int64_t iy = oh0 + j - g.PH;
-                if (iy < 0 || iy >= g.IH) { continue; }
+                if (iy < 0 || iy >= g.IH) {
+                    continue;
+                }
                 float v[Vec];
                 load_channels<T, Vec>(col + iy * g.in_row_stride, v);
-                #pragma unroll
+#pragma unroll
                 for (int kh = 0; kh < K; ++kh) {
                     const int r = j - kh;
-                    if (r < 0 || r >= ROWS || oh0 + r >= g.OH) { continue; }
-                    #pragma unroll
+                    if (r < 0 || r >= ROWS || oh0 + r >= g.OH) {
+                        continue;
+                    }
+#pragma unroll
                     for (int i = 0; i < Vec; ++i) {
                         acc[r][i] = IsMax ? fmaxf(acc[r][i], v[i]) : acc[r][i] + v[i];
                     }
@@ -418,28 +472,36 @@ __global__ void pooling_last_rows_kernel(const T* __restrict__ input,
         }
     }
 
-    #pragma unroll
+#pragma unroll
     for (int r = 0; r < ROWS; ++r) {
-        if (oh0 + r >= g.OH) { continue; }
+        if (oh0 + r >= g.OH) {
+            continue;
+        }
         const int64_t taps = int64_t(colcnt) * rowcnt[r] * dcount;
         if (IsMax) {
             if (taps == 0) {
-                #pragma unroll
-                for (int i = 0; i < Vec; ++i) { acc[r][i] = 0.0f; }
+#pragma unroll
+                for (int i = 0; i < Vec; ++i) {
+                    acc[r][i] = 0.0f;
+                }
             }
         } else {
             const int64_t denom = g.exclude_pad ? taps : g.KD * int64_t(K) * K;
             const float scale = denom > 0 ? 1.0f / static_cast<float>(denom) : 0.0f;
-            #pragma unroll
-            for (int i = 0; i < Vec; ++i) { acc[r][i] *= scale; }
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                acc[r][i] *= scale;
+            }
         }
-        T* out = out_img + od * g.out_d_stride + (oh0 + r) * g.out_row_stride
-               + ow * g.out_pix_stride;
+        T* out =
+            out_img + od * g.out_d_stride + (oh0 + r) * g.out_row_stride + ow * g.out_pix_stride;
         if (g.add_to) {
             float prev[Vec];
             load_channels<T, Vec>(out, prev);
-            #pragma unroll
-            for (int i = 0; i < Vec; ++i) { acc[r][i] += prev[i]; }
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                acc[r][i] += prev[i];
+            }
         }
         store_channels<T, Vec>(out, acc[r]);
     }
@@ -449,47 +511,56 @@ __global__ void pooling_last_rows_kernel(const T* __restrict__ input,
 /// channel vectors, the spatial index is decoded by division. Reached only by a
 /// geometry whose block axes cannot hold its task count.
 template <typename T, int Vec>
-__global__ void pooling_last_linear_kernel(const T* __restrict__ input,
-                                           T* __restrict__ output, PoolGeom g,
-                                           int64_t c_begin, int64_t chunks)
+__global__ void pooling_last_linear_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                           PoolGeom g, int64_t c_begin, int64_t chunks)
 {
     const int64_t pix_per_image = g.OD * g.OH * g.OW;
     const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (t >= g.N * pix_per_image * chunks) { return; }
+    if (t >= g.N * pix_per_image * chunks) {
+        return;
+    }
 
     const int64_t chunk = t % chunks;
-    const int64_t pix   = t / chunks;
-    const int64_t c0    = c_begin + chunk * Vec;
+    const int64_t pix = t / chunks;
+    const int64_t c0 = c_begin + chunk * Vec;
 
     const int64_t img = pix / pix_per_image;
-    const int64_t sp  = pix % pix_per_image;
+    const int64_t sp = pix % pix_per_image;
     const int64_t od = sp / (g.OH * g.OW);
     const int64_t oh = (sp / g.OW) % g.OH;
     const int64_t ow = sp % g.OW;
 
-    const T* in_img  = input  + img * (g.ID * g.in_d_stride) + c0;
-    T*       out_img = output + img * (g.OD * g.out_d_stride) + c0;
+    const T* in_img = input + img * (g.ID * g.in_d_stride) + c0;
+    T* out_img = output + img * (g.OD * g.out_d_stride) + c0;
 
     const bool is_max = g.type == PoolingType::Max;
     float acc[Vec];
-    #pragma unroll
-    for (int i = 0; i < Vec; ++i) { acc[i] = is_max ? -1e30f : 0.0f; }
+#pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+        acc[i] = is_max ? -1e30f : 0.0f;
+    }
 
     int64_t valid = 0;
     for (int64_t kd = 0; kd < g.KD; ++kd) {
         const int64_t id = od * g.SD + kd * g.DD - g.PD;
-        if (id < 0 || id >= g.ID) { continue; }
+        if (id < 0 || id >= g.ID) {
+            continue;
+        }
         const T* in_d = in_img + id * g.in_d_stride;
         for (int64_t kh = 0; kh < g.KH; ++kh) {
             const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
-            if (ih < 0 || ih >= g.IH) { continue; }
+            if (ih < 0 || ih >= g.IH) {
+                continue;
+            }
             const T* row = in_d + ih * g.in_row_stride;
             for (int64_t kw = 0; kw < g.KW; ++kw) {
                 const int64_t iw = ow * g.SW + kw * g.DW - g.PW;
-                if (iw < 0 || iw >= g.IW) { continue; }
+                if (iw < 0 || iw >= g.IW) {
+                    continue;
+                }
                 float v[Vec];
                 load_channels<T, Vec>(row + iw * g.in_pix_stride, v);
-                #pragma unroll
+#pragma unroll
                 for (int i = 0; i < Vec; ++i) {
                     acc[i] = is_max ? fmaxf(acc[i], v[i]) : acc[i] + v[i];
                 }
@@ -499,23 +570,27 @@ __global__ void pooling_last_linear_kernel(const T* __restrict__ input,
     }
 
     if (is_max) {
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < Vec; ++i) {
             acc[i] = (valid > 0) ? acc[i] : 0.0f;
         }
     } else {
         const int64_t denom = g.exclude_pad ? valid : g.KD * g.KH * g.KW;
         const float scale = denom > 0 ? 1.0f / static_cast<float>(denom) : 0.0f;
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { acc[i] *= scale; }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] *= scale;
+        }
     }
 
     T* out = out_img + od * g.out_d_stride + oh * g.out_row_stride + ow * g.out_pix_stride;
     if (g.add_to) {
         float prev[Vec];
         load_channels<T, Vec>(out, prev);
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { acc[i] += prev[i]; }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] += prev[i];
+        }
     }
     store_channels<T, Vec>(out, acc);
 }
@@ -528,12 +603,10 @@ __global__ void pooling_last_linear_kernel(const T* __restrict__ input,
 /// pitch puts dead bytes between rows, and reading through them would fold them
 /// into the reduction.
 template <typename T, bool IsMax>
-__global__ void pooling_global_first_kernel(const T* __restrict__ input,
-                                            T* __restrict__ output,
-                                            int64_t rows, int64_t width,
-                                            int64_t row_stride,
-                                            int64_t in_ch_stride,
-                                            int64_t out_ch_stride, bool add_to)
+__global__ void pooling_global_first_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                            int64_t rows, int64_t width, int64_t row_stride,
+                                            int64_t in_ch_stride, int64_t out_ch_stride,
+                                            bool add_to)
 {
     __shared__ float smem[kCudaBlockSize / kCudaWarpSize];
 
@@ -565,24 +638,21 @@ __global__ void pooling_global_first_kernel(const T* __restrict__ input,
 /// one image can fill several blocks' worth of lanes instead of being one
 /// thread's serial walk.
 template <typename T, int Vec, bool IsMax>
-__global__ void pooling_global_last_kernel(const T* __restrict__ input,
-                                           T* __restrict__ output,
-                                           int64_t c_begin, int64_t chunks,
-                                           int64_t rows, int64_t width,
-                                           int64_t in_img_stride,
-                                           int64_t in_row_stride,
-                                           int64_t in_pix_stride,
-                                           int64_t out_img_stride,
-                                           int64_t out_pix_stride,
-                                           bool add_to)
+__global__ void
+pooling_global_last_kernel(const T* __restrict__ input, T* __restrict__ output, int64_t c_begin,
+                           int64_t chunks, int64_t rows, int64_t width, int64_t in_img_stride,
+                           int64_t in_row_stride, int64_t in_pix_stride, int64_t out_img_stride,
+                           int64_t out_pix_stride, bool add_to)
 {
     const int64_t chunk = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t img   = blockIdx.y;
+    const int64_t img = blockIdx.y;
     const bool active = chunk < chunks;
 
     float acc[Vec];
-    #pragma unroll
-    for (int i = 0; i < Vec; ++i) { acc[i] = IsMax ? -1e30f : 0.0f; }
+#pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+        acc[i] = IsMax ? -1e30f : 0.0f;
+    }
 
     if (active) {
         const T* in_i = input + img * in_img_stride + c_begin + chunk * Vec;
@@ -591,7 +661,7 @@ __global__ void pooling_global_last_kernel(const T* __restrict__ input,
             for (int64_t w = 0; w < width; ++w) {
                 float v[Vec];
                 load_channels<T, Vec>(row + w * in_pix_stride, v);
-                #pragma unroll
+#pragma unroll
                 for (int i = 0; i < Vec; ++i) {
                     acc[i] = IsMax ? fmaxf(acc[i], v[i]) : acc[i] + v[i];
                 }
@@ -601,17 +671,23 @@ __global__ void pooling_global_last_kernel(const T* __restrict__ input,
 
     __shared__ float red[kCudaBlockSize * Vec];
     const int tid = int(threadIdx.y * blockDim.x + threadIdx.x);
-    #pragma unroll
-    for (int i = 0; i < Vec; ++i) { red[tid * Vec + i] = acc[i]; }
+#pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+        red[tid * Vec + i] = acc[i];
+    }
     __syncthreads();
 
-    if (threadIdx.y != 0 || !active) { return; }
+    if (threadIdx.y != 0 || !active) {
+        return;
+    }
     const int bx = int(blockDim.x);
-    #pragma unroll
-    for (int i = 0; i < Vec; ++i) { acc[i] = red[threadIdx.x * Vec + i]; }
+#pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+        acc[i] = red[threadIdx.x * Vec + i];
+    }
     for (int t = 1; t < int(blockDim.y); ++t) {
         const int base = (t * bx + int(threadIdx.x)) * Vec;
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < Vec; ++i) {
             acc[i] = IsMax ? fmaxf(acc[i], red[base + i]) : acc[i] + red[base + i];
         }
@@ -619,22 +695,26 @@ __global__ void pooling_global_last_kernel(const T* __restrict__ input,
 
     const int64_t pixels = rows * width;
     if (IsMax) {
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < Vec; ++i) {
             acc[i] = (acc[i] <= -1e29f) ? 0.0f : acc[i];
         }
     } else {
         const float scale = pixels > 0 ? 1.0f / static_cast<float>(pixels) : 0.0f;
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { acc[i] *= scale; }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] *= scale;
+        }
     }
 
     T* out = output + img * out_img_stride + c_begin + chunk * Vec;
     if (add_to) {
         float prev[Vec];
         load_channels<T, Vec>(out, prev);
-        #pragma unroll
-        for (int i = 0; i < Vec; ++i) { acc[i] += prev[i]; }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] += prev[i];
+        }
     }
     store_channels<T, Vec>(out, acc);
 }
@@ -643,8 +723,7 @@ __global__ void pooling_global_last_kernel(const T* __restrict__ input,
 // Host-side launchers
 // ============================================================
 
-inline PoolGeom pooling_geom(const PoolingAttributes& attrs,
-                             const TensorView& input,
+inline PoolGeom pooling_geom(const PoolingAttributes& attrs, const TensorView& input,
                              const TensorView& output)
 {
     const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
@@ -674,63 +753,69 @@ inline PoolGeom pooling_geom(const PoolingAttributes& attrs,
     g.add_to = attrs.add_to;
 
     if (is_channel_last(input.layout())) {
-        g.in_pix_stride  = input.shape(1);
-        g.in_row_stride  = input.row_stride_elems();
-        g.in_d_stride    = g.IH * g.in_row_stride;
+        g.in_pix_stride = input.shape(1);
+        g.in_row_stride = input.row_stride_elems();
+        g.in_d_stride = g.IH * g.in_row_stride;
         g.out_pix_stride = output.shape(1);
         g.out_row_stride = output.row_stride_elems();
-        g.out_d_stride   = g.OH * g.out_row_stride;
+        g.out_d_stride = g.OH * g.out_row_stride;
     } else {
-        g.in_row_stride  = input.row_stride_elems();
-        g.in_d_stride    = g.IH * g.in_row_stride;
-        g.in_ch_stride   = g.ID * g.in_d_stride;
+        g.in_row_stride = input.row_stride_elems();
+        g.in_d_stride = g.IH * g.in_row_stride;
+        g.in_ch_stride = g.ID * g.in_d_stride;
         g.out_row_stride = output.row_stride_elems();
-        g.out_d_stride   = g.OH * g.out_row_stride;
-        g.out_ch_stride  = g.OD * g.out_d_stride;
+        g.out_d_stride = g.OH * g.out_row_stride;
+        g.out_ch_stride = g.OD * g.out_d_stride;
     }
     return g;
 }
 
 template <typename T, int K, int SW_, int VW>
-void pooling_first_window_launch(const PoolGeom& g, const T* in, T* out,
-                                 cudaStream_t stream)
+void pooling_first_window_launch(const PoolGeom& g, const T* in, T* out, cudaStream_t stream)
 {
     const dim3 block(16, 16, 1);
     const dim3 grid(static_cast<unsigned>((g.OW + 16 * VW - 1) / (16 * VW)),
                     static_cast<unsigned>((g.OH + 15) / 16),
                     static_cast<unsigned>(g.N * g.C * g.OD));
     if (g.type == PoolingType::Max) {
-        pooling_first_window_kernel<T, K, SW_, VW, true>
-            <<<grid, block, 0, stream>>>(in, out, g);
+        pooling_first_window_kernel<T, K, SW_, VW, true><<<grid, block, 0, stream>>>(in, out, g);
     } else {
-        pooling_first_window_kernel<T, K, SW_, VW, false>
-            <<<grid, block, 0, stream>>>(in, out, g);
+        pooling_first_window_kernel<T, K, SW_, VW, false><<<grid, block, 0, stream>>>(in, out, g);
     }
 }
 
 /// Dispatch the (K, SW) menu the window kernel is instantiated for. Returns
 /// false for a geometry outside the menu, which then takes the grid kernel.
 template <typename T, int VW>
-bool pooling_first_window_dispatch(const PoolGeom& g, const T* in, T* out,
-                                   cudaStream_t stream)
+bool pooling_first_window_dispatch(const PoolGeom& g, const T* in, T* out, cudaStream_t stream)
 {
     switch (g.SW * 8 + g.KH) {
-    case 1 * 8 + 2: pooling_first_window_launch<T, 2, 1, VW>(g, in, out, stream); return true;
-    case 1 * 8 + 3: pooling_first_window_launch<T, 3, 1, VW>(g, in, out, stream); return true;
-    case 1 * 8 + 5: pooling_first_window_launch<T, 5, 1, VW>(g, in, out, stream); return true;
-    case 2 * 8 + 2: pooling_first_window_launch<T, 2, 2, VW>(g, in, out, stream); return true;
-    case 2 * 8 + 3: pooling_first_window_launch<T, 3, 2, VW>(g, in, out, stream); return true;
-    case 2 * 8 + 5: pooling_first_window_launch<T, 5, 2, VW>(g, in, out, stream); return true;
-    default: return false;
+    case 1 * 8 + 2:
+        pooling_first_window_launch<T, 2, 1, VW>(g, in, out, stream);
+        return true;
+    case 1 * 8 + 3:
+        pooling_first_window_launch<T, 3, 1, VW>(g, in, out, stream);
+        return true;
+    case 1 * 8 + 5:
+        pooling_first_window_launch<T, 5, 1, VW>(g, in, out, stream);
+        return true;
+    case 2 * 8 + 2:
+        pooling_first_window_launch<T, 2, 2, VW>(g, in, out, stream);
+        return true;
+    case 2 * 8 + 3:
+        pooling_first_window_launch<T, 3, 2, VW>(g, in, out, stream);
+        return true;
+    case 2 * 8 + 5:
+        pooling_first_window_launch<T, 5, 2, VW>(g, in, out, stream);
+        return true;
+    default:
+        return false;
     }
 }
 
 template <typename T>
-void pooling_channel_first_impl(
-    const PoolingAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void pooling_channel_first_impl(const PoolingAttributes& attrs, TensorView& output,
+                                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const PoolGeom g = pooling_geom(attrs, input, output);
@@ -741,10 +826,12 @@ void pooling_channel_first_impl(
     constexpr int VW = 4;
     const int64_t nc_od = g.N * g.C * g.OD;
     const bool square = g.KH == g.KW && (g.KH == 2 || g.KH == 3 || g.KH == 5);
-    const bool window = square && g.DH == 1 && g.DW == 1 && (g.SW == 1 || g.SW == 2)
-                        && g.OW >= 2 * VW && nc_od <= 65535 && g.OH <= 65535;
+    const bool window = square && g.DH == 1 && g.DW == 1 && (g.SW == 1 || g.SW == 2) &&
+                        g.OW >= 2 * VW && nc_od <= 65535 && g.OH <= 65535;
 
-    if (window && pooling_first_window_dispatch<T, VW>(g, in, out, stream)) { return; }
+    if (window && pooling_first_window_dispatch<T, VW>(g, in, out, stream)) {
+        return;
+    }
 
     if (nc_od <= 65535 && g.OH <= 65535) {
         // Narrow planes take a narrower block: at 7 and 14 columns a 32-lane
@@ -755,8 +842,7 @@ void pooling_channel_first_impl(
         const int by = rows < cap ? rows : cap;
         const dim3 block(static_cast<unsigned>(bx), static_cast<unsigned>(by), 1);
         const dim3 grid(static_cast<unsigned>((g.OW + bx - 1) / bx),
-                        static_cast<unsigned>((g.OH + by - 1) / by),
-                        static_cast<unsigned>(nc_od));
+                        static_cast<unsigned>((g.OH + by - 1) / by), static_cast<unsigned>(nc_od));
         if (g.type == PoolingType::Max) {
             pooling_first_grid_kernel<T, true><<<grid, block, 0, stream>>>(in, out, g);
         } else {
@@ -772,14 +858,12 @@ void pooling_channel_first_impl(
 }
 
 template <typename T, int Vec>
-void pooling_last_launch(const PoolGeom& g,
-                         TensorView& output,
-                         const TensorView& input,
-                         int64_t c_begin,
-                         int64_t c_count,
-                         cudaStream_t stream)
+void pooling_last_launch(const PoolGeom& g, TensorView& output, const TensorView& input,
+                         int64_t c_begin, int64_t c_count, cudaStream_t stream)
 {
-    if (c_count <= 0) { return; }
+    if (c_count <= 0) {
+        return;
+    }
 
     constexpr int kRows = 2;
     const int64_t chunks = (c_count + Vec - 1) / Vec;
@@ -791,8 +875,7 @@ void pooling_last_launch(const PoolGeom& g,
     const bool grid_ok = g.OW <= 65535;
 
     const bool square = g.KH == g.KW && (g.KH == 2 || g.KH == 3 || g.KH == 5);
-    const bool rows = square && g.SH == 1 && g.DH == 1 && g.DW == 1
-                      && g.OH >= 2 * kRows;
+    const bool rows = square && g.SH == 1 && g.DH == 1 && g.DW == 1 && g.OH >= 2 * kRows;
     const int64_t row_blocks = rows ? (g.OH + kRows - 1) / kRows : g.OH;
     const int64_t gz = g.N * g.OD * row_blocks;
 
@@ -803,21 +886,33 @@ void pooling_last_launch(const PoolGeom& g,
         if (rows) {
             if (g.type == PoolingType::Max) {
                 switch (int(g.KH)) {
-                case 2: pooling_last_rows_kernel<T, Vec, 2, kRows, true>
-                            <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks); return;
-                case 3: pooling_last_rows_kernel<T, Vec, 3, kRows, true>
-                            <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks); return;
-                default: pooling_last_rows_kernel<T, Vec, 5, kRows, true>
-                            <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks); return;
+                case 2:
+                    pooling_last_rows_kernel<T, Vec, 2, kRows, true>
+                        <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
+                    return;
+                case 3:
+                    pooling_last_rows_kernel<T, Vec, 3, kRows, true>
+                        <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
+                    return;
+                default:
+                    pooling_last_rows_kernel<T, Vec, 5, kRows, true>
+                        <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
+                    return;
                 }
             }
             switch (int(g.KH)) {
-            case 2: pooling_last_rows_kernel<T, Vec, 2, kRows, false>
-                        <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks); return;
-            case 3: pooling_last_rows_kernel<T, Vec, 3, kRows, false>
-                        <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks); return;
-            default: pooling_last_rows_kernel<T, Vec, 5, kRows, false>
-                        <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks); return;
+            case 2:
+                pooling_last_rows_kernel<T, Vec, 2, kRows, false>
+                    <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
+                return;
+            case 3:
+                pooling_last_rows_kernel<T, Vec, 3, kRows, false>
+                    <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
+                return;
+            default:
+                pooling_last_rows_kernel<T, Vec, 5, kRows, false>
+                    <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
+                return;
             }
         }
         if (g.type == PoolingType::Max) {
@@ -838,20 +933,17 @@ void pooling_last_launch(const PoolGeom& g,
 }
 
 template <typename T>
-void pooling_last_impl(
-    const PoolingAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void pooling_last_impl(const PoolingAttributes& attrs, TensorView& output,
+                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const PoolGeom g = pooling_geom(attrs, input, output);
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
     constexpr int kVec = static_cast<int>(16 / sizeof(T));
-    const bool vec_ok = g.C % kVec == 0
-                        && g.in_pix_stride % kVec == 0 && g.in_row_stride % kVec == 0
-                        && g.out_pix_stride % kVec == 0 && g.out_row_stride % kVec == 0;
+    const bool vec_ok = g.C % kVec == 0 && g.in_pix_stride % kVec == 0 &&
+                        g.in_row_stride % kVec == 0 && g.out_pix_stride % kVec == 0 &&
+                        g.out_row_stride % kVec == 0;
 
     const int64_t full = vec_ok ? (g.C / kVec) * kVec : 0;
     pooling_last_launch<T, kVec>(g, output, input, 0, full, stream);
@@ -859,82 +951,72 @@ void pooling_last_impl(
 }
 
 template <typename T, int Vec>
-void pooling_global_last_launch(const PoolingAttributes& attrs,
-                                TensorView& output,
-                                const TensorView& input,
-                                int64_t c_begin,
-                                int64_t c_count,
-                                const PoolGeom& g,
-                                int64_t in_img_stride,
-                                int64_t out_img_stride,
+void pooling_global_last_launch(const PoolingAttributes& attrs, TensorView& output,
+                                const TensorView& input, int64_t c_begin, int64_t c_count,
+                                const PoolGeom& g, int64_t in_img_stride, int64_t out_img_stride,
                                 cudaStream_t stream)
 {
-    if (c_count <= 0) { return; }
+    if (c_count <= 0) {
+        return;
+    }
     const int64_t chunks = (c_count + Vec - 1) / Vec;
     const int bx = int(std::min<int64_t>(chunks, kCudaWarpSize));
     const int by = kCudaBlockSize / bx;
     const dim3 block(static_cast<unsigned>(bx), static_cast<unsigned>(by), 1);
-    const dim3 grid(static_cast<unsigned>((chunks + bx - 1) / bx),
-                    static_cast<unsigned>(g.N), 1);
+    const dim3 grid(static_cast<unsigned>((chunks + bx - 1) / bx), static_cast<unsigned>(g.N), 1);
 
     const T* in = input.ptr<T>();
     T* out = output.ptr<T>();
     if (attrs.type == PoolingType::Max) {
         pooling_global_last_kernel<T, Vec, true><<<grid, block, 0, stream>>>(
-            in, out, c_begin, chunks, g.ID * g.IH, g.IW,
-            in_img_stride, g.in_row_stride, g.in_pix_stride,
-            out_img_stride, g.out_pix_stride, attrs.add_to);
+            in, out, c_begin, chunks, g.ID * g.IH, g.IW, in_img_stride, g.in_row_stride,
+            g.in_pix_stride, out_img_stride, g.out_pix_stride, attrs.add_to);
     } else {
         pooling_global_last_kernel<T, Vec, false><<<grid, block, 0, stream>>>(
-            in, out, c_begin, chunks, g.ID * g.IH, g.IW,
-            in_img_stride, g.in_row_stride, g.in_pix_stride,
-            out_img_stride, g.out_pix_stride, attrs.add_to);
+            in, out, c_begin, chunks, g.ID * g.IH, g.IW, in_img_stride, g.in_row_stride,
+            g.in_pix_stride, out_img_stride, g.out_pix_stride, attrs.add_to);
     }
 }
 
 template <typename T>
-void pooling_global_impl(
-    const PoolingAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void pooling_global_impl(const PoolingAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const PoolGeom g = pooling_geom(attrs, input, output);
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
     if (!is_channel_last(input.layout())) {
-        const int64_t in_ch_stride  = g.ID * g.IH * g.in_row_stride;
+        const int64_t in_ch_stride = g.ID * g.IH * g.in_row_stride;
         const int64_t out_ch_stride = g.out_row_stride;
         const int64_t NC = g.N * g.C;
         if (g.type == PoolingType::Max) {
             pooling_global_first_kernel<T, true>
                 <<<static_cast<unsigned>(NC), kCudaBlockSize, 0, stream>>>(
-                    input.ptr<T>(), output.ptr<T>(), g.ID * g.IH, g.IW,
-                    g.in_row_stride, in_ch_stride, out_ch_stride, attrs.add_to);
+                    input.ptr<T>(), output.ptr<T>(), g.ID * g.IH, g.IW, g.in_row_stride,
+                    in_ch_stride, out_ch_stride, attrs.add_to);
         } else {
             pooling_global_first_kernel<T, false>
                 <<<static_cast<unsigned>(NC), kCudaBlockSize, 0, stream>>>(
-                    input.ptr<T>(), output.ptr<T>(), g.ID * g.IH, g.IW,
-                    g.in_row_stride, in_ch_stride, out_ch_stride, attrs.add_to);
+                    input.ptr<T>(), output.ptr<T>(), g.ID * g.IH, g.IW, g.in_row_stride,
+                    in_ch_stride, out_ch_stride, attrs.add_to);
         }
         return;
     }
 
-    const int64_t in_img_stride  = g.ID * g.IH * g.in_row_stride;
+    const int64_t in_img_stride = g.ID * g.IH * g.in_row_stride;
     const int64_t out_img_stride = g.out_row_stride;
 
     constexpr int kVec = static_cast<int>(16 / sizeof(T));
-    const bool vec_ok = g.C % kVec == 0 && g.in_pix_stride % kVec == 0
-                        && g.out_pix_stride % kVec == 0
-                        && g.in_row_stride % kVec == 0
-                        && in_img_stride % kVec == 0 && out_img_stride % kVec == 0;
+    const bool vec_ok = g.C % kVec == 0 && g.in_pix_stride % kVec == 0 &&
+                        g.out_pix_stride % kVec == 0 && g.in_row_stride % kVec == 0 &&
+                        in_img_stride % kVec == 0 && out_img_stride % kVec == 0;
 
     const int64_t full = vec_ok ? (g.C / kVec) * kVec : 0;
-    pooling_global_last_launch<T, kVec>(attrs, output, input, 0, full, g,
-                                        in_img_stride, out_img_stride, stream);
-    pooling_global_last_launch<T, 1>(attrs, output, input, full, g.C - full, g,
-                                     in_img_stride, out_img_stride, stream);
+    pooling_global_last_launch<T, kVec>(attrs, output, input, 0, full, g, in_img_stride,
+                                        out_img_stride, stream);
+    pooling_global_last_launch<T, 1>(attrs, output, input, full, g.C - full, g, in_img_stride,
+                                     out_img_stride, stream);
 }
 
 // ============================================================
@@ -942,10 +1024,8 @@ void pooling_global_impl(
 // ============================================================
 
 template <typename T>
-void pooling_dispatch(const PoolingAttributes& attrs,
-                      TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx)
+void pooling_dispatch(const PoolingAttributes& attrs, TensorView& output,
+                      std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     if (attrs.global) {
         pooling_global_impl<T>(attrs, output, inputs, ctx);
@@ -956,12 +1036,9 @@ void pooling_dispatch(const PoolingAttributes& attrs,
     }
 }
 
-Status pooling_cuda(
-    const PoolingAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx,
-    void* /*workspace*/)
+Status pooling_cuda(const PoolingAttributes& attrs, TensorView& output,
+                    std::span<const TensorView> inputs, const ComputeContext& ctx,
+                    void* /*workspace*/)
 {
     switch (inputs[0].data_type()) {
     case DataType::f32:
@@ -978,4 +1055,4 @@ Status pooling_cuda(
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

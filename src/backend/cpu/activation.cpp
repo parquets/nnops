@@ -31,38 +31,66 @@ namespace {
 /// Shared by the f32/f16 paths (in/out strides may differ) and the quantized
 /// path (in == out, stride == N, add_to == false).
 template <typename T>
-void apply_activation_flt(ActivationType type, const T* in, T* out,
-                          int64_t M, int64_t N, int64_t in_stride, int64_t out_stride,
-                          bool add_to, float alpha, float beta) {
+void apply_activation_flt(ActivationType type, const T* in, T* out, int64_t M, int64_t N,
+                          int64_t in_stride, int64_t out_stride, bool add_to, float alpha,
+                          float beta)
+{
     switch (type) {
-    case ActivationType::Relu:        kernel::relu<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case ActivationType::LeakyRelu:   kernel::leaky_relu<T>(in, out, M, N, in_stride, out_stride, add_to, alpha); break;
-    case ActivationType::Sigmoid:     kernel::sigmoid<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case ActivationType::Tanh:        kernel::tanh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case ActivationType::Gelu:        kernel::gelu<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case ActivationType::Silu:        kernel::silu<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case ActivationType::HardSwish:   kernel::hard_swish<T>(in, out, M, N, in_stride, out_stride, add_to, beta); break;
-    case ActivationType::Elu:         kernel::elu<T>(in, out, M, N, in_stride, out_stride, add_to, alpha); break;
-    case ActivationType::HardSigmoid: kernel::hard_sigmoid<T>(in, out, M, N, in_stride, out_stride, add_to, alpha, beta); break;
-    case ActivationType::Softplus:    kernel::softplus<T>(in, out, M, N, in_stride, out_stride, add_to, beta); break;
-    case ActivationType::Selu:        kernel::selu<T>(in, out, M, N, in_stride, out_stride, add_to, alpha, beta); break;
-    case ActivationType::Mish:        kernel::mish<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case ActivationType::QuickGelu:   kernel::quick_gelu<T>(in, out, M, N, in_stride, out_stride, add_to, alpha); break;
-    case ActivationType::GeluExact:   kernel::gelu_exact<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case ActivationType::PRelu:       break;  // channel-mixing; see prelu_impl
+    case ActivationType::Relu:
+        kernel::relu<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case ActivationType::LeakyRelu:
+        kernel::leaky_relu<T>(in, out, M, N, in_stride, out_stride, add_to, alpha);
+        break;
+    case ActivationType::Sigmoid:
+        kernel::sigmoid<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case ActivationType::Tanh:
+        kernel::tanh<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case ActivationType::Gelu:
+        kernel::gelu<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case ActivationType::Silu:
+        kernel::silu<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case ActivationType::HardSwish:
+        kernel::hard_swish<T>(in, out, M, N, in_stride, out_stride, add_to, beta);
+        break;
+    case ActivationType::Elu:
+        kernel::elu<T>(in, out, M, N, in_stride, out_stride, add_to, alpha);
+        break;
+    case ActivationType::HardSigmoid:
+        kernel::hard_sigmoid<T>(in, out, M, N, in_stride, out_stride, add_to, alpha, beta);
+        break;
+    case ActivationType::Softplus:
+        kernel::softplus<T>(in, out, M, N, in_stride, out_stride, add_to, beta);
+        break;
+    case ActivationType::Selu:
+        kernel::selu<T>(in, out, M, N, in_stride, out_stride, add_to, alpha, beta);
+        break;
+    case ActivationType::Mish:
+        kernel::mish<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case ActivationType::QuickGelu:
+        kernel::quick_gelu<T>(in, out, M, N, in_stride, out_stride, add_to, alpha);
+        break;
+    case ActivationType::GeluExact:
+        kernel::gelu_exact<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case ActivationType::PRelu:
+        break; // channel-mixing; see prelu_impl
     }
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 /// PRelu: one slope per logical channel (dim 1). Channel-first strides a whole plane
 /// per slope, so a row is one constant-slope LeakyRelu; channel-last packs C
 /// inside every pixel, so the slope vector loads alongside the pixel vector.
 template <typename T>
-void prelu_impl(const ActivationAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx)
+void prelu_impl(const ActivationAttributes& attrs, TensorView& output,
+                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     using namespace simd;
     const auto& x = inputs[0];
@@ -72,13 +100,15 @@ void prelu_impl(const ActivationAttributes& attrs,
     const T* sp = slope.ptr<T>();
     const T* in = x.ptr<T>();
     T* out = output.ptr<T>();
-    const int64_t in_stride  = x.row_stride_elems();
+    const int64_t in_stride = x.row_stride_elems();
     const int64_t out_stride = output.row_stride_elems();
     const bool add_to = attrs.add_to;
     const T* type_tag = nullptr;
 
     const int64_t rows_total = x.total_rows();
-    if (rows_total == 0) { return; }
+    if (rows_total == 0) {
+        return;
+    }
     const int64_t rows_per_c = (C > 0) ? rows_total / C : 0;
 
     // Rank-2 keeps C on the innermost axis in either layout; rank ≥ 3 channel-first
@@ -96,9 +126,8 @@ void prelu_impl(const ActivationAttributes& attrs,
             for (int64_t j = 0; j < m; ++j) {
                 const int64_t r = r0 + j;
                 const int64_t c = (slope_n == 1) ? 0 : r / rows_per_c;
-                kernel::leaky_relu<T>(in + r * in_stride, out + r * out_stride,
-                                      1, cols, in_stride, out_stride, add_to,
-                                      s_load(&sp[c]));
+                kernel::leaky_relu<T>(in + r * in_stride, out + r * out_stride, 1, cols, in_stride,
+                                      out_stride, add_to, s_load(&sp[c]));
             }
         });
         return;
@@ -113,8 +142,12 @@ void prelu_impl(const ActivationAttributes& attrs,
 
     // The slope vector for the L lanes starting at column @p c0.
     const auto slope_vec = [&](int64_t c0) {
-        if (slope_n == 1) { return v_set1(type_tag, s_load(sp)); }
-        if (c_aligned) { return v_load(&sp[c0 % C]); }
+        if (slope_n == 1) {
+            return v_set1(type_tag, s_load(sp));
+        }
+        if (c_aligned) {
+            return v_load(&sp[c0 % C]);
+        }
         // The channel repeats every C, so one vector can straddle two pixels;
         // gather its lanes.
         T lane_alpha[L];
@@ -149,42 +182,38 @@ void prelu_impl(const ActivationAttributes& attrs,
 }
 
 template <typename T>
-void activation_impl(const ActivationAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx)
+void activation_impl(const ActivationAttributes& attrs, TensorView& output,
+                     std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    tiled_float_transform<T>(inputs[0], output, ctx,
+    tiled_float_transform<T>(
+        inputs[0], output, ctx,
         [&](const T* in, T* out, int64_t m, int64_t n, int64_t in_stride, int64_t out_stride) {
-            apply_activation_flt<T>(attrs.type, in, out, m, n, in_stride, out_stride,
-                                    attrs.add_to, attrs.alpha, attrs.beta);
+            apply_activation_flt<T>(attrs.type, in, out, m, n, in_stride, out_stride, attrs.add_to,
+                                    attrs.alpha, attrs.beta);
         });
 }
 
-Status activation_quant_impl(const ActivationAttributes& attrs,
-                              TensorView& output,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx)
+Status activation_quant_impl(const ActivationAttributes& attrs, TensorView& output,
+                             std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     // add_to is only meaningful on the float (non-quantized) path.
-    if (attrs.add_to) { return Status::unsupported; }
+    if (attrs.add_to) {
+        return Status::unsupported;
+    }
 
-    quantized_unary_transform(inputs[0], output, ctx,
-        [&](float* scratch, int h, int w) {
-            apply_activation_flt<float>(attrs.type, scratch, scratch, h, w, w, w, false,
-                                        attrs.alpha, attrs.beta);
-        });
+    quantized_unary_transform(inputs[0], output, ctx, [&](float* scratch, int h, int w) {
+        apply_activation_flt<float>(attrs.type, scratch, scratch, h, w, w, w, false, attrs.alpha,
+                                    attrs.beta);
+    });
     return Status::ok;
 }
 
-Status activation_cpu(const ActivationAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* /*workspace*/)
+Status activation_cpu(const ActivationAttributes& attrs, TensorView& output,
+                      std::span<const TensorView> inputs, const ComputeContext& ctx,
+                      void* /*workspace*/)
 {
     const auto dtype = inputs[0].data_type();
-    const bool in_is_int  = is_quantized_dtype(dtype);
+    const bool in_is_int = is_quantized_dtype(dtype);
     const bool out_is_int = is_quantized_dtype(output.data_type());
 
     if (!in_is_int && !out_is_int) {
@@ -204,9 +233,11 @@ Status activation_cpu(const ActivationAttributes& attrs,
 
     // A per-channel slope crossing channels would need the fused dequant to
     // carry the channel index; keep the float route as the only one.
-    if (attrs.type == ActivationType::PRelu) { return Status::unsupported; }
+    if (attrs.type == ActivationType::PRelu) {
+        return Status::unsupported;
+    }
 
     return activation_quant_impl(attrs, output, inputs, ctx);
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

@@ -36,12 +36,13 @@ void split_impl(const TensorView& input, std::span<TensorView> outputs,
     int64_t off = 0;
     for (int64_t j = 0; j < n; ++j) {
         TensorView& out = outputs[static_cast<size_t>(j)];
-        const int64_t len = attrs.split.empty() ? dim / n
-                                                : attrs.split[static_cast<size_t>(j)];
+        const int64_t len = attrs.split.empty() ? dim / n : attrs.split[static_cast<size_t>(j)];
 
         int64_t odims[8], ostr[8];
         logical_strides(out, ostr);
-        for (int64_t d = 0; d < out.rank(); ++d) { odims[d] = out.shape(d); }
+        for (int64_t d = 0; d < out.rank(); ++d) {
+            odims[d] = out.shape(d);
+        }
 
         T* op = out.ptr<T>();
         const int64_t base = off * istr[axis];
@@ -59,13 +60,10 @@ void split_impl(const TensorView& input, std::span<TensorView> outputs,
     }
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status split_cpu(const SplitAttributes& attrs,
-                 std::span<TensorView> outputs,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* /*workspace*/)
+Status split_cpu(const SplitAttributes& attrs, std::span<TensorView> outputs,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
     for_each_data_type(inputs[0].data_type(), [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -74,4 +72,4 @@ Status split_cpu(const SplitAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

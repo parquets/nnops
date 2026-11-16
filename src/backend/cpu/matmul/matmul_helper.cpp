@@ -52,8 +52,8 @@ namespace nnops::backend::cpu {
 // Trailing live width: one kernel serves a full panel and a tail.
 
 template <class T>
-using PackFn = void (*)(T* NNOPS_RESTRICT output, const T* NNOPS_RESTRICT input,
-                        int ir_step, int K, float scale, int w);
+using PackFn = void (*)(T* NNOPS_RESTRICT output, const T* NNOPS_RESTRICT input, int ir_step, int K,
+                        float scale, int w);
 
 // Pack tables (largest-first): row 0 = LHS (MR), row 1 = RHS (NR).
 constexpr std::array<std::array<PackFn<float>, MR_LEVELS>, 2> pack_trans_f32_fn = {{
@@ -117,9 +117,15 @@ template <> struct TileTraits<float> {
     static constexpr const int* mr() { return MR_F32; }
     static constexpr const int* nr() { return NR_F32; }
     static constexpr const auto& trans() { return pack_trans_f32_fn; }
-    static constexpr const auto& copy()  { return pack_copy_f32_fn; }
-    template <bool Z, int S = 0> static constexpr const auto& mma_pack() { return mma_pack_fns_f32<Z, S>; }
-    template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_f32<Z, S>; }
+    static constexpr const auto& copy() { return pack_copy_f32_fn; }
+    template <bool Z, int S = 0> static constexpr const auto& mma_pack()
+    {
+        return mma_pack_fns_f32<Z, S>;
+    }
+    template <bool Z, int S> static constexpr const auto& mma_direct()
+    {
+        return mma_direct_fns_f32<Z, S>;
+    }
 };
 
 template <> struct TileTraits<half> {
@@ -127,9 +133,15 @@ template <> struct TileTraits<half> {
     static constexpr const int* mr() { return MR_F16; }
     static constexpr const int* nr() { return NR_F16; }
     static constexpr const auto& trans() { return pack_trans_f16_fn; }
-    static constexpr const auto& copy()  { return pack_copy_f16_fn; }
-    template <bool Z, int S = 0> static constexpr const auto& mma_pack() { return mma_pack_fns_f16<Z, S>; }
-    template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_f16<Z, S>; }
+    static constexpr const auto& copy() { return pack_copy_f16_fn; }
+    template <bool Z, int S = 0> static constexpr const auto& mma_pack()
+    {
+        return mma_pack_fns_f16<Z, S>;
+    }
+    template <bool Z, int S> static constexpr const auto& mma_direct()
+    {
+        return mma_direct_fns_f16<Z, S>;
+    }
 };
 
 #ifdef NNOPS_ARCH_AARCH64
@@ -138,18 +150,23 @@ template <> struct TileTraits<bfloat16> {
     static constexpr const int* mr() { return MR_BF16; }
     static constexpr const int* nr() { return NR_BF16; }
     static constexpr const auto& trans() { return pack_trans_bf16_fn; }
-    static constexpr const auto& copy()  { return pack_copy_bf16_fn; }
-    template <bool Z, int S = 0> static constexpr const auto& mma_pack() { return mma_pack_fns_bf16<Z, S>; }
-    template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_bf16<Z, S>; }
+    static constexpr const auto& copy() { return pack_copy_bf16_fn; }
+    template <bool Z, int S = 0> static constexpr const auto& mma_pack()
+    {
+        return mma_pack_fns_bf16<Z, S>;
+    }
+    template <bool Z, int S> static constexpr const auto& mma_direct()
+    {
+        return mma_direct_fns_bf16<Z, S>;
+    }
 };
 #endif
 
 /// 64-byte-aligned panel stride, in elements.
-template <class T>
-constexpr int panel_stride(int rows, int kc) {
-    return static_cast<int>(
-        mma_pack_align(rows * kc * static_cast<int>(sizeof(T)))
-        / static_cast<int>(sizeof(T)));
+template <class T> constexpr int panel_stride(int rows, int kc)
+{
+    return static_cast<int>(mma_pack_align(rows * kc * static_cast<int>(sizeof(T))) /
+                            static_cast<int>(sizeof(T)));
 }
 
 /// One M panel: @p level selects the packer and MMA width, @p rows is how many
@@ -157,7 +174,10 @@ constexpr int panel_stride(int rows, int kc) {
 /// kernels alias every row past the live count onto the last live row, in A and
 /// in C: the surplus rows redo a lane of arithmetic and store it back to the
 /// same place. No padding, no bounds, no change in the result.
-struct MrPanel { int level; int rows; };
+struct MrPanel {
+    int level;
+    int rows;
+};
 
 /// The rows below the level-0 stride, largest level first, then the last two
 /// panels folded into the next wider kernel for as long as they both fit in it.
@@ -166,15 +186,20 @@ struct MrPanel { int level; int rows; };
 ///
 /// Caller passes fewer than 3 * levels[0] rows, so the tail is at most
 /// 3 * levels[0] / levels[1] + 2 panels; MrPanel[10] covers every shipped table.
-inline int tail_panels(int count, const int* levels, MrPanel* out) {
+inline int tail_panels(int count, const int* levels, MrPanel* out)
+{
     int n = 0;
     for (int lv = 1; lv < MR_LEVELS && levels[lv] > 0; ++lv) {
-        for (const int w = levels[lv]; count >= w; count -= w) { out[n++] = {lv, w}; }
+        for (const int w = levels[lv]; count >= w; count -= w) {
+            out[n++] = {lv, w};
+        }
     }
     while (n >= 2) {
         MrPanel& a = out[n - 2];
         const int merged = a.rows + out[n - 1].rows;
-        if (a.level == 0 || merged > levels[a.level - 1]) { break; }
+        if (a.level == 0 || merged > levels[a.level - 1]) {
+            break;
+        }
         a.rows = merged;
         --a.level;
         --n;
@@ -190,8 +215,8 @@ inline int tail_panels(int count, const int* levels, MrPanel* out) {
 /// Only the level-0 count is searched, and only a couple of steps below greedy:
 /// giving up a level-0 panel frees under one stride, which one tail panel now
 /// covers outright. Yields 1, 2, 4/3, 4, 6/5, 6, 6+1, 4+4 for 1..8 rows.
-template <class Emit>
-inline void walk_levels(int& i, int count, const int* levels, Emit&& emit) {
+template <class Emit> inline void walk_levels(int& i, int count, const int* levels, Emit&& emit)
+{
     const int l0 = levels[0];
     const int greedy = count / l0;
     int best_q0 = greedy, best_n = count + 1, best_waste = 0, best_wide = 0;
@@ -214,11 +239,16 @@ inline void walk_levels(int& i, int count, const int* levels, Emit&& emit) {
             best_waste = waste;
             best_wide = wide;
             best_tail_n = tn;
-            for (int t = 0; t < tn; ++t) { best_tail[t] = tail[t]; }
+            for (int t = 0; t < tn; ++t) {
+                best_tail[t] = tail[t];
+            }
         }
     }
 
-    for (int n = 0; n < best_q0; ++n) { emit(0, l0); i += l0; }
+    for (int n = 0; n < best_q0; ++n) {
+        emit(0, l0);
+        i += l0;
+    }
     for (int t = 0; t < best_tail_n; ++t) {
         emit(best_tail[t].level, best_tail[t].rows);
         i += best_tail[t].rows;
@@ -230,31 +260,45 @@ inline void walk_levels(int& i, int count, const int* levels, Emit&& emit) {
 /// the kernel that packed it and the tail stays exact. The count search still
 /// applies (8 rows is 4+4, not 6+1+1); only the rounding does not.
 template <class Emit>
-inline void walk_levels_exact(int& i, int count, const int* levels, Emit&& emit) {
+inline void walk_levels_exact(int& i, int count, const int* levels, Emit&& emit)
+{
     const int l0 = levels[0], l1 = levels[1];
     const int greedy = count / l0;
     int best = count + 1, best_q0 = greedy;
     for (int q0 = greedy; q0 >= 0 && q0 >= greedy - 2; --q0) {
         const int rest = count - q0 * l0;
         const int n = q0 + rest / l1 + rest % l1;
-        if (n < best) { best = n; best_q0 = q0; }
+        if (n < best) {
+            best = n;
+            best_q0 = q0;
+        }
     }
-    for (int n = 0; n < best_q0; ++n) { emit(0, l0); i += l0; }
+    for (int n = 0; n < best_q0; ++n) {
+        emit(0, l0);
+        i += l0;
+    }
     for (int lv = 1; lv < MR_LEVELS && levels[lv] > 0; ++lv) {
-        for (int w = levels[lv]; i + w <= count; i += w) { emit(lv, w); }
+        for (int w = levels[lv]; i + w <= count; i += w) {
+            emit(lv, w);
+        }
     }
 }
 
-template <class Pack>
-inline void for_each_n_panel(int nc, int nr_max, Pack&& pack) {
+template <class Pack> inline void for_each_n_panel(int nc, int nr_max, Pack&& pack)
+{
     int n = 0;
-    for (; n + nr_max <= nc; n += nr_max) { pack(nr_max); }
-    if (n < nc) { pack(nc - n); }
+    for (; n + nr_max <= nc; n += nr_max) {
+        pack(nr_max);
+    }
+    if (n < nc) {
+        pack(nc - n);
+    }
 }
 
 template <class T>
-void tile_pack_lhs_impl(bool trans, int mc, int kc, T* dst, int ldd,
-                        const T* src, int lds, float scale) {
+void tile_pack_lhs_impl(bool trans, int mc, int kc, T* dst, int ldd, const T* src, int lds,
+                        float scale)
+{
     using Tr = TileTraits<T>;
     using Fn = typename Tr::Pack;
     // transposed source is a plain copy; row-major needs the transposing kernel.
@@ -269,19 +313,22 @@ void tile_pack_lhs_impl(bool trans, int mc, int kc, T* dst, int ldd,
     });
 }
 
-void tile_pack_lhs(bool trans, int mc, int kc,
-                   float* dst, int ldd, const float* src, int lds, float scale) {
+void tile_pack_lhs(bool trans, int mc, int kc, float* dst, int ldd, const float* src, int lds,
+                   float scale)
+{
     tile_pack_lhs_impl(trans, mc, kc, dst, ldd, src, lds, scale);
 }
 
-void tile_pack_lhs(bool trans, int mc, int kc,
-                   half* dst, int ldd, const half* src, int lds, float scale) {
+void tile_pack_lhs(bool trans, int mc, int kc, half* dst, int ldd, const half* src, int lds,
+                   float scale)
+{
     tile_pack_lhs_impl(trans, mc, kc, dst, ldd, src, lds, scale);
 }
 
 #ifdef NNOPS_ARCH_AARCH64
-void tile_pack_lhs(bool trans, int mc, int kc,
-                   bfloat16* dst, int ldd, const bfloat16* src, int lds, float scale) {
+void tile_pack_lhs(bool trans, int mc, int kc, bfloat16* dst, int ldd, const bfloat16* src, int lds,
+                   float scale)
+{
     tile_pack_lhs_impl(trans, mc, kc, dst, ldd, src, lds, scale);
 }
 #endif
@@ -291,8 +338,9 @@ void tile_pack_lhs(bool trans, int mc, int kc,
 // =========================================================================
 
 template <class T>
-void tile_pack_rhs_impl(bool trans, int nc, int kc, T* dst, int ldd,
-                        const T* src, int lds, float scale) {
+void tile_pack_rhs_impl(bool trans, int nc, int kc, T* dst, int ldd, const T* src, int lds,
+                        float scale)
+{
     using Tr = TileTraits<T>;
     using Fn = typename Tr::Pack;
     constexpr int nr_max = Tr::nr()[0];
@@ -313,10 +361,10 @@ void tile_pack_rhs_impl(bool trans, int nc, int kc, T* dst, int ldd,
 /// `Seed` picks the bias axis: 1 is a per-row vector indexed from @p m, 2 a
 /// per-column one that steps with the panel.
 template <class T, bool Zero, int Seed>
-void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc,
-                        const T* packed_a, const T* b, int64_t ldb,
-                        float clamp_min, float clamp_max,
-                        const T* bias, const T* col_bias) {
+void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc, const T* packed_a, const T* b,
+                        int64_t ldb, float clamp_min, float clamp_max, const T* bias,
+                        const T* col_bias)
+{
     using Tr = TileTraits<T>;
     const auto& fns = Tr::template mma_pack<Zero, Seed>();
     constexpr int nr = Tr::nr()[0];
@@ -329,14 +377,14 @@ void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc,
     int m = 0;
     walk_levels(m, Mc, Tr::mr(), [&](int level, int s) {
         if (ldb == -1) {
-            fns[level](s, Nc, Kc, c + m * ldc, ldc, packed_a, b,
-                       clamp_min, clamp_max, seed_at(m, 0));
+            fns[level](s, Nc, Kc, c + m * ldc, ldc, packed_a, b, clamp_min, clamp_max,
+                       seed_at(m, 0));
         } else {
             for (int n = 0; n < Nc; n += nr) {
                 const int w = std::min<int>(nr, Nc - n);
                 fns[level](s, w, Kc, c + m * ldc + n, ldc, packed_a,
-                           b + (static_cast<int64_t>(n) / nr) * -ldb,
-                           clamp_min, clamp_max, seed_at(m, n));
+                           b + (static_cast<int64_t>(n) / nr) * -ldb, clamp_min, clamp_max,
+                           seed_at(m, n));
             }
         }
         packed_a += ldd_a;
@@ -348,10 +396,10 @@ void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc,
 /// The partial last panel is packed into @p stage, since the kernel reads a
 /// panel whole.
 template <class T, bool Zero, int Seed>
-void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
-                          const T* a, int lda, const T* b, int64_t ldb,
-                          T* stage, float clamp_min, float clamp_max,
-                          const T* bias, const T* col_bias) {
+void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc, const T* a, int lda, const T* b,
+                          int64_t ldb, T* stage, float clamp_min, float clamp_max, const T* bias,
+                          const T* col_bias)
+{
     using Tr = TileTraits<T>;
     const auto& fns = Tr::template mma_direct<Zero, Seed>();
     constexpr int nr = Tr::nr()[0];
@@ -366,8 +414,8 @@ void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
     walk_levels(m, Mc, Tr::mr(), [&](int level, int s) {
         const T* const a_m = a + m * lda;
         if (ldb == -1) {
-            fns[level](s, Nc, Kc, c + m * ldc, ldc, a_m, lda, b, /*ldb=*/-1,
-                       clamp_min, clamp_max, seed_at(m, 0));
+            fns[level](s, Nc, Kc, c + m * ldc, ldc, a_m, lda, b, /*ldb=*/-1, clamp_min, clamp_max,
+                       seed_at(m, 0));
         } else if (ldb < 0) {
             // A 1-row panel is a pure weight stream, so its kernel takes two
             // packed panels there and its one A scalar feeds two panel widths;
@@ -377,15 +425,15 @@ void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
             for (int n = 0; n < Nc; n += step) {
                 const int w = std::min<int>(step, Nc - n);
                 fns[level](s, w, Kc, c + m * ldc + n, ldc, a_m, lda,
-                           b + (static_cast<int64_t>(n) / nr) * -ldb, b_ld,
-                           clamp_min, clamp_max, seed_at(m, n));
+                           b + (static_cast<int64_t>(n) / nr) * -ldb, b_ld, clamp_min, clamp_max,
+                           seed_at(m, n));
             }
         } else {
             const int ld = static_cast<int>(ldb);
             int n = 0;
             for (; n + nr <= Nc; n += nr) {
-                fns[level](s, nr, Kc, c + m * ldc + n, ldc, a_m, lda, b + n, ld,
-                           clamp_min, clamp_max, seed_at(m, n));
+                fns[level](s, nr, Kc, c + m * ldc + n, ldc, a_m, lda, b + n, ld, clamp_min,
+                           clamp_max, seed_at(m, n));
             }
             if (n < Nc) {
                 const int w = Nc - n;
@@ -395,12 +443,12 @@ void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
                 // and handing it back at `ldb == nr` would misread the layout
                 // (and bf16's panel is ⌈kc/4⌉ groups, wider than nr·kc).
                 if constexpr (std::is_same_v<T, bfloat16>) {
-                    fns[level](s, w, Kc, c + m * ldc + n, ldc, a_m, lda, b + n, ld,
-                               clamp_min, clamp_max, seed_at(m, n));
+                    fns[level](s, w, Kc, c + m * ldc + n, ldc, a_m, lda, b + n, ld, clamp_min,
+                               clamp_max, seed_at(m, n));
                 } else {
                     tile_pack_rhs(false, w, Kc, stage, nr * Kc, b + n, ld, 1.0f);
-                    fns[level](s, w, Kc, c + m * ldc + n, ldc, a_m, lda, stage, nr,
-                               clamp_min, clamp_max, seed_at(m, n));
+                    fns[level](s, w, Kc, c + m * ldc + n, ldc, a_m, lda, stage, nr, clamp_min,
+                               clamp_max, seed_at(m, n));
                 }
             }
         }
@@ -408,40 +456,59 @@ void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
 }
 
 template <class T>
-void dispatch_mma_pack(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
-                       const T* a, const T* b, int64_t ldb, float lo, float hi,
-                       const T* bias, const T* col_bias) {
+void dispatch_mma_pack(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc, const T* a,
+                       const T* b, int64_t ldb, float lo, float hi, const T* bias,
+                       const T* col_bias)
+{
     // Either bias builds the tile, so there is nothing in C to accumulate onto.
-    if (col_bias != nullptr) { tile_mma_pack_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, nullptr, col_bias); }
-    else if (bias != nullptr) { tile_mma_pack_impl<T, true, 1>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, bias, nullptr); }
-    else if (zero_mode)  { tile_mma_pack_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, nullptr, nullptr); }
-    else                 { tile_mma_pack_impl<T, false, 0>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, nullptr, nullptr); }
+    if (col_bias != nullptr) {
+        tile_mma_pack_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, nullptr, col_bias);
+    } else if (bias != nullptr) {
+        tile_mma_pack_impl<T, true, 1>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, bias, nullptr);
+    } else if (zero_mode) {
+        tile_mma_pack_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, nullptr, nullptr);
+    } else {
+        tile_mma_pack_impl<T, false, 0>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, nullptr, nullptr);
+    }
 }
 
 template <class T>
-void dispatch_mma_direct(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
-                         const T* a, int lda, const T* b, int64_t ldb, T* stage,
-                         float lo, float hi, const T* bias, const T* col_bias) {
+void dispatch_mma_direct(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc, const T* a, int lda,
+                         const T* b, int64_t ldb, T* stage, float lo, float hi, const T* bias,
+                         const T* col_bias)
+{
     // Either bias builds the tile, so there is nothing in C to accumulate onto.
-    if (col_bias != nullptr) { tile_mma_direct_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, nullptr, col_bias); }
-    else if (bias != nullptr) { tile_mma_direct_impl<T, true, 1>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, bias, nullptr); }
-    else if (zero_mode)  { tile_mma_direct_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, nullptr, nullptr); }
-    else                 { tile_mma_direct_impl<T, false, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, nullptr, nullptr); }
+    if (col_bias != nullptr) {
+        tile_mma_direct_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, nullptr,
+                                         col_bias);
+    } else if (bias != nullptr) {
+        tile_mma_direct_impl<T, true, 1>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, bias,
+                                         nullptr);
+    } else if (zero_mode) {
+        tile_mma_direct_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, nullptr,
+                                         nullptr);
+    } else {
+        tile_mma_direct_impl<T, false, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi,
+                                          nullptr, nullptr);
+    }
 }
 
-void tile_pack_rhs(bool trans, int nc, int kc,
-                   float* dst, int ldd, const float* src, int lds, float scale) {
+void tile_pack_rhs(bool trans, int nc, int kc, float* dst, int ldd, const float* src, int lds,
+                   float scale)
+{
     tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
 }
 
-void tile_pack_rhs(bool trans, int nc, int kc,
-                   half* dst, int ldd, const half* src, int lds, float scale) {
+void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* src, int lds,
+                   float scale)
+{
     tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
 }
 
 #ifdef NNOPS_ARCH_AARCH64
-void tile_pack_rhs(bool trans, int nc, int kc,
-                   bfloat16* dst, int ldd, const bfloat16* src, int lds, float scale) {
+void tile_pack_rhs(bool trans, int nc, int kc, bfloat16* dst, int ldd, const bfloat16* src, int lds,
+                   float scale)
+{
     tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
 }
 #endif
@@ -450,31 +517,29 @@ void tile_pack_rhs(bool trans, int nc, int kc,
 // The f32/f16 panel layout matches tile_pack_rhs; bf16 uses the BFMMLA layout
 // pack_bf16.hpp defines. The MMA route never sees the blocks either way.
 
-static_assert(q4_1_block_elems == 32,
-              "the block RHS packers assume 32-value blocks");
+static_assert(q4_1_block_elems == 32, "the block RHS packers assume 32-value blocks");
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale) {
-    arch::pack_q4_1_rhs<float>(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                               src_row_blocks, scale);
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, float* dst, int ldd,
+                        const void* src, int64_t src_row_blocks, float scale)
+{
+    arch::pack_q4_1_rhs<float>(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks,
+                               scale);
 }
 
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale) {
-    arch::pack_q4_1_rhs<half>(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                              src_row_blocks, scale);
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, half* dst, int ldd,
+                        const void* src, int64_t src_row_blocks, float scale)
+{
+    arch::pack_q4_1_rhs<half>(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks,
+                              scale);
 }
 
 #ifdef NNOPS_ARCH_AARCH64
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        bfloat16* dst, int ldd, const void* src,
-                        int64_t src_row_blocks, float scale) {
-    arch::pack_q4_1_rhs(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                        src_row_blocks, scale);
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, bfloat16* dst,
+                        int ldd, const void* src, int64_t src_row_blocks, float scale)
+{
+    arch::pack_q4_1_rhs(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks, scale);
 }
 #endif
 
@@ -485,10 +550,13 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 /// The width must be the arch's float RHS panel width — the workspace stride
 /// and the MMA are sized from it — and that is 12 for aarch64 f32, 16 elsewhere.
 /// The arch packers write this same layout, but decode a block once per row.
-template <class T>
-constexpr int block_panel_nr() noexcept {
-    if constexpr (std::is_same_v<T, float>) { return NR_MAX_F32; }
-    else { return NR_MAX_F16; }
+template <class T> constexpr int block_panel_nr() noexcept
+{
+    if constexpr (std::is_same_v<T, float>) {
+        return NR_MAX_F32;
+    } else {
+        return NR_MAX_F16;
+    }
 }
 
 /// Values per block, for the indexing below; must equal q4_1_block_elems.
@@ -496,16 +564,20 @@ constexpr int kBlockElems = 32;
 
 /// One block-packed format's row decoder: unpack(block_ptr, float out[]).
 template <class T, class Unpack>
-void tile_pack_rhs_block_scalar(bool trans, int n_start, int nc, int k_start, int kc,
-                                T* dst, int ldd, const void* src, int64_t row_blocks,
-                                float scale, size_t block_bytes, Unpack unpack) {
+void tile_pack_rhs_block_scalar(bool trans, int n_start, int nc, int k_start, int kc, T* dst,
+                                int ldd, const void* src, int64_t row_blocks, float scale,
+                                size_t block_bytes, Unpack unpack)
+{
     constexpr int NR = block_panel_nr<T>();
     const uint8_t* base = static_cast<const uint8_t*>(src);
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(block_bytes);
 
     auto store = [](T* p, float v) {
-        if constexpr (std::is_same_v<T, float>) { *p = v; }
-        else { *p = float_to_half(v); }
+        if constexpr (std::is_same_v<T, float>) {
+            *p = v;
+        } else {
+            *p = float_to_half(v);
+        }
     };
 
     int n = 0;
@@ -515,93 +587,97 @@ void tile_pack_rhs_block_scalar(bool trans, int n_start, int nc, int k_start, in
             T* o = dst + static_cast<int64_t>(k) * NR;
             for (int j = 0; j < nr; ++j) {
                 const int row = trans ? (n_start + n + j) : (k_start + k);
-                const int col = trans ? (k_start + k)     : (n_start + n + j);
+                const int col = trans ? (k_start + k) : (n_start + n + j);
                 float vals[kBlockElems];
-                unpack(base + static_cast<int64_t>(row) * row_bytes
-                            + static_cast<int64_t>(col / kBlockElems) * block_bytes,
+                unpack(base + static_cast<int64_t>(row) * row_bytes +
+                           static_cast<int64_t>(col / kBlockElems) * block_bytes,
                        vals);
                 store(&o[j], vals[col % kBlockElems] * scale);
             }
-            for (int j = nr; j < NR; ++j) { o[j] = T{}; }
+            for (int j = nr; j < NR; ++j) {
+                o[j] = T{};
+            }
         }
         dst += ldd;
         n += nr;
     }
 }
 
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale) {
-    tile_pack_rhs_block_scalar<float>(trans, n_start, nc, k_start, kc, dst, ldd,
-                                      src, src_row_blocks, scale,
-                                      q4_1_block_bytes, q4_1_unpack_block);
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, float* dst, int ldd,
+                        const void* src, int64_t src_row_blocks, float scale)
+{
+    tile_pack_rhs_block_scalar<float>(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                                      src_row_blocks, scale, q4_1_block_bytes, q4_1_unpack_block);
 }
 
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale) {
-    tile_pack_rhs_block_scalar<half>(trans, n_start, nc, k_start, kc, dst, ldd,
-                                     src, src_row_blocks, scale,
-                                     q4_1_block_bytes, q4_1_unpack_block);
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, half* dst, int ldd,
+                        const void* src, int64_t src_row_blocks, float scale)
+{
+    tile_pack_rhs_block_scalar<half>(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks,
+                                     scale, q4_1_block_bytes, q4_1_unpack_block);
 }
 
 #endif
 
-void tile_mma_pack(int Mc, int Nc, int Kc, float* c, int ldc,
-                   const float* packed_a, const float* b, int64_t ldb,
-                   float clamp_min, float clamp_max, bool zero_mode,
-                   const float* bias, const float* col_bias) {
-    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, ldb,
-                      clamp_min, clamp_max, bias, col_bias);
+void tile_mma_pack(int Mc, int Nc, int Kc, float* c, int ldc, const float* packed_a, const float* b,
+                   int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const float* bias,
+                   const float* col_bias)
+{
+    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, ldb, clamp_min, clamp_max, bias,
+                      col_bias);
 }
 
-void tile_mma_pack(int Mc, int Nc, int Kc, half* c, int ldc,
-                   const half* packed_a, const half* b, int64_t ldb,
-                   float clamp_min, float clamp_max, bool zero_mode,
-                   const half* bias, const half* col_bias) {
-    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, ldb,
-                      clamp_min, clamp_max, bias, col_bias);
+void tile_mma_pack(int Mc, int Nc, int Kc, half* c, int ldc, const half* packed_a, const half* b,
+                   int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const half* bias,
+                   const half* col_bias)
+{
+    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, ldb, clamp_min, clamp_max, bias,
+                      col_bias);
 }
 
-void tile_mma_direct(int Mc, int Nc, int Kc, float* c, int ldc,
-                     const float* a, int lda, const float* b, int64_t ldb,
-                     float* stage, float clamp_min, float clamp_max,
-                     bool zero_mode, const float* bias, const float* col_bias) {
-    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb,
-                        stage, clamp_min, clamp_max, bias, col_bias);
+void tile_mma_direct(int Mc, int Nc, int Kc, float* c, int ldc, const float* a, int lda,
+                     const float* b, int64_t ldb, float* stage, float clamp_min, float clamp_max,
+                     bool zero_mode, const float* bias, const float* col_bias)
+{
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, clamp_min, clamp_max,
+                        bias, col_bias);
 }
 
-void tile_mma_direct(int Mc, int Nc, int Kc, half* c, int ldc,
-                     const half* a, int lda, const half* b, int64_t ldb,
-                     half* stage, float clamp_min, float clamp_max,
-                     bool zero_mode, const half* bias, const half* col_bias) {
-    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb,
-                        stage, clamp_min, clamp_max, bias, col_bias);
+void tile_mma_direct(int Mc, int Nc, int Kc, half* c, int ldc, const half* a, int lda,
+                     const half* b, int64_t ldb, half* stage, float clamp_min, float clamp_max,
+                     bool zero_mode, const half* bias, const half* col_bias)
+{
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, clamp_min, clamp_max,
+                        bias, col_bias);
 }
 
 #ifdef NNOPS_ARCH_AARCH64
-void tile_mma_pack(int Mc, int Nc, int Kc, bfloat16* c, int ldc,
-                   const bfloat16* packed_a, const bfloat16* b, int64_t ldb,
-                   float clamp_min, float clamp_max, bool zero_mode,
-                   const bfloat16* bias, const bfloat16* col_bias) {
-    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, ldb,
-                      clamp_min, clamp_max, bias, col_bias);
+void tile_mma_pack(int Mc, int Nc, int Kc, bfloat16* c, int ldc, const bfloat16* packed_a,
+                   const bfloat16* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode,
+                   const bfloat16* bias, const bfloat16* col_bias)
+{
+    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, ldb, clamp_min, clamp_max, bias,
+                      col_bias);
 }
 
-void tile_mma_direct(int Mc, int Nc, int Kc, bfloat16* c, int ldc,
-                     const bfloat16* a, int lda, const bfloat16* b, int64_t ldb,
-                     bfloat16* stage, float clamp_min, float clamp_max,
-                     bool zero_mode, const bfloat16* bias, const bfloat16* col_bias) {
-    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb,
-                        stage, clamp_min, clamp_max, bias, col_bias);
+void tile_mma_direct(int Mc, int Nc, int Kc, bfloat16* c, int ldc, const bfloat16* a, int lda,
+                     const bfloat16* b, int64_t ldb, bfloat16* stage, float clamp_min,
+                     float clamp_max, bool zero_mode, const bfloat16* bias,
+                     const bfloat16* col_bias)
+{
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, clamp_min, clamp_max,
+                        bias, col_bias);
 }
 #endif
 
 // ---- the blob ---------------------------------------------------------
 
-MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcept {
+MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcept
+{
     MatMulPackedB g;
-    if (N <= 0 || K <= 0) { return g; }
+    if (N <= 0 || K <= 0) {
+        return g;
+    }
 
     if (dtype == DataType::s8) {
         // One slot per panel per k segment: the kernel reads a panel's
@@ -629,14 +705,17 @@ MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcep
     }
 #endif
 
-    if (dtype != DataType::f32 && dtype != DataType::f16) { return g; }
+    if (dtype != DataType::f32 && dtype != DataType::f16) {
+        return g;
+    }
 
     const int64_t nr = (dtype == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32;
     const int64_t esz = static_cast<int64_t>(data_type_size(dtype));
     g.nr = nr;
     // The same aligned slot the per-call pack uses, only at the whole K.
     g.ldd = static_cast<int64_t>(
-        mma_pack_align(static_cast<size_t>(nr * K) * static_cast<size_t>(esz))) / esz;
+                mma_pack_align(static_cast<size_t>(nr * K) * static_cast<size_t>(esz))) /
+            esz;
     g.np = (N + nr - 1) / nr;
     g.total = g.np * g.ldd;
     return g;
@@ -645,28 +724,34 @@ MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcep
 namespace {
 
 /// N and K of a raw B, in the order @p transpose_b describes.
-inline void raw_b_extent(const TensorDesc& raw, bool transpose_b,
-                         int64_t& N, int64_t& K) noexcept {
+inline void raw_b_extent(const TensorDesc& raw, bool transpose_b, int64_t& N, int64_t& K) noexcept
+{
     const size_t r = static_cast<size_t>(raw.rank);
     N = transpose_b ? raw.dims[r - 2] : raw.dims[r - 1];
     K = transpose_b ? raw.dims[r - 1] : raw.dims[r - 2];
 }
 
 /// ⌈total / N⌉ × N — the descriptor's numel, and so the blob's allocation.
-inline int64_t packed_b_numel(const MatMulPackedB& g, int64_t N) noexcept {
+inline int64_t packed_b_numel(const MatMulPackedB& g, int64_t N) noexcept
+{
     return ((g.total + N - 1) / N) * N;
 }
 
-}  // namespace
+} // namespace
 
-TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b) {
+TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b)
+{
     TensorDesc d;
-    if (raw.rank < 2) { return d; }
+    if (raw.rank < 2) {
+        return d;
+    }
 
     int64_t N = 0, K = 0;
     raw_b_extent(raw, transpose_b, N, K);
     const MatMulPackedB g = matmul_packed_b_geom(N, K, raw.dtype);
-    if (!g.ok()) { return d; }
+    if (!g.ok()) {
+        return d;
+    }
 
     d.rank = 2;
     d.dtype = raw.dtype;
@@ -678,15 +763,19 @@ TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b) {
     return d;
 }
 
-bool matmul_packed_b_matches(const TensorDesc& packed, int64_t K) noexcept {
-    if (!is_packed_matmul_b(packed.layout) || packed.rank < 2) { return false; }
+bool matmul_packed_b_matches(const TensorDesc& packed, int64_t K) noexcept
+{
+    if (!is_packed_matmul_b(packed.layout) || packed.rank < 2) {
+        return false;
+    }
     const int64_t N = packed.dims[0];
     const MatMulPackedB g = matmul_packed_b_geom(N, K, packed.dtype);
     return g.ok() && packed.numel() == packed_b_numel(g, N);
 }
 
-void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
-                          bool transpose_b, const ComputeContext& ctx) {
+void matmul_packed_b_pack(const TensorView& raw, TensorView& packed, bool transpose_b,
+                          const ComputeContext& ctx)
+{
     const DataType dt = packed.data_type();
     const bool trans = transpose_b;
     const int64_t N = trans ? raw.shape(raw.rank() - 2) : raw.shape(raw.rank() - 1);
@@ -710,8 +799,8 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
         const bool a_biased = int8_a_pack_bias(DataType::s8) != 0;
         const int8_t* const base = raw.ptr<int8_t>();
         int8_t* const blob = packed.ptr<int8_t>();
-        const int64_t tasks = std::min<int64_t>(
-            cells, std::max<int64_t>(ctx.cpu.thread_count(), 1));
+        const int64_t tasks =
+            std::min<int64_t>(cells, std::max<int64_t>(ctx.cpu.thread_count(), 1));
         ctx.cpu.run(0, tasks, [&](int64_t t) {
             const int64_t c0 = t * cells / tasks;
             const int64_t c1 = (t + 1) * cells / tasks;
@@ -722,11 +811,9 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
                 const int64_t seg_kc = std::min(g.seg, K - k0);
                 const int64_t n_start = p * g.nr;
                 const int w = static_cast<int>(std::min(g.nr, N - n_start));
-                const int64_t src_off = trans ? n_start * lds + k0
-                                              : k0 * lds + n_start;
-                tile_pack_rhs_i8(trans, w, static_cast<int>(seg_kc),
-                                 blob + (b * g.np + p) * g.ldd, ldd,
-                                 base + src_off, lds_i, a_biased);
+                const int64_t src_off = trans ? n_start * lds + k0 : k0 * lds + n_start;
+                tile_pack_rhs_i8(trans, w, static_cast<int>(seg_kc), blob + (b * g.np + p) * g.ldd,
+                                 ldd, base + src_off, lds_i, a_biased);
             }
         });
         return;
@@ -734,8 +821,7 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
 
     // Panels are independent: one contiguous range per task, each panel packed
     // by the same kernel the per-call route runs on a k-block.
-    const int64_t tasks = std::min<int64_t>(g.np,
-        std::max<int64_t>(ctx.cpu.thread_count(), 1));
+    const int64_t tasks = std::min<int64_t>(g.np, std::max<int64_t>(ctx.cpu.thread_count(), 1));
     ctx.cpu.run(0, tasks, [&](int64_t t) {
         const int64_t p0 = t * g.np / tasks;
         const int64_t p1 = (t + 1) * g.np / tasks;
@@ -763,8 +849,9 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
     });
 }
 
-void matmul_packed_b_i8_col_sums(const TensorView& packed, int64_t K,
-                                 int32_t* r_b, const ComputeContext& ctx) {
+void matmul_packed_b_i8_col_sums(const TensorView& packed, int64_t K, int32_t* r_b,
+                                 const ComputeContext& ctx)
+{
     const int64_t N = packed.shape(0);
     const MatMulPackedB g = matmul_packed_b_geom(N, K, DataType::s8);
     NNOPS_ASSERT(g.ok() && r_b != nullptr);
@@ -776,15 +863,16 @@ void matmul_packed_b_i8_col_sums(const TensorView& packed, int64_t K,
     const int cols = static_cast<int>(g.nr);
     const int64_t nb = (K + g.seg - 1) / g.seg;
     const int8_t* const blob = packed.ptr<int8_t>();
-    const int64_t tasks = std::min<int64_t>(g.np,
-        std::max<int64_t>(ctx.cpu.thread_count(), 1));
+    const int64_t tasks = std::min<int64_t>(g.np, std::max<int64_t>(ctx.cpu.thread_count(), 1));
     ctx.cpu.run(0, tasks, [&](int64_t t) {
         const int64_t p0 = t * g.np / tasks;
         const int64_t p1 = (t + 1) * g.np / tasks;
         for (int64_t p = p0; p < p1; ++p) {
             int32_t* const out = r_b + p * cols;
             const int live = static_cast<int>(std::min(g.nr, N - p * g.nr));
-            for (int c = 0; c < live; ++c) { out[c] = 0; }
+            for (int c = 0; c < live; ++c) {
+                out[c] = 0;
+            }
             for (int64_t b = 0; b < nb; ++b) {
                 const int kseg = static_cast<int>(std::min(g.seg, K - b * g.seg));
                 const int kg = (kseg + group - 1) / group;
@@ -792,7 +880,9 @@ void matmul_packed_b_i8_col_sums(const TensorView& packed, int64_t K,
                 for (int grp = 0; grp < kg; ++grp, panel += cols * group) {
                     for (int c = 0; c < live; ++c) {
                         const int8_t* q = panel + c * group;
-                        for (int i = 0; i < group; ++i) { out[c] += q[i]; }
+                        for (int i = 0; i < group; ++i) {
+                            out[c] += q[i];
+                        }
                     }
                 }
             }
@@ -805,28 +895,34 @@ void matmul_packed_b_i8_col_sums(const TensorView& packed, int64_t K,
 // =========================================================================
 // Same split as the float route; the accumulation is int32.
 
-using PackI8Fn = void (*)(void* NNOPS_RESTRICT output,
-                          const void* NNOPS_RESTRICT input,
+using PackI8Fn = void (*)(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
                           int ir_step, int K, float scale);
 
-using PackI8WideFn = void (*)(void* NNOPS_RESTRICT output,
-                              const void* NNOPS_RESTRICT input,
+using PackI8WideFn = void (*)(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int nr);
 
 // LHS cascade: a panel is a level's full row count, so no width argument.
 constexpr std::array<PackI8Fn, 3> pack_trans_i8_lhs = {{
 #ifdef NNOPS_ARCH_X86_64
-    pack_trans_n6_dp4a_i8, pack_trans_n4_dp4a_i8, pack_trans_n1_dp4a_i8,
+    pack_trans_n6_dp4a_i8,
+    pack_trans_n4_dp4a_i8,
+    pack_trans_n1_dp4a_i8,
 #elif defined(NNOPS_ARCH_AARCH64)
-    pack_trans_n8_dp4a_i8, pack_trans_n4_dp4a_i8, pack_trans_n1_dp4a_i8,
+    pack_trans_n8_dp4a_i8,
+    pack_trans_n4_dp4a_i8,
+    pack_trans_n1_dp4a_i8,
 #endif
 }};
 
 constexpr std::array<PackI8Fn, 3> pack_copy_i8_lhs = {{
 #ifdef NNOPS_ARCH_X86_64
-    pack_copy_n6_dp4a_i8, pack_copy_n4_dp4a_i8, pack_copy_n1_dp4a_i8,
+    pack_copy_n6_dp4a_i8,
+    pack_copy_n4_dp4a_i8,
+    pack_copy_n1_dp4a_i8,
 #elif defined(NNOPS_ARCH_AARCH64)
-    pack_copy_n8_dp4a_i8, pack_copy_n4_dp4a_i8, pack_copy_n1_dp4a_i8,
+    pack_copy_n8_dp4a_i8,
+    pack_copy_n4_dp4a_i8,
+    pack_copy_n1_dp4a_i8,
 #endif
 }};
 
@@ -834,22 +930,27 @@ constexpr std::array<PackI8Fn, 3> pack_copy_i8_lhs = {{
 // The SMMLA route's LHS ladder: same rungs, eight-k groups, one 16-byte
 // fragment per row pair.
 constexpr std::array<PackI8Fn, 3> pack_trans_i8_lhs_i8mm = {{
-    pack_trans_n8_i8mm, pack_trans_n4_i8mm, pack_trans_n1_i8mm,
+    pack_trans_n8_i8mm,
+    pack_trans_n4_i8mm,
+    pack_trans_n1_i8mm,
 }};
 constexpr std::array<PackI8Fn, 3> pack_copy_i8_lhs_i8mm = {{
-    pack_copy_n8_i8mm, pack_copy_n4_i8mm, pack_copy_n1_i8mm,
+    pack_copy_n8_i8mm,
+    pack_copy_n4_i8mm,
+    pack_copy_n1_i8mm,
 }};
 #endif
 
 #ifdef NNOPS_ARCH_X86_64
 constexpr PackI8WideFn pack_i8_rhs_trans = pack_trans_n16_dp4a_i8;
-constexpr PackI8WideFn pack_i8_rhs_copy  = pack_copy_n16_dp4a_i8;
+constexpr PackI8WideFn pack_i8_rhs_copy = pack_copy_n16_dp4a_i8;
 #elif defined(NNOPS_ARCH_AARCH64)
 constexpr PackI8WideFn pack_i8_rhs_trans = pack_trans_n12_dp4a_i8;
-constexpr PackI8WideFn pack_i8_rhs_copy  = pack_copy_n12_dp4a_i8;
+constexpr PackI8WideFn pack_i8_rhs_copy = pack_copy_n12_dp4a_i8;
 #endif
 
-void xor0x80_i8(int8_t* p, int nbytes) {
+void xor0x80_i8(int8_t* p, int nbytes)
+{
     uint8_t* u = reinterpret_cast<uint8_t*>(p);
     int i = 0;
 #if defined(NNOPS_ARCH_X86_64)
@@ -871,25 +972,28 @@ void xor0x80_i8(int8_t* p, int nbytes) {
 
 /// int8 A pack. With @p a_biased every panel is XOR-biased (see
 /// int8_a_pack_bias): s8 → u8 on x86, u8 → s8 on aarch64.
-void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd,
-                      const int8_t* src, int lds, bool a_biased) {
+void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd, const int8_t* src, int lds,
+                      bool a_biased)
+{
     // transposed source is a plain copy; row-major needs the transposing kernel.
 #ifdef NNOPS_ARCH_AARCH64
     const bool i8mm = i8mm_enabled();
-    const PackI8Fn* fns = i8mm
-        ? (trans ? pack_copy_i8_lhs_i8mm.data() : pack_trans_i8_lhs_i8mm.data())
-        : (trans ? pack_copy_i8_lhs.data() : pack_trans_i8_lhs.data());
+    const PackI8Fn* fns =
+        i8mm ? (trans ? pack_copy_i8_lhs_i8mm.data() : pack_trans_i8_lhs_i8mm.data()) :
+               (trans ? pack_copy_i8_lhs.data() : pack_trans_i8_lhs.data());
     const int kbytes = i8mm ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
 #else
     const PackI8Fn* fns = trans ? pack_copy_i8_lhs.data() : pack_trans_i8_lhs.data();
-    const int kbytes   = (kc + 3) & ~3;  // pack writes ceil(kc/4)*4 bytes per row
+    const int kbytes = (kc + 3) & ~3; // pack writes ceil(kc/4)*4 bytes per row
 #endif
     const int pack_lds = trans ? 1 : lds;
 
     int i = 0;
     walk_levels_exact(i, mc, MR_I8, [&](int level, int s) {
         fns[level](dst, src, lds, kc, 0.0f);
-        if (a_biased) { xor0x80_i8(dst, s * kbytes); }
+        if (a_biased) {
+            xor0x80_i8(dst, s * kbytes);
+        }
         dst += ldd;
         src += s * pack_lds;
     });
@@ -899,17 +1003,15 @@ void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd,
 /// on it — the same bytes the materialise-then-pack route produces, without the
 /// full M×K intermediate.
 template <class AT, class QT>
-void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd,
-                            const AT* src, int lds,
-                            const float* scale, const int32_t* zero,
-                            float scale_scalar, int32_t zero_scalar,
-                            bool a_biased) {
+void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd, const AT* src, int lds,
+                            const float* scale, const int32_t* zero, float scale_scalar,
+                            int32_t zero_scalar, bool a_biased)
+{
     NNOPS_ASSERT(kc <= KC_CAP_I8);
 #ifdef NNOPS_ARCH_AARCH64
     const bool i8mm = i8mm_enabled();
     const int kbytes = i8mm ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
-    const PackI8Fn* const packers = i8mm ? pack_trans_i8_lhs_i8mm.data()
-                                         : pack_trans_i8_lhs.data();
+    const PackI8Fn* const packers = i8mm ? pack_trans_i8_lhs_i8mm.data() : pack_trans_i8_lhs.data();
 #else
     const int kbytes = (kc + 3) & ~3;
     const PackI8Fn* const packers = pack_trans_i8_lhs.data();
@@ -923,152 +1025,149 @@ void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd,
             const float sc = (scale != nullptr) ? scale[i + r] : scale_scalar;
             // The quant kernel takes a float zero-point array; null means no
             // zero point, as in the materialised route.
-            float zf = (zero != nullptr) ? static_cast<float>(zero[i + r])
-                                         : static_cast<float>(zero_scalar);
+            float zf = (zero != nullptr) ? static_cast<float>(zero[i + r]) :
+                                           static_cast<float>(zero_scalar);
             const float* zp = (zero != nullptr || zero_scalar != 0) ? &zf : nullptr;
-            kernel::quant_kernel::quantization<QT>(
-                1, kc, tmp + r * kbytes, kbytes, src + (i + r) * lds, lds, &sc, zp);
+            kernel::quant_kernel::quantization<QT>(1, kc, tmp + r * kbytes, kbytes,
+                                                   src + (i + r) * lds, lds, &sc, zp);
         }
         packers[level](dst, tmp, kbytes, kc, 0.0f);
-        if (a_biased) { xor0x80_i8(dst, s * kbytes); }
+        if (a_biased) {
+            xor0x80_i8(dst, s * kbytes);
+        }
         dst += ldd;
     });
 }
 
 template <class AT>
-void pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
-                       const AT* src, int lds,
-                       const float* scale, const int32_t* zero,
-                       float scale_scalar, int32_t zero_scalar,
-                       bool u8, bool a_biased) {
+void pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd, const AT* src, int lds,
+                       const float* scale, const int32_t* zero, float scale_scalar,
+                       int32_t zero_scalar, bool u8, bool a_biased)
+{
     // Only the clamp range differs between the two quantised storage types.
     if (u8) {
-        pack_quant_lhs_i8_impl<AT, uint8_t>(mc, kc, dst, ldd, src, lds, scale, zero,
-                                            scale_scalar, zero_scalar, a_biased);
+        pack_quant_lhs_i8_impl<AT, uint8_t>(mc, kc, dst, ldd, src, lds, scale, zero, scale_scalar,
+                                            zero_scalar, a_biased);
     } else {
-        pack_quant_lhs_i8_impl<AT, int8_t>(mc, kc, dst, ldd, src, lds, scale, zero,
-                                           scale_scalar, zero_scalar, a_biased);
+        pack_quant_lhs_i8_impl<AT, int8_t>(mc, kc, dst, ldd, src, lds, scale, zero, scale_scalar,
+                                           zero_scalar, a_biased);
     }
 }
 
-void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
-                            const float* src, int lds,
-                            const float* scale, const int32_t* zero,
-                            float scale_scalar, int32_t zero_scalar,
-                            bool u8, bool a_biased) {
-    pack_quant_lhs_i8<float>(mc, kc, dst, ldd, src, lds, scale, zero,
-                             scale_scalar, zero_scalar, u8, a_biased);
+void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd, const float* src, int lds,
+                            const float* scale, const int32_t* zero, float scale_scalar,
+                            int32_t zero_scalar, bool u8, bool a_biased)
+{
+    pack_quant_lhs_i8<float>(mc, kc, dst, ldd, src, lds, scale, zero, scale_scalar, zero_scalar, u8,
+                             a_biased);
 }
 
-void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
-                            const half* src, int lds,
-                            const float* scale, const int32_t* zero,
-                            float scale_scalar, int32_t zero_scalar,
-                            bool u8, bool a_biased) {
-    pack_quant_lhs_i8<half>(mc, kc, dst, ldd, src, lds, scale, zero,
-                            scale_scalar, zero_scalar, u8, a_biased);
+void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd, const half* src, int lds,
+                            const float* scale, const int32_t* zero, float scale_scalar,
+                            int32_t zero_scalar, bool u8, bool a_biased)
+{
+    pack_quant_lhs_i8<half>(mc, kc, dst, ldd, src, lds, scale, zero, scale_scalar, zero_scalar, u8,
+                            a_biased);
 }
 
-void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
-                            const bfloat16* src, int lds,
-                            const float* scale, const int32_t* zero,
-                            float scale_scalar, int32_t zero_scalar,
-                            bool u8, bool a_biased) {
-    pack_quant_lhs_i8<bfloat16>(mc, kc, dst, ldd, src, lds, scale, zero,
-                                scale_scalar, zero_scalar, u8, a_biased);
+void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd, const bfloat16* src, int lds,
+                            const float* scale, const int32_t* zero, float scale_scalar,
+                            int32_t zero_scalar, bool u8, bool a_biased)
+{
+    pack_quant_lhs_i8<bfloat16>(mc, kc, dst, ldd, src, lds, scale, zero, scale_scalar, zero_scalar,
+                                u8, a_biased);
 }
 
 /// B into uniform panels. On x86 each panel's column sums are appended after
 /// its data (zeroed when @p a_biased is false); the MMA seeds from them.
-void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,
-                      const int8_t* src, int lds, bool a_biased,
-                      bool src_shift) {
+void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd, const int8_t* src, int lds,
+                      bool a_biased, bool src_shift)
+{
     constexpr int nr_max = NR_MAX_I8;
 #ifdef NNOPS_ARCH_AARCH64
     // 8-k groups on the SMMLA route, 4-k on SDOT; the panel width is the same.
     const bool i8mm = i8mm_enabled();
-    const PackI8WideFn fn = i8mm
-        ? (trans ? pack_trans_n12_i8mm : pack_copy_n12_i8mm)
-        : (trans ? pack_i8_rhs_trans : pack_i8_rhs_copy);
+    const PackI8WideFn fn = i8mm ? (trans ? pack_trans_n12_i8mm : pack_copy_n12_i8mm) :
+                                   (trans ? pack_i8_rhs_trans : pack_i8_rhs_copy);
     const int kbytes = i8mm ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
 #else
     const PackI8WideFn fn = trans ? pack_i8_rhs_trans : pack_i8_rhs_copy;
     const int kbytes = (kc + 3) & ~3;
 #endif
     // transposed source: a panel is nr_max rows of K; row-major: nr_max columns.
-    const int step   = trans ? lds : 1;
+    const int step = trans ? lds : 1;
 
     for_each_n_panel(nc, nr_max, [&](int w) {
         fn(dst, src, lds, kc, 0.0f, w);
         // Only the data lanes are shifted; the correction block after them must
         // then be summed from the shifted bytes, so this has to come first.
-        if (src_shift) { xor0x80_i8(dst, nr_max * kbytes); }
+        if (src_shift) {
+            xor0x80_i8(dst, nr_max * kbytes);
+        }
         mma_i8_b_panel_sums(dst, kbytes, a_biased);
         dst += ldd;
         src += w * step;
     });
 }
 
-using MmaPackI8Fn = void (*)(int, int, int, int32_t*, int, const int8_t*,
-                             const int8_t*, int, int32_t, int32_t);
-using MmaDirectI8Fn = void (*)(int, int, int, int32_t*, int, const int8_t*, int,
-                               const int8_t*, int, int32_t, int32_t);
+using MmaPackI8Fn = void (*)(int, int, int, int32_t*, int, const int8_t*, const int8_t*, int,
+                             int32_t, int32_t);
+using MmaDirectI8Fn = void (*)(int, int, int, int32_t*, int, const int8_t*, int, const int8_t*, int,
+                               int32_t, int32_t);
 
 /// The rung's kernel for the route this process runs. Both routes share the MR
 /// ladder and the panel width; only the bytes inside a B panel differ.
-inline MmaPackI8Fn mma_pack_i8_fn(int level, bool zero_mode) {
+inline MmaPackI8Fn mma_pack_i8_fn(int level, bool zero_mode)
+{
 #ifdef NNOPS_ARCH_AARCH64
     if (i8mm_enabled()) {
-        return zero_mode ? mma_pack_fns_i8mm<true>[level]
-                         : mma_pack_fns_i8mm<false>[level];
+        return zero_mode ? mma_pack_fns_i8mm<true>[level] : mma_pack_fns_i8mm<false>[level];
     }
 #endif
     return zero_mode ? mma_pack_fns_i8<true>[level] : mma_pack_fns_i8<false>[level];
 }
 
-inline MmaDirectI8Fn mma_direct_i8_fn(int level, bool zero_mode) {
+inline MmaDirectI8Fn mma_direct_i8_fn(int level, bool zero_mode)
+{
 #ifdef NNOPS_ARCH_AARCH64
     if (i8mm_enabled()) {
-        return zero_mode ? mma_direct_fns_i8mm<true>[level]
-                         : mma_direct_fns_i8mm<false>[level];
+        return zero_mode ? mma_direct_fns_i8mm<true>[level] : mma_direct_fns_i8mm<false>[level];
     }
 #endif
-    return zero_mode ? mma_direct_fns_i8<true>[level]
-                     : mma_direct_fns_i8<false>[level];
+    return zero_mode ? mma_direct_fns_i8<true>[level] : mma_direct_fns_i8<false>[level];
 }
 
 /// One MMA call per M panel; the kernel walks the N side itself.
-void tile_mma_pack_i8(int mc, int nc, int kc,
-                      int32_t* c, int ldc,
-                      const int8_t* packed_a, const int8_t* packed_b, int ldb,
-                      int32_t clamp_min, int32_t clamp_max, bool zero_mode) {
+void tile_mma_pack_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t* packed_a,
+                      const int8_t* packed_b, int ldb, int32_t clamp_min, int32_t clamp_max,
+                      bool zero_mode)
+{
     const int ldd_a = static_cast<int>(GEOM_I8.ldd_a(kc));
 
     int m = 0;
     walk_levels_exact(m, mc, MR_I8, [&](int level, int s) {
-        mma_pack_i8_fn(level, zero_mode)(s, nc, kc, c + m * ldc, ldc, packed_a,
-                                         packed_b, ldb, clamp_min, clamp_max);
+        mma_pack_i8_fn(level, zero_mode)(s, nc, kc, c + m * ldc, ldc, packed_a, packed_b, ldb,
+                                         clamp_min, clamp_max);
         packed_a += ldd_a;
     });
 }
 
-void tile_mma_direct_i8(int mc, int nc, int kc,
-                        int32_t* c, int ldc,
-                        const int8_t* a, int lda, const int8_t* packed_b, int ldb,
-                        int32_t clamp_min, int32_t clamp_max, bool zero_mode) {
+void tile_mma_direct_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t* a, int lda,
+                        const int8_t* packed_b, int ldb, int32_t clamp_min, int32_t clamp_max,
+                        bool zero_mode)
+{
     // Same MR cascade as the packed route; only the A operand moves.
     int m = 0;
     walk_levels_exact(m, mc, MR_I8, [&](int level, int s) {
-        mma_direct_i8_fn(level, zero_mode)(s, nc, kc, c + m * ldc, ldc,
-                                           a + m * lda, lda, packed_b, ldb,
-                                           clamp_min, clamp_max);
+        mma_direct_i8_fn(level, zero_mode)(s, nc, kc, c + m * ldc, ldc, a + m * lda, lda, packed_b,
+                                           ldb, clamp_min, clamp_max);
     });
 }
 
 // ---- tile scale -----------------------------------------------------------
 
-template <typename T>
-void tile_scale_impl(T* c, int ldc, float scale, int M, int N) {
+template <typename T> void tile_scale_impl(T* c, int ldc, float scale, int M, int N)
+{
     using namespace nnops::simd;
     constexpr int L = simd_lane_for<T>;
     for (int m = 0; m < M; ++m) {
@@ -1084,16 +1183,19 @@ void tile_scale_impl(T* c, int ldc, float scale, int M, int N) {
     }
 }
 
-void tile_scale(float* c, int ldc, float scale, int M, int N) {
+void tile_scale(float* c, int ldc, float scale, int M, int N)
+{
     tile_scale_impl(c, ldc, scale, M, N);
 }
 
-void tile_scale(half* c, int ldc, float scale, int M, int N) {
+void tile_scale(half* c, int ldc, float scale, int M, int N)
+{
     tile_scale_impl(c, ldc, scale, M, N);
 }
 
 #ifdef NNOPS_ARCH_AARCH64
-void tile_scale(bfloat16* c, int ldc, float scale, int M, int N) {
+void tile_scale(bfloat16* c, int ldc, float scale, int M, int N)
+{
     tile_scale_impl(c, ldc, scale, M, N);
 }
 #endif
@@ -1102,8 +1204,8 @@ void tile_scale(bfloat16* c, int ldc, float scale, int M, int N) {
 /// rather than trusting 0·C: the old C is arbitrary (a pooled output buffer),
 /// and 0·±inf or 0·NaN is NaN, which would then ride the whole k sweep.
 template <typename T>
-void tile_scale_add_bias_impl(T* c, int ldc, float scale, const T* bias,
-                              int M, int N) {
+void tile_scale_add_bias_impl(T* c, int ldc, float scale, const T* bias, int M, int N)
+{
     using namespace nnops::simd;
     constexpr int L = simd_lane_for<T>;
     const bool replace = (scale == 0.0f);
@@ -1112,41 +1214,38 @@ void tile_scale_add_bias_impl(T* c, int ldc, float scale, const T* bias,
         auto v_scale = v_set1(row, scale);
         int i = 0;
         for (; i + L <= N; i += L) {
-            auto v = replace
-                ? v_load(bias + i)
-                : v_add(v_mul(v_load(row + i), v_scale), v_load(bias + i));
+            auto v = replace ? v_load(bias + i) :
+                               v_add(v_mul(v_load(row + i), v_scale), v_load(bias + i));
             v_store(row + i, v);
         }
         for (; i < N; ++i) {
-            s_store(&row[i], replace ? s_load(&bias[i])
-                                     : s_load(&row[i]) * scale + s_load(&bias[i]));
+            s_store(&row[i],
+                    replace ? s_load(&bias[i]) : s_load(&row[i]) * scale + s_load(&bias[i]));
         }
     }
 }
 
-void tile_scale_add_bias(float* c, int ldc, float scale, const float* bias,
-                         int M, int N) {
+void tile_scale_add_bias(float* c, int ldc, float scale, const float* bias, int M, int N)
+{
     tile_scale_add_bias_impl(c, ldc, scale, bias, M, N);
 }
 
-void tile_scale_add_bias(half* c, int ldc, float scale, const half* bias,
-                         int M, int N) {
+void tile_scale_add_bias(half* c, int ldc, float scale, const half* bias, int M, int N)
+{
     tile_scale_add_bias_impl(c, ldc, scale, bias, M, N);
 }
 
 #ifdef NNOPS_ARCH_AARCH64
-void tile_scale_add_bias(bfloat16* c, int ldc, float scale, const bfloat16* bias,
-                         int M, int N) {
+void tile_scale_add_bias(bfloat16* c, int ldc, float scale, const bfloat16* bias, int M, int N)
+{
     tile_scale_add_bias_impl(c, ldc, scale, bias, M, N);
 }
 #endif
 
-MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
-                          const TensorDesc& a_desc,
-                          const TensorDesc& b_desc,
-                          int num_threads,
-                          bool use_thread_slots) {
-    MatMulPlan plan{};  // the dtype-reject returns below promise an all-zero plan
+MatMulPlan get_matmul_plan(const MatMulAttributes& attrs, const TensorDesc& a_desc,
+                           const TensorDesc& b_desc, int num_threads, bool use_thread_slots)
+{
+    MatMulPlan plan{}; // the dtype-reject returns below promise an all-zero plan
 
     const auto dt_a = a_desc.dtype;
     const auto dt_b = b_desc.dtype;
@@ -1162,13 +1261,21 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     }
 
     const MatmulGeom* geom = nullptr;
-    if (int8_pair)                      { geom = &GEOM_I8; }
-    else if (dt_a == DataType::f32)     { geom = &GEOM_F32; }
-    else if (dt_a == DataType::f16)     { geom = &GEOM_F16; }
+    if (int8_pair) {
+        geom = &GEOM_I8;
+    } else if (dt_a == DataType::f32) {
+        geom = &GEOM_F32;
+    } else if (dt_a == DataType::f16) {
+        geom = &GEOM_F16;
+    }
 #ifdef NNOPS_ARCH_AARCH64
-    else if (dt_a == DataType::bf16)    { geom = &GEOM_BF16; }
+    else if (dt_a == DataType::bf16) {
+        geom = &GEOM_BF16;
+    }
 #endif
-    else                                { return plan; }
+    else {
+        return plan;
+    }
     num_threads = std::max(num_threads, 1);
 
     const int64_t a_rank = a_desc.rank;
@@ -1189,16 +1296,16 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
         return plan;
     }
 
-    const int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 1)]
-                                        : a_desc.dims[static_cast<size_t>(a_rank - 2)];
-    const int64_t N = packed_b ? b_desc.dims[0]
-                   : attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
-                                       : b_desc.dims[static_cast<size_t>(b_rank - 1)];
-    const int64_t K = packed_b
-        ? (attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 2)]
-                             : a_desc.dims[static_cast<size_t>(a_rank - 1)])
-        : (attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)]
-                             : b_desc.dims[static_cast<size_t>(b_rank - 2)]);
+    const int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 1)] :
+                                          a_desc.dims[static_cast<size_t>(a_rank - 2)];
+    const int64_t N = packed_b          ? b_desc.dims[0] :
+                      attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)] :
+                                          b_desc.dims[static_cast<size_t>(b_rank - 1)];
+    const int64_t K = packed_b ?
+                          (attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 2)] :
+                                               a_desc.dims[static_cast<size_t>(a_rank - 1)]) :
+                          (attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)] :
+                                               b_desc.dims[static_cast<size_t>(b_rank - 2)]);
 
     // Pack A for correctness (transpose_a), for int8, or for a deep K.
     plan.pack_a = geom->packs_a_always || attrs.transpose_a || (K > PACK_A_K_THRESHOLD);
@@ -1217,15 +1324,13 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
         // frozen at the segment length and mc/nc are sized around it.
         const MatMulPackedB bg = matmul_packed_b_geom(N, K, dt_b);
         NNOPS_ASSERT(bg.ok());
-        choose_tile_impl(M, N, K, geom->mr_max, geom->nr_max, geom->elem,
-                         num_threads, plan.split_n, geom->kc_cap, bg.seg,
-                         features.l1_cache_size(), features.l2_shared_cache_size(),
-                         plan.mc, plan.nc, plan.kc);
+        choose_tile_impl(M, N, K, geom->mr_max, geom->nr_max, geom->elem, num_threads, plan.split_n,
+                         geom->kc_cap, bg.seg, features.l1_cache_size(),
+                         features.l2_shared_cache_size(), plan.mc, plan.nc, plan.kc);
     } else {
-        choose_matmul_tile(M, N, K, geom->mr_max, geom->nr_max, geom->elem,
-                           num_threads, plan.split_n, geom->kc_cap,
-                           features.l1_cache_size(), features.l2_shared_cache_size(),
-                           plan.mc, plan.nc, plan.kc);
+        choose_matmul_tile(M, N, K, geom->mr_max, geom->nr_max, geom->elem, num_threads,
+                           plan.split_n, geom->kc_cap, features.l1_cache_size(),
+                           features.l2_shared_cache_size(), plan.mc, plan.nc, plan.kc);
     }
 
     // Sizing stride at full Kc.
@@ -1235,8 +1340,8 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     // Packed-B scratch. N-split: one slice per n-block. M-split: one per
     // m-block, or per worker thread when ids are available and blocks outnumber
     // them (see MatMulPlan::num_slots). int8 hoists B, so one slot serves all.
-    const int64_t slice_bytes = static_cast<int64_t>(panel_count(static_cast<int>(N)))
-                              * ldd_b * geom->elem;
+    const int64_t slice_bytes =
+        static_cast<int64_t>(panel_count(static_cast<int>(N))) * ldd_b * geom->elem;
 
     const int64_t num_m_blocks = split_block_count(M, plan.mc);
     const int64_t num_n_blocks = (N + plan.nc - 1) / plan.nc;
@@ -1265,7 +1370,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     plan.pack_a_offset = plan.workspace_size;
     if (plan.pack_a) {
         const int64_t nconcurrent = plan.split_n ? num_n_blocks : num_m_blocks;
-        const int64_t nt          = std::max<int64_t>(num_threads, 1);
+        const int64_t nt = std::max<int64_t>(num_threads, 1);
         if (nt <= 1) {
             plan.num_slots_a = 1;
         } else if (use_thread_slots && nt < nconcurrent) {
@@ -1277,11 +1382,11 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
         plan.ldd_a = geom->ldd_a(plan.kc);
         plan.np_a = num_panels_max(static_cast<int>(plan.mc), geom->mr_levels);
 
-        plan.workspace_size = plan.pack_a_offset
-                            + plan.num_slots_a * plan.np_a * plan.ldd_a * geom->elem;
+        plan.workspace_size =
+            plan.pack_a_offset + plan.num_slots_a * plan.np_a * plan.ldd_a * geom->elem;
     }
 
     return plan;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

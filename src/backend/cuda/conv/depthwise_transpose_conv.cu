@@ -48,8 +48,7 @@ namespace {
 /// Channel-last store of one Vec-wide lane: bias, clamp, activation, as a single
 /// 16 B write. add_to takes the scalar path instead, which re-reads the pixel.
 template <class Elem, int Vec>
-__device__ inline void dw_last_store(const ConvParams& p, Elem* dst, const float* acc,
-                                     int c0)
+__device__ inline void dw_last_store(const ConvParams& p, Elem* dst, const float* acc, int c0)
 {
     using V = std::conditional_t<sizeof(Elem) == 2, uint4, float4>;
     const Elem* bias = static_cast<const Elem*>(p.bias);
@@ -58,7 +57,9 @@ __device__ inline void dw_last_store(const ConvParams& p, Elem* dst, const float
     CUTE_UNROLL
     for (int v = 0; v < Vec; ++v) {
         float x = acc[v];
-        if (bias != nullptr) { x += float(bias[c0 + v]); }
+        if (bias != nullptr) {
+            x += float(bias[c0 + v]);
+        }
         x = fminf(fmaxf(x, p.min_clip), p.max_clip);
         x = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, x);
         os[v] = Elem(x);
@@ -74,7 +75,9 @@ __global__ void dw_last_kernel(ConvParams pin, int th_max, int col_blocks)
     using V = std::conditional_t<sizeof(Elem) == 2, uint4, float4>;
     const int cls = int(blockIdx.z) / col_blocks;
     const TClass tc = tconv_class(pin, cls);
-    if (tc.empty) { return; }
+    if (tc.empty) {
+        return;
+    }
 
     const ConvParams p = tc.q;
     // Copied out: ConvParams is too wide to stay in registers as one object, and
@@ -82,17 +85,17 @@ __global__ void dw_last_kernel(ConvParams pin, int th_max, int col_blocks)
     const int KH = p.kh, KW = p.kw, DH = p.dh, DW = p.dw, PH = p.ph, PW = p.pw;
     const int IH = p.ih, IW = p.iw, IN_H = p.in_h, IN_W = p.in_w;
     const int W_KH = p.w_kh, W_KW = p.w_kw, W_IC = p.w_ic;
-    const int ow = (int(blockIdx.z) - cls * col_blocks) * int(blockDim.y) +
-                   int(threadIdx.y);
+    const int ow = (int(blockIdx.z) - cls * col_blocks) * int(blockDim.y) + int(threadIdx.y);
     const int img = int(blockIdx.x) / th_max;
     const int th = int(blockIdx.x) - img * th_max;
     const int c0 = (int(blockIdx.y) * int(blockDim.x) + int(threadIdx.x)) * Vec;
-    if (th >= p.oh || ow >= p.ow || c0 >= p.oc) { return; }
+    if (th >= p.oh || ow >= p.ow || c0 >= p.oc) {
+        return;
+    }
 
     const Elem* in = static_cast<const Elem*>(p.input) + int64_t(img) * p.in_batch + c0;
     // The class starts at tap k0 of the original kernel, on both axes.
-    const Elem* w = static_cast<const Elem*>(p.weight) + int64_t(c0) * p.w_ic +
-                    tc.w_off;
+    const Elem* w = static_cast<const Elem*>(p.weight) + int64_t(c0) * p.w_ic + tc.w_off;
 
     // The taps walk by pointer: DW and W_KW are constants of the class, so each
     // step is one add where an index would be a 64-bit multiply.
@@ -103,7 +106,9 @@ __global__ void dw_last_kernel(ConvParams pin, int th_max, int col_blocks)
     const int ow_in = ow - PW;
     for (int kh = 0; kh < KH; ++kh) {
         const int ih = ih0 + kh * DH;
-        if (unsigned(ih) >= unsigned(IH)) { continue; }
+        if (unsigned(ih) >= unsigned(IH)) {
+            continue;
+        }
         const Elem* xp = in + int64_t(ih) * IN_H + int64_t(ow_in) * IN_W;
         const Elem* wp = w + int64_t(kh) * W_KH;
         int iw = ow_in;
@@ -145,31 +150,36 @@ __global__ void dw_first_kernel(ConvParams pin, int th_max, int col_blocks)
 {
     const int cls = int(blockIdx.z) / col_blocks;
     const TClass tc = tconv_class(pin, cls);
-    if (tc.empty) { return; }
+    if (tc.empty) {
+        return;
+    }
 
     const ConvParams p = tc.q;
     const int KH = p.kh, KW = p.kw, DH = p.dh, DW = p.dw, PH = p.ph, PW = p.pw;
     const int IH = p.ih, IW = p.iw, IN_H = p.in_h, IN_W = p.in_w;
     const int W_KH = p.w_kh, W_KW = p.w_kw;
-    const int ow0 = (int(blockIdx.z) - cls * col_blocks) * int(blockDim.x) * VW +
-                    int(threadIdx.x) * VW;
+    const int ow0 =
+        (int(blockIdx.z) - cls * col_blocks) * int(blockDim.x) * VW + int(threadIdx.x) * VW;
     const int row_i = int(blockIdx.y) * int(blockDim.y) + int(threadIdx.y);
     const int img = row_i / th_max;
     const int th = row_i - img * th_max;
     const int c = int(blockIdx.x);
-    if (img >= p.batch || th >= p.oh || ow0 >= p.ow) { return; }
+    if (img >= p.batch || th >= p.oh || ow0 >= p.ow) {
+        return;
+    }
     const int cols = (p.ow - ow0 < VW) ? p.ow - ow0 : VW;
 
-    const Elem* in = static_cast<const Elem*>(p.input) + int64_t(img) * p.in_batch +
-                     int64_t(c) * p.in_c;
+    const Elem* in =
+        static_cast<const Elem*>(p.input) + int64_t(img) * p.in_batch + int64_t(c) * p.in_c;
     // The class starts at tap k0 of the original kernel, on both axes.
-    const Elem* w = static_cast<const Elem*>(p.weight) + int64_t(c) * p.w_ic +
-                    tc.w_off;
+    const Elem* w = static_cast<const Elem*>(p.weight) + int64_t(c) * p.w_ic + tc.w_off;
 
     float acc[VW] = {};
     for (int kh = 0; kh < KH; ++kh) {
         const int ih = th - PH + kh * DH;
-        if (unsigned(ih) >= unsigned(IH)) { continue; }
+        if (unsigned(ih) >= unsigned(IH)) {
+            continue;
+        }
         const Elem* wp = w + int64_t(kh) * W_KH;
         int iw = ow0 - PW;
         for (int kw = 0; kw < KW; ++kw) {
@@ -187,9 +197,8 @@ __global__ void dw_first_kernel(ConvParams pin, int th_max, int col_blocks)
         }
     }
 
-    Elem* dst = static_cast<Elem*>(p.output) + int64_t(img) * p.out_batch +
-                int64_t(c) * p.out_c + tc.out_off + int64_t(th) * p.out_h +
-                int64_t(ow0) * p.out_w;
+    Elem* dst = static_cast<Elem*>(p.output) + int64_t(img) * p.out_batch + int64_t(c) * p.out_c +
+                tc.out_off + int64_t(th) * p.out_h + int64_t(ow0) * p.out_w;
     const Elem* bias = static_cast<const Elem*>(p.bias);
     for (int v = 0; v < cols; ++v) {
         tconv_store<Elem>(p, dst, acc[v], c, bias);
@@ -208,14 +217,17 @@ __global__ void dw_first_kernel(ConvParams pin, int th_max, int col_blocks)
 /// warp degenerates into one row per lane and the tap loads stop coalescing.
 int col_window_first(int64_t lanes, int tw_max)
 {
-    if (tw_max < 2 || lanes < 4096) { return 1; }
-    if (tw_max < 4 || lanes < 16384) { return 2; }
+    if (tw_max < 2 || lanes < 4096) {
+        return 1;
+    }
+    if (tw_max < 4 || lanes < 16384) {
+        return 2;
+    }
     return 4;
 }
 
 template <class Elem>
-void launch_last(const ConvParams& p, int th_max, int col_blocks, int by,
-                 cudaStream_t stream)
+void launch_last(const ConvParams& p, int th_max, int col_blocks, int by, cudaStream_t stream)
 {
     constexpr int Vec = 16 / int(sizeof(Elem));
     const int chunks = p.oc / Vec;
@@ -226,13 +238,11 @@ void launch_last(const ConvParams& p, int th_max, int col_blocks, int by,
 }
 
 template <class Elem, int VW>
-void launch_first(const ConvParams& p, int th_max, int col_blocks, int bx,
-                  cudaStream_t stream)
+void launch_first(const ConvParams& p, int th_max, int col_blocks, int bx, cudaStream_t stream)
 {
     const int by = kCudaBlockSize / bx;
     const int rows = p.batch * th_max;
-    dim3 grid(unsigned(p.oc), unsigned((rows + by - 1) / by),
-              unsigned(p.classes * col_blocks));
+    dim3 grid(unsigned(p.oc), unsigned((rows + by - 1) / by), unsigned(p.classes * col_blocks));
     dw_first_kernel<Elem, VW><<<grid, dim3(bx, by), 0, stream>>>(p, th_max, col_blocks);
 }
 
@@ -241,30 +251,46 @@ void dispatch_first(const ConvParams& p, int th_max, int col_blocks, int bx, int
                     cudaStream_t stream)
 {
     switch (vw) {
-    case 4:  launch_first<Elem, 4>(p, th_max, col_blocks, bx, stream); break;
-    case 2:  launch_first<Elem, 2>(p, th_max, col_blocks, bx, stream); break;
-    default: launch_first<Elem, 1>(p, th_max, col_blocks, bx, stream); break;
+    case 4:
+        launch_first<Elem, 4>(p, th_max, col_blocks, bx, stream);
+        break;
+    case 2:
+        launch_first<Elem, 2>(p, th_max, col_blocks, bx, stream);
+        break;
+    default:
+        launch_first<Elem, 1>(p, th_max, col_blocks, bx, stream);
+        break;
     }
 }
 
 template <class Elem>
 bool run_first(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
 {
-    if (p.oc > 65535) { return false; }
+    if (p.oc > 65535) {
+        return false;
+    }
     const int64_t rows = int64_t(p.batch) * th_max;
-    if (rows > 0x7fffffff) { return false; }
+    if (rows > 0x7fffffff) {
+        return false;
+    }
 
     const int64_t lanes = rows * tw_max * p.oc;
     int vw = col_window_first(lanes, tw_max);
     // A window wider than the class row leaves one lane per row, and a warp then
     // walks 32 separate rows instead of one contiguous run.
-    while (vw > 1 && (tw_max + vw - 1) / vw < 2) { vw >>= 1; }
+    while (vw > 1 && (tw_max + vw - 1) / vw < 2) {
+        vw >>= 1;
+    }
     const int want = (tw_max + vw - 1) / vw;
     const int bx = want < 32 ? want : 32;
     const int by = kCudaBlockSize / bx;
-    if ((rows + by - 1) / by > 65535) { return false; }
+    if ((rows + by - 1) / by > 65535) {
+        return false;
+    }
     const int col_blocks = (tw_max + bx * vw - 1) / (bx * vw);
-    if (int64_t(p.classes) * col_blocks > 65535) { return false; }
+    if (int64_t(p.classes) * col_blocks > 65535) {
+        return false;
+    }
 
     dispatch_first<Elem>(p, th_max, col_blocks, bx, vw, stream);
     return true;
@@ -275,19 +301,33 @@ bool run_last(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
 {
     constexpr int Vec = 16 / int(sizeof(Elem));
     constexpr int64_t esz = int64_t(sizeof(Elem));
-    if (p.in_c != 1 || p.out_c != 1) { return false; }
-    if (p.ic % Vec != 0 || p.oc % Vec != 0) { return false; }
-    if ((p.in_w * esz) % 16 != 0 || (p.out_w * esz) % 16 != 0) { return false; }
-    if (reinterpret_cast<uintptr_t>(p.input) % 16 != 0) { return false; }
-    if (reinterpret_cast<uintptr_t>(p.output) % 16 != 0) { return false; }
-    if (int64_t(p.batch) * th_max > 0x7fffffff || p.oc > 65535) { return false; }
+    if (p.in_c != 1 || p.out_c != 1) {
+        return false;
+    }
+    if (p.ic % Vec != 0 || p.oc % Vec != 0) {
+        return false;
+    }
+    if ((p.in_w * esz) % 16 != 0 || (p.out_w * esz) % 16 != 0) {
+        return false;
+    }
+    if (reinterpret_cast<uintptr_t>(p.input) % 16 != 0) {
+        return false;
+    }
+    if (reinterpret_cast<uintptr_t>(p.output) % 16 != 0) {
+        return false;
+    }
+    if (int64_t(p.batch) * th_max > 0x7fffffff || p.oc > 65535) {
+        return false;
+    }
 
     const int chunks = p.oc / Vec;
     const int bx = chunks < 32 ? chunks : 32;
     const int max_by = kCudaBlockSize / bx;
     const int by = tw_max < max_by ? tw_max : max_by;
     const int col_blocks = (tw_max + by - 1) / by;
-    if (int64_t(p.classes) * col_blocks > 65535) { return false; }
+    if (int64_t(p.classes) * col_blocks > 65535) {
+        return false;
+    }
 
     launch_last<Elem>(p, th_max, col_blocks, by, stream);
     return true;
@@ -300,39 +340,46 @@ bool run_last(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
 /// One output element per thread with the channel innermost, for a channel-last
 /// geometry the 16 B lane declines. The tap search is the CPU's: a tap counts
 /// when (o + P − k·D) divides by S and the pixel it names exists.
-template <class Elem>
-__global__ void dw_last_scalar_kernel(ConvParams p)
+template <class Elem> __global__ void dw_last_scalar_kernel(ConvParams p)
 {
     const int64_t total = int64_t(p.batch) * p.oc * p.oh * p.ow;
     const int64_t step = int64_t(blockDim.x) * gridDim.x;
-    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
-         i += step) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += step) {
         int64_t r = i;
-        const int c = int(r % p.oc); r /= p.oc;
-        const int ow = int(r % p.ow); r /= p.ow;
-        const int oh = int(r % p.oh); r /= p.oh;
+        const int c = int(r % p.oc);
+        r /= p.oc;
+        const int ow = int(r % p.ow);
+        r /= p.ow;
+        const int oh = int(r % p.oh);
+        r /= p.oh;
         const int n = int(r);
 
         // The channel step is one element on this layout, as in the lane kernel.
-        const Elem* in = static_cast<const Elem*>(p.input) +
-                         int64_t(n) * p.in_batch + c;
+        const Elem* in = static_cast<const Elem*>(p.input) + int64_t(n) * p.in_batch + c;
         const Elem* w = static_cast<const Elem*>(p.weight) + int64_t(c) * p.w_ic;
 
         float acc = 0.0f;
         for (int kh = 0; kh < p.kh; ++kh) {
             const int nh = oh + p.ph - kh * p.dh;
-            if (nh < 0 || nh % p.sh != 0) { continue; }
+            if (nh < 0 || nh % p.sh != 0) {
+                continue;
+            }
             const int ih = nh / p.sh;
-            if (ih >= p.ih) { continue; }
+            if (ih >= p.ih) {
+                continue;
+            }
             const Elem* row = in + int64_t(ih) * p.in_h;
             const Elem* tap = w + int64_t(kh) * p.w_kh;
             for (int kw = 0; kw < p.kw; ++kw) {
                 const int nw = ow + p.pw - kw * p.dw;
-                if (nw < 0 || nw % p.sw != 0) { continue; }
+                if (nw < 0 || nw % p.sw != 0) {
+                    continue;
+                }
                 const int iw = nw / p.sw;
-                if (iw >= p.iw) { continue; }
-                acc = fmaf(float(row[int64_t(iw) * p.in_w]),
-                           float(tap[int64_t(kw) * p.w_kw]), acc);
+                if (iw >= p.iw) {
+                    continue;
+                }
+                acc = fmaf(float(row[int64_t(iw) * p.in_w]), float(tap[int64_t(kw) * p.w_kw]), acc);
             }
         }
 
@@ -342,8 +389,7 @@ __global__ void dw_last_scalar_kernel(ConvParams p)
     }
 }
 
-template <class Elem>
-void launch_last_scalar(const ConvParams& p, cudaStream_t stream)
+template <class Elem> void launch_last_scalar(const ConvParams& p, cudaStream_t stream)
 {
     const int64_t total = int64_t(p.batch) * p.oc * p.oh * p.ow;
     const int64_t blocks = (total + kCudaBlockSize - 1) / kCudaBlockSize;
@@ -351,36 +397,37 @@ void launch_last_scalar(const ConvParams& p, cudaStream_t stream)
     dw_last_scalar_kernel<Elem><<<grid, kCudaBlockSize, 0, stream>>>(p);
 }
 
-}  // namespace
+} // namespace
 
-bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max,
-                                     bool channel_last, DataType dtype,
-                                     cudaStream_t stream)
+bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max, bool channel_last,
+                                     DataType dtype, cudaStream_t stream)
 {
-    if (p.icg != 1 || p.ocg != 1) { return false; }
-    if (p.batch <= 0 || th_max <= 0 || tw_max <= 0) { return false; }
+    if (p.icg != 1 || p.ocg != 1) {
+        return false;
+    }
+    if (p.batch <= 0 || th_max <= 0 || tw_max <= 0) {
+        return false;
+    }
     switch (dtype) {
     case DataType::f16:
-        return channel_last ? run_last<cute::half_t>(p, th_max, tw_max, stream)
-                            : run_first<cute::half_t>(p, th_max, tw_max, stream);
+        return channel_last ? run_last<cute::half_t>(p, th_max, tw_max, stream) :
+                              run_first<cute::half_t>(p, th_max, tw_max, stream);
     case DataType::bf16:
-        return channel_last ? run_last<cute::bfloat16_t>(p, th_max, tw_max, stream)
-                            : run_first<cute::bfloat16_t>(p, th_max, tw_max, stream);
+        return channel_last ? run_last<cute::bfloat16_t>(p, th_max, tw_max, stream) :
+                              run_first<cute::bfloat16_t>(p, th_max, tw_max, stream);
     default:
-        return channel_last ? run_last<float>(p, th_max, tw_max, stream)
-                            : run_first<float>(p, th_max, tw_max, stream);
+        return channel_last ? run_last<float>(p, th_max, tw_max, stream) :
+                              run_first<float>(p, th_max, tw_max, stream);
     }
 }
 
-}  // namespace nnops::backend::cuda::tconv
+} // namespace nnops::backend::cuda::tconv
 
 namespace nnops::backend::cuda {
 
 Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& attrs,
-                                     TensorView& output,
-                                     std::span<const TensorView> inputs,
-                                     const ComputeContext& ctx,
-                                     void* /*workspace*/)
+                                     TensorView& output, std::span<const TensorView> inputs,
+                                     const ComputeContext& ctx, void* /*workspace*/)
 {
     const TensorView& act = inputs[0];
     const TensorView& wgt = inputs[1];
@@ -389,17 +436,23 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     const DataType dt = act.data_type();
     if ((dt != DataType::f32 && dt != DataType::f16 && dt != DataType::bf16) ||
         wgt.data_type() != dt || output.data_type() != dt) {
-        return Status::unsupported;   // the quantized route is CPU-only
+        return Status::unsupported; // the quantized route is CPU-only
     }
-    if (output.numel() == 0) { return Status::ok; }
+    if (output.numel() == 0) {
+        return Status::ok;
+    }
 
     const bool last = is_channel_last(act.layout());
-    if (last != is_channel_last(output.layout())) { return Status::unsupported; }
+    if (last != is_channel_last(output.layout())) {
+        return Status::unsupported;
+    }
     if (!last && !is_channel_first_spatial(act.layout())) {
         return Status::unsupported;
     }
     const int64_t ch = act.shape(1);
-    if (ch <= 0 || output.shape(1) != ch) { return Status::unsupported; }
+    if (ch <= 0 || output.shape(1) != ch) {
+        return Status::unsupported;
+    }
 
     tconv::ConvParams p;
     p.batch = int(act.shape(0));
@@ -464,12 +517,13 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     const bool half_elem = (dt != DataType::f32);
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
-    if (!tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last, dt,
-                                                stream)) {
+    if (!tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last, dt, stream)) {
         // The class view declines a geometry or a grid it cannot hold; on the
         // channel-last side the scalar script still covers it, and channel-first
         // has no such residue.
-        if (!last) { return Status::unsupported; }
+        if (!last) {
+            return Status::unsupported;
+        }
         if (dt == DataType::bf16) {
             tconv::launch_last_scalar<cute::bfloat16_t>(p, stream);
         } else if (half_elem) {
@@ -481,4 +535,4 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

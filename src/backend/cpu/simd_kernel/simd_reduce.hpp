@@ -20,16 +20,14 @@ using namespace simd;
 
 /// Contiguous: one row's reduction through the shared row_reduce primitive.
 template <typename T>
-inline void reduce_process_contiguous_row(
-    const T* x_row, float* out_scalar,
-    int64_t norm_size, ReduceType type)
+inline void reduce_process_contiguous_row(const T* x_row, float* out_scalar, int64_t norm_size,
+                                          ReduceType type)
 {
     switch (type) {
     case ReduceType::Sum:
     case ReduceType::Mean: {
         const float sum = row_reduce<T, ReduceAdd>(x_row, norm_size);
-        *out_scalar = (type == ReduceType::Mean)
-            ? sum / static_cast<float>(norm_size) : sum;
+        *out_scalar = (type == ReduceType::Mean) ? sum / static_cast<float>(norm_size) : sum;
         break;
     }
     case ReduceType::Max:
@@ -43,11 +41,10 @@ inline void reduce_process_contiguous_row(
 
 /// Inner-contiguous: SIMD across the inner axis, L inner elements per block.
 template <typename T>
-inline void reduce_process_inner_contiguous_block(
-    const T* x_base, T* y_base,
-    int64_t inner_start, int64_t inner_end,
-    int64_t reduce_size, int64_t axis_stride,
-    ReduceType type, float inv_reduce)
+inline void reduce_process_inner_contiguous_block(const T* x_base, T* y_base, int64_t inner_start,
+                                                  int64_t inner_end, int64_t reduce_size,
+                                                  int64_t axis_stride, ReduceType type,
+                                                  float inv_reduce)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t inner = inner_start;
@@ -136,4 +133,4 @@ inline void reduce_process_inner_contiguous_block(
     }
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

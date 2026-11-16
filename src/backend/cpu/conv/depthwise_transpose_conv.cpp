@@ -49,15 +49,15 @@ using namespace nnops::simd;
 namespace {
 
 struct DwtConvGeom {
-    int64_t N, C, IH, IW;          // input
-    int64_t OH, OW;                // output
-    int64_t KH, KW;                // kernel
-    int64_t SH, SW;                // stride
-    int64_t DH, DW;                // dilation
-    int64_t PH, PW;                // padding
+    int64_t N, C, IH, IW; // input
+    int64_t OH, OW;       // output
+    int64_t KH, KW;       // kernel
+    int64_t SH, SW;       // stride
+    int64_t DH, DW;       // dilation
+    int64_t PH, PW;       // padding
     Epilogue epilogue;
     bool add_to;
-    bool pre_act;   ///< fold add_to's old value in before the epilogue
+    bool pre_act; ///< fold add_to's old value in before the epilogue
 };
 
 /// The tap lists hold at most ceil(K) entries; a taller kernel takes the scalar
@@ -66,8 +66,8 @@ constexpr int64_t kMaxTaps = 16;
 
 struct TapList {
     int64_t n = 0;
-    int64_t a[kMaxTaps] = {};   // kernel index (kh or kw)
-    int64_t b[kMaxTaps] = {};   // input index (ih) or column shift
+    int64_t a[kMaxTaps] = {}; // kernel index (kh or kw)
+    int64_t b[kMaxTaps] = {}; // input index (ih) or column shift
 };
 
 /// The (kh, ih) pairs that land on output row @p oh.
@@ -76,9 +76,13 @@ TapList row_taps(const DwtConvGeom& gm, int64_t oh) noexcept
     TapList t;
     for (int64_t kh = 0; kh < gm.KH && t.n < kMaxTaps; ++kh) {
         const int64_t num = oh + gm.PH - kh * gm.DH;
-        if (num < 0 || num % gm.SH != 0) { continue; }
+        if (num < 0 || num % gm.SH != 0) {
+            continue;
+        }
         const int64_t ih = num / gm.SH;
-        if (ih >= gm.IH) { continue; }
+        if (ih >= gm.IH) {
+            continue;
+        }
         t.a[t.n] = kh;
         t.b[t.n] = ih;
         ++t.n;
@@ -94,9 +98,13 @@ TapList col_taps(const DwtConvGeom& gm, int64_t r, int64_t mic) noexcept
     TapList t;
     for (int64_t kw = 0; kw < gm.KW && t.n < kMaxTaps; ++kw) {
         const int64_t num = r + gm.PW - kw * gm.DW;
-        if (num % gm.SW != 0) { continue; }
+        if (num % gm.SW != 0) {
+            continue;
+        }
         const int64_t shift = num / gm.SW;
-        if (shift >= gm.IW || shift <= -mic) { continue; }
+        if (shift >= gm.IW || shift <= -mic) {
+            continue;
+        }
         t.a[t.n] = kw;
         t.b[t.n] = shift;
         ++t.n;
@@ -124,9 +132,11 @@ DwtRowGrid dwt_row_grid(const DwtConvGeom& gm, int64_t threads) noexcept
     const int64_t slots = threads > 0 ? threads : 1;
     const int64_t total_rows = gm.N * gm.C * gm.OH;
     const int64_t planes = gm.N * gm.C;
-    if (total_rows <= 0 || planes <= 0) { return g; }
+    if (total_rows <= 0 || planes <= 0) {
+        return g;
+    }
 
-    const int64_t want = 8 * slots;              // eight claims per item slot
+    const int64_t want = 8 * slots; // eight claims per item slot
     g.rows_per_task = gm.OH;
     if (total_rows >= want) {
         g.row_blocks = std::min<int64_t>(gm.OH, (want + planes - 1) / planes);
@@ -146,24 +156,23 @@ DwtRowGrid dwt_row_grid(const DwtConvGeom& gm, int64_t threads) noexcept
 
 template <typename T>
 void dwtconv_scalar_first(const DwtConvGeom& gm, TensorView& output,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx)
+                          std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const T* in_ptr  = input.ptr<T>();
-    const T* w_ptr   = weight.ptr<T>();
-    const T* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const T* in_ptr = input.ptr<T>();
+    const T* w_ptr = weight.ptr<T>();
+    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
-    const int64_t in_n   = input.stride_elems(0);
+    const int64_t in_n = input.stride_elems(0);
     const int64_t in_row = input.row_stride_elems();
-    const int64_t in_ch  = input.channel_block_stride_elems();
-    const int64_t out_n   = output.stride_elems(0);
+    const int64_t in_ch = input.channel_block_stride_elems();
+    const int64_t out_n = output.stride_elems(0);
     const int64_t out_row = output.row_stride_elems();
-    const int64_t out_ch  = output.channel_block_stride_elems();
+    const int64_t out_ch = output.channel_block_stride_elems();
     const int64_t w_ch = weight.stride_elems(0);
     const int64_t w_kh = weight.stride_elems(2);
     const int64_t w_kw = weight.stride_elems(3);
@@ -171,7 +180,7 @@ void dwtconv_scalar_first(const DwtConvGeom& gm, TensorView& output,
     ctx.cpu.run(0, gm.N * gm.C, [&](int64_t task) {
         const int64_t n = task / gm.C;
         const int64_t c = task % gm.C;
-        const T* in_c  = in_ptr + n * in_n + c * in_ch;
+        const T* in_c = in_ptr + n * in_n + c * in_ch;
         T* out_c = out_ptr + n * out_n + c * out_ch;
         const T* w_c = w_ptr + c * w_ch;
         const float bias = has_bias ? s_load(&b_ptr[c]) : 0.0f;
@@ -182,22 +191,28 @@ void dwtconv_scalar_first(const DwtConvGeom& gm, TensorView& output,
                 float acc = 0.0f;
                 for (int64_t kh = 0; kh < gm.KH; ++kh) {
                     const int64_t num_h = oh + gm.PH - kh * gm.DH;
-                    if (num_h < 0 || num_h % gm.SH != 0) { continue; }
+                    if (num_h < 0 || num_h % gm.SH != 0) {
+                        continue;
+                    }
                     const int64_t ih = num_h / gm.SH;
-                    if (ih >= gm.IH) { continue; }
+                    if (ih >= gm.IH) {
+                        continue;
+                    }
                     const T* xrow = in_c + ih * in_row;
                     for (int64_t kw = 0; kw < gm.KW; ++kw) {
                         const int64_t num_w = ow + gm.PW - kw * gm.DW;
-                        if (num_w < 0 || num_w % gm.SW != 0) { continue; }
+                        if (num_w < 0 || num_w % gm.SW != 0) {
+                            continue;
+                        }
                         const int64_t iw = num_w / gm.SW;
-                        if (iw >= gm.IW) { continue; }
-                        acc += s_load(&xrow[iw]) *
-                               s_load(&w_c[kh * w_kh + kw * w_kw]);
+                        if (iw >= gm.IW) {
+                            continue;
+                        }
+                        acc += s_load(&xrow[iw]) * s_load(&w_c[kh * w_kh + kw * w_kw]);
                     }
                 }
                 acc += bias;
-                apply_epilogue_store<T>(&orow[ow], acc, gm.epilogue, c, gm.add_to,
-                                        gm.pre_act);
+                apply_epilogue_store<T>(&orow[ow], acc, gm.epilogue, c, gm.add_to, gm.pre_act);
             }
         }
     });
@@ -205,28 +220,27 @@ void dwtconv_scalar_first(const DwtConvGeom& gm, TensorView& output,
 
 template <typename T>
 void dwtconv_scalar_last(const DwtConvGeom& gm, TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx)
+                         std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const T* in_ptr  = input.ptr<T>();
-    const T* w_ptr   = weight.ptr<T>();
-    const T* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const T* in_ptr = input.ptr<T>();
+    const T* w_ptr = weight.ptr<T>();
+    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
-    const int64_t in_n   = input.stride_elems(0);
+    const int64_t in_n = input.stride_elems(0);
     const int64_t in_row = input.row_stride_elems();
-    const int64_t out_n   = output.stride_elems(0);
+    const int64_t out_n = output.stride_elems(0);
     const int64_t out_row = output.row_stride_elems();
     const int64_t w_kh = weight.stride_elems(0);
     const int64_t w_kw = weight.stride_elems(1);
     const int64_t C = gm.C;
 
     ctx.cpu.run(0, gm.N * gm.OH, [&](int64_t task) {
-        const int64_t n  = task / gm.OH;
+        const int64_t n = task / gm.OH;
         const int64_t oh = task % gm.OH;
         const T* in_np = in_ptr + n * in_n;
         T* orow = out_ptr + n * out_n + oh * out_row;
@@ -237,22 +251,31 @@ void dwtconv_scalar_last(const DwtConvGeom& gm, TensorView& output,
                 float acc = 0.0f;
                 for (int64_t kh = 0; kh < gm.KH; ++kh) {
                     const int64_t num_h = oh + gm.PH - kh * gm.DH;
-                    if (num_h < 0 || num_h % gm.SH != 0) { continue; }
+                    if (num_h < 0 || num_h % gm.SH != 0) {
+                        continue;
+                    }
                     const int64_t ih = num_h / gm.SH;
-                    if (ih >= gm.IH) { continue; }
+                    if (ih >= gm.IH) {
+                        continue;
+                    }
                     const T* xrow = in_np + ih * in_row;
                     for (int64_t kw = 0; kw < gm.KW; ++kw) {
                         const int64_t num_w = ow + gm.PW - kw * gm.DW;
-                        if (num_w < 0 || num_w % gm.SW != 0) { continue; }
+                        if (num_w < 0 || num_w % gm.SW != 0) {
+                            continue;
+                        }
                         const int64_t iw = num_w / gm.SW;
-                        if (iw >= gm.IW) { continue; }
-                        acc += s_load(&xrow[iw * C + c]) *
-                               s_load(&w_ptr[kh * w_kh + kw * w_kw + c]);
+                        if (iw >= gm.IW) {
+                            continue;
+                        }
+                        acc +=
+                            s_load(&xrow[iw * C + c]) * s_load(&w_ptr[kh * w_kh + kw * w_kw + c]);
                     }
                 }
-                if (has_bias) { acc += s_load(&b_ptr[c]); }
-                apply_epilogue_store<T>(&dst[c], acc, gm.epilogue, c, gm.add_to,
-                                        gm.pre_act);
+                if (has_bias) {
+                    acc += s_load(&b_ptr[c]);
+                }
+                apply_epilogue_store<T>(&dst[c], acc, gm.epilogue, c, gm.add_to, gm.pre_act);
             }
         }
     });
@@ -264,24 +287,23 @@ void dwtconv_scalar_last(const DwtConvGeom& gm, TensorView& output,
 
 template <typename T>
 void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx)
+                           std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const T* in_ptr  = input.ptr<T>();
-    const T* w_ptr   = weight.ptr<T>();
-    const T* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const T* in_ptr = input.ptr<T>();
+    const T* w_ptr = weight.ptr<T>();
+    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
-    const int64_t in_n   = input.stride_elems(0);
+    const int64_t in_n = input.stride_elems(0);
     const int64_t in_row = input.row_stride_elems();
-    const int64_t in_ch  = input.channel_block_stride_elems();
-    const int64_t out_n   = output.stride_elems(0);
+    const int64_t in_ch = input.channel_block_stride_elems();
+    const int64_t out_n = output.stride_elems(0);
     const int64_t out_row = output.row_stride_elems();
-    const int64_t out_ch  = output.channel_block_stride_elems();
+    const int64_t out_ch = output.channel_block_stride_elems();
     // The raw [C, 1, KH, KW] filter: one tap block per channel.
     const int64_t w_ch = weight.stride_elems(0);
     const int64_t w_kh = weight.stride_elems(2);
@@ -291,18 +313,20 @@ void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
     constexpr int L = simd_lane_for<T>;
 
     const DwtRowGrid grid = dwt_row_grid(gm, ctx.cpu.thread_count());
-    if (grid.total <= 0) { return; }
+    if (grid.total <= 0) {
+        return;
+    }
 
     ctx.cpu.run(0, grid.total, [&](int64_t task) {
         const int64_t st = task % grid.strips;
         const int64_t t1 = task / grid.strips;
         const int64_t rb = t1 % grid.row_blocks;
         const int64_t t2 = t1 / grid.row_blocks;
-        const int64_t c  = t2 % gm.C;
-        const int64_t n  = t2 / gm.C;
+        const int64_t c = t2 % gm.C;
+        const int64_t n = t2 / gm.C;
 
         const int64_t oh_begin = rb * grid.rows_per_task;
-        const int64_t oh_end   = std::min(gm.OH, oh_begin + grid.rows_per_task);
+        const int64_t oh_end = std::min(gm.OH, oh_begin + grid.rows_per_task);
 
         const T* in_c = in_ptr + n * in_n + c * in_ch;
         T* och = out_ptr + n * out_n + c * out_ch;
@@ -322,7 +346,9 @@ void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
                 const int64_t per = (mic + grid.strips - 1) / grid.strips;
                 const int64_t ts = std::min(mic, st * per);
                 const int64_t te = std::min(mic, ts + per);
-                if (ts >= te) { continue; }
+                if (ts >= te) {
+                    continue;
+                }
 
                 const TapList ct = col_taps(gm, r, mic);
 
@@ -332,7 +358,9 @@ void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
                     t_lo = std::max(t_lo, -ct.b[k]);
                     t_hi = std::min(t_hi, gm.IW - ct.b[k]);
                 }
-                if (t_lo > t_hi) { t_lo = t_hi; }   // no tap is in range throughout
+                if (t_lo > t_hi) {
+                    t_lo = t_hi;
+                } // no tap is in range throughout
 
                 const auto pixel = [&](int64_t t) {
                     float acc = 0.0f;
@@ -340,34 +368,37 @@ void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
                         const T* xrow = in_c + rt.b[a] * in_row;
                         for (int64_t k = 0; k < ct.n; ++k) {
                             const int64_t iw = ct.b[k] + t;
-                            if (iw < 0 || iw >= gm.IW) { continue; }
-                            acc += s_load(&xrow[iw]) *
-                                   s_load(&w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]);
+                            if (iw < 0 || iw >= gm.IW) {
+                                continue;
+                            }
+                            acc +=
+                                s_load(&xrow[iw]) * s_load(&w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]);
                         }
                     }
                     acc += bias;
                     T* dst = orow + r + t * gm.SW;
-                    apply_epilogue_store<T>(dst, acc, gm.epilogue, c, gm.add_to,
-                                            gm.pre_act);
+                    apply_epilogue_store<T>(dst, acc, gm.epilogue, c, gm.add_to, gm.pre_act);
                 };
 
                 const int64_t ilo = std::min(std::max(t_lo, ts), te);
                 const int64_t ihi = std::min(t_hi, te);
                 int64_t t = ts;
-                for (; t < ilo; ++t) { pixel(t); }
+                for (; t < ilo; ++t) {
+                    pixel(t);
+                }
 
                 for (; t + L <= ihi; t += L) {
                     vec_for<T> acc = v_zero(tag);
                     for (int64_t a = 0; a < rt.n; ++a) {
                         const T* xrow = in_c + rt.b[a] * in_row;
                         for (int64_t k = 0; k < ct.n; ++k) {
-                            const float wv =
-                                s_load(&w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]);
-                            acc = v_fmadd(v_load(xrow + ct.b[k] + t),
-                                          v_set1(tag, wv), acc);
+                            const float wv = s_load(&w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]);
+                            acc = v_fmadd(v_load(xrow + ct.b[k] + t), v_set1(tag, wv), acc);
                         }
                     }
-                    if (has_bias) { acc = v_add(acc, v_set1(tag, bias)); }
+                    if (has_bias) {
+                        acc = v_add(acc, v_set1(tag, bias));
+                    }
                     // The residual joins before the epilogue; the same staging
                     // that gathers a strided destination may serve both orders.
                     const bool strided = (gm.SW != 1);
@@ -404,10 +435,14 @@ void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
                     }
                 }
 
-                for (; t < ihi; ++t) { pixel(t); }
-                for (; t < te; ++t) { pixel(t); }
+                for (; t < ihi; ++t) {
+                    pixel(t);
+                }
+                for (; t < te; ++t) {
+                    pixel(t);
+                }
             }
-            }
+        }
     });
 }
 
@@ -417,21 +452,20 @@ void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
 
 template <typename T>
 void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx)
+                          std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const T* in_ptr  = input.ptr<T>();
-    const T* w_ptr   = weight.ptr<T>();
-    const T* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const T* in_ptr = input.ptr<T>();
+    const T* w_ptr = weight.ptr<T>();
+    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
-    const int64_t in_n   = input.stride_elems(0);
+    const int64_t in_n = input.stride_elems(0);
     const int64_t in_row = input.row_stride_elems();
-    const int64_t out_n   = output.stride_elems(0);
+    const int64_t out_n = output.stride_elems(0);
     const int64_t out_row = output.row_stride_elems();
     // The raw HWCM [KH][KW][C] filter: one tap is C contiguous channels.
     const int64_t w_kh = weight.stride_elems(0);
@@ -458,10 +492,10 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
     const int64_t nc = std::min(gm.SW, gm.OW);
 
     ctx.cpu.run(0, rows * strips, [&](int64_t task) {
-        const int64_t st  = task % strips;
+        const int64_t st = task % strips;
         const int64_t row = task / strips;
-        const int64_t oh  = row % gm.OH;
-        const int64_t n   = row / gm.OH;
+        const int64_t oh = row % gm.OH;
+        const int64_t n = row / gm.OH;
 
         const T* in_np = in_ptr + n * in_n;
         T* orow = out_ptr + n * out_n + oh * out_row;
@@ -472,7 +506,9 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
             const int64_t per = (mic + strips - 1) / strips;
             const int64_t ts = std::min(mic, st * per);
             const int64_t te = std::min(mic, ts + per);
-            if (ts >= te) { continue; }
+            if (ts >= te) {
+                continue;
+            }
 
             const TapList ct = col_taps(gm, r, mic);
             int64_t t_lo = 0;
@@ -481,7 +517,9 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                 t_lo = std::max(t_lo, -ct.b[k]);
                 t_hi = std::min(t_hi, gm.IW - ct.b[k]);
             }
-            if (t_lo > t_hi) { t_lo = t_hi; }
+            if (t_lo > t_hi) {
+                t_lo = t_hi;
+            }
 
             const auto scalar_one = [&](int64_t t, int64_t c) {
                 float acc = 0.0f;
@@ -489,15 +527,18 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                     const T* xrow = in_np + rt.b[a] * in_row;
                     for (int64_t k = 0; k < ct.n; ++k) {
                         const int64_t iw = ct.b[k] + t;
-                        if (iw < 0 || iw >= gm.IW) { continue; }
+                        if (iw < 0 || iw >= gm.IW) {
+                            continue;
+                        }
                         acc += s_load(&xrow[iw * C + c]) *
                                s_load(&w_ptr[rt.a[a] * w_kh + ct.a[k] * w_kw + c]);
                     }
                 }
-                if (has_bias) { acc += s_load(&b_ptr[c]); }
+                if (has_bias) {
+                    acc += s_load(&b_ptr[c]);
+                }
                 T* dst = orow + (r + t * gm.SW) * C + c;
-                apply_epilogue_store<T>(dst, acc, gm.epilogue, c, gm.add_to,
-                                        gm.pre_act);
+                apply_epilogue_store<T>(dst, acc, gm.epilogue, c, gm.add_to, gm.pre_act);
             };
 
             const auto pixel = [&](int64_t t) {
@@ -510,21 +551,25 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                             const T* xrow = in_np + rt.b[a] * in_row;
                             for (int64_t k = 0; k < ct.n; ++k) {
                                 const int64_t iw = ct.b[k] + t;
-                                if (iw < 0 || iw >= gm.IW) { continue; }
-                                acc = v_fmadd(
-                                    v_load(xrow + iw * C + c),
-                                    v_load(w_ptr + rt.a[a] * w_kh +
-                                           ct.a[k] * w_kw + c),
-                                    acc);
+                                if (iw < 0 || iw >= gm.IW) {
+                                    continue;
+                                }
+                                acc = v_fmadd(v_load(xrow + iw * C + c),
+                                              v_load(w_ptr + rt.a[a] * w_kh + ct.a[k] * w_kw + c),
+                                              acc);
                             }
                         }
-                        if (has_bias) { acc = v_add(acc, v_load(b_ptr + c)); }
+                        if (has_bias) {
+                            acc = v_add(acc, v_load(b_ptr + c));
+                        }
                         T* dst = orow + (r + t * gm.SW) * C + c;
-                        acc = apply_epilogue_vec_dst<T>(gm.epilogue, tag, acc, dst,
-                                                        gm.add_to, gm.pre_act);
+                        acc = apply_epilogue_vec_dst<T>(gm.epilogue, tag, acc, dst, gm.add_to,
+                                                        gm.pre_act);
                         v_store(dst, acc);
                     }
-                    for (; c < cend; ++c) { scalar_one(t, c); }
+                    for (; c < cend; ++c) {
+                        scalar_one(t, c);
+                    }
                 }
             };
 
@@ -543,8 +588,7 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                             const T* xrow = in_np + rt.b[a] * in_row + c;
                             for (int64_t k = 0; k < ct.n; ++k) {
                                 const vec_for<T> wv =
-                                    v_load(w_ptr + rt.a[a] * w_kh +
-                                           ct.a[k] * w_kw + c);
+                                    v_load(w_ptr + rt.a[a] * w_kh + ct.a[k] * w_kw + c);
                                 const T* src = xrow + (ct.b[k] + t) * C;
                                 a0 = v_fmadd(v_load(src), wv, a0);
                                 a1 = v_fmadd(v_load(src + C), wv, a1);
@@ -563,21 +607,23 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                         T* d1 = d0 + gm.SW * C;
                         T* d2 = d1 + gm.SW * C;
                         T* d3 = d2 + gm.SW * C;
-                        a0 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a0, d0,
-                                                       gm.add_to, gm.pre_act);
-                        a1 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a1, d1,
-                                                       gm.add_to, gm.pre_act);
-                        a2 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a2, d2,
-                                                       gm.add_to, gm.pre_act);
-                        a3 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a3, d3,
-                                                       gm.add_to, gm.pre_act);
+                        a0 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a0, d0, gm.add_to,
+                                                       gm.pre_act);
+                        a1 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a1, d1, gm.add_to,
+                                                       gm.pre_act);
+                        a2 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a2, d2, gm.add_to,
+                                                       gm.pre_act);
+                        a3 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a3, d3, gm.add_to,
+                                                       gm.pre_act);
                         v_store(d0, a0);
                         v_store(d1, a1);
                         v_store(d2, a2);
                         v_store(d3, a3);
                     }
                     for (; c < cend; ++c) {
-                        for (int64_t j = 0; j < 4; ++j) { scalar_one(t + j, c); }
+                        for (int64_t j = 0; j < 4; ++j) {
+                            scalar_one(t + j, c);
+                        }
                     }
                 }
             };
@@ -585,10 +631,18 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
             const int64_t ilo = std::max(t_lo, ts);
             const int64_t ihi = std::min(t_hi, te);
             int64_t t = ts;
-            for (; t < ilo; ++t) { pixel(t); }
-            for (; t + 4 <= ihi; t += 4) { tile4(t); }
-            for (; t < ihi; ++t) { pixel(t); }
-            for (; t < te; ++t) { pixel(t); }
+            for (; t < ilo; ++t) {
+                pixel(t);
+            }
+            for (; t + 4 <= ihi; t += 4) {
+                tile4(t);
+            }
+            for (; t < ihi; ++t) {
+                pixel(t);
+            }
+            for (; t < te; ++t) {
+                pixel(t);
+            }
         }
     });
 }
@@ -617,9 +671,9 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
 /// zero point shifted to the s8 convention.
 struct DwtI8Plane {
     const int8_t* ptr = nullptr;
-    int64_t n_stride = 0;    ///< elements between batches
-    int64_t row_stride = 0;  ///< elements between rows of one plane
-    int64_t ch_stride = 0;   ///< channel-first: elements between channels
+    int64_t n_stride = 0;   ///< elements between batches
+    int64_t row_stride = 0; ///< elements between rows of one plane
+    int64_t ch_stride = 0;  ///< channel-first: elements between channels
     float scale = 1.0f;
     int32_t zero = 0;
 };
@@ -630,14 +684,13 @@ struct DwtI8Plane {
 /// against the shifted zero point is still the reference's (x − zp_x) — the
 /// clamp windows map onto each other under the same −128.
 template <class TAct>
-Status dwtconv_i8_plane(const TensorView& in, bool channel_last, bool act_u8,
-                        DwtI8Plane& pl, PoolArray<int8_t>& buf,
-                        const ComputeContext& ctx)
+Status dwtconv_i8_plane(const TensorView& in, bool channel_last, bool act_u8, DwtI8Plane& pl,
+                        PoolArray<int8_t>& buf, const ComputeContext& ctx)
 {
     constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
 
-    const int64_t N  = in.shape(0);
-    const int64_t C  = in.shape(1);
+    const int64_t N = in.shape(0);
+    const int64_t C = in.shape(1);
     const int64_t IH = in.shape(2);
     const int64_t IW = in.shape(3);
     const int64_t row_len = channel_last ? IW * C : IW;
@@ -659,8 +712,12 @@ Status dwtconv_i8_plane(const TensorView& in, bool channel_last, bool act_u8,
 
     const int64_t rows = channel_last ? N * IH : N * C * IH;
     const int64_t total = rows * row_len;
-    if (!buf.reset(static_cast<size_t>(total))) { return Status::out_of_memory; }
-    if (total <= 0) { return Status::ok; }
+    if (!buf.reset(static_cast<size_t>(total))) {
+        return Status::out_of_memory;
+    }
+    if (total <= 0) {
+        return Status::ok;
+    }
 
     pl.ptr = buf.data();
     pl.n_stride = IH * IW * C;
@@ -684,8 +741,8 @@ Status dwtconv_i8_plane(const TensorView& in, bool channel_last, bool act_u8,
             }
             int8_t* dp = dst + r * row_len;
             if constexpr (kFpAct) {
-                quant_kernel::quantization<int8_t>(1, static_cast<int>(row_len), dp, 0,
-                                                   sp, 0, &s, &z);
+                quant_kernel::quantization<int8_t>(1, static_cast<int>(row_len), dp, 0, sp, 0, &s,
+                                                   &z);
             } else if constexpr (std::is_same_v<TAct, uint8_t>) {
                 for (int64_t k = 0; k < row_len; ++k) {
                     dp[k] = static_cast<int8_t>(static_cast<uint8_t>(sp[k] ^ 0x80u));
@@ -706,19 +763,19 @@ Status dwtconv_i8_plane(const TensorView& in, bool channel_last, bool act_u8,
     }
     const int64_t slab = (rows + nt - 1) / nt;
     const int64_t nslab = (rows + slab - 1) / slab;
-    ctx.cpu.run(0, nslab, [&](int64_t i) {
-        run(i * slab, std::min(i * slab + slab, rows));
-    });
+    ctx.cpu.run(0, nslab, [&](int64_t i) { run(i * slab, std::min(i * slab + slab, rows)); });
     return Status::ok;
 }
 
 /// (w − zp_w) as int16 lanes: [KH·KW][stride], the channels padded with zeros so
 /// a 16-lane load never reaches into the next tap's storage.
-Status dwtconv_i8_weight(const TensorView& weight, int64_t KH, int64_t KW,
-                         int64_t C, PoolArray<int16_t>& buf, int64_t& stride)
+Status dwtconv_i8_weight(const TensorView& weight, int64_t KH, int64_t KW, int64_t C,
+                         PoolArray<int16_t>& buf, int64_t& stride)
 {
     stride = (C + kI8Lane - 1) / kI8Lane * kI8Lane;
-    if (C <= 0) { return Status::ok; }
+    if (C <= 0) {
+        return Status::ok;
+    }
     if (!buf.reset(static_cast<size_t>(KH * KW * stride))) {
         return Status::out_of_memory;
     }
@@ -733,10 +790,11 @@ Status dwtconv_i8_weight(const TensorView& weight, int64_t KH, int64_t KW,
             int16_t* d = buf.data() + (kh * KW + kw) * stride;
             const int8_t* s = w_ptr + kh * w_kh + kw * w_kw;
             for (int64_t c = 0; c < C; ++c) {
-                d[c] = static_cast<int16_t>(
-                    static_cast<int32_t>(s[c]) - quant_zp_at(qw, c));
+                d[c] = static_cast<int16_t>(static_cast<int32_t>(s[c]) - quant_zp_at(qw, c));
             }
-            for (int64_t c = C; c < stride; ++c) { d[c] = 0; }
+            for (int64_t c = C; c < stride; ++c) {
+                d[c] = 0;
+            }
         }
     }
     return Status::ok;
@@ -745,8 +803,8 @@ Status dwtconv_i8_weight(const TensorView& weight, int64_t KH, int64_t KW,
 /// Channel-first int8: the lane spans the residue step, as in the fp route.
 template <typename TOut>
 Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const DwtI8Plane& pl, const ComputeContext& ctx)
+                        std::span<const TensorView> inputs, const DwtI8Plane& pl,
+                        const ComputeContext& ctx)
 {
     constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
@@ -778,7 +836,9 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
     const bool relu = gm.epilogue.type == EpilogueActivateType::Relu;
 
     const DwtRowGrid grid = dwt_row_grid(gm, ctx.cpu.thread_count());
-    if (grid.total <= 0) { return Status::ok; }
+    if (grid.total <= 0) {
+        return Status::ok;
+    }
     const int64_t nc = std::min(gm.SW, gm.OW);
 
     ctx.cpu.run(0, grid.total, [&](int64_t task) {
@@ -786,11 +846,11 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
         const int64_t t1 = task / grid.strips;
         const int64_t rb = t1 % grid.row_blocks;
         const int64_t t2 = t1 / grid.row_blocks;
-        const int64_t c  = t2 % gm.C;
-        const int64_t n  = t2 / gm.C;
+        const int64_t c = t2 % gm.C;
+        const int64_t n = t2 / gm.C;
 
         const int64_t oh_begin = rb * grid.rows_per_task;
-        const int64_t oh_end   = std::min(gm.OH, oh_begin + grid.rows_per_task);
+        const int64_t oh_end = std::min(gm.OH, oh_begin + grid.rows_per_task);
 
         const int8_t* in_c = pl.ptr + n * pl.n_stride + c * in_ch;
         TOut* och = out_ptr + n * out_n + c * out_ch;
@@ -814,11 +874,15 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
         const auto emit = [&](TOut* dst, int32_t acc) {
             if constexpr (kIntOut) {
                 int32_t v = acc + bias_i;
-                if (relu) { v = std::max(v, 0); }
+                if (relu) {
+                    v = std::max(v, 0);
+                }
                 *dst = matmul_int8_requant<TOut>(v, req, zp_out);
             } else {
                 float f = static_cast<float>(acc) * swsx;
-                if (has_bias) { f += bias_f; }
+                if (has_bias) {
+                    f += bias_f;
+                }
                 apply_epilogue_store<TOut>(dst, f, gm.epilogue, c,
                                            /*add_to=*/false, /*pre_act=*/false);
             }
@@ -841,9 +905,11 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
                 for (int64_t j = 0; j < kI8Lane; j += 8) {
                     v_f32x8 f = v_cvt_i32_to_f32(lanes + j);
                     f = v_mul(f, v_set1_f32x8(swsx));
-                    if (has_bias) { f = v_add(f, v_set1_f32x8(bias_f)); }
-                    f = apply_epilogue_vec<float>(gm.epilogue,
-                                                  static_cast<const float*>(nullptr), f);
+                    if (has_bias) {
+                        f = v_add(f, v_set1_f32x8(bias_f));
+                    }
+                    f = apply_epilogue_vec<float>(gm.epilogue, static_cast<const float*>(nullptr),
+                                                  f);
                     if constexpr (std::is_same_v<TOut, half>) {
                         v_store(dst + j, v_cvt_f32_to_f16(f));
                     } else {
@@ -866,7 +932,9 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
                 const int64_t per = (mic + grid.strips - 1) / grid.strips;
                 const int64_t ts = std::min(mic, st * per);
                 const int64_t te = std::min(mic, ts + per);
-                if (ts >= te) { continue; }
+                if (ts >= te) {
+                    continue;
+                }
 
                 const TapList ct = col_taps(gm, r, mic);
                 int64_t t_lo = 0;
@@ -875,16 +943,20 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
                     t_lo = std::max(t_lo, -ct.b[k]);
                     t_hi = std::min(t_hi, gm.IW - ct.b[k]);
                 }
-                if (t_lo > t_hi) { t_lo = t_hi; }
+                if (t_lo > t_hi) {
+                    t_lo = t_hi;
+                }
 
                 const auto pixel = [&](int64_t t) {
                     int32_t acc = 0;
                     for (int64_t a = 0; a < rt.n; ++a) {
                         for (int64_t k = 0; k < ct.n; ++k) {
                             const int64_t iw = ct.b[k] + t;
-                            if (iw < 0 || iw >= gm.IW) { continue; }
-                            const int32_t we = static_cast<int32_t>(
-                                w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]) - zp_w;
+                            if (iw < 0 || iw >= gm.IW) {
+                                continue;
+                            }
+                            const int32_t we =
+                                static_cast<int32_t>(w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]) - zp_w;
                             acc += we * (static_cast<int32_t>(xrow[a][iw]) - zp_x);
                         }
                     }
@@ -897,8 +969,7 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
                 int32_t sum_w = 0;
                 for (int64_t a = 0; a < rt.n; ++a) {
                     for (int64_t k = 0; k < ct.n; ++k) {
-                        sum_w += static_cast<int32_t>(
-                                     w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]) - zp_w;
+                        sum_w += static_cast<int32_t>(w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]) - zp_w;
                     }
                 }
                 const int32_t seed = -zp_x * sum_w;
@@ -906,7 +977,9 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
                 const int64_t ilo = std::min(std::max(t_lo, ts), te);
                 const int64_t ihi = std::min(t_hi, te);
                 int64_t t = ts;
-                for (; t < ilo; ++t) { pixel(t); }
+                for (; t < ilo; ++t) {
+                    pixel(t);
+                }
 
                 for (; t + kI8Lane <= ihi; t += kI8Lane) {
                     I8LaneAcc acc;
@@ -914,8 +987,8 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
                     for (int64_t a = 0; a < rt.n; ++a) {
                         for (int64_t k = 0; k < ct.n; ++k) {
                             acc.madd_s(xrow[a] + ct.b[k] + t,
-                                       static_cast<int32_t>(
-                                           w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]) - zp_w);
+                                       static_cast<int32_t>(w_c[rt.a[a] * w_kh + ct.a[k] * w_kw]) -
+                                           zp_w);
                         }
                     }
                     acc.store(lanes);
@@ -928,8 +1001,12 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
                     }
                 }
 
-                for (; t < ihi; ++t) { pixel(t); }
-                for (; t < te; ++t) { pixel(t); }
+                for (; t < ihi; ++t) {
+                    pixel(t);
+                }
+                for (; t < te; ++t) {
+                    pixel(t);
+                }
             }
         }
     });
@@ -940,8 +1017,8 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
 /// per accumulate step, the filter read from the staged int16 copy.
 template <typename TOut>
 Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
-                       std::span<const TensorView> inputs, const DwtI8Plane& pl,
-                       const int16_t* wq, int64_t wq_c, const ComputeContext& ctx)
+                       std::span<const TensorView> inputs, const DwtI8Plane& pl, const int16_t* wq,
+                       int64_t wq_c, const ComputeContext& ctx)
 {
     constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
@@ -969,7 +1046,9 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
     PoolArray<float> req_arr;
     const float* req = nullptr;
     if constexpr (kIntOut) {
-        if (!req_arr.reset(static_cast<size_t>(C))) { return Status::out_of_memory; }
+        if (!req_arr.reset(static_cast<size_t>(C))) {
+            return Status::out_of_memory;
+        }
         for (int64_t c = 0; c < C; ++c) {
             req_arr[static_cast<size_t>(c)] =
                 matmul_int8_requant_scale(quant_scale_at(qw, c), s_x, out_scale);
@@ -982,22 +1061,23 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
     int64_t strips = 1;
     if (rows < nt) {
         const int64_t max_strips = std::max<int64_t>(1, (gm.OW + 3) / 4);
-        strips = std::max<int64_t>(1,
-                                   std::min<int64_t>((nt + rows - 1) / rows, max_strips));
+        strips = std::max<int64_t>(1, std::min<int64_t>((nt + rows - 1) / rows, max_strips));
     }
     const int64_t nc = std::min(gm.SW, gm.OW);
 
     ctx.cpu.run(0, rows * strips, [&](int64_t task) {
-        const int64_t st  = task % strips;
+        const int64_t st = task % strips;
         const int64_t row = task / strips;
-        const int64_t oh  = row % gm.OH;
-        const int64_t n   = row / gm.OH;
+        const int64_t oh = row % gm.OH;
+        const int64_t n = row / gm.OH;
 
         const int8_t* in_n = pl.ptr + n * pl.n_stride;
         TOut* orow = out_ptr + n * out_n + oh * out_row;
         const TapList rt = row_taps(gm, oh);
         const int8_t* xrow[kMaxTaps];
-        for (int64_t a = 0; a < rt.n; ++a) { xrow[a] = in_n + rt.b[a] * in_row; }
+        for (int64_t a = 0; a < rt.n; ++a) {
+            xrow[a] = in_n + rt.b[a] * in_row;
+        }
 
         alignas(32) int32_t lanes[kI8Lane];
         alignas(32) float swsx[kI8Lane];
@@ -1007,7 +1087,9 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
             const int64_t per = (mic + strips - 1) / strips;
             const int64_t ts = std::min(mic, st * per);
             const int64_t te = std::min(mic, ts + per);
-            if (ts >= te) { continue; }
+            if (ts >= te) {
+                continue;
+            }
 
             const TapList ct = col_taps(gm, r, mic);
             int64_t t_lo = 0;
@@ -1016,7 +1098,9 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
                 t_lo = std::max(t_lo, -ct.b[k]);
                 t_hi = std::min(t_hi, gm.IW - ct.b[k]);
             }
-            if (t_lo > t_hi) { t_lo = t_hi; }
+            if (t_lo > t_hi) {
+                t_lo = t_hi;
+            }
 
             // One channel at a time, for the fewer-than-16 tail.
             const auto scalar_one = [&](int64_t t, int64_t c) {
@@ -1024,20 +1108,25 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
                 for (int64_t a = 0; a < rt.n; ++a) {
                     for (int64_t k = 0; k < ct.n; ++k) {
                         const int64_t iw = ct.b[k] + t;
-                        if (iw < 0 || iw >= gm.IW) { continue; }
-                        acc += static_cast<int32_t>(
-                                   wq[(rt.a[a] * gm.KW + ct.a[k]) * wq_c + c]) *
+                        if (iw < 0 || iw >= gm.IW) {
+                            continue;
+                        }
+                        acc += static_cast<int32_t>(wq[(rt.a[a] * gm.KW + ct.a[k]) * wq_c + c]) *
                                (static_cast<int32_t>(xrow[a][iw * C + c]) - zp_x);
                     }
                 }
                 TOut* dst = orow + (r + t * gm.SW) * C + c;
                 if constexpr (kIntOut) {
                     int32_t v = acc + (has_bias ? b_i32[c] : 0);
-                    if (relu) { v = std::max(v, 0); }
+                    if (relu) {
+                        v = std::max(v, 0);
+                    }
                     *dst = matmul_int8_requant<TOut>(v, req[c], zp_out);
                 } else {
                     float f = static_cast<float>(acc) * (quant_scale_at(qw, c) * s_x);
-                    if (has_bias) { f += s_load(&b_out[c]); }
+                    if (has_bias) {
+                        f += s_load(&b_out[c]);
+                    }
                     apply_epilogue_store<TOut>(dst, f, gm.epilogue, c,
                                                /*add_to=*/false, /*pre_act=*/false);
                 }
@@ -1092,8 +1181,8 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
                                     f = v_add(f, v_load(b_out + cb + j));
                                 }
                             }
-                            f = apply_epilogue_vec<float>(
-                                gm.epilogue, static_cast<const float*>(nullptr), f);
+                            f = apply_epilogue_vec<float>(gm.epilogue,
+                                                          static_cast<const float*>(nullptr), f);
                             if constexpr (std::is_same_v<TOut, half>) {
                                 v_store(dst + j, v_cvt_f32_to_f16(f));
                             } else {
@@ -1107,18 +1196,25 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
                     I8LaneAcc acc;
                     acc.set1(0);
                     I8LaneAcc sum;
-                    if (zp_x != 0) { sum.set1(0); }
+                    if (zp_x != 0) {
+                        sum.set1(0);
+                    }
                     for (int64_t a = 0; a < rt.n; ++a) {
                         for (int64_t k = 0; k < ct.n; ++k) {
                             const int64_t iw = ct.b[k] + t;
-                            if (iw < 0 || iw >= gm.IW) { continue; }
-                            const int16_t* wv =
-                                wq + (rt.a[a] * gm.KW + ct.a[k]) * wq_c + cb;
+                            if (iw < 0 || iw >= gm.IW) {
+                                continue;
+                            }
+                            const int16_t* wv = wq + (rt.a[a] * gm.KW + ct.a[k]) * wq_c + cb;
                             acc.madd_v(xrow[a] + iw * C + cb, wv);
-                            if (zp_x != 0) { sum.add_v(wv); }
+                            if (zp_x != 0) {
+                                sum.add_v(wv);
+                            }
                         }
                     }
-                    if (zp_x != 0) { acc.sub_scaled(sum, zp_x); }
+                    if (zp_x != 0) {
+                        acc.sub_scaled(sum, zp_x);
+                    }
                     acc.store(lanes);
                     emit_block(t);
                 };
@@ -1126,7 +1222,9 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
                 const int64_t ilo = std::min(std::max(t_lo, ts), te);
                 const int64_t ihi = std::min(t_hi, te);
                 int64_t t = ts;
-                for (; t < ilo; ++t) { edge_pixel(t); }
+                for (; t < ilo; ++t) {
+                    edge_pixel(t);
+                }
                 for (; t < ihi; ++t) {
                     I8LaneAcc acc = base;
                     for (int64_t a = 0; a < rt.n; ++a) {
@@ -1138,11 +1236,15 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
                     acc.store(lanes);
                     emit_block(t);
                 }
-                for (; t < te; ++t) { edge_pixel(t); }
+                for (; t < te; ++t) {
+                    edge_pixel(t);
+                }
             }
 
             for (int64_t c = c0; c < C; ++c) {
-                for (int64_t t = ts; t < te; ++t) { scalar_one(t, c); }
+                for (int64_t t = ts; t < te; ++t) {
+                    scalar_one(t, c);
+                }
             }
         }
     });
@@ -1151,36 +1253,42 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
 
 template <typename TOut>
 Status dwtconv_i8_layout(const DwtConvGeom& gm, TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const DwtI8Plane& pl, const ComputeContext& ctx)
+                         std::span<const TensorView> inputs, const DwtI8Plane& pl,
+                         const ComputeContext& ctx)
 {
     if (is_channel_last(inputs[0].layout())) {
         PoolArray<int16_t> wq;
         int64_t wq_c = 0;
         const Status st = dwtconv_i8_weight(inputs[1], gm.KH, gm.KW, gm.C, wq, wq_c);
-        if (!is_ok(st)) { return st; }
+        if (!is_ok(st)) {
+            return st;
+        }
         return dwtconv_i8_last<TOut>(gm, output, inputs, pl, wq.data(), wq_c, ctx);
     }
     return dwtconv_i8_first<TOut>(gm, output, inputs, pl, ctx);
 }
 
 template <class TAct>
-Status dwtconv_i8_act(const DwtConvGeom& gm, TensorView& output,
-                      std::span<const TensorView> inputs, bool act_u8,
-                      const ComputeContext& ctx)
+Status dwtconv_i8_act(const DwtConvGeom& gm, TensorView& output, std::span<const TensorView> inputs,
+                      bool act_u8, const ComputeContext& ctx)
 {
     DwtI8Plane pl;
     PoolArray<int8_t> plane;
-    const Status st = dwtconv_i8_plane<TAct>(inputs[0],
-                                             is_channel_last(inputs[0].layout()),
-                                             act_u8, pl, plane, ctx);
-    if (!is_ok(st)) { return st; }
+    const Status st = dwtconv_i8_plane<TAct>(inputs[0], is_channel_last(inputs[0].layout()), act_u8,
+                                             pl, plane, ctx);
+    if (!is_ok(st)) {
+        return st;
+    }
 
     switch (output.data_type()) {
-    case DataType::f32: return dwtconv_i8_layout<float>(gm, output, inputs, pl, ctx);
-    case DataType::f16: return dwtconv_i8_layout<half>(gm, output, inputs, pl, ctx);
-    case DataType::s8:  return dwtconv_i8_layout<int8_t>(gm, output, inputs, pl, ctx);
-    default:            return dwtconv_i8_layout<uint8_t>(gm, output, inputs, pl, ctx);
+    case DataType::f32:
+        return dwtconv_i8_layout<float>(gm, output, inputs, pl, ctx);
+    case DataType::f16:
+        return dwtconv_i8_layout<half>(gm, output, inputs, pl, ctx);
+    case DataType::s8:
+        return dwtconv_i8_layout<int8_t>(gm, output, inputs, pl, ctx);
+    default:
+        return dwtconv_i8_layout<uint8_t>(gm, output, inputs, pl, ctx);
     }
 }
 
@@ -1203,34 +1311,41 @@ Status depthwise_transpose_conv_int8_cpu(const DepthwiseTransposeConv2DAttribute
     if (!int_out && odt != DataType::f32 && odt != DataType::f16) {
         return Status::unsupported;
     }
-    if (!int_out && fp_act && odt != adt) { return Status::unsupported; }
-    if (inputs.size() > 2 &&
-        inputs[2].data_type() != (int_out ? DataType::s32 : odt)) {
+    if (!int_out && fp_act && odt != adt) {
         return Status::unsupported;
     }
-    if (gm.add_to) { return Status::unsupported; }
+    if (inputs.size() > 2 && inputs[2].data_type() != (int_out ? DataType::s32 : odt)) {
+        return Status::unsupported;
+    }
+    if (gm.add_to) {
+        return Status::unsupported;
+    }
 
-    if (gm.N == 0 || gm.C == 0 || gm.OH == 0 || gm.OW == 0) { return Status::ok; }
+    if (gm.N == 0 || gm.C == 0 || gm.OH == 0 || gm.OW == 0) {
+        return Status::ok;
+    }
 
     // The plane's storage follows the reference: an fp activation is quantized
     // to act_quant_dtype, a pre-quantized one keeps its own.
-    const bool act_u8 = fp_act ? (attrs.act_quant_dtype == DataType::u8)
-                               : (adt == DataType::u8);
+    const bool act_u8 = fp_act ? (attrs.act_quant_dtype == DataType::u8) : (adt == DataType::u8);
 
     switch (adt) {
-    case DataType::f32: return dwtconv_i8_act<float>(gm, output, inputs, act_u8, ctx);
-    case DataType::f16: return dwtconv_i8_act<half>(gm, output, inputs, act_u8, ctx);
-    case DataType::u8:  return dwtconv_i8_act<uint8_t>(gm, output, inputs, act_u8, ctx);
-    default:            return dwtconv_i8_act<int8_t>(gm, output, inputs, act_u8, ctx);
+    case DataType::f32:
+        return dwtconv_i8_act<float>(gm, output, inputs, act_u8, ctx);
+    case DataType::f16:
+        return dwtconv_i8_act<half>(gm, output, inputs, act_u8, ctx);
+    case DataType::u8:
+        return dwtconv_i8_act<uint8_t>(gm, output, inputs, act_u8, ctx);
+    default:
+        return dwtconv_i8_act<int8_t>(gm, output, inputs, act_u8, ctx);
     }
 }
 
 /// The fp kernels' layout choice: the per-tap form for the channel-last lane,
 /// the scalar form when the filter outruns the unrolled tap count.
 template <class T>
-void dwtconv_fp(const DwtConvGeom& gm, TensorView& output,
-                std::span<const TensorView> inputs, const ComputeContext& ctx,
-                bool last)
+void dwtconv_fp(const DwtConvGeom& gm, TensorView& output, std::span<const TensorView> inputs,
+                const ComputeContext& ctx, bool last)
 {
     if (last) {
         if (gm.KH > kMaxTaps || gm.KW > kMaxTaps) {
@@ -1247,24 +1362,22 @@ void dwtconv_fp(const DwtConvGeom& gm, TensorView& output,
     }
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // ============================================================
 // Entry point with dtype and layout dispatch
 // ============================================================
 
 Status depthwise_transpose_conv_cpu(const DepthwiseTransposeConv2DAttributes& attrs,
-                                    TensorView& output,
-                                    std::span<const TensorView> inputs,
-                                    const ComputeContext& ctx,
-                                    void* /*workspace*/)
+                                    TensorView& output, std::span<const TensorView> inputs,
+                                    const ComputeContext& ctx, void* /*workspace*/)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
     DwtConvGeom gm{};
-    gm.N  = input.shape(0);
-    gm.C  = input.shape(1);
+    gm.N = input.shape(0);
+    gm.C = input.shape(1);
     gm.IH = input.shape(2);
     gm.IW = input.shape(3);
     gm.OH = output.shape(2);
@@ -1295,25 +1408,25 @@ Status depthwise_transpose_conv_cpu(const DepthwiseTransposeConv2DAttributes& at
     std::array<TensorView, 3> operands;
     if (last && weight.rank() == 4 && is_channel_first_spatial(weight.layout())) {
         if (weight.shape(0) != gm.C || weight.shape(1) != 1) {
-            return Status::unsupported;   // not one filter per channel
+            return Status::unsupported; // not one filter per channel
         }
         const int64_t taps = gm.KH * gm.KW;
         const size_t es = data_type_size(weight.data_type());
         w_per_tap.reset(static_cast<size_t>(taps * gm.C) * es);
-        if (!w_per_tap) { return Status::unsupported; }
+        if (!w_per_tap) {
+            return Status::unsupported;
+        }
 
         const auto* src = weight.ptr<std::byte>();
         auto* dst = w_per_tap.data();
-        const int64_t s_c  = weight.stride_elems(0);
+        const int64_t s_c = weight.stride_elems(0);
         const int64_t s_kh = weight.stride_elems(2);
         const int64_t s_kw = weight.stride_elems(3);
         for (int64_t c = 0; c < gm.C; ++c) {
             for (int64_t kh = 0; kh < gm.KH; ++kh) {
                 for (int64_t kw = 0; kw < gm.KW; ++kw) {
-                    const size_t from =
-                        static_cast<size_t>((c * s_c + kh * s_kh + kw * s_kw)) * es;
-                    const size_t to =
-                        static_cast<size_t>(((kh * gm.KW + kw) * gm.C + c)) * es;
+                    const size_t from = static_cast<size_t>((c * s_c + kh * s_kh + kw * s_kw)) * es;
+                    const size_t to = static_cast<size_t>(((kh * gm.KW + kw) * gm.C + c)) * es;
                     std::memcpy(dst + to, src + from, es);
                 }
             }
@@ -1323,27 +1436,34 @@ Status depthwise_transpose_conv_cpu(const DepthwiseTransposeConv2DAttributes& at
 
         operands[0] = inputs[0];
         operands[1] = w_hwcm;
-        if (inputs.size() > 2) { operands[2] = inputs[2]; }
+        if (inputs.size() > 2) {
+            operands[2] = inputs[2];
+        }
         inputs = std::span<const TensorView>(operands.data(), inputs.size());
     }
 
     if (is_quantized_depthwise_transpose_conv2d(weight.data_type())) {
         return depthwise_transpose_conv_int8_cpu(attrs, gm, output, inputs, ctx);
     }
-    if (input.data_type() != weight.data_type() ||
-        output.data_type() != input.data_type()) {
+    if (input.data_type() != weight.data_type() || output.data_type() != input.data_type()) {
         return Status::unsupported;
     }
 
     switch (input.data_type()) {
-    case DataType::f32: dwtconv_fp<float>(gm, output, inputs, ctx, last); return Status::ok;
-    case DataType::f16: dwtconv_fp<half>(gm, output, inputs, ctx, last);  return Status::ok;
+    case DataType::f32:
+        dwtconv_fp<float>(gm, output, inputs, ctx, last);
+        return Status::ok;
+    case DataType::f16:
+        dwtconv_fp<half>(gm, output, inputs, ctx, last);
+        return Status::ok;
 #ifdef NNOPS_ARCH_AARCH64
-    case DataType::bf16: dwtconv_fp<bfloat16>(gm, output, inputs, ctx, last); return Status::ok;
+    case DataType::bf16:
+        dwtconv_fp<bfloat16>(gm, output, inputs, ctx, last);
+        return Status::ok;
 #endif
     default:
         return Status::unsupported;
     }
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

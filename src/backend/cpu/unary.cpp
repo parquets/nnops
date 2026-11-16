@@ -26,77 +26,126 @@ namespace {
 
 /// Dispatch a float unary op over an M×N tile; the quantized path reuses it with in == out and add_to == false.
 template <typename T>
-void apply_unary_flt(UnaryType type, const T* in, T* out,
-                     int64_t M, int64_t N, int64_t in_stride, int64_t out_stride,
-                     bool add_to) {
+void apply_unary_flt(UnaryType type, const T* in, T* out, int64_t M, int64_t N, int64_t in_stride,
+                     int64_t out_stride, bool add_to)
+{
     switch (type) {
-    case UnaryType::Exp:   kernel::exp<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Log:   kernel::log<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Sin:   kernel::sin<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Cos:   kernel::cos<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Tan:   kernel::tan<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Tanh:  kernel::tanh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Abs:   kernel::abs<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Neg:   kernel::neg<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Sqrt:  kernel::sqrt<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Erf:   kernel::erf<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Round: kernel::round<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Ceil:  kernel::ceil<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Floor: kernel::floor<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Recip: kernel::recip<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Sign:  kernel::sign<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Exp2:  kernel::exp2<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Log2:  kernel::log2<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Log10: kernel::log10<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Asin:  kernel::asin<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Acos:  kernel::acos<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Atan:  kernel::atan<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Sinh:  kernel::sinh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Cosh:  kernel::cosh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Asinh: kernel::asinh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Acosh: kernel::acosh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Atanh: kernel::atanh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
-    case UnaryType::Erfc:  kernel::erfc<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Exp:
+        kernel::exp<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Log:
+        kernel::log<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Sin:
+        kernel::sin<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Cos:
+        kernel::cos<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Tan:
+        kernel::tan<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Tanh:
+        kernel::tanh<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Abs:
+        kernel::abs<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Neg:
+        kernel::neg<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Sqrt:
+        kernel::sqrt<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Erf:
+        kernel::erf<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Round:
+        kernel::round<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Ceil:
+        kernel::ceil<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Floor:
+        kernel::floor<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Recip:
+        kernel::recip<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Sign:
+        kernel::sign<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Exp2:
+        kernel::exp2<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Log2:
+        kernel::log2<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Log10:
+        kernel::log10<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Asin:
+        kernel::asin<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Acos:
+        kernel::acos<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Atan:
+        kernel::atan<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Sinh:
+        kernel::sinh<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Cosh:
+        kernel::cosh<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Asinh:
+        kernel::asinh<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Acosh:
+        kernel::acosh<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Atanh:
+        kernel::atanh<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
+    case UnaryType::Erfc:
+        kernel::erfc<T>(in, out, M, N, in_stride, out_stride, add_to);
+        break;
     }
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 template <typename T>
-void unary_impl(const UnaryAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx)
+void unary_impl(const UnaryAttributes& attrs, TensorView& output,
+                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    tiled_float_transform<T>(inputs[0], output, ctx,
+    tiled_float_transform<T>(
+        inputs[0], output, ctx,
         [&](const T* in, T* out, int64_t m, int64_t n, int64_t in_stride, int64_t out_stride) {
             apply_unary_flt<T>(attrs.type, in, out, m, n, in_stride, out_stride, attrs.add_to);
         });
 }
 
-Status unary_quant_impl(const UnaryAttributes& attrs,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx)
+Status unary_quant_impl(const UnaryAttributes& attrs, TensorView& output,
+                        std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     // add_to is only meaningful on the float (non-quantized) path.
-    if (attrs.add_to) { return Status::unsupported; }
+    if (attrs.add_to) {
+        return Status::unsupported;
+    }
 
-    quantized_unary_transform(inputs[0], output, ctx,
-        [&](float* scratch, int h, int w) {
-            apply_unary_flt<float>(attrs.type, scratch, scratch, h, w, w, w, false);
-        });
+    quantized_unary_transform(inputs[0], output, ctx, [&](float* scratch, int h, int w) {
+        apply_unary_flt<float>(attrs.type, scratch, scratch, h, w, w, w, false);
+    });
     return Status::ok;
 }
 
-Status unary_cpu(const UnaryAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* /*workspace*/)
+Status unary_cpu(const UnaryAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
     const auto dtype = inputs[0].data_type();
-    const bool in_is_int  = is_quantized_dtype(dtype);
+    const bool in_is_int = is_quantized_dtype(dtype);
     const bool out_is_int = is_quantized_dtype(output.data_type());
 
     if (!in_is_int && !out_is_int) {
@@ -119,4 +168,4 @@ Status unary_cpu(const UnaryAttributes& attrs,
     return unary_quant_impl(attrs, output, inputs, ctx);
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

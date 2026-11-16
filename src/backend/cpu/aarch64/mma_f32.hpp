@@ -39,13 +39,12 @@ namespace nnops::backend::cpu::aarch64 {
 // ---- A and B both packed ----
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_pack_mr8_nr12_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A,
-    const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-
+inline void mma_pack_mr8_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
+                                           const float* NNOPS_RESTRICT A,
+                                           const float* NNOPS_RESTRICT B, float clamp_min,
+                                           float clamp_max,
+                                           const float* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     float* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
     float* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
     float* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
@@ -71,9 +70,13 @@ inline void mma_pack_mr8_nr12_mrxncxkc_f32(
 
     // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
-        else { return vdupq_n_f32(0.0f); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f32(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f32(bias + n + off);
+        } else {
+            return vdupq_n_f32(0.0f);
+        }
     };
 
     for (; n < nc - 11; n += 12) {
@@ -291,13 +294,12 @@ inline void mma_pack_mr8_nr12_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_pack_mr4_nr12_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A,
-    const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-
+inline void mma_pack_mr4_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
+                                           const float* NNOPS_RESTRICT A,
+                                           const float* NNOPS_RESTRICT B, float clamp_min,
+                                           float clamp_max,
+                                           const float* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     float* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
     float* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
     float* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
@@ -315,9 +317,13 @@ inline void mma_pack_mr4_nr12_mrxncxkc_f32(
 
     // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
-        else { return vdupq_n_f32(0.0f); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f32(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f32(bias + n + off);
+        } else {
+            return vdupq_n_f32(0.0f);
+        }
     };
 
     for (; n < nc - 11; n += 12) {
@@ -435,7 +441,10 @@ inline void mma_pack_mr4_nr12_mrxncxkc_f32(
         }
 
         const float32x4_t acc[4][3] = {
-            {c00, c01, c02}, {c10, c11, c12}, {c20, c21, c22}, {c30, c31, c32},
+            {c00, c01, c02},
+            {c10, c11, c12},
+            {c20, c21, c22},
+            {c30, c31, c32},
         };
         float* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
         for (int r = 0; r < mr; ++r) {
@@ -466,13 +475,12 @@ inline void mma_pack_mr4_nr12_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_pack_mr1_nr12_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A,
-    const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-
+inline void mma_pack_mr1_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
+                                           const float* NNOPS_RESTRICT A,
+                                           const float* NNOPS_RESTRICT B, float clamp_min,
+                                           float clamp_max,
+                                           const float* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     float* NNOPS_RESTRICT c0_ptr = C;
 
     const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
@@ -482,9 +490,13 @@ inline void mma_pack_mr1_nr12_mrxncxkc_f32(
     int n = 0;
 
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
-        else { return vdupq_n_f32(0.0f); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f32(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f32(bias + n + off);
+        } else {
+            return vdupq_n_f32(0.0f);
+        }
     };
 
     for (; n < nc - 11; n += 12) {
@@ -578,13 +590,12 @@ inline void mma_pack_mr1_nr12_mrxncxkc_f32(
 // ---- only B packed, A read row-major ----
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_direct_mr8_nr12_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B, int ldb,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-
+inline void mma_direct_mr8_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_RESTRICT C,
+                                             int ldc, const float* NNOPS_RESTRICT A, int lda,
+                                             const float* NNOPS_RESTRICT B, int ldb,
+                                             float clamp_min, float clamp_max,
+                                             const float* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -610,9 +621,13 @@ inline void mma_direct_mr8_nr12_mrxncxkc_f32(
     int n = 0;
 
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
-        else { return vdupq_n_f32(0.0f); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f32(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f32(bias + n + off);
+        } else {
+            return vdupq_n_f32(0.0f);
+        }
     };
     for (; n < nc - 11; n += 12) {
         float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
@@ -858,13 +873,12 @@ inline void mma_direct_mr8_nr12_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_direct_mr4_nr12_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B, int ldb,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-
+inline void mma_direct_mr4_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_RESTRICT C,
+                                             int ldc, const float* NNOPS_RESTRICT A, int lda,
+                                             const float* NNOPS_RESTRICT B, int ldb,
+                                             float clamp_min, float clamp_max,
+                                             const float* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -882,9 +896,13 @@ inline void mma_direct_mr4_nr12_mrxncxkc_f32(
     int n = 0;
 
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
-        else { return vdupq_n_f32(0.0f); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f32(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f32(bias + n + off);
+        } else {
+            return vdupq_n_f32(0.0f);
+        }
     };
     for (; n < nc - 11; n += 12) {
         float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
@@ -1013,7 +1031,10 @@ inline void mma_direct_mr4_nr12_mrxncxkc_f32(
         }
 
         const float32x4_t acc[4][3] = {
-            {c00, c01, c02}, {c10, c11, c12}, {c20, c21, c22}, {c30, c31, c32},
+            {c00, c01, c02},
+            {c10, c11, c12},
+            {c20, c21, c22},
+            {c30, c31, c32},
         };
         float* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
         for (int r = 0; r < mr; ++r) {
@@ -1044,12 +1065,12 @@ inline void mma_direct_mr4_nr12_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_direct_mr1_nr12_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B, int ldb,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
+inline void mma_direct_mr1_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_RESTRICT C,
+                                             int ldc, const float* NNOPS_RESTRICT A, int lda,
+                                             const float* NNOPS_RESTRICT B, int ldb,
+                                             float clamp_min, float clamp_max,
+                                             const float* NNOPS_RESTRICT bias = nullptr) noexcept
+{
     (void)mr;
     (void)lda;
     (void)ldc;
@@ -1067,9 +1088,13 @@ inline void mma_direct_mr1_nr12_mrxncxkc_f32(
     int n = 0;
 
     const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
-        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
-        else { return vdupq_n_f32(0.0f); }
+        if constexpr (seed == 1) {
+            return vdupq_n_f32(bias[r]);
+        } else if constexpr (seed == 2) {
+            return vld1q_f32(bias + n + off);
+        } else {
+            return vdupq_n_f32(0.0f);
+        }
     };
     // Two packed panels per pass: at one row the loop is nothing but weight
     // stream, and its scalar A load costs a whole load slot of its own, so one
@@ -1211,15 +1236,13 @@ inline void mma_direct_mr1_nr12_mrxncxkc_f32(
 
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
 template <bool Z, int Seed = 0>
-inline constexpr auto mma_pack_fns_f32 = std::array{
-    &mma_pack_mr8_nr12_mrxncxkc_f32<Z, Seed>,
-    &mma_pack_mr4_nr12_mrxncxkc_f32<Z, Seed>,
-    &mma_pack_mr1_nr12_mrxncxkc_f32<Z, Seed>};
+inline constexpr auto mma_pack_fns_f32 =
+    std::array{&mma_pack_mr8_nr12_mrxncxkc_f32<Z, Seed>, &mma_pack_mr4_nr12_mrxncxkc_f32<Z, Seed>,
+               &mma_pack_mr1_nr12_mrxncxkc_f32<Z, Seed>};
 
 template <bool Z, int Seed = 0>
-inline constexpr auto mma_direct_fns_f32 = std::array{
-    &mma_direct_mr8_nr12_mrxncxkc_f32<Z, Seed>,
-    &mma_direct_mr4_nr12_mrxncxkc_f32<Z, Seed>,
-    &mma_direct_mr1_nr12_mrxncxkc_f32<Z, Seed>};
+inline constexpr auto mma_direct_fns_f32 = std::array{&mma_direct_mr8_nr12_mrxncxkc_f32<Z, Seed>,
+                                                      &mma_direct_mr4_nr12_mrxncxkc_f32<Z, Seed>,
+                                                      &mma_direct_mr1_nr12_mrxncxkc_f32<Z, Seed>};
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

@@ -46,10 +46,9 @@ using nnops::backend::cpu::half_from_bits;
 using nnops::backend::cpu::half_to_float;
 
 /// Decode one block's 32 values into four 8-lane f32 vectors.
-inline void decode_q4_1_block_ps(const uint8_t* p,
-                                 __m256& v0, __m256& v1,
-                                 __m256& v2, __m256& v3,
-                                 float scale = 1.0f) noexcept {
+inline void decode_q4_1_block_ps(const uint8_t* p, __m256& v0, __m256& v1, __m256& v2, __m256& v3,
+                                 float scale = 1.0f) noexcept
+{
     uint16_t d_bits, m_bits;
     std::memcpy(&d_bits, p + 0, sizeof(d_bits));
     std::memcpy(&m_bits, p + 2, sizeof(m_bits));
@@ -80,8 +79,8 @@ inline void decode_q4_1_block_ps(const uint8_t* p,
 
 /// Decode one block into 32 f32 or f16 values (f16 rounds once per element).
 template <class T>
-inline void decode_q4_1_block(const uint8_t* p, T* out,
-                              float scale = 1.0f) noexcept {
+inline void decode_q4_1_block(const uint8_t* p, T* out, float scale = 1.0f) noexcept
+{
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
                   "decode_q4_1_block: T must be float or half");
 
@@ -89,8 +88,8 @@ inline void decode_q4_1_block(const uint8_t* p, T* out,
     decode_q4_1_block_ps(p, v0, v1, v2, v3, scale);
 
     if constexpr (std::is_same_v<T, float>) {
-        _mm256_storeu_ps(out + 0,  v0);
-        _mm256_storeu_ps(out + 8,  v1);
+        _mm256_storeu_ps(out + 0, v0);
+        _mm256_storeu_ps(out + 8, v1);
         _mm256_storeu_ps(out + 16, v2);
         _mm256_storeu_ps(out + 24, v3);
     } else {
@@ -108,8 +107,8 @@ inline void decode_q4_1_block(const uint8_t* p, T* out,
 /// Decode @p count values from a stream of 20-byte blocks into a dense array;
 /// a trailing partial block goes through a block-sized scratch and only its
 /// live values are copied.
-template <class T>
-void pack_q4(const void* blocks, int64_t count, T* out) noexcept {
+template <class T> void pack_q4(const void* blocks, int64_t count, T* out) noexcept
+{
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
                   "pack_q4: T must be float or half");
 
@@ -146,14 +145,14 @@ inline constexpr int q4_1_nr_max = 16;
 /// [k_start, k_start + kc); a panel straddles at most two 32-value blocks. Width
 /// is ignored when NR > 0.
 template <class T, int NR>
-void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
-                          int k_start, int kc, int n_start, int width,
-                          float scale = 1.0f) noexcept {
-    const int nb    = (NR > 0) ? NR : width;
-    const int blk0  = n_start >> 5;
-    const int off0  = n_start & 31;
+void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks, int k_start, int kc,
+                          int n_start, int width, float scale = 1.0f) noexcept
+{
+    const int nb = (NR > 0) ? NR : width;
+    const int blk0 = n_start >> 5;
+    const int off0 = n_start & 31;
     const int first = std::min(nb, 32 - off0);
-    const bool two  = (nb > first);
+    const bool two = (nb > first);
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(q4_1_block_bytes);
 
     T v0[q4_1_block_elems];
@@ -162,14 +161,13 @@ void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
         const uint8_t* row = src + static_cast<int64_t>(k_start + k) * row_bytes;
         T* o = out + static_cast<int64_t>(k) * q4_1_nr_max;
 
-        decode_q4_1_block<T>(row + static_cast<int64_t>(blk0) * q4_1_block_bytes, v0,
-                             scale);
+        decode_q4_1_block<T>(row + static_cast<int64_t>(blk0) * q4_1_block_bytes, v0, scale);
         for (int j = 0; j < first; ++j) {
             o[j] = v0[off0 + j];
         }
         if (two) {
-            decode_q4_1_block<T>(
-                row + static_cast<int64_t>(blk0 + 1) * q4_1_block_bytes, v1, scale);
+            decode_q4_1_block<T>(row + static_cast<int64_t>(blk0 + 1) * q4_1_block_bytes, v1,
+                                 scale);
             for (int j = first; j < nb; ++j) {
                 o[j] = v1[j - first];
             }
@@ -185,24 +183,23 @@ void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
 /// yields up to 32 consecutive k values — the efficient direction for Linear's
 /// weights.
 template <class T, int NR>
-void pack_q4_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
-                           int k_start, int kc, int n_start, int width,
-                           float scale = 1.0f) noexcept {
-    const int nb     = (NR > 0) ? NR : width;
-    const int blk0   = k_start >> 5;
-    const int off0   = k_start & 31;
-    const int nblk   = (off0 + kc + 31) >> 5;
+void pack_q4_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks, int k_start, int kc,
+                           int n_start, int width, float scale = 1.0f) noexcept
+{
+    const int nb = (NR > 0) ? NR : width;
+    const int blk0 = k_start >> 5;
+    const int off0 = k_start & 31;
+    const int nblk = (off0 + kc + 31) >> 5;
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(q4_1_block_bytes);
 
     T vals[q4_1_block_elems];
     for (int j = 0; j < nb; ++j) {
-        const uint8_t* row = src + static_cast<int64_t>(n_start + j) * row_bytes
-                           + static_cast<int64_t>(blk0) * q4_1_block_bytes;
+        const uint8_t* row = src + static_cast<int64_t>(n_start + j) * row_bytes +
+                             static_cast<int64_t>(blk0) * q4_1_block_bytes;
 
         int k = 0;
         for (int b = 0; b < nblk; ++b) {
-            decode_q4_1_block<T>(row + static_cast<int64_t>(b) * q4_1_block_bytes,
-                                 vals, scale);
+            decode_q4_1_block<T>(row + static_cast<int64_t>(b) * q4_1_block_bytes, vals, scale);
             const int start = (b == 0) ? off0 : 0;
             const int count = std::min(32 - start, kc - k);
             T* o = out + static_cast<int64_t>(k) * q4_1_nr_max + j;
@@ -226,9 +223,9 @@ void pack_q4_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
 /// physically [N][K]; @p dst steps by @p ldd (64-byte-aligned nr_max * kc) per
 /// panel, and @p row_blocks is the B row pitch in 20-byte blocks.
 template <class T>
-void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc,
-                   T* dst, int ldd, const void* src, int64_t row_blocks,
-                   float scale) noexcept {
+void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc, T* dst, int ldd,
+                   const void* src, int64_t row_blocks, float scale) noexcept
+{
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
                   "pack_q4_1_rhs: T must be float or half");
 
@@ -237,23 +234,23 @@ void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc,
     int n = 0;
     for (; n + q4_1_nr_max <= nc; n += q4_1_nr_max) {
         if (trans) {
-            pack_q4_1_trans_panel<T, q4_1_nr_max>(
-                dst, base, row_blocks, k_start, kc, n_start + n, 0, scale);
+            pack_q4_1_trans_panel<T, q4_1_nr_max>(dst, base, row_blocks, k_start, kc, n_start + n,
+                                                  0, scale);
         } else {
-            pack_q4_1_copy_panel<T, q4_1_nr_max>(
-                dst, base, row_blocks, k_start, kc, n_start + n, 0, scale);
+            pack_q4_1_copy_panel<T, q4_1_nr_max>(dst, base, row_blocks, k_start, kc, n_start + n, 0,
+                                                 scale);
         }
         dst += ldd;
     }
     if (n < nc) {
         if (trans) {
-            pack_q4_1_trans_panel<T, 0>(
-                dst, base, row_blocks, k_start, kc, n_start + n, nc - n, scale);
+            pack_q4_1_trans_panel<T, 0>(dst, base, row_blocks, k_start, kc, n_start + n, nc - n,
+                                        scale);
         } else {
-            pack_q4_1_copy_panel<T, 0>(
-                dst, base, row_blocks, k_start, kc, n_start + n, nc - n, scale);
+            pack_q4_1_copy_panel<T, 0>(dst, base, row_blocks, k_start, kc, n_start + n, nc - n,
+                                       scale);
         }
     }
 }
 
-}  // namespace nnops::backend::cpu::x86_64
+} // namespace nnops::backend::cpu::x86_64

@@ -22,8 +22,8 @@ namespace nnops::backend::cpu {
 namespace {
 
 template <typename T>
-void tile_impl(const TileAttributes& /*attrs*/, TensorView& output,
-               const TensorView& input, const ComputeContext& ctx)
+void tile_impl(const TileAttributes& /*attrs*/, TensorView& output, const TensorView& input,
+               const ComputeContext& ctx)
 {
     const int64_t rank = input.rank();
     int64_t odims[8], ostr[8], istr[8], idims[8];
@@ -48,16 +48,20 @@ void tile_impl(const TileAttributes& /*attrs*/, TensorView& output,
 }
 
 template <typename T>
-void expand_impl(const ExpandAttributes& /*attrs*/, TensorView& output,
-                 const TensorView& input, const ComputeContext& ctx)
+void expand_impl(const ExpandAttributes& /*attrs*/, TensorView& output, const TensorView& input,
+                 const ComputeContext& ctx)
 {
     const int64_t orank = output.rank();
     const int64_t irank = input.rank();
     int64_t odims[8], ostr[8], istr[8], idims[8];
     logical_strides(input, istr);
     logical_strides(output, ostr);
-    for (int64_t d = 0; d < orank; ++d) { odims[d] = output.shape(d); }
-    for (int64_t d = 0; d < irank; ++d) { idims[d] = input.shape(d); }
+    for (int64_t d = 0; d < orank; ++d) {
+        odims[d] = output.shape(d);
+    }
+    for (int64_t d = 0; d < irank; ++d) {
+        idims[d] = input.shape(d);
+    }
 
     const T* ip = input.ptr<T>();
     T* op = output.ptr<T>();
@@ -67,19 +71,18 @@ void expand_impl(const ExpandAttributes& /*attrs*/, TensorView& output,
         for (int64_t d = 0; d < orank; ++d) {
             os += o[d] * ostr[d];
             const int64_t ii = irank - orank + d;
-            if (ii >= 0 && idims[ii] != 1) { is += o[d] * istr[ii]; }
+            if (ii >= 0 && idims[ii] != 1) {
+                is += o[d] * istr[ii];
+            }
         }
         op[os] = ip[is];
     });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status tile_cpu(const TileAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx,
-                void* /*workspace*/)
+Status tile_cpu(const TileAttributes& attrs, TensorView& output, std::span<const TensorView> inputs,
+                const ComputeContext& ctx, void* /*workspace*/)
 {
     for_each_data_type(inputs[0].data_type(), [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -88,10 +91,8 @@ Status tile_cpu(const TileAttributes& attrs,
     return Status::ok;
 }
 
-Status expand_cpu(const ExpandAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
+Status expand_cpu(const ExpandAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx,
                   void* /*workspace*/)
 {
     for_each_data_type(inputs[0].data_type(), [&](auto tag) {
@@ -101,4 +102,4 @@ Status expand_cpu(const ExpandAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

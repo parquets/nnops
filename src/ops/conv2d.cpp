@@ -44,15 +44,11 @@ NNOPS_DECLARE_CPU(DepthwiseConvAttributes, depthwise_conv_cpu)
 NNOPS_DECLARE_CUDA(DepthwiseConvAttributes, depthwise_conv_cuda)
 
 struct Conv2D::Impl {
-    using KernelFn = Status (*)(const Conv2DAttributes&,
-                                TensorView&,
-                                std::span<const TensorView>,
-                                const ComputeContext&,
-                                void*);
+    using KernelFn = Status (*)(const Conv2DAttributes&, TensorView&, std::span<const TensorView>,
+                                const ComputeContext&, void*);
     KernelFn kernel_fn = nullptr;
 };
 Conv2D::~Conv2D() = default;
-
 
 namespace {
 
@@ -63,7 +59,9 @@ namespace {
 /// blob is excluded on purpose: it is a caller asking for the im2col route.
 bool is_depthwise_geometry(const Conv2DAttributes& attrs, const TensorView& weight)
 {
-    if (attrs.groups <= 1) { return false; }
+    if (attrs.groups <= 1) {
+        return false;
+    }
     const TensorLayout layout = weight.layout();
     if (!is_channel_first_spatial(layout) && !is_channel_last_weight(layout)) {
         return false;
@@ -74,12 +72,10 @@ bool is_depthwise_geometry(const Conv2DAttributes& attrs, const TensorView& weig
 
 bool is_fp(DataType dtype) noexcept
 {
-    return dtype == DataType::f32 || dtype == DataType::f16 ||
-           dtype == DataType::bf16;
+    return dtype == DataType::f32 || dtype == DataType::f16 || dtype == DataType::bf16;
 }
 
-auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
-    -> Conv2D::Impl::KernelFn
+auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm) -> Conv2D::Impl::KernelFn
 {
     if (algorithm == ConvAlgorithm::Winograd && backend == Backend::CPU) {
         return backend::cpu::conv2d_winograd_kernel;
@@ -91,8 +87,7 @@ auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
     case Backend::CUDA:
         // The CUDA route is implicit GEMM only: a Winograd weight handed in
         // (U) has no CUDA consumer, so it is refused rather than mis-read.
-        return algorithm == ConvAlgorithm::Winograd
-            ? nullptr : backend::cuda::conv2d_cuda;
+        return algorithm == ConvAlgorithm::Winograd ? nullptr : backend::cuda::conv2d_cuda;
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:
@@ -111,9 +106,9 @@ auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
 /// free of scratch and of ordering. A 512x512 filter is 262k transforms at load
 /// time — the one pack in this file big enough to be worth the dispatch.
 template <class T>
-void wino_pack_weight(const TensorView& weight, TensorView& u_out,
-                      int64_t OC, int64_t ICG, int64_t ld_u, int64_t ld_c,
-                      backend::cpu::WinoOrder order, const ComputeContext& ctx)
+void wino_pack_weight(const TensorView& weight, TensorView& u_out, int64_t OC, int64_t ICG,
+                      int64_t ld_u, int64_t ld_c, backend::cpu::WinoOrder order,
+                      const ComputeContext& ctx)
 {
     const T* g = weight.ptr<T>();
     T* u = u_out.ptr<T>();
@@ -123,11 +118,11 @@ void wino_pack_weight(const TensorView& weight, TensorView& u_out,
             T* const dst = u + oc * ICG + ic;
             const T* const src = g + (oc * ICG + ic) * 9;
             if (f23) {
-                nnops::kernel::winograd_weight_transform(
-                    src, 3, dst, static_cast<int>(ld_u), static_cast<int>(ld_c));
+                nnops::kernel::winograd_weight_transform(src, 3, dst, static_cast<int>(ld_u),
+                                                         static_cast<int>(ld_c));
             } else {
-                nnops::kernel::winograd43_weight_transform(
-                    src, 3, dst, static_cast<int>(ld_u), static_cast<int>(ld_c));
+                nnops::kernel::winograd43_weight_transform(src, 3, dst, static_cast<int>(ld_u),
+                                                           static_cast<int>(ld_c));
             }
         }
     });
@@ -140,29 +135,30 @@ void wino_pack_weight(const TensorView& weight, TensorView& u_out,
 /// owns the (k, col) lane of every position, so the split needs no scratch.
 template <class T>
 void wino_pack_weight_hwio(const TensorView& weight, TensorView& u_out,
-                           const backend::cpu::WinoChannelLastU& ug,
-                           int64_t ICG, int64_t OCG, int64_t G,
-                           const ComputeContext& ctx)
+                           const backend::cpu::WinoChannelLastU& ug, int64_t ICG, int64_t OCG,
+                           int64_t G, const ComputeContext& ctx)
 {
     const T* g = weight.ptr<T>();
     T* u = u_out.ptr<T>();
     // Strides come from the dims, not the pitch: a weight is a load-time constant.
-    const int64_t OC  = OCG * G;
-    const int64_t tap = ICG * OC;   // one filter position ([kh][kw]) of all groups
+    const int64_t OC = OCG * G;
+    const int64_t tap = ICG * OC; // one filter position ([kh][kw]) of all groups
     const bool f23 = ug.order == backend::cpu::WinoOrder::F23;
     // The group and the in-group channel flatten to one index, so the task axis
     // is the filter's whole output-channel extent.
     ctx.cpu.run(0, OC, [&](int64_t o) {
-        const int64_t gg  = o / OCG;
-        const int64_t n   = o % OCG;
-        const int64_t j   = gg * ug.jb + n / ug.nr;
+        const int64_t gg = o / OCG;
+        const int64_t n = o % OCG;
+        const int64_t j = gg * ug.jb + n / ug.nr;
         const int64_t col = n - (n / ug.nr) * ug.nr;
         for (int64_t ic = 0; ic < ICG; ++ic) {
             const int64_t kb = ic / ug.kc;
-            const int64_t k  = ic - kb * ug.kc;
+            const int64_t k = ic - kb * ug.kc;
             const T* src = g + ic * OC + o;
             T gt[9];
-            for (int t = 0; t < 9; ++t) { gt[t] = src[t * tap]; }
+            for (int t = 0; t < 9; ++t) {
+                gt[t] = src[t * tap];
+            }
             T uu[36];
             if (f23) {
                 nnops::kernel::winograd_weight_transform(gt, 3, uu, 4, 1);
@@ -170,11 +166,13 @@ void wino_pack_weight_hwio(const TensorView& weight, TensorView& u_out,
                 nnops::kernel::winograd43_weight_transform(gt, 3, uu, 6, 1);
             }
             T* dst = u + (kb * ug.jbg + j) * ug.ldd + k * ug.nr + col;
-            for (int64_t p = 0; p < ug.pos; ++p) { dst[p * ug.plane] = uu[p]; }
+            for (int64_t p = 0; p < ug.pos; ++p) {
+                dst[p * ug.plane] = uu[p];
+            }
         }
     });
 }
-}  // anonymous namespace
+} // anonymous namespace
 
 NNOPS_OP_CREATE(Conv2D, Conv2DAttributes)
 
@@ -184,15 +182,13 @@ Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_conv2d_kernel(backend, attrs_.algorithm);
 }
 
-std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Conv2D::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     // HWIO's last axis is OC, so the channel count is the weight's last dim.
-    const bool wt_hwio = inputs.size() > 1 &&
-        is_channel_last_weight(inputs[1].layout);
-    std::vector<TensorDesc> outs = conv2d_output_shape(
-        attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
-        static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs, wt_hwio);
+    const bool wt_hwio = inputs.size() > 1 && is_channel_last_weight(inputs[1].layout);
+    std::vector<TensorDesc> outs =
+        conv2d_output_shape(attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
+                            static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs, wt_hwio);
 
     // The quantized route writes s8/u8 when output_dtype says so, else the fp
     // activation's dtype (output_dtype for a pre-quantized one); an unsupported
@@ -238,16 +234,18 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
     // the other routes beats silently applying the residual on the wrong side
     // of the activation.
     if (attrs_.add_to && attrs_.residual_pre_activation) {
-        if (is_quantized_conv2d(inputs[1].dtype)) { return Status::unsupported; }
-        if (backend_ == Backend::CUDA) { return Status::unsupported; }
+        if (is_quantized_conv2d(inputs[1].dtype)) {
+            return Status::unsupported;
+        }
+        if (backend_ == Backend::CUDA) {
+            return Status::unsupported;
+        }
     }
     return Status::ok;
 }
 
-Status Conv2D::compute(std::span<TensorView> outputs,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace)
+Status Conv2D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                       const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
@@ -257,12 +255,12 @@ Status Conv2D::compute(std::span<TensorView> outputs,
     Conv2DAttributes attrs = attrs_;
     if (attrs.auto_pad != Conv2DAttributes::AutoPad::NOTSET) {
         const int ap = static_cast<int>(attrs.auto_pad);
-        attrs.padding[0] = resolve_leading_padding(
-            inputs[0].shape(2), attrs.kernel_size[0], attrs.stride[0],
-            attrs.dilation[0], attrs.padding[0], ap);
-        attrs.padding[1] = resolve_leading_padding(
-            inputs[0].shape(3), attrs.kernel_size[1], attrs.stride[1],
-            attrs.dilation[1], attrs.padding[1], ap);
+        attrs.padding[0] =
+            resolve_leading_padding(inputs[0].shape(2), attrs.kernel_size[0], attrs.stride[0],
+                                    attrs.dilation[0], attrs.padding[0], ap);
+        attrs.padding[1] =
+            resolve_leading_padding(inputs[0].shape(3), attrs.kernel_size[1], attrs.stride[1],
+                                    attrs.dilation[1], attrs.padding[1], ap);
         attrs.auto_pad = Conv2DAttributes::AutoPad::NOTSET;
     }
 
@@ -272,16 +270,16 @@ Status Conv2D::compute(std::span<TensorView> outputs,
     // loses by roughly 3.8x on the MobileNetV2 shapes on the CPU, an order of
     // magnitude more on the GPU, where every group also pays its own block.
     if ((backend_ == Backend::CPU || backend_ == Backend::CUDA) &&
-        attrs.algorithm != ConvAlgorithm::ImplicitGemm &&
-        inputs.size() >= 2 && is_fp(inputs[0].data_type()) &&
-        is_fp(inputs[1].data_type()) && is_depthwise_geometry(attrs, inputs[1])) {
+        attrs.algorithm != ConvAlgorithm::ImplicitGemm && inputs.size() >= 2 &&
+        is_fp(inputs[0].data_type()) && is_fp(inputs[1].data_type()) &&
+        is_depthwise_geometry(attrs, inputs[1])) {
         DepthwiseConvAttributes dw;
         dw.kernel_size = {1, attrs.kernel_size[0], attrs.kernel_size[1]};
-        dw.stride      = {1, attrs.stride[0], attrs.stride[1]};
-        dw.dilation    = {1, attrs.dilation[0], attrs.dilation[1]};
-        dw.padding     = {0, attrs.padding[0], attrs.padding[1]};
-        dw.epilogue    = attrs.epilogue;
-        dw.add_to      = attrs.add_to;
+        dw.stride = {1, attrs.stride[0], attrs.stride[1]};
+        dw.dilation = {1, attrs.dilation[0], attrs.dilation[1]};
+        dw.padding = {0, attrs.padding[0], attrs.padding[1]};
+        dw.epilogue = attrs.epilogue;
+        dw.add_to = attrs.add_to;
         dw.residual_pre_activation = attrs.residual_pre_activation;
         if (backend_ == Backend::CPU) {
             return backend::cpu::depthwise_conv_cpu(dw, output, inputs, ctx, workspace);
@@ -297,33 +295,33 @@ Status Conv2D::compute(std::span<TensorView> outputs,
     // prepacked form, each pairing with its own activation layout.
     const bool wino_u = is_wino_weight(inputs[1].layout());
     if (backend_ == Backend::CPU &&
-        (is_quantized_conv2d(inputs[1].data_type()) ||
-         is_packed_conv_weight(inputs[1].layout()) ||
+        (is_quantized_conv2d(inputs[1].data_type()) || is_packed_conv_weight(inputs[1].layout()) ||
          (is_channel_last(inputs[0].layout()) && !wino_u))) {
-        return backend::cpu::conv2d_implicit_gemm_kernel(attrs, output, inputs, ctx,
-                                                         workspace);
+        return backend::cpu::conv2d_implicit_gemm_kernel(attrs, output, inputs, ctx, workspace);
     }
 
     // Auto reads the weight it was handed: a raw filter has no U to use.
     auto kernel_fn = impl_->kernel_fn;
     if (attrs.algorithm == ConvAlgorithm::Auto) {
-        attrs.algorithm = wino_u ? ConvAlgorithm::Winograd
-                                 : ConvAlgorithm::ImplicitGemm;
+        attrs.algorithm = wino_u ? ConvAlgorithm::Winograd : ConvAlgorithm::ImplicitGemm;
         kernel_fn = resolve_conv2d_kernel(backend_, attrs.algorithm);
     }
 
-    if (!kernel_fn) { return Status::unsupported; }
+    if (!kernel_fn) {
+        return Status::unsupported;
+    }
     return kernel_fn(attrs, output, inputs, ctx, workspace);
 }
 
-void Conv2D::prepackWeights(std::span<const TensorView> inputs,
-                            std::span<TensorView> outputs,
+void Conv2D::prepackWeights(std::span<const TensorView> inputs, std::span<TensorView> outputs,
                             const ComputeContext& ctx)
 {
     // The CUDA kernels read the raw filter in place (implicit GEMM only), so
     // this backend has no packed product: the query stays empty, the same
     // "no packed form" answer MatMul gives a dtype it cannot pack.
-    if (backend_ != Backend::CPU) { return; }
+    if (backend_ != Backend::CPU) {
+        return;
+    }
     NNOPS_ASSERT(inputs.size() >= 1);
     NNOPS_ASSERT(outputs.size() >= 1);
     const auto& weight = inputs[0];
@@ -344,16 +342,14 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     // The U exists for f32 and f16 only: the Winograd kernel refuses every
     // other dtype (its U panels are the dense fp pack), so neither an Auto nor
     // an explicit Winograd pack may hand back a U the same call would decline.
-    const bool wino_dtype = weight.data_type() == DataType::f32 ||
-                            weight.data_type() == DataType::f16;
+    const bool wino_dtype =
+        weight.data_type() == DataType::f32 || weight.data_type() == DataType::f16;
     const bool wino_product =
         wino_dtype &&
         (attrs_.algorithm == ConvAlgorithm::Winograd ||
-         (attrs_.algorithm == ConvAlgorithm::Auto &&
-          !is_quantized_conv2d(weight.data_type()) &&
-          attrs_.kernel_size[0] == 3 && attrs_.kernel_size[1] == 3 &&
-          attrs_.stride[0] == 1 && attrs_.stride[1] == 1 &&
-          attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1));
+         (attrs_.algorithm == ConvAlgorithm::Auto && !is_quantized_conv2d(weight.data_type()) &&
+          attrs_.kernel_size[0] == 3 && attrs_.kernel_size[1] == 3 && attrs_.stride[0] == 1 &&
+          attrs_.stride[1] == 1 && attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1));
 
     if (!wino_product) {
         // A square 3x3/5x5/7x7 over at most four channels has no packed form on
@@ -367,34 +363,28 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
             !(!attrs_.add_to && (attrs_.epilogue.type == EpilogueActivateType::Relu ||
                                  attrs_.epilogue.type == EpilogueActivateType::Relu6));
         if (is_channel_last_weight(weight.layout()) && attrs_.groups == 1 &&
-            (weight.data_type() == DataType::f32 ||
-             weight.data_type() == DataType::f16) && weight.shape(2) <= 4 &&
-            weight.shape(3) % 16 == 0 && ks == attrs_.kernel_size[1] &&
+            (weight.data_type() == DataType::f32 || weight.data_type() == DataType::f16) &&
+            weight.shape(2) <= 4 && weight.shape(3) % 16 == 0 && ks == attrs_.kernel_size[1] &&
             ks >= 3 && ks <= 7 && (ks & 1) && !attrs_.add_to && !epi_pass) {
             return;
         }
         // The descriptor comes from the attributes and the filter's own dims, so
         // the query needs no activation.
-        const TensorDesc d =
-            backend::cpu::conv_packed_weight_desc(attrs_, weight.desc());
-        NNOPS_ASSERT(d.rank > 0 &&
-                     "Conv2D::prepackWeights: this filter has no packed form");
+        const TensorDesc d = backend::cpu::conv_packed_weight_desc(attrs_, weight.desc());
+        NNOPS_ASSERT(d.rank > 0 && "Conv2D::prepackWeights: this filter has no packed form");
         std::vector<int64_t> shape(d.dims.begin(), d.dims.begin() + d.rank);
         const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));
 
         if (outputs[0].is_empty()) {
             // The pitch is the row length in bytes: a packed filter is not
             // channel-packed, so the default alignment would not describe it.
-            outputs[0] = TensorView(shape, d.dtype, nullptr,
-                                    d.row_stride_elems * esz, d.layout,
+            outputs[0] = TensorView(shape, d.dtype, nullptr, d.row_stride_elems * esz, d.layout,
                                     weight.quant_params());
             return;
         }
 
-        NNOPS_ASSERT(outputs[0].layout() == d.layout &&
-                     outputs[0].rank() == d.rank &&
-                     outputs[0].shape(0) == shape[0] &&
-                     outputs[0].shape(1) == shape[1] &&
+        NNOPS_ASSERT(outputs[0].layout() == d.layout && outputs[0].rank() == d.rank &&
+                     outputs[0].shape(0) == shape[0] && outputs[0].shape(1) == shape[1] &&
                      "Conv2D::prepackWeights: the packed buffer does not match "
                      "the geometry");
         backend::cpu::conv_packed_weight_pack(attrs_, weight, outputs[0], ctx);
@@ -403,13 +393,12 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
 
     // compute() receives U and cannot fall back to the raw-weight im2col path,
     // so every unsupported configuration must fail here, at prepack time.
-    NNOPS_ASSERT((attrs_.algorithm == ConvAlgorithm::Winograd ||
-                  attrs_.algorithm == ConvAlgorithm::Auto) &&
-                 "Conv2D::prepackWeights: attrs.algorithm must be Winograd or Auto");
+    NNOPS_ASSERT(
+        (attrs_.algorithm == ConvAlgorithm::Winograd || attrs_.algorithm == ConvAlgorithm::Auto) &&
+        "Conv2D::prepackWeights: attrs.algorithm must be Winograd or Auto");
     NNOPS_ASSERT(attrs_.kernel_size[0] == 3 && attrs_.kernel_size[1] == 3 &&
-                 attrs_.stride[0] == 1 && attrs_.stride[1] == 1 &&
-                 attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1 &&
-                 "Conv2D::prepackWeights: Winograd requires k3s1");
+                 attrs_.stride[0] == 1 && attrs_.stride[1] == 1 && attrs_.dilation[0] == 1 &&
+                 attrs_.dilation[1] == 1 && "Conv2D::prepackWeights: Winograd requires k3s1");
 
     const DataType dtype = weight.data_type();
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
@@ -424,18 +413,19 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
         plane_h = inputs[1].shape(cl ? 1 : 2);
         plane_w = inputs[1].shape(cl ? 2 : 3);
     }
-    NNOPS_ASSERT((attrs_.winograd_order == 0 || attrs_.winograd_order == 2 ||
-                  attrs_.winograd_order == 4) &&
-                 "Conv2D::prepackWeights: winograd_order is 0, 2 or 4");
+    NNOPS_ASSERT(
+        (attrs_.winograd_order == 0 || attrs_.winograd_order == 2 || attrs_.winograd_order == 4) &&
+        "Conv2D::prepackWeights: winograd_order is 0, 2 or 4");
     // The worker count, not the item grid: an over-subscribed pool hands a
     // worker several items, and what the transform's cost per task amortizes
     // against is the cores it runs on.
     const int team = std::max(ctx.cpu.thread_slot_count(), 1);
     const auto pick_order = [&](int64_t icg, int64_t ocg, bool channel_last) {
-        return attrs_.winograd_order == 2 ? backend::cpu::WinoOrder::F23
-             : attrs_.winograd_order == 4 ? backend::cpu::WinoOrder::F43
-             : backend::cpu::wino_pick_order(dtype, icg, ocg, plane_h, plane_w,
-                                             channel_last, team);
+        return attrs_.winograd_order == 2 ? backend::cpu::WinoOrder::F23 :
+               attrs_.winograd_order == 4 ? backend::cpu::WinoOrder::F43 :
+                                            backend::cpu::wino_pick_order(dtype, icg, ocg, plane_h,
+                                                                          plane_w, channel_last,
+                                                                          team);
     };
 
     // Both U forms hold the same G g Gᵀ — only the packing differs, because the
@@ -443,8 +433,8 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     if (is_channel_last_weight(weight.layout())) {
         // Weight: [KH, KW, IC/G, OC]
         const int64_t ICG = weight.shape(2);
-        const int64_t OC  = weight.shape(3);
-        const int64_t G   = attrs_.groups;
+        const int64_t OC = weight.shape(3);
+        const int64_t G = attrs_.groups;
         NNOPS_ASSERT(G >= 1 && OC % G == 0 && ICG > 0);
         const int64_t OCG = OC / G;
 
@@ -457,9 +447,8 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
             // Query: the panels [pos][nb][G·jb][ldd], pitched at ldd — not
             // channel-packed, so the default 32 B row alignment would not fit.
             const int64_t u_shape[] = {ug.pos, ug.nb, ug.jbg, ug.ldd};
-            outputs[0] = TensorView(std::span<const int64_t>(u_shape, 4), dtype,
-                                    nullptr, ug.ldd * elem_size,
-                                    TensorLayout::PackedWinoWeightLast);
+            outputs[0] = TensorView(std::span<const int64_t>(u_shape, 4), dtype, nullptr,
+                                    ug.ldd * elem_size, TensorLayout::PackedWinoWeightLast);
             return;
         }
 
@@ -474,14 +463,13 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
             wino_pack_weight_hwio<float>(weight, outputs[0], ug, ICG, OCG, G, ctx);
         } else {
             NNOPS_ASSERT(dtype == DataType::f16);
-            wino_pack_weight_hwio<backend::cpu::half>(weight, outputs[0], ug, ICG,
-                                                      OCG, G, ctx);
+            wino_pack_weight_hwio<backend::cpu::half>(weight, outputs[0], ug, ICG, OCG, G, ctx);
         }
         return;
     }
 
     // Weight: [OC, IC/G, 3, 3]
-    const int64_t OC  = weight.shape(0);
+    const int64_t OC = weight.shape(0);
     const int64_t ICG = weight.shape(1);
 
     // The transform order is the channel-first U's leading dimension, exactly as
@@ -493,25 +481,24 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
         // channel-packed, so row_pitch() would 32 B-align it instead.
         const int64_t u_shape[] = {backend::cpu::wino_pos(order), OC, ICG};
         const int64_t u_pitch = ICG * elem_size;
-        outputs[0] = TensorView(std::span<const int64_t>(u_shape, 3), dtype,
-                                nullptr, u_pitch, TensorLayout::PackedWinoWeight);
+        outputs[0] = TensorView(std::span<const int64_t>(u_shape, 3), dtype, nullptr, u_pitch,
+                                TensorLayout::PackedWinoWeight);
         return;
     }
 
     // ---- Pack: U[p][oc][ic] = (G g Gᵀ)[p], row stride between p planes.
     NNOPS_ASSERT(outputs[0].shape(0) == backend::cpu::wino_pos(order) &&
                  outputs[0].shape(1) == OC && outputs[0].shape(2) == ICG);
-    const int64_t plane = OC * ICG;  // elements between transform positions
-    const int64_t ld_c  = plane;     // column (j) step of the pos block
-    const int64_t ld_u  = backend::cpu::wino_alpha(order) * plane;  // row (i) step
+    const int64_t plane = OC * ICG; // elements between transform positions
+    const int64_t ld_c = plane;     // column (j) step of the pos block
+    const int64_t ld_u = backend::cpu::wino_alpha(order) * plane; // row (i) step
 
     if (dtype == DataType::f32) {
         wino_pack_weight<float>(weight, outputs[0], OC, ICG, ld_u, ld_c, order, ctx);
     } else {
         NNOPS_ASSERT(dtype == DataType::f16);
-        wino_pack_weight<backend::cpu::half>(weight, outputs[0], OC, ICG, ld_u, ld_c,
-                                             order, ctx);
+        wino_pack_weight<backend::cpu::half>(weight, outputs[0], OC, ICG, ld_u, ld_c, order, ctx);
     }
 }
 
-}  // namespace nnops
+} // namespace nnops

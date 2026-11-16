@@ -33,8 +33,8 @@ inline void* view_data(const TensorView& v) noexcept
 inline TensorView lift_wide(const TensorView& v)
 {
     const int64_t s[4] = {v.shape(0), v.shape(1), 1, v.shape(2)};
-    return TensorView(std::span<const int64_t>(s, 4), v.data_type(), view_data(v),
-                      v.pitch(), v.layout(), v.quant_params());
+    return TensorView(std::span<const int64_t>(s, 4), v.data_type(), view_data(v), v.pitch(),
+                      v.layout(), v.quant_params());
 }
 
 /// A conv filter (rank 3) → its 2D order: OIHW [OC, IC/G, K] → [OC, IC/G, 1, K],
@@ -54,11 +54,11 @@ inline TensorView lift_filter_wide(const TensorView& w)
         w.shape(2),
     };
     if (hwio) {
-        return TensorView(std::span<const int64_t>(s, 4), w.data_type(), view_data(w),
-                          w.layout(), w.quant_params());
+        return TensorView(std::span<const int64_t>(s, 4), w.data_type(), view_data(w), w.layout(),
+                          w.quant_params());
     }
-    return TensorView(std::span<const int64_t>(s, 4), w.data_type(), view_data(w),
-                      w.pitch(), w.layout(), w.quant_params());
+    return TensorView(std::span<const int64_t>(s, 4), w.data_type(), view_data(w), w.pitch(),
+                      w.layout(), w.quant_params());
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

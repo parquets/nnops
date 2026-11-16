@@ -55,14 +55,14 @@ namespace {
 /// and mapping mode. Scalars only, passed by value.
 struct ResizeGeom {
     int64_t ow, oh, od;
-    int64_t iw, ih, id;   // effective input extents, after the crop
+    int64_t iw, ih, id; // effective input extents, after the crop
     int64_t n, c;
-    int64_t crop_off;     // crop origin, in elements
+    int64_t crop_off; // crop origin, in elements
 
     int64_t in_n, in_c, in_d, in_row, in_pix;
     int64_t out_n, out_c, out_d, out_row, out_pix;
 
-    int coord_mode;       // 0 half pixel, 1 align corners, 2 asymmetric
+    int coord_mode; // 0 half pixel, 1 align corners, 2 asymmetric
     float cubic_a;
     bool add_to;
 };
@@ -74,14 +74,15 @@ struct ResizeGeom {
 /// mode: 0 half pixel, 1 align corners, 2 asymmetric.
 __device__ inline float rsz_src(int64_t o, int64_t in_size, int64_t out_size, int mode)
 {
-    if (in_size == out_size) { return float(o); }
+    if (in_size == out_size) {
+        return float(o);
+    }
     if (mode == 1) {
-        return out_size <= 1 ? 0.0f
-                             : float(o) * float(in_size - 1) / float(out_size - 1);
+        return out_size <= 1 ? 0.0f : float(o) * float(in_size - 1) / float(out_size - 1);
     }
     const float scale = float(in_size) / float(out_size);
-    return mode == 0 ? __fsub_rn(__fmul_rn(float(o) + 0.5f, scale), 0.5f)
-                     : __fmul_rn(float(o), scale);
+    return mode == 0 ? __fsub_rn(__fmul_rn(float(o) + 0.5f, scale), 0.5f) :
+                       __fmul_rn(float(o), scale);
 }
 
 __device__ inline int64_t rsz_clamp(int64_t i, int64_t size)
@@ -89,8 +90,7 @@ __device__ inline int64_t rsz_clamp(int64_t i, int64_t size)
     return i < 0 ? 0 : (i >= size ? size - 1 : i);
 }
 
-__device__ inline int64_t rsz_nearest(int64_t o, int64_t in_size, int64_t out_size,
-                                      int mode)
+__device__ inline int64_t rsz_nearest(int64_t o, int64_t in_size, int64_t out_size, int mode)
 {
     return rsz_clamp(int64_t(roundf(rsz_src(o, in_size, out_size, mode))), in_size);
 }
@@ -103,8 +103,7 @@ struct LinearTap {
     float w;
 };
 
-__device__ inline LinearTap rsz_linear_tap(int64_t o, int64_t in_size, int64_t out_size,
-                                           int mode)
+__device__ inline LinearTap rsz_linear_tap(int64_t o, int64_t in_size, int64_t out_size, int mode)
 {
     const float src = rsz_src(o, in_size, out_size, mode);
     const float floored = floorf(src);
@@ -120,8 +119,12 @@ __device__ inline LinearTap rsz_linear_tap(int64_t o, int64_t in_size, int64_t o
 __device__ inline float rsz_cubic_weight(float x, float a)
 {
     const float ax = fabsf(x);
-    if (ax <= 1.0f) { return ((a + 2.0f) * ax - (a + 3.0f)) * ax * ax + 1.0f; }
-    if (ax < 2.0f) { return ((a * ax - 5.0f * a) * ax + 8.0f * a) * ax - 4.0f * a; }
+    if (ax <= 1.0f) {
+        return ((a + 2.0f) * ax - (a + 3.0f)) * ax * ax + 1.0f;
+    }
+    if (ax < 2.0f) {
+        return ((a * ax - 5.0f * a) * ax + 8.0f * a) * ax - 4.0f * a;
+    }
     return 0.0f;
 }
 
@@ -130,14 +133,16 @@ struct CubicTap {
     float w[4];
 };
 
-__device__ inline CubicTap rsz_cubic_tap(int64_t o, int64_t in_size, int64_t out_size,
-                                         int mode, float a)
+__device__ inline CubicTap rsz_cubic_tap(int64_t o, int64_t in_size, int64_t out_size, int mode,
+                                         float a)
 {
     const float src = rsz_src(o, in_size, out_size, mode);
     const int64_t base = int64_t(floorf(src));
     const float frac = src - float(base);
     CubicTap t;
-    for (int j = 0; j < 4; ++j) { t.idx[j] = rsz_clamp(base + j - 1, in_size); }
+    for (int j = 0; j < 4; ++j) {
+        t.idx[j] = rsz_clamp(base + j - 1, in_size);
+    }
     t.w[0] = rsz_cubic_weight(frac + 1.0f, a);
     t.w[1] = rsz_cubic_weight(frac, a);
     t.w[2] = rsz_cubic_weight(1.0f - frac, a);
@@ -145,10 +150,11 @@ __device__ inline CubicTap rsz_cubic_tap(int64_t o, int64_t in_size, int64_t out
     return t;
 }
 
-template <class T>
-__device__ inline void rsz_store(T* dst, float v, bool add_to)
+template <class T> __device__ inline void rsz_store(T* dst, float v, bool add_to)
 {
-    if (add_to) { v += s_load(dst); }
+    if (add_to) {
+        v += s_load(dst);
+    }
     s_store(dst, v);
 }
 
@@ -162,11 +168,12 @@ __device__ inline void rsz_store(T* dst, float v, bool add_to)
 /// dimension under 65535 and a thread pays the decode once per row iteration
 /// rather than once per element.
 template <class T, int Mode, int VW, bool ThreeD>
-__global__ void resize_first_kernel(const T* __restrict__ in, T* __restrict__ out,
-                                    ResizeGeom g)
+__global__ void resize_first_kernel(const T* __restrict__ in, T* __restrict__ out, ResizeGeom g)
 {
     const int64_t ow0 = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) * VW;
-    if (ow0 >= g.ow) { return; }
+    if (ow0 >= g.ow) {
+        return;
+    }
     const int cols = int(g.ow - ow0 < int64_t(VW) ? g.ow - ow0 : int64_t(VW));
 
     for (int64_t nc = blockIdx.z; nc < g.n * g.c; nc += gridDim.z) {
@@ -199,15 +206,11 @@ __global__ void resize_first_kernel(const T* __restrict__ in, T* __restrict__ ou
                     const T* r0 = in + in_plane + ty.i0 * g.in_row;
                     const T* r1 = in + in_plane + ty.i1 * g.in_row;
                     for (int v = 0; v < cols; ++v) {
-                        const LinearTap tx =
-                            rsz_linear_tap(ow0 + v, g.iw, g.ow, g.coord_mode);
+                        const LinearTap tx = rsz_linear_tap(ow0 + v, g.iw, g.ow, g.coord_mode);
                         const float wx0 = 1.0f - tx.w;
-                        const float top = wx0 * s_load(&r0[tx.i0]) +
-                                          tx.w * s_load(&r0[tx.i1]);
-                        const float bot = wx0 * s_load(&r1[tx.i0]) +
-                                          tx.w * s_load(&r1[tx.i1]);
-                        rsz_store(&orow[v], (1.0f - ty.w) * top + ty.w * bot,
-                                  g.add_to);
+                        const float top = wx0 * s_load(&r0[tx.i0]) + tx.w * s_load(&r0[tx.i1]);
+                        const float bot = wx0 * s_load(&r1[tx.i0]) + tx.w * s_load(&r1[tx.i1]);
+                        rsz_store(&orow[v], (1.0f - ty.w) * top + ty.w * bot, g.add_to);
                     }
                 } else {
                     const LinearTap tz = rsz_linear_tap(od, g.id, g.od, g.coord_mode);
@@ -215,8 +218,7 @@ __global__ void resize_first_kernel(const T* __restrict__ in, T* __restrict__ ou
                     const T* d1 = in + in_plane + tz.i1 * g.in_d;
                     const float wz0 = 1.0f - tz.w;
                     for (int v = 0; v < cols; ++v) {
-                        const LinearTap tx =
-                            rsz_linear_tap(ow0 + v, g.iw, g.ow, g.coord_mode);
+                        const LinearTap tx = rsz_linear_tap(ow0 + v, g.iw, g.ow, g.coord_mode);
                         const float wx0 = 1.0f - tx.w;
                         const float y0t = wx0 * s_load(&d0[ty.i0 * g.in_row + tx.i0]) +
                                           tx.w * s_load(&d0[ty.i0 * g.in_row + tx.i1]);
@@ -232,15 +234,13 @@ __global__ void resize_first_kernel(const T* __restrict__ in, T* __restrict__ ou
                     }
                 }
             } else {
-                const CubicTap ty =
-                    rsz_cubic_tap(oh, g.ih, g.oh, g.coord_mode, g.cubic_a);
+                const CubicTap ty = rsz_cubic_tap(oh, g.ih, g.oh, g.coord_mode, g.cubic_a);
                 const T* rows[4];
                 for (int j = 0; j < 4; ++j) {
                     rows[j] = in + in_plane + ty.idx[j] * g.in_row;
                 }
                 for (int v = 0; v < cols; ++v) {
-                    const CubicTap tx =
-                        rsz_cubic_tap(ow0 + v, g.iw, g.ow, g.coord_mode, g.cubic_a);
+                    const CubicTap tx = rsz_cubic_tap(ow0 + v, g.iw, g.ow, g.coord_mode, g.cubic_a);
                     float acc = 0.0f;
                     for (int j = 0; j < 4; ++j) {
                         const T* r = rows[j];
@@ -265,8 +265,8 @@ __global__ void resize_first_kernel(const T* __restrict__ in, T* __restrict__ ou
 /// block's channel chunk and threadIdx.y consecutive output pixels, so a warp
 /// touches one contiguous run of the pixel-major image.
 template <class T, int Mode, int Vec, bool ThreeD>
-__global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__ out,
-                                       ResizeGeom g, int c_blocks)
+__global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__ out, ResizeGeom g,
+                                       int c_blocks)
 {
     using V = std::conditional_t<sizeof(T) == 2, pack8<T>, float4>;
     static_assert(Vec * sizeof(T) == 16, "the channel lane is one 128-bit vector");
@@ -275,7 +275,9 @@ __global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__
     const int wb = int(blockIdx.x) / c_blocks;
     const int64_t c0 = (int64_t(cb) * blockDim.x + threadIdx.x) * Vec;
     const int64_t ow = int64_t(wb) * blockDim.y + threadIdx.y;
-    if (c0 >= g.c || ow >= g.ow) { return; }
+    if (c0 >= g.c || ow >= g.ow) {
+        return;
+    }
 
     // Only the channel offset is fixed here: every source tap below adds its own
     // column * in_pix, so carrying a column term here would count it twice.
@@ -307,7 +309,9 @@ __global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__
 #pragma unroll
                 for (int i = 0; i < Vec; ++i) {
                     float f = s_load(&xs[i]);
-                    if (g.add_to) { f += s_load(&out_c[i]); }
+                    if (g.add_to) {
+                        f += s_load(&out_c[i]);
+                    }
                     s_store(&rs[i], f);
                 }
                 *reinterpret_cast<V*>(dst) = res;
@@ -339,7 +343,9 @@ __global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__
                         const float top = wx0 * s_load(&p0[i]) + tx.w * s_load(&p1[i]);
                         const float bot = wx0 * s_load(&p2[i]) + tx.w * s_load(&p3[i]);
                         float f = wy0 * top + ty.w * bot;
-                        if (g.add_to) { f += s_load(&out_c[i]); }
+                        if (g.add_to) {
+                            f += s_load(&out_c[i]);
+                        }
                         s_store(&rs[i], f);
                     }
                     *reinterpret_cast<V*>(dst) = res;
@@ -375,16 +381,16 @@ __global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__
                         const float y0 = wy0 * a + ty.w * b;
                         const float y1 = wy0 * c + ty.w * d;
                         float f = wz0 * y0 + tz.w * y1;
-                        if (g.add_to) { f += s_load(&out_c[i]); }
+                        if (g.add_to) {
+                            f += s_load(&out_c[i]);
+                        }
                         s_store(&rs[i], f);
                     }
                     *reinterpret_cast<V*>(dst) = res;
                 }
             } else {
-                const CubicTap ty =
-                    rsz_cubic_tap(oh, g.ih, g.oh, g.coord_mode, g.cubic_a);
-                const CubicTap tx =
-                    rsz_cubic_tap(ow, g.iw, g.ow, g.coord_mode, g.cubic_a);
+                const CubicTap ty = rsz_cubic_tap(oh, g.ih, g.oh, g.coord_mode, g.cubic_a);
+                const CubicTap tx = rsz_cubic_tap(ow, g.iw, g.ow, g.coord_mode, g.cubic_a);
                 const T* rows[4];
                 for (int j = 0; j < 4; ++j) {
                     rows[j] = in + in_img + ty.idx[j] * g.in_row;
@@ -393,7 +399,9 @@ __global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__
                 T* rs = reinterpret_cast<T*>(&res);
                 float acc[Vec];
 #pragma unroll
-                for (int i = 0; i < Vec; ++i) { acc[i] = 0.0f; }
+                for (int i = 0; i < Vec; ++i) {
+                    acc[i] = 0.0f;
+                }
                 for (int j = 0; j < 4; ++j) {
                     const T* r = rows[j];
                     const V v0 = *reinterpret_cast<const V*>(r + tx.idx[0] * g.in_pix);
@@ -416,7 +424,9 @@ __global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__
 #pragma unroll
                 for (int i = 0; i < Vec; ++i) {
                     float f = acc[i];
-                    if (g.add_to) { f += s_load(&out_c[i]); }
+                    if (g.add_to) {
+                        f += s_load(&out_c[i]);
+                    }
                     s_store(&rs[i], f);
                 }
                 *reinterpret_cast<V*>(dst) = res;
@@ -433,7 +443,9 @@ __global__ void resize_last_scalar_kernel(const T* __restrict__ in, T* __restric
                                           ResizeGeom g)
 {
     const int64_t ow = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (ow >= g.ow) { return; }
+    if (ow >= g.ow) {
+        return;
+    }
 
     for (int64_t bn = blockIdx.z; bn < g.n; bn += gridDim.z) {
         const int64_t in_img = bn * g.in_n + g.crop_off;
@@ -492,10 +504,8 @@ __global__ void resize_last_scalar_kernel(const T* __restrict__ in, T* __restric
                     }
                 }
             } else {
-                const CubicTap ty =
-                    rsz_cubic_tap(oh, g.ih, g.oh, g.coord_mode, g.cubic_a);
-                const CubicTap tx =
-                    rsz_cubic_tap(ow, g.iw, g.ow, g.coord_mode, g.cubic_a);
+                const CubicTap ty = rsz_cubic_tap(oh, g.ih, g.oh, g.coord_mode, g.cubic_a);
+                const CubicTap tx = rsz_cubic_tap(ow, g.iw, g.ow, g.coord_mode, g.cubic_a);
                 const T* rows[4];
                 for (int j = 0; j < 4; ++j) {
                     rows[j] = in + in_img + ty.idx[j] * g.in_row;
@@ -532,26 +542,21 @@ void launch_first(const ResizeGeom& g, const T* in, T* out, cudaStream_t stream)
     const int by = std::max(1, kThreads / lanes);
     const dim3 block(static_cast<unsigned>(lanes), static_cast<unsigned>(by), 1);
     const dim3 grid(static_cast<unsigned>(ceil_div(g.ow, int64_t(lanes) * VW)),
-                    static_cast<unsigned>(
-                        std::min<int64_t>(ceil_div(g.od * g.oh, by), 65535)),
+                    static_cast<unsigned>(std::min<int64_t>(ceil_div(g.od * g.oh, by), 65535)),
                     static_cast<unsigned>(std::min<int64_t>(g.n * g.c, 65535)));
-    resize_first_kernel<T, Mode, VW, ThreeD>
-        <<<grid, block, 0, stream>>>(in, out, g);
+    resize_first_kernel<T, Mode, VW, ThreeD><<<grid, block, 0, stream>>>(in, out, g);
 }
 
 template <class T, int Mode, int Vec, bool ThreeD>
-void launch_last_vec(const ResizeGeom& g, const T* in, T* out, int bx, int by,
-                     cudaStream_t stream)
+void launch_last_vec(const ResizeGeom& g, const T* in, T* out, int bx, int by, cudaStream_t stream)
 {
-    const int c_blocks =
-        static_cast<int>(ceil_div(g.c / Vec, int64_t(bx)));
+    const int c_blocks = static_cast<int>(ceil_div(g.c / Vec, int64_t(bx)));
     const int w_blocks = static_cast<int>(ceil_div(g.ow, int64_t(by)));
     const dim3 block(static_cast<unsigned>(bx), static_cast<unsigned>(by), 1);
     const dim3 grid(static_cast<unsigned>(int64_t(c_blocks) * w_blocks),
                     static_cast<unsigned>(std::min<int64_t>(g.od * g.oh, 65535)),
                     static_cast<unsigned>(std::min<int64_t>(g.n, 65535)));
-    resize_last_vec_kernel<T, Mode, Vec, ThreeD>
-        <<<grid, block, 0, stream>>>(in, out, g, c_blocks);
+    resize_last_vec_kernel<T, Mode, Vec, ThreeD><<<grid, block, 0, stream>>>(in, out, g, c_blocks);
 }
 
 template <class T, int Mode, bool ThreeD>
@@ -568,21 +573,29 @@ void launch_last_scalar(const ResizeGeom& g, const T* in, T* out, cudaStream_t s
 /// The channel-vector lane needs a channel count that fills it, a pixel stride
 /// that keeps every lane 16 B aligned, and 16 B-aligned buffers — the pitch model
 /// supplies the row alignment, so only the base pointer is checked here.
-template <class T>
-bool lane_ok(const ResizeGeom& g, const T* in, T* out)
+template <class T> bool lane_ok(const ResizeGeom& g, const T* in, T* out)
 {
     constexpr int Vec = 16 / int(sizeof(T));
-    if (g.c % Vec != 0 || g.c / Vec < 4) { return false; }
-    if (g.in_pix != g.c || g.out_pix != g.c) { return false; }
-    if (g.in_row % Vec != 0 || g.out_row % Vec != 0) { return false; }
-    if (reinterpret_cast<uintptr_t>(in) % 16 != 0) { return false; }
-    if (reinterpret_cast<uintptr_t>(out) % 16 != 0) { return false; }
+    if (g.c % Vec != 0 || g.c / Vec < 4) {
+        return false;
+    }
+    if (g.in_pix != g.c || g.out_pix != g.c) {
+        return false;
+    }
+    if (g.in_row % Vec != 0 || g.out_row % Vec != 0) {
+        return false;
+    }
+    if (reinterpret_cast<uintptr_t>(in) % 16 != 0) {
+        return false;
+    }
+    if (reinterpret_cast<uintptr_t>(out) % 16 != 0) {
+        return false;
+    }
     return true;
 }
 
 template <class T, int Mode, bool ThreeD>
-void resize_launch(const ResizeGeom& g, bool last, const T* in, T* out,
-                   cudaStream_t stream)
+void resize_launch(const ResizeGeom& g, bool last, const T* in, T* out, cudaStream_t stream)
 {
     if (!last) {
         // A wider window buys columns at the cost of row lanes, and it only pays
@@ -675,8 +688,12 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
         g.out_d = g.oh * g.out_row;
     }
 
-    if (g.n == 0 || g.c == 0 || g.ow == 0 || g.oh == 0 || g.od == 0) { return; }
-    if (g.iw == 0 || g.ih == 0 || g.id == 0) { return; }
+    if (g.n == 0 || g.c == 0 || g.ow == 0 || g.oh == 0 || g.od == 0) {
+        return;
+    }
+    if (g.iw == 0 || g.ih == 0 || g.id == 0) {
+        return;
+    }
 
     const T* in = input.ptr<T>();
     T* out = output.ptr<T>();
@@ -703,15 +720,14 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
     }
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 Status resize_cuda(const ResizeAttributes& attrs, TensorView& output,
                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                    void* /*workspace*/)
 {
     // Cubic is the 2D bicubic; PyTorch and ONNX Runtime stop there too.
-    if (attrs.mode == ResizeMode::Cubic &&
-        ResizeAttributes::spatial_rank(inputs[0].rank()) != 2) {
+    if (attrs.mode == ResizeMode::Cubic && ResizeAttributes::spatial_rank(inputs[0].rank()) != 2) {
         return Status::unsupported;
     }
     switch (inputs[0].data_type()) {
@@ -729,4 +745,4 @@ Status resize_cuda(const ResizeAttributes& attrs, TensorView& output,
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

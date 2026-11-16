@@ -24,31 +24,33 @@ namespace {
 
 bool is_fp(DataType dtype) noexcept
 {
-    return dtype == DataType::f32 || dtype == DataType::f16 ||
-           dtype == DataType::bf16;
+    return dtype == DataType::f32 || dtype == DataType::f16 || dtype == DataType::bf16;
 }
 
 /// One input and one output channel per group, with the filter in the
 /// channel-first order the depthwise kernels take.
 bool is_depthwise_geometry(const TransposeConv2DAttributes& attrs, const TensorView& weight)
 {
-    if (attrs.groups <= 1) { return false; }
-    if (!is_channel_first_spatial(weight.layout()) || weight.rank() != 4) { return false; }
+    if (attrs.groups <= 1) {
+        return false;
+    }
+    if (!is_channel_first_spatial(weight.layout()) || weight.rank() != 4) {
+        return false;
+    }
     return weight.shape(1) == 1 && weight.shape(0) == attrs.groups;
 }
 
-}  // namespace
+} // namespace
 
-NNOPS_OP_BOILERPLATE(TransposeConv2D, TransposeConv2DAttributes,
-        backend::cpu::transpose_conv2d_cpu,
-        NNOPS_IF_CUDA(backend::cuda::transpose_conv2d_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(TransposeConv2D, TransposeConv2DAttributes, backend::cpu::transpose_conv2d_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::transpose_conv2d_cuda), nullptr)
 
-std::vector<TensorDesc> TransposeConv2D::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc>
+TransposeConv2D::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
-    std::vector<TensorDesc> outs = transpose_conv2d_output_shape(
-        attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
-        attrs_.output_padding, attrs_.groups, inputs);
+    std::vector<TensorDesc> outs =
+        transpose_conv2d_output_shape(attrs_.kernel_size, attrs_.stride, attrs_.dilation,
+                                      attrs_.padding, attrs_.output_padding, attrs_.groups, inputs);
 
     // The quantized route writes s8/u8 when output_dtype says so, else the fp
     // activation's dtype (output_dtype for a pre-quantized one); an unsupported
@@ -78,10 +80,8 @@ Status TransposeConv2D::validate(std::span<const TensorDesc> inputs,
         is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOrChannelLast));
 }
 
-Status TransposeConv2D::compute(std::span<TensorView> outputs,
-                                std::span<const TensorView> inputs,
-                                const ComputeContext& ctx,
-                                void* workspace)
+Status TransposeConv2D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                                const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
@@ -92,29 +92,28 @@ Status TransposeConv2D::compute(std::span<TensorView> outputs,
     // while the depthwise kernels accumulate the pixels directly. CUDA needs no
     // hand-over: its TransposeConv2D entry declines the GEMM on this geometry
     // and reaches the same kernel file from its own dispatch.
-    if (backend_ == Backend::CPU && inputs.size() >= 2 &&
-        is_fp(inputs[0].data_type()) &&
+    if (backend_ == Backend::CPU && inputs.size() >= 2 && is_fp(inputs[0].data_type()) &&
         inputs[1].data_type() == inputs[0].data_type() &&
-        (is_channel_first_spatial(inputs[0].layout()) ||
-         is_channel_last(inputs[0].layout())) &&
+        (is_channel_first_spatial(inputs[0].layout()) || is_channel_last(inputs[0].layout())) &&
         is_depthwise_geometry(attrs_, inputs[1])) {
         DepthwiseTransposeConv2DAttributes dw;
-        dw.kernel_size     = attrs_.kernel_size;
-        dw.stride          = attrs_.stride;
-        dw.dilation        = attrs_.dilation;
-        dw.padding         = attrs_.padding;
-        dw.output_padding  = attrs_.output_padding;
-        dw.epilogue        = attrs_.epilogue;
-        dw.add_to          = attrs_.add_to;
+        dw.kernel_size = attrs_.kernel_size;
+        dw.stride = attrs_.stride;
+        dw.dilation = attrs_.dilation;
+        dw.padding = attrs_.padding;
+        dw.output_padding = attrs_.output_padding;
+        dw.epilogue = attrs_.epilogue;
+        dw.add_to = attrs_.add_to;
         dw.residual_pre_activation = attrs_.residual_pre_activation;
-        dw.output_dtype    = attrs_.output_dtype;
+        dw.output_dtype = attrs_.output_dtype;
         dw.act_quant_dtype = attrs_.act_quant_dtype;
-        return backend::cpu::depthwise_transpose_conv_cpu(dw, outputs[0], inputs, ctx,
-                                                          workspace);
+        return backend::cpu::depthwise_transpose_conv_cpu(dw, outputs[0], inputs, ctx, workspace);
     }
 
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

@@ -23,12 +23,10 @@ namespace nnops {
 NNOPS_DECLARE_CPU(LinearAttributes, linear_cpu)
 NNOPS_DECLARE_CUDA(LinearAttributes, linear_cuda)
 
-NNOPS_OP_BOILERPLATE(Linear, LinearAttributes,
-        backend::cpu::linear_cpu,
-        NNOPS_IF_CUDA(backend::cuda::linear_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(Linear, LinearAttributes, backend::cpu::linear_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::linear_cuda), nullptr)
 
-std::vector<TensorDesc> Linear::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Linear::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     auto out = linear_output_shape(inputs);
 
@@ -40,9 +38,8 @@ std::vector<TensorDesc> Linear::getOutputTensorDesc(
 
     if (is_int8_matmul(inputs[0].dtype, inputs[1].dtype)) {
         const DataType odt = attrs_.output_dtype;
-        const bool known = odt == DataType::f16 || odt == DataType::f32 ||
-                           odt == DataType::s32 || odt == DataType::s8 ||
-                           odt == DataType::u8;
+        const bool known = odt == DataType::f16 || odt == DataType::f32 || odt == DataType::s32 ||
+                           odt == DataType::s8 || odt == DataType::u8;
         out[0].dtype = known ? odt : DataType::f32;
     }
 
@@ -53,8 +50,8 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
                         std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
-    NNOPS_TRY(detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)));
+    NNOPS_TRY(
+        detail::require(is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)));
 
     // The CUDA kernels carry four batch axes — the same rank-six ceiling as
     // MatMul's front end — while the CPU batch walk is unbounded.
@@ -71,7 +68,9 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
         }
     }
 
-    if (!attrs_.gated) { return Status::ok; }
+    if (!attrs_.gated) {
+        return Status::ok;
+    }
 
     // The gated combine implements Silu (SwiGLU), Gelu (GeGLU) and the plain
     // activations; anything else has no kernel.
@@ -109,23 +108,24 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
     return Status::ok;
 }
 
-Status Linear::compute(std::span<TensorView> outputs,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace)
+Status Linear::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                       const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 2, 3, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-void Linear::prepackWeights(std::span<const TensorView> inputs,
-                            std::span<TensorView> outputs,
+void Linear::prepackWeights(std::span<const TensorView> inputs, std::span<TensorView> outputs,
                             const ComputeContext& ctx)
 {
     // CUDA reads the raw [N, K] weight in place; the query answers empty.
-    if (backend_ != Backend::CPU) { return; }
+    if (backend_ != Backend::CPU) {
+        return;
+    }
     NNOPS_ASSERT(inputs.size() >= 1);
     NNOPS_ASSERT(outputs.size() >= 1);
     const auto& weight = inputs[0];
@@ -141,19 +141,19 @@ void Linear::prepackWeights(std::span<const TensorView> inputs,
         // so the default alignment would not describe it. A weight with no packed
         // form answers empty rather than failing, since a graph engine asks
         // unconditionally.
-        if (d.rank <= 0) { return; }
-        outputs[0] = TensorView(shape, d.dtype, nullptr, d.row_stride_elems * esz,
-                                d.layout, weight.quant_params());
+        if (d.rank <= 0) {
+            return;
+        }
+        outputs[0] = TensorView(shape, d.dtype, nullptr, d.row_stride_elems * esz, d.layout,
+                                weight.quant_params());
         return;
     }
 
-    NNOPS_ASSERT(d.rank > 0 && outputs[0].layout() == d.layout &&
-                 outputs[0].rank() == d.rank &&
-                 outputs[0].shape(0) == shape[0] &&
-                 outputs[0].shape(1) == shape[1] &&
+    NNOPS_ASSERT(d.rank > 0 && outputs[0].layout() == d.layout && outputs[0].rank() == d.rank &&
+                 outputs[0].shape(0) == shape[0] && outputs[0].shape(1) == shape[1] &&
                  "Linear::prepackWeights: the packed buffer does not match the "
                  "geometry");
     backend::cpu::matmul_packed_b_pack(weight, outputs[0], /*transpose_b=*/true, ctx);
 }
 
-}  // namespace nnops
+} // namespace nnops

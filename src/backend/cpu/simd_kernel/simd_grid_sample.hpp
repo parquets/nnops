@@ -22,7 +22,8 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-inline float gridsample_grid_to_pixel(float coord, int64_t size, bool align_corners) {
+inline float gridsample_grid_to_pixel(float coord, int64_t size, bool align_corners)
+{
     if (align_corners) {
         return (coord + 1.0f) * static_cast<float>(size - 1) * 0.5f;
     } else {
@@ -30,7 +31,8 @@ inline float gridsample_grid_to_pixel(float coord, int64_t size, bool align_corn
     }
 }
 
-inline float gridsample_reflect_coord(float x, int64_t size) {
+inline float gridsample_reflect_coord(float x, int64_t size)
+{
     if (size <= 1) {
         return 0.0f;
     }
@@ -42,7 +44,8 @@ inline float gridsample_reflect_coord(float x, int64_t size) {
     return r;
 }
 
-inline float gridsample_apply_padding(float pixel, int64_t size, GridSamplePaddingMode padding) {
+inline float gridsample_apply_padding(float pixel, int64_t size, GridSamplePaddingMode padding)
+{
     switch (padding) {
     case GridSamplePaddingMode::Border:
         return std::max(0.0f, std::min(pixel, static_cast<float>(size - 1)));
@@ -54,31 +57,30 @@ inline float gridsample_apply_padding(float pixel, int64_t size, GridSamplePaddi
     }
 }
 
-inline bool gridsample_in_bounds(float pixel, int64_t size) {
+inline bool gridsample_in_bounds(float pixel, int64_t size)
+{
     return pixel >= 0.0f && pixel <= static_cast<float>(size - 1);
 }
 
-inline int64_t gridsample_clamp_idx(int64_t idx, int64_t size) {
+inline int64_t gridsample_clamp_idx(int64_t idx, int64_t size)
+{
     return std::max<int64_t>(0, std::min(idx, size - 1));
 }
 
 /// Check if all 4 corners of a bilinear region are in bounds.
-inline bool gridsample_bilinear_bounds_ok(float py, float pz, int64_t IH, int64_t IW) {
-    return gridsample_in_bounds(std::floor(py), IH) &&
-           gridsample_in_bounds(std::ceil(py),  IH) &&
-           gridsample_in_bounds(std::floor(pz), IW) &&
-           gridsample_in_bounds(std::ceil(pz),  IW);
+inline bool gridsample_bilinear_bounds_ok(float py, float pz, int64_t IH, int64_t IW)
+{
+    return gridsample_in_bounds(std::floor(py), IH) && gridsample_in_bounds(std::ceil(py), IH) &&
+           gridsample_in_bounds(std::floor(pz), IW) && gridsample_in_bounds(std::ceil(pz), IW);
 }
 
 /// Check if all 8 corners of a trilinear region are in bounds.
-inline bool gridsample_trilinear_bounds_ok(float px, float py, float pz,
-                                            int64_t ID, int64_t IH, int64_t IW) {
-    return gridsample_in_bounds(std::floor(px), ID) &&
-           gridsample_in_bounds(std::ceil(px),  ID) &&
-           gridsample_in_bounds(std::floor(py), IH) &&
-           gridsample_in_bounds(std::ceil(py),  IH) &&
-           gridsample_in_bounds(std::floor(pz), IW) &&
-           gridsample_in_bounds(std::ceil(pz),  IW);
+inline bool gridsample_trilinear_bounds_ok(float px, float py, float pz, int64_t ID, int64_t IH,
+                                           int64_t IW)
+{
+    return gridsample_in_bounds(std::floor(px), ID) && gridsample_in_bounds(std::ceil(px), ID) &&
+           gridsample_in_bounds(std::floor(py), IH) && gridsample_in_bounds(std::ceil(py), IH) &&
+           gridsample_in_bounds(std::floor(pz), IW) && gridsample_in_bounds(std::ceil(pz), IW);
 }
 
 // ============================================================
@@ -87,7 +89,8 @@ inline bool gridsample_trilinear_bounds_ok(float px, float py, float pz,
 
 /// Copy one pixel's C channels, or leave `add_to` destinations untouched.
 template <typename T>
-inline void gridsample_copy_pixel(T* dst, const T* src, int64_t C, bool add_to) {
+inline void gridsample_copy_pixel(T* dst, const T* src, int64_t C, bool add_to)
+{
     constexpr int L = simd_lane_for<T>;
     int64_t c = 0;
     for (; c + L <= C; c += L) {
@@ -99,9 +102,11 @@ inline void gridsample_copy_pixel(T* dst, const T* src, int64_t C, bool add_to) 
 }
 
 /// Zero one pixel's C channels (zeros padding); add_to leaves it alone.
-template <typename T>
-inline void gridsample_zero_pixel(T* dst, int64_t C, bool add_to) {
-    if (add_to) { return; }
+template <typename T> inline void gridsample_zero_pixel(T* dst, int64_t C, bool add_to)
+{
+    if (add_to) {
+        return;
+    }
     constexpr int L = simd_lane_for<T>;
     int64_t c = 0;
     for (; c + L <= C; c += L) {
@@ -117,12 +122,10 @@ inline void gridsample_zero_pixel(T* dst, int64_t C, bool add_to) {
 // ============================================================
 
 template <typename T>
-void gridsample_channel_first_2d(
-    T* output, const T* input, const float* grid_n,
-    int64_t IH, int64_t IW, int64_t OH, int64_t OW,
-    int64_t in_row_stride, int64_t out_row_stride,
-    int64_t grid_row_stride,
-    bool align_corners, GridSamplePaddingMode padding, bool add_to)
+void gridsample_channel_first_2d(T* output, const T* input, const float* grid_n, int64_t IH,
+                                 int64_t IW, int64_t OH, int64_t OW, int64_t in_row_stride,
+                                 int64_t out_row_stride, int64_t grid_row_stride,
+                                 bool align_corners, GridSamplePaddingMode padding, bool add_to)
 {
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
 
@@ -130,13 +133,15 @@ void gridsample_channel_first_2d(
         const float* g_row = grid_n + oh * grid_row_stride;
 
         for (int64_t ow = 0; ow < OW; ++ow) {
-            const float* g_pos = g_row + ow * 2;  // 2D: (y, x)
+            const float* g_pos = g_row + ow * 2; // 2D: (y, x)
             float py = gridsample_grid_to_pixel(g_pos[0], IH, align_corners);
             float pz = gridsample_grid_to_pixel(g_pos[1], IW, align_corners);
 
             T* dst = output + ow;
             if (zeros_pad && !gridsample_bilinear_bounds_ok(py, pz, IH, IW)) {
-                if (!add_to) { s_store(dst, 0.0f); }
+                if (!add_to) {
+                    s_store(dst, 0.0f);
+                }
                 continue;
             }
 
@@ -148,8 +153,8 @@ void gridsample_channel_first_2d(
             const int64_t y1 = gridsample_clamp_idx(y0 + 1, IH);
             const int64_t z1 = gridsample_clamp_idx(z0 + 1, IW);
 
-            const float wy  = py - static_cast<float>(y0);
-            const float wz  = pz - static_cast<float>(z0);
+            const float wy = py - static_cast<float>(y0);
+            const float wz = pz - static_cast<float>(z0);
             const float wy0 = 1.0f - wy;
             const float wz0 = 1.0f - wz;
 
@@ -167,12 +172,11 @@ void gridsample_channel_first_2d(
 }
 
 template <typename T>
-void gridsample_nearest_channel_first_2d(
-    T* output, const T* input, const float* grid_n,
-    int64_t IH, int64_t IW, int64_t OH, int64_t OW,
-    int64_t in_row_stride, int64_t out_row_stride,
-    int64_t grid_row_stride,
-    bool align_corners, GridSamplePaddingMode padding, bool add_to)
+void gridsample_nearest_channel_first_2d(T* output, const T* input, const float* grid_n, int64_t IH,
+                                         int64_t IW, int64_t OH, int64_t OW, int64_t in_row_stride,
+                                         int64_t out_row_stride, int64_t grid_row_stride,
+                                         bool align_corners, GridSamplePaddingMode padding,
+                                         bool add_to)
 {
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
 
@@ -187,9 +191,10 @@ void gridsample_nearest_channel_first_2d(
             const float pz_r = std::round(pz);
 
             T* dst = output + ow;
-            if (zeros_pad &&
-                (!gridsample_in_bounds(py_r, IH) || !gridsample_in_bounds(pz_r, IW))) {
-                if (!add_to) { s_store(dst, 0.0f); }
+            if (zeros_pad && (!gridsample_in_bounds(py_r, IH) || !gridsample_in_bounds(pz_r, IW))) {
+                if (!add_to) {
+                    s_store(dst, 0.0f);
+                }
                 continue;
             }
 
@@ -205,14 +210,11 @@ void gridsample_nearest_channel_first_2d(
 }
 
 template <typename T>
-void gridsample_channel_first_3d(
-    T* output, const T* input, const float* grid_n,
-    int64_t ID, int64_t IH, int64_t IW,
-    int64_t OD, int64_t OH, int64_t OW,
-    int64_t in_d_stride, int64_t in_row_stride,
-    int64_t out_d_stride, int64_t out_row_stride,
-    int64_t grid_row_stride,
-    bool align_corners, GridSamplePaddingMode padding, bool add_to)
+void gridsample_channel_first_3d(T* output, const T* input, const float* grid_n, int64_t ID,
+                                 int64_t IH, int64_t IW, int64_t OD, int64_t OH, int64_t OW,
+                                 int64_t in_d_stride, int64_t in_row_stride, int64_t out_d_stride,
+                                 int64_t out_row_stride, int64_t grid_row_stride,
+                                 bool align_corners, GridSamplePaddingMode padding, bool add_to)
 {
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
 
@@ -230,7 +232,9 @@ void gridsample_channel_first_3d(
 
                 T* dst = out_d + oh * out_row_stride + ow;
                 if (zeros_pad && !gridsample_trilinear_bounds_ok(px, py, pz, ID, IH, IW)) {
-                    if (!add_to) { s_store(dst, 0.0f); }
+                    if (!add_to) {
+                        s_store(dst, 0.0f);
+                    }
                     continue;
                 }
 
@@ -270,14 +274,12 @@ void gridsample_channel_first_3d(
 }
 
 template <typename T>
-void gridsample_nearest_channel_first_3d(
-    T* output, const T* input, const float* grid_n,
-    int64_t ID, int64_t IH, int64_t IW,
-    int64_t OD, int64_t OH, int64_t OW,
-    int64_t in_d_stride, int64_t in_row_stride,
-    int64_t out_d_stride, int64_t out_row_stride,
-    int64_t grid_row_stride,
-    bool align_corners, GridSamplePaddingMode padding, bool add_to)
+void gridsample_nearest_channel_first_3d(T* output, const T* input, const float* grid_n, int64_t ID,
+                                         int64_t IH, int64_t IW, int64_t OD, int64_t OH, int64_t OW,
+                                         int64_t in_d_stride, int64_t in_row_stride,
+                                         int64_t out_d_stride, int64_t out_row_stride,
+                                         int64_t grid_row_stride, bool align_corners,
+                                         GridSamplePaddingMode padding, bool add_to)
 {
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
 
@@ -301,7 +303,9 @@ void gridsample_nearest_channel_first_3d(
                 if (zeros_pad &&
                     (!gridsample_in_bounds(px_r, ID) || !gridsample_in_bounds(py_r, IH) ||
                      !gridsample_in_bounds(pz_r, IW))) {
-                    if (!add_to) { s_store(dst, 0.0f); }
+                    if (!add_to) {
+                        s_store(dst, 0.0f);
+                    }
                     continue;
                 }
 
@@ -324,12 +328,10 @@ void gridsample_nearest_channel_first_3d(
 // ============================================================
 
 template <typename T>
-void gridsample_last_2d(
-    T* output, const T* input, const float* grid_n, int64_t C,
-    int64_t IH, int64_t IW, int64_t OH, int64_t OW,
-    int64_t in_row_stride, int64_t out_row_stride,
-    int64_t grid_row_stride,
-    bool align_corners, GridSamplePaddingMode padding, bool add_to)
+void gridsample_last_2d(T* output, const T* input, const float* grid_n, int64_t C, int64_t IH,
+                        int64_t IW, int64_t OH, int64_t OW, int64_t in_row_stride,
+                        int64_t out_row_stride, int64_t grid_row_stride, bool align_corners,
+                        GridSamplePaddingMode padding, bool add_to)
 {
     constexpr int L = simd_lane_for<T>;
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
@@ -357,8 +359,8 @@ void gridsample_last_2d(
             const int64_t y1 = gridsample_clamp_idx(y0 + 1, IH);
             const int64_t z1 = gridsample_clamp_idx(z0 + 1, IW);
 
-            const float wy  = py - static_cast<float>(y0);
-            const float wz  = pz - static_cast<float>(z0);
+            const float wy = py - static_cast<float>(y0);
+            const float wz = pz - static_cast<float>(z0);
             const float wy0 = 1.0f - wy;
             const float wz0 = 1.0f - wz;
 
@@ -367,9 +369,9 @@ void gridsample_last_2d(
             const T* p10 = input + y1 * in_row_stride + z0 * C;
             const T* p11 = input + y1 * in_row_stride + z1 * C;
 
-            const auto vwz  = v_set1(dst, wz);
+            const auto vwz = v_set1(dst, wz);
             const auto vwz0 = v_set1(dst, wz0);
-            const auto vwy  = v_set1(dst, wy);
+            const auto vwy = v_set1(dst, wy);
             const auto vwy0 = v_set1(dst, wy0);
 
             int64_t c = 0;
@@ -388,12 +390,11 @@ void gridsample_last_2d(
 }
 
 template <typename T>
-void gridsample_nearest_last_2d(
-    T* output, const T* input, const float* grid_n, int64_t C,
-    int64_t IH, int64_t IW, int64_t OH, int64_t OW,
-    int64_t in_row_stride, int64_t out_row_stride,
-    int64_t grid_row_stride,
-    bool align_corners, GridSamplePaddingMode padding, bool add_to)
+void gridsample_nearest_last_2d(T* output, const T* input, const float* grid_n, int64_t C,
+                                int64_t IH, int64_t IW, int64_t OH, int64_t OW,
+                                int64_t in_row_stride, int64_t out_row_stride,
+                                int64_t grid_row_stride, bool align_corners,
+                                GridSamplePaddingMode padding, bool add_to)
 {
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
 
@@ -409,8 +410,7 @@ void gridsample_nearest_last_2d(
             const float pz_r = std::round(pz);
             T* dst = orow + ow * C;
 
-            if (zeros_pad &&
-                (!gridsample_in_bounds(py_r, IH) || !gridsample_in_bounds(pz_r, IW))) {
+            if (zeros_pad && (!gridsample_in_bounds(py_r, IH) || !gridsample_in_bounds(pz_r, IW))) {
                 gridsample_zero_pixel<T>(dst, C, add_to);
                 continue;
             }
@@ -426,14 +426,11 @@ void gridsample_nearest_last_2d(
 }
 
 template <typename T>
-void gridsample_last_3d(
-    T* output, const T* input, const float* grid_n, int64_t C,
-    int64_t ID, int64_t IH, int64_t IW,
-    int64_t OD, int64_t OH, int64_t OW,
-    int64_t in_d_stride, int64_t in_row_stride,
-    int64_t out_d_stride, int64_t out_row_stride,
-    int64_t grid_row_stride,
-    bool align_corners, GridSamplePaddingMode padding, bool add_to)
+void gridsample_last_3d(T* output, const T* input, const float* grid_n, int64_t C, int64_t ID,
+                        int64_t IH, int64_t IW, int64_t OD, int64_t OH, int64_t OW,
+                        int64_t in_d_stride, int64_t in_row_stride, int64_t out_d_stride,
+                        int64_t out_row_stride, int64_t grid_row_stride, bool align_corners,
+                        GridSamplePaddingMode padding, bool add_to)
 {
     constexpr int L = simd_lane_for<T>;
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
@@ -452,8 +449,7 @@ void gridsample_last_3d(
                 g_pos += 3;
                 T* dst = orow + ow * C;
 
-                if (zeros_pad &&
-                    !gridsample_trilinear_bounds_ok(px, py, pz, ID, IH, IW)) {
+                if (zeros_pad && !gridsample_trilinear_bounds_ok(px, py, pz, ID, IH, IW)) {
                     gridsample_zero_pixel<T>(dst, C, add_to);
                     continue;
                 }
@@ -469,9 +465,9 @@ void gridsample_last_3d(
                 const int64_t y1 = gridsample_clamp_idx(y0 + 1, IH);
                 const int64_t z1 = gridsample_clamp_idx(z0 + 1, IW);
 
-                const float wx  = px - static_cast<float>(x0);
-                const float wy  = py - static_cast<float>(y0);
-                const float wz  = pz - static_cast<float>(z0);
+                const float wx = px - static_cast<float>(x0);
+                const float wy = py - static_cast<float>(y0);
+                const float wz = pz - static_cast<float>(z0);
                 const float wx0 = 1.0f - wx;
                 const float wy0 = 1.0f - wy;
                 const float wz0 = 1.0f - wz;
@@ -481,11 +477,11 @@ void gridsample_last_3d(
                 const T* base10 = input + x1 * in_d_stride + y0 * in_row_stride;
                 const T* base11 = input + x1 * in_d_stride + y1 * in_row_stride;
 
-                const auto vwx  = v_set1(dst, wx);
+                const auto vwx = v_set1(dst, wx);
                 const auto vwx0 = v_set1(dst, wx0);
-                const auto vwy  = v_set1(dst, wy);
+                const auto vwy = v_set1(dst, wy);
                 const auto vwy0 = v_set1(dst, wy0);
-                const auto vwz  = v_set1(dst, wz);
+                const auto vwz = v_set1(dst, wz);
                 const auto vwz0 = v_set1(dst, wz0);
 
                 int64_t c = 0;
@@ -503,14 +499,14 @@ void gridsample_last_3d(
                     v_store_add(dst + c, v_fmadd(vwx0, s0, v_mul(vwx, s1)), add_to);
                 }
                 for (; c < C; ++c) {
-                    const float r00 = wz0 * s_load(&base00[z0 * C + c]) +
-                                      wz * s_load(&base00[z1 * C + c]);
-                    const float r01 = wz0 * s_load(&base01[z0 * C + c]) +
-                                      wz * s_load(&base01[z1 * C + c]);
-                    const float r10 = wz0 * s_load(&base10[z0 * C + c]) +
-                                      wz * s_load(&base10[z1 * C + c]);
-                    const float r11 = wz0 * s_load(&base11[z0 * C + c]) +
-                                      wz * s_load(&base11[z1 * C + c]);
+                    const float r00 =
+                        wz0 * s_load(&base00[z0 * C + c]) + wz * s_load(&base00[z1 * C + c]);
+                    const float r01 =
+                        wz0 * s_load(&base01[z0 * C + c]) + wz * s_load(&base01[z1 * C + c]);
+                    const float r10 =
+                        wz0 * s_load(&base10[z0 * C + c]) + wz * s_load(&base10[z1 * C + c]);
+                    const float r11 =
+                        wz0 * s_load(&base11[z0 * C + c]) + wz * s_load(&base11[z1 * C + c]);
                     const float s0 = wy0 * r00 + wy * r01;
                     const float s1 = wy0 * r10 + wy * r11;
                     s_store_add(&dst[c], wx0 * s0 + wx * s1, add_to);
@@ -521,14 +517,12 @@ void gridsample_last_3d(
 }
 
 template <typename T>
-void gridsample_nearest_last_3d(
-    T* output, const T* input, const float* grid_n, int64_t C,
-    int64_t ID, int64_t IH, int64_t IW,
-    int64_t OD, int64_t OH, int64_t OW,
-    int64_t in_d_stride, int64_t in_row_stride,
-    int64_t out_d_stride, int64_t out_row_stride,
-    int64_t grid_row_stride,
-    bool align_corners, GridSamplePaddingMode padding, bool add_to)
+void gridsample_nearest_last_3d(T* output, const T* input, const float* grid_n, int64_t C,
+                                int64_t ID, int64_t IH, int64_t IW, int64_t OD, int64_t OH,
+                                int64_t OW, int64_t in_d_stride, int64_t in_row_stride,
+                                int64_t out_d_stride, int64_t out_row_stride,
+                                int64_t grid_row_stride, bool align_corners,
+                                GridSamplePaddingMode padding, bool add_to)
 {
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
 
@@ -565,11 +559,10 @@ void gridsample_nearest_last_3d(
                 const int64_t iz = static_cast<int64_t>(std::round(pz));
 
                 gridsample_copy_pixel<T>(
-                    dst, input + ix * in_d_stride + iy * in_row_stride + iz * C,
-                    C, add_to);
+                    dst, input + ix * in_d_stride + iy * in_row_stride + iz * C, C, add_to);
             }
         }
     }
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

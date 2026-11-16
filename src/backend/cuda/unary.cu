@@ -17,33 +17,36 @@ namespace nnops::backend::cuda {
 // Device unary functions (compute a single element)
 // ============================================================
 
-__device__ inline float unary_exp(float x)   { return expf(x); }
-__device__ inline float unary_log(float x)   { return logf(x); }
-__device__ inline float unary_sin(float x)   { return sinf(x); }
-__device__ inline float unary_cos(float x)   { return cosf(x); }
-__device__ inline float unary_tan(float x)   { return tanf(x); }
-__device__ inline float unary_tanh(float x)  { return tanhf(x); }
-__device__ inline float unary_abs(float x)   { return fabsf(x); }
-__device__ inline float unary_neg(float x)   { return -x; }
-__device__ inline float unary_sqrt(float x)  { return sqrtf(x); }
-__device__ inline float unary_erf(float x)   { return erff(x); }
+__device__ inline float unary_exp(float x) { return expf(x); }
+__device__ inline float unary_log(float x) { return logf(x); }
+__device__ inline float unary_sin(float x) { return sinf(x); }
+__device__ inline float unary_cos(float x) { return cosf(x); }
+__device__ inline float unary_tan(float x) { return tanf(x); }
+__device__ inline float unary_tanh(float x) { return tanhf(x); }
+__device__ inline float unary_abs(float x) { return fabsf(x); }
+__device__ inline float unary_neg(float x) { return -x; }
+__device__ inline float unary_sqrt(float x) { return sqrtf(x); }
+__device__ inline float unary_erf(float x) { return erff(x); }
 __device__ inline float unary_round(float x) { return rintf(x); }
-__device__ inline float unary_ceil(float x)  { return ceilf(x); }
+__device__ inline float unary_ceil(float x) { return ceilf(x); }
 __device__ inline float unary_floor(float x) { return floorf(x); }
 __device__ inline float unary_recip(float x) { return 1.0f / x; }
-__device__ inline float unary_sign(float x)  { return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f); }
-__device__ inline float unary_exp2(float x)  { return exp2f(x); }
-__device__ inline float unary_log2(float x)  { return log2f(x); }
+__device__ inline float unary_sign(float x)
+{
+    return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f);
+}
+__device__ inline float unary_exp2(float x) { return exp2f(x); }
+__device__ inline float unary_log2(float x) { return log2f(x); }
 __device__ inline float unary_log10(float x) { return log10f(x); }
-__device__ inline float unary_asin(float x)  { return asinf(x); }
-__device__ inline float unary_acos(float x)  { return acosf(x); }
-__device__ inline float unary_atan(float x)  { return atanf(x); }
-__device__ inline float unary_sinh(float x)  { return sinhf(x); }
-__device__ inline float unary_cosh(float x)  { return coshf(x); }
+__device__ inline float unary_asin(float x) { return asinf(x); }
+__device__ inline float unary_acos(float x) { return acosf(x); }
+__device__ inline float unary_atan(float x) { return atanf(x); }
+__device__ inline float unary_sinh(float x) { return sinhf(x); }
+__device__ inline float unary_cosh(float x) { return coshf(x); }
 __device__ inline float unary_asinh(float x) { return asinhf(x); }
 __device__ inline float unary_acosh(float x) { return acoshf(x); }
 __device__ inline float unary_atanh(float x) { return atanhf(x); }
-__device__ inline float unary_erfc(float x)  { return erfcf(x); }
+__device__ inline float unary_erfc(float x) { return erfcf(x); }
 
 // ============================================================
 // Function pointer type for unary
@@ -51,35 +54,63 @@ __device__ inline float unary_erfc(float x)  { return erfcf(x); }
 
 using UnaryFn = float (*)(float);
 
-__device__ UnaryFn get_unary_fn(UnaryType type) {
+__device__ UnaryFn get_unary_fn(UnaryType type)
+{
     switch (type) {
-    case UnaryType::Exp:  return unary_exp;
-    case UnaryType::Log:  return unary_log;
-    case UnaryType::Sin:  return unary_sin;
-    case UnaryType::Cos:  return unary_cos;
-    case UnaryType::Tan:  return unary_tan;
-    case UnaryType::Tanh: return unary_tanh;
-    case UnaryType::Abs:  return unary_abs;
-    case UnaryType::Neg:  return unary_neg;
-    case UnaryType::Sqrt: return unary_sqrt;
-    case UnaryType::Erf:   return unary_erf;
-    case UnaryType::Round: return unary_round;
-    case UnaryType::Ceil:  return unary_ceil;
-    case UnaryType::Floor: return unary_floor;
-    case UnaryType::Recip: return unary_recip;
-    case UnaryType::Sign:  return unary_sign;
-    case UnaryType::Exp2:  return unary_exp2;
-    case UnaryType::Log2:  return unary_log2;
-    case UnaryType::Log10: return unary_log10;
-    case UnaryType::Asin:  return unary_asin;
-    case UnaryType::Acos:  return unary_acos;
-    case UnaryType::Atan:  return unary_atan;
-    case UnaryType::Sinh:  return unary_sinh;
-    case UnaryType::Cosh:  return unary_cosh;
-    case UnaryType::Asinh: return unary_asinh;
-    case UnaryType::Acosh: return unary_acosh;
-    case UnaryType::Atanh: return unary_atanh;
-    case UnaryType::Erfc:  return unary_erfc;
+    case UnaryType::Exp:
+        return unary_exp;
+    case UnaryType::Log:
+        return unary_log;
+    case UnaryType::Sin:
+        return unary_sin;
+    case UnaryType::Cos:
+        return unary_cos;
+    case UnaryType::Tan:
+        return unary_tan;
+    case UnaryType::Tanh:
+        return unary_tanh;
+    case UnaryType::Abs:
+        return unary_abs;
+    case UnaryType::Neg:
+        return unary_neg;
+    case UnaryType::Sqrt:
+        return unary_sqrt;
+    case UnaryType::Erf:
+        return unary_erf;
+    case UnaryType::Round:
+        return unary_round;
+    case UnaryType::Ceil:
+        return unary_ceil;
+    case UnaryType::Floor:
+        return unary_floor;
+    case UnaryType::Recip:
+        return unary_recip;
+    case UnaryType::Sign:
+        return unary_sign;
+    case UnaryType::Exp2:
+        return unary_exp2;
+    case UnaryType::Log2:
+        return unary_log2;
+    case UnaryType::Log10:
+        return unary_log10;
+    case UnaryType::Asin:
+        return unary_asin;
+    case UnaryType::Acos:
+        return unary_acos;
+    case UnaryType::Atan:
+        return unary_atan;
+    case UnaryType::Sinh:
+        return unary_sinh;
+    case UnaryType::Cosh:
+        return unary_cosh;
+    case UnaryType::Asinh:
+        return unary_asinh;
+    case UnaryType::Acosh:
+        return unary_acosh;
+    case UnaryType::Atanh:
+        return unary_atanh;
+    case UnaryType::Erfc:
+        return unary_erfc;
     }
     return unary_exp;
 }
@@ -89,30 +120,24 @@ __device__ UnaryFn get_unary_fn(UnaryType type) {
 // ============================================================
 
 template <typename T>
-__global__ void unary_kernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    int64_t num_rows,
-    int64_t last_dim,
-    int64_t in_row_stride,
-    int64_t out_row_stride,
-    UnaryType type,
-    bool add_to)
+__global__ void unary_kernel(const T* __restrict__ input, T* __restrict__ output, int64_t num_rows,
+                             int64_t last_dim, int64_t in_row_stride, int64_t out_row_stride,
+                             UnaryType type, bool add_to)
 {
     const UnaryFn fn = get_unary_fn(type);
-    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;  // 128-bit / sizeof(T)
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4; // 128-bit / sizeof(T)
 
     const int tid = threadIdx.x;
     const int row = blockIdx.x;
 
-    if (row >= num_rows) return;
+    if (row >= num_rows)
+        return;
 
-    const T* in_row  = input  + row * in_row_stride;
-    T*       out_row = output + row * out_row_stride;
+    const T* in_row = input + row * in_row_stride;
+    T* out_row = output + row * out_row_stride;
 
     // An unaligned row walks the scalar loop instead of the 16 B one.
-    const int64_t vec_end =
-        aligned16(in_row, out_row) ? (last_dim / VEC) * VEC : 0;
+    const int64_t vec_end = aligned16(in_row, out_row) ? (last_dim / VEC) * VEC : 0;
 
     // 128-bit vectorized loop: VEC elements per iteration
     if constexpr (sizeof(T) == 4) {
@@ -122,8 +147,8 @@ __global__ void unary_kernel(
             float r0 = fn(vin.x), r1 = fn(vin.y), r2 = fn(vin.z), r3 = fn(vin.w);
             if (add_to) {
                 float4 vout = v4_load(&out_row[i]);
-                v4_store(&out_row[i], make_float4(
-                    vout.x + r0, vout.y + r1, vout.z + r2, vout.w + r3));
+                v4_store(&out_row[i],
+                         make_float4(vout.x + r0, vout.y + r1, vout.z + r2, vout.w + r3));
             } else {
                 v4_store(&out_row[i], make_float4(r0, r1, r2, r3));
             }
@@ -141,8 +166,8 @@ __global__ void unary_kernel(
             float r6 = fn(elem_to_float(vin.data[6]));
             float r7 = fn(elem_to_float(vin.data[7]));
             if (add_to) {
-                v4_store(&out_row[i], pack8_add<T>(v4_load(&out_row[i]),
-                    r0, r1, r2, r3, r4, r5, r6, r7));
+                v4_store(&out_row[i],
+                         pack8_add<T>(v4_load(&out_row[i]), r0, r1, r2, r3, r4, r5, r6, r7));
             } else {
                 v4_store(&out_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
             }
@@ -166,20 +191,15 @@ __global__ void unary_kernel(
 // ============================================================
 
 template <typename T>
-__global__ void unary_flat_kernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    int64_t total,
-    UnaryType type,
-    bool add_to)
+__global__ void unary_flat_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                  int64_t total, UnaryType type, bool add_to)
 {
     const UnaryFn fn = get_unary_fn(type);
-    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;  // 128-bit / sizeof(T)
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4; // 128-bit / sizeof(T)
 
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
-    const int64_t vec_end =
-        aligned16(input, output) ? (total / VEC) * VEC : 0;
+    const int64_t vec_end = aligned16(input, output) ? (total / VEC) * VEC : 0;
 
     // 128-bit vectorized grid-stride loop
     if constexpr (sizeof(T) == 4) {
@@ -189,8 +209,8 @@ __global__ void unary_flat_kernel(
             float r0 = fn(vin.x), r1 = fn(vin.y), r2 = fn(vin.z), r3 = fn(vin.w);
             if (add_to) {
                 float4 vout = v4_load(&output[i]);
-                v4_store(&output[i], make_float4(
-                    vout.x + r0, vout.y + r1, vout.z + r2, vout.w + r3));
+                v4_store(&output[i],
+                         make_float4(vout.x + r0, vout.y + r1, vout.z + r2, vout.w + r3));
             } else {
                 v4_store(&output[i], make_float4(r0, r1, r2, r3));
             }
@@ -208,8 +228,8 @@ __global__ void unary_flat_kernel(
             float r6 = fn(elem_to_float(vin.data[6]));
             float r7 = fn(elem_to_float(vin.data[7]));
             if (add_to) {
-                v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
-                    r0, r1, r2, r3, r4, r5, r6, r7));
+                v4_store(&output[i],
+                         pack8_add<T>(v4_load(&output[i]), r0, r1, r2, r3, r4, r5, r6, r7));
             } else {
                 v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
             }
@@ -233,15 +253,13 @@ __global__ void unary_flat_kernel(
 // ============================================================
 
 template <typename T>
-void unary_cuda_impl(
-    const UnaryAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void unary_cuda_impl(const UnaryAttributes& attrs, TensorView& output,
+                     std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t total = input.numel();
-    if (total == 0) return;
+    if (total == 0)
+        return;
 
     const int64_t rank = input.rank();
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
@@ -249,28 +267,25 @@ void unary_cuda_impl(
     if (rank <= 1) {
         // Flat tensor — use flat kernel with grid-stride loop
         const int block_size = kCudaBlockSize;
-        const int grid_size = std::min(
-            static_cast<int>(ceil_div(total, static_cast<int64_t>(block_size))),
-            65535);
-        unary_flat_kernel<<<grid_size, block_size, 0, stream>>>(
-            input.ptr<T>(), output.ptr<T>(), total,
-            attrs.type, attrs.add_to);
+        const int grid_size =
+            std::min(static_cast<int>(ceil_div(total, static_cast<int64_t>(block_size))), 65535);
+        unary_flat_kernel<<<grid_size, block_size, 0, stream>>>(input.ptr<T>(), output.ptr<T>(),
+                                                                total, attrs.type, attrs.add_to);
     } else {
         // Row-by-row processing, respecting pitch. A channel-last row is one
         // spatial line — W pixels × C channels.
-        const int64_t last_dim = (rank >= 3 && is_channel_last(input.layout()))
-            ? input.shape(1) * input.shape(rank - 1)
-            : input.shape(rank - 1);
+        const int64_t last_dim = (rank >= 3 && is_channel_last(input.layout())) ?
+                                     input.shape(1) * input.shape(rank - 1) :
+                                     input.shape(rank - 1);
         const int64_t num_rows = input.total_rows();
-        const int64_t in_row_stride  = input.row_stride_elems();
+        const int64_t in_row_stride = input.row_stride_elems();
         const int64_t out_row_stride = output.row_stride_elems();
 
         const int block_size = std::min(static_cast<int>(last_dim), kCudaBlockSize);
 
-        unary_kernel<<<num_rows, block_size, 0, stream>>>(
-            input.ptr<T>(), output.ptr<T>(),
-            num_rows, last_dim, in_row_stride, out_row_stride,
-            attrs.type, attrs.add_to);
+        unary_kernel<<<num_rows, block_size, 0, stream>>>(input.ptr<T>(), output.ptr<T>(), num_rows,
+                                                          last_dim, in_row_stride, out_row_stride,
+                                                          attrs.type, attrs.add_to);
     }
 }
 
@@ -278,12 +293,9 @@ void unary_cuda_impl(
 // Entry point
 // ============================================================
 
-Status unary_cuda(
-    const UnaryAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx,
-    void* /*workspace*/)
+Status unary_cuda(const UnaryAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx,
+                  void* /*workspace*/)
 {
     const auto dtype = inputs[0].data_type();
     switch (dtype) {
@@ -302,4 +314,4 @@ Status unary_cuda(
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

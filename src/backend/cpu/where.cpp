@@ -19,8 +19,7 @@ namespace nnops::backend::cpu {
 namespace {
 
 template <typename T>
-void where_impl(TensorView& out, std::span<const TensorView> inputs,
-                const ComputeContext& ctx)
+void where_impl(TensorView& out, std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto* cond = inputs[0].ptr<uint8_t>();
     const auto* xp = inputs[1].ptr<T>();
@@ -32,13 +31,10 @@ void where_impl(TensorView& out, std::span<const TensorView> inputs,
     });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status where_cpu(const WhereAttributes&,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* /*workspace*/)
+Status where_cpu(const WhereAttributes&, TensorView& output, std::span<const TensorView> inputs,
+                 const ComputeContext& ctx, void* /*workspace*/)
 {
     for_each_data_type(inputs[1].data_type(), [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -47,4 +43,4 @@ Status where_cpu(const WhereAttributes&,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

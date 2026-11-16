@@ -18,10 +18,8 @@
 namespace nnops::backend::cpu {
 
 template <typename T>
-void clamp_impl(const ClampAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx)
+void clamp_impl(const ClampAttributes& attrs, TensorView& output,
+                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const float min_val = attrs.min_val;
     const float max_val = attrs.max_val;
@@ -31,19 +29,18 @@ void clamp_impl(const ClampAttributes& attrs,
     const auto vmin = simd::v_set1(inputs[0].ptr<T>(), min_val);
     const auto vmax = simd::v_set1(inputs[0].ptr<T>(), max_val);
 
-    tiled_float_transform<T>(inputs[0], output, ctx,
+    tiled_float_transform<T>(
+        inputs[0], output, ctx,
         [&](const T* in, T* out, int64_t m, int64_t n, int64_t in_stride, int64_t out_stride) {
-            kernel::tiled_map_simd<T, 1>({in}, {in_stride}, out, out_stride, m, n, attrs.add_to,
+            kernel::tiled_map_simd<T, 1>(
+                {in}, {in_stride}, out, out_stride, m, n, attrs.add_to,
                 [vmin, vmax](auto x) { return simd::v_max(simd::v_min(x, vmax), vmin); },
                 [min_val, max_val](float v) { return std::max(min_val, std::min(max_val, v)); });
         });
 }
 
-Status clamp_cpu(const ClampAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* /*workspace*/)
+Status clamp_cpu(const ClampAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "clamp_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -52,4 +49,4 @@ Status clamp_cpu(const ClampAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

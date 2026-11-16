@@ -39,70 +39,73 @@
 #endif
 
 /// Default kernel signature: one output view, N input views.
-#define NNOPS_KERNEL_ARGS(Attrs)                                       \
-    (const Attrs&, TensorView&, std::span<const TensorView>,           \
-     const ComputeContext&, void*)
+#define NNOPS_KERNEL_ARGS(Attrs) \
+    (const Attrs&, TensorView&, std::span<const TensorView>, const ComputeContext&, void*)
 
-#define NNOPS_DECLARE_CPU(Attrs, fn)                                   \
-    namespace backend::cpu { Status fn NNOPS_KERNEL_ARGS(Attrs); }
-#define NNOPS_DECLARE_CUDA(Attrs, fn)                                  \
-    namespace backend::cuda { Status fn NNOPS_KERNEL_ARGS(Attrs); }
-#define NNOPS_DECLARE_VULKAN(Attrs, fn)                                \
-    namespace backend::vulkan { Status fn NNOPS_KERNEL_ARGS(Attrs); }
-#define NNOPS_DECLARE_METAL(Attrs, fn)                                 \
-    namespace backend::metal { Status fn NNOPS_KERNEL_ARGS(Attrs); }
+#define NNOPS_DECLARE_CPU(Attrs, fn)    \
+    namespace backend::cpu {            \
+    Status fn NNOPS_KERNEL_ARGS(Attrs); \
+    }
+#define NNOPS_DECLARE_CUDA(Attrs, fn)   \
+    namespace backend::cuda {           \
+    Status fn NNOPS_KERNEL_ARGS(Attrs); \
+    }
+#define NNOPS_DECLARE_VULKAN(Attrs, fn) \
+    namespace backend::vulkan {         \
+    Status fn NNOPS_KERNEL_ARGS(Attrs); \
+    }
+#define NNOPS_DECLARE_METAL(Attrs, fn)  \
+    namespace backend::metal {          \
+    Status fn NNOPS_KERNEL_ARGS(Attrs); \
+    }
 
 /// The op's Impl (one function pointer) and its out-of-line destructor.
-#define NNOPS_KERNEL_IMPL(Op, Attrs)                                   \
-    struct Op::Impl {                                                  \
-        using KernelFn = Status (*) NNOPS_KERNEL_ARGS(Attrs);          \
-        KernelFn kernel_fn = nullptr;                                  \
-    };                                                                 \
+#define NNOPS_KERNEL_IMPL(Op, Attrs)                         \
+    struct Op::Impl {                                        \
+        using KernelFn = Status(*) NNOPS_KERNEL_ARGS(Attrs); \
+        KernelFn kernel_fn = nullptr;                        \
+    };                                                       \
     Op::~Op() = default;
 
 /// The factory is the same everywhere.
-#define NNOPS_OP_CREATE(Op, Attrs)                                     \
+#define NNOPS_OP_CREATE(Op, Attrs)                                      \
     std::unique_ptr<Op> Op::create(const Attrs& attrs, Backend backend) \
-    {                                                                  \
-        return std::unique_ptr<Op>(new Op(attrs, backend));            \
+    {                                                                   \
+        return std::unique_ptr<Op>(new Op(attrs, backend));             \
     }
 
 /// Impl, destructor, factory and constructor — the shape every op shares.
-#define NNOPS_OP_BOILERPLATE(Op, Attrs, cpu, cuda, vulkan)             \
-    NNOPS_KERNEL_IMPL(Op, Attrs)                                       \
-    NNOPS_OP_CREATE(Op, Attrs)                                         \
-    Op::Op(const Attrs& attrs, Backend backend)                        \
-        : impl_(std::make_unique<Impl>()), attrs_(attrs),               \
-          backend_(backend)                                            \
-    {                                                                  \
-        impl_->kernel_fn = NNOPS_RESOLVE(Op, Op::Impl::KernelFn,       \
-                                         backend, cpu, cuda, vulkan);  \
+#define NNOPS_OP_BOILERPLATE(Op, Attrs, cpu, cuda, vulkan)                                    \
+    NNOPS_KERNEL_IMPL(Op, Attrs)                                                              \
+    NNOPS_OP_CREATE(Op, Attrs)                                                                \
+    Op::Op(const Attrs& attrs, Backend backend)                                               \
+        : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)                   \
+    {                                                                                         \
+        impl_->kernel_fn = NNOPS_RESOLVE(Op, Op::Impl::KernelFn, backend, cpu, cuda, vulkan); \
     }
 
-#define NNOPS_PICK_KERNEL(Fn, be, cpu, cuda, vulkan)                   \
-    ((be) == Backend::CPU    ? static_cast<Fn>(cpu)    :               \
-     (be) == Backend::CUDA   ? static_cast<Fn>(cuda)   :               \
-     (be) == Backend::Vulkan ? static_cast<Fn>(vulkan) : nullptr)
+#define NNOPS_PICK_KERNEL(Fn, be, cpu, cuda, vulkan)     \
+    ((be) == Backend::CPU    ? static_cast<Fn>(cpu) :    \
+     (be) == Backend::CUDA   ? static_cast<Fn>(cuda) :   \
+     (be) == Backend::Vulkan ? static_cast<Fn>(vulkan) : \
+                               nullptr)
 
 /// Resolve one backend's kernel. A backend with no kernel resolves to nullptr:
 /// the op is still constructible, and compute() reports Status::unsupported
 /// instead of aborting the host process at create() time.
-#define NNOPS_RESOLVE(Op, Fn, be, cpu, cuda, vulkan)                   \
-    NNOPS_PICK_KERNEL(Fn, be, cpu, cuda, vulkan)
+#define NNOPS_RESOLVE(Op, Fn, be, cpu, cuda, vulkan) NNOPS_PICK_KERNEL(Fn, be, cpu, cuda, vulkan)
 
 /// Boilerplate for ops that also have a Metal kernel; the rest keep
 /// NNOPS_OP_BOILERPLATE and resolve Metal to nullptr.
-#define NNOPS_OP_BOILERPLATE_METAL(Op, Attrs, cpu, cuda, vulkan, metal) \
-    NNOPS_KERNEL_IMPL(Op, Attrs)                                       \
-    NNOPS_OP_CREATE(Op, Attrs)                                         \
-    Op::Op(const Attrs& attrs, Backend backend)                        \
-        : impl_(std::make_unique<Impl>()), attrs_(attrs),               \
-          backend_(backend)                                            \
-    {                                                                  \
-        impl_->kernel_fn = NNOPS_RESOLVE_METAL(Op, Op::Impl::KernelFn, \
-                                               backend, cpu, cuda, vulkan, metal); \
+#define NNOPS_OP_BOILERPLATE_METAL(Op, Attrs, cpu, cuda, vulkan, metal)                     \
+    NNOPS_KERNEL_IMPL(Op, Attrs)                                                            \
+    NNOPS_OP_CREATE(Op, Attrs)                                                              \
+    Op::Op(const Attrs& attrs, Backend backend)                                             \
+        : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)                 \
+    {                                                                                       \
+        impl_->kernel_fn =                                                                  \
+            NNOPS_RESOLVE_METAL(Op, Op::Impl::KernelFn, backend, cpu, cuda, vulkan, metal); \
     }
 
-#define NNOPS_RESOLVE_METAL(Op, Fn, be, cpu, cuda, vulkan, metal)      \
-    ((be) == Backend::Metal ? static_cast<Fn>(metal)                   \
-                            : NNOPS_RESOLVE(Op, Fn, be, cpu, cuda, vulkan))
+#define NNOPS_RESOLVE_METAL(Op, Fn, be, cpu, cuda, vulkan, metal) \
+    ((be) == Backend::Metal ? static_cast<Fn>(metal) : NNOPS_RESOLVE(Op, Fn, be, cpu, cuda, vulkan))

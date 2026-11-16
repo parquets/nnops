@@ -29,9 +29,9 @@ namespace nnops::backend::cpu::aarch64 {
 //  LHS transpose pack (int8)  —  N rows x K, 4 int8 per int32 (k step 16)
 // =========================================================================
 
-inline void pack_trans_n1_dp4a_i8(void* NNOPS_RESTRICT output,
-                                  const void* NNOPS_RESTRICT input,
-                                  int ir_step, int K, float scale) noexcept {
+inline void pack_trans_n1_dp4a_i8(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                  int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int32_t* NNOPS_RESTRICT output_i32 = static_cast<int32_t*>(output);
     const int32_t* NNOPS_RESTRICT input_i32 = static_cast<const int32_t*>(input);
@@ -52,9 +52,9 @@ inline void pack_trans_n1_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n4_dp4a_i8(void* NNOPS_RESTRICT output,
-                                  const void* NNOPS_RESTRICT input,
-                                  int ir_step, int K, float scale) noexcept {
+inline void pack_trans_n4_dp4a_i8(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                  int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int32_t* NNOPS_RESTRICT output_i32 = static_cast<int32_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = static_cast<const int8_t*>(input);
@@ -104,9 +104,9 @@ inline void pack_trans_n4_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n8_dp4a_i8(void* NNOPS_RESTRICT output,
-                                  const void* NNOPS_RESTRICT input,
-                                  int ir_step, int K, float scale) noexcept {
+inline void pack_trans_n8_dp4a_i8(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                  int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int32_t* NNOPS_RESTRICT output_i32 = static_cast<int32_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = static_cast<const int8_t*>(input);
@@ -132,9 +132,8 @@ inline void pack_trans_n8_dp4a_i8(void* NNOPS_RESTRICT output,
         v_in1.val[2] = vreinterpretq_s32_s8(vld1q_s8(input_i8_ptr6));
         v_in1.val[3] = vreinterpretq_s32_s8(vld1q_s8(input_i8_ptr7));
 
-        transpose_8x4_i32(
-            v_in0.val[0], v_in0.val[1], v_in0.val[2], v_in0.val[3],
-            v_in1.val[0], v_in1.val[1], v_in1.val[2], v_in1.val[3]);
+        transpose_8x4_i32(v_in0.val[0], v_in0.val[1], v_in0.val[2], v_in0.val[3], v_in1.val[0],
+                          v_in1.val[1], v_in1.val[2], v_in1.val[3]);
 
         vst1q_s32(output_i32 + 0 * 4, v_in0.val[0]);
         vst1q_s32(output_i32 + 1 * 4, v_in0.val[1]);
@@ -192,10 +191,9 @@ inline void pack_trans_n8_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output,
-                                   const void* NNOPS_RESTRICT input,
-                                   int ir_step, int K, float scale,
-                                   int nr = 12) noexcept {
+inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                   int ir_step, int K, float scale, int nr = 12) noexcept
+{
     (void)scale;
     int32_t* NNOPS_RESTRICT output_i32 = static_cast<int32_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = static_cast<const int8_t*>(input);
@@ -204,8 +202,7 @@ inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output,
         int8_t* NNOPS_RESTRICT output_i8 = reinterpret_cast<int8_t*>(output_i32);
         for (int k = 0; k < K; k += 4) {
             for (int x = 0; x < 12; ++x) {
-                const int8_t* NNOPS_RESTRICT rp =
-                    (x < nr) ? input_i8 + x * ir_step : input_i8;
+                const int8_t* NNOPS_RESTRICT rp = (x < nr) ? input_i8 + x * ir_step : input_i8;
                 for (int i = 0; i < 4; ++i) {
                     output_i8[0] = (x < nr && k + i < K) ? rp[k + i] : 0;
                     ++output_i8;
@@ -244,21 +241,20 @@ inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output,
         v_in2.val[2] = vreinterpretq_s32_s8(vld1q_s8(input_i8_ptra));
         v_in2.val[3] = vreinterpretq_s32_s8(vld1q_s8(input_i8_ptrb));
 
-        transpose_12x4_i32(
-            v_in0.val[0], v_in0.val[1], v_in0.val[2], v_in0.val[3],
-            v_in1.val[0], v_in1.val[1], v_in1.val[2], v_in1.val[3],
-            v_in2.val[0], v_in2.val[1], v_in2.val[2], v_in2.val[3]);
+        transpose_12x4_i32(v_in0.val[0], v_in0.val[1], v_in0.val[2], v_in0.val[3], v_in1.val[0],
+                           v_in1.val[1], v_in1.val[2], v_in1.val[3], v_in2.val[0], v_in2.val[1],
+                           v_in2.val[2], v_in2.val[3]);
 
-        vst1q_s32(output_i32 + 0 * 4,  v_in0.val[0]);
-        vst1q_s32(output_i32 + 1 * 4,  v_in0.val[1]);
-        vst1q_s32(output_i32 + 2 * 4,  v_in0.val[2]);
-        vst1q_s32(output_i32 + 3 * 4,  v_in0.val[3]);
-        vst1q_s32(output_i32 + 4 * 4,  v_in1.val[0]);
-        vst1q_s32(output_i32 + 5 * 4,  v_in1.val[1]);
-        vst1q_s32(output_i32 + 6 * 4,  v_in1.val[2]);
-        vst1q_s32(output_i32 + 7 * 4,  v_in1.val[3]);
-        vst1q_s32(output_i32 + 8 * 4,  v_in2.val[0]);
-        vst1q_s32(output_i32 + 9 * 4,  v_in2.val[1]);
+        vst1q_s32(output_i32 + 0 * 4, v_in0.val[0]);
+        vst1q_s32(output_i32 + 1 * 4, v_in0.val[1]);
+        vst1q_s32(output_i32 + 2 * 4, v_in0.val[2]);
+        vst1q_s32(output_i32 + 3 * 4, v_in0.val[3]);
+        vst1q_s32(output_i32 + 4 * 4, v_in1.val[0]);
+        vst1q_s32(output_i32 + 5 * 4, v_in1.val[1]);
+        vst1q_s32(output_i32 + 6 * 4, v_in1.val[2]);
+        vst1q_s32(output_i32 + 7 * 4, v_in1.val[3]);
+        vst1q_s32(output_i32 + 8 * 4, v_in2.val[0]);
+        vst1q_s32(output_i32 + 9 * 4, v_in2.val[1]);
         vst1q_s32(output_i32 + 10 * 4, v_in2.val[2]);
         vst1q_s32(output_i32 + 11 * 4, v_in2.val[3]);
 
@@ -309,16 +305,16 @@ inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output,
     if (k < K) {
         int8_t* output_i8 = reinterpret_cast<int8_t*>(output_i32);
         for (int i = 0; i < 4; ++i) {
-            output_i8[4 * 0 + i]  = k + i < K ? input_i8_ptr0[i] : 0;
-            output_i8[4 * 1 + i]  = k + i < K ? input_i8_ptr1[i] : 0;
-            output_i8[4 * 2 + i]  = k + i < K ? input_i8_ptr2[i] : 0;
-            output_i8[4 * 3 + i]  = k + i < K ? input_i8_ptr3[i] : 0;
-            output_i8[4 * 4 + i]  = k + i < K ? input_i8_ptr4[i] : 0;
-            output_i8[4 * 5 + i]  = k + i < K ? input_i8_ptr5[i] : 0;
-            output_i8[4 * 6 + i]  = k + i < K ? input_i8_ptr6[i] : 0;
-            output_i8[4 * 7 + i]  = k + i < K ? input_i8_ptr7[i] : 0;
-            output_i8[4 * 8 + i]  = k + i < K ? input_i8_ptr8[i] : 0;
-            output_i8[4 * 9 + i]  = k + i < K ? input_i8_ptr9[i] : 0;
+            output_i8[4 * 0 + i] = k + i < K ? input_i8_ptr0[i] : 0;
+            output_i8[4 * 1 + i] = k + i < K ? input_i8_ptr1[i] : 0;
+            output_i8[4 * 2 + i] = k + i < K ? input_i8_ptr2[i] : 0;
+            output_i8[4 * 3 + i] = k + i < K ? input_i8_ptr3[i] : 0;
+            output_i8[4 * 4 + i] = k + i < K ? input_i8_ptr4[i] : 0;
+            output_i8[4 * 5 + i] = k + i < K ? input_i8_ptr5[i] : 0;
+            output_i8[4 * 6 + i] = k + i < K ? input_i8_ptr6[i] : 0;
+            output_i8[4 * 7 + i] = k + i < K ? input_i8_ptr7[i] : 0;
+            output_i8[4 * 8 + i] = k + i < K ? input_i8_ptr8[i] : 0;
+            output_i8[4 * 9 + i] = k + i < K ? input_i8_ptr9[i] : 0;
             output_i8[4 * 10 + i] = k + i < K ? input_i8_ptra[i] : 0;
             output_i8[4 * 11 + i] = k + i < K ? input_i8_ptrb[i] : 0;
         }
@@ -329,9 +325,9 @@ inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output,
 //  RHS copy pack (int8)  —  contiguous rows, 4-int8 runs per column
 // =========================================================================
 
-inline void pack_copy_n1_dp4a_i8(void* NNOPS_RESTRICT output,
-                                 const void* NNOPS_RESTRICT input,
-                                 int ir_step, int K, float scale) noexcept {
+inline void pack_copy_n1_dp4a_i8(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                 int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT output_i8 = reinterpret_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = reinterpret_cast<const int8_t*>(input);
@@ -353,9 +349,9 @@ inline void pack_copy_n1_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_copy_n4_dp4a_i8(void* NNOPS_RESTRICT output,
-                                 const void* NNOPS_RESTRICT input,
-                                 int ir_step, int K, float scale) noexcept {
+inline void pack_copy_n4_dp4a_i8(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                 int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT output_i8 = reinterpret_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = reinterpret_cast<const int8_t*>(input);
@@ -382,9 +378,9 @@ inline void pack_copy_n4_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_copy_n8_dp4a_i8(void* NNOPS_RESTRICT output,
-                                 const void* NNOPS_RESTRICT input,
-                                 int ir_step, int K, float scale) noexcept {
+inline void pack_copy_n8_dp4a_i8(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                 int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT output_i8 = reinterpret_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = reinterpret_cast<const int8_t*>(input);
@@ -412,10 +408,9 @@ inline void pack_copy_n8_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_copy_n12_dp4a_i8(void* NNOPS_RESTRICT output,
-                                  const void* NNOPS_RESTRICT input,
-                                  int ir_step, int K, float scale,
-                                  int nr = 12) noexcept {
+inline void pack_copy_n12_dp4a_i8(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                  int ir_step, int K, float scale, int nr = 12) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT output_i8 = reinterpret_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = reinterpret_cast<const int8_t*>(input);
@@ -424,8 +419,7 @@ inline void pack_copy_n12_dp4a_i8(void* NNOPS_RESTRICT output,
         for (int k = 0; k < K; k += 4) {
             for (int x = 0; x < 12; ++x) {
                 for (int i = 0; i < 4; ++i) {
-                    output_i8[0] = (x < nr && k + i < K)
-                        ? input_i8[(k + i) * ir_step + x] : 0;
+                    output_i8[0] = (x < nr && k + i < K) ? input_i8[(k + i) * ir_step + x] : 0;
                     ++output_i8;
                 }
             }
@@ -465,9 +459,9 @@ inline void pack_copy_n12_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-inline void pack_copy_n16_dp4a_i8(void* NNOPS_RESTRICT output,
-                                  const void* NNOPS_RESTRICT input,
-                                  int ir_step, int K, float scale) noexcept {
+inline void pack_copy_n16_dp4a_i8(void* NNOPS_RESTRICT output, const void* NNOPS_RESTRICT input,
+                                  int ir_step, int K, float scale) noexcept
+{
     (void)scale;
     int8_t* NNOPS_RESTRICT output_i8 = reinterpret_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = reinterpret_cast<const int8_t*>(input);
@@ -496,4 +490,4 @@ inline void pack_copy_n16_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

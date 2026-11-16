@@ -68,8 +68,8 @@ __device__ inline Elem tconv_weight(const ConvParams& p, const Elem* base, int n
     }
     const int kh = tap / p.kw;
     const int kw = tap - kh * p.kw;
-    return base[int64_t(n) * p.w_n + int64_t(ic) * p.w_ic +
-                int64_t(kh) * p.w_kh + int64_t(kw) * p.w_kw];
+    return base[int64_t(n) * p.w_n + int64_t(ic) * p.w_ic + int64_t(kh) * p.w_kh +
+                int64_t(kw) * p.w_kw];
 }
 
 /// The rows of an A tile one thread feeds on the channel-last vector walk, and
@@ -81,7 +81,7 @@ struct ConvRows {
     static constexpr int kMax = 4;
     int count = 0;
     int row[kMax] = {};
-    int off[kMax] = {};   // (oh·sh − ph)·in_h + (ow·sw − pw)·in_w
+    int off[kMax] = {}; // (oh·sh − ph)·in_h + (ow·sw − pw)·in_w
     int oh0[kMax] = {};
     int ow0[kMax] = {};
     int ok[kMax] = {};
@@ -90,7 +90,7 @@ struct ConvRows {
 template <class Elem, int Threads, int bM, int bK>
 __device__ inline ConvRows conv_rows(const ConvParams& p, int pixel0)
 {
-    constexpr int kGroup = 16 / int(sizeof(Elem));   // one 16 B vector of k
+    constexpr int kGroup = 16 / int(sizeof(Elem)); // one 16 B vector of k
     constexpr int groups = bK / kGroup;
     constexpr int step = Threads / groups;
     static_assert(bM % step == 0 && bM / step <= ConvRows::kMax,
@@ -102,7 +102,9 @@ __device__ inline ConvRows conv_rows(const ConvParams& p, int pixel0)
     r.count = bM / step;
     CUTE_UNROLL
     for (int i = 0; i < ConvRows::kMax; ++i) {
-        if (i >= r.count) { break; }
+        if (i >= r.count) {
+            break;
+        }
         const int row = row0 + i * step;
         const int pixel = pixel0 + row;
         const int oh = pixel / p.ow;
@@ -121,11 +123,10 @@ __device__ inline ConvRows conv_rows(const ConvParams& p, int pixel0)
 /// inside a single tap -- contiguous in the activation and in the shared tile,
 /// so both the load and the store are one 16 B move.
 template <class Elem, int bK, class SmemA>
-__device__ inline void conv_fill_a_vec(const ConvParams& p, SmemA sA, int stage,
-                                       const Elem* in, const ConvRows& rows,
-                                       int k0)
+__device__ inline void conv_fill_a_vec(const ConvParams& p, SmemA sA, int stage, const Elem* in,
+                                       const ConvRows& rows, int k0)
 {
-    constexpr int kGroup = 16 / int(sizeof(Elem));   // one 16 B vector of k
+    constexpr int kGroup = 16 / int(sizeof(Elem)); // one 16 B vector of k
     using Vec = std::conditional_t<sizeof(Elem) == 2, uint4, float4>;
 
     const int K = p.icg * p.kh * p.kw;
@@ -143,7 +144,9 @@ __device__ inline void conv_fill_a_vec(const ConvParams& p, SmemA sA, int stage,
 
     CUTE_UNROLL
     for (int i = 0; i < ConvRows::kMax; ++i) {
-        if (i >= rows.count) { break; }
+        if (i >= rows.count) {
+            break;
+        }
         Vec v = zero;
         if (k_ok && rows.ok[i]) {
             const int ih = rows.oh0[i] + dh;
@@ -166,8 +169,8 @@ __device__ inline void conv_fill_a_vec(const ConvParams& p, SmemA sA, int stage,
 /// division by a runtime value is a ~20-instruction sequence on this ISA, and
 /// the element-at-a-time form spent two of them on every element of the tile.
 template <class Elem, bool ChannelsLast, int Threads, int bM, int bK, class SmemA>
-__device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage,
-                                   const Elem* in, int pixel0, int k0)
+__device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage, const Elem* in,
+                                   int pixel0, int k0)
 {
     const int M = p.oh * p.ow;
     const int K = p.icg * p.kh * p.kw;
@@ -178,7 +181,7 @@ __device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage,
 
     if constexpr (ChannelsLast) {
         static_assert(Threads % bK == 0, "a thread has to own one k column");
-        constexpr int per = Threads / bK;   // pixels per round
+        constexpr int per = Threads / bK; // pixels per round
         const int col = tid % bK;
         const int k = k0 + col;
         const int tap = k / p.icg;
@@ -199,12 +202,15 @@ __device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage,
             sA(row, col, stage) = val;
             pixel += per;
             ow += per;
-            while (ow >= p.ow) { ow -= p.ow; ++oh; }
+            while (ow >= p.ow) {
+                ow -= p.ow;
+                ++oh;
+            }
         }
     } else {
         static_assert(Threads % bM == 0 && bK % (Threads / bM) == 0,
                       "the k column walk has to divide the tile");
-        constexpr int per = Threads / bM;   // k columns per thread
+        constexpr int per = Threads / bM; // k columns per thread
         const int row = tid % bM;
         const int pixel = pixel0 + row;
         const bool m_ok = pixel < M;
@@ -220,28 +226,29 @@ __device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage,
             const int ih = oh * p.sh - p.ph + kh * p.dh;
             const int iw = ow * p.sw - p.pw + kw * p.dw;
             Elem val = Elem(0);
-            if (m_ok && k < K && unsigned(ih) < unsigned(p.ih) &&
-                unsigned(iw) < unsigned(p.iw)) {
+            if (m_ok && k < K && unsigned(ih) < unsigned(p.ih) && unsigned(iw) < unsigned(p.iw)) {
                 val = in[ic * inc + ih * inh + iw * inw];
             }
             sA(row, col0 + j, stage) = val;
             ++k;
             if (++kw == p.kw) {
                 kw = 0;
-                if (++kh == p.kh) { kh = 0; ++ic; }
+                if (++kh == p.kh) {
+                    kh = 0;
+                    ++ic;
+                }
             }
         }
     }
 }
 
 template <class Elem>
-__device__ inline Elem* tconv_out_addr(const ConvParams& p, int64_t base,
-                                       int pixel, int n)
+__device__ inline Elem* tconv_out_addr(const ConvParams& p, int64_t base, int pixel, int n)
 {
     const int oh = pixel / p.ow;
     const int ow = pixel - oh * p.ow;
-    return static_cast<Elem*>(p.output) + base + int64_t(oh) * p.out_h +
-           int64_t(ow) * p.out_w + int64_t(n) * p.out_c;
+    return static_cast<Elem*>(p.output) + base + int64_t(oh) * p.out_h + int64_t(ow) * p.out_w +
+           int64_t(n) * p.out_c;
 }
 
 // ============================================================
@@ -252,11 +259,10 @@ __device__ inline Elem* tconv_out_addr(const ConvParams& p, int64_t base,
 /// two stages — the depth that keeps three blocks resident per SM, which is
 /// what the shallow upsampler grids need. A wider n tile is the tempting lever
 /// and it is worse here for the same reason it is worse there.
-struct ConvTileH
-{
+struct ConvTileH {
     static constexpr int bM = 64;
     static constexpr int bN = 64;
-    static constexpr int bK = 64;   // the swizzle atom is 64 halves wide in k
+    static constexpr int bK = 64; // the swizzle atom is 64 halves wide in k
     static constexpr int stages = 2;
     static constexpr int wm = 2;
     static constexpr int wn = 2;
@@ -266,8 +272,7 @@ struct ConvTileH
 };
 
 template <class Elem, bool ChannelsLast>
-__global__ __launch_bounds__(ConvTileH::threads)
-void tconv_gemm_h_kernel(ConvParams pin)
+__global__ __launch_bounds__(ConvTileH::threads) void tconv_gemm_h_kernel(ConvParams pin)
 {
     using namespace cute;
 
@@ -279,27 +284,29 @@ void tconv_gemm_h_kernel(ConvParams pin)
     const int cls = int(blockIdx.z) % pin.classes;
     const int zg = int(blockIdx.z) / pin.classes;
     const TClass tc = tconv_class(pin, cls);
-    if (tc.empty) { return; }
+    if (tc.empty) {
+        return;
+    }
 
     const ConvParams p = tc.q;
     const int M = p.oh * p.ow;
     const int N = p.ocg;
     const int K = p.icg * p.kh * p.kw;
     const int m0 = int(blockIdx.x) * bM;
-    if (m0 >= M) { return; }
+    if (m0 >= M) {
+        return;
+    }
     const int n0 = int(blockIdx.y) * bN;
 
     const int zb = zg / p.groups;
     const int g = zg - zb * p.groups;
 
     const int64_t in_base = int64_t(zb) * p.in_batch + int64_t(g) * p.icg * p.in_c;
-    const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c +
-                             tc.out_off;
+    const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c + tc.out_off;
 
     // A group owns IC/G consecutive input channels, so its filter slice starts
     // at g·IC/G·w_ic — the input axis, not the output one.
-    Elem const* W = static_cast<Elem const*>(p.weight) +
-                    int64_t(g) * p.icg * p.w_ic + tc.w_off;
+    Elem const* W = static_cast<Elem const*>(p.weight) + int64_t(g) * p.icg * p.w_ic + tc.w_off;
     // Shifted once so the fill's own arithmetic stays 32-bit (the launch gate
     // keeps every offset it forms inside int).
     Elem const* in = static_cast<Elem const*>(p.input) + in_base;
@@ -308,22 +315,19 @@ void tconv_gemm_h_kernel(ConvParams pin)
     auto cta_tiler = make_shape(Int<bM>{}, Int<bN>{}, Int<bK>{});
     auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
 
-    constexpr auto sA_layout = detail::gemm_smem_layout<true>(
-        Int<bM>{}, Int<bK>{}, Int<kStages>{});
-    constexpr auto sB_layout = detail::gemm_smem_layout<!ChannelsLast>(
-        Int<bN>{}, Int<bK>{}, Int<kStages>{});
+    constexpr auto sA_layout = detail::gemm_smem_layout<true>(Int<bM>{}, Int<bK>{}, Int<kStages>{});
+    constexpr auto sB_layout =
+        detail::gemm_smem_layout<!ChannelsLast>(Int<bN>{}, Int<bK>{}, Int<kStages>{});
     constexpr int kSmemA = int(cosize(sA_layout));
 
     extern __shared__ char gemm_smem[];
     Tensor sA = make_tensor(make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem)), sA_layout);
     Tensor sB = make_tensor(
-        make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem + kSmemA * int(sizeof(Elem)))),
-        sB_layout);
+        make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem + kSmemA * int(sizeof(Elem)))), sB_layout);
 
-    TiledMMA mma = make_tiled_mma(
-        detail::gemm_mma_atom<Elem>{},
-        Layout<Shape<Int<ConvTileH::wm>, Int<ConvTileH::wn>, _1>>{},
-        cute::Tile<Int<ConvTileH::mmaM>, Int<ConvTileH::mmaN>, _16>{});
+    TiledMMA mma = make_tiled_mma(detail::gemm_mma_atom<Elem>{},
+                                  Layout<Shape<Int<ConvTileH::wm>, Int<ConvTileH::wn>, _1>>{},
+                                  cute::Tile<Int<ConvTileH::mmaM>, Int<ConvTileH::mmaN>, _16>{});
 
     auto load_a = [&](int kt, int stage) {
         if constexpr (ChannelsLast) {
@@ -332,14 +336,13 @@ void tconv_gemm_h_kernel(ConvParams pin)
                 return;
             }
         }
-        conv_fill_a<Elem, ChannelsLast, ConvTileH::threads, bM, bK>(
-            p, sA, stage, in, m0, kt * bK);
+        conv_fill_a<Elem, ChannelsLast, ConvTileH::threads, bM, bK>(p, sA, stage, in, m0, kt * bK);
     };
     // One column of B per thread, so the tap is decoded once and the row walk is
     // a stride. The filter's k axis is never contiguous here (the output channel
     // sits inside the reduction), so there is no copy atom to fall back on.
     auto load_b = [&](int kt, int stage) {
-        constexpr int per = ConvTileH::threads / bK;   // rows per round
+        constexpr int per = ConvTileH::threads / bK; // rows per round
         const int col = int(threadIdx.x) % bK;
         const int k = kt * bK + col;
         const int karea = p.kh * p.kw;
@@ -354,12 +357,10 @@ void tconv_gemm_h_kernel(ConvParams pin)
         const int kh = tap / p.kw;
         const int kw = tap - kh * p.kw;
         const bool k_ok = k < K;
-        const Elem* wc = W + int64_t(ic) * p.w_ic + int64_t(kh) * p.w_kh +
-                         int64_t(kw) * p.w_kw;
+        const Elem* wc = W + int64_t(ic) * p.w_ic + int64_t(kh) * p.w_kh + int64_t(kw) * p.w_kw;
         for (int row = int(threadIdx.x) / bK; row < bN; row += per) {
             const int n = n0 + row;
-            sB(row, col, stage) =
-                (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : Elem(0);
+            sB(row, col, stage) = (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : Elem(0);
         }
     };
 
@@ -373,7 +374,9 @@ void tconv_gemm_h_kernel(ConvParams pin)
         load_b(k_tile_next, pipe);
         cp_async_fence();
         --tiles_left;
-        if (tiles_left > 0) { ++k_tile_next; }
+        if (tiles_left > 0) {
+            ++k_tile_next;
+        }
     }
 
     ThrMMA thr_mma = mma.get_slice(threadIdx.x);
@@ -382,8 +385,8 @@ void tconv_gemm_h_kernel(ConvParams pin)
     // The identity tile carries the (m, n) coordinates the epilogue needs and
     // gives the fragment its static extent; there is no strided C tensor to
     // partition because the pixel axis is only uniform inside one output row.
-    Tensor gCc = local_tile(make_identity_tensor(make_shape(M, N)), cta_tiler,
-                            cta_coord, Step<_1, _1, X>{});
+    Tensor gCc =
+        local_tile(make_identity_tensor(make_shape(M, N)), cta_tiler, cta_coord, Step<_1, _1, X>{});
     Tensor tCcC = thr_mma.partition_C(gCc);
     Tensor tCrC = thr_mma.make_fragment_C(tCcC);
     clear(tCrC);
@@ -436,24 +439,27 @@ void tconv_gemm_h_kernel(ConvParams pin)
                 load_b(k_tile_next, smem_pipe_write);
                 cp_async_fence();
                 --tiles_left;
-                if (tiles_left > 0) { ++k_tile_next; }
+                if (tiles_left > 0) {
+                    ++k_tile_next;
+                }
                 smem_pipe_write = smem_pipe_read;
-                smem_pipe_read =
-                    (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
+                smem_pipe_read = (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
             }
             gemm(mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
         }
     }
 
-    Elem const* bias = p.bias != nullptr
-        ? static_cast<Elem const*>(p.bias) + int64_t(g) * p.ocg : nullptr;
+    Elem const* bias =
+        p.bias != nullptr ? static_cast<Elem const*>(p.bias) + int64_t(g) * p.ocg : nullptr;
 
     CUTE_UNROLL
     for (int i = 0; i < size(tCrC); ++i) {
         auto coord = tCcC(i);
         const int m = int(get<0>(coord));
         const int n = int(get<1>(coord));
-        if (m >= M || n >= N) { continue; }
+        if (m >= M || n >= N) {
+            continue;
+        }
         Elem* dst = tconv_out_addr<Elem>(p, out_base, m, n);
         tconv_store<Elem>(p, dst, float(tCrC(i)), n, bias);
     }
@@ -464,8 +470,7 @@ void tconv_gemm_h_kernel(ConvParams pin)
 // ============================================================
 
 template <bool ChannelsLast>
-__global__ __launch_bounds__(kThreads)
-void tconv_gemm_f_kernel(ConvParams pin)
+__global__ __launch_bounds__(kThreads) void tconv_gemm_f_kernel(ConvParams pin)
 {
     using namespace cute;
     using Elem = float;
@@ -474,32 +479,34 @@ void tconv_gemm_f_kernel(ConvParams pin)
     constexpr int bN = 64;
     constexpr int bK = 16;
     constexpr int kStages = 3;
-    constexpr int kPad = 4;   // 16 B: a cp.async destination row start must be 16 B aligned
+    constexpr int kPad = 4; // 16 B: a cp.async destination row start must be 16 B aligned
 
     const int cls = int(blockIdx.z) % pin.classes;
     const int zg = int(blockIdx.z) / pin.classes;
     const TClass tc = tconv_class(pin, cls);
-    if (tc.empty) { return; }
+    if (tc.empty) {
+        return;
+    }
 
     const ConvParams p = tc.q;
     const int M = p.oh * p.ow;
     const int N = p.ocg;
     const int K = p.icg * p.kh * p.kw;
     const int m0 = int(blockIdx.x) * bM;
-    if (m0 >= M) { return; }
+    if (m0 >= M) {
+        return;
+    }
     const int n0 = int(blockIdx.y) * bN;
 
     const int zb = zg / p.groups;
     const int g = zg - zb * p.groups;
 
     const int64_t in_base = int64_t(zb) * p.in_batch + int64_t(g) * p.icg * p.in_c;
-    const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c +
-                             tc.out_off;
+    const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c + tc.out_off;
 
     // A group owns IC/G consecutive input channels, so its filter slice starts
     // at g·IC/G·w_ic — the input axis, not the output one.
-    Elem const* W = static_cast<Elem const*>(p.weight) +
-                    int64_t(g) * p.icg * p.w_ic + tc.w_off;
+    Elem const* W = static_cast<Elem const*>(p.weight) + int64_t(g) * p.icg * p.w_ic + tc.w_off;
     // Shifted once so the fill's own arithmetic stays 32-bit (the launch gate
     // keeps every offset it forms inside int).
     Elem const* in = static_cast<Elem const*>(p.input) + in_base;
@@ -508,18 +515,16 @@ void tconv_gemm_f_kernel(ConvParams pin)
     auto cta_tiler = make_shape(Int<bM>{}, Int<bN>{}, Int<bK>{});
     auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
 
-    constexpr auto sA_layout = make_layout(
-        make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
-        make_stride(Int<bK + kPad>{}, Int<1>{}, Int<(bK + kPad) * bM>{}));
+    constexpr auto sA_layout =
+        make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
+                    make_stride(Int<bK + kPad>{}, Int<1>{}, Int<(bK + kPad) * bM>{}));
     constexpr auto sB_layout = [&] {
         if constexpr (ChannelsLast) {
             return make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
-                               make_stride(Int<1>{}, Int<bN + kPad>{},
-                                           Int<(bN + kPad) * bK>{}));
+                               make_stride(Int<1>{}, Int<bN + kPad>{}, Int<(bN + kPad) * bK>{}));
         } else {
             return make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
-                               make_stride(Int<bK + kPad>{}, Int<1>{},
-                                           Int<(bK + kPad) * bN>{}));
+                               make_stride(Int<bK + kPad>{}, Int<1>{}, Int<(bK + kPad) * bN>{}));
         }
     }();
     constexpr int kSmemA = int(cosize(sA_layout));
@@ -527,14 +532,12 @@ void tconv_gemm_f_kernel(ConvParams pin)
     extern __shared__ char gemm_smem[];
     Tensor sA = make_tensor(make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem)), sA_layout);
     Tensor sB = make_tensor(
-        make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem + kSmemA * int(sizeof(Elem)))),
-        sB_layout);
+        make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem + kSmemA * int(sizeof(Elem)))), sB_layout);
 
     // One-thread atom: the atom layout has to cover every launched thread, or
     // the extra threads alias thread 0's slice and race with it (the epilogue
     // reads the destination for add_to).
-    TiledMMA mma = make_tiled_mma(UniversalFMA<float, float, float>{},
-                                  Layout<Shape<_8, _16, _1>>{},
+    TiledMMA mma = make_tiled_mma(UniversalFMA<float, float, float>{}, Layout<Shape<_8, _16, _1>>{},
                                   Tile<_64, _64, _1>{});
 
     auto load_a = [&](int kt, int stage) {
@@ -544,11 +547,10 @@ void tconv_gemm_f_kernel(ConvParams pin)
                 return;
             }
         }
-        conv_fill_a<Elem, ChannelsLast, kThreads, bM, bK>(
-            p, sA, stage, in, m0, kt * bK);
+        conv_fill_a<Elem, ChannelsLast, kThreads, bM, bK>(p, sA, stage, in, m0, kt * bK);
     };
     auto load_b = [&](int kt, int stage) {
-        constexpr int per = kThreads / bK;   // rows per round
+        constexpr int per = kThreads / bK; // rows per round
         const int col = int(threadIdx.x) % bK;
         const int k = kt * bK + col;
         const int karea = p.kh * p.kw;
@@ -563,12 +565,10 @@ void tconv_gemm_f_kernel(ConvParams pin)
         const int kh = tap / p.kw;
         const int kw = tap - kh * p.kw;
         const bool k_ok = k < K;
-        const Elem* wc = W + int64_t(ic) * p.w_ic + int64_t(kh) * p.w_kh +
-                         int64_t(kw) * p.w_kw;
+        const Elem* wc = W + int64_t(ic) * p.w_ic + int64_t(kh) * p.w_kh + int64_t(kw) * p.w_kw;
         for (int row = int(threadIdx.x) / bK; row < bN; row += per) {
             const int n = n0 + row;
-            sB(row, col, stage) =
-                (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : Elem(0);
+            sB(row, col, stage) = (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : Elem(0);
         }
     };
 
@@ -582,7 +582,9 @@ void tconv_gemm_f_kernel(ConvParams pin)
         load_b(k_tile_next, pipe);
         cp_async_fence();
         --tiles_left;
-        if (tiles_left > 0) { ++k_tile_next; }
+        if (tiles_left > 0) {
+            ++k_tile_next;
+        }
     }
 
     ThrMMA thr_mma = mma.get_slice(threadIdx.x);
@@ -590,8 +592,8 @@ void tconv_gemm_f_kernel(ConvParams pin)
     Tensor tCsB = thr_mma.partition_B(sB);
     Tensor tCrA = thr_mma.make_fragment_A(tCsA(_, _, _, 0));
     Tensor tCrB = thr_mma.make_fragment_B(tCsB(_, _, _, 0));
-    Tensor gCc = local_tile(make_identity_tensor(make_shape(M, N)), cta_tiler,
-                            cta_coord, Step<_1, _1, X>{});
+    Tensor gCc =
+        local_tile(make_identity_tensor(make_shape(M, N)), cta_tiler, cta_coord, Step<_1, _1, X>{});
     Tensor tCcC = thr_mma.partition_C(gCc);
     Tensor tCrC = thr_mma.make_fragment_C(tCcC);
     clear(tCrC);
@@ -613,20 +615,24 @@ void tconv_gemm_f_kernel(ConvParams pin)
         gemm(mma, tCrA, tCrB, tCrC);
 
         --tiles_left;
-        if (tiles_left > 0) { ++k_tile_next; }
+        if (tiles_left > 0) {
+            ++k_tile_next;
+        }
         smem_pipe_write = smem_pipe_read;
         smem_pipe_read = (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
     }
 
-    Elem const* bias = p.bias != nullptr
-        ? static_cast<Elem const*>(p.bias) + int64_t(g) * p.ocg : nullptr;
+    Elem const* bias =
+        p.bias != nullptr ? static_cast<Elem const*>(p.bias) + int64_t(g) * p.ocg : nullptr;
 
     CUTE_UNROLL
     for (int i = 0; i < size(tCrC); ++i) {
         auto coord = tCcC(i);
         const int m = int(get<0>(coord));
         const int n = int(get<1>(coord));
-        if (m >= M || n >= N) { continue; }
+        if (m >= M || n >= N) {
+            continue;
+        }
         Elem* dst = tconv_out_addr<Elem>(p, out_base, m, n);
         tconv_store<Elem>(p, dst, tCrC(i), n, bias);
     }
@@ -639,44 +645,51 @@ void tconv_gemm_f_kernel(ConvParams pin)
 /// Fetch one input channel of one tap with the stride/dilation arithmetic the
 /// class decomposition does not need but a general geometry does.
 template <class Elem>
-__device__ inline bool tconv_tap(const ConvParams& p, const Elem* in, const Elem* w,
-                                 int ic, int n, int oh, int ow, int kh, int kw,
-                                 float& acc)
+__device__ inline bool tconv_tap(const ConvParams& p, const Elem* in, const Elem* w, int ic, int n,
+                                 int oh, int ow, int kh, int kw, float& acc)
 {
     const int t = oh + p.ph - kh * p.dh;
-    if (t < 0 || t % p.sh != 0) { return false; }
+    if (t < 0 || t % p.sh != 0) {
+        return false;
+    }
     const int ih = t / p.sh;
-    if (ih >= p.ih) { return false; }
+    if (ih >= p.ih) {
+        return false;
+    }
     const int u = ow + p.pw - kw * p.dw;
-    if (u < 0 || u % p.sw != 0) { return false; }
+    if (u < 0 || u % p.sw != 0) {
+        return false;
+    }
     const int iw = u / p.sw;
-    if (iw >= p.iw) { return false; }
+    if (iw >= p.iw) {
+        return false;
+    }
     acc += float(in[int64_t(ih) * p.in_h + int64_t(iw) * p.in_w + int64_t(ic) * p.in_c]) *
-           float(w[int64_t(ic) * p.w_ic + int64_t(n) * p.w_n +
-                   int64_t(kh) * p.w_kh + int64_t(kw) * p.w_kw]);
+           float(w[int64_t(ic) * p.w_ic + int64_t(n) * p.w_n + int64_t(kh) * p.w_kh +
+                   int64_t(kw) * p.w_kw]);
     return true;
 }
 
 /// One output element per thread, arbitrary layout, stride, dilation and group
 /// geometry. blockIdx.x walks (plane, ow tile) flat so the (image, channel) pair
 /// needs one division per block rather than one per element.
-template <class Elem>
-__global__ void tconv_plane_kernel(ConvParams p, int ow_tiles)
+template <class Elem> __global__ void tconv_plane_kernel(ConvParams p, int ow_tiles)
 {
     const int plane = int(blockIdx.x) / ow_tiles;
     const int ow = (int(blockIdx.x) - plane * ow_tiles) * int(blockDim.x) + int(threadIdx.x);
     const int oh = int(blockIdx.y) * int(blockDim.y) + int(threadIdx.y);
-    if (ow >= p.ow || oh >= p.oh) { return; }
+    if (ow >= p.ow || oh >= p.oh) {
+        return;
+    }
 
     const int oc = plane % p.oc;
     const int zb = plane / p.oc;
     const int g = oc / p.ocg;
     const int n = oc - g * p.ocg;
 
-    const Elem* in = static_cast<const Elem*>(p.input) +
-                     int64_t(zb) * p.in_batch + int64_t(g) * p.icg * p.in_c;
-    const Elem* w = static_cast<const Elem*>(p.weight) +
-                     int64_t(g) * p.icg * p.w_ic;
+    const Elem* in =
+        static_cast<const Elem*>(p.input) + int64_t(zb) * p.in_batch + int64_t(g) * p.icg * p.in_c;
+    const Elem* w = static_cast<const Elem*>(p.weight) + int64_t(g) * p.icg * p.w_ic;
 
     float acc = 0.0f;
     for (int kh = 0; kh < p.kh; ++kh) {
@@ -687,10 +700,10 @@ __global__ void tconv_plane_kernel(ConvParams p, int ow_tiles)
         }
     }
 
-    const Elem* bias = p.bias != nullptr
-        ? static_cast<const Elem*>(p.bias) + int64_t(g) * p.ocg : nullptr;
-    Elem* dst = static_cast<Elem*>(p.output) + int64_t(zb) * p.out_batch +
-                int64_t(oc) * p.out_c + int64_t(oh) * p.out_h + int64_t(ow) * p.out_w;
+    const Elem* bias =
+        p.bias != nullptr ? static_cast<const Elem*>(p.bias) + int64_t(g) * p.ocg : nullptr;
+    Elem* dst = static_cast<Elem*>(p.output) + int64_t(zb) * p.out_batch + int64_t(oc) * p.out_c +
+                int64_t(oh) * p.out_h + int64_t(ow) * p.out_w;
     tconv_store<Elem>(p, dst, acc, n, bias);
 }
 
@@ -703,42 +716,38 @@ void launch_tconv_gemm_h(const ConvParams& p, int m_max, cudaStream_t stream)
 {
     using namespace cute;
     constexpr int bM = ConvTileH::bM, bN = ConvTileH::bN, bK = ConvTileH::bK;
-    constexpr auto la = detail::gemm_smem_layout<true>(
-        Int<bM>{}, Int<bK>{}, Int<ConvTileH::stages>{});
-    constexpr auto lb = detail::gemm_smem_layout<!ChannelsLast>(
-        Int<bN>{}, Int<bK>{}, Int<ConvTileH::stages>{});
+    constexpr auto la =
+        detail::gemm_smem_layout<true>(Int<bM>{}, Int<bK>{}, Int<ConvTileH::stages>{});
+    constexpr auto lb =
+        detail::gemm_smem_layout<!ChannelsLast>(Int<bN>{}, Int<bK>{}, Int<ConvTileH::stages>{});
     constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(Elem));
 
     auto kernel = tconv_gemm_h_kernel<Elem, ChannelsLast>;
-    static const cudaError_t cfg = cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    static const cudaError_t cfg =
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
-    dim3 grid(ceil_div(m_max, bM), ceil_div(p.ocg, bN),
-              p.batch * p.groups * p.classes);
+    dim3 grid(ceil_div(m_max, bM), ceil_div(p.ocg, bN), p.batch * p.groups * p.classes);
     kernel<<<grid, ConvTileH::threads, smem, stream>>>(p);
 }
 
 template <bool ChannelsLast>
 void launch_tconv_gemm_f(const ConvParams& p, int m_max, cudaStream_t stream)
 {
-    using namespace cute;   // ceil_div
+    using namespace cute; // ceil_div
     constexpr int bM = 64, bN = 64, bK = 16, kStages = 3, kPad = 4;
-    constexpr int smem =
-        (bM * (bK + kPad) + bN * (bK + kPad)) * kStages * int(sizeof(float));
+    constexpr int smem = (bM * (bK + kPad) + bN * (bK + kPad)) * kStages * int(sizeof(float));
 
     auto kernel = tconv_gemm_f_kernel<ChannelsLast>;
-    static const cudaError_t cfg = cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    static const cudaError_t cfg =
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
-    dim3 grid(ceil_div(m_max, bM), ceil_div(p.ocg, bN),
-              p.batch * p.groups * p.classes);
+    dim3 grid(ceil_div(m_max, bM), ceil_div(p.ocg, bN), p.batch * p.groups * p.classes);
     kernel<<<grid, kThreads, smem, stream>>>(p);
 }
 
-template <class Elem>
-void launch_tconv_plane(const ConvParams& p, cudaStream_t stream)
+template <class Elem> void launch_tconv_plane(const ConvParams& p, cudaStream_t stream)
 {
     constexpr int bx = 32, by = 8;
     const int ow_tiles = (p.ow + bx - 1) / bx;
@@ -747,11 +756,10 @@ void launch_tconv_plane(const ConvParams& p, cudaStream_t stream)
     tconv_plane_kernel<Elem><<<grid, dim3(bx, by), 0, stream>>>(p, ow_tiles);
 }
 
-}  // namespace
+} // namespace
 
 Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView& output,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx, void*)
+                             std::span<const TensorView> inputs, const ComputeContext& ctx, void*)
 {
     const TensorView& act = inputs[0];
     const TensorView& wgt = inputs[1];
@@ -762,11 +770,19 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
         wgt.data_type() != dt || output.data_type() != dt) {
         return Status::unsupported;
     }
-    if (is_quantized_transpose_conv2d(wgt.data_type())) { return Status::unsupported; }
-    if (output.numel() == 0) { return Status::ok; }
-    if (!is_channel_first_spatial(wgt.layout())) { return Status::unsupported; }
+    if (is_quantized_transpose_conv2d(wgt.data_type())) {
+        return Status::unsupported;
+    }
+    if (output.numel() == 0) {
+        return Status::ok;
+    }
+    if (!is_channel_first_spatial(wgt.layout())) {
+        return Status::unsupported;
+    }
     const bool last = is_channel_last(act.layout());
-    if (last != is_channel_last(output.layout())) { return Status::unsupported; }
+    if (last != is_channel_last(output.layout())) {
+        return Status::unsupported;
+    }
 
     ConvParams p;
     p.batch = static_cast<int>(act.shape(0));
@@ -824,19 +840,18 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     // channel stride is what has to be 16 B aligned.
     const int64_t esz = static_cast<int64_t>(data_type_size(dt));
     const int kGroup = esz == 2 ? 8 : 4;
-    p.fill_vec = last && p.in_c == 1 && p.icg % kGroup == 0 &&
-                 (p.in_w * esz) % 16 == 0 &&
+    p.fill_vec = last && p.in_c == 1 && p.icg % kGroup == 0 && (p.in_w * esz) % 16 == 0 &&
                  (reinterpret_cast<uintptr_t>(p.input) % 16 == 0);
 
     p.classes = p.sh * p.sw;
     // Launch gates, in the order the dispatch below reads them: M per class is
     // at most ceil(OH/SH)·ceil(OW/SW), blockIdx.z is 16-bit, and the fills form
     // 32-bit offsets inside one activation plane.
-    const int m_max = int((int64_t(p.oh) + p.sh - 1) / p.sh) *
-                      int((int64_t(p.ow) + p.sw - 1) / p.sw);
+    const int m_max =
+        int((int64_t(p.oh) + p.sh - 1) / p.sh) * int((int64_t(p.ow) + p.sw - 1) / p.sw);
     const int64_t zg = int64_t(p.batch) * p.groups * p.classes;
-    const bool gemm = p.ocg >= 16 && p.classes <= 16 && zg <= 65535 &&
-                      m_max <= 65535 && act.numel() <= (int64_t(1) << 30);
+    const bool gemm = p.ocg >= 16 && p.classes <= 16 && zg <= 65535 && m_max <= 65535 &&
+                      act.numel() <= (int64_t(1) << 30);
     // A depthwise geometry — one channel on both sides of a group — has no
     // channel axis to tile, so it takes the class-view correlation kernels of
     // depthwise_transpose_conv.cu instead of anything here.
@@ -847,26 +862,38 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     if (gemm) {
         if (dt == DataType::bf16) {
-            if (last) { launch_tconv_gemm_h<cute::bfloat16_t, true>(p, m_max, stream); }
-            else      { launch_tconv_gemm_h<cute::bfloat16_t, false>(p, m_max, stream); }
+            if (last) {
+                launch_tconv_gemm_h<cute::bfloat16_t, true>(p, m_max, stream);
+            } else {
+                launch_tconv_gemm_h<cute::bfloat16_t, false>(p, m_max, stream);
+            }
         } else if (esz == 2) {
-            if (last) { launch_tconv_gemm_h<cute::half_t, true>(p, m_max, stream); }
-            else      { launch_tconv_gemm_h<cute::half_t, false>(p, m_max, stream); }
+            if (last) {
+                launch_tconv_gemm_h<cute::half_t, true>(p, m_max, stream);
+            } else {
+                launch_tconv_gemm_h<cute::half_t, false>(p, m_max, stream);
+            }
         } else {
-            if (last) { launch_tconv_gemm_f<true>(p, m_max, stream); }
-            else      { launch_tconv_gemm_f<false>(p, m_max, stream); }
+            if (last) {
+                launch_tconv_gemm_f<true>(p, m_max, stream);
+            } else {
+                launch_tconv_gemm_f<false>(p, m_max, stream);
+            }
         }
-    } else if (tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last,
-                                                     dt, stream)) {
+    } else if (tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last, dt, stream)) {
         // launched by the depthwise route
     } else if (plane_ok) {
-        if (dt == DataType::bf16) { launch_tconv_plane<cute::bfloat16_t>(p, stream); }
-        else if (esz == 2)        { launch_tconv_plane<cute::half_t>(p, stream); }
-        else                      { launch_tconv_plane<float>(p, stream); }
+        if (dt == DataType::bf16) {
+            launch_tconv_plane<cute::bfloat16_t>(p, stream);
+        } else if (esz == 2) {
+            launch_tconv_plane<cute::half_t>(p, stream);
+        } else {
+            launch_tconv_plane<float>(p, stream);
+        }
     } else {
         return Status::unsupported;
     }
     return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

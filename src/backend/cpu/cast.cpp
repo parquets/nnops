@@ -43,16 +43,13 @@ namespace {
 
 // ---- load as f32 / store from f32 --------------------------------------
 
-template <class S>
-inline float load_f32(const S* p) { return simd::s_load(p); }
+template <class S> inline float load_f32(const S* p) { return simd::s_load(p); }
 
-template <class S>
-inline void store_f32(S* p, float v) { simd::s_store(p, v); }
+template <class S> inline void store_f32(S* p, float v) { simd::s_store(p, v); }
 
 // ---- the four conversion categories -----------------------------------
 
-template <class Src, class Dst>
-inline void cast_element(const Src* src, Dst* dst)
+template <class Src, class Dst> inline void cast_element(const Src* src, Dst* dst)
 {
     constexpr bool src_int = std::is_integral_v<Src>;
     constexpr bool dst_int = std::is_integral_v<Dst>;
@@ -77,9 +74,9 @@ inline void cast_element(const Src* src, Dst* dst)
         } else {
             constexpr float lo = static_cast<float>(std::numeric_limits<Dst>::lowest());
             constexpr float hi = static_cast<float>(std::numeric_limits<Dst>::max());
-            *dst = v <= lo ? std::numeric_limits<Dst>::lowest()
-                  : v >= hi ? std::numeric_limits<Dst>::max()
-                            : static_cast<Dst>(v);
+            *dst = v <= lo ? std::numeric_limits<Dst>::lowest() :
+                   v >= hi ? std::numeric_limits<Dst>::max() :
+                             static_cast<Dst>(v);
         }
     } else {
         store_f32(dst, load_f32(src));
@@ -89,8 +86,7 @@ inline void cast_element(const Src* src, Dst* dst)
 /// The types the eight-lane widening/narrowing path covers.
 template <typename T>
 inline constexpr bool is_float_storage =
-    std::is_same_v<T, float> || std::is_same_v<T, half> ||
-    std::is_same_v<T, bfloat16>;
+    std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, bfloat16>;
 
 // ---- f32 → integer, eight lanes ---------------------------------------
 //
@@ -106,14 +102,12 @@ inline __m256i f32_to_i32_sat(const float* p)
 {
     const __m256 v = _mm256_loadu_ps(p);
     __m256i i = _mm256_cvttps_epi32(v);
-    const __m256 nan   = _mm256_cmp_ps(v, v, _CMP_UNORD_Q);
+    const __m256 nan = _mm256_cmp_ps(v, v, _CMP_UNORD_Q);
     const __m256 ge_hi = _mm256_cmp_ps(v, _mm256_set1_ps(2147483648.0f), _CMP_GE_OQ);
     const __m256 lt_lo = _mm256_cmp_ps(v, _mm256_set1_ps(-2147483648.0f), _CMP_LT_OQ);
-    i = _mm256_blendv_epi8(i, _mm256_set1_epi32(INT32_MAX),
-                           _mm256_castps_si256(ge_hi));
-    i = _mm256_blendv_epi8(i, _mm256_set1_epi32(INT32_MIN),
-                           _mm256_castps_si256(lt_lo));
-    return _mm256_andnot_si256(_mm256_castps_si256(nan), i);   // NaN → 0
+    i = _mm256_blendv_epi8(i, _mm256_set1_epi32(INT32_MAX), _mm256_castps_si256(ge_hi));
+    i = _mm256_blendv_epi8(i, _mm256_set1_epi32(INT32_MIN), _mm256_castps_si256(lt_lo));
+    return _mm256_andnot_si256(_mm256_castps_si256(nan), i); // NaN → 0
 }
 
 inline void f32_to_i32_sat(const float* s, int32_t* d)
@@ -122,14 +116,12 @@ inline void f32_to_i32_sat(const float* s, int32_t* d)
 }
 
 /// Eight floats → eight saturating int8 / uint8.
-template <class Dst>
-inline void f32_to_i8_sat(const float* s, Dst* d)
+template <class Dst> inline void f32_to_i8_sat(const float* s, Dst* d)
 {
     const __m256i i = f32_to_i32_sat(s);
-    const __m128i i16 = _mm_packs_epi32(_mm256_castsi256_si128(i),
-                                        _mm256_extracti128_si256(i, 1));
-    const __m128i i8 = std::is_same_v<Dst, uint8_t>
-        ? _mm_packus_epi16(i16, i16) : _mm_packs_epi16(i16, i16);
+    const __m128i i16 = _mm_packs_epi32(_mm256_castsi256_si128(i), _mm256_extracti128_si256(i, 1));
+    const __m128i i8 =
+        std::is_same_v<Dst, uint8_t> ? _mm_packus_epi16(i16, i16) : _mm_packs_epi16(i16, i16);
     _mm_storel_epi64(reinterpret_cast<__m128i*>(d), i8);
 }
 
@@ -141,8 +133,7 @@ inline void f32_to_i32_sat(const float* s, int32_t* d)
     vst1q_s32(d + 4, vcvtq_s32_f32(vld1q_f32(s + 4)));
 }
 
-template <class Dst>
-inline void f32_to_i8_sat(const float* s, Dst* d)
+template <class Dst> inline void f32_to_i8_sat(const float* s, Dst* d)
 {
     const int32x4_t a = vcvtq_s32_f32(vld1q_f32(s));
     const int32x4_t b = vcvtq_s32_f32(vld1q_f32(s + 4));
@@ -157,8 +148,7 @@ inline void f32_to_i8_sat(const float* s, Dst* d)
 #endif
 
 /// Convert a contiguous run.
-template <class Src, class Dst>
-inline void cast_range(const Src* s, Dst* d, int64_t n)
+template <class Src, class Dst> inline void cast_range(const Src* s, Dst* d, int64_t n)
 {
     int64_t i = 0;
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
@@ -182,12 +172,18 @@ inline void cast_range(const Src* s, Dst* d, int64_t n)
             simd::v_store_f32(d + i, simd::v_load_f32(s + i));
         }
     } else if constexpr (std::is_same_v<Src, int8_t> && std::is_same_v<Dst, float>) {
-        for (; i + 8 <= n; i += 8) { simd::v_store(d + i, simd::v_cvt_s8_to_f32(s + i)); }
+        for (; i + 8 <= n; i += 8) {
+            simd::v_store(d + i, simd::v_cvt_s8_to_f32(s + i));
+        }
     } else if constexpr (std::is_same_v<Src, uint8_t> && std::is_same_v<Dst, float>) {
-        for (; i + 8 <= n; i += 8) { simd::v_store(d + i, simd::v_cvt_u8_to_f32(s + i)); }
+        for (; i + 8 <= n; i += 8) {
+            simd::v_store(d + i, simd::v_cvt_u8_to_f32(s + i));
+        }
     } else if constexpr (std::is_same_v<Src, Dst> &&
                          (std::is_same_v<Src, int8_t> || std::is_same_v<Src, uint8_t>)) {
-        for (; i + 16 <= n; i += 16) { simd::v_store(d + i, simd::v_load(s + i)); }
+        for (; i + 16 <= n; i += 16) {
+            simd::v_store(d + i, simd::v_load(s + i));
+        }
     }
     for (; i < n; ++i) {
         cast_element(s + i, d + i);
@@ -206,55 +202,73 @@ void cast_rows(const TensorView& in, TensorView& out, const ComputeContext& ctx)
     constexpr int64_t kCastTile = int64_t{1} << 15;
     const int64_t tiles_per_row = (g.last_dim + kCastTile - 1) / kCastTile;
     ctx.cpu.run(0, g.num_rows * tiles_per_row, [&](int64_t t) {
-        const int64_t r   = t / tiles_per_row;
+        const int64_t r = t / tiles_per_row;
         const int64_t off = (t % tiles_per_row) * kCastTile;
         const int64_t len = g.last_dim - off < kCastTile ? g.last_dim - off : kCastTile;
-        cast_range(src + r * g.in_stride + off,
-                   dst + r * g.out_stride + off, len);
+        cast_range(src + r * g.in_stride + off, dst + r * g.out_stride + off, len);
     });
 }
 
 template <class Src>
-Status cast_from(DataType to, const TensorView& in, TensorView& out,
-                 const ComputeContext& ctx)
+Status cast_from(DataType to, const TensorView& in, TensorView& out, const ComputeContext& ctx)
 {
     switch (to) {
-    case DataType::f32: cast_rows<Src, float>(in, out, ctx); return Status::ok;
-    case DataType::f16: cast_rows<Src, half>(in, out, ctx); return Status::ok;
+    case DataType::f32:
+        cast_rows<Src, float>(in, out, ctx);
+        return Status::ok;
+    case DataType::f16:
+        cast_rows<Src, half>(in, out, ctx);
+        return Status::ok;
 #ifdef NNOPS_ARCH_AARCH64
-    case DataType::bf16: cast_rows<Src, bfloat16>(in, out, ctx); return Status::ok;
+    case DataType::bf16:
+        cast_rows<Src, bfloat16>(in, out, ctx);
+        return Status::ok;
 #endif
-    case DataType::s32: cast_rows<Src, int32_t>(in, out, ctx); return Status::ok;
-    case DataType::s64: cast_rows<Src, int64_t>(in, out, ctx); return Status::ok;
-    case DataType::s8:  cast_rows<Src, int8_t>(in, out, ctx); return Status::ok;
-    case DataType::u8:  cast_rows<Src, uint8_t>(in, out, ctx); return Status::ok;
-    default: break;
+    case DataType::s32:
+        cast_rows<Src, int32_t>(in, out, ctx);
+        return Status::ok;
+    case DataType::s64:
+        cast_rows<Src, int64_t>(in, out, ctx);
+        return Status::ok;
+    case DataType::s8:
+        cast_rows<Src, int8_t>(in, out, ctx);
+        return Status::ok;
+    case DataType::u8:
+        cast_rows<Src, uint8_t>(in, out, ctx);
+        return Status::ok;
+    default:
+        break;
     }
     return Status::unsupported;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status cast_cpu(const CastAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx,
-                void* /*workspace*/)
+Status cast_cpu(const CastAttributes& attrs, TensorView& output, std::span<const TensorView> inputs,
+                const ComputeContext& ctx, void* /*workspace*/)
 {
     const TensorView& in = inputs[0];
     switch (in.data_type()) {
-    case DataType::f32: return cast_from<float>(attrs.to, in, output, ctx);
-    case DataType::f16: return cast_from<half>(attrs.to, in, output, ctx);
+    case DataType::f32:
+        return cast_from<float>(attrs.to, in, output, ctx);
+    case DataType::f16:
+        return cast_from<half>(attrs.to, in, output, ctx);
 #ifdef NNOPS_ARCH_AARCH64
-    case DataType::bf16: return cast_from<bfloat16>(attrs.to, in, output, ctx);
+    case DataType::bf16:
+        return cast_from<bfloat16>(attrs.to, in, output, ctx);
 #endif
-    case DataType::s32: return cast_from<int32_t>(attrs.to, in, output, ctx);
-    case DataType::s64: return cast_from<int64_t>(attrs.to, in, output, ctx);
-    case DataType::s8:  return cast_from<int8_t>(attrs.to, in, output, ctx);
-    case DataType::u8:  return cast_from<uint8_t>(attrs.to, in, output, ctx);
-    default: break;
+    case DataType::s32:
+        return cast_from<int32_t>(attrs.to, in, output, ctx);
+    case DataType::s64:
+        return cast_from<int64_t>(attrs.to, in, output, ctx);
+    case DataType::s8:
+        return cast_from<int8_t>(attrs.to, in, output, ctx);
+    case DataType::u8:
+        return cast_from<uint8_t>(attrs.to, in, output, ctx);
+    default:
+        break;
     }
     return Status::unsupported;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

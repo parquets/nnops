@@ -18,11 +18,11 @@
 /// the route geometry both the plan and the kernels size themselves from.
 
 #include "attention.h"
-#include "backend/cpu/common/gate_combine.hpp"         // gate_scale_row, the output gate
-#include "backend/cpu/matmul/matmul_helper.h"           // tile_mma_direct / tile_pack_rhs + panel constants
-#include "backend/cpu/simd_kernel/activation_kernels.hpp"  // v_tanh, for softcapping
-#include "backend/cpu/simd_kernel/simd_softmax.hpp"     // softmax + FlashAttention row kernels
-#include "backend/cpu/simd_kernel/tiled_map.hpp"        // simd_vec_t
+#include "backend/cpu/common/gate_combine.hpp" // gate_scale_row, the output gate
+#include "backend/cpu/matmul/matmul_helper.h"  // tile_mma_direct / tile_pack_rhs + panel constants
+#include "backend/cpu/simd_kernel/activation_kernels.hpp" // v_tanh, for softcapping
+#include "backend/cpu/simd_kernel/simd_softmax.hpp"       // softmax + FlashAttention row kernels
+#include "backend/cpu/simd_kernel/tiled_map.hpp"          // simd_vec_t
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -38,27 +38,24 @@
 namespace nnops::backend::cpu {
 
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
-constexpr float kPosInf =  std::numeric_limits<float>::infinity();
+constexpr float kPosInf = std::numeric_limits<float>::infinity();
 
 // ---- dtype-selected tiling constants -------------------------------------
 // k-block length per dtype, mirroring matmul_helper.h so plan and kernels agree.
 
-template <class T>
-constexpr int64_t kc_for() {
-    return std::is_same_v<T, half> ? KC_F16 : KC_F32;
-}
+template <class T> constexpr int64_t kc_for() { return std::is_same_v<T, half> ? KC_F16 : KC_F32; }
 
 /// Size bound for the packed-B scratch's k-run: min(Kc, k). The loops still
 /// step by Kc; pass the longer of the two GEMMs' k.
-template <class T>
-constexpr int64_t kc_pack_bound(int64_t k) {
+template <class T> constexpr int64_t kc_pack_bound(int64_t k)
+{
     constexpr int64_t kc = std::is_same_v<T, half> ? KC_F16 : KC_F32;
     return k < kc ? k : kc;
 }
 
 /// Panel count a uniform packed-B tile of any n <= n_max emits.
-template <class T>
-constexpr int panels_for_pack(int64_t n_max) {
+template <class T> constexpr int panels_for_pack(int64_t n_max)
+{
     constexpr int nr_max = nr_max_flt<T>();
     return static_cast<int>((n_max + nr_max - 1) / nr_max);
 }
@@ -67,7 +64,7 @@ constexpr int panels_for_pack(int64_t n_max) {
 
 struct HeadShape {
     int64_t B, H, Hkv, Sq, Sk, Sv, Dqk, Dv;
-    int64_t Sk_past = 0;  ///< rows in the past segment; Sk counts the whole run
+    int64_t Sk_past = 0; ///< rows in the past segment; Sk counts the whole run
     bool merged;
 };
 
@@ -82,8 +79,7 @@ inline bool has_past_view(const AttentionConfig& cfg, std::span<const TensorView
     return inputs.size() > p && !inputs[p].is_empty();
 }
 
-inline HeadShape resolve_head_shape(const AttentionConfig& cfg,
-                                    std::span<const TensorView> inputs)
+inline HeadShape resolve_head_shape(const AttentionConfig& cfg, std::span<const TensorView> inputs)
 {
     const auto& Q = inputs[0];
     const auto& K = inputs[1];
@@ -132,16 +128,15 @@ inline bool has_mask_input(const AttentionConfig& cfg, std::span<const TensorVie
 /// A mask view of rank 4 is a per-(batch, head) additive bias [B, H, Sq, Sk];
 /// rank 2 is the flat [Sq, Sk] every head shares. Both occupy the mask slot, so
 /// they are mutually exclusive by construction.
-inline bool mask_is_head_bias(const AttentionConfig& cfg,
-                              std::span<const TensorView> inputs)
+inline bool mask_is_head_bias(const AttentionConfig& cfg, std::span<const TensorView> inputs)
 {
     return has_mask_input(cfg, inputs) && inputs[mask_slot(cfg)].rank() == 4;
 }
 
 /// First element of query row @p i's bias row for (batch @p b, head @p h). The
 /// bias is stored densely over [B][H][Sq], each row one pitch long.
-inline int64_t head_bias_row_offset(int64_t b, int64_t h, int64_t i,
-                                    int64_t H, int64_t Sq, int64_t row_stride)
+inline int64_t head_bias_row_offset(int64_t b, int64_t h, int64_t i, int64_t H, int64_t Sq,
+                                    int64_t row_stride)
 {
     return ((b * H + h) * Sq + i) * row_stride;
 }
@@ -165,9 +160,13 @@ inline bool has_seqlens_input(const AttentionConfig& cfg, std::span<const Tensor
 /// Batch @p b's valid key-run length, clamped to the tensor's run.
 inline int64_t run_length(const int32_t* seqlens, int64_t b, int64_t Sk)
 {
-    if (seqlens == nullptr) { return Sk; }
+    if (seqlens == nullptr) {
+        return Sk;
+    }
     const int64_t v = seqlens[b];
-    if (v <= 0) { return 0; }
+    if (v <= 0) {
+        return 0;
+    }
     return v < Sk ? v : Sk;
 }
 
@@ -211,7 +210,9 @@ inline bool scratch_per_worker(const CpuBackend& cpu, int64_t tasks)
 
 inline int64_t scratch_slot_of(const CpuBackend& cpu, int64_t tasks, int64_t idx)
 {
-    if (scratch_per_worker(cpu, tasks)) { return cpu.current_thread_id(); }
+    if (scratch_per_worker(cpu, tasks)) {
+        return cpu.current_thread_id();
+    }
     return cpu.worker_count() <= 1 ? 0 : idx;
 }
 
@@ -222,13 +223,16 @@ inline int64_t scratch_slot_of(const CpuBackend& cpu, int64_t tasks, int64_t idx
 /// cfg.position_offset when given, bottom-right (run - Sq) otherwise. @p run is
 /// the batch's valid key-run length (run_length), so a shorter run truncates
 /// both the padding and the causal diagonal.
-inline int64_t causal_limit(const AttentionConfig& cfg, int64_t i,
-                            int64_t Sq, int64_t run)
+inline int64_t causal_limit(const AttentionConfig& cfg, int64_t i, int64_t Sq, int64_t run)
 {
-    if (!cfg.causal) { return run; }
+    if (!cfg.causal) {
+        return run;
+    }
     const int64_t q0 = cfg.position_offset >= 0 ? cfg.position_offset : (run - Sq);
     const int64_t lim = q0 + i + 1;
-    if (lim < 0) { return 0; }
+    if (lim < 0) {
+        return 0;
+    }
     return lim > run ? run : lim;
 }
 
@@ -236,27 +240,30 @@ inline int64_t causal_limit(const AttentionConfig& cfg, int64_t i,
 /// still read. 0 without a window, so the valid range stays [0, causal_limit).
 /// The window counts back from the row's own absolute position, the same q0 the
 /// causal limit uses, which makes it a band around the diagonal.
-inline int64_t key_lo(const AttentionConfig& cfg, int64_t i,
-                      int64_t Sq, int64_t run)
+inline int64_t key_lo(const AttentionConfig& cfg, int64_t i, int64_t Sq, int64_t run)
 {
-    if (cfg.window <= 0) { return 0; }
+    if (cfg.window <= 0) {
+        return 0;
+    }
     const int64_t q0 = cfg.position_offset >= 0 ? cfg.position_offset : (run - Sq);
     const int64_t lo = q0 + i - cfg.window + 1;
-    if (lo <= 0) { return 0; }
+    if (lo <= 0) {
+        return 0;
+    }
     return lo > run ? run : lo;
 }
 
-template <class T>
-inline void row_fill(T* row, int64_t n, float val)
+template <class T> inline void row_fill(T* row, int64_t n, float val)
 {
-    for (int64_t i = 0; i < n; ++i) { simd::s_store(&row[i], val); }
+    for (int64_t i = 0; i < n; ++i) {
+        simd::s_store(&row[i], val);
+    }
 }
 
 /// s' = cap·tanh(s·scale/cap), in place over one row. The softcap rides with
 /// the scale because the standard and flash routes fuse scale into the GEMM1
 /// RHS pack, while the decode route applies both here.
-template <class T>
-inline void row_softcap(T* row, int64_t n, float scale, float cap)
+template <class T> inline void row_softcap(T* row, int64_t n, float scale, float cap)
 {
     using V = kernel::simd_vec_t<T>;
     constexpr int L = simd::simd_lane_for<T>;
@@ -279,7 +286,7 @@ inline void row_softcap(T* row, int64_t n, float scale, float cap)
 // cache. Br / Bc follow the MLAS L2 heuristic: Bc = L2 / (sizeof(T)·4·(Dqk+Dv))
 // and Br = min(Bc, Dqk+Dv), then both capped to Sk / Sq.
 
-constexpr int64_t kFlashMinScores = 1 << 16;  // Sq*Sk threshold (≈ 256 KiB f32)
+constexpr int64_t kFlashMinScores = 1 << 16; // Sq*Sk threshold (≈ 256 KiB f32)
 
 // Tile caps measured across 1T..20T:
 //  - Bc tops out at 256. The L2 formula asks for 512 at D=128 f32, but the
@@ -301,16 +308,17 @@ inline bool should_use_flash_attention(int64_t Sq, int64_t Sk)
     return Sq * Sk >= kFlashMinScores;
 }
 
-inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk,
-                                     int64_t Dqk, int64_t Dv, bool causal,
-                                     int& Br, int& Bc)
+inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk, int64_t Dqk,
+                                     int64_t Dv, bool causal, int& Br, int& Bc)
 {
     const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
-    const size_t l2_eff = l2 > 0 ? l2 : (1024u * 1024u);  // 1 MiB fallback
-    const int64_t head_pairs = Dqk + Dv;  // qk_head_size + v_head_size
-    Bc = static_cast<int>(std::min<int64_t>(l2_eff / (elem_size * 4 * static_cast<size_t>(head_pairs)),
-                                            kFlashBcMax));
-    if (Bc < 1) { Bc = 1; }
+    const size_t l2_eff = l2 > 0 ? l2 : (1024u * 1024u); // 1 MiB fallback
+    const int64_t head_pairs = Dqk + Dv;                 // qk_head_size + v_head_size
+    Bc = static_cast<int>(
+        std::min<int64_t>(l2_eff / (elem_size * 4 * static_cast<size_t>(head_pairs)), kFlashBcMax));
+    if (Bc < 1) {
+        Bc = 1;
+    }
     Br = static_cast<int>(std::min<int64_t>(Bc, head_pairs));
     if (causal && Sq >= 4 * kCausalBrMax && Sk <= 2 * Sq) {
         Br = std::min(Br, kCausalBrMax);
@@ -318,27 +326,28 @@ inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk,
     }
     Bc = static_cast<int>(std::min<int64_t>(Bc, Sk));
     Br = static_cast<int>(std::min<int64_t>(Br, Sq));
-    if (Br < 1) { Br = 1; }
-    if (Bc < 1) { Bc = 1; }
+    if (Br < 1) {
+        Br = 1;
+    }
+    if (Bc < 1) {
+        Bc = 1;
+    }
 }
 
 // Per-task scratch for one Br-row query block, matching the layout inside
 // attention_flash_impl: [m:Br][l:Br][s:Br*Bc][o_acc:Br*Dv][pack_b]. The
 // packed-B slot serves GEMM1 (K = Dqk, N <= Bc) and GEMM2 (K <= Bc, N = Dv).
-template <class T>
-inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv)
+template <class T> inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv)
 {
     constexpr int nr_max = nr_max_flt<T>();
     const int ldd_b_full = static_cast<int>(
-        mma_pack_align(nr_max * static_cast<int>(
-            kc_pack_bound<T>(std::max<int64_t>(Dqk, Bc))) * static_cast<int>(sizeof(T)))
-        / static_cast<int>(sizeof(T)));
+        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(std::max<int64_t>(Dqk, Bc))) *
+                       static_cast<int>(sizeof(T))) /
+        static_cast<int>(sizeof(T)));
     const int np_full = std::max(panels_for_pack<T>(Bc), panels_for_pack<T>(Dv));
     const int pack_elems = np_full * ldd_b_full;
-    return static_cast<int64_t>(Br) * 2
-         + static_cast<int64_t>(Br) * Bc
-         + static_cast<int64_t>(Br) * Dv
-         + pack_elems;
+    return static_cast<int64_t>(Br) * 2 + static_cast<int64_t>(Br) * Bc +
+           static_cast<int64_t>(Br) * Dv + pack_elems;
 }
 
 // ---- decode route geometry -----------------------------------------------
@@ -346,33 +355,24 @@ inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv)
 // walks the run in, the head batch one task serves, and the KV-split caps.
 
 constexpr int64_t kDecodeChunk = 1024;   ///< keys per decode softmax block
-constexpr int     kDecodeHeadBatch = 8;  ///< query heads one decode task serves
-constexpr int     kDecodeMaxSplits = 16; ///< KV slices per decode unit, at most
+constexpr int kDecodeHeadBatch = 8;      ///< query heads one decode task serves
+constexpr int kDecodeMaxSplits = 16;     ///< KV slices per decode unit, at most
 constexpr int64_t kDecodeMinSlice = 256; ///< shortest slice worth its merge pass
 
 // ---- route entries -------------------------------------------------------
 // Each route file defines one; the dispatch in attention.cpp calls it after
 // validating the dtype. Scratch is the pooled workspace from the plan.
 
-void attention_standard_cpu(const AttentionConfig& cfg,
-                            TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx,
-                            const AttentionPlan& plan,
-                            void* scratch);
+void attention_standard_cpu(const AttentionConfig& cfg, TensorView& output,
+                            std::span<const TensorView> inputs, const ComputeContext& ctx,
+                            const AttentionPlan& plan, void* scratch);
 
-void attention_flash_cpu(const AttentionConfig& cfg,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         const AttentionPlan& plan,
-                         void* scratch);
+void attention_flash_cpu(const AttentionConfig& cfg, TensorView& output,
+                         std::span<const TensorView> inputs, const ComputeContext& ctx,
+                         const AttentionPlan& plan, void* scratch);
 
-void attention_decode_cpu(const AttentionConfig& cfg,
-                          TensorView& output,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx,
-                          const AttentionPlan& plan,
-                          void* scratch);
+void attention_decode_cpu(const AttentionConfig& cfg, TensorView& output,
+                          std::span<const TensorView> inputs, const ComputeContext& ctx,
+                          const AttentionPlan& plan, void* scratch);
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

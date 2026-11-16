@@ -28,12 +28,9 @@ using namespace nnops;
 // ============================================================
 
 template <typename T>
-__global__ void reduce_fast_kernel(
-    const T* __restrict__ x,
-    T* __restrict__ y,
-    int64_t norm_size,
-    int64_t row_stride,
-    int reduce_type)  // 0=Sum, 1=Min, 2=Max, 3=Mean
+__global__ void reduce_fast_kernel(const T* __restrict__ x, T* __restrict__ y, int64_t norm_size,
+                                   int64_t row_stride,
+                                   int reduce_type) // 0=Sum, 1=Min, 2=Max, 3=Mean
 {
     extern __shared__ float smem[];
 
@@ -45,7 +42,7 @@ __global__ void reduce_fast_kernel(
     // Each thread accumulates its partial over norm_size elements
     float result;
     switch (reduce_type) {
-    case 0: // Sum
+    case 0:   // Sum
     case 3: { // Mean
         float sum = 0.0f;
         for (int i = tid; i < norm_size; i += blockDim.x) {
@@ -61,7 +58,8 @@ __global__ void reduce_fast_kernel(
         float val = 1e30f;
         for (int i = tid; i < norm_size; i += blockDim.x) {
             float v = s_load(&x_row[i]);
-            if (v < val) val = v;
+            if (v < val)
+                val = v;
         }
         result = block_reduce_min(val, smem);
         break;
@@ -70,7 +68,8 @@ __global__ void reduce_fast_kernel(
         float val = -1e30f;
         for (int i = tid; i < norm_size; i += blockDim.x) {
             float v = s_load(&x_row[i]);
-            if (v > val) val = v;
+            if (v > val)
+                val = v;
         }
         result = block_reduce_max(val, smem);
         break;
@@ -91,13 +90,9 @@ __global__ void reduce_fast_kernel(
 // ============================================================
 
 template <typename T>
-__global__ void reduce_general_kernel(
-    const T* __restrict__ x,
-    T* __restrict__ y,
-    int64_t norm_size,
-    int64_t outer_stride,
-    const int64_t* __restrict__ inner_offsets,
-    int reduce_type)
+__global__ void reduce_general_kernel(const T* __restrict__ x, T* __restrict__ y, int64_t norm_size,
+                                      int64_t outer_stride,
+                                      const int64_t* __restrict__ inner_offsets, int reduce_type)
 {
     extern __shared__ float smem[];
 
@@ -108,7 +103,7 @@ __global__ void reduce_general_kernel(
 
     float result;
     switch (reduce_type) {
-    case 0: // Sum
+    case 0:   // Sum
     case 3: { // Mean
         float sum = 0.0f;
         for (int i = tid; i < norm_size; i += blockDim.x) {
@@ -124,7 +119,8 @@ __global__ void reduce_general_kernel(
         float val = 1e30f;
         for (int i = tid; i < norm_size; i += blockDim.x) {
             float v = s_load(&x_base[inner_offsets[i]]);
-            if (v < val) val = v;
+            if (v < val)
+                val = v;
         }
         result = block_reduce_min(val, smem);
         break;
@@ -133,7 +129,8 @@ __global__ void reduce_general_kernel(
         float val = -1e30f;
         for (int i = tid; i < norm_size; i += blockDim.x) {
             float v = s_load(&x_base[inner_offsets[i]]);
-            if (v > val) val = v;
+            if (v > val)
+                val = v;
         }
         result = block_reduce_max(val, smem);
         break;
@@ -154,34 +151,37 @@ __global__ void reduce_general_kernel(
 
 namespace {
 
-int to_int_reduce_type(ReduceType t) {
+int to_int_reduce_type(ReduceType t)
+{
     switch (t) {
-    case ReduceType::Sum:  return 0;
-    case ReduceType::Min:  return 1;
-    case ReduceType::Max:  return 2;
-    case ReduceType::Mean: return 3;
+    case ReduceType::Sum:
+        return 0;
+    case ReduceType::Min:
+        return 1;
+    case ReduceType::Max:
+        return 2;
+    case ReduceType::Mean:
+        return 3;
     }
     return 0;
 }
 
 template <typename T>
-void reduce_cuda_impl(
-    const ReduceAttributes& attrs,
-    TensorView& output,
-    const TensorView& input,
-    int64_t axis,
-    const ComputeContext& ctx)
+void reduce_cuda_impl(const ReduceAttributes& attrs, TensorView& output, const TensorView& input,
+                      int64_t axis, const ComputeContext& ctx)
 {
     const int64_t rank = input.rank();
 
     const int64_t outer_dim_count = [&]() {
         int64_t n = 1;
-        for (int64_t d = 0; d < axis; ++d) n *= input.shape(d);
+        for (int64_t d = 0; d < axis; ++d)
+            n *= input.shape(d);
         return n;
     }();
     const int64_t norm_size = [&]() {
         int64_t n = 1;
-        for (int64_t d = axis; d < rank; ++d) n *= input.shape(d);
+        for (int64_t d = axis; d < rank; ++d)
+            n *= input.shape(d);
         return n;
     }();
 
@@ -197,8 +197,8 @@ void reduce_cuda_impl(
     if (axis == rank - 1 && !is_channel_last(input.layout())) {
         // Contiguous tail fast path: channel-first only — channel-last has C innermost.
         const int64_t row_stride = (axis > 0) ? input.stride_elems(axis - 1) : input.numel();
-        reduce_fast_kernel<T><<<grid, block_size, shared_bytes, stream>>>(
-            x_ptr, y_ptr, norm_size, row_stride, reduce_type);
+        reduce_fast_kernel<T><<<grid, block_size, shared_bytes, stream>>>(x_ptr, y_ptr, norm_size,
+                                                                          row_stride, reduce_type);
     } else {
         // General axis: pre-compute inner offsets, upload to device.
         // stride_elems() is layout-aware, so channel-last works unchanged.
@@ -216,8 +216,7 @@ void reduce_cuda_impl(
 
         int64_t* d_offsets = nullptr;
         cudaMalloc(&d_offsets, norm_size * sizeof(int64_t));
-        cudaMemcpyAsync(d_offsets, h_offsets.data(),
-                        norm_size * sizeof(int64_t),
+        cudaMemcpyAsync(d_offsets, h_offsets.data(), norm_size * sizeof(int64_t),
                         cudaMemcpyHostToDevice, stream);
 
         const int64_t outer_stride = (axis > 0) ? input.stride_elems(axis - 1) : input.numel();
@@ -228,25 +227,27 @@ void reduce_cuda_impl(
     }
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // ============================================================
 // Entry point
 // ============================================================
 
-Status reduce_cuda(const ReduceAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* /*workspace*/)
+Status reduce_cuda(const ReduceAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx,
+                   void* /*workspace*/)
 {
     const auto& input = inputs[0];
 
     // Single-axis only for now; multi-axis and the empty-means-all default
     // fall back to the caller.
-    if (attrs.axes.size() != 1) { return Status::unsupported; }
+    if (attrs.axes.size() != 1) {
+        return Status::unsupported;
+    }
     int64_t axis = attrs.axes[0];
-    if (axis < 0) { axis += input.rank(); }
+    if (axis < 0) {
+        axis += input.rank();
+    }
 
     switch (input.data_type()) {
     case DataType::f32:
@@ -263,4 +264,4 @@ Status reduce_cuda(const ReduceAttributes& attrs,
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

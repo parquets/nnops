@@ -51,8 +51,7 @@ inline V gate_act_vec(V g, const T* tag, float alpha)
         // extra alpha factor would change every existing alpha != 1 call.
         return v_mul(g, kernel::v_sigmoid(v_mul(g, v_set1(tag, alpha)), vone));
     } else if constexpr (Act == EpilogueActivateType::Gelu) {
-        return kernel::v_gelu(g, v_set1(tag, 0.5f), vone,
-                              v_set1(tag, 0.7978845608028654f),
+        return kernel::v_gelu(g, v_set1(tag, 0.5f), vone, v_set1(tag, 0.7978845608028654f),
                               v_set1(tag, 0.044715f));
     } else if constexpr (Act == EpilogueActivateType::Relu) {
         return kernel::v_relu(g, v_zero(tag));
@@ -66,15 +65,13 @@ inline V gate_act_vec(V g, const T* tag, float alpha)
 }
 
 /// Scalar twin of gate_act_vec.
-template <EpilogueActivateType Act>
-inline float gate_act_scalar(float g, float alpha)
+template <EpilogueActivateType Act> inline float gate_act_scalar(float g, float alpha)
 {
-    (void)alpha;  // only Silu reads it
+    (void)alpha; // only Silu reads it
     if constexpr (Act == EpilogueActivateType::Silu) {
         return g / (1.0f + std::exp(-alpha * g));
     } else if constexpr (Act == EpilogueActivateType::Gelu) {
-        return 0.5f * g * (1.0f + std::tanh(0.7978845608028654f
-                                            * (g + 0.044715f * g * g * g)));
+        return 0.5f * g * (1.0f + std::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g)));
     } else if constexpr (Act == EpilogueActivateType::Relu) {
         return g > 0.0f ? g : 0.0f;
     } else if constexpr (Act == EpilogueActivateType::Sigmoid) {
@@ -106,19 +103,19 @@ inline void gate_scale_row(T* y, const T* g, int64_t n, float alpha = 1.0f)
 }
 
 template <typename T>
-inline void gate_scale_row_dispatch(EpilogueActivateType act, T* y, const T* g,
-                                    int64_t n, float alpha = 1.0f)
+inline void gate_scale_row_dispatch(EpilogueActivateType act, T* y, const T* g, int64_t n,
+                                    float alpha = 1.0f)
 {
-#define NNOPS_GATE_CASE(name)                                                  \
-    case EpilogueActivateType::name:                                           \
-        gate_scale_row<EpilogueActivateType::name>(y, g, n, alpha);            \
+#define NNOPS_GATE_CASE(name)                                       \
+    case EpilogueActivateType::name:                                \
+        gate_scale_row<EpilogueActivateType::name>(y, g, n, alpha); \
         return
     switch (act) {
-    NNOPS_GATE_CASE(Silu);
-    NNOPS_GATE_CASE(Gelu);
-    NNOPS_GATE_CASE(Relu);
-    NNOPS_GATE_CASE(Sigmoid);
-    NNOPS_GATE_CASE(Tanh);
+        NNOPS_GATE_CASE(Silu);
+        NNOPS_GATE_CASE(Gelu);
+        NNOPS_GATE_CASE(Relu);
+        NNOPS_GATE_CASE(Sigmoid);
+        NNOPS_GATE_CASE(Tanh);
     default:
         gate_scale_row<EpilogueActivateType::None>(y, g, n, alpha);
         return;
@@ -127,14 +124,12 @@ inline void gate_scale_row_dispatch(EpilogueActivateType act, T* y, const T* g,
 }
 
 template <EpilogueActivateType Act, typename T>
-inline void gate_combine_tile(const T* gate, const T* value, T* out,
-                              int64_t m, int64_t n,
-                              int64_t gate_pitch, int64_t value_pitch,
-                              int64_t out_pitch,
+inline void gate_combine_tile(const T* gate, const T* value, T* out, int64_t m, int64_t n,
+                              int64_t gate_pitch, int64_t value_pitch, int64_t out_pitch,
                               float alpha, float beta, float limit)
 {
     using namespace simd;
-    const auto vlim  = v_set1(gate, limit);
+    const auto vlim = v_set1(gate, limit);
     const auto vnlim = v_neg(vlim);
     const auto vbeta = v_set1(gate, beta);
     const bool clamp = std::isfinite(limit);
@@ -153,24 +148,23 @@ inline void gate_combine_tile(const T* gate, const T* value, T* out,
         }
         return gate_act_scalar<Act>(g, alpha) * (v + beta);
     };
-    kernel::tiled_map_simd<T, 2>({gate, value}, {gate_pitch, value_pitch},
-                                 out, out_pitch, m, n, false, vec, scalar);
+    kernel::tiled_map_simd<T, 2>({gate, value}, {gate_pitch, value_pitch}, out, out_pitch, m, n,
+                                 false, vec, scalar);
 }
 
 /// Interleaved form: one row holds (gate_0, value_0, gate_1, value_1, ...), so
 /// the two operands are the even and odd lanes of one row and the result is
 /// written compact.
 template <EpilogueActivateType Act, typename T>
-inline void gate_combine_pairs(const T* pairs, T* out, int64_t m, int64_t n,
-                               int64_t pairs_pitch, int64_t out_pitch,
-                               float alpha, float beta, float limit)
+inline void gate_combine_pairs(const T* pairs, T* out, int64_t m, int64_t n, int64_t pairs_pitch,
+                               int64_t out_pitch, float alpha, float beta, float limit)
 {
     using V = kernel::simd_vec_t<T>;
     constexpr int64_t L = simd::simd_lane_for<T>;
     using namespace simd;
-    const V vlim   = v_set1(out, limit);
-    const V vnlim  = v_neg(vlim);
-    const V vbeta  = v_set1(out, beta);
+    const V vlim = v_set1(out, limit);
+    const V vnlim = v_neg(vlim);
+    const V vbeta = v_set1(out, beta);
     const bool clamp = std::isfinite(limit);
 
     for (int64_t r = 0; r < m; ++r) {
@@ -184,8 +178,7 @@ inline void gate_combine_pairs(const T* pairs, T* out, int64_t m, int64_t n,
                 g = v_max(v_min(g, vlim), vnlim);
                 v = v_max(v_min(v, vlim), vnlim);
             }
-            v_store(orow + c,
-                    v_mul(gate_act_vec<Act>(g, out, alpha), v_add(v, vbeta)));
+            v_store(orow + c, v_mul(gate_act_vec<Act>(g, out, alpha), v_add(v, vbeta)));
         }
         for (; c < n; ++c) {
             float g = s_load(pr + 2 * c);
@@ -201,58 +194,52 @@ inline void gate_combine_pairs(const T* pairs, T* out, int64_t m, int64_t n,
 
 /// Runtime activation → the compile-time kernels above.
 template <typename T>
-inline void gate_combine_tile_dispatch(EpilogueActivateType act,
-                                       const T* gate, const T* value, T* out,
-                                       int64_t m, int64_t n,
-                                       int64_t gate_pitch, int64_t value_pitch,
-                                       int64_t out_pitch,
-                                       float alpha, float beta, float limit)
+inline void gate_combine_tile_dispatch(EpilogueActivateType act, const T* gate, const T* value,
+                                       T* out, int64_t m, int64_t n, int64_t gate_pitch,
+                                       int64_t value_pitch, int64_t out_pitch, float alpha,
+                                       float beta, float limit)
 {
-#define NNOPS_GATE_CASE(name)                                                  \
-    case EpilogueActivateType::name:                                           \
-        gate_combine_tile<EpilogueActivateType::name>(                          \
-            gate, value, out, m, n, gate_pitch, value_pitch, out_pitch,         \
-            alpha, beta, limit);                                                \
+#define NNOPS_GATE_CASE(name)                                                                      \
+    case EpilogueActivateType::name:                                                               \
+        gate_combine_tile<EpilogueActivateType::name>(gate, value, out, m, n, gate_pitch,          \
+                                                      value_pitch, out_pitch, alpha, beta, limit); \
         return
     switch (act) {
-    NNOPS_GATE_CASE(Silu);
-    NNOPS_GATE_CASE(Gelu);
-    NNOPS_GATE_CASE(Relu);
-    NNOPS_GATE_CASE(Sigmoid);
-    NNOPS_GATE_CASE(Tanh);
+        NNOPS_GATE_CASE(Silu);
+        NNOPS_GATE_CASE(Gelu);
+        NNOPS_GATE_CASE(Relu);
+        NNOPS_GATE_CASE(Sigmoid);
+        NNOPS_GATE_CASE(Tanh);
     default:
-        gate_combine_tile<EpilogueActivateType::None>(
-            gate, value, out, m, n, gate_pitch, value_pitch, out_pitch,
-            alpha, beta, limit);
+        gate_combine_tile<EpilogueActivateType::None>(gate, value, out, m, n, gate_pitch,
+                                                      value_pitch, out_pitch, alpha, beta, limit);
         return;
     }
 #undef NNOPS_GATE_CASE
 }
 
 template <typename T>
-inline void gate_combine_pairs_dispatch(EpilogueActivateType act,
-                                        const T* pairs, T* out,
-                                        int64_t m, int64_t n,
-                                        int64_t pairs_pitch, int64_t out_pitch,
+inline void gate_combine_pairs_dispatch(EpilogueActivateType act, const T* pairs, T* out, int64_t m,
+                                        int64_t n, int64_t pairs_pitch, int64_t out_pitch,
                                         float alpha, float beta, float limit)
 {
-#define NNOPS_GATE_CASE(name)                                                  \
-    case EpilogueActivateType::name:                                           \
-        gate_combine_pairs<EpilogueActivateType::name>(                         \
-            pairs, out, m, n, pairs_pitch, out_pitch, alpha, beta, limit);      \
+#define NNOPS_GATE_CASE(name)                                                                    \
+    case EpilogueActivateType::name:                                                             \
+        gate_combine_pairs<EpilogueActivateType::name>(pairs, out, m, n, pairs_pitch, out_pitch, \
+                                                       alpha, beta, limit);                      \
         return
     switch (act) {
-    NNOPS_GATE_CASE(Silu);
-    NNOPS_GATE_CASE(Gelu);
-    NNOPS_GATE_CASE(Relu);
-    NNOPS_GATE_CASE(Sigmoid);
-    NNOPS_GATE_CASE(Tanh);
+        NNOPS_GATE_CASE(Silu);
+        NNOPS_GATE_CASE(Gelu);
+        NNOPS_GATE_CASE(Relu);
+        NNOPS_GATE_CASE(Sigmoid);
+        NNOPS_GATE_CASE(Tanh);
     default:
-        gate_combine_pairs<EpilogueActivateType::None>(
-            pairs, out, m, n, pairs_pitch, out_pitch, alpha, beta, limit);
+        gate_combine_pairs<EpilogueActivateType::None>(pairs, out, m, n, pairs_pitch, out_pitch,
+                                                       alpha, beta, limit);
         return;
     }
 #undef NNOPS_GATE_CASE
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

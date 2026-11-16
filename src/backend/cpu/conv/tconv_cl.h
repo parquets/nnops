@@ -47,8 +47,7 @@ using namespace nnops::simd;
 /// `gm` is duck-typed on OW, OC, epilogue, pre_act and add_to, so the 2-D and
 /// 3-D geometries both fit without either kernel learning the other's type.
 template <typename T, typename G>
-void merge_oc_row(T* orow, const T* row, const T* bias, int64_t oc_base,
-                  const G& gm, int64_t nc)
+void merge_oc_row(T* orow, const T* row, const T* bias, int64_t oc_base, const G& gm, int64_t nc)
 {
     const T* bp = bias ? bias + oc_base : nullptr;
     for (int64_t ow = 0; ow < gm.OW; ++ow) {
@@ -63,8 +62,7 @@ inline constexpr int64_t kColCapBytes = 8 << 20;
 
 /// One channel-last col GEMM call, resolved to flat operands: the chunk walk
 /// varies only the group and the oc chunk.
-template <typename T, typename G>
-struct TconvClCall {
+template <typename T, typename G> struct TconvClCall {
     const G& gm;
     const T *in, *w, *b;
     T *out, *col, *aux, *rows;
@@ -77,9 +75,8 @@ struct TconvClCall {
 /// The oc chunk: how many output channels one GEMM plus one per-worker row
 /// scratch fit the col cap — half of it when the filter is walked per call
 /// (direct_w), because `aux` then also holds a col copy.
-inline int64_t tconv_cl_oc_chunk(int64_t ocg, int64_t npix, int64_t karea,
-                                 int64_t OW, int64_t slots, int64_t esz,
-                                 bool direct_w)
+inline int64_t tconv_cl_oc_chunk(int64_t ocg, int64_t npix, int64_t karea, int64_t OW,
+                                 int64_t slots, int64_t esz, bool direct_w)
 {
     const int64_t elem_cap = kColCapBytes / esz;
     const int64_t cap = direct_w ? elem_cap / 2 : elem_cap;
@@ -94,8 +91,8 @@ inline int64_t tconv_cl_oc_chunk(int64_t ocg, int64_t npix, int64_t karea,
 /// per batch item the GEMM, the direct-weight col transpose, and the scatter and
 /// merge of each output row.
 template <typename T, typename G, class Walk>
-void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk,
-                    const ComputeContext& ctx, int64_t g, int64_t oc0, int64_t nc)
+void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk, const ComputeContext& ctx, int64_t g,
+                    int64_t oc0, int64_t nc)
 {
     const int64_t m = nc * c.karea;
 
@@ -109,11 +106,8 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk,
 
     const int64_t bshape[] = {c.icg, m};
     TensorView bm(std::span<const int64_t>(bshape, 2), c.vdt,
-                  c.direct_w
-                      ? const_cast<T*>(c.w + (g * c.icg * c.ocg + oc0) * c.karea)
-                      : c.aux,
-                  (c.direct_w ? c.ocg * c.karea : m) * sizeof(T),
-                  TensorLayout::NCHW);
+                  c.direct_w ? const_cast<T*>(c.w + (g * c.icg * c.ocg + oc0) * c.karea) : c.aux,
+                  (c.direct_w ? c.ocg * c.karea : m) * sizeof(T), TensorLayout::NCHW);
 
     for (int64_t n = 0; n < c.gm.N; ++n) {
         const T* in_n = c.in + n * c.in_n_stride;
@@ -122,8 +116,7 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk,
         // A: the channel-last image as [pixels] × [IC/G] — one pixel stride of
         // IC, so the group offset is g·IC/G elements in.
         const int64_t ashape[] = {c.npix, c.icg};
-        TensorView am(std::span<const int64_t>(ashape, 2), c.vdt,
-                      const_cast<T*>(in_n + g * c.icg),
+        TensorView am(std::span<const int64_t>(ashape, 2), c.vdt, const_cast<T*>(in_n + g * c.icg),
                       static_cast<int64_t>(c.gm.IC * sizeof(T)), TensorLayout::NCHW);
         const int64_t cshape[] = {c.npix, m};
         TensorView cm(std::span<const int64_t>(cshape, 2), c.vdt, c.col,
@@ -145,8 +138,7 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk,
 
         const int64_t row_len = c.gm.OW * nc;
         ctx.cpu.run(0, c.rows_per_n, [&](int64_t row_index) {
-            T* row = c.rows +
-                     static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
+            T* row = c.rows + static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
             nnops::kernel::row_fill(row, row_len, 0.0f);
 
             walk(cbase, row, row_index, m, nc);
@@ -160,28 +152,30 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk,
 /// The whole channel-last col route: the col, the filter staging and the row
 /// scratch are pooled once, then one chunk call per (group, oc chunk).
 template <typename T, typename G, class Walk>
-bool tconv_cl_route(const G& gm, TensorView& output,
-                    std::span<const TensorView> inputs, const ComputeContext& ctx,
-                    int64_t npix, int64_t rows_per_n, int64_t karea,
+bool tconv_cl_route(const G& gm, TensorView& output, std::span<const TensorView> inputs,
+                    const ComputeContext& ctx, int64_t npix, int64_t rows_per_n, int64_t karea,
                     int64_t direct_w, Walk&& walk)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
     const int64_t icg = gm.IC_per_G;
     const int64_t ocg = gm.OC_per_G;
-    if (npix <= 0 || karea <= 0 || icg <= 0 || ocg <= 0) { return false; }
+    if (npix <= 0 || karea <= 0 || icg <= 0 || ocg <= 0) {
+        return false;
+    }
 
     const int64_t slots = std::max(1, ctx.cpu.worker_count());
     const int64_t cc = tconv_cl_oc_chunk(ocg, npix, karea, gm.OW, slots,
-                                         static_cast<int64_t>(sizeof(T)),
-                                         direct_w != 0);
+                                         static_cast<int64_t>(sizeof(T)), direct_w != 0);
 
     PoolArray<T> col(static_cast<size_t>(npix * karea * cc));
     PoolArray<T> aux(static_cast<size_t>((direct_w ? npix : icg) * karea * cc));
     PoolArray<T> rows(static_cast<size_t>(slots * gm.OW * cc));
-    if (!col || !aux || !rows) { return false; }
+    if (!col || !aux || !rows) {
+        return false;
+    }
 
     const TconvClCall<T, G> call{gm,
                                  input.ptr<T>(),
@@ -205,7 +199,9 @@ bool tconv_cl_route(const G& gm, TensorView& output,
     for (int64_t g = 0; g < gm.G; ++g) {
         for (int64_t oc0 = 0; oc0 < ocg; oc0 += cc) {
             const int64_t nc = std::min(cc, ocg - oc0);
-            if (nc > 0) { tconv_cl_chunk(call, walk, ctx, g, oc0, nc); }
+            if (nc > 0) {
+                tconv_cl_chunk(call, walk, ctx, g, oc0, nc);
+            }
         }
     }
     return true;
@@ -217,40 +213,44 @@ bool tconv_cl_route(const G& gm, TensorView& output,
 /// filter so its tap indexes `wd` rather than the source. Returns false when the
 /// row scratch would not fit.
 template <typename T, typename G, class Walk>
-bool tconv_cl_depthwise(const G& gm, TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx, int64_t rows_per_n,
-                        int64_t karea, int64_t C, Walk&& walk)
+bool tconv_cl_depthwise(const G& gm, TensorView& output, std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, int64_t rows_per_n, int64_t karea, int64_t C,
+                        Walk&& walk)
 {
-    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) { return false; }
+    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) {
+        return false;
+    }
 
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t slots   = std::max(1, ctx.cpu.worker_count());
+    const int64_t slots = std::max(1, ctx.cpu.worker_count());
     const int64_t row_len = gm.OW * C;
     const int64_t elem_cap = kColCapBytes / static_cast<int64_t>(sizeof(T));
-    if (C <= 0 || slots * row_len > elem_cap) { return false; }
+    if (C <= 0 || slots * row_len > elem_cap) {
+        return false;
+    }
 
     PoolArray<T> wd(static_cast<size_t>(karea * C));
     PoolArray<T> rows(static_cast<size_t>(slots * row_len));
-    if (!wd || !rows) { return false; }
+    if (!wd || !rows) {
+        return false;
+    }
 
     nnops::kernel::permute_taps(weight.ptr<T>(), wd.data(), C, karea);
 
-    const T* in_ptr  = input.ptr<T>();
-    const T* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
-    T* out_ptr       = output.ptr<T>();
-    const int64_t in_n_stride    = input.stride_elems(0);
-    const int64_t out_n_stride   = output.stride_elems(0);
+    const T* in_ptr = input.ptr<T>();
+    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
+    T* out_ptr = output.ptr<T>();
+    const int64_t in_n_stride = input.stride_elems(0);
+    const int64_t out_n_stride = output.stride_elems(0);
     const int64_t out_row_stride = output.row_stride_elems();
 
     ctx.cpu.run(0, gm.N * rows_per_n, [&](int64_t task) {
         const int64_t n = task / rows_per_n;
         const int64_t row_index = task % rows_per_n;
-        T* row = rows.data() +
-                 static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
+        T* row = rows.data() + static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
 
         nnops::kernel::row_fill(row, row_len, 0.0f);
         walk(in_ptr + n * in_n_stride, row, row_index, wd.data(), C, C);
@@ -261,4 +261,4 @@ bool tconv_cl_depthwise(const G& gm, TensorView& output,
     return true;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

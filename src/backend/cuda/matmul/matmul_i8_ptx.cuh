@@ -55,32 +55,30 @@ namespace nnops::backend::cuda {
 /// the warp grid multiplies it into the CTA tile, and the k depth and the ring
 /// depth are the pipeline's. Every derived value is a compile-time constant, so
 /// a tile costs nothing at run time and a search is a switch.
-template <int WarpM_, int WarpN_, int WarpsM_, int WarpsN_, int BK_, int ST_,
-          int MinBlocks_ = 2>
-struct ManualI8Shape
-{
+template <int WarpM_, int WarpN_, int WarpsM_, int WarpsN_, int BK_, int ST_, int MinBlocks_ = 2>
+struct ManualI8Shape {
     static constexpr int WM = WarpM_;  ///< rows per warp (16-row atoms)
     static constexpr int WN = WarpN_;  ///< columns per warp (8-col atoms)
-    static constexpr int MA = WM / 16;  ///< m atoms per warp
-    static constexpr int NA = WN / 8;   ///< n atoms per warp
-    static constexpr int wm = WarpsM_;  ///< warps along m
-    static constexpr int wn = WarpsN_;  ///< warps along n
+    static constexpr int MA = WM / 16; ///< m atoms per warp
+    static constexpr int NA = WN / 8;  ///< n atoms per warp
+    static constexpr int wm = WarpsM_; ///< warps along m
+    static constexpr int wn = WarpsN_; ///< warps along n
     static constexpr int threads = wm * wn * 32;
-    static constexpr int BM = WM * wm;  ///< rows per CTA
-    static constexpr int BN = WN * wn;  ///< columns per CTA
-    static constexpr int BK = BK_;      ///< reduction depth per stage
-    static constexpr int stages = ST_;  ///< cp.async ring depth
+    static constexpr int BM = WM * wm; ///< rows per CTA
+    static constexpr int BN = WN * wn; ///< columns per CTA
+    static constexpr int BK = BK_;     ///< reduction depth per stage
+    static constexpr int stages = ST_; ///< cp.async ring depth
     static constexpr int MinBlocks = MinBlocks_;
     /// 16 B of pad per row: it keeps every row 16 B aligned for the cp.async
     /// vectors, and (LD/4 = 4 mod 8) it puts the eight lane rows of a fragment
     /// read on eight disjoint bank quads.
     static constexpr int kPad = 16;
-    static constexpr int LD = BK + kPad;  ///< row stride of either panel, bytes
+    static constexpr int LD = BK + kPad; ///< row stride of either panel, bytes
     static constexpr int kABytes = BM * LD;
     static constexpr int kBBytes = BN * LD;
     static constexpr int kSmemBytes = stages * (kABytes + kBBytes);
-    static constexpr int kKC = BK / 32;         ///< 32-byte k steps per stage
-    static constexpr int kVecPerRow = BK / 16;  ///< 16 B vectors along a row
+    static constexpr int kKC = BK / 32;        ///< 32-byte k steps per stage
+    static constexpr int kVecPerRow = BK / 16; ///< 16 B vectors along a row
     static constexpr int kRowsPerPass = threads / kVecPerRow;
 
     static_assert(WM % 16 == 0, "the warp tile must hold whole 16-row atoms");
@@ -95,16 +93,15 @@ struct ManualI8Shape
 /// s8 and u8 A differ only in the opcode: the raw accumulate is the true integer
 /// dot product in whichever domain the bytes are stored in.
 template <class AElem>
-__device__ __forceinline__ void manual_mma_i8(int32_t* acc, const uint32_t* a,
-                                              const uint32_t* b)
+__device__ __forceinline__ void manual_mma_i8(int32_t* acc, const uint32_t* a, const uint32_t* b)
 {
     uint32_t* d = reinterpret_cast<uint32_t*>(acc);
     if constexpr (std::is_same_v<AElem, uint8_t>) {
-        mma_m16n8k32_u8s8(&d[0], &d[1], &d[2], &d[3], a[0], a[1], a[2], a[3],
-                          b[0], b[1], d[0], d[1], d[2], d[3]);
+        mma_m16n8k32_u8s8(&d[0], &d[1], &d[2], &d[3], a[0], a[1], a[2], a[3], b[0], b[1], d[0],
+                          d[1], d[2], d[3]);
     } else {
-        mma_m16n8k32_s8s8(&d[0], &d[1], &d[2], &d[3], a[0], a[1], a[2], a[3],
-                          b[0], b[1], d[0], d[1], d[2], d[3]);
+        mma_m16n8k32_s8s8(&d[0], &d[1], &d[2], &d[3], a[0], a[1], a[2], a[3], b[0], b[1], d[0],
+                          d[1], d[2], d[3]);
     }
 }
 
@@ -113,10 +110,9 @@ __device__ __forceinline__ void manual_mma_i8(int32_t* acc, const uint32_t* a,
 /// block is inside both tensors: hoisting it here is what keeps the interior
 /// tiles free of per-segment predicates.
 template <bool Full, class S, int Rows>
-__device__ __forceinline__ void i8_fill_kcontig(int8_t* sP, const int8_t* src,
-                                                int64_t ld, int tile0, int limit,
-                                                int k0, int K, int vrow, int vcol,
-                                                bool vec, bool word)
+__device__ __forceinline__ void i8_fill_kcontig(int8_t* sP, const int8_t* src, int64_t ld,
+                                                int tile0, int limit, int k0, int K, int vrow,
+                                                int vcol, bool vec, bool word)
 {
     constexpr int LD = S::LD;
     constexpr int kRowsPerPass = S::kRowsPerPass;
@@ -138,7 +134,9 @@ __device__ __forceinline__ void i8_fill_kcontig(int8_t* sP, const int8_t* src,
                 dw[2] = sw[2];
                 dw[3] = sw[3];
             } else {
-                for (int t = 0; t < 16; ++t) { d[t] = s[t]; }
+                for (int t = 0; t < 16; ++t) {
+                    d[t] = s[t];
+                }
             }
         } else if (gr < limit && kk + 16 <= K) {
             if (vec) {
@@ -151,7 +149,9 @@ __device__ __forceinline__ void i8_fill_kcontig(int8_t* sP, const int8_t* src,
                 dw[2] = sw[2];
                 dw[3] = sw[3];
             } else {
-                for (int t = 0; t < 16; ++t) { d[t] = s[t]; }
+                for (int t = 0; t < 16; ++t) {
+                    d[t] = s[t];
+                }
             }
         } else {
             for (int t = 0; t < 16; ++t) {
@@ -163,8 +163,7 @@ __device__ __forceinline__ void i8_fill_kcontig(int8_t* sP, const int8_t* src,
 
 /// The integer GEMM: per-warp value tile from `S`, cp.async ring, k-major panels.
 template <class S, class AElem, bool TransA, bool TransB, bool Dequant>
-__global__ __launch_bounds__(S::threads, S::MinBlocks)
-void manual_gemm_i8_kernel(GemmI8Params q)
+__global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_i8_kernel(GemmI8Params q)
 {
     const GemmParams& gp = q.g;
     constexpr int BM = S::BM, BN = S::BN, BK = S::BK, ST = S::stages;
@@ -193,16 +192,15 @@ void manual_gemm_i8_kernel(GemmI8Params q)
     const int group_span = kGroupM * num_n;
     const int gid = int(blockIdx.x) / group_span;
     const int within = int(blockIdx.x) - gid * group_span;
-    const int m_span =
-        (num_m - gid * kGroupM) < kGroupM ? (num_m - gid * kGroupM) : kGroupM;
+    const int m_span = (num_m - gid * kGroupM) < kGroupM ? (num_m - gid * kGroupM) : kGroupM;
     const int m_tile = (gid * kGroupM + within % m_span) * BM;
     const int n_tile = (within / m_span) * BN;
     const int batch = detail::gemm_block_batch(gp);
 
-    const AElem* const A = static_cast<const AElem*>(gp.a) +
-                           detail::gemm_batch_offset(gp, gp.a_batch, batch);
-    const int8_t* const B = static_cast<const int8_t*>(gp.b) +
-                            detail::gemm_batch_offset(gp, gp.b_batch, batch);
+    const AElem* const A =
+        static_cast<const AElem*>(gp.a) + detail::gemm_batch_offset(gp, gp.a_batch, batch);
+    const int8_t* const B =
+        static_cast<const int8_t*>(gp.b) + detail::gemm_batch_offset(gp, gp.b_batch, batch);
 
     /// One 16 B segment of a k-major panel per thread per pass.
     const int vrow = tid / S::kVecPerRow;
@@ -210,10 +208,8 @@ void manual_gemm_i8_kernel(GemmI8Params q)
     // A 16 B cp.async needs the base and the pitch 16 B aligned (`q.a_vec` /
     // `q.b_vec`, decided by the launcher); a 4 B word otherwise, and a byte only
     // when even that fails.
-    const bool aWord =
-        (reinterpret_cast<uintptr_t>(A) % 4 == 0) && (gp.lda % 4 == 0);
-    const bool bWord =
-        (reinterpret_cast<uintptr_t>(B) % 4 == 0) && (gp.ldb % 4 == 0);
+    const bool aWord = (reinterpret_cast<uintptr_t>(A) % 4 == 0) && (gp.lda % 4 == 0);
+    const bool bWord = (reinterpret_cast<uintptr_t>(B) % 4 == 0) && (gp.ldb % 4 == 0);
 
     // One call is one committed group, whether or not it copies anything: the
     // wait's group count has to stay uniform across the ring.
@@ -233,30 +229,30 @@ void manual_gemm_i8_kernel(GemmI8Params q)
         // The async half first, so the transpose's global reads overlap it.
         if constexpr (TransB) {
             if (bFull) {
-                i8_fill_kcontig<true, S, BN>(sB, B, gp.ldb, n_tile, N, k0, K,
-                                             vrow, vcol, q.b_vec, bWord);
+                i8_fill_kcontig<true, S, BN>(sB, B, gp.ldb, n_tile, N, k0, K, vrow, vcol, q.b_vec,
+                                             bWord);
             } else {
-                i8_fill_kcontig<false, S, BN>(sB, B, gp.ldb, n_tile, N, k0, K,
-                                              vrow, vcol, q.b_vec, bWord);
+                i8_fill_kcontig<false, S, BN>(sB, B, gp.ldb, n_tile, N, k0, K, vrow, vcol, q.b_vec,
+                                              bWord);
             }
         }
         if constexpr (!TransA) {
             if (aFull) {
-                i8_fill_kcontig<true, S, BM>(sA, a8, gp.lda, m_tile, M, k0, K,
-                                             vrow, vcol, q.a_vec, aWord);
+                i8_fill_kcontig<true, S, BM>(sA, a8, gp.lda, m_tile, M, k0, K, vrow, vcol, q.a_vec,
+                                             aWord);
             } else {
-                i8_fill_kcontig<false, S, BM>(sA, a8, gp.lda, m_tile, M, k0, K,
-                                              vrow, vcol, q.a_vec, aWord);
+                i8_fill_kcontig<false, S, BM>(sA, a8, gp.lda, m_tile, M, k0, K, vrow, vcol, q.a_vec,
+                                              aWord);
             }
         } else {
             // A arrives `[k][m]`: the transpose fill's 4x4 byte blocks are the
             // only way to a k-major panel without a scatter per byte.
-            detail::i8_transpose_fill<BM, BK>(sA, LD, a8, m_tile, k0, M, K, int(gp.lda),
-                                      tid, S::threads);
+            detail::i8_transpose_fill<BM, BK>(sA, LD, a8, m_tile, k0, M, K, int(gp.lda), tid,
+                                              S::threads);
         }
         if constexpr (!TransB) {
-            detail::i8_transpose_fill<BN, BK>(sB, LD, B, n_tile, k0, N, K, int(gp.ldb),
-                                      tid, S::threads);
+            detail::i8_transpose_fill<BN, BK>(sB, LD, B, n_tile, k0, N, K, int(gp.ldb), tid,
+                                              S::threads);
         }
         cp_async_commit_group();
     };
@@ -267,7 +263,9 @@ void manual_gemm_i8_kernel(GemmI8Params q)
 #pragma unroll
         for (int j = 0; j < NA; ++j)
 #pragma unroll
-            for (int t = 0; t < 4; ++t) { acc[i][j][t] = 0; }
+            for (int t = 0; t < 4; ++t) {
+                acc[i][j][t] = 0;
+            }
 
     uint32_t fa[MA][4];
     uint32_t fb[NA][2];
@@ -282,7 +280,9 @@ void manual_gemm_i8_kernel(GemmI8Params q)
     // Prime every stage but one; the loop then keeps exactly ST groups in
     // flight, so `wait_group<ST-2>` retires precisely the tile about to be read.
 #pragma unroll
-    for (int t = 0; t < ST - 1; ++t) { fill(t, t % ST); }
+    for (int t = 0; t < ST - 1; ++t) {
+        fill(t, t % ST);
+    }
     for (int kt = 0; kt < k_tiles; ++kt) {
         const int stage = kt % ST;
         // One barrier a tile: the wait retires this tile's group, the barrier
@@ -313,17 +313,14 @@ void manual_gemm_i8_kernel(GemmI8Params q)
         // `short_scoreboard` at 1.5% already said: the ldmatrix-to-MMA latency
         // is hidden across warps, so moving the loads earlier inside one warp
         // buys nothing and costs registers.
-        const uint32_t sAl =
-            smem_addr_u32(sA + (warp_m * WM + a_row) * LD + a_koff);
-        const uint32_t sBl =
-            smem_addr_u32(sB + (warp_n * WN + b_row) * LD + b_koff);
+        const uint32_t sAl = smem_addr_u32(sA + (warp_m * WM + a_row) * LD + a_koff);
+        const uint32_t sBl = smem_addr_u32(sB + (warp_n * WN + b_row) * LD + b_koff);
 #pragma unroll
         for (int ks = 0; ks < S::kKC; ++ks) {
             const int kc = ks * 32;
 #pragma unroll
             for (int i = 0; i < MA; ++i) {
-                ldmatrix_x4_at(&fa[i][0], &fa[i][1], &fa[i][2], &fa[i][3],
-                               sAl + i * 16 * LD + kc);
+                ldmatrix_x4_at(&fa[i][0], &fa[i][1], &fa[i][2], &fa[i][3], sAl + i * 16 * LD + kc);
             }
 #pragma unroll
             for (int j = 0; j < NA; ++j) {
@@ -356,10 +353,8 @@ void manual_gemm_i8_kernel(GemmI8Params q)
         const bool wide = q.out == I8OutKind::S32;
         int32_t* const c32 = wide ? static_cast<int32_t*>(gp.c) + c_off : nullptr;
         int8_t* const c8 = wide ? nullptr : static_cast<int8_t*>(gp.c) + c_off;
-        const bool pair32 = wide && even_pitch &&
-                            (reinterpret_cast<uintptr_t>(c32) % 8) == 0;
-        const bool pair2 = !wide && even_pitch &&
-                           (reinterpret_cast<uintptr_t>(c8) % 2) == 0;
+        const bool pair32 = wide && even_pitch && (reinterpret_cast<uintptr_t>(c32) % 8) == 0;
+        const bool pair2 = !wide && even_pitch && (reinterpret_cast<uintptr_t>(c8) % 2) == 0;
         // The compensation `raw - zp_a*R_b[n] - (R_a[m] - K*zp_a)*zp_b[n]`
         // factors into a row scalar and a column scalar,
         //   v = raw - P[m]*R[n] - Q[m]*S[n],
@@ -370,10 +365,12 @@ void manual_gemm_i8_kernel(GemmI8Params q)
         // where the profile said the instructions were: in an int8 GEMM there is
         // one MMA per output element, so every instruction the epilogue spends
         // is one the tensor pipe does not get.
-        const auto vint = [](int32_t raw, int32_t P, int32_t Q, int32_t R,
-                             int32_t S, int32_t bias, bool relu) {
+        const auto vint = [](int32_t raw, int32_t P, int32_t Q, int32_t R, int32_t S, int32_t bias,
+                             bool relu) {
             int32_t v = raw - P * R - Q * S + bias;
-            if (relu) { v = v < 0 ? 0 : v; }
+            if (relu) {
+                v = v < 0 ? 0 : v;
+            }
             return v;
         };
         const int32_t zp_b_scalar = q.zp_b_scalar;
@@ -388,120 +385,114 @@ void manual_gemm_i8_kernel(GemmI8Params q)
 #pragma unroll
         for (int i = 0; i < MA; ++i) {
             const int gm = m_tile + warp_m * WM + i * 16 + cm;
-            if (gm >= M) { continue; }
+            if (gm >= M) {
+                continue;
+            }
             int32_t* const r32 = wide ? c32 + int64_t(gm) * gp.ldc : nullptr;
             int8_t* const rb = wide ? nullptr : c8 + int64_t(gm) * gp.ldc;
             const bool lo8 = gm + 8 < M;
             // Rows gm and gm+8: two scalars each, and the requant's row factor.
-            const int32_t zp0 =
-                (q.zp_a != nullptr ? q.zp_a[gm] : q.zp_a_scalar) + q.a_shift;
+            const int32_t zp0 = (q.zp_a != nullptr ? q.zp_a[gm] : q.zp_a_scalar) + q.a_shift;
             const int32_t P0 = zp0;
             const int32_t Q0 = r_a_b[gm] + q.a_shift * gp.k - gp.k * zp0;
-            const float rk0 = (q.sc_a != nullptr ? q.sc_a[gm] : q.sc_a_scalar) /
-                              rq_out;
+            const float rk0 = (q.sc_a != nullptr ? q.sc_a[gm] : q.sc_a_scalar) / rq_out;
             const int32_t zp8 =
-                lo8 ? (q.zp_a != nullptr ? q.zp_a[gm + 8] : q.zp_a_scalar) +
-                          q.a_shift
-                    : 0;
+                lo8 ? (q.zp_a != nullptr ? q.zp_a[gm + 8] : q.zp_a_scalar) + q.a_shift : 0;
             const int32_t P8 = zp8;
-            const int32_t Q8 =
-                lo8 ? r_a_b[gm + 8] + q.a_shift * gp.k - gp.k * zp8 : 0;
-            const float rk8 = lo8
-                ? (q.sc_a != nullptr ? q.sc_a[gm + 8] : q.sc_a_scalar) / rq_out
-                : 0.0f;
+            const int32_t Q8 = lo8 ? r_a_b[gm + 8] + q.a_shift * gp.k - gp.k * zp8 : 0;
+            const float rk8 =
+                lo8 ? (q.sc_a != nullptr ? q.sc_a[gm + 8] : q.sc_a_scalar) / rq_out : 0.0f;
 #pragma unroll
             for (int j = 0; j < NA; ++j) {
                 const int gn = n_tile + warp_n * WN + j * 8 + cn;
-                if (gn >= N) { continue; }
+                if (gn >= N) {
+                    continue;
+                }
                 const bool hi = gn + 1 < N;
                 // Columns gn and gn+1.
                 const int32_t R0 = r_b_b[gn];
                 const int32_t S0 = zp_b != nullptr ? zp_b[gn] : zp_b_scalar;
                 const int32_t B0 = bias32 != nullptr ? bias32[gn] : 0;
-                const float sb0 =
-                    q.sc_b != nullptr ? q.sc_b[gn] : q.sc_b_scalar;
+                const float sb0 = q.sc_b != nullptr ? q.sc_b[gn] : q.sc_b_scalar;
                 const int32_t R1 = hi ? r_b_b[gn + 1] : 0;
-                const int32_t S1 = hi ? (zp_b != nullptr ? zp_b[gn + 1]
-                                                         : zp_b_scalar) : 0;
-                const int32_t B1 =
-                    (hi && bias32 != nullptr) ? bias32[gn + 1] : 0;
-                const float sb1 = hi ? (q.sc_b != nullptr ? q.sc_b[gn + 1]
-                                                          : q.sc_b_scalar)
-                                     : 0.0f;
+                const int32_t S1 = hi ? (zp_b != nullptr ? zp_b[gn + 1] : zp_b_scalar) : 0;
+                const int32_t B1 = (hi && bias32 != nullptr) ? bias32[gn + 1] : 0;
+                const float sb1 = hi ? (q.sc_b != nullptr ? q.sc_b[gn + 1] : q.sc_b_scalar) : 0.0f;
                 if (wide) {
                     const int32_t v0 = vint(acc[i][j][0], P0, Q0, R0, S0, B0, q.relu);
-                    const int32_t v1 = hi
-                        ? vint(acc[i][j][1], P0, Q0, R1, S1, B1, q.relu) : 0;
-                    const int32_t v2 = lo8
-                        ? vint(acc[i][j][2], P8, Q8, R0, S0, B0, q.relu) : 0;
-                    const int32_t v3 = (lo8 && hi)
-                        ? vint(acc[i][j][3], P8, Q8, R1, S1, B1, q.relu) : 0;
+                    const int32_t v1 = hi ? vint(acc[i][j][1], P0, Q0, R1, S1, B1, q.relu) : 0;
+                    const int32_t v2 = lo8 ? vint(acc[i][j][2], P8, Q8, R0, S0, B0, q.relu) : 0;
+                    const int32_t v3 =
+                        (lo8 && hi) ? vint(acc[i][j][3], P8, Q8, R1, S1, B1, q.relu) : 0;
                     int32_t* const row8 = r32 + 8 * gp.ldc;
                     if (pair32 && hi) {
                         *reinterpret_cast<int2*>(r32 + gn) = make_int2(v0, v1);
                         if (lo8) {
-                            *reinterpret_cast<int2*>(row8 + gn) =
-                                make_int2(v2, v3);
+                            *reinterpret_cast<int2*>(row8 + gn) = make_int2(v2, v3);
                         }
                     } else {
                         r32[gn] = v0;
-                        if (hi) { r32[gn + 1] = v1; }
+                        if (hi) {
+                            r32[gn + 1] = v1;
+                        }
                         if (lo8) {
                             row8[gn] = v2;
-                            if (hi) { row8[gn + 1] = v3; }
+                            if (hi) {
+                                row8[gn + 1] = v3;
+                            }
                         }
                     }
                 } else {
                     // Same factoring, and the requant's per-row and per-column
                     // scales are already resolved above.
-                    const uint8_t b0 = uint8_t(s8out
-                        ? int32_t(detail::i8_requant<int8_t>(
-                              vint(acc[i][j][0], P0, Q0, R0, S0, B0, q.relu),
-                              rk0, sb0, rq_zp))
-                        : int32_t(detail::i8_requant<uint8_t>(
-                              vint(acc[i][j][0], P0, Q0, R0, S0, B0, q.relu),
-                              rk0, sb0, rq_zp)));
-                    const uint8_t b1 = hi
-                        ? uint8_t(s8out
-                            ? int32_t(detail::i8_requant<int8_t>(
-                                  vint(acc[i][j][1], P0, Q0, R1, S1, B1, q.relu),
-                                  rk0, sb1, rq_zp))
-                            : int32_t(detail::i8_requant<uint8_t>(
-                                  vint(acc[i][j][1], P0, Q0, R1, S1, B1, q.relu),
-                                  rk0, sb1, rq_zp)))
-                        : uint8_t(0);
-                    const uint8_t b2 = lo8
-                        ? uint8_t(s8out
-                            ? int32_t(detail::i8_requant<int8_t>(
-                                  vint(acc[i][j][2], P8, Q8, R0, S0, B0, q.relu),
-                                  rk8, sb0, rq_zp))
-                            : int32_t(detail::i8_requant<uint8_t>(
-                                  vint(acc[i][j][2], P8, Q8, R0, S0, B0, q.relu),
-                                  rk8, sb0, rq_zp)))
-                        : uint8_t(0);
-                    const uint8_t b3 = (lo8 && hi)
-                        ? uint8_t(s8out
-                            ? int32_t(detail::i8_requant<int8_t>(
-                                  vint(acc[i][j][3], P8, Q8, R1, S1, B1, q.relu),
-                                  rk8, sb1, rq_zp))
-                            : int32_t(detail::i8_requant<uint8_t>(
-                                  vint(acc[i][j][3], P8, Q8, R1, S1, B1, q.relu),
-                                  rk8, sb1, rq_zp)))
-                        : uint8_t(0);
+                    const uint8_t b0 = uint8_t(
+                        s8out ?
+                            int32_t(detail::i8_requant<int8_t>(
+                                vint(acc[i][j][0], P0, Q0, R0, S0, B0, q.relu), rk0, sb0, rq_zp)) :
+                            int32_t(detail::i8_requant<uint8_t>(
+                                vint(acc[i][j][0], P0, Q0, R0, S0, B0, q.relu), rk0, sb0, rq_zp)));
+                    const uint8_t b1 =
+                        hi ? uint8_t(s8out ? int32_t(detail::i8_requant<int8_t>(
+                                                 vint(acc[i][j][1], P0, Q0, R1, S1, B1, q.relu),
+                                                 rk0, sb1, rq_zp)) :
+                                             int32_t(detail::i8_requant<uint8_t>(
+                                                 vint(acc[i][j][1], P0, Q0, R1, S1, B1, q.relu),
+                                                 rk0, sb1, rq_zp))) :
+                             uint8_t(0);
+                    const uint8_t b2 =
+                        lo8 ? uint8_t(s8out ? int32_t(detail::i8_requant<int8_t>(
+                                                  vint(acc[i][j][2], P8, Q8, R0, S0, B0, q.relu),
+                                                  rk8, sb0, rq_zp)) :
+                                              int32_t(detail::i8_requant<uint8_t>(
+                                                  vint(acc[i][j][2], P8, Q8, R0, S0, B0, q.relu),
+                                                  rk8, sb0, rq_zp))) :
+                              uint8_t(0);
+                    const uint8_t b3 =
+                        (lo8 && hi) ?
+                            uint8_t(s8out ? int32_t(detail::i8_requant<int8_t>(
+                                                vint(acc[i][j][3], P8, Q8, R1, S1, B1, q.relu), rk8,
+                                                sb1, rq_zp)) :
+                                            int32_t(detail::i8_requant<uint8_t>(
+                                                vint(acc[i][j][3], P8, Q8, R1, S1, B1, q.relu), rk8,
+                                                sb1, rq_zp))) :
+                            uint8_t(0);
                     int8_t* const row8 = rb + 8 * gp.ldc;
                     if (pair2 && hi) {
-                        *reinterpret_cast<uint16_t*>(rb + gn) =
-                            uint16_t(b0 | (uint16_t(b1) << 8));
+                        *reinterpret_cast<uint16_t*>(rb + gn) = uint16_t(b0 | (uint16_t(b1) << 8));
                         if (lo8) {
                             *reinterpret_cast<uint16_t*>(row8 + gn) =
                                 uint16_t(b2 | (uint16_t(b3) << 8));
                         }
                     } else {
                         rb[gn] = int8_t(b0);
-                        if (hi) { rb[gn + 1] = int8_t(b1); }
+                        if (hi) {
+                            rb[gn + 1] = int8_t(b1);
+                        }
                         if (lo8) {
                             row8[gn] = int8_t(b2);
-                            if (hi) { row8[gn + 1] = int8_t(b3); }
+                            if (hi) {
+                                row8[gn + 1] = int8_t(b3);
+                            }
                         }
                     }
                 }
@@ -514,52 +505,56 @@ void manual_gemm_i8_kernel(GemmI8Params q)
     const bool wide = q.out == I8OutKind::F32;
     float* const cf = wide ? static_cast<float*>(gp.c) + c_off : nullptr;
     __half* const ch = wide ? nullptr : static_cast<__half*>(gp.c) + c_off;
-    const bool pair32 = wide && even_pitch &&
-                        (reinterpret_cast<uintptr_t>(cf) % 8) == 0;
-    const bool pair4 = !wide && even_pitch &&
-                       (reinterpret_cast<uintptr_t>(ch) % 4) == 0;
+    const bool pair32 = wide && even_pitch && (reinterpret_cast<uintptr_t>(cf) % 8) == 0;
+    const bool pair4 = !wide && even_pitch && (reinterpret_cast<uintptr_t>(ch) % 4) == 0;
 #pragma unroll
     for (int i = 0; i < MA; ++i) {
         const int gm = m_tile + warp_m * WM + i * 16 + cm;
-        if (gm >= M) { continue; }
+        if (gm >= M) {
+            continue;
+        }
         float* const rf = wide ? cf + int64_t(gm) * gp.ldc : nullptr;
         __half* const rh = wide ? nullptr : ch + int64_t(gm) * gp.ldc;
         const bool lo8 = gm + 8 < M;
 #pragma unroll
         for (int j = 0; j < NA; ++j) {
             const int gn = n_tile + warp_n * WN + j * 8 + cn;
-            if (gn >= N) { continue; }
+            if (gn >= N) {
+                continue;
+            }
             const bool hi = gn + 1 < N;
             const float f0 = detail::i8_fp_value(q, acc[i][j][0], gm, gn, r_a_b, r_b_b);
-            const float f1 = hi
-                ? detail::i8_fp_value(q, acc[i][j][1], gm, gn + 1, r_a_b, r_b_b) : 0.0f;
-            const float f2 = lo8
-                ? detail::i8_fp_value(q, acc[i][j][2], gm + 8, gn, r_a_b, r_b_b) : 0.0f;
-            const float f3 = (lo8 && hi)
-                ? detail::i8_fp_value(q, acc[i][j][3], gm + 8, gn + 1, r_a_b, r_b_b)
-                : 0.0f;
+            const float f1 =
+                hi ? detail::i8_fp_value(q, acc[i][j][1], gm, gn + 1, r_a_b, r_b_b) : 0.0f;
+            const float f2 =
+                lo8 ? detail::i8_fp_value(q, acc[i][j][2], gm + 8, gn, r_a_b, r_b_b) : 0.0f;
+            const float f3 =
+                (lo8 && hi) ? detail::i8_fp_value(q, acc[i][j][3], gm + 8, gn + 1, r_a_b, r_b_b) :
+                              0.0f;
             if (wide) {
                 float* const row8 = rf + 8 * gp.ldc;
                 if (pair32 && hi) {
                     *reinterpret_cast<float2*>(rf + gn) = make_float2(f0, f1);
                     if (lo8) {
-                        *reinterpret_cast<float2*>(row8 + gn) =
-                            make_float2(f2, f3);
+                        *reinterpret_cast<float2*>(row8 + gn) = make_float2(f2, f3);
                     }
                 } else {
                     rf[gn] = f0;
-                    if (hi) { rf[gn + 1] = f1; }
+                    if (hi) {
+                        rf[gn + 1] = f1;
+                    }
                     if (lo8) {
                         row8[gn] = f2;
-                        if (hi) { row8[gn + 1] = f3; }
+                        if (hi) {
+                            row8[gn + 1] = f3;
+                        }
                     }
                 }
             } else {
                 __half* const row8 = rh + 8 * gp.ldc;
                 if (pair4 && hi) {
                     const __half2 h0 = __floats2half2_rn(f0, f1);
-                    *reinterpret_cast<uint32_t*>(rh + gn) =
-                        *reinterpret_cast<const uint32_t*>(&h0);
+                    *reinterpret_cast<uint32_t*>(rh + gn) = *reinterpret_cast<const uint32_t*>(&h0);
                     if (lo8) {
                         const __half2 h8 = __floats2half2_rn(f2, f3);
                         *reinterpret_cast<uint32_t*>(row8 + gn) =
@@ -567,10 +562,14 @@ void manual_gemm_i8_kernel(GemmI8Params q)
                     }
                 } else {
                     rh[gn] = __float2half(f0);
-                    if (hi) { rh[gn + 1] = __float2half(f1); }
+                    if (hi) {
+                        rh[gn + 1] = __float2half(f1);
+                    }
                     if (lo8) {
                         row8[gn] = __float2half(f2);
-                        if (hi) { row8[gn + 1] = __float2half(f3); }
+                        if (hi) {
+                            row8[gn + 1] = __float2half(f3);
+                        }
                     }
                 }
             }
@@ -578,4 +577,4 @@ void manual_gemm_i8_kernel(GemmI8Params q)
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

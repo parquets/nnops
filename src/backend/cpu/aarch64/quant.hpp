@@ -45,8 +45,10 @@ using nnops::backend::cpu::float_to_half;
 /// Quantize 16 floats (4×float32x4_t) to 16 int8 (1×int8x16_t) in natural order;
 /// each lane is one FMA `zero + d * inv_scale`.
 template <bool Q_U8>
-inline int8x16_t quant_block16_f32_i8(float32x4_t d0, float32x4_t d1, float32x4_t d2, float32x4_t d3,
-                                      float32x4_t inv_scale, float32x4_t zero) noexcept {
+inline int8x16_t quant_block16_f32_i8(float32x4_t d0, float32x4_t d1, float32x4_t d2,
+                                      float32x4_t d3, float32x4_t inv_scale,
+                                      float32x4_t zero) noexcept
+{
     d0 = vfmaq_f32(zero, d0, inv_scale);
     d1 = vfmaq_f32(zero, d1, inv_scale);
     d2 = vfmaq_f32(zero, d2, inv_scale);
@@ -70,8 +72,8 @@ inline int8x16_t quant_block16_f32_i8(float32x4_t d0, float32x4_t d1, float32x4_
 
 /// Widen 8 int8 (int8x8_t) to 8 int32 (2×int32x4_t); the u8 path reinterprets
 /// as unsigned first, so bytes ≥ 128 recover their true magnitude.
-template <bool Q_U8>
-inline void widen8_i8_to_i32(int8x8_t v, int32x4_t& lo, int32x4_t& hi) noexcept {
+template <bool Q_U8> inline void widen8_i8_to_i32(int8x8_t v, int32x4_t& lo, int32x4_t& hi) noexcept
+{
     if constexpr (Q_U8) {
         const uint16x8_t s = vmovl_u8(vreinterpret_u8_s8(v));
         lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(s)));
@@ -88,8 +90,9 @@ inline void widen8_i8_to_i32(int8x8_t v, int32x4_t& lo, int32x4_t& hi) noexcept 
 /// single FMA `i_f32 * scale + neg_zero_scale`.
 template <bool Q_U8>
 inline void dequant_block16_i8_f32(int8x16_t v, float32x4_t scale, float32x4_t neg_zero_scale,
-                                   float32x4_t& res0, float32x4_t& res1,
-                                   float32x4_t& res2, float32x4_t& res3) noexcept {
+                                   float32x4_t& res0, float32x4_t& res1, float32x4_t& res2,
+                                   float32x4_t& res3) noexcept
+{
     int32x4_t i0, i1, i2, i3;
     widen8_i8_to_i32<Q_U8>(vget_low_s8(v), i0, i1);
     widen8_i8_to_i32<Q_U8>(vget_high_s8(v), i2, i3);
@@ -106,11 +109,11 @@ inline void dequant_block16_i8_f32(int8x16_t v, float32x4_t scale, float32x4_t n
 /// Quantize an M×N f32 matrix to integer `T`, one (scale, zero_point) per row;
 /// `dst`/`src` use row strides `dr_step`/`sr_step`.
 template <typename T>
-inline void quantization(int M, int N,
-                         T* NNOPS_RESTRICT dst, int dr_step,
+inline void quantization(int M, int N, T* NNOPS_RESTRICT dst, int dr_step,
                          const float* NNOPS_RESTRICT src, int sr_step,
                          const float* NNOPS_RESTRICT scale,
-                         const float* NNOPS_RESTRICT zero) noexcept {
+                         const float* NNOPS_RESTRICT zero) noexcept
+{
     static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
                   "quantization: T must be int8_t or uint8_t");
     constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
@@ -166,11 +169,11 @@ inline void quantization(int M, int N,
 /// f16 input variant of `quantization<T>`: widen half → f32 (`vcvt_f32_f16` /
 /// `vcvt_high_f32_f16`), then the same arithmetic, rounding and clamping.
 template <typename T>
-inline void quantization(int M, int N,
-                         T* NNOPS_RESTRICT dst, int dr_step,
+inline void quantization(int M, int N, T* NNOPS_RESTRICT dst, int dr_step,
                          const half* NNOPS_RESTRICT src, int sr_step,
                          const float* NNOPS_RESTRICT scale,
-                         const float* NNOPS_RESTRICT zero) noexcept {
+                         const float* NNOPS_RESTRICT zero) noexcept
+{
     static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
                   "quantization: T must be int8_t or uint8_t");
     constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
@@ -233,11 +236,11 @@ inline void quantization(int M, int N,
 /// widening a lane pair is one 16-bit shift, and the arithmetic, rounding and
 /// clamping are the f32 kernel's.
 template <typename T>
-inline void quantization(int M, int N,
-                         T* NNOPS_RESTRICT dst, int dr_step,
+inline void quantization(int M, int N, T* NNOPS_RESTRICT dst, int dr_step,
                          const bfloat16* NNOPS_RESTRICT src, int sr_step,
                          const float* NNOPS_RESTRICT scale,
-                         const float* NNOPS_RESTRICT zero) noexcept {
+                         const float* NNOPS_RESTRICT zero) noexcept
+{
     static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
                   "quantization: T must be int8_t or uint8_t");
     constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
@@ -299,8 +302,9 @@ inline void quantization(int M, int N,
 /// Requantize 8 floats with a broadcast scale/zero_point into 8 int8/uint8:
 /// `dst[i] = clamp(round(src[i] * inv_scale + zero), qmin, qmax)`.
 template <typename T>
-inline void requantize_8(T* NNOPS_RESTRICT dst, const float* NNOPS_RESTRICT src,
-                         float inv_scale, float zero) noexcept {
+inline void requantize_8(T* NNOPS_RESTRICT dst, const float* NNOPS_RESTRICT src, float inv_scale,
+                         float zero) noexcept
+{
     static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
                   "requantize_8: T must be int8_t or uint8_t");
     constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
@@ -325,7 +329,8 @@ inline void requantize_8(T* NNOPS_RESTRICT dst, const float* NNOPS_RESTRICT src,
 /// scale and zero_point.
 template <typename T>
 inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
-                  const T* NNOPS_RESTRICT b) noexcept {
+                  const T* NNOPS_RESTRICT b) noexcept
+{
     static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
                   "max_8: T must be int8_t or uint8_t");
     constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
@@ -333,8 +338,7 @@ inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
     const int8x8_t vb = vld1_s8(reinterpret_cast<const int8_t*>(b));
     int8x8_t vmax;
     if constexpr (Q_U8) {
-        vmax = vreinterpret_s8_u8(vmax_u8(vreinterpret_u8_s8(va),
-                                          vreinterpret_u8_s8(vb)));
+        vmax = vreinterpret_s8_u8(vmax_u8(vreinterpret_u8_s8(va), vreinterpret_u8_s8(vb)));
     } else {
         vmax = vmax_s8(va, vb);
     }
@@ -344,11 +348,11 @@ inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
 /// Dequantize an M×N integer matrix of type `T` to f32, one (scale, zero_point)
 /// per row; `dst`/`src` use row strides `dr_step`/`sr_step`.
 template <typename T>
-inline void dequantization(int M, int N,
-                           float* NNOPS_RESTRICT dst, int dr_step,
+inline void dequantization(int M, int N, float* NNOPS_RESTRICT dst, int dr_step,
                            const T* NNOPS_RESTRICT src, int sr_step,
                            const float* NNOPS_RESTRICT scale,
-                           const float* NNOPS_RESTRICT zero) noexcept {
+                           const float* NNOPS_RESTRICT zero) noexcept
+{
     static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
                   "dequantization: T must be int8_t or uint8_t");
     constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
@@ -403,11 +407,11 @@ inline void dequantization(int M, int N,
 /// f16 output variant of `dequantization<T>`: dequantize in f32, then narrow to
 /// f16 (`vcvt_f16_f32`).
 template <typename T>
-inline void dequantization(int M, int N,
-                           half* NNOPS_RESTRICT dst, int dr_step,
+inline void dequantization(int M, int N, half* NNOPS_RESTRICT dst, int dr_step,
                            const T* NNOPS_RESTRICT src, int sr_step,
                            const float* NNOPS_RESTRICT scale,
-                           const float* NNOPS_RESTRICT zero) noexcept {
+                           const float* NNOPS_RESTRICT zero) noexcept
+{
     static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
                   "dequantization: T must be int8_t or uint8_t");
     constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
@@ -454,4 +458,4 @@ inline void dequantization(int M, int N,
     }
 }
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

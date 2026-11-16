@@ -19,15 +19,14 @@ using namespace simd;
 /// Transpose [M × K] at @p in_ptr (row stride @p in_ld) to [K × M] at
 /// @p out_ptr (row stride @p out_ld).
 template <typename T>
-inline void tiled_transpose_2d(const T* in_ptr, T* out_ptr,
-                                int64_t M, int64_t K,
-                                int64_t in_ld, int64_t out_ld)
+inline void tiled_transpose_2d(const T* in_ptr, T* out_ptr, int64_t M, int64_t K, int64_t in_ld,
+                               int64_t out_ld)
 {
-    constexpr int64_t TILE = 8;  // SIMD lane width for both f32/f16
+    constexpr int64_t TILE = 8; // SIMD lane width for both f32/f16
     const int64_t num_tile_rows = (M + TILE - 1) / TILE;
 
     for (int64_t ti = 0; ti < num_tile_rows; ++ti) {
-        const int64_t i = ti * TILE;          // start row in input
+        const int64_t i = ti * TILE; // start row in input
         const int64_t tile_m = std::min(TILE, M - i);
 
         for (int64_t j = 0; j < K; j += TILE) {
@@ -56,8 +55,7 @@ inline void tiled_transpose_2d(const T* in_ptr, T* out_ptr,
             } else {
                 for (int64_t mi = 0; mi < tile_m; ++mi) {
                     for (int64_t kj = 0; kj < tile_k; ++kj) {
-                        out_ptr[(j + kj) * out_ld + (i + mi)] =
-                            in_ptr[(i + mi) * in_ld + (j + kj)];
+                        out_ptr[(j + kj) * out_ld + (i + mi)] = in_ptr[(i + mi) * in_ld + (j + kj)];
                     }
                 }
             }
@@ -65,4 +63,4 @@ inline void tiled_transpose_2d(const T* in_ptr, T* out_ptr,
     }
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

@@ -52,8 +52,8 @@ using nnops::backend::cpu::half_to_float;
 /// Decode one block into 32 f32, f16 or bf16 values; an f16/bf16 destination
 /// rounds once per element.
 template <class T>
-inline void decode_q4_1_block(const uint8_t* p, T* out,
-                              float scale = 1.0f) noexcept {
+inline void decode_q4_1_block(const uint8_t* p, T* out, float scale = 1.0f) noexcept
+{
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> ||
                       std::is_same_v<T, bfloat16>,
                   "decode_q4_1_block: T must be float, half or bfloat16");
@@ -76,12 +76,10 @@ inline void decode_q4_1_block(const uint8_t* p, T* out,
     const uint8x16_t hi = vshrq_n_u8(qs, 4);
 
     auto emit = [&](int g, uint16x8_t nib) {
-        const float32x4_t v0 =
-            vfmaq_f32(vm, vcvtq_f32_u32(vmovl_u16(vget_low_u16(nib))), vd);
-        const float32x4_t v1 =
-            vfmaq_f32(vm, vcvtq_f32_u32(vmovl_u16(vget_high_u16(nib))), vd);
+        const float32x4_t v0 = vfmaq_f32(vm, vcvtq_f32_u32(vmovl_u16(vget_low_u16(nib))), vd);
+        const float32x4_t v1 = vfmaq_f32(vm, vcvtq_f32_u32(vmovl_u16(vget_high_u16(nib))), vd);
         if constexpr (std::is_same_v<T, float>) {
-            vst1q_f32(out + 8 * g,     v0);
+            vst1q_f32(out + 8 * g, v0);
             vst1q_f32(out + 8 * g + 4, v1);
         } else if constexpr (std::is_same_v<T, half>) {
             vst1q_f16(reinterpret_cast<float16_t*>(out) + 8 * g,
@@ -92,10 +90,10 @@ inline void decode_q4_1_block(const uint8_t* p, T* out,
         }
     };
 
-    emit(0, vmovl_u8(vget_low_u8(lo)));   // values  0..7
-    emit(1, vmovl_u8(vget_high_u8(lo)));  // values  8..15
-    emit(2, vmovl_u8(vget_low_u8(hi)));   // values 16..23
-    emit(3, vmovl_u8(vget_high_u8(hi)));  // values 24..31
+    emit(0, vmovl_u8(vget_low_u8(lo)));  // values  0..7
+    emit(1, vmovl_u8(vget_high_u8(lo))); // values  8..15
+    emit(2, vmovl_u8(vget_low_u8(hi)));  // values 16..23
+    emit(3, vmovl_u8(vget_high_u8(hi))); // values 24..31
 }
 
 // =========================================================================
@@ -105,24 +103,23 @@ inline void decode_q4_1_block(const uint8_t* p, T* out,
 /// Panel width per element type: nr_f32[0] (12) for f32, nr_f16[0] (16) for
 /// f16, and the 16-column bf16 panel.
 template <class T>
-inline constexpr int q4_1_nr_max =
-    std::is_same_v<T, float> ? nr_f32[0]
-    : std::is_same_v<T, half> ? nr_f16[0]
-                              : bf16_nr_max;
+inline constexpr int q4_1_nr_max = std::is_same_v<T, float> ? nr_f32[0] :
+                                   std::is_same_v<T, half>  ? nr_f16[0] :
+                                                              bf16_nr_max;
 
 /// Row-major B (phys [K][N]): a panel is columns [n_start, +width) of rows
 /// [k_start, +kc); it straddles at most two 32-value blocks. Width is ignored
 /// when NR > 0.
 template <class T, int NR>
-void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
-                          int k_start, int kc, int n_start, int width,
-                          float scale = 1.0f) noexcept {
+void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks, int k_start, int kc,
+                          int n_start, int width, float scale = 1.0f) noexcept
+{
     constexpr int kPanel = q4_1_nr_max<T>;
-    const int nb    = (NR > 0) ? NR : width;
-    const int blk0  = n_start >> 5;
-    const int off0  = n_start & 31;
+    const int nb = (NR > 0) ? NR : width;
+    const int blk0 = n_start >> 5;
+    const int off0 = n_start & 31;
     const int first = std::min(nb, 32 - off0);
-    const bool two  = (nb > first);
+    const bool two = (nb > first);
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(q4_1_block_bytes);
 
     T v0[q4_1_block_elems];
@@ -131,14 +128,13 @@ void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
         const uint8_t* row = src + static_cast<int64_t>(k_start + k) * row_bytes;
         T* o = out + static_cast<int64_t>(k) * kPanel;
 
-        decode_q4_1_block<T>(row + static_cast<int64_t>(blk0) * q4_1_block_bytes, v0,
-                             scale);
+        decode_q4_1_block<T>(row + static_cast<int64_t>(blk0) * q4_1_block_bytes, v0, scale);
         for (int j = 0; j < first; ++j) {
             o[j] = v0[off0 + j];
         }
         if (two) {
-            decode_q4_1_block<T>(
-                row + static_cast<int64_t>(blk0 + 1) * q4_1_block_bytes, v1, scale);
+            decode_q4_1_block<T>(row + static_cast<int64_t>(blk0 + 1) * q4_1_block_bytes, v1,
+                                 scale);
             for (int j = first; j < nb; ++j) {
                 o[j] = v1[j - first];
             }
@@ -153,25 +149,24 @@ void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
 /// [k_start, +kc). Each source row is swept linearly, so one decode yields up
 /// to 32 consecutive k values — the efficient direction for Linear's weights.
 template <class T, int NR>
-void pack_q4_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
-                           int k_start, int kc, int n_start, int width,
-                           float scale = 1.0f) noexcept {
+void pack_q4_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks, int k_start, int kc,
+                           int n_start, int width, float scale = 1.0f) noexcept
+{
     constexpr int kPanel = q4_1_nr_max<T>;
-    const int nb     = (NR > 0) ? NR : width;
-    const int blk0   = k_start >> 5;
-    const int off0   = k_start & 31;
-    const int nblk   = (off0 + kc + 31) >> 5;
+    const int nb = (NR > 0) ? NR : width;
+    const int blk0 = k_start >> 5;
+    const int off0 = k_start & 31;
+    const int nblk = (off0 + kc + 31) >> 5;
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(q4_1_block_bytes);
 
     T vals[q4_1_block_elems];
     for (int j = 0; j < nb; ++j) {
-        const uint8_t* row = src + static_cast<int64_t>(n_start + j) * row_bytes
-                           + static_cast<int64_t>(blk0) * q4_1_block_bytes;
+        const uint8_t* row = src + static_cast<int64_t>(n_start + j) * row_bytes +
+                             static_cast<int64_t>(blk0) * q4_1_block_bytes;
 
         int k = 0;
         for (int b = 0; b < nblk; ++b) {
-            decode_q4_1_block<T>(row + static_cast<int64_t>(b) * q4_1_block_bytes,
-                                 vals, scale);
+            decode_q4_1_block<T>(row + static_cast<int64_t>(b) * q4_1_block_bytes, vals, scale);
             const int start = (b == 0) ? off0 : 0;
             const int count = std::min(32 - start, kc - k);
             T* o = out + static_cast<int64_t>(k) * kPanel + j;
@@ -195,9 +190,9 @@ void pack_q4_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
 /// physically [N][K]; @p dst steps by @p ldd (64-byte-aligned nr_max * kc) per
 /// panel, and @p row_blocks is the B row pitch in 20-byte blocks.
 template <class T>
-void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc,
-                   T* dst, int ldd, const void* src, int64_t row_blocks,
-                   float scale) noexcept {
+void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc, T* dst, int ldd,
+                   const void* src, int64_t row_blocks, float scale) noexcept
+{
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
                   "pack_q4_1_rhs: T must be float or half");
 
@@ -207,21 +202,21 @@ void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc,
     int n = 0;
     for (; n + kPanel <= nc; n += kPanel) {
         if (trans) {
-            pack_q4_1_trans_panel<T, kPanel>(
-                dst, base, row_blocks, k_start, kc, n_start + n, 0, scale);
+            pack_q4_1_trans_panel<T, kPanel>(dst, base, row_blocks, k_start, kc, n_start + n, 0,
+                                             scale);
         } else {
-            pack_q4_1_copy_panel<T, kPanel>(
-                dst, base, row_blocks, k_start, kc, n_start + n, 0, scale);
+            pack_q4_1_copy_panel<T, kPanel>(dst, base, row_blocks, k_start, kc, n_start + n, 0,
+                                            scale);
         }
         dst += ldd;
     }
     if (n < nc) {
         if (trans) {
-            pack_q4_1_trans_panel<T, 0>(
-                dst, base, row_blocks, k_start, kc, n_start + n, nc - n, scale);
+            pack_q4_1_trans_panel<T, 0>(dst, base, row_blocks, k_start, kc, n_start + n, nc - n,
+                                        scale);
         } else {
-            pack_q4_1_copy_panel<T, 0>(
-                dst, base, row_blocks, k_start, kc, n_start + n, nc - n, scale);
+            pack_q4_1_copy_panel<T, 0>(dst, base, row_blocks, k_start, kc, n_start + n, nc - n,
+                                       scale);
         }
     }
 }
@@ -237,10 +232,13 @@ void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc,
 
 /// Zero the lanes a short panel or a short final k-group leaves unread:
 /// columns past `width`, and k past `kc`.
-inline void q4_1_zero_bf16_tail(bfloat16* out, int kc, int width) noexcept {
+inline void q4_1_zero_bf16_tail(bfloat16* out, int kc, int width) noexcept
+{
     const int groups = (kc + 3) >> 2;
     const bool short_k = (kc & 3) != 0;
-    if (width >= bf16_nr_max && !short_k) { return; }
+    if (width >= bf16_nr_max && !short_k) {
+        return;
+    }
 
     for (int g = 0; g < groups; ++g) {
         bfloat16* grp = out + static_cast<int64_t>(g) * bf16_b_k4_elems;
@@ -249,8 +247,12 @@ inline void q4_1_zero_bf16_tail(bfloat16* out, int kc, int width) noexcept {
             const bool c1 = 2 * cp + 1 < width;
             for (int i = 0; i < 4; ++i) {
                 const bool live_k = g * 4 + i < kc;
-                if (!(c0 && live_k)) { grp[cp * 8 + i] = bfloat16{}; }
-                if (!(c1 && live_k)) { grp[cp * 8 + 4 + i] = bfloat16{}; }
+                if (!(c0 && live_k)) {
+                    grp[cp * 8 + i] = bfloat16{};
+                }
+                if (!(c1 && live_k)) {
+                    grp[cp * 8 + 4 + i] = bfloat16{};
+                }
             }
         }
     }
@@ -259,9 +261,9 @@ inline void q4_1_zero_bf16_tail(bfloat16* out, int kc, int width) noexcept {
 /// One bf16 panel: columns [n_start, +width) of rows [k_start, +kc), written in
 /// the BFMMLA operand layout. @p Trans means B is physically [N][K].
 template <bool Trans>
-void pack_q4_1_bf16_panel(bfloat16* out, const uint8_t* src, int64_t row_blocks,
-                          int k_start, int kc, int n_start, int width,
-                          float scale) noexcept {
+void pack_q4_1_bf16_panel(bfloat16* out, const uint8_t* src, int64_t row_blocks, int k_start,
+                          int kc, int n_start, int width, float scale) noexcept
+{
     q4_1_zero_bf16_tail(out, kc, width);
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(q4_1_block_bytes);
 
@@ -273,32 +275,29 @@ void pack_q4_1_bf16_panel(bfloat16* out, const uint8_t* src, int64_t row_blocks,
         const int nblk = (koff + kc + 31) >> 5;
         for (int cp = 0; cp < bf16_nr_max / 2 && 2 * cp < width; ++cp) {
             const bool pair = 2 * cp + 1 < width;
-            const uint8_t* row0 =
-                src + static_cast<int64_t>(n_start + 2 * cp) * row_bytes;
+            const uint8_t* row0 = src + static_cast<int64_t>(n_start + 2 * cp) * row_bytes;
             const uint8_t* row1 =
-                pair ? src + static_cast<int64_t>(n_start + 2 * cp + 1) * row_bytes
-                     : nullptr;
+                pair ? src + static_cast<int64_t>(n_start + 2 * cp + 1) * row_bytes : nullptr;
 
             int done = 0;
             for (int b = 0; b < nblk; ++b) {
                 bfloat16 v0[q4_1_block_elems];
                 decode_q4_1_block<bfloat16>(
-                    row0 + static_cast<int64_t>(kblk + b) * q4_1_block_bytes, v0,
-                    scale);
+                    row0 + static_cast<int64_t>(kblk + b) * q4_1_block_bytes, v0, scale);
                 bfloat16 v1[q4_1_block_elems];
                 if (pair) {
                     decode_q4_1_block<bfloat16>(
-                        row1 + static_cast<int64_t>(kblk + b) * q4_1_block_bytes,
-                        v1, scale);
+                        row1 + static_cast<int64_t>(kblk + b) * q4_1_block_bytes, v1, scale);
                 }
                 const int start = (b == 0) ? koff : 0;
                 const int count = std::min(32 - start, kc - done);
                 for (int i = 0; i < count; ++i) {
                     const int k = done + i;
-                    bfloat16* grp =
-                        out + static_cast<int64_t>(k >> 2) * bf16_b_k4_elems;
+                    bfloat16* grp = out + static_cast<int64_t>(k >> 2) * bf16_b_k4_elems;
                     grp[cp * 8 + (k & 3)] = v0[start + i];
-                    if (pair) { grp[cp * 8 + 4 + (k & 3)] = v1[start + i]; }
+                    if (pair) {
+                        grp[cp * 8 + 4 + (k & 3)] = v1[start + i];
+                    }
                 }
                 done += count;
             }
@@ -310,22 +309,19 @@ void pack_q4_1_bf16_panel(bfloat16* out, const uint8_t* src, int64_t row_blocks,
         const int noff = n_start & 31;
         const bool two = noff + width > 32;
         for (int k = 0; k < kc; ++k) {
-            const uint8_t* row =
-                src + static_cast<int64_t>(k_start + k) * row_bytes;
+            const uint8_t* row = src + static_cast<int64_t>(k_start + k) * row_bytes;
             bfloat16 v0[q4_1_block_elems];
-            decode_q4_1_block<bfloat16>(
-                row + static_cast<int64_t>(nblk) * q4_1_block_bytes, v0, scale);
+            decode_q4_1_block<bfloat16>(row + static_cast<int64_t>(nblk) * q4_1_block_bytes, v0,
+                                        scale);
             bfloat16 v1[q4_1_block_elems];
             if (two) {
-                decode_q4_1_block<bfloat16>(
-                    row + static_cast<int64_t>(nblk + 1) * q4_1_block_bytes, v1,
-                    scale);
+                decode_q4_1_block<bfloat16>(row + static_cast<int64_t>(nblk + 1) * q4_1_block_bytes,
+                                            v1, scale);
             }
             bfloat16* grp = out + static_cast<int64_t>(k >> 2) * bf16_b_k4_elems;
             for (int c = 0; c < width; ++c) {
                 const int col = noff + c;
-                grp[(c >> 1) * 8 + (c & 1) * 4 + (k & 3)] =
-                    (col < 32) ? v0[col] : v1[col - 32];
+                grp[(c >> 1) * 8 + (c & 1) * 4 + (k & 3)] = (col < 32) ? v0[col] : v1[col - 32];
             }
         }
     }
@@ -334,31 +330,31 @@ void pack_q4_1_bf16_panel(bfloat16* out, const uint8_t* src, int64_t row_blocks,
 /// Pack one k-block of the Q4_1 RHS into bf16 BFMMLA panels. @p trans means B
 /// is physically [N][K]; @p dst steps by @p ldd (bf16_b_panel_stride(kc)) per
 /// panel, and @p row_blocks is the B row pitch in 20-byte blocks.
-inline void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc,
-                          bfloat16* dst, int ldd, const void* src,
-                          int64_t row_blocks, float scale) noexcept {
+inline void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc, bfloat16* dst,
+                          int ldd, const void* src, int64_t row_blocks, float scale) noexcept
+{
     const uint8_t* base = static_cast<const uint8_t*>(src);
 
     int n = 0;
     for (; n + bf16_nr_max <= nc; n += bf16_nr_max) {
         if (trans) {
-            pack_q4_1_bf16_panel<true>(dst, base, row_blocks, k_start, kc,
-                                       n_start + n, bf16_nr_max, scale);
+            pack_q4_1_bf16_panel<true>(dst, base, row_blocks, k_start, kc, n_start + n, bf16_nr_max,
+                                       scale);
         } else {
-            pack_q4_1_bf16_panel<false>(dst, base, row_blocks, k_start, kc,
-                                        n_start + n, bf16_nr_max, scale);
+            pack_q4_1_bf16_panel<false>(dst, base, row_blocks, k_start, kc, n_start + n,
+                                        bf16_nr_max, scale);
         }
         dst += ldd;
     }
     if (n < nc) {
         if (trans) {
-            pack_q4_1_bf16_panel<true>(dst, base, row_blocks, k_start, kc,
-                                       n_start + n, nc - n, scale);
+            pack_q4_1_bf16_panel<true>(dst, base, row_blocks, k_start, kc, n_start + n, nc - n,
+                                       scale);
         } else {
-            pack_q4_1_bf16_panel<false>(dst, base, row_blocks, k_start, kc,
-                                        n_start + n, nc - n, scale);
+            pack_q4_1_bf16_panel<false>(dst, base, row_blocks, k_start, kc, n_start + n, nc - n,
+                                        scale);
         }
     }
 }
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64

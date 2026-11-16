@@ -13,14 +13,13 @@ NNOPS_DECLARE_CPU(ArgMinMaxAttributes, argmin_cpu)
 NNOPS_DECLARE_CUDA(ArgMinMaxAttributes, argmax_cuda)
 NNOPS_DECLARE_CUDA(ArgMinMaxAttributes, argmin_cuda)
 
-NNOPS_OP_BOILERPLATE(ArgMax, ArgMinMaxAttributes,
-        backend::cpu::argmax_cpu, NNOPS_IF_CUDA(backend::cuda::argmax_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(ArgMax, ArgMinMaxAttributes, backend::cpu::argmax_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::argmax_cuda), nullptr)
 
-NNOPS_OP_BOILERPLATE(ArgMin, ArgMinMaxAttributes,
-        backend::cpu::argmin_cpu, NNOPS_IF_CUDA(backend::cuda::argmin_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(ArgMin, ArgMinMaxAttributes, backend::cpu::argmin_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::argmin_cuda), nullptr)
 
-std::vector<TensorDesc> ArgMax::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> ArgMax::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     return argminmax_output_shape(attrs_.axis, attrs_.keepdims, inputs);
 }
@@ -31,19 +30,18 @@ Status ArgMax::validate(std::span<const TensorDesc> inputs,
     return detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1);
 }
 
-Status ArgMax::compute(std::span<TensorView> outputs,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace)
+Status ArgMax::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                       const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-std::vector<TensorDesc> ArgMin::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> ArgMin::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     return argminmax_output_shape(attrs_.axis, attrs_.keepdims, inputs);
 }
@@ -54,15 +52,15 @@ Status ArgMin::validate(std::span<const TensorDesc> inputs,
     return detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1);
 }
 
-Status ArgMin::compute(std::span<TensorView> outputs,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace)
+Status ArgMin::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                       const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

@@ -30,10 +30,9 @@ namespace {
 struct CoordTable {
     std::vector<int64_t> i0;
     std::vector<int64_t> i1;
-    std::vector<float>   w;
+    std::vector<float> w;
 
-    void build(int64_t in_size, int64_t out_size,
-               CoordinateTransformMode coord_mode, bool linear)
+    void build(int64_t in_size, int64_t out_size, CoordinateTransformMode coord_mode, bool linear)
     {
         i0.resize(static_cast<size_t>(out_size));
         i1.resize(static_cast<size_t>(out_size));
@@ -41,18 +40,17 @@ struct CoordTable {
         for (int64_t o = 0; o < out_size; ++o) {
             const float src = k::resize_compute_src_coord(o, in_size, out_size, coord_mode);
             if (!linear) {
-                const int64_t idx = k::resize_clamp_idx(
-                    static_cast<int64_t>(std::round(src)), in_size);
+                const int64_t idx =
+                    k::resize_clamp_idx(static_cast<int64_t>(std::round(src)), in_size);
                 i0[static_cast<size_t>(o)] = idx;
                 i1[static_cast<size_t>(o)] = idx;
-                w[static_cast<size_t>(o)]  = 0.0f;
+                w[static_cast<size_t>(o)] = 0.0f;
             } else {
                 const float floored = std::floor(src);
-                const int64_t lo = k::resize_clamp_idx(
-                    static_cast<int64_t>(floored), in_size);
+                const int64_t lo = k::resize_clamp_idx(static_cast<int64_t>(floored), in_size);
                 i0[static_cast<size_t>(o)] = lo;
                 i1[static_cast<size_t>(o)] = k::resize_clamp_idx(lo + 1, in_size);
-                w[static_cast<size_t>(o)]  = src - floored;
+                w[static_cast<size_t>(o)] = src - floored;
             }
         }
     }
@@ -61,28 +59,24 @@ struct CoordTable {
 struct CubicTable {
     std::vector<k::ResizeCubicTap> taps;
 
-    void build(int64_t in_size, int64_t out_size,
-               CoordinateTransformMode coord_mode, float a)
+    void build(int64_t in_size, int64_t out_size, CoordinateTransformMode coord_mode, float a)
     {
         taps.resize(static_cast<size_t>(out_size));
         for (int64_t o = 0; o < out_size; ++o) {
             taps[static_cast<size_t>(o)] = k::resize_make_cubic_tap(
-                k::resize_compute_src_coord(o, in_size, out_size, coord_mode),
-                in_size, a);
+                k::resize_compute_src_coord(o, in_size, out_size, coord_mode), in_size, a);
         }
     }
 };
 
-}  // anonymous namespace
+} // anonymous namespace
 
 template <typename T>
-void resize_impl(const ResizeAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx)
+void resize_impl(const ResizeAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
-    const int64_t rank  = input.rank();
+    const int64_t rank = input.rank();
     const int64_t srank = ResizeAttributes::spatial_rank(rank);
 
     const int64_t N = input.shape(0);
@@ -124,7 +118,7 @@ void resize_impl(const ResizeAttributes& attrs,
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    const bool cubic  = (attrs.mode == ResizeMode::Cubic);
+    const bool cubic = (attrs.mode == ResizeMode::Cubic);
     const bool linear = (attrs.mode == ResizeMode::Linear);
     const bool add_to = attrs.add_to;
 
@@ -141,43 +135,38 @@ void resize_impl(const ResizeAttributes& attrs,
         }
     }
 
-    if (OW == 0 || OH == 0 || OD == 0 || N == 0 || C == 0) { return; }
+    if (OW == 0 || OH == 0 || OD == 0 || N == 0 || C == 0) {
+        return;
+    }
 
-    auto*       out_ptr = output.ptr<T>();
-    const auto* in_ptr  = input.ptr<T>();
+    auto* out_ptr = output.ptr<T>();
+    const auto* in_ptr = input.ptr<T>();
 
-    const int64_t in_row_stride  = input.row_stride_elems();
-    const int64_t in_d_stride    = raw_IH * in_row_stride;
+    const int64_t in_row_stride = input.row_stride_elems();
+    const int64_t in_d_stride = raw_IH * in_row_stride;
     const int64_t out_row_stride = output.row_stride_elems();
-    const int64_t out_d_stride   = OH * out_row_stride;
+    const int64_t out_d_stride = OH * out_row_stride;
 
     if (is_channel_last(input.layout())) {
-        const int64_t in_n_stride  = input.stride_elems(0);
+        const int64_t in_n_stride = input.stride_elems(0);
         const int64_t out_n_stride = output.stride_elems(0);
 
         const auto process = [&](int64_t n) {
-            const T* in_base  = in_ptr + n * in_n_stride + crop_off;
-            T*       out_base = out_ptr + n * out_n_stride;
+            const T* in_base = in_ptr + n * in_n_stride + crop_off;
+            T* out_base = out_ptr + n * out_n_stride;
 
             if (cubic) {
-                k::resize_last_2d_cubic<T>(
-                    out_base, in_base, C, OH, OW,
-                    ky.taps.data(), kx.taps.data(),
-                    in_row_stride, out_row_stride, add_to);
+                k::resize_last_2d_cubic<T>(out_base, in_base, C, OH, OW, ky.taps.data(),
+                                           kx.taps.data(), in_row_stride, out_row_stride, add_to);
             } else if (srank == 3) {
-                k::resize_last_3d<T>(
-                    out_base, in_base, C, OD, OH, OW,
-                    cz.i0.data(), cz.i1.data(), cz.w.data(),
-                    cy.i0.data(), cy.i1.data(), cy.w.data(),
-                    cx.i0.data(), cx.i1.data(), cx.w.data(),
-                    in_d_stride, in_row_stride, out_d_stride, out_row_stride,
-                    linear, add_to);
+                k::resize_last_3d<T>(out_base, in_base, C, OD, OH, OW, cz.i0.data(), cz.i1.data(),
+                                     cz.w.data(), cy.i0.data(), cy.i1.data(), cy.w.data(),
+                                     cx.i0.data(), cx.i1.data(), cx.w.data(), in_d_stride,
+                                     in_row_stride, out_d_stride, out_row_stride, linear, add_to);
             } else {
-                k::resize_last_2d<T>(
-                    out_base, in_base, C, OH, OW,
-                    cy.i0.data(), cy.i1.data(), cy.w.data(),
-                    cx.i0.data(), cx.i1.data(), cx.w.data(),
-                    in_row_stride, out_row_stride, linear, add_to);
+                k::resize_last_2d<T>(out_base, in_base, C, OH, OW, cy.i0.data(), cy.i1.data(),
+                                     cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
+                                     in_row_stride, out_row_stride, linear, add_to);
             }
         };
 
@@ -185,51 +174,42 @@ void resize_impl(const ResizeAttributes& attrs,
         return;
     }
 
-    const int64_t in_c_stride  = input.stride_elems(1);
+    const int64_t in_c_stride = input.stride_elems(1);
     const int64_t out_c_stride = output.stride_elems(1);
-    const int64_t in_n_stride  = input.stride_elems(0);
+    const int64_t in_n_stride = input.stride_elems(0);
     const int64_t out_n_stride = output.stride_elems(0);
 
     const auto process = [&](int64_t task) {
         const int64_t n = task / C;
         const int64_t c = task % C;
-        const T* in_base  = in_ptr  + n * in_n_stride  + c * in_c_stride  + crop_off;
-        T*       out_base = out_ptr + n * out_n_stride + c * out_c_stride;
+        const T* in_base = in_ptr + n * in_n_stride + c * in_c_stride + crop_off;
+        T* out_base = out_ptr + n * out_n_stride + c * out_c_stride;
 
         if (cubic) {
-            k::resize_channel_first_2d_cubic<T>(
-                out_base, in_base, OH, OW,
-                ky.taps.data(), kx.taps.data(),
-                in_row_stride, out_row_stride, add_to);
+            k::resize_channel_first_2d_cubic<T>(out_base, in_base, OH, OW, ky.taps.data(),
+                                                kx.taps.data(), in_row_stride, out_row_stride,
+                                                add_to);
         } else if (srank == 3) {
             k::resize_channel_first_3d<T>(
-                out_base, in_base, OD, OH, OW,
-                cz.i0.data(), cz.i1.data(), cz.w.data(),
-                cy.i0.data(), cy.i1.data(), cy.w.data(),
-                cx.i0.data(), cx.i1.data(), cx.w.data(),
-                in_d_stride, in_row_stride, out_d_stride, out_row_stride,
-                linear, add_to);
+                out_base, in_base, OD, OH, OW, cz.i0.data(), cz.i1.data(), cz.w.data(),
+                cy.i0.data(), cy.i1.data(), cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
+                in_d_stride, in_row_stride, out_d_stride, out_row_stride, linear, add_to);
         } else {
-            k::resize_channel_first_2d<T>(
-                out_base, in_base, OH, OW,
-                cy.i0.data(), cy.i1.data(), cy.w.data(),
-                cx.i0.data(), cx.i1.data(), cx.w.data(),
-                in_row_stride, out_row_stride, linear, add_to);
+            k::resize_channel_first_2d<T>(out_base, in_base, OH, OW, cy.i0.data(), cy.i1.data(),
+                                          cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
+                                          in_row_stride, out_row_stride, linear, add_to);
         }
     };
 
     ctx.cpu.run(0, N * C, process);
 }
 
-Status resize_cpu(const ResizeAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx,
-                void* /*workspace*/)
+Status resize_cpu(const ResizeAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx,
+                  void* /*workspace*/)
 {
     // Cubic is the 2D bicubic; PyTorch and ONNX Runtime stop there too.
-    if (attrs.mode == ResizeMode::Cubic &&
-        ResizeAttributes::spatial_rank(inputs[0].rank()) != 2) {
+    if (attrs.mode == ResizeMode::Cubic && ResizeAttributes::spatial_rank(inputs[0].rank()) != 2) {
         return Status::unsupported;
     }
     dispatch_f32_f16(inputs[0].data_type(), "resize_cpu", [&](auto tag) {
@@ -239,4 +219,4 @@ Status resize_cpu(const ResizeAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

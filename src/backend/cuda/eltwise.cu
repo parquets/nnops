@@ -18,32 +18,25 @@ namespace nnops::backend::cuda {
 // ============================================================
 
 template <typename T>
-__global__ void eltwise_kernel(
-    const T* __restrict__ a,
-    const T* __restrict__ b,
-    T* __restrict__ output,
-    int64_t num_rows,
-    int64_t last_dim,
-    int64_t a_row_stride,
-    int64_t b_row_stride,
-    int64_t o_row_stride,
-    EltwiseType op_type,
-    bool add_to)
+__global__ void eltwise_kernel(const T* __restrict__ a, const T* __restrict__ b,
+                               T* __restrict__ output, int64_t num_rows, int64_t last_dim,
+                               int64_t a_row_stride, int64_t b_row_stride, int64_t o_row_stride,
+                               EltwiseType op_type, bool add_to)
 {
-    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;  // 128-bit / sizeof(T)
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4; // 128-bit / sizeof(T)
 
     const int tid = threadIdx.x;
     const int row = blockIdx.x;
 
-    if (row >= num_rows) return;
+    if (row >= num_rows)
+        return;
 
     const T* a_row = a + row * a_row_stride;
     const T* b_row = b + row * b_row_stride;
     T* o_row = output + row * o_row_stride;
 
     // An unaligned row walks the scalar loops instead of the 16 B ones.
-    const int64_t vec_end =
-        aligned16(a_row, b_row, o_row) ? (last_dim / VEC) * VEC : 0;
+    const int64_t vec_end = aligned16(a_row, b_row, o_row) ? (last_dim / VEC) * VEC : 0;
 
     switch (op_type) {
     // ================================================================
@@ -56,13 +49,11 @@ __global__ void eltwise_kernel(
                 float4 vb = v4_load(&b_row[i]);
                 if (add_to) {
                     float4 vo = v4_load(&o_row[i]);
-                    v4_store(&o_row[i], make_float4(
-                        vo.x + va.x + vb.x, vo.y + va.y + vb.y,
-                        vo.z + va.z + vb.z, vo.w + va.w + vb.w));
+                    v4_store(&o_row[i], make_float4(vo.x + va.x + vb.x, vo.y + va.y + vb.y,
+                                                    vo.z + va.z + vb.z, vo.w + va.w + vb.w));
                 } else {
-                    v4_store(&o_row[i], make_float4(
-                        va.x + vb.x, va.y + vb.y,
-                        va.z + vb.z, va.w + vb.w));
+                    v4_store(&o_row[i],
+                             make_float4(va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w));
                 }
             }
         } else {
@@ -78,8 +69,8 @@ __global__ void eltwise_kernel(
                 float r6 = elem_to_float(va.data[6]) + elem_to_float(vb.data[6]);
                 float r7 = elem_to_float(va.data[7]) + elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i],
+                             pack8_add<T>(v4_load(&o_row[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -105,13 +96,11 @@ __global__ void eltwise_kernel(
                 float4 vb = v4_load(&b_row[i]);
                 if (add_to) {
                     float4 vo = v4_load(&o_row[i]);
-                    v4_store(&o_row[i], make_float4(
-                        vo.x + va.x - vb.x, vo.y + va.y - vb.y,
-                        vo.z + va.z - vb.z, vo.w + va.w - vb.w));
+                    v4_store(&o_row[i], make_float4(vo.x + va.x - vb.x, vo.y + va.y - vb.y,
+                                                    vo.z + va.z - vb.z, vo.w + va.w - vb.w));
                 } else {
-                    v4_store(&o_row[i], make_float4(
-                        va.x - vb.x, va.y - vb.y,
-                        va.z - vb.z, va.w - vb.w));
+                    v4_store(&o_row[i],
+                             make_float4(va.x - vb.x, va.y - vb.y, va.z - vb.z, va.w - vb.w));
                 }
             }
         } else {
@@ -127,8 +116,8 @@ __global__ void eltwise_kernel(
                 float r6 = elem_to_float(va.data[6]) - elem_to_float(vb.data[6]);
                 float r7 = elem_to_float(va.data[7]) - elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i],
+                             pack8_add<T>(v4_load(&o_row[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -154,13 +143,11 @@ __global__ void eltwise_kernel(
                 float4 vb = v4_load(&b_row[i]);
                 if (add_to) {
                     float4 vo = v4_load(&o_row[i]);
-                    v4_store(&o_row[i], make_float4(
-                        vo.x + va.x * vb.x, vo.y + va.y * vb.y,
-                        vo.z + va.z * vb.z, vo.w + va.w * vb.w));
+                    v4_store(&o_row[i], make_float4(vo.x + va.x * vb.x, vo.y + va.y * vb.y,
+                                                    vo.z + va.z * vb.z, vo.w + va.w * vb.w));
                 } else {
-                    v4_store(&o_row[i], make_float4(
-                        va.x * vb.x, va.y * vb.y,
-                        va.z * vb.z, va.w * vb.w));
+                    v4_store(&o_row[i],
+                             make_float4(va.x * vb.x, va.y * vb.y, va.z * vb.z, va.w * vb.w));
                 }
             }
         } else {
@@ -176,8 +163,8 @@ __global__ void eltwise_kernel(
                 float r6 = elem_to_float(va.data[6]) * elem_to_float(vb.data[6]);
                 float r7 = elem_to_float(va.data[7]) * elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i],
+                             pack8_add<T>(v4_load(&o_row[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -203,13 +190,11 @@ __global__ void eltwise_kernel(
                 float4 vb = v4_load(&b_row[i]);
                 if (add_to) {
                     float4 vo = v4_load(&o_row[i]);
-                    v4_store(&o_row[i], make_float4(
-                        vo.x + va.x / vb.x, vo.y + va.y / vb.y,
-                        vo.z + va.z / vb.z, vo.w + va.w / vb.w));
+                    v4_store(&o_row[i], make_float4(vo.x + va.x / vb.x, vo.y + va.y / vb.y,
+                                                    vo.z + va.z / vb.z, vo.w + va.w / vb.w));
                 } else {
-                    v4_store(&o_row[i], make_float4(
-                        va.x / vb.x, va.y / vb.y,
-                        va.z / vb.z, va.w / vb.w));
+                    v4_store(&o_row[i],
+                             make_float4(va.x / vb.x, va.y / vb.y, va.z / vb.z, va.w / vb.w));
                 }
             }
         } else {
@@ -225,8 +210,8 @@ __global__ void eltwise_kernel(
                 float r6 = elem_to_float(va.data[6]) / elem_to_float(vb.data[6]);
                 float r7 = elem_to_float(va.data[7]) / elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i],
+                             pack8_add<T>(v4_load(&o_row[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -256,8 +241,7 @@ __global__ void eltwise_kernel(
                 float r3 = fminf(va.w, vb.w);
                 if (add_to) {
                     float4 vo = v4_load(&o_row[i]);
-                    v4_store(&o_row[i], make_float4(
-                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                    v4_store(&o_row[i], make_float4(vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
                 } else {
                     v4_store(&o_row[i], make_float4(r0, r1, r2, r3));
                 }
@@ -275,8 +259,8 @@ __global__ void eltwise_kernel(
                 float r6 = fminf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
                 float r7 = fminf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i],
+                             pack8_add<T>(v4_load(&o_row[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -308,8 +292,7 @@ __global__ void eltwise_kernel(
                 float r3 = fmaxf(va.w, vb.w);
                 if (add_to) {
                     float4 vo = v4_load(&o_row[i]);
-                    v4_store(&o_row[i], make_float4(
-                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                    v4_store(&o_row[i], make_float4(vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
                 } else {
                     v4_store(&o_row[i], make_float4(r0, r1, r2, r3));
                 }
@@ -327,8 +310,8 @@ __global__ void eltwise_kernel(
                 float r6 = fmaxf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
                 float r7 = fmaxf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i],
+                             pack8_add<T>(v4_load(&o_row[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -360,8 +343,7 @@ __global__ void eltwise_kernel(
                 float r3 = powf(va.w, vb.w);
                 if (add_to) {
                     float4 vo = v4_load(&o_row[i]);
-                    v4_store(&o_row[i], make_float4(
-                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                    v4_store(&o_row[i], make_float4(vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
                 } else {
                     v4_store(&o_row[i], make_float4(r0, r1, r2, r3));
                 }
@@ -379,8 +361,8 @@ __global__ void eltwise_kernel(
                 float r6 = powf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
                 float r7 = powf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&o_row[i], pack8_add<T>(v4_load(&o_row[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&o_row[i],
+                             pack8_add<T>(v4_load(&o_row[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&o_row[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -404,15 +386,11 @@ __global__ void eltwise_kernel(
 // ============================================================
 
 template <typename T>
-__global__ void eltwise_flat_kernel(
-    const T* __restrict__ a,
-    const T* __restrict__ b,
-    T* __restrict__ output,
-    int64_t total,
-    EltwiseType op_type,
-    bool add_to)
+__global__ void eltwise_flat_kernel(const T* __restrict__ a, const T* __restrict__ b,
+                                    T* __restrict__ output, int64_t total, EltwiseType op_type,
+                                    bool add_to)
 {
-    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;  // 128-bit / sizeof(T)
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4; // 128-bit / sizeof(T)
 
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
@@ -429,13 +407,11 @@ __global__ void eltwise_flat_kernel(
                 float4 vb = v4_load(&b[i]);
                 if (add_to) {
                     float4 vo = v4_load(&output[i]);
-                    v4_store(&output[i], make_float4(
-                        vo.x + va.x + vb.x, vo.y + va.y + vb.y,
-                        vo.z + va.z + vb.z, vo.w + va.w + vb.w));
+                    v4_store(&output[i], make_float4(vo.x + va.x + vb.x, vo.y + va.y + vb.y,
+                                                     vo.z + va.z + vb.z, vo.w + va.w + vb.w));
                 } else {
-                    v4_store(&output[i], make_float4(
-                        va.x + vb.x, va.y + vb.y,
-                        va.z + vb.z, va.w + vb.w));
+                    v4_store(&output[i],
+                             make_float4(va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w));
                 }
             }
         } else {
@@ -451,8 +427,8 @@ __global__ void eltwise_flat_kernel(
                 float r6 = elem_to_float(va.data[6]) + elem_to_float(vb.data[6]);
                 float r7 = elem_to_float(va.data[7]) + elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i],
+                             pack8_add<T>(v4_load(&output[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -478,13 +454,11 @@ __global__ void eltwise_flat_kernel(
                 float4 vb = v4_load(&b[i]);
                 if (add_to) {
                     float4 vo = v4_load(&output[i]);
-                    v4_store(&output[i], make_float4(
-                        vo.x + va.x - vb.x, vo.y + va.y - vb.y,
-                        vo.z + va.z - vb.z, vo.w + va.w - vb.w));
+                    v4_store(&output[i], make_float4(vo.x + va.x - vb.x, vo.y + va.y - vb.y,
+                                                     vo.z + va.z - vb.z, vo.w + va.w - vb.w));
                 } else {
-                    v4_store(&output[i], make_float4(
-                        va.x - vb.x, va.y - vb.y,
-                        va.z - vb.z, va.w - vb.w));
+                    v4_store(&output[i],
+                             make_float4(va.x - vb.x, va.y - vb.y, va.z - vb.z, va.w - vb.w));
                 }
             }
         } else {
@@ -500,8 +474,8 @@ __global__ void eltwise_flat_kernel(
                 float r6 = elem_to_float(va.data[6]) - elem_to_float(vb.data[6]);
                 float r7 = elem_to_float(va.data[7]) - elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i],
+                             pack8_add<T>(v4_load(&output[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -527,13 +501,11 @@ __global__ void eltwise_flat_kernel(
                 float4 vb = v4_load(&b[i]);
                 if (add_to) {
                     float4 vo = v4_load(&output[i]);
-                    v4_store(&output[i], make_float4(
-                        vo.x + va.x * vb.x, vo.y + va.y * vb.y,
-                        vo.z + va.z * vb.z, vo.w + va.w * vb.w));
+                    v4_store(&output[i], make_float4(vo.x + va.x * vb.x, vo.y + va.y * vb.y,
+                                                     vo.z + va.z * vb.z, vo.w + va.w * vb.w));
                 } else {
-                    v4_store(&output[i], make_float4(
-                        va.x * vb.x, va.y * vb.y,
-                        va.z * vb.z, va.w * vb.w));
+                    v4_store(&output[i],
+                             make_float4(va.x * vb.x, va.y * vb.y, va.z * vb.z, va.w * vb.w));
                 }
             }
         } else {
@@ -549,8 +521,8 @@ __global__ void eltwise_flat_kernel(
                 float r6 = elem_to_float(va.data[6]) * elem_to_float(vb.data[6]);
                 float r7 = elem_to_float(va.data[7]) * elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i],
+                             pack8_add<T>(v4_load(&output[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -576,13 +548,11 @@ __global__ void eltwise_flat_kernel(
                 float4 vb = v4_load(&b[i]);
                 if (add_to) {
                     float4 vo = v4_load(&output[i]);
-                    v4_store(&output[i], make_float4(
-                        vo.x + va.x / vb.x, vo.y + va.y / vb.y,
-                        vo.z + va.z / vb.z, vo.w + va.w / vb.w));
+                    v4_store(&output[i], make_float4(vo.x + va.x / vb.x, vo.y + va.y / vb.y,
+                                                     vo.z + va.z / vb.z, vo.w + va.w / vb.w));
                 } else {
-                    v4_store(&output[i], make_float4(
-                        va.x / vb.x, va.y / vb.y,
-                        va.z / vb.z, va.w / vb.w));
+                    v4_store(&output[i],
+                             make_float4(va.x / vb.x, va.y / vb.y, va.z / vb.z, va.w / vb.w));
                 }
             }
         } else {
@@ -598,8 +568,8 @@ __global__ void eltwise_flat_kernel(
                 float r6 = elem_to_float(va.data[6]) / elem_to_float(vb.data[6]);
                 float r7 = elem_to_float(va.data[7]) / elem_to_float(vb.data[7]);
                 if (add_to) {
-                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i],
+                             pack8_add<T>(v4_load(&output[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -629,8 +599,7 @@ __global__ void eltwise_flat_kernel(
                 float r3 = fminf(va.w, vb.w);
                 if (add_to) {
                     float4 vo = v4_load(&output[i]);
-                    v4_store(&output[i], make_float4(
-                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                    v4_store(&output[i], make_float4(vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
                 } else {
                     v4_store(&output[i], make_float4(r0, r1, r2, r3));
                 }
@@ -648,8 +617,8 @@ __global__ void eltwise_flat_kernel(
                 float r6 = fminf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
                 float r7 = fminf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i],
+                             pack8_add<T>(v4_load(&output[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -681,8 +650,7 @@ __global__ void eltwise_flat_kernel(
                 float r3 = fmaxf(va.w, vb.w);
                 if (add_to) {
                     float4 vo = v4_load(&output[i]);
-                    v4_store(&output[i], make_float4(
-                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                    v4_store(&output[i], make_float4(vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
                 } else {
                     v4_store(&output[i], make_float4(r0, r1, r2, r3));
                 }
@@ -700,8 +668,8 @@ __global__ void eltwise_flat_kernel(
                 float r6 = fmaxf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
                 float r7 = fmaxf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i],
+                             pack8_add<T>(v4_load(&output[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -733,8 +701,7 @@ __global__ void eltwise_flat_kernel(
                 float r3 = powf(va.w, vb.w);
                 if (add_to) {
                     float4 vo = v4_load(&output[i]);
-                    v4_store(&output[i], make_float4(
-                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                    v4_store(&output[i], make_float4(vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
                 } else {
                     v4_store(&output[i], make_float4(r0, r1, r2, r3));
                 }
@@ -752,8 +719,8 @@ __global__ void eltwise_flat_kernel(
                 float r6 = powf(elem_to_float(va.data[6]), elem_to_float(vb.data[6]));
                 float r7 = powf(elem_to_float(va.data[7]), elem_to_float(vb.data[7]));
                 if (add_to) {
-                    v4_store(&output[i], pack8_add<T>(v4_load(&output[i]),
-                        r0, r1, r2, r3, r4, r5, r6, r7));
+                    v4_store(&output[i],
+                             pack8_add<T>(v4_load(&output[i]), r0, r1, r2, r3, r4, r5, r6, r7));
                 } else {
                     v4_store(&output[i], pack8_set<T>(r0, r1, r2, r3, r4, r5, r6, r7));
                 }
@@ -777,16 +744,14 @@ __global__ void eltwise_flat_kernel(
 // ============================================================
 
 template <typename T>
-void eltwise_cuda_impl(
-    const EltwiseAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void eltwise_cuda_impl(const EltwiseAttributes& attrs, TensorView& output,
+                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& A = inputs[0];
     const auto& B = inputs[1];
     const int64_t total = A.numel();
-    if (total == 0) return;
+    if (total == 0)
+        return;
     NNOPS_ASSERT(A.numel() == B.numel());
     NNOPS_ASSERT(output.numel() == total);
 
@@ -796,18 +761,16 @@ void eltwise_cuda_impl(
     if (rank <= 1) {
         // Flat tensor — use flat kernel with grid-stride loop
         const int block_size = kCudaBlockSize;
-        const int grid_size = std::min(
-            static_cast<int>(ceil_div(total, static_cast<int64_t>(block_size))),
-            65535);
+        const int grid_size =
+            std::min(static_cast<int>(ceil_div(total, static_cast<int64_t>(block_size))), 65535);
         eltwise_flat_kernel<<<grid_size, block_size, 0, stream>>>(
-            A.ptr<T>(), B.ptr<T>(), output.ptr<T>(),
-            total, attrs.type, attrs.add_to);
+            A.ptr<T>(), B.ptr<T>(), output.ptr<T>(), total, attrs.type, attrs.add_to);
     } else {
         // Row-by-row processing, respecting pitch. A channel-last row is one
         // spatial line — W pixels × C channels.
-        const int64_t last_dim = (rank >= 3 && is_channel_last(A.layout()))
-            ? A.shape(1) * A.shape(rank - 1)
-            : A.shape(rank - 1);
+        const int64_t last_dim = (rank >= 3 && is_channel_last(A.layout())) ?
+                                     A.shape(1) * A.shape(rank - 1) :
+                                     A.shape(rank - 1);
         const int64_t num_rows = A.total_rows();
         const int64_t a_row_stride = A.row_stride_elems();
         const int64_t b_row_stride = B.row_stride_elems();
@@ -816,9 +779,8 @@ void eltwise_cuda_impl(
         const int block_size = std::min(static_cast<int>(last_dim), kCudaBlockSize);
 
         eltwise_kernel<<<num_rows, block_size, 0, stream>>>(
-            A.ptr<T>(), B.ptr<T>(), output.ptr<T>(),
-            num_rows, last_dim, a_row_stride, b_row_stride, o_row_stride,
-            attrs.type, attrs.add_to);
+            A.ptr<T>(), B.ptr<T>(), output.ptr<T>(), num_rows, last_dim, a_row_stride, b_row_stride,
+            o_row_stride, attrs.type, attrs.add_to);
     }
 }
 
@@ -826,12 +788,9 @@ void eltwise_cuda_impl(
 // Entry point
 // ============================================================
 
-Status eltwise_cuda(
-    const EltwiseAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx,
-    void* /*workspace*/)
+Status eltwise_cuda(const EltwiseAttributes& attrs, TensorView& output,
+                    std::span<const TensorView> inputs, const ComputeContext& ctx,
+                    void* /*workspace*/)
 {
     const auto dtype = inputs[0].data_type();
     switch (dtype) {
@@ -850,4 +809,4 @@ Status eltwise_cuda(
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

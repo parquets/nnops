@@ -49,20 +49,21 @@ using namespace nnops::simd;
 namespace {
 
 struct RoPESection {
-    int64_t dim_start;   // inclusive
-    int64_t dim_end;     // exclusive (must be even)
-    float   base;
+    int64_t dim_start; // inclusive
+    int64_t dim_end;   // exclusive (must be even)
+    float base;
 };
 
-std::vector<RoPESection> build_sections(const RoPEAttributes& attrs, int64_t head_dim) {
+std::vector<RoPESection> build_sections(const RoPEAttributes& attrs, int64_t head_dim)
+{
     std::vector<RoPESection> secs;
     if (attrs.mrope_section_dims.empty()) {
         secs.push_back({0, head_dim, attrs.base});
     } else {
         int64_t off = 0;
         for (size_t i = 0; i < attrs.mrope_section_dims.size(); ++i) {
-            float b = (i < attrs.mrope_section_bases.size())
-                ? attrs.mrope_section_bases[i] : attrs.base;
+            float b =
+                (i < attrs.mrope_section_bases.size()) ? attrs.mrope_section_bases[i] : attrs.base;
             secs.push_back({off, off + attrs.mrope_section_dims[i], b});
             off += attrs.mrope_section_dims[i];
         }
@@ -75,9 +76,9 @@ std::vector<RoPESection> build_sections(const RoPEAttributes& attrs, int64_t hea
 struct SectionPlan {
     int64_t dim;
     int64_t pairs;
-    float   base;
-    float   low;
-    float   high;
+    float base;
+    float low;
+    float high;
 };
 
 constexpr float kTwoPi = 6.28318530717958647692528677f;
@@ -87,14 +88,12 @@ constexpr float kTwoPi = 6.28318530717958647692528677f;
 /// sits at this dim. Both HF and llama.cpp spell it this way.
 float correction_dim(int64_t dim, float rotations, float base, int64_t orig)
 {
-    return static_cast<float>(dim)
-         * std::log(static_cast<float>(orig) / (rotations * kTwoPi))
-         / (2.0f * std::log(base));
+    return static_cast<float>(dim) * std::log(static_cast<float>(orig) / (rotations * kTwoPi)) /
+           (2.0f * std::log(base));
 }
 
 std::vector<SectionPlan> plan_sections(const RoPEAttributes& attrs,
-                                       const std::vector<RoPESection>& sections,
-                                       int64_t seq_len)
+                                       const std::vector<RoPESection>& sections, int64_t seq_len)
 {
     std::vector<SectionPlan> plans;
     plans.reserve(sections.size());
@@ -102,8 +101,8 @@ std::vector<SectionPlan> plan_sections(const RoPEAttributes& attrs,
     // Dynamic NTK pivots on the run's end position: with an offset the chunk
     // ends at offset + seq_len, which is the seq_len HF derives from
     // max(position_ids) + 1.
-    const double end_pos = static_cast<double>(attrs.position_offset)
-                         + static_cast<double>(seq_len);
+    const double end_pos =
+        static_cast<double>(attrs.position_offset) + static_cast<double>(seq_len);
     const double orig = static_cast<double>(attrs.original_max_position);
 
     for (const auto& sec : sections) {
@@ -112,21 +111,19 @@ std::vector<SectionPlan> plan_sections(const RoPEAttributes& attrs,
 
         if (attrs.scaling_type == RoPEScalingType::Dynamic) {
             const double len = std::max(end_pos, orig);
-            const double exp = sec_len > 2
-                ? static_cast<double>(sec_len) / static_cast<double>(sec_len - 2)
-                : 1.0;
-            const double mult = attrs.scaling_factor * len / orig
-                              - (attrs.scaling_factor - 1.0);
+            const double exp =
+                sec_len > 2 ? static_cast<double>(sec_len) / static_cast<double>(sec_len - 2) : 1.0;
+            const double mult = attrs.scaling_factor * len / orig - (attrs.scaling_factor - 1.0);
             p.base = static_cast<float>(sec.base * std::pow(mult, exp));
         } else if (attrs.scaling_type == RoPEScalingType::YaRN) {
             // Same truncation llama.cpp always applies: floor the fast bound,
             // ceil the slow one, then clamp into the dimension range.
-            p.low = std::max(0.0f,
-                std::floor(correction_dim(sec_len, attrs.yarn_beta_fast,
-                                          sec.base, attrs.original_max_position)));
+            p.low =
+                std::max(0.0f, std::floor(correction_dim(sec_len, attrs.yarn_beta_fast, sec.base,
+                                                         attrs.original_max_position)));
             p.high = std::min(static_cast<float>(sec_len - 1),
-                std::ceil(correction_dim(sec_len, attrs.yarn_beta_slow,
-                                         sec.base, attrs.original_max_position)));
+                              std::ceil(correction_dim(sec_len, attrs.yarn_beta_slow, sec.base,
+                                                       attrs.original_max_position)));
         }
         plans.push_back(p);
     }
@@ -135,35 +132,31 @@ std::vector<SectionPlan> plan_sections(const RoPEAttributes& attrs,
 
 float yarn_attention_scale(const RoPEAttributes& attrs)
 {
-    if (attrs.attention_factor > 0.0f) { return attrs.attention_factor; }
-    return attrs.scaling_factor > 1.0f
-        ? 1.0f + 0.1f * std::log(attrs.scaling_factor)
-        : 1.0f;
+    if (attrs.attention_factor > 0.0f) {
+        return attrs.attention_factor;
+    }
+    return attrs.scaling_factor > 1.0f ? 1.0f + 0.1f * std::log(attrs.scaling_factor) : 1.0f;
 }
 
-void compute_cos_sin_tables(
-    PoolArray<float>& cos_table,
-    PoolArray<float>& sin_table,
-    int64_t seq_len,
-    int64_t rotary_dim,
-    const std::vector<RoPESection>& sections,
-    const RoPEAttributes& attrs)
+void compute_cos_sin_tables(PoolArray<float>& cos_table, PoolArray<float>& sin_table,
+                            int64_t seq_len, int64_t rotary_dim,
+                            const std::vector<RoPESection>& sections, const RoPEAttributes& attrs)
 {
     const int64_t half = rotary_dim / 2;
-    const size_t  total = static_cast<size_t>(seq_len) * static_cast<size_t>(half);
+    const size_t total = static_cast<size_t>(seq_len) * static_cast<size_t>(half);
     cos_table.reset(total);
     sin_table.reset(total);
 
-    const auto  plans      = plan_sections(attrs, sections, seq_len);
-    const bool  linear     = attrs.scaling_type == RoPEScalingType::Linear;
-    const bool  yarn       = attrs.scaling_type == RoPEScalingType::YaRN;
-    const bool  llama3     = attrs.scaling_type == RoPEScalingType::Llama3;
-    const float factor     = attrs.scaling_factor;
-    const float magnitude  = yarn ? yarn_attention_scale(attrs) : 1.0f;
+    const auto plans = plan_sections(attrs, sections, seq_len);
+    const bool linear = attrs.scaling_type == RoPEScalingType::Linear;
+    const bool yarn = attrs.scaling_type == RoPEScalingType::YaRN;
+    const bool llama3 = attrs.scaling_type == RoPEScalingType::Llama3;
+    const float factor = attrs.scaling_factor;
+    const float magnitude = yarn ? yarn_attention_scale(attrs) : 1.0f;
 
     // Llama3's two wavelength bands, both divisors of the pretraining window.
-    const float orig       = static_cast<float>(attrs.original_max_position);
-    const float low_wavelen  = orig / attrs.llama3_low_freq_factor;
+    const float orig = static_cast<float>(attrs.original_max_position);
+    const float low_wavelen = orig / attrs.llama3_low_freq_factor;
     const float high_wavelen = orig / attrs.llama3_high_freq_factor;
     const float band = attrs.llama3_high_freq_factor - attrs.llama3_low_freq_factor;
 
@@ -177,8 +170,7 @@ void compute_cos_sin_tables(
             const float sec_dim_f = static_cast<float>(plan.dim);
 
             for (int64_t p = 0; p < plan.pairs; ++p) {
-                const float ratio = std::pow(plan.base,
-                    2.0f * static_cast<float>(p) / sec_dim_f);
+                const float ratio = std::pow(plan.base, 2.0f * static_cast<float>(p) / sec_dim_f);
                 const float extrap = pos_f / ratio;
 
                 float theta = extrap;
@@ -188,10 +180,9 @@ void compute_cos_sin_tables(
                     // Ramp 0 keeps the extrapolated angle at the fast-rotating
                     // dims, 1 takes the interpolated one at the slow dims.
                     const float interp = extrap / factor;
-                    const float ramp = std::clamp(
-                        (static_cast<float>(p) - plan.low)
-                            / std::max(0.001f, plan.high - plan.low),
-                        0.0f, 1.0f);
+                    const float ramp = std::clamp((static_cast<float>(p) - plan.low) /
+                                                      std::max(0.001f, plan.high - plan.low),
+                                                  0.0f, 1.0f);
                     theta = interp * ramp + extrap * (1.0f - ramp);
                 } else if (llama3) {
                     // Short wavelengths are untouched, long ones divide by
@@ -201,8 +192,7 @@ void compute_cos_sin_tables(
                         theta = extrap / factor;
                     } else if (wavelen >= high_wavelen) {
                         const float smooth = std::clamp(
-                            (orig / wavelen - attrs.llama3_low_freq_factor) / band,
-                            0.0f, 1.0f);
+                            (orig / wavelen - attrs.llama3_low_freq_factor) / band, 0.0f, 1.0f);
                         theta = extrap * ((1.0f - smooth) / factor + smooth);
                     }
                 }
@@ -215,12 +205,10 @@ void compute_cos_sin_tables(
     }
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 template <typename T>
-void rope_impl(const RoPEAttributes& attrs,
-               TensorView& output,
-               std::span<const TensorView> inputs,
+void rope_impl(const RoPEAttributes& attrs, TensorView& output, std::span<const TensorView> inputs,
                const ComputeContext& ctx)
 {
     const auto& X = inputs[0];
@@ -246,10 +234,10 @@ void rope_impl(const RoPEAttributes& attrs,
     // bases, the mRoPE sections and the scaling types do not apply. A table in
     // the activation dtype is widened once into f32, the same layout the
     // computed tables use.
-    const bool  has_table = inputs.size() > 3 && !inputs[3].is_empty();
+    const bool has_table = inputs.size() > 3 && !inputs[3].is_empty();
     const float* cos_src = nullptr;
     const float* sin_src = nullptr;
-    int64_t      tbl_stride = half;
+    int64_t tbl_stride = half;
     PoolArray<float> cos_table;
     PoolArray<float> sin_table;
 
@@ -286,25 +274,23 @@ void rope_impl(const RoPEAttributes& attrs,
         sin_src = sin_table.data();
     }
 
-    const T* x_ptr   = X.ptr<T>();
-    T*       y_ptr   = output.ptr<T>();
-    const int64_t row_stride  = X.row_stride_elems();
+    const T* x_ptr = X.ptr<T>();
+    T* y_ptr = output.ptr<T>();
+    const int64_t row_stride = X.row_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
-    const bool    interleaved = attrs.interleaved;
+    const bool interleaved = attrs.interleaved;
 
-    const T* gamma = inputs.size() > 1 && !inputs[1].is_empty()
-                         ? inputs[1].ptr<T>() : nullptr;
-    const T* beta  = inputs.size() > 2 && !inputs[2].is_empty()
-                         ? inputs[2].ptr<T>() : nullptr;
+    const T* gamma = inputs.size() > 1 && !inputs[1].is_empty() ? inputs[1].ptr<T>() : nullptr;
+    const T* beta = inputs.size() > 2 && !inputs[2].is_empty() ? inputs[2].ptr<T>() : nullptr;
     const float norm_eps = attrs.norm_epsilon;
 
     const auto process_outer = [&](int64_t outer) {
         const T* x_outer = x_ptr + outer * seq_len * row_stride;
-        T*       y_outer = y_ptr + outer * seq_len * out_row_stride;
+        T* y_outer = y_ptr + outer * seq_len * out_row_stride;
 
         for (int64_t pos = 0; pos < seq_len; ++pos) {
             const T* x_row = x_outer + pos * row_stride;
-            T*       y_row = y_outer + pos * out_row_stride;
+            T* y_row = y_outer + pos * out_row_stride;
             const float* cos_row = cos_src + pos * tbl_stride;
             const float* sin_row = sin_src + pos * tbl_stride;
 
@@ -313,24 +299,20 @@ void rope_impl(const RoPEAttributes& attrs,
                 // prefix in place — one fewer tensor pass than norm+rope.
                 auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_row, head_dim);
                 (void)sum;
-                const float inv_rms = 1.0f / std::sqrt(
-                    sum_sq / static_cast<float>(head_dim) + norm_eps);
+                const float inv_rms =
+                    1.0f / std::sqrt(sum_sq / static_cast<float>(head_dim) + norm_eps);
                 if (beta) {
                     kernel::norm_apply_row<T, false, true, true>(
-                        x_row, y_row, head_dim, 0.0f, inv_rms,
-                        gamma, beta, false, false);
+                        x_row, y_row, head_dim, 0.0f, inv_rms, gamma, beta, false, false);
                 } else {
                     kernel::norm_apply_row<T, false, true, false>(
-                        x_row, y_row, head_dim, 0.0f, inv_rms,
-                        gamma, nullptr, false, false);
+                        x_row, y_row, head_dim, 0.0f, inv_rms, gamma, nullptr, false, false);
                 }
-                kernel::rope_process_row<T>(
-                    y_row, y_row, head_dim, rotary_dim, cos_row, sin_row,
-                    interleaved);
+                kernel::rope_process_row<T>(y_row, y_row, head_dim, rotary_dim, cos_row, sin_row,
+                                            interleaved);
             } else {
-                kernel::rope_process_row<T>(
-                    y_row, x_row, head_dim, rotary_dim, cos_row, sin_row,
-                    interleaved);
+                kernel::rope_process_row<T>(y_row, x_row, head_dim, rotary_dim, cos_row, sin_row,
+                                            interleaved);
             }
         }
     };
@@ -338,11 +320,8 @@ void rope_impl(const RoPEAttributes& attrs,
     ctx.cpu.run(0, outer_count, process_outer);
 }
 
-Status rope_cpu(const RoPEAttributes& attrs,
-              TensorView& output,
-              std::span<const TensorView> inputs,
-              const ComputeContext& ctx,
-              void* /*workspace*/)
+Status rope_cpu(const RoPEAttributes& attrs, TensorView& output, std::span<const TensorView> inputs,
+                const ComputeContext& ctx, void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "rope_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -351,4 +330,4 @@ Status rope_cpu(const RoPEAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

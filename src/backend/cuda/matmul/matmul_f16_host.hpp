@@ -55,4 +55,4 @@ struct ManualHCall {
 /// Launch the hand-written kernel; false when the call is outside its pose.
 bool manual_dense_h_call(const ManualHCall& call, cudaStream_t stream);
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

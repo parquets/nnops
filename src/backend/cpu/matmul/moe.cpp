@@ -66,20 +66,15 @@ inline bool has_input(std::span<const TensorView> inputs, size_t i) noexcept
     return i < inputs.size() && !inputs[i].is_empty();
 }
 
-template <typename T>
-inline float ldf(const T* p) noexcept { return simd::s_load(p); }
+template <typename T> inline float ldf(const T* p) noexcept { return simd::s_load(p); }
 
-template <typename T>
-inline void stf(T* p, float v) noexcept { simd::s_store(p, v); }
+template <typename T> inline void stf(T* p, float v) noexcept { simd::s_store(p, v); }
 
 /// Elementwise router scores for the gatings that do not need the whole row
 /// (softmax is normalized by the caller). Sigmoid saturates on its own;
 /// softplus needs the guard at 20 that ggml uses — beyond it log1p(exp(x))
 /// already equals x in f32, and exp(x) overflows f32 near 88.
-inline float gating_sigmoid(float x) noexcept
-{
-    return 1.0f / (1.0f + std::exp(-x));
-}
+inline float gating_sigmoid(float x) noexcept { return 1.0f / (1.0f + std::exp(-x)); }
 
 inline float gating_sqrt_softplus(float x) noexcept
 {
@@ -92,9 +87,12 @@ inline float gating_sqrt_softplus(float x) noexcept
 inline EpilogueActivateType epilogue_of(MoEActivation act) noexcept
 {
     switch (act) {
-    case MoEActivation::Relu: return EpilogueActivateType::Relu;
-    case MoEActivation::Gelu: return EpilogueActivateType::Gelu;
-    case MoEActivation::Silu: return EpilogueActivateType::Silu;
+    case MoEActivation::Relu:
+        return EpilogueActivateType::Relu;
+    case MoEActivation::Gelu:
+        return EpilogueActivateType::Gelu;
+    case MoEActivation::Silu:
+        return EpilogueActivateType::Silu;
     case MoEActivation::Identity:
     case MoEActivation::SwiGLU:
     case MoEActivation::GeGLU:
@@ -108,8 +106,7 @@ inline EpilogueActivateType epilogue_of(MoEActivation act) noexcept
 /// cases.
 inline EpilogueActivateType gate_act_of(MoEActivation act) noexcept
 {
-    return act == MoEActivation::GeGLU ? EpilogueActivateType::Gelu
-                                       : EpilogueActivateType::Silu;
+    return act == MoEActivation::GeGLU ? EpilogueActivateType::Gelu : EpilogueActivateType::Silu;
 }
 
 /// Run one `[M,K] x [N,K]^T -> [M,N]` GEMM into @p out, whose rows are @p ld
@@ -123,20 +120,19 @@ inline EpilogueActivateType gate_act_of(MoEActivation act) noexcept
 /// @p b is raw weight storage of @p bdt, which may be block-packed: the caller
 /// offsets it by whole rows either way, and MatMul is what knows the format.
 template <typename T>
-void expert_gemm(const T* a, int64_t lda, int64_t M, int64_t K,
-                 const void* b, int64_t N, DataType bdt,
-                 const T* bias, const Epilogue& ep,
-                 T* out, int64_t ld,
-                 DataType dt, const ComputeContext& ctx)
+void expert_gemm(const T* a, int64_t lda, int64_t M, int64_t K, const void* b, int64_t N,
+                 DataType bdt, const T* bias, const Epilogue& ep, T* out, int64_t ld, DataType dt,
+                 const ComputeContext& ctx)
 {
-    if (M == 0 || N == 0 || K == 0) { return; }
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
 
     const int64_t a_shape[] = {M, K};
     const int64_t b_shape[] = {N, K};
     const int64_t c_shape[] = {M, N};
 
-    TensorView a_view(a_shape, dt, const_cast<T*>(a),
-                      lda * static_cast<int64_t>(sizeof(T)));
+    TensorView a_view(a_shape, dt, const_cast<T*>(a), lda * static_cast<int64_t>(sizeof(T)));
     TensorView b_view(b_shape, bdt, const_cast<void*>(b));
     // beta = 0: the GEMM overwrites its slice, so no clear pass is needed.
     TensorView c_view(c_shape, dt, out, ld * static_cast<int64_t>(sizeof(T)));
@@ -150,24 +146,21 @@ void expert_gemm(const T* a, int64_t lda, int64_t M, int64_t K,
         const int64_t bias_shape[] = {N};
         ins[2] = TensorView(bias_shape, dt, const_cast<T*>(bias));
     }
-    matmul_cpu(mm, c_view, std::span<const TensorView>(ins, bias != nullptr ? 3 : 2),
-               ctx, nullptr);
+    matmul_cpu(mm, c_view, std::span<const TensorView>(ins, bias != nullptr ? 3 : 2), ctx, nullptr);
 }
 
 template <typename T>
-void moe_cpu_impl(const MoEAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx)
+void moe_cpu_impl(const MoEAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input        = inputs[0];
+    const auto& input = inputs[0];
     const auto& router_probs = inputs[1];
-    const auto& fc1_w        = inputs[2];
-    const auto& fc2_w        = inputs[4];
+    const auto& fc1_w = inputs[2];
+    const auto& fc2_w = inputs[4];
 
     const bool has_fc1_bias = has_input(inputs, 3);
     const bool has_fc2_bias = has_input(inputs, 5);
-    const bool has_fc3_w    = has_input(inputs, 6);
+    const bool has_fc3_w = has_input(inputs, 6);
     const bool has_fc3_bias = has_input(inputs, 7);
     const bool has_rweights = has_input(inputs, 8);
 
@@ -182,11 +175,11 @@ void moe_cpu_impl(const MoEAttributes& attrs,
 
     // Both gated forms — SwiGLU and GeGLU — share the layout machinery and the
     // combine pass; they differ only in the gate half's activation.
-    const bool gated = (attrs.activation == MoEActivation::SwiGLU ||
-                        attrs.activation == MoEActivation::GeGLU);
-    const bool swi_separate    = gated && attrs.swiglu_layout == SwiGLULayout::Separate;
+    const bool gated =
+        (attrs.activation == MoEActivation::SwiGLU || attrs.activation == MoEActivation::GeGLU);
+    const bool swi_separate = gated && attrs.swiglu_layout == SwiGLULayout::Separate;
     const bool swi_interleaved = gated && attrs.swiglu_layout == SwiGLULayout::Interleaved;
-    const bool swi_block       = gated && attrs.swiglu_layout == SwiGLULayout::Block;
+    const bool swi_block = gated && attrs.swiglu_layout == SwiGLULayout::Block;
     const EpilogueActivateType gate_act = gate_act_of(attrs.activation);
 
     NNOPS_ASSERT(!attrs.use_sparse_mixer);
@@ -198,8 +191,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         // fc1 is the gate alone and fc3 holds the value, both I wide.
         NNOPS_ASSERT(has_fc3_w);
         NNOPS_ASSERT(fc1_w.shape(1) == I);
-        NNOPS_ASSERT(inputs[6].shape(0) == E && inputs[6].shape(1) == I &&
-                     inputs[6].shape(2) == H);
+        NNOPS_ASSERT(inputs[6].shape(0) == E && inputs[6].shape(1) == I && inputs[6].shape(2) == H);
     } else if (gated) {
         // The fused layouts pack gate and value into fc1 (fc1_out == 2 * I)
         // and carry no fc3.
@@ -218,25 +210,24 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     const DataType fc3_dt = has_fc3_w ? inputs[6].data_type() : fc1_dt;
     const auto* fc1_base = static_cast<const uint8_t*>(fc1_w.ptr<void>());
     const auto* fc2_base = static_cast<const uint8_t*>(fc2_w.ptr<void>());
-    const auto* fc3_base = has_fc3_w ? static_cast<const uint8_t*>(inputs[6].ptr<void>())
-                                     : nullptr;
+    const auto* fc3_base = has_fc3_w ? static_cast<const uint8_t*>(inputs[6].ptr<void>()) : nullptr;
     const int64_t fc1_row_bytes = fc1_w.pitch();
     const int64_t fc2_row_bytes = fc2_w.pitch();
     const int64_t fc3_row_bytes = has_fc3_w ? inputs[6].pitch() : 0;
 
-    const T* in_ptr      = input.ptr<T>();
-    const T* rout_ptr    = router_probs.ptr<T>();
-    const T* fc1b_ptr    = has_fc1_bias ? inputs[3].ptr<T>() : nullptr;
-    const T* fc2b_ptr    = has_fc2_bias ? inputs[5].ptr<T>() : nullptr;
-    const T* fc3b_ptr    = has_fc3_bias ? inputs[7].ptr<T>() : nullptr;
-    const T* rw_ptr      = has_rweights ? inputs[8].ptr<T>() : nullptr;
+    const T* in_ptr = input.ptr<T>();
+    const T* rout_ptr = router_probs.ptr<T>();
+    const T* fc1b_ptr = has_fc1_bias ? inputs[3].ptr<T>() : nullptr;
+    const T* fc2b_ptr = has_fc2_bias ? inputs[5].ptr<T>() : nullptr;
+    const T* fc3b_ptr = has_fc3_bias ? inputs[7].ptr<T>() : nullptr;
+    const T* rw_ptr = has_rweights ? inputs[8].ptr<T>() : nullptr;
 
-    const int64_t in_row_stride   = input.row_stride_elems();
+    const int64_t in_row_stride = input.row_stride_elems();
     const int64_t rout_row_stride = router_probs.row_stride_elems();
-    const int64_t rw_row_stride   = has_rweights ? inputs[8].row_stride_elems() : 0;
-    const int64_t out_row_stride  = output.row_stride_elems();
+    const int64_t rw_row_stride = has_rweights ? inputs[8].row_stride_elems() : 0;
+    const int64_t out_row_stride = output.row_stride_elems();
 
-    const int64_t total = k * num_tokens;  // number of (token, expert) routes
+    const int64_t total = k * num_tokens; // number of (token, expert) routes
 
     // fc1_out is used only by the guards above; FC1 below is driven with
     // fc1_out = I. A Release build (NNOPS_ASSERT compiled out) fed fc1_out != I
@@ -249,10 +240,10 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     // Anything that finalizes route_weight must happen here — phase B reads it
     // from worker threads.
     PoolArray<int32_t> route_expert(static_cast<size_t>(total));
-    PoolArray<float>   route_weight(static_cast<size_t>(total));
+    PoolArray<float> route_weight(static_cast<size_t>(total));
     {
         PoolArray<float> probs(static_cast<size_t>(E));
-        PoolArray<char>  used(static_cast<size_t>(E));
+        PoolArray<char> used(static_cast<size_t>(E));
 
         for (int64_t t = 0; t < num_tokens; ++t) {
             const T* logits = rout_ptr + t * rout_row_stride;
@@ -294,7 +285,9 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                 // expert index.
                 int64_t best = -1;
                 for (int64_t e = 0; e < E; ++e) {
-                    if (used[static_cast<size_t>(e)]) { continue; }
+                    if (used[static_cast<size_t>(e)]) {
+                        continue;
+                    }
                     if (best < 0 ||
                         probs[static_cast<size_t>(e)] > probs[static_cast<size_t>(best)]) {
                         best = e;
@@ -303,9 +296,9 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                 used[static_cast<size_t>(best)] = 1;
                 const int64_t idx = t * k + j;
                 route_expert[static_cast<size_t>(idx)] = static_cast<int32_t>(best);
-                route_weight[static_cast<size_t>(idx)] = has_rweights
-                    ? ldf(rw_ptr + t * rw_row_stride + best)
-                    : probs[static_cast<size_t>(best)];
+                route_weight[static_cast<size_t>(idx)] =
+                    has_rweights ? ldf(rw_ptr + t * rw_row_stride + best) :
+                                   probs[static_cast<size_t>(best)];
             }
 
             if (attrs.normalize_routing_weights) {
@@ -362,7 +355,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     PoolPtr gather_owner(static_cast<size_t>(total) * static_cast<size_t>(H) * sizeof(T));
     PoolPtr eout_owner(static_cast<size_t>(total) * static_cast<size_t>(H) * sizeof(T));
     T* gather = gather_owner.as<T>();
-    T* eout   = eout_owner.as<T>();
+    T* eout = eout_owner.as<T>();
 
     // FC1 output for every route. The two GEMM stages are separated by a
     // barrier — a second-stage task reads a whole gate row, which several
@@ -379,9 +372,9 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     PoolPtr gates_owner;
     PoolPtr values_owner;
     PoolPtr gv_owner;
-    T* gates  = nullptr;
+    T* gates = nullptr;
     T* values = nullptr;
-    T* gv     = nullptr;
+    T* gv = nullptr;
     if (!swi_block) {
         gates_owner = PoolPtr(static_cast<size_t>(total) * static_cast<size_t>(I) * sizeof(T));
         gates = gates_owner.as<T>();
@@ -420,7 +413,9 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     const auto blocks_for = [&](int64_t N) {
         int64_t b = (kTasksPerWorker * workers + E - 1) / E;
         const int64_t widest = (N + kMinSlice - 1) / kMinSlice;
-        if (b > widest) { b = widest; }
+        if (b > widest) {
+            b = widest;
+        }
         return std::max<int64_t>(b, 1);
     };
     // Slice width: the block count's share of N, rounded up to a whole panel.
@@ -439,8 +434,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     // FC1's bias and activation fold into the GEMM's output pass; the gated
     // halves take neither, since the combine pass reads the gate raw.
     Epilogue act_ep{};
-    act_ep.type = gated ? EpilogueActivateType::None
-                        : epilogue_of(attrs.activation);
+    act_ep.type = gated ? EpilogueActivateType::None : epilogue_of(attrs.activation);
 
     // Stage 1: FC1 (and the value half) on one output-channel slice, then —
     // when gated — the gate×value combine over the same cells.
@@ -452,7 +446,9 @@ void moe_cpu_impl(const MoEAttributes& attrs,
 
         const int64_t span = span_of(I, ib);
         const int64_t n0 = nblk * span;
-        if (n0 >= I) { return; }
+        if (n0 >= I) {
+            return;
+        }
         const int64_t n1 = std::min(I, n0 + span);
         const int64_t w = n1 - n0;
 
@@ -462,54 +458,49 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         if (swi_interleaved) {
             // fc1 holds [Gate_0, Value_0, Gate_1, Value_1, ...], so a span of
             // pairs is one contiguous run of 2w output channels.
-            expert_gemm<T>(a, H, rows, H,
-                           fc1_base + (eoff + 2 * n0) * fc1_row_bytes, 2 * w, fc1_dt,
+            expert_gemm<T>(a, H, rows, H, fc1_base + (eoff + 2 * n0) * fc1_row_bytes, 2 * w, fc1_dt,
                            fc1b_ptr ? fc1b_ptr + eoff + 2 * n0 : nullptr, Epilogue{},
                            gv + begin * 2 * I + 2 * n0, 2 * I, dt, serial_ctx);
             gate_combine_pairs_dispatch<T>(
-                gate_act, gv + begin * 2 * I + 2 * n0, gates + begin * I + n0,
-                rows, w, 2 * I, I, attrs.activation_alpha, attrs.activation_beta,
-                attrs.swiglu_limit);
+                gate_act, gv + begin * 2 * I + 2 * n0, gates + begin * I + n0, rows, w, 2 * I, I,
+                attrs.activation_alpha, attrs.activation_beta, attrs.swiglu_limit);
         } else if (swi_block) {
             // fc1 holds [Gate_0..Gate_{I-1} | Value_0..Value_{I-1}]: two
             // column slices of one expert matrix, combined in place into the
             // gate half, which is what FC2 reads through an ld of 2I.
-            expert_gemm<T>(a, H, rows, H, fc1_base + (eoff + n0) * fc1_row_bytes, w,
-                           fc1_dt, fc1b_ptr ? fc1b_ptr + eoff + n0 : nullptr, Epilogue{},
+            expert_gemm<T>(a, H, rows, H, fc1_base + (eoff + n0) * fc1_row_bytes, w, fc1_dt,
+                           fc1b_ptr ? fc1b_ptr + eoff + n0 : nullptr, Epilogue{},
                            gv + begin * 2 * I + n0, 2 * I, dt, serial_ctx);
-            expert_gemm<T>(a, H, rows, H,
-                           fc1_base + (eoff + I + n0) * fc1_row_bytes, w, fc1_dt,
+            expert_gemm<T>(a, H, rows, H, fc1_base + (eoff + I + n0) * fc1_row_bytes, w, fc1_dt,
                            fc1b_ptr ? fc1b_ptr + eoff + I + n0 : nullptr, Epilogue{},
                            gv + begin * 2 * I + I + n0, 2 * I, dt, serial_ctx);
             T* gvb = gv + begin * 2 * I + n0;
-            gate_combine_tile_dispatch<T>(
-                gate_act, gvb, gvb + I, gvb, rows, w, 2 * I, 2 * I, 2 * I,
-                attrs.activation_alpha, attrs.activation_beta, attrs.swiglu_limit);
+            gate_combine_tile_dispatch<T>(gate_act, gvb, gvb + I, gvb, rows, w, 2 * I, 2 * I, 2 * I,
+                                          attrs.activation_alpha, attrs.activation_beta,
+                                          attrs.swiglu_limit);
         } else {
             T* gate = gates + begin * I + n0;
             // FC1: [rows, H] x [w, H]^T -> [rows, w] (the gate half).
-            expert_gemm<T>(a, H, rows, H, fc1_base + (eoff + n0) * fc1_row_bytes, w,
-                           fc1_dt, fc1b_ptr ? fc1b_ptr + eoff + n0 : nullptr, act_ep,
-                           gate, I, dt, serial_ctx);
+            expert_gemm<T>(a, H, rows, H, fc1_base + (eoff + n0) * fc1_row_bytes, w, fc1_dt,
+                           fc1b_ptr ? fc1b_ptr + eoff + n0 : nullptr, act_ep, gate, I, dt,
+                           serial_ctx);
 
             if (swi_separate) {
                 T* value = values + begin * I + n0;
                 // FC3: the value half, same shape.
-                expert_gemm<T>(a, H, rows, H,
-                               fc3_base + (e * I + n0) * fc3_row_bytes, w, fc3_dt,
-                               fc3b_ptr ? fc3b_ptr + e * I + n0 : nullptr, Epilogue{},
-                               value, I, dt, serial_ctx);
-                gate_combine_tile_dispatch<T>(
-                    gate_act, gate, value, gate, rows, w, I, I, I,
-                    attrs.activation_alpha, attrs.activation_beta,
-                    attrs.swiglu_limit);
+                expert_gemm<T>(a, H, rows, H, fc3_base + (e * I + n0) * fc3_row_bytes, w, fc3_dt,
+                               fc3b_ptr ? fc3b_ptr + e * I + n0 : nullptr, Epilogue{}, value, I, dt,
+                               serial_ctx);
+                gate_combine_tile_dispatch<T>(gate_act, gate, value, gate, rows, w, I, I, I,
+                                              attrs.activation_alpha, attrs.activation_beta,
+                                              attrs.swiglu_limit);
             }
         }
     });
 
     // Stage 2: FC2 over an output-channel slice, straight into the expert's
     // routes.
-    const T* fc2_a  = swi_block ? gv : gates;
+    const T* fc2_a = swi_block ? gv : gates;
     const int64_t fc2_ld = swi_block ? 2 * I : I;
 
     ctx.cpu.run(0, E * hb, [&](int64_t task) {
@@ -520,16 +511,18 @@ void moe_cpu_impl(const MoEAttributes& attrs,
 
         const int64_t span = span_of(H, hb);
         const int64_t n0 = nblk * span;
-        if (n0 >= H) { return; }
+        if (n0 >= H) {
+            return;
+        }
         const int64_t n1 = std::min(H, n0 + span);
         const int64_t w = n1 - n0;
 
         T* out_slice = eout + begin * H;
         // [rows, I] x [w, I]^T -> [rows, w].
         expert_gemm<T>(fc2_a + begin * fc2_ld, fc2_ld, rows, I,
-                       fc2_base + (e * H + n0) * fc2_row_bytes,
-                       w, fc2_dt, fc2b_ptr ? fc2b_ptr + e * H + n0 : nullptr, Epilogue{},
-                       out_slice + n0, H, dt, serial_ctx);
+                       fc2_base + (e * H + n0) * fc2_row_bytes, w, fc2_dt,
+                       fc2b_ptr ? fc2b_ptr + e * H + n0 : nullptr, Epilogue{}, out_slice + n0, H,
+                       dt, serial_ctx);
     });
 
     // Phase B: one token per task, its K contributions summed in j order. On the
@@ -546,9 +539,9 @@ void moe_cpu_impl(const MoEAttributes& attrs,
             for (int64_t j = 0; j < k; ++j) {
                 const int64_t idx = t * k + j;
                 const T* er = eout + static_cast<size_t>(slot[static_cast<size_t>(idx)]) * H + n;
-                acc = simd::v_add(acc, simd::v_mul(
-                    simd::v_set1_f32x8(route_weight[static_cast<size_t>(idx)]),
-                    simd::v_load_f32(er)));
+                acc = simd::v_add(
+                    acc, simd::v_mul(simd::v_set1_f32x8(route_weight[static_cast<size_t>(idx)]),
+                                     simd::v_load_f32(er)));
             }
             simd::v_store_f32(out_row + n, acc);
         }
@@ -565,13 +558,10 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status moe_cpu(const MoEAttributes& attrs,
-             TensorView& output,
-             std::span<const TensorView> inputs,
-             const ComputeContext& ctx,
-             void* workspace)
+Status moe_cpu(const MoEAttributes& attrs, TensorView& output, std::span<const TensorView> inputs,
+               const ComputeContext& ctx, void* workspace)
 {
     // Sigmoid scores sit in (0, 1) and do not sum to 1 (sqrt-softplus scores
     // are unbounded and likewise do not sum to 1), so leaving them unnormalized
@@ -581,21 +571,27 @@ Status moe_cpu(const MoEAttributes& attrs,
     // `router_weights` supplies the mixing weights, since then the scores only
     // select.
     NNOPS_WARN_MSG(attrs.router_gating == MoERouterGating::Softmax ||
-                       attrs.normalize_routing_weights ||
-                       has_input(inputs, 8),
+                       attrs.normalize_routing_weights || has_input(inputs, 8),
                    "moe_cpu: non-softmax router gating without "
                    "normalize_routing_weights: the routed output will be "
                    "systematically smaller than under softmax");
 
     switch (inputs[0].data_type()) {
-    case DataType::f32: moe_cpu_impl<float>(attrs, output, inputs, ctx); return Status::ok;
-    case DataType::f16: moe_cpu_impl<half>(attrs, output, inputs, ctx);  return Status::ok;
+    case DataType::f32:
+        moe_cpu_impl<float>(attrs, output, inputs, ctx);
+        return Status::ok;
+    case DataType::f16:
+        moe_cpu_impl<half>(attrs, output, inputs, ctx);
+        return Status::ok;
 #ifdef NNOPS_ARCH_AARCH64
-    case DataType::bf16: moe_cpu_impl<bfloat16>(attrs, output, inputs, ctx); return Status::ok;
+    case DataType::bf16:
+        moe_cpu_impl<bfloat16>(attrs, output, inputs, ctx);
+        return Status::ok;
 #endif
-    default: break;
+    default:
+        break;
     }
     return Status::unsupported;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

@@ -40,7 +40,9 @@ PackedWeightOffsets packed_weight_offsets(const RecurrentPackedHeader& h) noexce
         for (int64_t ph = 0; ph < h.nphases; ++ph) {
             o.bias[ph] = take_bytes(4 * h.phase_cols[ph]);
         }
-        if (h.lbr != 0) { o.rh = take_bytes(4 * h.total_cols); }
+        if (h.lbr != 0) {
+            o.rh = take_bytes(4 * h.total_cols);
+        }
         o.dir_bytes = off;
         return o;
     }
@@ -58,8 +60,12 @@ PackedWeightOffsets packed_weight_offsets(const RecurrentPackedHeader& h) noexce
         const MatMulPackedB rg = matmul_packed_b_geom(h.phase_cols[ph], h.hidden, dt);
         o.r[ph] = take(packed_b_numel(h.phase_cols[ph], rg.total));
     }
-    for (int64_t ph = 0; ph < h.nphases; ++ph) { o.bias[ph] = take(h.phase_cols[ph]); }
-    if (h.lbr != 0) { o.rh = take(h.total_cols); }
+    for (int64_t ph = 0; ph < h.nphases; ++ph) {
+        o.bias[ph] = take(h.phase_cols[ph]);
+    }
+    if (h.lbr != 0) {
+        o.rh = take(h.total_cols);
+    }
     o.dir_bytes = off;
     return o;
 }
@@ -93,10 +99,9 @@ namespace {
 /// One direction's weights into the blob: the same interleave and pack passes
 /// compute() would run, plus the bias vectors.
 template <typename T>
-void pack_direction(const RecurrentParams& p, const RecurrentPackedHeader& h,
-                    const T* w, int64_t w_lds, const T* r, int64_t r_lds,
-                    const T* wb, const T* rb, T* raw, char* base,
-                    const ComputeContext& ctx)
+void pack_direction(const RecurrentParams& p, const RecurrentPackedHeader& h, const T* w,
+                    int64_t w_lds, const T* r, int64_t r_lds, const T* wb, const T* rb, T* raw,
+                    char* base, const ComputeContext& ctx)
 {
     const PackedWeightOffsets o = packed_weight_offsets(h);
     const int64_t H = h.hidden;
@@ -110,8 +115,8 @@ void pack_direction(const RecurrentParams& p, const RecurrentPackedHeader& h,
     int64_t col = 0;
     for (int64_t ph = 0; ph < h.nphases; ++ph) {
         const PhaseKind kind = phase_kind(p.mode, lbr, ph);
-        interleave_gates(w, w_lds, H, I, phase_gates(kind),
-                         phase_gate_offset(p.mode, lbr, ph), raw + col * I);
+        interleave_gates(w, w_lds, H, I, phase_gates(kind), phase_gate_offset(p.mode, lbr, ph),
+                         raw + col * I);
         col += h.phase_cols[ph];
     }
     {
@@ -119,8 +124,7 @@ void pack_direction(const RecurrentParams& p, const RecurrentPackedHeader& h,
         TensorView rv(std::span<const int64_t>(sh, 2), dt, raw,
                       I * static_cast<int64_t>(sizeof(T)));
         const MatMulPackedB wg = matmul_packed_b_geom(h.total_cols, I, dt);
-        TensorView pv = packed_view(h.total_cols, wg.total,
-                                    reinterpret_cast<T*>(base + o.w));
+        TensorView pv = packed_view(h.total_cols, wg.total, reinterpret_cast<T*>(base + o.w));
         matmul_packed_b_pack(rv, pv, /*transpose_b=*/true, ctx);
     }
 
@@ -135,31 +139,31 @@ void pack_direction(const RecurrentParams& p, const RecurrentPackedHeader& h,
             TensorView rv(std::span<const int64_t>(sh, 2), dt, raw,
                           H * static_cast<int64_t>(sizeof(T)));
             const MatMulPackedB rg = matmul_packed_b_geom(h.phase_cols[ph], H, dt);
-            TensorView pv = packed_view(h.phase_cols[ph], rg.total,
-                                        reinterpret_cast<T*>(base + o.r[ph]));
+            TensorView pv =
+                packed_view(h.phase_cols[ph], rg.total, reinterpret_cast<T*>(base + o.r[ph]));
             matmul_packed_b_pack(rv, pv, /*transpose_b=*/true, ctx);
         }
 
         // Rbh belongs after the recurrent product under linear_before_reset, so
         // the h gate's bias vector here takes Wb alone. The h gate is the third
         // of a merged GRU phase and the only one of a h~ phase.
-        const int64_t h_gate = (kind == PhaseKind::GruZr) ? -1
-                             : (kind == PhaseKind::GruAll) ? 2 : 0;
+        const int64_t h_gate = (kind == PhaseKind::GruZr)  ? -1 :
+                               (kind == PhaseKind::GruAll) ? 2 :
+                                                             0;
         const int64_t all_gates = (int64_t{1} << gates) - 1;
         const int64_t h_bit = (h_gate < 0) ? 0 : (int64_t{1} << h_gate);
-        build_bias(wb, rb, H, gates, lbr ? (all_gates & ~h_bit) : all_gates,
-                   gate_off, reinterpret_cast<T*>(base + o.bias[ph]));
+        build_bias(wb, rb, H, gates, lbr ? (all_gates & ~h_bit) : all_gates, gate_off,
+                   reinterpret_cast<T*>(base + o.bias[ph]));
         if (lbr) {
-            build_bias(static_cast<const T*>(nullptr), rb, H, gates, h_bit,
-                       gate_off, reinterpret_cast<T*>(base + o.rh));
+            build_bias(static_cast<const T*>(nullptr), rb, H, gates, h_bit, gate_off,
+                       reinterpret_cast<T*>(base + o.rh));
         }
     }
 }
 
 template <typename T>
-Status pack_weights_impl(const RecurrentParams& p, const TensorView& w,
-                         const TensorView& r, const TensorView* bias,
-                         TensorView& dst, const ComputeContext& ctx)
+Status pack_weights_impl(const RecurrentParams& p, const TensorView& w, const TensorView& r,
+                         const TensorView* bias, TensorView& dst, const ComputeContext& ctx)
 {
     const int64_t need = recurrent_packed_numel(p);
     if (dst.is_empty() || dst.data_type() != p.dtype || dst.numel() < need) {
@@ -171,7 +175,9 @@ Status pack_weights_impl(const RecurrentParams& p, const TensorView& w,
     // The interleave staging area, then the pool the pack's scratch lives in.
     const int64_t elems = h.total_cols * std::max(h.input, h.hidden);
     PoolPtr owner(static_cast<size_t>(elems) * sizeof(T) + 4096);
-    if (!owner) { return Status::out_of_memory; }
+    if (!owner) {
+        return Status::out_of_memory;
+    }
     T* raw = static_cast<T*>(owner.get());
 
     char* blob = reinterpret_cast<char*>(dst.ptr<T>());
@@ -181,8 +187,7 @@ Status pack_weights_impl(const RecurrentParams& p, const TensorView& w,
         const T* wb = bias ? bias->ptr<T>(static_cast<size_t>(d)) : nullptr;
         const T* rb = wb ? wb + G * h.hidden : nullptr;
         pack_direction<T>(p, h, w.ptr<T>(static_cast<size_t>(d * G * h.hidden)),
-                          w.row_stride_elems(),
-                          r.ptr<T>(static_cast<size_t>(d * G * h.hidden)),
+                          w.row_stride_elems(), r.ptr<T>(static_cast<size_t>(d * G * h.hidden)),
                           r.row_stride_elems(), wb, rb, raw,
                           blob + packed_header_bytes() + d * h.dir_bytes, ctx);
     }
@@ -192,9 +197,8 @@ Status pack_weights_impl(const RecurrentParams& p, const TensorView& w,
 /// The quantized blob: the fp pack's directions, but W and R go in as int8
 /// panels with their per-column scales, and the bias stays f32 — the blob is
 /// shared by the f32 and f16 compute routes, and the driver converts it.
-Status pack_weights_q8(const RecurrentParams& p, const TensorView& w,
-                       const TensorView& r, const TensorView* bias,
-                       TensorView& dst, const ComputeContext& ctx)
+Status pack_weights_q8(const RecurrentParams& p, const TensorView& w, const TensorView& r,
+                       const TensorView* bias, TensorView& dst, const ComputeContext& ctx)
 {
     const int64_t need = recurrent_packed_numel(p);
     if (dst.is_empty() || dst.data_type() != DataType::s8 || dst.numel() < need) {
@@ -210,10 +214,11 @@ Status pack_weights_q8(const RecurrentParams& p, const TensorView& w,
     const int64_t raw_bytes = align_up64(h.total_cols * std::max(h.input, h.hidden));
     PoolPtr owner(static_cast<size_t>(raw_bytes) +
                   static_cast<size_t>(2 * G * h.hidden) * sizeof(float) + 4096);
-    if (!owner) { return Status::out_of_memory; }
+    if (!owner) {
+        return Status::out_of_memory;
+    }
     int8_t* raw = static_cast<int8_t*>(owner.get());
-    float* bias_f32 =
-        reinterpret_cast<float*>(static_cast<char*>(owner.get()) + raw_bytes);
+    float* bias_f32 = reinterpret_cast<float*>(static_cast<char*>(owner.get()) + raw_bytes);
 
     char* blob = reinterpret_cast<char*>(dst.ptr<int8_t>());
     std::memcpy(blob, &h, sizeof(h));
@@ -235,7 +240,7 @@ Status pack_weights_q8(const RecurrentParams& p, const TensorView& w,
     return Status::ok;
 }
 
-}  // namespace
+} // namespace
 
 int64_t recurrent_packed_numel(const RecurrentParams& p)
 {
@@ -244,12 +249,10 @@ int64_t recurrent_packed_numel(const RecurrentParams& p)
     return (packed_header_bytes() + h.directions * h.dir_bytes) / esz;
 }
 
-Status recurrent_pack_weights(const RecurrentParams& p, const TensorView& w,
-                              const TensorView& r, const TensorView* bias,
-                              TensorView& dst, const ComputeContext& ctx)
+Status recurrent_pack_weights(const RecurrentParams& p, const TensorView& w, const TensorView& r,
+                              const TensorView* bias, TensorView& dst, const ComputeContext& ctx)
 {
-    if (p.dtype != DataType::f32 && p.dtype != DataType::f16 &&
-        p.dtype != DataType::bf16) {
+    if (p.dtype != DataType::f32 && p.dtype != DataType::f16 && p.dtype != DataType::bf16) {
         return Status::unsupported;
     }
     if (p.input <= 0 || p.hidden <= 0 || p.directions <= 0) {
@@ -267,8 +270,8 @@ Status recurrent_pack_weights(const RecurrentParams& p, const TensorView& w,
 #ifdef NNOPS_ARCH_AARCH64
     return pack_weights_impl<bfloat16>(p, w, r, bias, dst, ctx);
 #else
-    return Status::unsupported;  // bf16 is aarch64-only (validate() refuses it)
+    return Status::unsupported; // bf16 is aarch64-only (validate() refuses it)
 #endif
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

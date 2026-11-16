@@ -16,14 +16,13 @@ namespace nnops {
 
 /// Channel-first → channel-last. `dst` carries the channel-last layout.
 void convert_channel_first_to_channel_last(const TensorView& src, TensorView& dst,
-                                    const ComputeContext& ctx = {});
+                                           const ComputeContext& ctx = {});
 
 /// Channel-last → channel-first.
 void convert_channel_last_to_channel_first(const TensorView& src, TensorView& dst,
-                                    const ComputeContext& ctx = {});
+                                           const ComputeContext& ctx = {});
 
 /// Bytes for an aligned channel-last buffer of a logical desc.
-size_t channel_last_storage_bytes(const TensorDesc& logical_desc,
-                                  int64_t alignment = 32);
+size_t channel_last_storage_bytes(const TensorDesc& logical_desc, int64_t alignment = 32);
 
-}  // namespace nnops
+} // namespace nnops

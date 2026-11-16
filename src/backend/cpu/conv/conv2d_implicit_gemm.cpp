@@ -82,13 +82,13 @@
 ///    on a 3x3 whose zero points are not the packer's).
 
 #include "conv2d_implicit_gemm.h"
-#include "backend/cpu/matmul/matmul_helper.h"               // uniform pack/MMA + panel strides
-#include "backend/cpu/simd_kernel/simd_epilogue.hpp"        // epilogue / dequant epilogues
-#include "backend/cpu/simd_kernel/simd_im2col.hpp"          // tiled im2col gathers
-#include "backend/cpu/simd_kernel/simd_int8_reduce.hpp"     // int8_row_sum / int8_col_sum_slab
-#include "backend/cpu/simd_kernel/simd_quant.hpp"           // quant_kernel::quantization
-#include "backend/cpu/simd_kernel/simd_stem_conv.hpp"       // the tiny filter's direct 3x3
-#include "backend/cpu/common/memory_pool.hpp"               // internal scratch-memory pool
+#include "backend/cpu/matmul/matmul_helper.h"           // uniform pack/MMA + panel strides
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp"    // epilogue / dequant epilogues
+#include "backend/cpu/simd_kernel/simd_im2col.hpp"      // tiled im2col gathers
+#include "backend/cpu/simd_kernel/simd_int8_reduce.hpp" // int8_row_sum / int8_col_sum_slab
+#include "backend/cpu/simd_kernel/simd_quant.hpp"       // quant_kernel::quantization
+#include "backend/cpu/simd_kernel/simd_stem_conv.hpp"   // the tiny filter's direct 3x3
+#include "backend/cpu/common/memory_pool.hpp"           // internal scratch-memory pool
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"
@@ -111,7 +111,7 @@ constexpr bool is_fp_activation_dtype(DataType d) noexcept
 {
     return d == DataType::f32 || d == DataType::f16
 #ifdef NNOPS_ARCH_AARCH64
-        || d == DataType::bf16
+           || d == DataType::bf16
 #endif
         ;
 }
@@ -124,28 +124,37 @@ namespace channel_first {
 namespace {
 
 using namespace nnops::simd;
-namespace k = nnops::kernel;  // pure SIMD kernels: tiled_im2col_2d / tiled_im2col_3d
+namespace k = nnops::kernel; // pure SIMD kernels: tiled_im2col_2d / tiled_im2col_3d
 
 // ---- block-size heuristics (ported from nn_compute) ----------------------
 
 /// Input-channel block: kdim = ic_block × karea lands in ~144–200.
-inline int get_ic_block(int karea) noexcept {
-    if (karea == 1)  { return 64; }
-    if (karea <= 9)  { return 16; }
-    if (karea <= 25) { return 8;  }
-    if (karea <= 49) { return 2;  }
+inline int get_ic_block(int karea) noexcept
+{
+    if (karea == 1) {
+        return 64;
+    }
+    if (karea <= 9) {
+        return 16;
+    }
+    if (karea <= 25) {
+        return 8;
+    }
+    if (karea <= 49) {
+        return 2;
+    }
     return 1;
 }
 
-constexpr int kOcnBlock = 128;  // output-channel tile (nn_compute single-thread default)
-constexpr int kAlign     = 4;   // oh-block alignment
+constexpr int kOcnBlock = 128; // output-channel tile (nn_compute single-thread default)
+constexpr int kAlign = 4;      // oh-block alignment
 
 // ---- tile init / save / add helpers --------------------------------------
 
 /// Fill a tile with the per-row bias, or add it into what is already there.
 template <class T>
-void tile_set_bias(T* NNOPS_RESTRICT tile, int ld, int M, int N,
-                   const T* NNOPS_RESTRICT bias, bool add_to) noexcept
+void tile_set_bias(T* NNOPS_RESTRICT tile, int ld, int M, int N, const T* NNOPS_RESTRICT bias,
+                   bool add_to) noexcept
 {
     constexpr int L = simd_lane_for<T>;
     for (int m = 0; m < M; ++m) {
@@ -173,8 +182,7 @@ void tile_set_bias(T* NNOPS_RESTRICT tile, int ld, int M, int N,
 
 /// Copy a strided tile (row stride ld) into a dense scratch buffer (row stride N).
 template <class T>
-void tile_save(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src,
-               int ld, int M, int N) noexcept
+void tile_save(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src, int ld, int M, int N) noexcept
 {
     constexpr int L = simd_lane_for<T>;
     for (int m = 0; m < M; ++m) {
@@ -193,19 +201,16 @@ void tile_save(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src,
 // ---- main kernel ----------------------------------------------------------
 
 template <class T>
-void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
-                        TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx,
-                        const Conv2DGemmPlan& plan,
-                        void* workspace)
+void conv2d_channel_first_impl(const Conv2DAttributes& attrs, TensorView& output,
+                               std::span<const TensorView> inputs, const ComputeContext& ctx,
+                               const Conv2DGemmPlan& plan, void* workspace)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
     // Input: [N, IC, IH, IW]
-    const int64_t N  = input.shape(0);
+    const int64_t N = input.shape(0);
     const int64_t IC = input.shape(1);
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
@@ -236,35 +241,35 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
 
     const int64_t icn_block = plan.icn_block;
     const int64_t ocn_block = plan.ocn_block;
-    const int64_t oh_block  = plan.oh_block;
+    const int64_t oh_block = plan.oh_block;
     const int64_t num_oh_blocks = plan.num_oh_blocks;
-    const int64_t oh_chunks     = plan.oh_chunks;
-    const int64_t oc_chunks     = plan.oc_chunks;
+    const int64_t oh_chunks = plan.oh_chunks;
+    const int64_t oc_chunks = plan.oc_chunks;
 
     // Strides (elements).
-    const int64_t icn_step = IH * in_row_stride;         // between input channels
-    const int64_t ib_step  = IC * icn_step;              // between batch samples
-    const int64_t ig_step  = ic_per_group * icn_step;    // between groups (input)
+    const int64_t icn_step = IH * in_row_stride;     // between input channels
+    const int64_t ib_step = IC * icn_step;           // between batch samples
+    const int64_t ig_step = ic_per_group * icn_step; // between groups (input)
 
-    const int64_t ocn_step = OH * out_row_stride;        // between output channels
-    const int64_t ob_step  = OC * ocn_step;              // between batch samples
-    const int64_t og_step  = oc_per_group * ocn_step;    // between groups (output)
+    const int64_t ocn_step = OH * out_row_stride;    // between output channels
+    const int64_t ob_step = OC * ocn_step;           // between batch samples
+    const int64_t og_step = oc_per_group * ocn_step; // between groups (output)
 
     // Weight row stride within a group: [oc_per_group][ic_per_group][karea].
     // Dims, not pitch: a weight is a load-time constant.
     const int64_t w_ocn_step = ic_per_group * karea;
 
     T* out_ptr = output.ptr<T>();
-    const T* in_ptr  = input.ptr<T>();
-    const T* w_ptr   = weight.ptr<T>();
-    const T* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const T* in_ptr = input.ptr<T>();
+    const T* w_ptr = weight.ptr<T>();
+    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
 
     // One slot per worker when the backend reports thread ids, else one per
     // task. No col buffer on this route: the gather writes packed B directly,
     // so a slot is [orig][pack_b].
     NNOPS_ASSERT(plan.col_size == 0);
     constexpr int nr_max = nr_max_flt<T>();
-    constexpr int esz    = static_cast<int>(sizeof(T));
+    constexpr int esz = static_cast<int>(sizeof(T));
     const Conv2DGemmScratch sc = gemm_scratch_layout(plan, esz);
     char* const arena = static_cast<char*>(workspace);
 
@@ -292,10 +297,17 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
     bool epilogue_folded = false;
     if (!attrs.add_to) {
         switch (attrs.epilogue.type) {
-        case EpilogueActivateType::Relu:  clamp_lo = 0.0f; epilogue_folded = true; break;
-        case EpilogueActivateType::Relu6: clamp_lo = 0.0f; clamp_hi = 6.0f;
-                                          epilogue_folded = true; break;
-        default: break;
+        case EpilogueActivateType::Relu:
+            clamp_lo = 0.0f;
+            epilogue_folded = true;
+            break;
+        case EpilogueActivateType::Relu6:
+            clamp_lo = 0.0f;
+            clamp_hi = 6.0f;
+            epilogue_folded = true;
+            break;
+        default:
+            break;
         }
     }
     const bool epilogue_pass = epilogue_active && !epilogue_folded;
@@ -308,25 +320,24 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
     const bool seed_needed = attrs.add_to;
 
     const auto run_task = [&](int64_t t) {
-        const int64_t ng      = t / chunks_per_ng;
-        const int64_t rem     = t % chunks_per_ng;
+        const int64_t ng = t / chunks_per_ng;
+        const int64_t rem = t % chunks_per_ng;
         // The oc-chunk varies fastest: neighbours in task order then cover
         // different filter rows, so their weight streams differ.
-        const int64_t chunk    = rem / oc_chunks;
+        const int64_t chunk = rem / oc_chunks;
         const int64_t oc_chunk = rem % oc_chunks;
         const int64_t n = ng / G;
         const int64_t g = ng % G;
 
         const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
         char* const slot_ptr = arena + sc.head + slot * sc.slot_stride;
-        T* orig   = attrs.add_to ? reinterpret_cast<T*>(slot_ptr + sc.off_orig)
-                                 : nullptr;
+        T* orig = attrs.add_to ? reinterpret_cast<T*>(slot_ptr + sc.off_orig) : nullptr;
         T* pack_b = reinterpret_cast<T*>(slot_ptr + sc.off_pack);
 
         T* output_ptr = out_ptr + n * ob_step + g * og_step;
-        const T* input_ptr  = in_ptr + n * ib_step + g * ig_step;
+        const T* input_ptr = in_ptr + n * ib_step + g * ig_step;
         const T* weight_ptr = w_ptr + g * oc_per_group * ic_per_group * karea;
-        const T* bias_ptr   = b_ptr ? b_ptr + g * oc_per_group : nullptr;
+        const T* bias_ptr = b_ptr ? b_ptr + g * oc_per_group : nullptr;
 
         // This chunk's contiguous oh-block range (disjoint across chunks).
         const int64_t b0 = chunk * num_oh_blocks / oh_chunks;
@@ -337,16 +348,16 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
         const int64_t oc_hi = (oc_chunk + 1) * oc_per_group / oc_chunks;
 
         for (int64_t b = b0; b < b1; ++b) {
-            const int64_t oh       = b * oh_block;
-            const int64_t ohc      = std::min(oh_block, OH - oh);
+            const int64_t oh = b * oh_block;
+            const int64_t ohc = std::min(oh_block, OH - oh);
             const int64_t roi_area = ohc * OW;
 
             const int64_t ih = oh * SH - PH;
             const int64_t iw = 0 * SW - PW;
-            const int roi_pad_h = (ih < 0) ? static_cast<int>(-ih)
-                                           : (ih >= IH ? static_cast<int>(ih - IH) : 0);
-            const int roi_pad_w = (iw < 0) ? static_cast<int>(-iw)
-                                           : (iw >= IW ? static_cast<int>(iw - IW) : 0);
+            const int roi_pad_h =
+                (ih < 0) ? static_cast<int>(-ih) : (ih >= IH ? static_cast<int>(ih - IH) : 0);
+            const int roi_pad_w =
+                (iw < 0) ? static_cast<int>(-iw) : (iw >= IW ? static_cast<int>(iw - IW) : 0);
 
             T* tile_base = output_ptr + oh * out_row_stride;
 
@@ -362,23 +373,21 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
                 // The pack's panel stride, from the one rule the plan sizes
                 // with: bf16's BFMMLA panel rounds k up to its k-group, so a
                 // dense NR*kdim stride is wrong whenever kdim % 4 != 0.
-                const int ldd_b = static_cast<int>(gemm_panel_slot(
-                    kdim, nr_max, esz, false, std::is_same_v<T, bfloat16>));
+                const int ldd_b = static_cast<int>(
+                    gemm_panel_slot(kdim, nr_max, esz, false, std::is_same_v<T, bfloat16>));
 
                 if (!plan.pointwise) {
                     // Gather straight into the panels: materializing the col
                     // matrix first would move the same bytes twice for a pure
                     // re-ordering, with identical values and panel layout.
-                    k::tiled_im2col_2d_packed<T, nr_max>(pack_b, ldd_b, input_local,
-                                                 0, static_cast<int>(oh),
-                                                 static_cast<int>(OW), static_cast<int>(ohc),
-                                                 roi_pad_h, roi_pad_w,
-                                                 static_cast<int>(PH), static_cast<int>(PW),
-                                                 static_cast<int>(icnc), static_cast<int>(IH), static_cast<int>(IW),
-                                                 static_cast<int>(icn_step), static_cast<int>(in_row_stride),
-                                                 static_cast<int>(KH), static_cast<int>(KW),
-                                                 static_cast<int>(SH), static_cast<int>(SW),
-                                                 static_cast<int>(DH), static_cast<int>(DW));
+                    k::tiled_im2col_2d_packed<T, nr_max>(
+                        pack_b, ldd_b, input_local, 0, static_cast<int>(oh), static_cast<int>(OW),
+                        static_cast<int>(ohc), roi_pad_h, roi_pad_w, static_cast<int>(PH),
+                        static_cast<int>(PW), static_cast<int>(icnc), static_cast<int>(IH),
+                        static_cast<int>(IW), static_cast<int>(icn_step),
+                        static_cast<int>(in_row_stride), static_cast<int>(KH), static_cast<int>(KW),
+                        static_cast<int>(SH), static_cast<int>(SW), static_cast<int>(DH),
+                        static_cast<int>(DW));
                 } else {
                     // A pointwise gather would be a dense row copy; read B from
                     // the input instead. pad == 0 and stride == 1 keep the ROI
@@ -389,8 +398,8 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
                     // where the plane's are a plane-row apart (measured 11% worse
                     // at 1T on a 28x28 plane to read it in place).
                     const T* b_src = input_local + oh * in_row_stride;
-                    tile_pack_rhs(false, static_cast<int>(roi_area), kdim,
-                                  pack_b, ldd_b, b_src, static_cast<int>(icn_step), 1.0f);
+                    tile_pack_rhs(false, static_cast<int>(roi_area), kdim, pack_b, ldd_b, b_src,
+                                  static_cast<int>(icn_step), 1.0f);
                 }
 
                 for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block) {
@@ -406,8 +415,8 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
                             tile_save<T>(orig, tile, static_cast<int>(ocn_step),
                                          static_cast<int>(ocnc), static_cast<int>(roi_area));
                         }
-                        tile_set_bias<T>(tile, static_cast<int>(ocn_step),
-                                         static_cast<int>(ocnc), static_cast<int>(roi_area),
+                        tile_set_bias<T>(tile, static_cast<int>(ocn_step), static_cast<int>(ocnc),
+                                         static_cast<int>(roi_area),
                                          bias_ptr ? bias_ptr + ocn : nullptr,
                                          attrs.add_to && (!epilogue_active || pre_act));
                     }
@@ -416,15 +425,12 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
                     // Only the final ic-block clamps; partial sums accumulate
                     // unclamped.
                     const bool clamp_here = is_last_icn && epilogue_folded;
-                    tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(roi_area),
-                                            kdim,
-                                            tile, static_cast<int>(ocn_step),
-                                            a, static_cast<int>(w_ocn_step),
-                                            pack_b, /*ldb=*/-1, /*stage=*/nullptr,
-                                            clamp_here ? clamp_lo : -kInf,
-                                            clamp_here ? clamp_hi : kInf,
-                                            /*zero_mode=*/icn == 0 && !seed_needed,
-                                            (icn == 0 && bias_in_mma) ? bias_ptr + ocn : nullptr);
+                    tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(roi_area), kdim, tile,
+                                    static_cast<int>(ocn_step), a, static_cast<int>(w_ocn_step),
+                                    pack_b, /*ldb=*/-1, /*stage=*/nullptr,
+                                    clamp_here ? clamp_lo : -kInf, clamp_here ? clamp_hi : kInf,
+                                    /*zero_mode=*/icn == 0 && !seed_needed,
+                                    (icn == 0 && bias_in_mma) ? bias_ptr + ocn : nullptr);
 
                     // An identity epilogue is a whole-tile copy-back; skip it.
                     if (is_last_icn && epilogue_pass) {
@@ -449,10 +455,15 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
 // (fp destination) or requantizes (s8/u8 destination).
 
 /// True when every zero point the tensor carries equals @p v.
-inline bool all_zp_equal(const QuantParams& q, int64_t n, int32_t v) noexcept {
-    if (q.zero_point_data == nullptr) { return q.zero_point == v; }
+inline bool all_zp_equal(const QuantParams& q, int64_t n, int32_t v) noexcept
+{
+    if (q.zero_point_data == nullptr) {
+        return q.zero_point == v;
+    }
     for (int64_t i = 0; i < n; ++i) {
-        if (q.zero_point_data[i] != v) { return false; }
+        if (q.zero_point_data[i] != v) {
+            return false;
+        }
     }
     return true;
 }
@@ -466,9 +477,9 @@ void quantize_plane(const TensorView& in, TDst* dst, float scale, int32_t zero,
     const int64_t IC = in.shape(1);
     const int64_t IH = in.shape(2);
     const int64_t IW = in.shape(3);
-    const int64_t N  = in.shape(0);
+    const int64_t N = in.shape(0);
     const int64_t rs = in.row_stride_elems();
-    const TAct* src  = in.ptr<TAct>();
+    const TAct* src = in.ptr<TAct>();
 
     const float s = scale;
     const float z = static_cast<float>(zero);
@@ -476,9 +487,8 @@ void quantize_plane(const TensorView& in, TDst* dst, float scale, int32_t zero,
 
     auto quant_range = [&](int64_t beg, int64_t end) {
         if (rs == IW) {
-            k::quant_kernel::quantization<TDst>(
-                static_cast<int>(1), static_cast<int>(end - beg), dst + beg, 1,
-                src + beg, 1, &s, &z);
+            k::quant_kernel::quantization<TDst>(static_cast<int>(1), static_cast<int>(end - beg),
+                                                dst + beg, 1, src + beg, 1, &s, &z);
             return;
         }
         // Pitched source: row by row, never across the pitch tail.
@@ -486,9 +496,8 @@ void quantize_plane(const TensorView& in, TDst* dst, float scale, int32_t zero,
             const int64_t row = e / IW;
             const int64_t off = e - row * IW;
             const int64_t len = std::min(IW - off, end - e);
-            k::quant_kernel::quantization<TDst>(
-                static_cast<int>(1), static_cast<int>(len), dst + e, 1,
-                src + row * rs + off, 1, &s, &z);
+            k::quant_kernel::quantization<TDst>(static_cast<int>(1), static_cast<int>(len), dst + e,
+                                                1, src + row * rs + off, 1, &s, &z);
             e += len;
         }
     };
@@ -504,19 +513,15 @@ void quantize_plane(const TensorView& in, TDst* dst, float scale, int32_t zero,
     }
     const int64_t slab = (total + nt - 1) / nt;
     const int64_t nslab = (total + slab - 1) / slab;
-    ctx.cpu.run(0, nslab, [&](int64_t i) {
-        quant_range(i * slab, std::min(i * slab + slab, total));
-    });
+    ctx.cpu.run(0, nslab,
+                [&](int64_t i) { quant_range(i * slab, std::min(i * slab + slab, total)); });
 }
 
 /// One (activation, storage, output) dtype triple of the quantized route.
 template <class TAct, class TDst, class TOut>
-void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
-                             TensorView& output,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx,
-                             const Conv2DGemmPlan& plan,
-                             void* workspace)
+void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
+                                    std::span<const TensorView> inputs, const ComputeContext& ctx,
+                                    const Conv2DGemmPlan& plan, void* workspace)
 {
     constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
     // The B packer XORs 0x80: stored bytes are read as unsigned, then shifted
@@ -524,12 +529,12 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
     constexpr bool kU8 = std::is_same_v<TDst, uint8_t>;
     constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
     // Input: [N, IC, IH, IW]
-    const int64_t N  = input.shape(0);
+    const int64_t N = input.shape(0);
     const int64_t IC = input.shape(1);
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
@@ -543,7 +548,7 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
     const int64_t OW = output.shape(3);
     const int64_t out_row_stride = output.row_stride_elems();
 
-    const int64_t G  = attrs.groups;
+    const int64_t G = attrs.groups;
     const int64_t ic_per_group = IC / G;
     const int64_t oc_per_group = OC / G;
 
@@ -557,17 +562,17 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
     const int64_t PW = attrs.padding[1];
 
     const int64_t karea = KH * KW;
-    const int64_t k_full = ic_per_group * karea;   // the epilogue's K
+    const int64_t k_full = ic_per_group * karea; // the epilogue's K
 
     const int64_t icn_block = plan.icn_block;
     const int64_t ocn_block = plan.ocn_block;
-    const int64_t oh_block  = plan.oh_block;
+    const int64_t oh_block = plan.oh_block;
     const int64_t num_oh_blocks = plan.num_oh_blocks;
-    const int64_t oh_chunks     = plan.oh_chunks;
+    const int64_t oh_chunks = plan.oh_chunks;
 
-    const int64_t ocn_step = OH * out_row_stride;        // between output channels
-    const int64_t ob_step  = OC * ocn_step;              // between batch samples
-    const int64_t og_step  = oc_per_group * ocn_step;    // between groups (output)
+    const int64_t ocn_step = OH * out_row_stride;    // between output channels
+    const int64_t ob_step = OC * ocn_step;           // between batch samples
+    const int64_t og_step = oc_per_group * ocn_step; // between groups (output)
 
     // Weight row stride within a group: [oc_per_group][ic_per_group][karea].
     // Dims, not pitch: a weight is a load-time constant.
@@ -579,8 +584,8 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
 
     // Per-tensor activation parameters: fixed offline, valid whether the
     // activation arrives quantized or as fp.
-    const float   s_x    = quant_scale_at(qa, 0);
-    const int32_t zp_x   = quant_zp_at(qa, 0);
+    const float s_x = quant_scale_at(qa, 0);
+    const int32_t zp_x = quant_zp_at(qa, 0);
     // The zero point in the shifted space the packer produces (u8 → value−128).
     const int32_t zp_eff = zp_x - (kU8 ? 128 : 0);
     NNOPS_ASSERT(s_x > 0.0f);
@@ -588,7 +593,7 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
     NNOPS_ASSERT(kU8 || (zp_x >= -128 && zp_x <= 127));
 
     // Only the weight's dtype drives the A-side bias.
-    const bool    a_biased      = int8_a_pack_bias(DataType::s8) != 0;
+    const bool a_biased = int8_a_pack_bias(DataType::s8) != 0;
     const int32_t a_bias_offset = int8_epilogue_offset(DataType::s8);
 
     // The epilogue's compensation is
@@ -610,23 +615,22 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
         TDst* plane = reinterpret_cast<TDst*>(workspace);
         quantize_plane<TAct, TDst>(input, plane, s_x, zp_x, ctx);
         in_base = plane;
-        in_row_stride = IW;               // the plane is compact
+        in_row_stride = IW; // the plane is compact
     } else {
-        in_base = input.ptr<TDst>();      // TAct == TDst on this route
+        in_base = input.ptr<TDst>(); // TAct == TDst on this route
         in_row_stride = input.row_stride_elems();
     }
 
-    const int64_t icn_step = IH * in_row_stride;         // between input channels
-    const int64_t ib_step  = IC * icn_step;              // between batch samples
-    const int64_t ig_step  = ic_per_group * icn_step;    // between groups (input)
+    const int64_t icn_step = IH * in_row_stride;     // between input channels
+    const int64_t ib_step = IC * icn_step;           // between batch samples
+    const int64_t ig_step = ic_per_group * icn_step; // between groups (input)
 
     const int8_t* w_ptr = weight.ptr<int8_t>();
     // The bias is the output dtype on the fp destination, int32 on the integer one.
-    [[maybe_unused]] const TOut* b_ptr =
-        (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
+    [[maybe_unused]] const TOut* b_ptr = (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
     [[maybe_unused]] const int32_t* b_i32 =
         (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
-    TOut* out_ptr       = output.ptr<TOut>();
+    TOut* out_ptr = output.ptr<TOut>();
     // The requant's output parameters, read only for an integer destination.
     [[maybe_unused]] const QuantParams& qc = output.quant_params();
 
@@ -635,18 +639,15 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
     // costs more than this one SIMD pass (see the header).
     // Panel geometry from the same function prepackWeights used.
     const ConvPackedWeightChannelFirst pg =
-        conv_packed_weight_channel_first(attrs, ic_per_group, oc_per_group,
-                                  weight.data_type());
-    NNOPS_ASSERT(!prepacked ||
-                 (pg.icn_block == icn_block && pg.ocn_block == ocn_block));
+        conv_packed_weight_channel_first(attrs, ic_per_group, oc_per_group, weight.data_type());
+    NNOPS_ASSERT(!prepacked || (pg.icn_block == icn_block && pg.ocn_block == ocn_block));
 
     PoolArray<int32_t> r_a;
     if (need_comp) {
         r_a.reset(static_cast<size_t>(OC));
         if (prepacked) {
             // The blob carries the sums, so no per-call walk of MMA-layout panels.
-            std::memcpy(r_a.data(), w_ptr + pg.sums_off,
-                        static_cast<size_t>(OC) * sizeof(int32_t));
+            std::memcpy(r_a.data(), w_ptr + pg.sums_off, static_cast<size_t>(OC) * sizeof(int32_t));
         } else {
             for (int64_t oc = 0; oc < OC; ++oc) {
                 r_a[static_cast<size_t>(oc)] =
@@ -665,8 +666,7 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
         row_fold.reset(static_cast<size_t>(OC));
         for (int64_t oc = 0; oc < OC; ++oc) {
             const int32_t coef_zp =
-                r_a[static_cast<size_t>(oc)] -
-                static_cast<int32_t>(k_full) * quant_zp_at(qw, oc);
+                r_a[static_cast<size_t>(oc)] - static_cast<int32_t>(k_full) * quant_zp_at(qw, oc);
             row_fold[static_cast<size_t>(oc)] = -zp_eff * coef_zp;
         }
         if constexpr (kIntOut) {
@@ -681,8 +681,7 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
     // R_b[column] = Σ_k (stored byte) over one output column's whole K,
     // accumulated across ic-blocks; per slot and per oh-block.
     const int64_t r_b_len = plan.oh_block * OW;
-    PoolArray<int32_t> r_b_buf(
-        need_col_sum ? static_cast<size_t>(plan.num_slots * r_b_len) : 0);
+    PoolArray<int32_t> r_b_buf(need_col_sum ? static_cast<size_t>(plan.num_slots * r_b_len) : 0);
 
     // ---- scratch slices ---------------------------------------------------
     // The activation plane sits at the front of the arena, shared across slots;
@@ -690,7 +689,7 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
     // gemm_scratch_layout decides all of it.
     const Conv2DGemmScratch sc = gemm_scratch_layout(plan, 1);
     char* const arena = static_cast<char*>(workspace);
-    int32_t* acc_base   = reinterpret_cast<int32_t*>(arena + sc.off_acc);
+    int32_t* acc_base = reinterpret_cast<int32_t*>(arena + sc.off_acc);
     int8_t* pack_a_base = reinterpret_cast<int8_t*>(arena + sc.off_pack_a);
 
     const int64_t NG = N * G;
@@ -700,7 +699,7 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
     const bool per_thread = nslots > 0 && nslots < total;
 
     ctx.cpu.run(0, total, [&](int64_t t) {
-        const int64_t ng    = t / oh_chunks;
+        const int64_t ng = t / oh_chunks;
         const int64_t chunk = t % oh_chunks;
         const int64_t n = ng / G;
         const int64_t g = ng % G;
@@ -710,33 +709,31 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
         char* const slot_ptr = arena + sc.head + slot * sc.slot_stride;
         TDst* col_data = reinterpret_cast<TDst*>(slot_ptr + sc.off_col);
         int8_t* pack_b = reinterpret_cast<int8_t*>(slot_ptr + sc.off_pack);
-        int32_t* acc   = acc_base + slot * plan.acc_size;
+        int32_t* acc = acc_base + slot * plan.acc_size;
         int8_t* pack_a = pack_a_base + slot * plan.pack_a_size;
-        int32_t* r_b   = need_col_sum ? r_b_buf.data() + slot * r_b_len : nullptr;
+        int32_t* r_b = need_col_sum ? r_b_buf.data() + slot * r_b_len : nullptr;
 
         TOut* output_ptr = out_ptr + n * ob_step + g * og_step;
-        const TDst* input_ptr  = in_base + n * ib_step + g * ig_step;
+        const TDst* input_ptr = in_base + n * ib_step + g * ig_step;
         const int8_t* weight_ptr = w_ptr + g * oc_per_group * w_ocn_step;
-        [[maybe_unused]] const TOut* bias_ptr =
-            b_ptr ? b_ptr + g * oc_per_group : nullptr;
-        [[maybe_unused]] const int32_t* ibias_ptr =
-            b_i32 ? b_i32 + g * oc_per_group : nullptr;
+        [[maybe_unused]] const TOut* bias_ptr = b_ptr ? b_ptr + g * oc_per_group : nullptr;
+        [[maybe_unused]] const int32_t* ibias_ptr = b_i32 ? b_i32 + g * oc_per_group : nullptr;
 
         // This chunk's contiguous oh-block range (disjoint across chunks).
         const int64_t b0 = chunk * num_oh_blocks / oh_chunks;
         const int64_t b1 = (chunk + 1) * num_oh_blocks / oh_chunks;
 
         for (int64_t b = b0; b < b1; ++b) {
-            const int64_t oh       = b * oh_block;
-            const int64_t ohc      = std::min(oh_block, OH - oh);
+            const int64_t oh = b * oh_block;
+            const int64_t ohc = std::min(oh_block, OH - oh);
             const int64_t roi_area = ohc * OW;
 
             const int64_t ih = oh * SH - PH;
             const int64_t iw = 0 * SW - PW;
-            const int roi_pad_h = (ih < 0) ? static_cast<int>(-ih)
-                                           : (ih >= IH ? static_cast<int>(ih - IH) : 0);
-            const int roi_pad_w = (iw < 0) ? static_cast<int>(-iw)
-                                           : (iw >= IW ? static_cast<int>(iw - IW) : 0);
+            const int roi_pad_h =
+                (ih < 0) ? static_cast<int>(-ih) : (ih >= IH ? static_cast<int>(ih - IH) : 0);
+            const int roi_pad_w =
+                (iw < 0) ? static_cast<int>(-iw) : (iw >= IW ? static_cast<int>(iw - IW) : 0);
 
             // oc is the outer loop: the int32 accumulator holds one oc-block's
             // tile and its partial sums must survive every ic-block. With
@@ -760,32 +757,27 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
                         // A padded sample is the real value 0, stored as the
                         // activation's zero point.
                         k::tiled_im2col_2d<TDst>(
-                            col_data, input_local,
-                            0, static_cast<int>(oh),
-                            static_cast<int>(OW), static_cast<int>(ohc),
-                            roi_pad_h, roi_pad_w,
-                            static_cast<int>(PH), static_cast<int>(PW),
-                            static_cast<int>(icnc), static_cast<int>(IH), static_cast<int>(IW),
-                            static_cast<int>(icn_step), static_cast<int>(in_row_stride),
-                            static_cast<int>(KH), static_cast<int>(KW),
-                            static_cast<int>(SH), static_cast<int>(SW),
-                            static_cast<int>(DH), static_cast<int>(DW),
-                            static_cast<TDst>(zp_x));
+                            col_data, input_local, 0, static_cast<int>(oh), static_cast<int>(OW),
+                            static_cast<int>(ohc), roi_pad_h, roi_pad_w, static_cast<int>(PH),
+                            static_cast<int>(PW), static_cast<int>(icnc), static_cast<int>(IH),
+                            static_cast<int>(IW), static_cast<int>(icn_step),
+                            static_cast<int>(in_row_stride), static_cast<int>(KH),
+                            static_cast<int>(KW), static_cast<int>(SH), static_cast<int>(SW),
+                            static_cast<int>(DH), static_cast<int>(DW), static_cast<TDst>(zp_x));
                     }
 
                     // B = [K=icnc*karea][N=roi_area]. The u8 shift happens inside
                     // the pack, before the x86 panel sums.
-                    const TDst* b_src = plan.pointwise
-                        ? input_local + oh * in_row_stride
-                        : col_data;
-                    const int b_ld = plan.pointwise ? static_cast<int>(icn_step)
-                                                    : static_cast<int>(roi_area);
+                    const TDst* b_src =
+                        plan.pointwise ? input_local + oh * in_row_stride : col_data;
+                    const int b_ld =
+                        plan.pointwise ? static_cast<int>(icn_step) : static_cast<int>(roi_area);
                     const int kdim = static_cast<int>(icnc * karea);
 
-                    tile_pack_rhs_i8(false, static_cast<int>(roi_area), kdim,
-                                     pack_b, static_cast<int>(int8_panel_stride(kdim)),
-                                     reinterpret_cast<const int8_t*>(b_src), b_ld,
-                                     a_biased, /*src_shift=*/kU8);
+                    tile_pack_rhs_i8(false, static_cast<int>(roi_area), kdim, pack_b,
+                                     static_cast<int>(int8_panel_stride(kdim)),
+                                     reinterpret_cast<const int8_t*>(b_src), b_ld, a_biased,
+                                     /*src_shift=*/kU8);
 
                     if (need_col_sum) {
                         // Sum the bytes as the packer read them, then move the
@@ -805,11 +797,10 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
                     const int8_t* a_panel;
                     if (prepacked) {
                         // From the blob base: pg.offset carries the group.
-                        a_panel = w_ptr +
-                            pg.offset(g, icn / icn_block, ocn / ocn_block);
+                        a_panel = w_ptr + pg.offset(g, icn / icn_block, ocn / ocn_block);
                     } else {
-                        tile_pack_lhs_i8(false, static_cast<int>(ocnc), kdim,
-                                         pack_a, static_cast<int>(geom_ldd_i8_a(kdim)),
+                        tile_pack_lhs_i8(false, static_cast<int>(ocnc), kdim, pack_a,
+                                         static_cast<int>(geom_ldd_i8_a(kdim)),
                                          weight_ptr + icn * karea + ocn * w_ocn_step,
                                          static_cast<int>(w_ocn_step), a_biased);
                         a_panel = pack_a;
@@ -817,9 +808,9 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
 
                     // The first ic-block stores instead of accumulating, so the
                     // tile needs no zero fill.
-                    tile_mma_pack_i8(static_cast<int>(ocnc), static_cast<int>(roi_area),
-                                     kdim, acc, static_cast<int>(roi_area),
-                                     a_panel, pack_b, /*ldb=*/0, INT32_MIN, INT32_MAX,
+                    tile_mma_pack_i8(static_cast<int>(ocnc), static_cast<int>(roi_area), kdim, acc,
+                                     static_cast<int>(roi_area), a_panel, pack_b, /*ldb=*/0,
+                                     INT32_MIN, INT32_MAX,
                                      /*zero_mode=*/icn == 0);
                 }
 
@@ -829,25 +820,23 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
                     // The tile's rows are output channels, so the weight's
                     // per-channel arrays are the per-row ones.
                     Int8EpilogueParams ip{};
-                    ip.r_a  = need_comp ? r_a.data() + g * oc_per_group + ocn
-                                        : nullptr;
-                    ip.s_a  = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn
-                                            : nullptr;
-                    ip.zp_a = qw.zero_point_data
-                            ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
-                    ip.r_b         = need_col_sum ? r_b : nullptr;
-                    ip.zp_b        = nullptr;          // per-tensor activation
-                    ip.s_a_scalar  = qw.scale;
-                    ip.s_b_scalar  = s_x;
+                    ip.r_a = need_comp ? r_a.data() + g * oc_per_group + ocn : nullptr;
+                    ip.s_a = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn : nullptr;
+                    ip.zp_a =
+                        qw.zero_point_data ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
+                    ip.r_b = need_col_sum ? r_b : nullptr;
+                    ip.zp_b = nullptr; // per-tensor activation
+                    ip.s_a_scalar = qw.scale;
+                    ip.s_b_scalar = s_x;
                     ip.zp_a_scalar = qw.zero_point;
                     ip.zp_b_scalar = zp_eff;
                     ip.a_bias_offset = a_bias_offset;
-                    ip.k    = static_cast<int32_t>(k_full);
+                    ip.k = static_cast<int32_t>(k_full);
                     // Both terms live unless the per-channel half is in bias_fold.
                     ip.compensate = need_col_sum;
-                    ip.col_term   = need_col_sum;
+                    ip.col_term = need_col_sum;
                     ip.out_scale = quant_scale_at(qc, 0);
-                    ip.zp_out    = quant_zp_at(qc, 0);
+                    ip.zp_out = quant_zp_at(qc, 0);
                     // Requantize epilogue: one output scale per channel.
                     if (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
                         attrs.epilogue.quant_param_count > 0) {
@@ -857,9 +846,8 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
                         ip.zp_out = epilogue_quant_zero(attrs.epilogue, 0);
                     }
                     ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
-                    ip.bias = !bias_fold.empty()
-                            ? bias_fold.data() + g * oc_per_group + ocn
-                            : (ibias_ptr ? ibias_ptr + ocn : nullptr);
+                    ip.bias = !bias_fold.empty() ? bias_fold.data() + g * oc_per_group + ocn :
+                                                   (ibias_ptr ? ibias_ptr + ocn : nullptr);
                     TOut* dst = output_ptr + oh * out_row_stride + ocn * ocn_step;
                     if constexpr (std::is_same_v<TOut, uint8_t>) {
                         ip.out_u8 = dst;
@@ -867,35 +855,33 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
                         ip.out = dst;
                     }
                     ip.ldc_out = static_cast<int>(ocn_step);
-                    int8_epilogue_tile(ip, acc, static_cast<int>(roi_area),
-                                       0, 0, ocnc, roi_area);
+                    int8_epilogue_tile(ip, acc, static_cast<int>(roi_area), 0, 0, ocnc, roi_area);
                 } else {
                     DqEpilogueParams<TOut> ip{};
-                    ip.r_a        = need_comp ? r_a.data() + g * oc_per_group + ocn : nullptr;
-                    ip.s_a        = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn
-                                                  : nullptr;
-                    ip.zp_a       = qw.zero_point_data
-                                  ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
-                    ip.r_b        = need_col_sum ? r_b : nullptr;
-                    ip.row_off    = row_fold.empty() ? nullptr
-                                : row_fold.data() + g * oc_per_group + ocn;
-                    ip.zp_b       = nullptr;          // per-tensor activation
+                    ip.r_a = need_comp ? r_a.data() + g * oc_per_group + ocn : nullptr;
+                    ip.s_a = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn : nullptr;
+                    ip.zp_a =
+                        qw.zero_point_data ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
+                    ip.r_b = need_col_sum ? r_b : nullptr;
+                    ip.row_off =
+                        row_fold.empty() ? nullptr : row_fold.data() + g * oc_per_group + ocn;
+                    ip.zp_b = nullptr; // per-tensor activation
                     ip.s_a_scalar = qw.scale;
                     ip.s_b_scalar = s_x;
                     ip.zp_a_scalar = qw.zero_point;
                     ip.zp_b_scalar = zp_eff;
                     ip.a_bias_offset = a_bias_offset;
-                    ip.k    = static_cast<int32_t>(k_full);
+                    ip.k = static_cast<int32_t>(k_full);
                     // Both terms unless the row half is in row_off.
                     ip.compensate = need_col_sum;
-                    ip.col_term   = need_col_sum;
+                    ip.col_term = need_col_sum;
                     ip.act_u8 = kU8;
-                    ip.ep   = &attrs.epilogue;
+                    ip.ep = &attrs.epilogue;
                     ip.bias = bias_ptr ? bias_ptr + ocn : nullptr;
-                    ip.out  = output_ptr + oh * out_row_stride + ocn * ocn_step;
+                    ip.out = output_ptr + oh * out_row_stride + ocn * ocn_step;
                     ip.ldc_out = static_cast<int>(ocn_step);
-                    dq_epilogue_tile<TOut>(ip, acc, static_cast<int>(roi_area),
-                                           0, 0, ocnc, roi_area);
+                    dq_epilogue_tile<TOut>(ip, acc, static_cast<int>(roi_area), 0, 0, ocnc,
+                                           roi_area);
                 }
             }
         }
@@ -906,18 +892,15 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
 //  Plan — single source of truth for block sizes, parallelism + workspace
 // =========================================================================
 
-Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
-                        std::span<const TensorDesc> inputs,
-                        std::span<const TensorDesc> outputs,
-                        int num_threads,
-                        bool use_thread_slots,
-                        int64_t num_slots)
+Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDesc> inputs,
+                         std::span<const TensorDesc> outputs, int num_threads,
+                         bool use_thread_slots, int64_t num_slots)
 {
     NNOPS_ASSERT(inputs.size() >= 2);
     NNOPS_ASSERT(outputs.size() >= 1);
 
-    const auto& in  = inputs[0];
-    const auto& wt  = inputs[1];
+    const auto& in = inputs[0];
+    const auto& wt = inputs[1];
     const auto& out = outputs[0];
 
     Conv2DGemmPlan plan;
@@ -928,8 +911,8 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
 
     if (quant) {
         // Activation: pre-quantized (u8/s8), or fp quantized per call.
-        if (dt != DataType::u8 && dt != DataType::s8 &&
-            dt != DataType::f32 && dt != DataType::f16) {
+        if (dt != DataType::u8 && dt != DataType::s8 && dt != DataType::f32 &&
+            dt != DataType::f16) {
             return plan;
         }
         // Output: fp (the activation dtype, or attributes.output_dtype when the
@@ -938,8 +921,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
         if (!int_out && out.dtype != DataType::f32 && out.dtype != DataType::f16) {
             return plan;
         }
-        if (!int_out && (dt == DataType::f32 || dt == DataType::f16) &&
-            out.dtype != dt) {
+        if (!int_out && (dt == DataType::f32 || dt == DataType::f16) && out.dtype != dt) {
             return plan;
         }
         const DataType bias_dt = int_out ? DataType::s32 : out.dtype;
@@ -962,7 +944,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
         }
     }
 
-    const int64_t N  = in.dims[0];
+    const int64_t N = in.dims[0];
     const int64_t IC = in.dims[1];
     const int64_t IW = in.dims[3];
     const int64_t OC = wt.dims[0];
@@ -974,7 +956,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     const int64_t oc_per_group = OC / G;
 
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
-    const int64_t PH    = attrs.padding[0];
+    const int64_t PH = attrs.padding[0];
 
     // A 1x1 kernel at unit stride with no padding lets the GEMM read the input
     // plane directly: B = input, ldb = the channel stride, K = ic_per_group.
@@ -983,11 +965,9 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     // An fp activation is re-quantized into a compact plane, so its pitch does
     // not disqualify it.
     const bool fp_act = (dt == DataType::f32 || dt == DataType::f16);
-    plan.pointwise = (karea == 1 &&
-                      attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
+    plan.pointwise = (karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
                       attrs.padding[0] == 0 && attrs.padding[1] == 0 &&
-                      ((quant && fp_act) ||
-                       in.row_stride_elems == 0 || in.row_stride_elems == IW));
+                      ((quant && fp_act) || in.row_stride_elems == 0 || in.row_stride_elems == IW));
 
     // An fp activation becomes a compact plane once per call, then behaves like
     // a pre-quantized one (see the header).
@@ -999,26 +979,26 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     // The quantized A panels are a load-time artifact (PackedOIHW), so its
     // blocks are conv_packed_weight_channel_first's; the fp route packs its own B.
     const bool prepacked_a = wt.layout == TensorLayout::PackedOIHW;
-    const ConvPackedWeightChannelFirst pg = quant
-        ? conv_packed_weight_channel_first(attrs, ic_per_group, oc_per_group, wt.dtype)
-        : ConvPackedWeightChannelFirst{};
-    plan.icn_block = quant
-                   ? pg.icn_block
-                   : (plan.pointwise
-                          ? ic_per_group
-                          : std::min<int64_t>(get_ic_block(static_cast<int>(karea)),
-                                              ic_per_group));
+    const ConvPackedWeightChannelFirst pg =
+        quant ? conv_packed_weight_channel_first(attrs, ic_per_group, oc_per_group, wt.dtype) :
+                ConvPackedWeightChannelFirst{};
+    plan.icn_block =
+        quant ? pg.icn_block :
+                (plan.pointwise ?
+                     ic_per_group :
+                     std::min<int64_t>(get_ic_block(static_cast<int>(karea)), ic_per_group));
     plan.ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
-    plan.oh_block  = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
+    plan.oh_block = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
 
     // The GEMM's N axis is the block's rows flattened into one roi_area-wide
     // run, and every store, seed and epilogue pass addresses it contiguously
     // (ldc is the channel step). A block may therefore only span rows the
     // destination lays out back to back: a pitched output pins it to one row.
     // row_stride_elems == 0 is TensorDesc's unknown → compact convention.
-    const bool out_rows_dense =
-        out.row_stride_elems == 0 || out.row_stride_elems == OW;
-    if (!out_rows_dense) { plan.oh_block = 1; }
+    const bool out_rows_dense = out.row_stride_elems == 0 || out.row_stride_elems == OW;
+    if (!out_rows_dense) {
+        plan.oh_block = 1;
+    }
 
     const int64_t NG = N * G;
     const int64_t nt = std::max<int64_t>(num_threads, 1);
@@ -1031,9 +1011,13 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     const int64_t nr_max = quant ? NR_MAX_I8 : nr_max_dt(dt);
     for (;;) {
         const int64_t blocks = (OH + plan.oh_block - 1) / plan.oh_block;
-        if (2 * NG * blocks >= nt || plan.oh_block <= 1) { break; }
+        if (2 * NG * blocks >= nt || plan.oh_block <= 1) {
+            break;
+        }
         const int64_t next = plan.oh_block / 2;
-        if (next * OW < 2 * nr_max) { break; }
+        if (next * OW < 2 * nr_max) {
+            break;
+        }
         plan.oh_block = next;
     }
 
@@ -1045,7 +1029,9 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
         while (plan.oh_block < OH) {
             const int64_t grown = std::min<int64_t>(plan.oh_block * 2, OH);
             const int64_t grown_blocks = (OH + grown - 1) / grown;
-            if (2 * NG * grown_blocks < nt) { break; }  // pool still needs the split
+            if (2 * NG * grown_blocks < nt) {
+                break;
+            } // pool still needs the split
             plan.oh_block = grown;
         }
     }
@@ -1060,17 +1046,16 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     // The search steps the block count by the chunk count rather than doubling
     // the row count: it can land on 14 rows on a 112 plane, where 4→8→16 cannot.
     if (out_rows_dense && !plan.pointwise) {
-        constexpr int64_t kScratchCap = int64_t{256} << 10;   // elements per slot
+        constexpr int64_t kScratchCap = int64_t{256} << 10; // elements per slot
         const int64_t scratch_per_row = plan.icn_block * karea * OW;
         const int64_t cap_rows = (scratch_per_row > 0) ? kScratchCap / scratch_per_row : OH;
-        const int64_t max_rows = std::max<int64_t>(plan.oh_block,
-                                                   std::min<int64_t>(OH, cap_rows));
+        const int64_t max_rows = std::max<int64_t>(plan.oh_block, std::min<int64_t>(OH, cap_rows));
         const int64_t chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, OH);
         // Rows the busiest oh-chunk owns under block size `block` (the kernel's
         // own b0..b1 split).
         auto busiest_chunk_rows = [&](int64_t block) {
             const int64_t nblk = (OH + block - 1) / block;
-            const int64_t nc = std::min(chunks, nblk);   // oh_chunks <= num_oh_blocks
+            const int64_t nc = std::min(chunks, nblk); // oh_chunks <= num_oh_blocks
             int64_t worst = 0;
             for (int64_t c = 0; c < nc; ++c) {
                 const int64_t lo = std::min(OH, c * nblk / nc * block);
@@ -1082,12 +1067,20 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
         const int64_t base_rows = busiest_chunk_rows(plan.oh_block);
         for (int64_t blocks = chunks; blocks <= OH; blocks += chunks) {
             const int64_t grown = (OH + blocks - 1) / blocks;
-            if (grown > max_rows) { continue; }          // over the scratch budget
+            if (grown > max_rows) {
+                continue;
+            } // over the scratch budget
             // ceil(OH/grown) need not hand `blocks` back — only then is the
             // split actually one block per chunk.
-            if ((OH + grown - 1) / grown != blocks) { continue; }
-            if (busiest_chunk_rows(grown) > base_rows) { continue; }  // long tail
-            if (grown > plan.oh_block) { plan.oh_block = grown; }
+            if ((OH + grown - 1) / grown != blocks) {
+                continue;
+            }
+            if (busiest_chunk_rows(grown) > base_rows) {
+                continue;
+            } // long tail
+            if (grown > plan.oh_block) {
+                plan.oh_block = grown;
+            }
             break;
         }
     }
@@ -1120,21 +1113,17 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     }
 
     // The fp route fuses gather and pack, so it has no col matrix.
-    plan.col_size  = (plan.pointwise || !quant)
-                   ? 0
-                   : plan.icn_block * karea * plan.oh_block * OW;
+    plan.col_size = (plan.pointwise || !quant) ? 0 : plan.icn_block * karea * plan.oh_block * OW;
     // add_to never reaches here on the quantized route (gated above).
-    plan.orig_size = (attrs.add_to && !quant)
-                   ? plan.ocn_block * plan.oh_block * OW : 0;
+    plan.orig_size = (attrs.add_to && !quant) ? plan.ocn_block * plan.oh_block * OW : 0;
 
     // Packed-B scratch at the widest n-block and longest k-block; the packer's
     // stride comes from the actual k, so this is a bound, not a worst case.
     // The quantized route's is in bytes (esz 1) with the int8 panel stride.
-    const int64_t esz      = quant ? 1 : static_cast<int64_t>(data_type_size(dt));
+    const int64_t esz = quant ? 1 : static_cast<int64_t>(data_type_size(dt));
     const int64_t kdim_max = plan.icn_block * karea;
-    plan.pack_size = ((plan.oh_block * OW + nr_max - 1) / nr_max)
-                   * gemm_panel_slot(kdim_max, nr_max, esz, quant,
-                                     dt == DataType::bf16);
+    plan.pack_size = ((plan.oh_block * OW + nr_max - 1) / nr_max) *
+                     gemm_panel_slot(kdim_max, nr_max, esz, quant, dt == DataType::bf16);
 
     // One slot per worker when the backend reports ids and there are fewer of
     // them than tasks; else one per task.
@@ -1146,18 +1135,18 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
         // Both regions sit behind the slots in the shared arena.
         plan.acc_size = plan.ocn_block * plan.oh_block * OW;
         // A prepacked filter's panels are read in place: no per-slot pack region.
-        plan.pack_a_size = prepacked_a
-            ? 0
-            : static_cast<int64_t>(
-                  num_panels_max(static_cast<int>(plan.ocn_block), MR_I8))
-              * geom_ldd_i8_a(kdim_max);
+        plan.pack_a_size =
+            prepacked_a ?
+                0 :
+                static_cast<int64_t>(num_panels_max(static_cast<int>(plan.ocn_block), MR_I8)) *
+                    geom_ldd_i8_a(kdim_max);
     }
     plan.workspace_size = static_cast<size_t>(gemm_scratch_layout(plan, esz).total);
     return plan;
 }
 
-}  // anonymous namespace
-}  // namespace channel_first
+} // anonymous namespace
+} // namespace channel_first
 
 // =========================================================================
 //  Channel-last route — pixels on M, the packed HWIO weight on N
@@ -1169,38 +1158,49 @@ namespace {
 using nnops::simd::s_load;
 using nnops::simd::s_store;
 
-namespace k = nnops::kernel;  // pure SIMD kernels: the stem's direct 3x3
+namespace k = nnops::kernel; // pure SIMD kernels: the stem's direct 3x3
 
 // ---- block-size heuristics ------------------------------------------------
 
 /// Input-channel block: kdim = ic_block × karea lands in ~144–256, and the
 /// packed-B panel (nr_max × kdim) stays near L1/L2. A 1x1 filter has neither a
 /// gather nor a karea multiplier, so K runs four times as wide.
-inline int64_t get_ic_block_channel_last(int64_t karea, int64_t ic_per_group) noexcept {
-    if (karea == 1)  { return 256; }
+inline int64_t get_ic_block_channel_last(int64_t karea, int64_t ic_per_group) noexcept
+{
+    if (karea == 1) {
+        return 256;
+    }
     // A narrow channel count takes itself whole even when the ladder would split
     // it: with every channel of a pixel in the block, one filter row's taps are
     // adjacent, so the gather copies one run instead of `KW` runs of two. That
     // is the 3-channel stem's whole loss (IC=3, 7x7).
-    if (ic_per_group * karea <= 256) { return std::max<int64_t>(ic_per_group, 1); }
-    if (karea <= 9)  { return 16; }
-    if (karea <= 25) { return 8;  }
-    if (karea <= 49) { return 2;  }
+    if (ic_per_group * karea <= 256) {
+        return std::max<int64_t>(ic_per_group, 1);
+    }
+    if (karea <= 9) {
+        return 16;
+    }
+    if (karea <= 25) {
+        return 8;
+    }
+    if (karea <= 49) {
+        return 2;
+    }
     return 1;
 }
 
-constexpr int64_t kOcnBlock = 128;  ///< output-channel tile (the GEMM's N)
+constexpr int64_t kOcnBlock = 128; ///< output-channel tile (the GEMM's N)
 /// An oc_per_group at or below this stays one block: every extra oc block costs
 /// a second pass over the pixels (A pack, accumulator fill, epilogue). Splitting
 /// 144 into 80 + 64 cost the int8 expand layer a quarter of its time.
 constexpr int64_t kOcnSingleCap = 192;
-constexpr int64_t kMBlock   = 24;   ///< pixel tile (the GEMM's M): 4 × mr_max(6)
+constexpr int64_t kMBlock = 24; ///< pixel tile (the GEMM's M): 4 × mr_max(6)
 /// Pixels a task needs before it is worth splitting the plane again: two M
 /// blocks, i.e. one full tile plus a second to hide its prologue.
 constexpr int64_t kTaskMinPixels = 2 * kMBlock;
 /// Bytes one accumulator pass may cover (the plan's rows-per-pass knob).
 constexpr int64_t kPassAccBytes = 128 * 1024;
-constexpr int64_t kABSlack  = 8;    ///< elements past the A tile (vector over-read)
+constexpr int64_t kABSlack = 8; ///< elements past the A tile (vector over-read)
 
 /// Cap on the shared packed-weight buffer: written once per call, read by every
 /// task, so a small plane (few pixels per task) need not pay the whole pack per
@@ -1218,8 +1218,8 @@ constexpr int64_t kTaskTileCap = int64_t{64} << 10;
 /// only: a lone bias is the accumulator's initial value (tile_mma_direct's
 /// col_bias), which costs no tile traffic.
 template <class T>
-void tile_seed(T* NNOPS_RESTRICT tile, int ld, int mc, int nc,
-               const T* NNOPS_RESTRICT bias, bool add) noexcept
+void tile_seed(T* NNOPS_RESTRICT tile, int ld, int mc, int nc, const T* NNOPS_RESTRICT bias,
+               bool add) noexcept
 {
     for (int m = 0; m < mc; ++m) {
         T* row = tile + static_cast<int64_t>(m) * ld;
@@ -1235,24 +1235,26 @@ void tile_seed(T* NNOPS_RESTRICT tile, int ld, int mc, int nc,
 
 /// Zero a strided tile [mc][nc] (row stride ld) — the accumulator seed when the
 /// add_to route has no bias to start from.
-template <class T>
-void tile_zero(T* NNOPS_RESTRICT tile, int ld, int mc, int nc) noexcept
+template <class T> void tile_zero(T* NNOPS_RESTRICT tile, int ld, int mc, int nc) noexcept
 {
     for (int m = 0; m < mc; ++m) {
         T* row = tile + static_cast<int64_t>(m) * ld;
-        for (int i = 0; i < nc; ++i) { row[i] = T{}; }
+        for (int i = 0; i < nc; ++i) {
+            row[i] = T{};
+        }
     }
 }
 
 /// Copy a strided tile (row stride ld) into a dense [M][N] scratch.
 template <class T>
-void tile_save(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src,
-               int ld, int M, int N) noexcept
+void tile_save(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src, int ld, int M, int N) noexcept
 {
     for (int m = 0; m < M; ++m) {
         const T* s = src + static_cast<int64_t>(m) * ld;
         T* d = dst + static_cast<int64_t>(m) * N;
-        for (int i = 0; i < N; ++i) { d[i] = s[i]; }
+        for (int i = 0; i < N; ++i) {
+            d[i] = s[i];
+        }
     }
 }
 
@@ -1264,16 +1266,14 @@ void tile_save(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src,
 // so one panel's rows are restaged tap-major first; the MMA still makes one call
 // over the whole kdim. Staging is per *panel* (nr_max × kdim, L1-sized).
 template <class T>
-void pack_block(T* dst, int64_t panel_slot, T* stage,
-                const T* w, int64_t w_ic_stride, int64_t w_tap_stride,
-                int64_t ocnc, int64_t icnc,
-                int karea, int64_t nr_max, int kdim) noexcept
+void pack_block(T* dst, int64_t panel_slot, T* stage, const T* w, int64_t w_ic_stride,
+                int64_t w_tap_stride, int64_t ocnc, int64_t icnc, int karea, int64_t nr_max,
+                int kdim) noexcept
 {
     (void)nr_max;
     if (karea == 1) {
-        tile_pack_rhs(false, static_cast<int>(ocnc), static_cast<int>(icnc),
-                      dst, static_cast<int>(panel_slot),
-                      w, static_cast<int>(w_ic_stride), 1.0f);
+        tile_pack_rhs(false, static_cast<int>(ocnc), static_cast<int>(icnc), dst,
+                      static_cast<int>(panel_slot), w, static_cast<int>(w_ic_stride), 1.0f);
         return;
     }
 
@@ -1286,9 +1286,8 @@ void pack_block(T* dst, int64_t panel_slot, T* stage,
                             static_cast<size_t>(np) * sizeof(T));
             }
         }
-        tile_pack_rhs(false, static_cast<int>(np), kdim,
-                      dst + (p0 / nr_max) * panel_slot, static_cast<int>(panel_slot),
-                      stage, static_cast<int>(nr_max), 1.0f);
+        tile_pack_rhs(false, static_cast<int>(np), kdim, dst + (p0 / nr_max) * panel_slot,
+                      static_cast<int>(panel_slot), stage, static_cast<int>(nr_max), 1.0f);
     }
 }
 
@@ -1299,39 +1298,34 @@ void pack_block(T* dst, int64_t panel_slot, T* stage,
 // wide enough that the pool's per-task cost is noise.
 
 template <class T, int IC, int K>
-void stem_conv_plane(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in,
-                     const T* NNOPS_RESTRICT w, const T* NNOPS_RESTRICT bias,
-                     int64_t N, int64_t IH, int64_t IW, int64_t OW, int64_t OC,
-                     int64_t in_rs, int64_t out_rs, int64_t ib_step,
-                     int64_t ob_step, int64_t OH,
-                     int SH, int SW, int PH, int PW, int DH, int DW,
-                     bool clamp, float lo, float hi, const ComputeContext& ctx)
+void stem_conv_plane(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in, const T* NNOPS_RESTRICT w,
+                     const T* NNOPS_RESTRICT bias, int64_t N, int64_t IH, int64_t IW, int64_t OW,
+                     int64_t OC, int64_t in_rs, int64_t out_rs, int64_t ib_step, int64_t ob_step,
+                     int64_t OH, int SH, int SW, int PH, int PW, int DH, int DW, bool clamp,
+                     float lo, float hi, const ComputeContext& ctx)
 {
     ctx.cpu.run(0, N * OH, [&](int64_t t) {
         const int64_t n = t / OH;
-        k::stem_conv_row<T, IC, K>(out + n * ob_step, in + n * ib_step, w, bias,
-                                   IH, IW, OW, OC, in_rs, out_rs, t - n * OH,
-                                   SH, SW, PH, PW, DH, DW, clamp, lo, hi);
+        k::stem_conv_row<T, IC, K>(out + n * ob_step, in + n * ib_step, w, bias, IH, IW, OW, OC,
+                                   in_rs, out_rs, t - n * OH, SH, SW, PH, PW, DH, DW, clamp, lo,
+                                   hi);
     });
 }
 
 // ---- main kernel ----------------------------------------------------------
 
 template <class T>
-void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
-                              TensorView& output,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx,
-                              const Conv2DGemmPlan& plan,
-                              void* workspace)
+void conv2d_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
+                              std::span<const TensorView> inputs, const ComputeContext& ctx,
+                              const Conv2DGemmPlan& plan, void* workspace)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
     // Logical [N, C, H, W]; channel-last stores [N][H][W][C], so a "row" is one spatial
     // line and a pixel's channel vector is contiguous.
-    const int64_t N  = input.shape(0);
+    const int64_t N = input.shape(0);
     const int64_t IC = input.shape(1);
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
@@ -1361,9 +1355,9 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
 
     const int64_t icn_block = plan.icn_block;
     const int64_t ocn_block = plan.ocn_block;
-    const int      m_block  = static_cast<int>(plan.m_block);
+    const int m_block = static_cast<int>(plan.m_block);
     const int64_t oh_chunks = plan.oh_chunks;
-    const int64_t ph_block  = plan.ph_block;
+    const int64_t ph_block = plan.ph_block;
     const int64_t oc_chunks = plan.oc_chunks;
 
     // A sample is IH rows of the channel-last pitch.
@@ -1376,15 +1370,17 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     // a load-time constant. A prepacked blob is read only through the panel
     // geometry, so its strides stay 0.
     //   w_ic_stride = OC (one input channel's row); w_tap_stride = ic_per_group·OC
-    const int64_t w_row = prepacked ? 0 : weight.shape(3);   // [oc] run of one (tap, ic)
-    const int64_t w_ic_stride = w_row;                       // [ic] within a tap
-    const int64_t w_tap_stride = prepacked                   // [kh][kw] position
-        ? 0 : weight.shape(2) * w_row;
+    const int64_t w_row = prepacked ? 0 : weight.shape(3); // [oc] run of one (tap, ic)
+    const int64_t w_ic_stride = w_row;                     // [ic] within a tap
+    const int64_t w_tap_stride = prepacked                 // [kh][kw] position
+                                     ?
+                                     0 :
+                                     weight.shape(2) * w_row;
 
     T* out_ptr = output.ptr<T>();
     const T* in_ptr = input.ptr<T>();
-    const T* w_ptr  = weight.ptr<T>();
-    const T* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const T* w_ptr = weight.ptr<T>();
+    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
 
     constexpr int64_t nr_max = nr_max_flt<T>();
     const int64_t esz = static_cast<int64_t>(sizeof(T));
@@ -1404,17 +1400,20 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     if (!attrs.add_to || pre_act) {
         switch (attrs.epilogue.type) {
         case EpilogueActivateType::Relu:
-            clamp_lo = 0.0f; epi_folded = true;
+            clamp_lo = 0.0f;
+            epi_folded = true;
             break;
         case EpilogueActivateType::Relu6:
-            clamp_lo = 0.0f; clamp_hi = 6.0f; epi_folded = true;
+            clamp_lo = 0.0f;
+            clamp_hi = 6.0f;
+            epi_folded = true;
             break;
         default:
             break;
         }
     }
     const bool epi_active = attrs.epilogue.type != EpilogueActivateType::None;
-    const bool epi_pass   = epi_active && !epi_folded;
+    const bool epi_pass = epi_active && !epi_folded;
 
     // add_to folds the pre-existing output into the accumulator seed when the
     // epilogue is the identity, and the pre-activation order always does; the
@@ -1426,48 +1425,53 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     // carries the residual. A seeded tile must never be zeroed by the MMA.
     const bool seed_bias = attrs.add_to && has_bias;
     const bool bias_seed = has_bias && !attrs.add_to;
-    const bool need_epi  = epi_pass;
+    const bool need_epi = epi_pass;
 
     // ---- the tiny filter ---------------------------------------------------
     // At most four input channels under a square 3x3/5x5/7x7: no gather, no
     // panel, no plan — the tap is read where it lies. prepackWeights declines
     // this shape too, so the filter arrives raw.
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
-        if (G == 1 && !prepacked && ic_per_group <= 4 && oc_per_group % 16 == 0 &&
-            KH == KW && KH >= 3 && KH <= 7 && (KH & 1) &&
-            !attrs.add_to && !epi_pass) {
+        if (G == 1 && !prepacked && ic_per_group <= 4 && oc_per_group % 16 == 0 && KH == KW &&
+            KH >= 3 && KH <= 7 && (KH & 1) && !attrs.add_to && !epi_pass) {
             const bool clamp = clamp_lo != -kInf || clamp_hi != kInf;
             const float lo = clamp ? clamp_lo : -kInf;
             const float hi = clamp ? clamp_hi : kInf;
             const auto run = [&](auto kk) {
                 constexpr int K = decltype(kk)::value;
                 switch (ic_per_group) {
-                case 1: stem_conv_plane<T, 1, K>(out_ptr, in_ptr, w_ptr, b_ptr,
-                                                 N, IH, IW, OW, OC, in_row_stride,
-                                                 out_row_stride, ib_step, ob_step, OH,
-                                                 SH, SW, PH, PW, DH, DW, clamp, lo, hi,
-                                                 ctx); return;
-                case 2: stem_conv_plane<T, 2, K>(out_ptr, in_ptr, w_ptr, b_ptr,
-                                                 N, IH, IW, OW, OC, in_row_stride,
-                                                 out_row_stride, ib_step, ob_step, OH,
-                                                 SH, SW, PH, PW, DH, DW, clamp, lo, hi,
-                                                 ctx); return;
-                case 3: stem_conv_plane<T, 3, K>(out_ptr, in_ptr, w_ptr, b_ptr,
-                                                 N, IH, IW, OW, OC, in_row_stride,
-                                                 out_row_stride, ib_step, ob_step, OH,
-                                                 SH, SW, PH, PW, DH, DW, clamp, lo, hi,
-                                                 ctx); return;
-                default: stem_conv_plane<T, 4, K>(out_ptr, in_ptr, w_ptr, b_ptr,
-                                                  N, IH, IW, OW, OC, in_row_stride,
-                                                  out_row_stride, ib_step, ob_step, OH,
-                                                  SH, SW, PH, PW, DH, DW, clamp, lo, hi,
-                                                  ctx); return;
+                case 1:
+                    stem_conv_plane<T, 1, K>(out_ptr, in_ptr, w_ptr, b_ptr, N, IH, IW, OW, OC,
+                                             in_row_stride, out_row_stride, ib_step, ob_step, OH,
+                                             SH, SW, PH, PW, DH, DW, clamp, lo, hi, ctx);
+                    return;
+                case 2:
+                    stem_conv_plane<T, 2, K>(out_ptr, in_ptr, w_ptr, b_ptr, N, IH, IW, OW, OC,
+                                             in_row_stride, out_row_stride, ib_step, ob_step, OH,
+                                             SH, SW, PH, PW, DH, DW, clamp, lo, hi, ctx);
+                    return;
+                case 3:
+                    stem_conv_plane<T, 3, K>(out_ptr, in_ptr, w_ptr, b_ptr, N, IH, IW, OW, OC,
+                                             in_row_stride, out_row_stride, ib_step, ob_step, OH,
+                                             SH, SW, PH, PW, DH, DW, clamp, lo, hi, ctx);
+                    return;
+                default:
+                    stem_conv_plane<T, 4, K>(out_ptr, in_ptr, w_ptr, b_ptr, N, IH, IW, OW, OC,
+                                             in_row_stride, out_row_stride, ib_step, ob_step, OH,
+                                             SH, SW, PH, PW, DH, DW, clamp, lo, hi, ctx);
+                    return;
                 }
             };
             switch (KH) {
-            case 3: run(std::integral_constant<int, 3>{}); return;
-            case 5: run(std::integral_constant<int, 5>{}); return;
-            default: run(std::integral_constant<int, 7>{}); return;
+            case 3:
+                run(std::integral_constant<int, 3>{});
+                return;
+            case 5:
+                run(std::integral_constant<int, 5>{});
+                return;
+            default:
+                run(std::integral_constant<int, 7>{});
+                return;
             }
         }
     }
@@ -1476,8 +1480,7 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     // Same function prepackWeights built the blob with; it must never disagree.
     const ConvPackedWeightLast pg =
         conv_packed_weight_last(attrs, ic_per_group, oc_per_group, weight.data_type());
-    NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block &&
-                 pg.nr == nr_max);
+    NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block && pg.nr == nr_max);
     const int64_t num_ic_blocks = pg.nfull_ic + (pg.tail_ic ? 1 : 0);
     const int64_t kdim_max = pg.kdim_max;
 
@@ -1497,8 +1500,8 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     if (shared) {
         const int64_t cols = (plan.shared_elems + OC - 1) / OC;
         const int64_t shape[] = {OC, cols};
-        TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(),
-                        shared_ptr, cols * esz, TensorLayout::PackedHWIO);
+        TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(), shared_ptr,
+                        cols * esz, TensorLayout::PackedHWIO);
         conv_packed_weight_pack(attrs, weight, blob, ctx);
     }
 
@@ -1519,25 +1522,25 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     }
 
     const auto run_task = [&](int64_t t) {
-        const int64_t ng   = t / chunks_per_ng;
-        const int64_t rem  = t % chunks_per_ng;
+        const int64_t ng = t / chunks_per_ng;
+        const int64_t rem = t % chunks_per_ng;
         // The oc-chunk varies fastest: neighbours in task order then cover
         // different filter rows, so their weight streams differ.
-        const int64_t chunk    = rem / oc_chunks;
+        const int64_t chunk = rem / oc_chunks;
         const int64_t oc_chunk = rem % oc_chunks;
         const int64_t n = ng / G;
         const int64_t g = ng % G;
 
         const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
         char* const slot_ptr = base + sc.head + slot * sc.slot_stride;
-        T* const a_buf    = reinterpret_cast<T*>(slot_ptr + sc.off_a);
+        T* const a_buf = reinterpret_cast<T*>(slot_ptr + sc.off_a);
         T* const orig_buf = reinterpret_cast<T*>(slot_ptr + sc.off_orig);
-        T* const stage    = reinterpret_cast<T*>(slot_ptr + sc.off_stage);
+        T* const stage = reinterpret_cast<T*>(slot_ptr + sc.off_stage);
         T* const pack_buf = reinterpret_cast<T*>(slot_ptr + sc.off_pack);
 
         T* const out_g = out_ptr + n * ob_step + g * oc_per_group;
         const T* const in_g = in_ptr + n * ib_step + g * ic_per_group;
-        const T* const w_g  = w_ptr + g * oc_per_group;
+        const T* const w_g = w_ptr + g * oc_per_group;
         const T* const bias_g = b_ptr ? b_ptr + g * oc_per_group : nullptr;
         const T* const bias_col = bias_seed ? bias_pad.data() + g * oc_per_group : nullptr;
 
@@ -1547,15 +1550,15 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
         const int64_t r0 = chunk * OH / oh_chunks;
         const int64_t r1 = (chunk + 1) * OH / oh_chunks;
         const int64_t oc_lo = oc_chunk * pg.panels_oc / oc_chunks * nr_max;
-        const int64_t oc_hi = std::min(
-            (oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
+        const int64_t oc_hi =
+            std::min((oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
 
         // Dense rows make a pixel tile one contiguous run, so it may cross a row
         // boundary — which keeps a narrow plane's tiles at the full M instead of
         // paying MR-row granularity per row (a 7-pixel row of a 6-row MR block
         // wastes 40%). Pointwise reads A the same way, so the input must be dense.
-        const bool flat = out_row_stride == OW * OC &&
-                          (!plan.pointwise || in_row_stride == IW * IC);
+        const bool flat =
+            out_row_stride == OW * OC && (!plan.pointwise || in_row_stride == IW * IC);
 
         // A task may start mid-block (oc_chunks splits on panels), but the blob
         // holds one oc block at a time: end the tile where the block does, so its
@@ -1563,91 +1566,85 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
         // therefore the tile's own end — a whole block from a short tile would
         // skip the rest of that block.
         const auto block_end = [&](int64_t ocn) {
-            return panels ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block)
-                          : oc_hi;
+            return panels ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block) : oc_hi;
         };
-        for (int64_t ocn = oc_lo; ocn < oc_hi;
-             ocn = panels ? block_end(ocn) : ocn + ocn_block) {
+        for (int64_t ocn = oc_lo; ocn < oc_hi; ocn = panels ? block_end(ocn) : ocn + ocn_block) {
             const int64_t oc_end = block_end(ocn);
             const int64_t ocnc = std::min(ocn_block, oc_end - ocn);
             // The residual region covers one pass's rows (one oc block live).
             T* const orig = keep_orig ? orig_buf : nullptr;
 
             for (int64_t pr = r0; pr < r1; pr += ph_block) {
-            const int64_t pr1 = std::min(r1, pr + ph_block);
-            const int64_t p_first = pr * OW;
-            const int64_t p_last  = pr1 * OW;
-            // A pass of 49 pixels is 24 + 24 + 1 and the last tile pays a whole
-            // MR block for one row. Re-split only a *short* tail, and keep the
-            // step a multiple of MR: 24 + 24 + 12 costs the same MR blocks as
-            // three even 16s, where a step of 23 would pay a fourth block for 5.
-            constexpr int64_t mr_step = mr_max_flt<T>();
-            const int64_t p_span = std::max<int64_t>(p_last - p_first, 1);
-            const int64_t p_tail = p_span % m_block;
-            const int64_t p_step =
-                (flat && p_tail != 0 && p_tail < mr_step && m_block >= 2 * mr_step)
-                    ? (m_block / mr_step - 1) * mr_step
-                    : m_block;
+                const int64_t pr1 = std::min(r1, pr + ph_block);
+                const int64_t p_first = pr * OW;
+                const int64_t p_last = pr1 * OW;
+                // A pass of 49 pixels is 24 + 24 + 1 and the last tile pays a whole
+                // MR block for one row. Re-split only a *short* tail, and keep the
+                // step a multiple of MR: 24 + 24 + 12 costs the same MR blocks as
+                // three even 16s, where a step of 23 would pay a fourth block for 5.
+                constexpr int64_t mr_step = mr_max_flt<T>();
+                const int64_t p_span = std::max<int64_t>(p_last - p_first, 1);
+                const int64_t p_tail = p_span % m_block;
+                const int64_t p_step =
+                    (flat && p_tail != 0 && p_tail < mr_step && m_block >= 2 * mr_step) ?
+                        (m_block / mr_step - 1) * mr_step :
+                        m_block;
 
-            for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
-                const int64_t icnc = std::min(icn_block, ic_per_group - icn);
-                const bool is_last_icn = (icn + icn_block) >= ic_per_group;
-                const int kdim = static_cast<int>(icnc * karea);
+                for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
+                    const int64_t icnc = std::min(icn_block, ic_per_group - icn);
+                    const bool is_last_icn = (icn + icn_block) >= ic_per_group;
+                    const int kdim = static_cast<int>(icnc * karea);
 
-                const T* b_panel;
-                int b_ld = 0;
-                if (panels) {
-                    // The blob's own walk: this oc block's k block, in place —
-                    // no pack, however many chunks the oc axis took.
-                    b_panel = panels + pg.offset(g, icn / icn_block, ocn);
-                } else if (karea == 1) {
-                    // A 1x1 filter is [ic][oc] with oc contiguous — a panel's k
-                    // rows already, `w_ic_stride` apart — so read it in place and
-                    // let the stage take the partial last panel only.
-                    b_panel = w_g + ocn + icn * w_ic_stride;
-                    b_ld = static_cast<int>(w_ic_stride);
-                } else {
-                    pack_block<T>(pack_buf,
-                                  gemm_panel_slot(kdim, nr_max, esz, false,
-                                                  std::is_same_v<T, bfloat16>),
-                                  stage, w_g + ocn + icn * w_ic_stride,
-                                  w_ic_stride, w_tap_stride, ocnc, icnc, karea,
-                                  nr_max, kdim);
-                    b_panel = pack_buf;
-                }
-
-                const bool clamp_here = is_last_icn && epi_folded;
-                const float c_lo = clamp_here ? clamp_lo : -kInf;
-                const float c_hi = clamp_here ? clamp_hi : kInf;
-
-                for (int64_t p = p_first; p < p_last; ) {
-                    const int64_t oh = p / OW;
-                    const int64_t ow0 = p - oh * OW;
-                    const int64_t left = flat ? std::min(p_step, p_last - p)
-                                              : (OW - ow0);
-                    const int mc = static_cast<int>(std::min<int64_t>(m_block, left));
-
-                    const T* a;
-                    int lda;
-                    if (plan.pointwise) {
-                        // The pixel is its own patch: A is the input run itself
-                        // (contiguous across a row boundary only when flat).
-                        a = in_g + oh * in_row_stride + ow0 * IC + icn;
-                        lda = static_cast<int>(IC);
+                    const T* b_panel;
+                    int b_ld = 0;
+                    if (panels) {
+                        // The blob's own walk: this oc block's k block, in place —
+                        // no pack, however many chunks the oc axis took.
+                        b_panel = panels + pg.offset(g, icn / icn_block, ocn);
+                    } else if (karea == 1) {
+                        // A 1x1 filter is [ic][oc] with oc contiguous — a panel's k
+                        // rows already, `w_ic_stride` apart — so read it in place and
+                        // let the stage take the partial last panel only.
+                        b_panel = w_g + ocn + icn * w_ic_stride;
+                        b_ld = static_cast<int>(w_ic_stride);
                     } else {
-                        tiled_im2col_channel_last<T>(a_buf, kdim, in_g + icn, in_row_stride, IC,
-                                       T{}, p, static_cast<int>(OW), flat, mc,
-                                       static_cast<int>(IH), static_cast<int>(IW),
-                                       KH, KW, SH, SW, DH, DW, PH, PW,
-                                       static_cast<int>(icnc), karea);
-                        a = a_buf;
-                        lda = kdim;
+                        pack_block<T>(
+                            pack_buf,
+                            gemm_panel_slot(kdim, nr_max, esz, false, std::is_same_v<T, bfloat16>),
+                            stage, w_g + ocn + icn * w_ic_stride, w_ic_stride, w_tap_stride, ocnc,
+                            icnc, karea, nr_max, kdim);
+                        b_panel = pack_buf;
                     }
 
-                    T* const tile = out_g + oh * out_row_stride + ow0 * OC + ocn;
-                    T* const orig_tile = orig
-                        ? orig + (p - p_first) * ocn_block
-                        : nullptr;
+                    const bool clamp_here = is_last_icn && epi_folded;
+                    const float c_lo = clamp_here ? clamp_lo : -kInf;
+                    const float c_hi = clamp_here ? clamp_hi : kInf;
+
+                    for (int64_t p = p_first; p < p_last;) {
+                        const int64_t oh = p / OW;
+                        const int64_t ow0 = p - oh * OW;
+                        const int64_t left = flat ? std::min(p_step, p_last - p) : (OW - ow0);
+                        const int mc = static_cast<int>(std::min<int64_t>(m_block, left));
+
+                        const T* a;
+                        int lda;
+                        if (plan.pointwise) {
+                            // The pixel is its own patch: A is the input run itself
+                            // (contiguous across a row boundary only when flat).
+                            a = in_g + oh * in_row_stride + ow0 * IC + icn;
+                            lda = static_cast<int>(IC);
+                        } else {
+                            tiled_im2col_channel_last<T>(a_buf, kdim, in_g + icn, in_row_stride, IC,
+                                                         T{}, p, static_cast<int>(OW), flat, mc,
+                                                         static_cast<int>(IH), static_cast<int>(IW),
+                                                         KH, KW, SH, SW, DH, DW, PH, PW,
+                                                         static_cast<int>(icnc), karea);
+                            a = a_buf;
+                            lda = kdim;
+                        }
+
+                        T* const tile = out_g + oh * out_row_stride + ow0 * OC + ocn;
+                        T* const orig_tile = orig ? orig + (p - p_first) * ocn_block : nullptr;
 
                         if (icn == 0 && attrs.add_to) {
                             if (keep_orig) {
@@ -1658,8 +1655,8 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                                 // The residual stays in the accumulator only on the
                                 // identity-epilogue route; keep_orig saves it and
                                 // the tile is the seed.
-                                tile_seed<T>(tile, static_cast<int>(OC), mc,
-                                             static_cast<int>(ocnc), bias_g + ocn,
+                                tile_seed<T>(tile, static_cast<int>(OC), mc, static_cast<int>(ocnc),
+                                             bias_g + ocn,
                                              /*add=*/!keep_orig);
                             } else if (keep_orig) {
                                 // No bias: the tile holds the residual, which the
@@ -1674,23 +1671,16 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                         // would double the tile's traffic for one addend.
                         // A 1x1 filter reads in place; everything else arrives as
                         // panels, the blob's or this call's.
-                        tile_mma_direct(mc, static_cast<int>(ocnc), kdim,
-                                        tile, static_cast<int>(OC),
-                                        a, lda, b_panel,
-                                        b_ld != 0 ? b_ld : -1, stage, c_lo, c_hi,
-                                        /*zero_mode=*/icn == 0 && !attrs.add_to &&
-                                                       !bias_seed,
-                                        nullptr,
-                                        (icn == 0 && bias_seed) ? bias_col + ocn
-                                                                : nullptr);
+                        tile_mma_direct(
+                            mc, static_cast<int>(ocnc), kdim, tile, static_cast<int>(OC), a, lda,
+                            b_panel, b_ld != 0 ? b_ld : -1, stage, c_lo, c_hi,
+                            /*zero_mode=*/icn == 0 && !attrs.add_to && !bias_seed, nullptr,
+                            (icn == 0 && bias_seed) ? bias_col + ocn : nullptr);
 
                         if (is_last_icn && need_epi) {
                             epilogue_inplace<T>(mc, static_cast<int>(ocnc), tile,
-                                                static_cast<int>(OC),
-                                                nullptr,
-                                                attrs.epilogue,
-                                                keep_orig ? orig_tile : nullptr,
-                                                keep_orig);
+                                                static_cast<int>(OC), nullptr, attrs.epilogue,
+                                                keep_orig ? orig_tile : nullptr, keep_orig);
                         }
                         p += flat ? p_step : mc;
                     }
@@ -1710,15 +1700,20 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
 // or requantizes. An fp activation is materialized into a compact s8 plane once
 // per call, as on the channel-first route.
 
-namespace k = nnops::kernel;  // pure SIMD kernels: the quantizer, int8 reductions
+namespace k = nnops::kernel; // pure SIMD kernels: the quantizer, int8 reductions
 
 constexpr int64_t align4(int64_t v) noexcept { return (v + 3) & ~int64_t{3}; }
 
 /// True when any zero point the tensor carries is non-zero.
-inline bool any_zp_nonzero(const QuantParams& q, int64_t n) noexcept {
-    if (q.zero_point_data == nullptr) { return q.zero_point != 0; }
+inline bool any_zp_nonzero(const QuantParams& q, int64_t n) noexcept
+{
+    if (q.zero_point_data == nullptr) {
+        return q.zero_point != 0;
+    }
     for (int64_t i = 0; i < n; ++i) {
-        if (q.zero_point_data[i] != 0) { return true; }
+        if (q.zero_point_data[i] != 0) {
+            return true;
+        }
     }
     return false;
 }
@@ -1731,15 +1726,14 @@ template <class TAct>
 void materialize_plane(const TensorView& in, int8_t* dst, float scale, int32_t zero,
                        const ComputeContext& ctx)
 {
-    constexpr bool kPreQuant =
-        std::is_same_v<TAct, int8_t> || std::is_same_v<TAct, uint8_t>;
+    constexpr bool kPreQuant = std::is_same_v<TAct, int8_t> || std::is_same_v<TAct, uint8_t>;
 
     const int64_t IC = in.shape(1);
     const int64_t IH = in.shape(2);
     const int64_t IW = in.shape(3);
-    const int64_t N  = in.shape(0);
+    const int64_t N = in.shape(0);
     const int64_t rs = in.row_stride_elems();
-    const TAct* src  = in.ptr<TAct>();
+    const TAct* src = in.ptr<TAct>();
 
     const float s = scale;
     const float z = static_cast<float>(zero);
@@ -1747,7 +1741,9 @@ void materialize_plane(const TensorView& in, int8_t* dst, float scale, int32_t z
     const int64_t row_len = IW * IC;
     const int64_t rows = N * IH;
     const int64_t total = rows * row_len;
-    if (total == 0) { return; }
+    if (total == 0) {
+        return;
+    }
 
     auto plane_range = [&](int64_t beg, int64_t end) {
         for (int64_t e = beg; e < end;) {
@@ -1761,8 +1757,8 @@ void materialize_plane(const TensorView& in, int8_t* dst, float scale, int32_t z
                     d[j] = static_cast<int8_t>(static_cast<uint8_t>(p[j]) ^ 0x80u);
                 }
             } else {
-                k::quant_kernel::quantization<int8_t>(
-                    static_cast<int>(1), static_cast<int>(len), d, 1, p, 1, &s, &z);
+                k::quant_kernel::quantization<int8_t>(static_cast<int>(1), static_cast<int>(len), d,
+                                                      1, p, 1, &s, &z);
             }
             e += len;
         }
@@ -1778,9 +1774,8 @@ void materialize_plane(const TensorView& in, int8_t* dst, float scale, int32_t z
     }
     const int64_t slab = (total + nt - 1) / nt;
     const int64_t nslab = (total + slab - 1) / slab;
-    ctx.cpu.run(0, nslab, [&](int64_t i) {
-        plane_range(i * slab, std::min(i * slab + slab, total));
-    });
+    ctx.cpu.run(0, nslab,
+                [&](int64_t i) { plane_range(i * slab, std::min(i * slab + slab, total)); });
 }
 
 // ---- the packed-B route ---------------------------------------------------
@@ -1790,15 +1785,14 @@ void materialize_plane(const TensorView& in, int8_t* dst, float scale, int32_t z
 /// @p a_biased must be set whenever the kernel folds an A-side bias out of its
 /// accumulators through the panel's column sums — on x86 always, since that is
 /// where the +128 the VNNI kernel adds to every A group is cancelled.
-inline void pack_block_i8(int8_t* dst, int64_t panel_slot, int8_t* stage,
-                          const int8_t* w, int64_t w_ic_stride, int64_t w_tap_stride,
-                          int64_t ocnc, int64_t icnc,
+inline void pack_block_i8(int8_t* dst, int64_t panel_slot, int8_t* stage, const int8_t* w,
+                          int64_t w_ic_stride, int64_t w_tap_stride, int64_t ocnc, int64_t icnc,
                           int karea, int64_t nr_max, int kdim, bool a_biased) noexcept
 {
     if (karea == 1) {
-        tile_pack_rhs_i8(false, static_cast<int>(ocnc), static_cast<int>(icnc),
-                         dst, static_cast<int>(panel_slot), w,
-                         static_cast<int>(w_ic_stride), a_biased, false);
+        tile_pack_rhs_i8(false, static_cast<int>(ocnc), static_cast<int>(icnc), dst,
+                         static_cast<int>(panel_slot), w, static_cast<int>(w_ic_stride), a_biased,
+                         false);
         return;
     }
 
@@ -1807,35 +1801,31 @@ inline void pack_block_i8(int8_t* dst, int64_t panel_slot, int8_t* stage,
         for (int t = 0; t < karea; ++t) {
             for (int64_t i = 0; i < icnc; ++i) {
                 std::memcpy(stage + (static_cast<int64_t>(t) * icnc + i) * nr_max,
-                            w + t * w_tap_stride + i * w_ic_stride + p0,
-                            static_cast<size_t>(np));
+                            w + t * w_tap_stride + i * w_ic_stride + p0, static_cast<size_t>(np));
             }
         }
-        tile_pack_rhs_i8(false, static_cast<int>(np), kdim,
-                         dst + (p0 / nr_max) * panel_slot, static_cast<int>(panel_slot),
-                         stage, static_cast<int>(nr_max), a_biased, false);
+        tile_pack_rhs_i8(false, static_cast<int>(np), kdim, dst + (p0 / nr_max) * panel_slot,
+                         static_cast<int>(panel_slot), stage, static_cast<int>(nr_max), a_biased,
+                         false);
     }
 }
 
 // ---- main kernel ----------------------------------------------------------
 
 template <class TAct, class TOut>
-void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
-                                   TensorView& output,
-                                   std::span<const TensorView> inputs,
-                                   const ComputeContext& ctx,
-                                   const Conv2DGemmPlan& plan,
-                                   void* workspace)
+void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
+                                   std::span<const TensorView> inputs, const ComputeContext& ctx,
+                                   const Conv2DGemmPlan& plan, void* workspace)
 {
     constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
     constexpr bool kU8 = std::is_same_v<TAct, uint8_t>;
     constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t N  = input.shape(0);
+    const int64_t N = input.shape(0);
     const int64_t IC = input.shape(1);
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
@@ -1861,13 +1851,13 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
     const int PH = static_cast<int>(attrs.padding[0]);
     const int PW = static_cast<int>(attrs.padding[1]);
     const int karea = KH * KW;
-    const int64_t k_full = ic_per_group * karea;   ///< the epilogue's K
+    const int64_t k_full = ic_per_group * karea; ///< the epilogue's K
 
     const int64_t icn_block = plan.icn_block;
     const int64_t ocn_block = plan.ocn_block;
-    const int      m_block  = static_cast<int>(plan.m_block);
+    const int m_block = static_cast<int>(plan.m_block);
     const int64_t oh_chunks = plan.oh_chunks;
-    const int64_t ph_block  = plan.ph_block;
+    const int64_t ph_block = plan.ph_block;
     const int64_t oc_chunks = plan.oc_chunks;
 
     const int64_t ob_step = OH * out_row_stride;
@@ -1880,15 +1870,14 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
     // Same geometry prepackWeights used (see the float kernel).
     const ConvPackedWeightLast pg =
         conv_packed_weight_last(attrs, ic_per_group, oc_per_group, weight.data_type());
-    NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block &&
-                 pg.nr == NR_MAX_I8);
+    NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block && pg.nr == NR_MAX_I8);
     constexpr int64_t nr_max = NR_MAX_I8;
 
     // ---- quantization parameters -----------------------------------------
     const QuantParams& qa = input.quant_params();
     const QuantParams& qw = weight.quant_params();
 
-    const float   s_x  = quant_scale_at(qa, 0);
+    const float s_x = quant_scale_at(qa, 0);
     const int32_t zp_x = quant_zp_at(qa, 0);
     NNOPS_ASSERT(s_x > 0.0f);
 
@@ -1902,7 +1891,7 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
     // The column term exists when the A-side shift and zero point do not cancel;
     // the per-pixel term when some weight zero point is non-zero.
     const bool col_term = (d + zp_x) != 0;
-    const bool comp     = any_zp_nonzero(qw, OC);
+    const bool comp = any_zp_nonzero(qw, OC);
 
     // ---- the activation as s8 bytes ---------------------------------------
     const Conv2DGemmScratch sc = gemm_scratch_layout(plan, 1);
@@ -1930,8 +1919,7 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
     const int64_t ib_step = IH * in_row_stride;
 
     const int8_t* const w_ptr = weight.ptr<int8_t>();
-    [[maybe_unused]] const TOut* b_ptr =
-        (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
+    [[maybe_unused]] const TOut* b_ptr = (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
     [[maybe_unused]] const int32_t* b_i32 =
         (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
     TOut* const out_ptr = output.ptr<TOut>();
@@ -1944,8 +1932,7 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
     const bool shared = plan.shared_elems > 0;
     // The panels every task reads in place: the caller's blob, or this call's
     // own copy (null when the weight did not fit — each task packs its slot).
-    const int8_t* const panels =
-        prepacked ? w_ptr : (shared ? shared_ptr : nullptr);
+    const int8_t* const panels = prepacked ? w_ptr : (shared ? shared_ptr : nullptr);
 
     // ---- the shared weight prepack (once per call) -------------------------
     // Through the entry prepackWeights uses, so the addressing is one code path.
@@ -1953,8 +1940,8 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
     if (shared) {
         const int64_t cols = (plan.shared_elems + OC - 1) / OC;
         const int64_t shape[] = {OC, cols};
-        TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(),
-                        shared_ptr, cols, TensorLayout::PackedHWIO);
+        TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(), shared_ptr, cols,
+                        TensorLayout::PackedHWIO);
         conv_packed_weight_pack(attrs, weight, blob, ctx);
     }
 
@@ -1990,250 +1977,250 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
     const bool per_thread = nslots > 0 && nslots < total;
 
     const auto run_task = [&](int64_t t) {
-        const int64_t ng   = t / chunks_per_ng;
-        const int64_t rem  = t % chunks_per_ng;
-        const int64_t chunk    = rem / oc_chunks;
+        const int64_t ng = t / chunks_per_ng;
+        const int64_t rem = t % chunks_per_ng;
+        const int64_t chunk = rem / oc_chunks;
         const int64_t oc_chunk = rem % oc_chunks;
         const int64_t n = ng / G;
         const int64_t g = ng % G;
 
         const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
         char* const slot_ptr = base + sc.head + slot * sc.slot_stride;
-        int8_t* const a_pack   = reinterpret_cast<int8_t*>(slot_ptr + sc.off_a);
-        int8_t* const a_buf    = a_pack + plan.a_pack_stride;
-        int8_t* const stage    = reinterpret_cast<int8_t*>(slot_ptr + sc.off_stage);
+        int8_t* const a_pack = reinterpret_cast<int8_t*>(slot_ptr + sc.off_a);
+        int8_t* const a_buf = a_pack + plan.a_pack_stride;
+        int8_t* const stage = reinterpret_cast<int8_t*>(slot_ptr + sc.off_stage);
         int8_t* const pack_buf = reinterpret_cast<int8_t*>(slot_ptr + sc.off_pack);
         int32_t* const acc_buf = reinterpret_cast<int32_t*>(
             base + sc.off_acc + slot * plan.acc_size * static_cast<int64_t>(sizeof(int32_t)));
 
         TOut* const out_g = out_ptr + n * ob_step + g * oc_per_group;
         const uint8_t* const in_g = in_base + n * ib_step + g * ic_per_group;
-        const int8_t* const w_g  = w_ptr + g * oc_per_group;
+        const int8_t* const w_g = w_ptr + g * oc_per_group;
         [[maybe_unused]] const TOut* const bias_g = b_ptr ? b_ptr + g * oc_per_group : nullptr;
-        [[maybe_unused]] const int32_t* const ibias_g =
-            b_i32 ? b_i32 + g * oc_per_group : nullptr;
+        [[maybe_unused]] const int32_t* const ibias_g = b_i32 ? b_i32 + g * oc_per_group : nullptr;
 
         const int64_t r0 = chunk * OH / oh_chunks;
         const int64_t r1 = (chunk + 1) * OH / oh_chunks;
         // Over *panels*, like the fp route: a task starts where a panel does.
         const int64_t oc_lo = oc_chunk * pg.panels_oc / oc_chunks * nr_max;
-        const int64_t oc_hi = std::min(
-            (oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
+        const int64_t oc_hi =
+            std::min((oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
 
         // Same flat-pixel rule as the fp route; pointwise also needs the input
         // dense, since it reads A straight out of the row.
-        const bool flat = out_row_stride == OW * OC &&
-                          (!plan.pointwise || in_row_stride == IW * IC);
+        const bool flat =
+            out_row_stride == OW * OC && (!plan.pointwise || in_row_stride == IW * IC);
 
         // Same block-end clamp and step as the fp route: the blob holds one oc
         // block at a time and the kernel walks its panels at `slot` apart.
         const auto block_end = [&](int64_t ocn) {
-            return panels ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block)
-                          : oc_hi;
+            return panels ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block) : oc_hi;
         };
-        for (int64_t ocn = oc_lo; ocn < oc_hi;
-             ocn = panels ? block_end(ocn) : ocn + ocn_block) {
+        for (int64_t ocn = oc_lo; ocn < oc_hi; ocn = panels ? block_end(ocn) : ocn + ocn_block) {
             const int64_t oc_end = block_end(ocn);
             const int64_t ocnc = std::min(ocn_block, oc_end - ocn);
 
             for (int64_t pr = r0; pr < r1; pr += ph_block) {
-            const int64_t pr1 = std::min(r1, pr + ph_block);
-            const int64_t p_first = pr * OW;
-            const int64_t p_last  = pr1 * OW;
-            // Re-split a tail shorter than MR evenly, keeping the step a
-            // multiple of MR so the re-split costs no extra block.
-            constexpr int64_t mr_step = MR_MAX_I8;
-            const int64_t p_span = std::max<int64_t>(p_last - p_first, 1);
-            const int64_t p_tail = p_span % m_block;
-            const int64_t p_step =
-                (flat && p_tail != 0 && p_tail < mr_step && m_block >= 2 * mr_step)
-                    ? (m_block / mr_step - 1) * mr_step
-                    : m_block;
+                const int64_t pr1 = std::min(r1, pr + ph_block);
+                const int64_t p_first = pr * OW;
+                const int64_t p_last = pr1 * OW;
+                // Re-split a tail shorter than MR evenly, keeping the step a
+                // multiple of MR so the re-split costs no extra block.
+                constexpr int64_t mr_step = MR_MAX_I8;
+                const int64_t p_span = std::max<int64_t>(p_last - p_first, 1);
+                const int64_t p_tail = p_span % m_block;
+                const int64_t p_step =
+                    (flat && p_tail != 0 && p_tail < mr_step && m_block >= 2 * mr_step) ?
+                        (m_block / mr_step - 1) * mr_step :
+                        m_block;
 
-            for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
-                const int64_t icnc = std::min(icn_block, ic_per_group - icn);
-                const bool is_last_icn = (icn + icn_block) >= ic_per_group;
-                const int kdim = static_cast<int>(icnc * karea);
-                const int kdim4 = static_cast<int>(align4(kdim));
-                // Pointwise reads the pixels straight out of the row, which needs
-                // a whole number of 4-byte k groups; else the gather zero-fills.
-                const bool direct_a = plan.pointwise && (kdim == kdim4);
+                for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
+                    const int64_t icnc = std::min(icn_block, ic_per_group - icn);
+                    const bool is_last_icn = (icn + icn_block) >= ic_per_group;
+                    const int kdim = static_cast<int>(icnc * karea);
+                    const int kdim4 = static_cast<int>(align4(kdim));
+                    // Pointwise reads the pixels straight out of the row, which needs
+                    // a whole number of 4-byte k groups; else the gather zero-fills.
+                    const bool direct_a = plan.pointwise && (kdim == kdim4);
 
-                const int8_t* b_panel;
-                if (panels) {
-                    b_panel = panels + pg.offset(g, icn / icn_block, ocn);
-                } else {
-                    pack_block_i8(pack_buf, gemm_panel_slot(kdim, nr_max, 1, true), stage,
-                                  w_g + ocn + icn * w_ic_stride,
-                                  w_ic_stride, w_tap_stride, ocnc, icnc, karea, nr_max,
-                                  kdim, a_biased);
-                    b_panel = pack_buf;
-                }
+                    const int8_t* b_panel;
+                    if (panels) {
+                        b_panel = panels + pg.offset(g, icn / icn_block, ocn);
+                    } else {
+                        pack_block_i8(pack_buf, gemm_panel_slot(kdim, nr_max, 1, true), stage,
+                                      w_g + ocn + icn * w_ic_stride, w_ic_stride, w_tap_stride,
+                                      ocnc, icnc, karea, nr_max, kdim, a_biased);
+                        b_panel = pack_buf;
+                    }
 
-                // `mc` lives outside the loop: it is the step, and the body's
-                // early exits still have to advance it.
-                int mc = 0;
-                for (int64_t p = p_first; p < p_last; p += flat ? p_step : mc) {
-                    const int64_t oh = p / OW;
-                    const int64_t ow0 = p - oh * OW;
-                    const int64_t left = flat ? std::min(p_step, p_last - p)
-                                              : (OW - ow0);
-                    mc = static_cast<int>(std::min<int64_t>(m_block, left));
-                    {
-                        const uint8_t* const in_row = in_g + oh * in_row_stride;
+                    // `mc` lives outside the loop: it is the step, and the body's
+                    // early exits still have to advance it.
+                    int mc = 0;
+                    for (int64_t p = p_first; p < p_last; p += flat ? p_step : mc) {
+                        const int64_t oh = p / OW;
+                        const int64_t ow0 = p - oh * OW;
+                        const int64_t left = flat ? std::min(p_step, p_last - p) : (OW - ow0);
+                        mc = static_cast<int>(std::min<int64_t>(m_block, left));
+                        {
+                            const uint8_t* const in_row = in_g + oh * in_row_stride;
 
-                        const int8_t* a;
-                        int lda;
-                        if (direct_a) {
-                            // The pixel is its own patch: A is the input run.
-                            a = reinterpret_cast<const int8_t*>(
-                                in_row + ow0 * IC + icn);
-                            lda = static_cast<int>(IC);
-                        } else {
-                            tiled_im2col_channel_last_i8(a_buf, kdim4, in_g + icn,
-                                           in_row_stride, IC, xr,
-                                           static_cast<uint8_t>(plane ? zp_x + d : zp_x),
-                                           p, static_cast<int>(OW), flat, mc,
-                                           static_cast<int>(IH), static_cast<int>(IW),
-                                           KH, KW, SH, SW, DH, DW, PH, PW,
-                                           static_cast<int>(icnc), karea, kdim, kdim4);
-                            a = a_buf;
-                            lda = kdim4;
-                        }
-
-                        int32_t* const acc_tile = acc_buf + (p - p_first) * ocn_block;
-
-                        // The MMA wants A packed (group-major, MR rows of 4 bytes
-                        // per k group): its direct-A variant costs ~2.7x the uops
-                        // broadcasting each group out of a row-major row.
-                        //
-                        // The first K block stores instead of accumulating, so the
-                        // tile needs no zero fill — a whole-tile write that only
-                        // existed to be read back is skipped.
-                        const int64_t ldd_a = geom_ldd_i8_a(kdim4);
-                        tile_pack_lhs_i8(false, mc, kdim4, a_pack,
-                                         static_cast<int>(ldd_a), a, lda, a_biased);
-                        tile_mma_pack_i8(mc, static_cast<int>(ocnc), kdim4,
-                                         acc_tile, static_cast<int>(ocn_block),
-                                         a_pack, b_panel, /*ldb=*/0, INT32_MIN, INT32_MAX,
-                                         /*zero_mode=*/icn == 0);
-
-                        if (!is_last_icn) { continue; }
-
-                        // The per-pixel sums the compensation reads: over the
-                        // whole K, of the *true* activation values (the gather's
-                        // shift comes back out), recomputed rather than buffered.
-                        int32_t ra_tile[64];
-                        const int32_t* ra_ptr = nullptr;
-                        if (comp) {
-                            NNOPS_ASSERT(mc <= 64);
+                            const int8_t* a;
+                            int lda;
                             if (direct_a) {
-                                // The pixel is its own patch, its channels one
-                                // contiguous run: a row sum of the bytes the MMA
-                                // reads — no gather, no A tile.
-                                for (int m = 0; m < mc; ++m) {
-                                    ra_tile[m] = k::int8_row_sum<int8_t>(
-                                        reinterpret_cast<const int8_t*>(in_row) +
-                                            static_cast<int64_t>(ow0 + m) * IC,
-                                        static_cast<int>(ic_per_group));
-                                }
+                                // The pixel is its own patch: A is the input run.
+                                a = reinterpret_cast<const int8_t*>(in_row + ow0 * IC + icn);
+                                lda = static_cast<int>(IC);
                             } else {
-                                for (int m = 0; m < mc; ++m) { ra_tile[m] = 0; }
-                                for (int64_t icn2 = 0; icn2 < ic_per_group; icn2 += icn_block) {
-                                    const int64_t icnc2 = std::min(icn_block, ic_per_group - icn2);
-                                    const int kd2 = static_cast<int>(icnc2 * karea);
-                                    const int kd24 = static_cast<int>(align4(kd2));
-                                    tiled_im2col_channel_last_i8(a_buf, kd24, in_g + icn2,
-                                                   in_row_stride, IC, xr,
-                                                   static_cast<uint8_t>(plane ? zp_x + d : zp_x),
-                                                   p, static_cast<int>(OW), flat, mc,
-                                                   static_cast<int>(IH), static_cast<int>(IW),
-                                                   KH, KW, SH, SW, DH, DW, PH, PW,
-                                                   static_cast<int>(icnc2), karea, kd2, kd24);
+                                tiled_im2col_channel_last_i8(
+                                    a_buf, kdim4, in_g + icn, in_row_stride, IC, xr,
+                                    static_cast<uint8_t>(plane ? zp_x + d : zp_x), p,
+                                    static_cast<int>(OW), flat, mc, static_cast<int>(IH),
+                                    static_cast<int>(IW), KH, KW, SH, SW, DH, DW, PH, PW,
+                                    static_cast<int>(icnc), karea, kdim, kdim4);
+                                a = a_buf;
+                                lda = kdim4;
+                            }
+
+                            int32_t* const acc_tile = acc_buf + (p - p_first) * ocn_block;
+
+                            // The MMA wants A packed (group-major, MR rows of 4 bytes
+                            // per k group): its direct-A variant costs ~2.7x the uops
+                            // broadcasting each group out of a row-major row.
+                            //
+                            // The first K block stores instead of accumulating, so the
+                            // tile needs no zero fill — a whole-tile write that only
+                            // existed to be read back is skipped.
+                            const int64_t ldd_a = geom_ldd_i8_a(kdim4);
+                            tile_pack_lhs_i8(false, mc, kdim4, a_pack, static_cast<int>(ldd_a), a,
+                                             lda, a_biased);
+                            tile_mma_pack_i8(mc, static_cast<int>(ocnc), kdim4, acc_tile,
+                                             static_cast<int>(ocn_block), a_pack, b_panel,
+                                             /*ldb=*/0, INT32_MIN, INT32_MAX,
+                                             /*zero_mode=*/icn == 0);
+
+                            if (!is_last_icn) {
+                                continue;
+                            }
+
+                            // The per-pixel sums the compensation reads: over the
+                            // whole K, of the *true* activation values (the gather's
+                            // shift comes back out), recomputed rather than buffered.
+                            int32_t ra_tile[64];
+                            const int32_t* ra_ptr = nullptr;
+                            if (comp) {
+                                NNOPS_ASSERT(mc <= 64);
+                                if (direct_a) {
+                                    // The pixel is its own patch, its channels one
+                                    // contiguous run: a row sum of the bytes the MMA
+                                    // reads — no gather, no A tile.
                                     for (int m = 0; m < mc; ++m) {
-                                        ra_tile[m] += k::int8_row_sum<int8_t>(
-                                            a_buf + static_cast<int64_t>(m) * kd24, kd2);
+                                        ra_tile[m] = k::int8_row_sum<int8_t>(
+                                            reinterpret_cast<const int8_t*>(in_row) +
+                                                static_cast<int64_t>(ow0 + m) * IC,
+                                            static_cast<int>(ic_per_group));
+                                    }
+                                } else {
+                                    for (int m = 0; m < mc; ++m) {
+                                        ra_tile[m] = 0;
+                                    }
+                                    for (int64_t icn2 = 0; icn2 < ic_per_group; icn2 += icn_block) {
+                                        const int64_t icnc2 =
+                                            std::min(icn_block, ic_per_group - icn2);
+                                        const int kd2 = static_cast<int>(icnc2 * karea);
+                                        const int kd24 = static_cast<int>(align4(kd2));
+                                        tiled_im2col_channel_last_i8(
+                                            a_buf, kd24, in_g + icn2, in_row_stride, IC, xr,
+                                            static_cast<uint8_t>(plane ? zp_x + d : zp_x), p,
+                                            static_cast<int>(OW), flat, mc, static_cast<int>(IH),
+                                            static_cast<int>(IW), KH, KW, SH, SW, DH, DW, PH, PW,
+                                            static_cast<int>(icnc2), karea, kd2, kd24);
+                                        for (int m = 0; m < mc; ++m) {
+                                            ra_tile[m] += k::int8_row_sum<int8_t>(
+                                                a_buf + static_cast<int64_t>(m) * kd24, kd2);
+                                        }
                                     }
                                 }
+                                const int32_t shift_total = d * static_cast<int32_t>(k_full);
+                                for (int m = 0; m < mc; ++m) {
+                                    ra_tile[m] -= shift_total;
+                                }
+                                ra_ptr = ra_tile;
                             }
-                            const int32_t shift_total = d * static_cast<int32_t>(k_full);
-                            for (int m = 0; m < mc; ++m) { ra_tile[m] -= shift_total; }
-                            ra_ptr = ra_tile;
-                        }
 
-                        TOut* const dst = out_g + oh * out_row_stride + ow0 * OC + ocn;
-                        if constexpr (kIntOut) {
-                            Int8EpilogueParams ip{};
-                            ip.r_a  = ra_ptr;
-                            ip.s_a  = nullptr;              // per-tensor activation
-                            ip.zp_a = nullptr;
-                            ip.r_b  = col_term
-                                    ? r_b_all.data() + g * oc_per_group + ocn : nullptr;
-                            ip.s_b  = qw.scale_data
-                                    ? qw.scale_data + g * oc_per_group + ocn : nullptr;
-                            ip.zp_b = qw.zero_point_data
-                                    ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
-                            ip.s_a_scalar    = s_x;
-                            ip.s_b_scalar    = qw.scale;
-                            ip.zp_a_scalar   = zp_x;
-                            ip.zp_b_scalar   = qw.zero_point;
-                            ip.a_bias_offset = d;
-                            ip.k    = static_cast<int32_t>(k_full);
-                            ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
-                            ip.compensate = comp;
-                            ip.col_term   = col_term;
-                            ip.out_scale  = quant_scale_at(qc, 0);
-                            ip.zp_out     = quant_zp_at(qc, 0);
-                            if (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
-                                attrs.epilogue.quant_param_count > 0) {
-                                ip.row_out_scales = attrs.epilogue.quant_scales;
-                                ip.row_out_zps = attrs.epilogue.quant_zero_points;
-                                ip.out_scale = epilogue_quant_scale(attrs.epilogue, 0);
-                                ip.zp_out = epilogue_quant_zero(attrs.epilogue, 0);
-                            }
-                            ip.bias     = nullptr;          // the bias is per column
-                            ip.col_bias = ibias_g ? ibias_g + ocn : nullptr;
-                            if constexpr (std::is_same_v<TOut, uint8_t>) {
-                                ip.out_u8 = dst;
+                            TOut* const dst = out_g + oh * out_row_stride + ow0 * OC + ocn;
+                            if constexpr (kIntOut) {
+                                Int8EpilogueParams ip{};
+                                ip.r_a = ra_ptr;
+                                ip.s_a = nullptr; // per-tensor activation
+                                ip.zp_a = nullptr;
+                                ip.r_b =
+                                    col_term ? r_b_all.data() + g * oc_per_group + ocn : nullptr;
+                                ip.s_b = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn :
+                                                         nullptr;
+                                ip.zp_b = qw.zero_point_data ?
+                                              qw.zero_point_data + g * oc_per_group + ocn :
+                                              nullptr;
+                                ip.s_a_scalar = s_x;
+                                ip.s_b_scalar = qw.scale;
+                                ip.zp_a_scalar = zp_x;
+                                ip.zp_b_scalar = qw.zero_point;
+                                ip.a_bias_offset = d;
+                                ip.k = static_cast<int32_t>(k_full);
+                                ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
+                                ip.compensate = comp;
+                                ip.col_term = col_term;
+                                ip.out_scale = quant_scale_at(qc, 0);
+                                ip.zp_out = quant_zp_at(qc, 0);
+                                if (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                                    attrs.epilogue.quant_param_count > 0) {
+                                    ip.row_out_scales = attrs.epilogue.quant_scales;
+                                    ip.row_out_zps = attrs.epilogue.quant_zero_points;
+                                    ip.out_scale = epilogue_quant_scale(attrs.epilogue, 0);
+                                    ip.zp_out = epilogue_quant_zero(attrs.epilogue, 0);
+                                }
+                                ip.bias = nullptr; // the bias is per column
+                                ip.col_bias = ibias_g ? ibias_g + ocn : nullptr;
+                                if constexpr (std::is_same_v<TOut, uint8_t>) {
+                                    ip.out_u8 = dst;
+                                } else {
+                                    ip.out = dst;
+                                }
+                                ip.ldc_out = static_cast<int>(OC);
+                                int8_epilogue_tile(ip, acc_tile, static_cast<int>(ocn_block), 0, 0,
+                                                   mc, ocnc);
                             } else {
+                                DqEpilogueParams<TOut> ip{};
+                                ip.r_a = ra_ptr;
+                                ip.s_a = nullptr;
+                                ip.zp_a = nullptr;
+                                ip.r_b =
+                                    col_term ? r_b_all.data() + g * oc_per_group + ocn : nullptr;
+                                ip.s_b = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn :
+                                                         nullptr;
+                                ip.zp_b = qw.zero_point_data ?
+                                              qw.zero_point_data + g * oc_per_group + ocn :
+                                              nullptr;
+                                ip.row_off = nullptr;
+                                ip.s_a_scalar = s_x;
+                                ip.s_b_scalar = qw.scale;
+                                ip.zp_a_scalar = zp_x;
+                                ip.zp_b_scalar = qw.zero_point;
+                                ip.a_bias_offset = d;
+                                ip.k = static_cast<int32_t>(k_full);
+                                ip.compensate = comp;
+                                ip.col_term = col_term;
+                                ip.act_u8 = u8a;
+                                ip.ep = &attrs.epilogue;
+                                ip.bias = nullptr;
+                                ip.col_bias = bias_g ? bias_g + ocn : nullptr;
                                 ip.out = dst;
+                                ip.ldc_out = static_cast<int>(OC);
+                                dq_epilogue_tile<TOut>(ip, acc_tile, static_cast<int>(ocn_block), 0,
+                                                       0, mc, ocnc);
                             }
-                            ip.ldc_out = static_cast<int>(OC);
-                            int8_epilogue_tile(ip, acc_tile, static_cast<int>(ocn_block),
-                                               0, 0, mc, ocnc);
-                        } else {
-                            DqEpilogueParams<TOut> ip{};
-                            ip.r_a  = ra_ptr;
-                            ip.s_a  = nullptr;
-                            ip.zp_a = nullptr;
-                            ip.r_b  = col_term
-                                    ? r_b_all.data() + g * oc_per_group + ocn : nullptr;
-                            ip.s_b  = qw.scale_data
-                                    ? qw.scale_data + g * oc_per_group + ocn : nullptr;
-                            ip.zp_b = qw.zero_point_data
-                                    ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
-                            ip.row_off       = nullptr;
-                            ip.s_a_scalar    = s_x;
-                            ip.s_b_scalar    = qw.scale;
-                            ip.zp_a_scalar   = zp_x;
-                            ip.zp_b_scalar   = qw.zero_point;
-                            ip.a_bias_offset = d;
-                            ip.k             = static_cast<int32_t>(k_full);
-                            ip.compensate    = comp;
-                            ip.col_term      = col_term;
-                            ip.act_u8        = u8a;
-                            ip.ep            = &attrs.epilogue;
-                            ip.bias          = nullptr;
-                            ip.col_bias      = bias_g ? bias_g + ocn : nullptr;
-                            ip.out           = dst;
-                            ip.ldc_out       = static_cast<int>(OC);
-                            dq_epilogue_tile<TOut>(ip, acc_tile,
-                                                   static_cast<int>(ocn_block),
-                                                   0, 0, mc, ocnc);
                         }
                     }
                 }
-            }
             }
         }
     };
@@ -2245,18 +2232,15 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
 //  Plan
 // =========================================================================
 
-Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
-                        std::span<const TensorDesc> inputs,
-                        std::span<const TensorDesc> outputs,
-                        int num_threads,
-                        bool use_thread_slots,
-                        int64_t num_slots)
+Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDesc> inputs,
+                         std::span<const TensorDesc> outputs, int num_threads,
+                         bool use_thread_slots, int64_t num_slots)
 {
     NNOPS_ASSERT(inputs.size() >= 2);
     NNOPS_ASSERT(outputs.size() >= 1);
 
-    const auto& in  = inputs[0];
-    const auto& wt  = inputs[1];
+    const auto& in = inputs[0];
+    const auto& wt = inputs[1];
     const auto& out = outputs[0];
 
     Conv2DGemmPlan plan;
@@ -2267,8 +2251,8 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
 
     if (quant) {
         // Activation: pre-quantized (u8/s8), or fp (quantized per call).
-        if (dt != DataType::u8 && dt != DataType::s8 &&
-            dt != DataType::f32 && dt != DataType::f16) {
+        if (dt != DataType::u8 && dt != DataType::s8 && dt != DataType::f32 &&
+            dt != DataType::f16) {
             return plan;
         }
         const bool int_out = out.dtype == DataType::s8 || out.dtype == DataType::u8;
@@ -2298,13 +2282,15 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
         }
     }
 
-    const int64_t N  = in.dims[0];
+    const int64_t N = in.dims[0];
     const int64_t IC = in.dims[1];
     // The channel-last weight is TensorFlow's [KH, KW, IC/G, OC]; anything else
     // is not this route's — except the prepacked blob, whose shape leads with OC
     // (see conv_packed_weight_desc).
     const bool prepacked = wt.layout == TensorLayout::PackedHWIO;
-    if (!is_channel_last_weight(wt.layout) && !prepacked) { return plan; }
+    if (!is_channel_last_weight(wt.layout) && !prepacked) {
+        return plan;
+    }
     const int64_t OC = prepacked ? wt.dims[0] : wt.dims[3];
     const int64_t OH = out.dims[2];
     const int64_t OW = out.dims[3];
@@ -2328,7 +2314,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     plan.icn_block = pg.icn_block;
     plan.ocn_block = pg.ocn_block;
     const int64_t nr_for_split = pg.nr;
-    plan.m_block   = kMBlock;
+    plan.m_block = kMBlock;
     plan.oh_chunks = 1;
     plan.oc_chunks = 1;
 
@@ -2361,16 +2347,15 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     const bool has_bias = inputs.size() > 2;
     const bool epi_active = attrs.epilogue.type != EpilogueActivateType::None;
     const bool epi_folded = !attrs.add_to && !has_bias &&
-        (attrs.epilogue.type == EpilogueActivateType::Relu ||
-         attrs.epilogue.type == EpilogueActivateType::Relu6);
+                            (attrs.epilogue.type == EpilogueActivateType::Relu ||
+                             attrs.epilogue.type == EpilogueActivateType::Relu6);
     const bool keep_orig = !quant && attrs.add_to && epi_active && !epi_folded;
 
     // The residual tile set must cover the task's whole row range for one oc
     // block; split the rows further until it fits (parallelism, not memory).
     if (keep_orig) {
         while (plan.oh_chunks < OH &&
-               ((OH + plan.oh_chunks - 1) / plan.oh_chunks) * OW * plan.ocn_block
-                   > kTaskTileCap) {
+               ((OH + plan.oh_chunks - 1) / plan.oh_chunks) * OW * plan.ocn_block > kTaskTileCap) {
             ++plan.oh_chunks;
         }
     }
@@ -2383,9 +2368,9 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     // DRAM. The shared prepack makes the extra passes free; a per-task pack pays
     // one pack per (oc block, pass, ic block).
     const int64_t pass_esz = std::max<int64_t>(4, esz);
-    plan.ph_block = std::clamp<int64_t>(
-        kPassAccBytes / (pass_esz * plan.ocn_block * std::max<int64_t>(OW, 1)),
-        1, std::max<int64_t>(rows_in_task, 1));
+    plan.ph_block =
+        std::clamp<int64_t>(kPassAccBytes / (pass_esz * plan.ocn_block * std::max<int64_t>(OW, 1)),
+                            1, std::max<int64_t>(rows_in_task, 1));
 
     const int64_t nr_max = pg.nr;
     const int64_t kdim_max = pg.kdim_max;
@@ -2407,15 +2392,15 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     // The quantized route hands the MMA a *packed* A panel (direct-A costs
     // ~2.7x the uops). The panel region comes first in the slot's A area, so its
     // stride is the gather's offset.
-    plan.a_pack_stride = quant
-        ? gemm_align64(static_cast<int64_t>(num_panels_max(static_cast<int>(plan.m_block), MR_I8))
-                       * geom_ldd_i8_a((kdim_max + 3) & ~int64_t{3}))
-        : 0;
-    plan.a_size = plan.a_pack_stride
-                + ((plan.pointwise && !pw_gather)
-                       ? 0
-                       : plan.m_block * (quant ? ((kdim_max + 3) & ~int64_t{3})
-                                               : kdim_max + kABSlack));
+    plan.a_pack_stride =
+        quant ? gemm_align64(
+                    static_cast<int64_t>(num_panels_max(static_cast<int>(plan.m_block), MR_I8)) *
+                    geom_ldd_i8_a((kdim_max + 3) & ~int64_t{3})) :
+                0;
+    plan.a_size = plan.a_pack_stride + ((plan.pointwise && !pw_gather) ?
+                                            0 :
+                                            plan.m_block * (quant ? ((kdim_max + 3) & ~int64_t{3}) :
+                                                                    kdim_max + kABSlack));
     // In HWIO a panel's k row is one OC-length run, nothing transposed. A 1x1
     // filter is read in place and needs only the tail's panel; a multi-tap one
     // restages a whole panel. Either way, only when a task does pack — which
@@ -2429,8 +2414,9 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     // call, as on the channel-first route. A pre-quantized u8 one is materialized too
     // when it takes the pointwise route, whose in-row A read cannot shift bytes.
     const bool fp_act = (dt == DataType::f32 || dt == DataType::f16);
-    plan.quant_size = (quant && (fp_act || (dt == DataType::u8 && plan.pointwise)))
-                    ? N * in.dims[2] * in.dims[3] * IC : 0;
+    plan.quant_size = (quant && (fp_act || (dt == DataType::u8 && plan.pointwise))) ?
+                          N * in.dims[2] * in.dims[3] * IC :
+                          0;
 
     const int64_t total = NG * plan.oh_chunks * plan.oc_chunks;
     const int64_t avail = (num_slots > 0) ? num_slots : nt;
@@ -2440,9 +2426,8 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     return plan;
 }
 
-
-}  // anonymous namespace
-}  // namespace channel_last
+} // anonymous namespace
+} // namespace channel_last
 
 // =========================================================================
 //  Public API — one route per axis, chosen from the activation's layout
@@ -2456,43 +2441,38 @@ namespace {
 struct ChannelFirstRoute {
     static Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
                                     std::span<const TensorDesc> inputs,
-                                    std::span<const TensorDesc> outputs,
-                                    int num_threads, bool use_thread_slots,
-                                    int64_t num_slots)
+                                    std::span<const TensorDesc> outputs, int num_threads,
+                                    bool use_thread_slots, int64_t num_slots)
     {
-        return channel_first::make_plan(attrs, inputs, outputs, num_threads,
-                                 use_thread_slots, num_slots);
+        return channel_first::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+                                        num_slots);
     }
 
     template <class T>
     static void fp_impl(const Conv2DAttributes& attrs, TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                        void* workspace)
+                        std::span<const TensorView> inputs, const ComputeContext& ctx,
+                        const Conv2DGemmPlan& plan, void* workspace)
     {
-        channel_first::conv2d_channel_first_impl<T>(attrs, output, inputs, ctx, plan,
-                                                    workspace);
+        channel_first::conv2d_channel_first_impl<T>(attrs, output, inputs, ctx, plan, workspace);
     }
 
     /// An fp activation is stored as `act_quant_dtype`; a pre-quantized one is
     /// already its own storage.
     template <class TAct, class TOut>
     static void quant_impl(const Conv2DAttributes& attrs, TensorView& output,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                           void* workspace)
+                           std::span<const TensorView> inputs, const ComputeContext& ctx,
+                           const Conv2DGemmPlan& plan, void* workspace)
     {
-        constexpr bool kPreQuant =
-            std::is_same_v<TAct, int8_t> || std::is_same_v<TAct, uint8_t>;
+        constexpr bool kPreQuant = std::is_same_v<TAct, int8_t> || std::is_same_v<TAct, uint8_t>;
         if constexpr (kPreQuant) {
-            channel_first::conv2d_channel_first_int8_impl<TAct, TAct, TOut>(
-                attrs, output, inputs, ctx, plan, workspace);
+            channel_first::conv2d_channel_first_int8_impl<TAct, TAct, TOut>(attrs, output, inputs,
+                                                                            ctx, plan, workspace);
         } else if (attrs.act_quant_dtype == DataType::u8) {
             channel_first::conv2d_channel_first_int8_impl<TAct, uint8_t, TOut>(
                 attrs, output, inputs, ctx, plan, workspace);
         } else {
-            channel_first::conv2d_channel_first_int8_impl<TAct, int8_t, TOut>(
-                attrs, output, inputs, ctx, plan, workspace);
+            channel_first::conv2d_channel_first_int8_impl<TAct, int8_t, TOut>(attrs, output, inputs,
+                                                                              ctx, plan, workspace);
         }
     }
 };
@@ -2500,34 +2480,30 @@ struct ChannelFirstRoute {
 struct ChannelLastRoute {
     static Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
                                     std::span<const TensorDesc> inputs,
-                                    std::span<const TensorDesc> outputs,
-                                    int num_threads, bool use_thread_slots,
-                                    int64_t num_slots)
+                                    std::span<const TensorDesc> outputs, int num_threads,
+                                    bool use_thread_slots, int64_t num_slots)
     {
-        return channel_last::make_plan(attrs, inputs, outputs, num_threads,
-                                       use_thread_slots, num_slots);
+        return channel_last::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+                                       num_slots);
     }
 
     template <class T>
     static void fp_impl(const Conv2DAttributes& attrs, TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                        void* workspace)
+                        std::span<const TensorView> inputs, const ComputeContext& ctx,
+                        const Conv2DGemmPlan& plan, void* workspace)
     {
-        channel_last::conv2d_channel_last_impl<T>(attrs, output, inputs, ctx, plan,
-                                                  workspace);
+        channel_last::conv2d_channel_last_impl<T>(attrs, output, inputs, ctx, plan, workspace);
     }
 
     /// The storage choice is a runtime flag inside this route's kernel, not a
     /// template parameter: its packer reads both signs on one path.
     template <class TAct, class TOut>
     static void quant_impl(const Conv2DAttributes& attrs, TensorView& output,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                           void* workspace)
+                           std::span<const TensorView> inputs, const ComputeContext& ctx,
+                           const Conv2DGemmPlan& plan, void* workspace)
     {
-        channel_last::conv2d_channel_last_int8_impl<TAct, TOut>(attrs, output, inputs,
-                                                               ctx, plan, workspace);
+        channel_last::conv2d_channel_last_int8_impl<TAct, TOut>(attrs, output, inputs, ctx, plan,
+                                                                workspace);
     }
 };
 
@@ -2541,9 +2517,8 @@ struct ChannelLastRoute {
 
 template <class TRoute, class TAct>
 Status conv2d_quant_out(const Conv2DAttributes& attrs, TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                        void* workspace)
+                        std::span<const TensorView> inputs, const ComputeContext& ctx,
+                        const Conv2DGemmPlan& plan, void* workspace)
 {
     switch (output.data_type()) {
     case DataType::f32:
@@ -2565,9 +2540,8 @@ Status conv2d_quant_out(const Conv2DAttributes& attrs, TensorView& output,
 
 template <class TRoute>
 Status conv2d_quant_run(const Conv2DAttributes& attrs, TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                        void* workspace)
+                        std::span<const TensorView> inputs, const ComputeContext& ctx,
+                        const Conv2DGemmPlan& plan, void* workspace)
 {
     switch (inputs[0].data_type()) {
     case DataType::f32:
@@ -2585,9 +2559,8 @@ Status conv2d_quant_run(const Conv2DAttributes& attrs, TensorView& output,
 
 template <class TRoute>
 Status conv2d_fp_run(const Conv2DAttributes& attrs, TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                     void* workspace)
+                     std::span<const TensorView> inputs, const ComputeContext& ctx,
+                     const Conv2DGemmPlan& plan, void* workspace)
 {
     switch (inputs[0].data_type()) {
     case DataType::f32:
@@ -2613,10 +2586,10 @@ TensorView wide_window(const TensorView& v, int64_t col0, int64_t len)
     const int64_t unit = static_cast<int64_t>(data_type_stride_unit(v.data_type()));
     const int64_t off = col0 * (is_channel_last(v.layout()) ? v.shape(1) : 1) * unit;
     const int64_t s[4] = {v.shape(0), v.shape(1), v.shape(2), len};
-    auto* base = const_cast<char*>(static_cast<const char*>(
-        static_cast<const void*>(v.ptr<uint8_t>())));
-    return TensorView(std::span<const int64_t>(s, 4), v.data_type(), base + off,
-                      v.pitch(), v.layout(), v.quant_params());
+    auto* base =
+        const_cast<char*>(static_cast<const char*>(static_cast<const void*>(v.ptr<uint8_t>())));
+    return TensorView(std::span<const int64_t>(s, 4), v.data_type(), base + off, v.pitch(),
+                      v.layout(), v.quant_params());
 }
 
 /// A one-row output has no oh axis to split, so the plan is left with the filter
@@ -2624,25 +2597,26 @@ TensorView wide_window(const TensorView& v, int64_t col0, int64_t len)
 /// gather once per chunk where a column chunk divides it. MLAS picks between M
 /// and N for the same reason (the larger one), and for a one-row image N = the
 /// row is normally the larger. Returns the column-chunk count, 1 for whole.
-int64_t wide_split_chunks(const Conv2DAttributes& attrs,
-                          std::span<const TensorView> inputs,
+int64_t wide_split_chunks(const Conv2DAttributes& attrs, std::span<const TensorView> inputs,
                           const TensorView& output, const Conv2DGemmPlan& plan,
                           const ComputeContext& ctx)
 {
-    const TensorView& input  = inputs[0];
+    const TensorView& input = inputs[0];
     const TensorView& weight = inputs[1];
     const int64_t OW = output.shape(3);
     const int64_t IW = input.shape(3);
     const int64_t workers = std::max<int64_t>(ctx.cpu.worker_count(), 1);
-    if (output.shape(2) != 1 || workers <= 1 || inputs.size() > 4) { return 1; }
+    if (output.shape(2) != 1 || workers <= 1 || inputs.size() > 4) {
+        return 1;
+    }
 
     // A chunk pays the filter's halo again, so eight effective kernels of output
     // amortize it. The quantized route also repacks the whole filter into the
     // MMA's A panels per task — compute, not traffic, invisible to the bound
     // below — so its chunks stay longer.
     const int64_t k_eff = attrs.dilation[1] * (attrs.kernel_size[1] - 1) + 1;
-    const int64_t min_len = std::max<int64_t>(
-        8 * k_eff, is_quantized_conv2d(weight.data_type()) ? 128 : 1);
+    const int64_t min_len =
+        std::max<int64_t>(8 * k_eff, is_quantized_conv2d(weight.data_type()) ? 128 : 1);
     if (OW < 2 * min_len || (OW - 1) * attrs.stride[1] - attrs.padding[1] >= IW) {
         return 1;
     }
@@ -2659,8 +2633,7 @@ int64_t wide_split_chunks(const Conv2DAttributes& attrs,
     // duplicating it.
     const int64_t plane_items = input.shape(0) * attrs.groups * plan.oh_chunks;
     const int64_t tasks = plane_items * plan.oc_chunks;
-    const int64_t chunks =
-        std::clamp<int64_t>(std::min(workers, OW / min_len), 1, by_traffic);
+    const int64_t chunks = std::clamp<int64_t>(std::min(workers, OW / min_len), 1, by_traffic);
 
     // Take the column axis only when it is at least as wide as the plan's own
     // grid, and only where that grid is thin: once batch and group fill the
@@ -2674,18 +2647,21 @@ int64_t wide_split_chunks(const Conv2DAttributes& attrs,
 /// dtype combination" answer, refused before anything is allocated.
 template <class TRoute>
 Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx)
+                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     std::vector<TensorDesc> descs;
     descs.reserve(inputs.size());
-    for (const auto& t : inputs) { descs.push_back(t.desc()); }
+    for (const auto& t : inputs) {
+        descs.push_back(t.desc());
+    }
     const TensorDesc outs[] = {output.desc()};
 
-    const Conv2DGemmPlan plan = TRoute::make_plan(
-        attrs, descs, outs, ctx.cpu.thread_count(), ctx.cpu.thread_slot_count() > 0,
-        ctx.cpu.thread_slot_count());
-    if (plan.icn_block <= 0) { return Status::unsupported; }
+    const Conv2DGemmPlan plan =
+        TRoute::make_plan(attrs, descs, outs, ctx.cpu.thread_count(),
+                          ctx.cpu.thread_slot_count() > 0, ctx.cpu.thread_slot_count());
+    if (plan.icn_block <= 0) {
+        return Status::unsupported;
+    }
 
     // The column split: each chunk is one serial call on its own output window,
     // so no nested region is opened, and the chunks write disjoint columns —
@@ -2708,8 +2684,8 @@ Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
             ops[0] = wide_window(inputs[0], origin, IW - origin);
             TensorView out_c = wide_window(output, o0, o1 - o0);
             const Status st = conv2d_implicit_gemm_kernel(
-                ac, out_c, std::span<const TensorView>(ops, inputs.size()),
-                ComputeContext{}, nullptr);
+                ac, out_c, std::span<const TensorView>(ops, inputs.size()), ComputeContext{},
+                nullptr);
             if (!is_ok(st)) {
                 fail.store(static_cast<int>(st), std::memory_order_relaxed);
             }
@@ -2721,16 +2697,18 @@ Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
     // A pointwise call with no add_to needs no scratch, but the pool rejects a
     // zero-byte request: ask for the smallest arena instead.
     PoolPtr scratch(plan.workspace_size ? plan.workspace_size : 1);
-    if (!scratch) { return Status::out_of_memory; }
+    if (!scratch) {
+        return Status::out_of_memory;
+    }
 
     // The weight's dtype is the family, whatever the activation is: an s8 filter
     // selects the quantized kernels, and a pre-quantized activation does not.
-    return is_quantized_conv2d(inputs[1].data_type())
-        ? conv2d_quant_run<TRoute>(attrs, output, inputs, ctx, plan, scratch.get())
-        : conv2d_fp_run<TRoute>(attrs, output, inputs, ctx, plan, scratch.get());
+    return is_quantized_conv2d(inputs[1].data_type()) ?
+               conv2d_quant_run<TRoute>(attrs, output, inputs, ctx, plan, scratch.get()) :
+               conv2d_fp_run<TRoute>(attrs, output, inputs, ctx, plan, scratch.get());
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // =========================================================================
 //  The prepacked filter (Conv2D::prepackWeights, im2col route)
@@ -2748,13 +2726,13 @@ Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
 // [p·nr, (p+1)·nr) of one k block, for every k block of the group — so any
 // panel-aligned oc range is readable and the plan's N tile stops constraining it.
 
-ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
-                                             int64_t ic_per_group,
-                                             int64_t oc_per_group,
-                                             DataType weight_dtype)
+ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs, int64_t ic_per_group,
+                                             int64_t oc_per_group, DataType weight_dtype)
 {
     ConvPackedWeightLast g;
-    if (ic_per_group <= 0 || oc_per_group <= 0 || attrs.groups <= 0) { return g; }
+    if (ic_per_group <= 0 || oc_per_group <= 0 || attrs.groups <= 0) {
+        return g;
+    }
 
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
     const bool quant = is_quantized_conv2d(weight_dtype);
@@ -2766,28 +2744,27 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
     // consulted (no input shape), and a padded 1x1 gathers with the same wide K.
     const bool unit_1x1 = karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1;
     g.nr = quant ? NR_MAX_I8 : nr_max_dt(weight_dtype);
-    g.icn_block = unit_1x1
-        ? ic_per_group
-        : std::min<int64_t>(channel_last::get_ic_block_channel_last(karea, ic_per_group),
-                            ic_per_group);
+    g.icn_block =
+        unit_1x1 ? ic_per_group :
+                   std::min<int64_t>(channel_last::get_ic_block_channel_last(karea, ic_per_group),
+                                     ic_per_group);
     // Balance the oc blocks rather than taking kOcnBlock and leaving a sliver:
     // 144 is 80 + 64, not 128 + 16 (an eighth-full block paying every per-block
     // cost: accumulator fill, A pack, epilogue).
-    const int64_t oc_blocks_wanted = oc_per_group <= channel_last::kOcnSingleCap
-        ? 1 : (oc_per_group + channel_last::kOcnBlock - 1) / channel_last::kOcnBlock;
-    const int64_t per_block =
-        (oc_per_group + oc_blocks_wanted - 1) / oc_blocks_wanted;
-    g.ocn_block = std::min<int64_t>(
-        oc_per_group, ((per_block + g.nr - 1) / g.nr) * g.nr);
+    const int64_t oc_blocks_wanted =
+        oc_per_group <= channel_last::kOcnSingleCap ?
+            1 :
+            (oc_per_group + channel_last::kOcnBlock - 1) / channel_last::kOcnBlock;
+    const int64_t per_block = (oc_per_group + oc_blocks_wanted - 1) / oc_blocks_wanted;
+    g.ocn_block = std::min<int64_t>(oc_per_group, ((per_block + g.nr - 1) / g.nr) * g.nr);
 
-    g.kdim_max    = g.icn_block * karea;
+    g.kdim_max = g.icn_block * karea;
     const bool bf16 = weight_dtype == DataType::bf16;
-    g.slot_full   = gemm_panel_slot(g.kdim_max, g.nr, esz, quant, bf16);
-    g.nfull_ic    = ic_per_group / g.icn_block;
-    g.tail_ic     = ic_per_group - g.nfull_ic * g.icn_block;
-    g.slot_tail   = g.tail_ic
-        ? gemm_panel_slot(g.tail_ic * karea, g.nr, esz, quant, bf16) : 0;
-    g.col_elems   = g.nfull_ic * g.slot_full + (g.tail_ic ? g.slot_tail : 0);
+    g.slot_full = gemm_panel_slot(g.kdim_max, g.nr, esz, quant, bf16);
+    g.nfull_ic = ic_per_group / g.icn_block;
+    g.tail_ic = ic_per_group - g.nfull_ic * g.icn_block;
+    g.slot_tail = g.tail_ic ? gemm_panel_slot(g.tail_ic * karea, g.nr, esz, quant, bf16) : 0;
+    g.col_elems = g.nfull_ic * g.slot_full + (g.tail_ic ? g.slot_tail : 0);
     // ⌈⌉, not ÷: a lone oc block is the group's own width, which need not be a
     // multiple of nr (24 channels is two panels, one of them half live).
     g.block_panels = (g.ocn_block + g.nr - 1) / g.nr;
@@ -2798,7 +2775,7 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
     // where ⌈512/12⌉ = 43. Sizing by the blocks is what keeps the last block's
     // shorter panel column inside the buffer.
     const int64_t num_oc_blocks = (oc_per_group + g.ocn_block - 1) / g.ocn_block;
-    g.panels_oc   = num_oc_blocks * g.block_panels;
+    g.panels_oc = num_oc_blocks * g.block_panels;
     g.group_elems = g.panels_oc * g.col_elems;
     g.total = attrs.groups * g.group_elems;
     if (quant) {
@@ -2812,12 +2789,14 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
 }
 
 ConvPackedWeightChannelFirst conv_packed_weight_channel_first(const Conv2DAttributes& attrs,
-                                                 int64_t ic_per_group,
-                                                 int64_t oc_per_group,
-                                                 DataType weight_dtype)
+                                                              int64_t ic_per_group,
+                                                              int64_t oc_per_group,
+                                                              DataType weight_dtype)
 {
     ConvPackedWeightChannelFirst g;
-    if (ic_per_group <= 0 || oc_per_group <= 0 || attrs.groups <= 0) { return g; }
+    if (ic_per_group <= 0 || oc_per_group <= 0 || attrs.groups <= 0) {
+        return g;
+    }
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
 
     // A float filter is already the channel-first GEMM's A operand (OIHW is exactly
@@ -2835,14 +2814,14 @@ ConvPackedWeightChannelFirst conv_packed_weight_channel_first(const Conv2DAttrib
     // plan's pointwise rule; padding is not consulted, for the channel-last
     // reason.
     const bool unit_1x1 = karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1;
-    g.icn_block = unit_1x1
-        ? ic_per_group
-        : std::min<int64_t>(channel_first::get_ic_block(static_cast<int>(karea)), ic_per_group);
+    g.icn_block = unit_1x1 ? ic_per_group :
+                             std::min<int64_t>(channel_first::get_ic_block(static_cast<int>(karea)),
+                                               ic_per_group);
     g.ocn_block = std::min<int64_t>(channel_first::kOcnBlock, oc_per_group);
-    g.kdim_max  = g.icn_block * karea;
+    g.kdim_max = g.icn_block * karea;
     g.num_oc_blocks = (oc_per_group + g.ocn_block - 1) / g.ocn_block;
-    g.nfull_ic  = ic_per_group / g.icn_block;
-    g.tail_ic   = ic_per_group - g.nfull_ic * g.icn_block;
+    g.nfull_ic = ic_per_group / g.icn_block;
+    g.tail_ic = ic_per_group - g.nfull_ic * g.icn_block;
     const int64_t panels = num_panels_max(static_cast<int>(g.ocn_block), MR_I8);
     g.set_full = panels * geom_ldd_i8_a(g.kdim_max);
     g.set_tail = g.tail_ic ? panels * geom_ldd_i8_a(g.tail_ic * karea) : 0;
@@ -2850,14 +2829,13 @@ ConvPackedWeightChannelFirst conv_packed_weight_channel_first(const Conv2DAttrib
     g.total = attrs.groups * g.group_elems;
     // The R_a table trails the panels (see ConvPackedWeightLast::sums_off).
     g.sums_off = g.total;
-    const int64_t sum_bytes =
-        attrs.groups * oc_per_group * static_cast<int64_t>(sizeof(int32_t));
+    const int64_t sum_bytes = attrs.groups * oc_per_group * static_cast<int64_t>(sizeof(int32_t));
     g.total += (sum_bytes + 3) & ~int64_t{3};
     return g;
 }
 
 int64_t ConvPackedWeightChannelFirst::offset(int64_t g, int64_t ic_block,
-                                       int64_t oc_block) const noexcept
+                                             int64_t oc_block) const noexcept
 {
     const int64_t ic = ic_block * num_oc_blocks * set_full;
     const int64_t oc = oc_block * set_full;
@@ -2869,11 +2847,13 @@ namespace {
 /// The blob's descriptor: [OC, ⌈elems / OC⌉] with an explicit pitch, so numel()
 /// is exactly the buffer — how the two-step prepack's callers size their
 /// allocation. The dims after [0] carry no meaning.
-TensorDesc packed_weight_desc(int64_t oc_per_group, int64_t groups,
-                              int64_t elems, DataType dtype, TensorLayout layout)
+TensorDesc packed_weight_desc(int64_t oc_per_group, int64_t groups, int64_t elems, DataType dtype,
+                              TensorLayout layout)
 {
     TensorDesc d;
-    if (elems <= 0 || oc_per_group <= 0) { return d; }
+    if (elems <= 0 || oc_per_group <= 0) {
+        return d;
+    }
     const int64_t OC = oc_per_group * groups;
 
     d.rank = 2;
@@ -2886,10 +2866,9 @@ TensorDesc packed_weight_desc(int64_t oc_per_group, int64_t groups,
     return d;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs,
-                                   const TensorDesc& weight)
+TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs, const TensorDesc& weight)
 {
     // The filter's own dims give the channel counts: OIHW is [OC][IC/G][KH][KW],
     // HWIO is [KH][KW][IC/G][OC].
@@ -2897,21 +2876,20 @@ TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs,
     if (weight.rank != 4 || (!hwio && weight.layout != TensorLayout::NCHW)) {
         return TensorDesc{};
     }
-    const int64_t OC  = hwio ? weight.dims[3] : weight.dims[0];
+    const int64_t OC = hwio ? weight.dims[3] : weight.dims[0];
     const int64_t ICG = hwio ? weight.dims[2] : weight.dims[1];
-    const int64_t G   = attrs.groups;
-    if (G <= 0 || OC % G != 0 || ICG <= 0) { return TensorDesc{}; }
+    const int64_t G = attrs.groups;
+    if (G <= 0 || OC % G != 0 || ICG <= 0) {
+        return TensorDesc{};
+    }
 
     if (hwio) {
-        const ConvPackedWeightLast g =
-            conv_packed_weight_last(attrs, ICG, OC / G, weight.dtype);
-        return packed_weight_desc(OC / G, G, g.total, weight.dtype,
-                                  TensorLayout::PackedHWIO);
+        const ConvPackedWeightLast g = conv_packed_weight_last(attrs, ICG, OC / G, weight.dtype);
+        return packed_weight_desc(OC / G, G, g.total, weight.dtype, TensorLayout::PackedHWIO);
     }
     const ConvPackedWeightChannelFirst g =
         conv_packed_weight_channel_first(attrs, ICG, OC / G, weight.dtype);
-    return packed_weight_desc(OC / G, G, g.total, weight.dtype,
-                              TensorLayout::PackedOIHW);
+    return packed_weight_desc(OC / G, G, g.total, weight.dtype, TensorLayout::PackedOIHW);
 }
 
 namespace {
@@ -2927,14 +2905,17 @@ void with_stage(const ComputeContext& ctx, int64_t n, int64_t stage_len, Body bo
     // One char array keeps this helper type-agnostic.
     PoolArray<char> stages(static_cast<size_t>(nslots * stage_len));
     auto run = [&](int64_t s) {
-        char* const stage = stages.data() +
+        char* const stage =
+            stages.data() +
             (par ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : 0) * stage_len;
         body(s, stage);
     };
     if (par) {
         ctx.cpu.run(0, n, run);
     } else {
-        for (int64_t s = 0; s < n; ++s) { run(s); }
+        for (int64_t s = 0; s < n; ++s) {
+            run(s);
+        }
     }
 }
 
@@ -2945,9 +2926,8 @@ void with_stage(const ComputeContext& ctx, int64_t n, int64_t stage_len, Body bo
 /// split is (group, oc block, k block) — the layout's own unit, so every task
 /// writes a contiguous region without the panels of two oc blocks interleaving.
 template <class T>
-void pack_weight_last(const TensorView& weight, TensorView& packed,
-                      const ConvPackedWeightLast& g, int64_t ic_per_group,
-                      int64_t oc_per_group, int64_t groups,
+void pack_weight_last(const TensorView& weight, TensorView& packed, const ConvPackedWeightLast& g,
+                      int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
                       const ComputeContext& ctx)
 {
     const int64_t karea = g.kdim_max / g.icn_block;
@@ -2957,43 +2937,42 @@ void pack_weight_last(const TensorView& weight, TensorView& packed,
 
     const T* const w = weight.ptr<T>();
     T* const blob = packed.ptr<T>();
-    const int64_t stage_len = g.nr * g.kdim_max;   // elements
+    const int64_t stage_len = g.nr * g.kdim_max; // elements
 
     with_stage(ctx, groups * per_group, stage_len * static_cast<int64_t>(sizeof(T)),
                [&](int64_t s, char* stage_raw) {
-        T* const stage = reinterpret_cast<T*>(stage_raw);
-        const int64_t gg  = s / per_group;
-        const int64_t rem = s % per_group;
-        const int64_t ob  = rem / num_ic_blocks;
-        const int64_t ib  = rem % num_ic_blocks;
+                   T* const stage = reinterpret_cast<T*>(stage_raw);
+                   const int64_t gg = s / per_group;
+                   const int64_t rem = s % per_group;
+                   const int64_t ob = rem / num_ic_blocks;
+                   const int64_t ib = rem % num_ic_blocks;
 
-        const int64_t icn  = ib * g.icn_block;
-        const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
-        const int64_t kdim = icnc * karea;
-        const int64_t slot = gemm_panel_slot(kdim, g.nr, sizeof(T), false,
-                                             std::is_same_v<T, bfloat16>);
-        const int64_t oc0  = ob * g.ocn_block;
-        const int64_t oc1  = std::min(oc0 + g.ocn_block, oc_per_group);
+                   const int64_t icn = ib * g.icn_block;
+                   const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
+                   const int64_t kdim = icnc * karea;
+                   const int64_t slot =
+                       gemm_panel_slot(kdim, g.nr, sizeof(T), false, std::is_same_v<T, bfloat16>);
+                   const int64_t oc0 = ob * g.ocn_block;
+                   const int64_t oc1 = std::min(oc0 + g.ocn_block, oc_per_group);
 
-        // HWIO: one input channel's tap is one OC-length run; the group's output
-        // channels start at gg·oc_per_group.
-        const int64_t w_ic  = weight.shape(3);          // between input channels
-        const int64_t w_tap = ic_per_group * w_ic;      // between filter taps
-        for (int64_t ocn = oc0; ocn < oc1; ocn += g.nr) {
-            const int64_t ocnc = std::min(g.nr, oc_per_group - ocn);
-            channel_last::pack_block<T>(blob + g.offset(gg, ib, ocn), slot, stage,
-                          w + gg * oc_per_group + ocn + icn * w_ic,
-                          w_ic, w_tap, ocnc, icnc, static_cast<int>(karea),
-                          g.nr, static_cast<int>(kdim));
-        }
-    });
+                   // HWIO: one input channel's tap is one OC-length run; the group's output
+                   // channels start at gg·oc_per_group.
+                   const int64_t w_ic = weight.shape(3);      // between input channels
+                   const int64_t w_tap = ic_per_group * w_ic; // between filter taps
+                   for (int64_t ocn = oc0; ocn < oc1; ocn += g.nr) {
+                       const int64_t ocnc = std::min(g.nr, oc_per_group - ocn);
+                       channel_last::pack_block<T>(blob + g.offset(gg, ib, ocn), slot, stage,
+                                                   w + gg * oc_per_group + ocn + icn * w_ic, w_ic,
+                                                   w_tap, ocnc, icnc, static_cast<int>(karea), g.nr,
+                                                   static_cast<int>(kdim));
+                   }
+               });
 }
 
 /// pack_block_i8's sibling of the float pack above: same split, same loop.
 void pack_weight_last_i8(const TensorView& weight, TensorView& packed,
-                         const ConvPackedWeightLast& g, int64_t ic_per_group,
-                         int64_t oc_per_group, int64_t groups,
-                         const ComputeContext& ctx)
+                         const ConvPackedWeightLast& g, int64_t ic_per_group, int64_t oc_per_group,
+                         int64_t groups, const ComputeContext& ctx)
 {
     const int64_t karea = g.kdim_max / g.icn_block;
     const int64_t num_ic_blocks = g.nfull_ic + (g.tail_ic ? 1 : 0);
@@ -3003,30 +2982,30 @@ void pack_weight_last_i8(const TensorView& weight, TensorView& packed,
 
     const int8_t* const w = weight.ptr<int8_t>();
     int8_t* const blob = packed.ptr<int8_t>();
-    const int64_t stage_len = g.nr * g.kdim_max;   // bytes
+    const int64_t stage_len = g.nr * g.kdim_max; // bytes
 
     with_stage(ctx, groups * per_group, stage_len, [&](int64_t s, char* stage_raw) {
         int8_t* const stage = reinterpret_cast<int8_t*>(stage_raw);
-        const int64_t gg  = s / per_group;
+        const int64_t gg = s / per_group;
         const int64_t rem = s % per_group;
-        const int64_t ob  = rem / num_ic_blocks;
-        const int64_t ib  = rem % num_ic_blocks;
+        const int64_t ob = rem / num_ic_blocks;
+        const int64_t ib = rem % num_ic_blocks;
 
-        const int64_t icn  = ib * g.icn_block;
+        const int64_t icn = ib * g.icn_block;
         const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
         const int64_t kdim = icnc * karea;
         const int64_t slot = gemm_panel_slot(kdim, g.nr, 1, true);
-        const int64_t oc0  = ob * g.ocn_block;
-        const int64_t oc1  = std::min(oc0 + g.ocn_block, oc_per_group);
+        const int64_t oc0 = ob * g.ocn_block;
+        const int64_t oc1 = std::min(oc0 + g.ocn_block, oc_per_group);
 
-        const int64_t w_ic  = weight.shape(3);
+        const int64_t w_ic = weight.shape(3);
         const int64_t w_tap = ic_per_group * w_ic;
         for (int64_t ocn = oc0; ocn < oc1; ocn += g.nr) {
             const int64_t ocnc = std::min(g.nr, oc_per_group - ocn);
             channel_last::pack_block_i8(blob + g.offset(gg, ib, ocn), slot, stage,
-                          w + gg * oc_per_group + ocn + icn * w_ic,
-                          w_ic, w_tap, ocnc, icnc, static_cast<int>(karea),
-                          g.nr, static_cast<int>(kdim), a_biased);
+                                        w + gg * oc_per_group + ocn + icn * w_ic, w_ic, w_tap, ocnc,
+                                        icnc, static_cast<int>(karea), g.nr, static_cast<int>(kdim),
+                                        a_biased);
         }
     });
 }
@@ -3035,9 +3014,8 @@ void pack_weight_last_i8(const TensorView& weight, TensorView& packed,
 /// block), each `num_panels_max(ocn_block, MR_I8)` panels of MR_I8 output
 /// channels at the k block's own A stride.
 void pack_weight_channel_first_i8(const TensorView& weight, TensorView& packed,
-                           const ConvPackedWeightChannelFirst& g,
-                           int64_t ic_per_group, int64_t oc_per_group,
-                           int64_t groups, const ComputeContext& ctx)
+                                  const ConvPackedWeightChannelFirst& g, int64_t ic_per_group,
+                                  int64_t oc_per_group, int64_t groups, const ComputeContext& ctx)
 {
     const int64_t karea = g.kdim_max / g.icn_block;
     const bool a_biased = arch::mma_i8_folds_a_bias;
@@ -3052,21 +3030,20 @@ void pack_weight_channel_first_i8(const TensorView& weight, TensorView& packed,
     // of the blob, so the split needs no scratch and no lock.
     const int64_t per_group = num_ic_blocks * oc_blocks;
     ctx.cpu.run(0, groups * per_group, [&](int64_t t) {
-        const int64_t gg  = t / per_group;
+        const int64_t gg = t / per_group;
         const int64_t rem = t % per_group;
-        const int64_t ib  = rem / oc_blocks;
-        const int64_t ob  = rem % oc_blocks;
+        const int64_t ib = rem / oc_blocks;
+        const int64_t ob = rem % oc_blocks;
 
-        const int64_t icn  = ib * g.icn_block;
+        const int64_t icn = ib * g.icn_block;
         const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
         const int64_t kdim = icnc * karea;
-        const int64_t ocn  = ob * g.ocn_block;
+        const int64_t ocn = ob * g.ocn_block;
         const int64_t ocnc = std::min(g.ocn_block, oc_per_group - ocn);
         int8_t* const dst = blob + g.offset(gg, ib, ob);
-        tile_pack_lhs_i8(false, static_cast<int>(ocnc), static_cast<int>(kdim),
-                         dst, static_cast<int>(geom_ldd_i8_a(kdim)),
-                         w + gg * oc_per_group * w_ocn_step +
-                             icn * karea + ocn * w_ocn_step,
+        tile_pack_lhs_i8(false, static_cast<int>(ocnc), static_cast<int>(kdim), dst,
+                         static_cast<int>(geom_ldd_i8_a(kdim)),
+                         w + gg * oc_per_group * w_ocn_step + icn * karea + ocn * w_ocn_step,
                          static_cast<int>(w_ocn_step), a_biased);
     });
 }
@@ -3074,14 +3051,13 @@ void pack_weight_channel_first_i8(const TensorView& weight, TensorView& packed,
 /// Σ_k weight[oc, k] per output channel over a group's whole K — the table the
 /// int8 epilogues compensate with (R_b channel-last, R_an channel-first). Written from
 /// the *raw* filter, in whichever order its layout makes contiguous.
-void write_weight_sums(const int8_t* w, int64_t OC, int64_t ic_per_group,
-                       int64_t karea, bool hwio, const TensorView& weight,
-                       int32_t* out, const ComputeContext& ctx)
+void write_weight_sums(const int8_t* w, int64_t OC, int64_t ic_per_group, int64_t karea, bool hwio,
+                       const TensorView& weight, int32_t* out, const ComputeContext& ctx)
 {
     if (hwio) {
         // [KH][KW][IC/G][OC]: the walk covers the group's input channels and
         // *all* groups' output channels at once — the OC axis spans groups.
-        const int64_t w_ic  = weight.shape(3);
+        const int64_t w_ic = weight.shape(3);
         const int64_t w_tap = ic_per_group * w_ic;
         // One output channel is one task: a channel's taps are strided, but the
         // writes are disjoint and this is the pack's smallest cost.
@@ -3089,7 +3065,9 @@ void write_weight_sums(const int8_t* w, int64_t OC, int64_t ic_per_group,
             int32_t acc = 0;
             for (int64_t t = 0; t < karea; ++t) {
                 const int8_t* const row = w + t * w_tap + oc;
-                for (int64_t i = 0; i < ic_per_group; ++i) { acc += row[i * w_ic]; }
+                for (int64_t i = 0; i < ic_per_group; ++i) {
+                    acc += row[i * w_ic];
+                }
             }
             out[oc] = acc;
         });
@@ -3102,17 +3080,15 @@ void write_weight_sums(const int8_t* w, int64_t OC, int64_t ic_per_group,
     });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-void conv_packed_weight_pack(const Conv2DAttributes& attrs,
-                             const TensorView& weight,
-                             TensorView& packed,
-                             const ComputeContext& ctx)
+void conv_packed_weight_pack(const Conv2DAttributes& attrs, const TensorView& weight,
+                             TensorView& packed, const ComputeContext& ctx)
 {
     const bool hwio = is_channel_last_weight(weight.layout());
-    const int64_t OC  = hwio ? weight.shape(3) : weight.shape(0);
+    const int64_t OC = hwio ? weight.shape(3) : weight.shape(0);
     const int64_t ICG = hwio ? weight.shape(2) : weight.shape(1);
-    const int64_t G   = attrs.groups;
+    const int64_t G = attrs.groups;
     const int64_t OCG = OC / G;
     const DataType dtype = weight.data_type();
     const int64_t esz = static_cast<int64_t>(data_type_size(dtype));
@@ -3147,8 +3123,7 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs,
             // The sums land on an unaligned byte offset: accumulate whole, copy in.
             PoolArray<int32_t> sums;
             sums.zero(static_cast<size_t>(OC));
-            write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, true, weight,
-                              sums.data(), ctx);
+            write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, true, weight, sums.data(), ctx);
             std::memcpy(packed.ptr<char>() + g.sums_off, sums.data(),
                         static_cast<size_t>(OC) * sizeof(int32_t));
         }
@@ -3168,8 +3143,7 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs,
         pack_weight_channel_first_i8(weight, packed, g, ICG, OCG, G, ctx);
         PoolArray<int32_t> sums;
         sums.zero(static_cast<size_t>(OC));
-        write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, false, weight,
-                          sums.data(), ctx);
+        write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, false, weight, sums.data(), ctx);
         std::memcpy(packed.ptr<char>() + g.sums_off, sums.data(),
                     static_cast<size_t>(OC) * sizeof(int32_t));
     }
@@ -3177,23 +3151,19 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs,
 
 Conv2DGemmPlan get_conv2d_implicit_gemm_plan(const Conv2DAttributes& attrs,
                                              std::span<const TensorDesc> inputs,
-                                             std::span<const TensorDesc> outputs,
-                                             int num_threads,
-                                             bool use_thread_slots,
-                                             int64_t num_slots)
+                                             std::span<const TensorDesc> outputs, int num_threads,
+                                             bool use_thread_slots, int64_t num_slots)
 {
     if (is_channel_last(inputs[0].layout)) {
-        return ChannelLastRoute::make_plan(attrs, inputs, outputs, num_threads,
-                                           use_thread_slots, num_slots);
+        return ChannelLastRoute::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+                                           num_slots);
     }
-    return ChannelFirstRoute::make_plan(attrs, inputs, outputs, num_threads,
-                                  use_thread_slots, num_slots);
+    return ChannelFirstRoute::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+                                        num_slots);
 }
 
-Status conv2d_implicit_gemm_kernel(const Conv2DAttributes& attrs,
-                                   TensorView& output,
-                                   std::span<const TensorView> inputs,
-                                   const ComputeContext& ctx,
+Status conv2d_implicit_gemm_kernel(const Conv2DAttributes& attrs, TensorView& output,
+                                   std::span<const TensorView> inputs, const ComputeContext& ctx,
                                    void* /*workspace*/)
 {
     if (is_channel_last(inputs[0].layout())) {
@@ -3202,4 +3172,4 @@ Status conv2d_implicit_gemm_kernel(const Conv2DAttributes& attrs,
     return conv2d_gemm_run<ChannelFirstRoute>(attrs, output, inputs, ctx);
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

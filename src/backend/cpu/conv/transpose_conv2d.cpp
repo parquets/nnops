@@ -54,7 +54,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
-#include "backend/cpu/simd_kernel/simd_quant.hpp"   // quant_kernel::quantization
+#include "backend/cpu/simd_kernel/simd_quant.hpp" // quant_kernel::quantization
 #include "backend/cpu/matmul/matmul.h"
 #include "backend/cpu/common/dtype_dispatch.hpp"
 #include "backend/cpu/common/memory_pool.hpp"
@@ -78,7 +78,7 @@ struct Geom {
     int64_t SH, SW, DH, DW, PH, PW;
     Epilogue epilogue;
     bool add_to;
-    bool pre_act;   ///< fold add_to's old value in before the epilogue
+    bool pre_act; ///< fold add_to's old value in before the epilogue
 
     /// The col2im module's view of the same numbers.
     Tconv2dColGeom col_geom() const
@@ -90,48 +90,54 @@ struct Geom {
 /// Channel-first through a col matrix — the onnxruntime route. Returns false when the
 /// operands cannot be read as flat matrices, leaving the caller its scalar path.
 template <typename T>
-bool tconv2d_channel_first_gemm(const Geom& gm,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx)
+bool tconv2d_channel_first_gemm(const Geom& gm, TensorView& output,
+                                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    if (weight.row_stride_elems() != gm.KW) { return false; }
-    if (input.row_stride_elems() != gm.IW) { return false; }
-    if (gm.KH > kMaxRowTaps) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
+    if (input.row_stride_elems() != gm.IW) {
+        return false;
+    }
+    if (gm.KH > kMaxRowTaps) {
+        return false;
+    }
 
     const int64_t karea = gm.KH * gm.KW;
-    const int64_t npix  = gm.IH * gm.IW;
-    const int64_t icg   = gm.IC_per_G;
-    const int64_t ocg   = gm.OC_per_G;
+    const int64_t npix = gm.IH * gm.IW;
+    const int64_t icg = gm.IC_per_G;
+    const int64_t ocg = gm.OC_per_G;
 
-    const int64_t in_n_stride    = input.stride_elems(0);
-    const int64_t out_n_stride   = output.stride_elems(0);
-    const int64_t out_c_stride   = output.stride_elems(1);
+    const int64_t in_n_stride = input.stride_elems(0);
+    const int64_t out_n_stride = output.stride_elems(0);
+    const int64_t out_c_stride = output.stride_elems(1);
     const int64_t out_row_stride = output.row_stride_elems();
 
     const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr  = weight.ptr<T>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const auto* w_ptr = weight.ptr<T>();
+    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     auto* out_ptr = output.ptr<T>();
 
     // A stride-SW output row splits into SW residue classes of `mic` pixels;
     // each class's taps read a contiguous run of the col.
     const Tconv2dColGeom cg = gm.col_geom();
     const int64_t row_len = cg.row_len;
-    const int64_t slots   = std::max(1, ctx.cpu.worker_count());
+    const int64_t slots = std::max(1, ctx.cpu.worker_count());
 
     const int64_t elems_per_oc = karea * npix;
     const int64_t cap = kColCapBytes / static_cast<int64_t>(sizeof(T));
-    const int64_t chunk = std::max<int64_t>(
-        1, std::min(ocg, cap / std::max<int64_t>(elems_per_oc, 1)));
+    const int64_t chunk =
+        std::max<int64_t>(1, std::min(ocg, cap / std::max<int64_t>(elems_per_oc, 1)));
 
     PoolArray<T> col(static_cast<size_t>(chunk * elems_per_oc));
     PoolArray<T> rows(static_cast<size_t>(slots * row_len));
-    if (!col || !rows) { return false; }
+    if (!col || !rows) {
+        return false;
+    }
 
     const DataType vdt = input.data_type();
 
@@ -154,48 +160,46 @@ bool tconv2d_channel_first_gemm(const Geom& gm,
 
             for (int64_t oc0 = 0; oc0 < ocg; oc0 += chunk) {
                 const int64_t cc = std::min(chunk, ocg - oc0);
-                const int64_t m  = cc * karea;
+                const int64_t m = cc * karea;
 
                 // A: the filter rows of this oc slice, [IC/G] × [OC/G·KH·KW],
                 // read through the group's own row stride.
                 const int64_t ashape[] = {icg, m};
                 TensorView am(std::span<const int64_t>(ashape, 2), vdt,
                               const_cast<T*>(w_g + oc0 * karea),
-                              static_cast<int64_t>(ocg * karea * sizeof(T)),
-                              TensorLayout::NCHW);
+                              static_cast<int64_t>(ocg * karea * sizeof(T)), TensorLayout::NCHW);
                 const int64_t cshape[] = {m, npix};
-                TensorView cm(std::span<const int64_t>(cshape, 2), vdt,
-                              col.data(), static_cast<int64_t>(npix * sizeof(T)),
-                              TensorLayout::NCHW);
+                TensorView cm(std::span<const int64_t>(cshape, 2), vdt, col.data(),
+                              static_cast<int64_t>(npix * sizeof(T)), TensorLayout::NCHW);
 
                 const TensorView mins[] = {am, bm};
                 matmul_cpu(mm, cm, mins, ctx, nullptr);
 
                 ctx.cpu.run(0, cc * gm.OH, [&](int64_t task) {
                     const int64_t oc_l = task / gm.OH;
-                    const int64_t oh   = task % gm.OH;
-                    T* row = rows.data() +
-                             static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
+                    const int64_t oh = task % gm.OH;
+                    T* row =
+                        rows.data() + static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
 
                     row_fill(row, row_len, b_g ? s_load(&b_g[oc_l]) : 0.0f);
 
                     tconv2d_col2im_channel_major<T>(
                         cg, col.data() + oc_l * karea * npix, row, oh,
-                        [](T* dst, const T* src, int64_t len, int64_t) {
-                            row_add(dst, src, len);
-                        }, npix);
+                        [](T* dst, const T* src, int64_t len, int64_t) { row_add(dst, src, len); },
+                        npix);
 
                     const int64_t oc = g * ocg + oc0 + oc_l;
                     T* orow = out_n + oc * out_c_stride + oh * out_row_stride;
                     for (int64_t r = 0; r < gm.SW; ++r) {
-                        if (r >= gm.OW) { break; }
+                        if (r >= gm.OW) {
+                            break;
+                        }
                         const int64_t nr = (gm.OW - r + gm.SW - 1) / gm.SW;
                         const T* rp = row + r * cg.mic;
                         for (int64_t t = 0; t < nr; ++t) {
                             const int64_t ow = r + t * gm.SW;
-                            apply_epilogue_store<T>(&orow[ow], s_load(&rp[t]),
-                                                    gm.epilogue, oc, gm.add_to,
-                                                    gm.pre_act);
+                            apply_epilogue_store<T>(&orow[ow], s_load(&rp[t]), gm.epilogue, oc,
+                                                    gm.add_to, gm.pre_act);
                         }
                     }
                 });
@@ -211,29 +215,32 @@ bool tconv2d_channel_first_gemm(const Geom& gm,
 /// scatter reads is the input plane. The skeleton — the repack to [KH·KW][C],
 /// the row scratch, the merge — is tconv_cl.h's; only the walk is 2-D.
 template <typename T>
-bool tconv2d_channel_last_depthwise(const Geom& gm,
-                                    TensorView& output,
-                                    std::span<const TensorView> inputs,
-                                    const ComputeContext& ctx)
+bool tconv2d_channel_last_depthwise(const Geom& gm, TensorView& output,
+                                    std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) { return false; }
+    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) {
+        return false;
+    }
 
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
-    if (weight.row_stride_elems() != gm.KW) { return false; }
-    if (input.row_stride_elems() != gm.IW * gm.IC) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
+    if (input.row_stride_elems() != gm.IW * gm.IC) {
+        return false;
+    }
 
     const Tconv2dColGeom cg = gm.col_geom();
     return tconv_cl_depthwise<T>(
         gm, output, inputs, ctx, gm.OH, gm.KH * gm.KW, gm.IC,
         [cg](const T* src, T* row, int64_t oh, const T* wd, int64_t m, int64_t nc) {
             // The tap indexes the repacked filter, not a source stride.
-            tconv2d_col2im_pixel_major<T>(
-                cg, src, m, nc, 0, row, oh,
-                [wd, nc](T* dst, const T* s, int64_t len, int64_t tap) {
-                    row_fma(dst, s, wd + tap * nc, len);
-                });
+            tconv2d_col2im_pixel_major<T>(cg, src, m, nc, 0, row, oh,
+                                          [wd, nc](T* dst, const T* s, int64_t len, int64_t tap) {
+                                              row_fma(dst, s, wd + tap * nc, len);
+                                          });
         });
 }
 
@@ -246,19 +253,23 @@ bool tconv2d_channel_last_depthwise(const Geom& gm,
 /// The chunk skeleton is tconv_cl.h's; only the walk is 2-D.
 /// Returns false when the operands cannot be read as flat matrices.
 template <typename T>
-bool tconv2d_channel_last_gemm(const Geom& gm,
-                               TensorView& output,
-                               std::span<const TensorView> inputs,
-                               const ComputeContext& ctx)
+bool tconv2d_channel_last_gemm(const Geom& gm, TensorView& output,
+                               std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
-    if (weight.row_stride_elems() != gm.KW) { return false; }
-    if (input.row_stride_elems() != gm.IW * gm.IC) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
+    if (input.row_stride_elems() != gm.IW * gm.IC) {
+        return false;
+    }
 
     const int64_t npix = gm.IH * gm.IW;
-    if (npix <= 0 || gm.KH * gm.KW <= 0 || gm.IC_per_G <= 0) { return false; }
+    if (npix <= 0 || gm.KH * gm.KW <= 0 || gm.IC_per_G <= 0) {
+        return false;
+    }
 
     // Two col orientations. Ordered [tap][oc] the GEMM needs the filter
     // permuted to [IC/G][KH·KW·OC/G], but the col feeds the scatter as it is.
@@ -274,9 +285,7 @@ bool tconv2d_channel_last_gemm(const Geom& gm,
         [cg](const T* col, T* row, int64_t oh, int64_t m, int64_t nc) {
             tconv2d_col2im_pixel_major<T>(
                 cg, col, m, nc, nc, row, oh,
-                [](T* dst, const T* src, int64_t len, int64_t) {
-                    row_add(dst, src, len);
-                });
+                [](T* dst, const T* src, int64_t len, int64_t) { row_add(dst, src, len); });
         });
 }
 
@@ -330,7 +339,7 @@ inline QuantParams qp_per_channel(const float* scale, const int32_t* zero, int64
 /// is already s8 and dense) and the single (scale, zero point) it carries.
 struct ActPlane {
     const int8_t* ptr = nullptr;
-    int64_t n_stride = 0;   ///< elements per batch item
+    int64_t n_stride = 0; ///< elements per batch item
     float scale = 1.0f;
     int32_t zero = 0;
 };
@@ -340,17 +349,17 @@ struct ActPlane {
 /// pixel-major [N][IH·IW][IC]. @p zero is the plane's zero point (-128 from the
 /// stored one when the storage was unsigned).
 template <class TAct>
-void build_activation_plane(const TensorView& in, int8_t* dst, float scale,
-                            int32_t zero, bool channel_last, int64_t IC,
-                            int64_t IH, int64_t IW, const ComputeContext& ctx)
+void build_activation_plane(const TensorView& in, int8_t* dst, float scale, int32_t zero,
+                            bool channel_last, int64_t IC, int64_t IH, int64_t IW,
+                            const ComputeContext& ctx)
 {
-    const int64_t N  = in.shape(0);
+    const int64_t N = in.shape(0);
     const int64_t rs = in.row_stride_elems();
     const int64_t ns = in.stride_elems(0);
     const int64_t cs = channel_last ? 0 : in.stride_elems(1);
     const int64_t row_len = channel_last ? IW * IC : IW;
-    const int64_t rows_n  = channel_last ? IH : IC * IH;
-    const int64_t total   = N * rows_n;
+    const int64_t rows_n = channel_last ? IH : IC * IH;
+    const int64_t total = N * rows_n;
     const TAct* src = in.ptr<TAct>();
     const float s = scale;
     const float z = static_cast<float>(zero);
@@ -358,9 +367,9 @@ void build_activation_plane(const TensorView& in, int8_t* dst, float scale,
     const auto run_rows = [&](int64_t beg, int64_t end) {
         for (int64_t r = beg; r < end; ++r) {
             const int64_t nb = r / rows_n;
-            const int64_t i  = r - nb * rows_n;
-            const int64_t h  = channel_last ? i : i % IH;
-            const int64_t c  = channel_last ? 0 : i / IH;
+            const int64_t i = r - nb * rows_n;
+            const int64_t h = channel_last ? i : i % IH;
+            const int64_t c = channel_last ? 0 : i / IH;
             const TAct* sp = src + nb * ns + c * cs + h * rs;
             int8_t* dp = dst + (nb * rows_n + i) * row_len;
             if constexpr (std::is_same_v<TAct, int8_t>) {
@@ -371,8 +380,7 @@ void build_activation_plane(const TensorView& in, int8_t* dst, float scale,
                 }
             } else {
                 k::quant_kernel::quantization<int8_t>(
-                    static_cast<int>(1), static_cast<int>(row_len), dp, 1, sp, 1,
-                    &s, &z);
+                    static_cast<int>(1), static_cast<int>(row_len), dp, 1, sp, 1, &s, &z);
             }
         }
     };
@@ -386,9 +394,7 @@ void build_activation_plane(const TensorView& in, int8_t* dst, float scale,
     }
     const int64_t slab = (total + nt - 1) / nt;
     const int64_t nslab = (total + slab - 1) / slab;
-    ctx.cpu.run(0, nslab, [&](int64_t i) {
-        run_rows(i * slab, std::min(i * slab + slab, total));
-    });
+    ctx.cpu.run(0, nslab, [&](int64_t i) { run_rows(i * slab, std::min(i * slab + slab, total)); });
 }
 
 /// The int32 col row, whether the GEMM wrote it or the depthwise FMA pass did.
@@ -397,11 +403,9 @@ void build_activation_plane(const TensorView& in, int8_t* dst, float scale,
 inline v_f32x8 v_acc_to_f32(const int32_t* p)
 {
 #if defined(NNOPS_ARCH_X86_64)
-    return v_f32x8(_mm256_cvtepi32_ps(
-        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p))));
+    return v_f32x8(_mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p))));
 #elif defined(NNOPS_ARCH_AARCH64)
-    return v_f32x8(vcvtq_f32_s32(vld1q_s32(p)),
-                   vcvtq_f32_s32(vld1q_s32(p + 4)));
+    return v_f32x8(vcvtq_f32_s32(vld1q_s32(p)), vcvtq_f32_s32(vld1q_s32(p + 4)));
 #endif
 }
 inline v_f32x8 v_acc_to_f32(const float* p) { return v_load(p); }
@@ -411,8 +415,7 @@ inline float acc_at(float v) { return v; }
 
 #if defined(NNOPS_ARCH_X86_64)
 /// Rounded int32 lanes: a float row is exact here, so the convert is a no-op.
-template <class Src>
-inline __m256i v_acc_to_i32(const Src* p)
+template <class Src> inline __m256i v_acc_to_i32(const Src* p)
 {
     if constexpr (std::is_same_v<Src, float>) {
         return _mm256_cvtps_epi32(_mm256_loadu_ps(p));
@@ -423,8 +426,7 @@ inline __m256i v_acc_to_i32(const Src* p)
 inline int32_t acc_to_i32(int32_t v) { return v; }
 inline int32_t acc_to_i32(float v) { return static_cast<int32_t>(v); }
 #elif defined(NNOPS_ARCH_AARCH64)
-template <class Src>
-inline int32x4_t v_acc_to_i32(const Src* p)
+template <class Src> inline int32x4_t v_acc_to_i32(const Src* p)
 {
     if constexpr (std::is_same_v<Src, float>) {
         return vcvtnq_s32_f32(vld1q_f32(p));
@@ -440,9 +442,8 @@ inline int32_t acc_to_i32(float v) { return static_cast<int32_t>(v); }
 /// zp_out, `req` carrying the per-lane requant scale. Eight lanes at a time,
 /// matching matmul_int8_requant's clamp-round-then-bias order.
 template <typename TOut, class Src>
-void requant_oc_row_i8(TOut* dp, const Src* rp, int64_t nc,
-                       const int32_t* bias, bool relu, const float* req,
-                       int32_t zp_out)
+void requant_oc_row_i8(TOut* dp, const Src* rp, int64_t nc, const int32_t* bias, bool relu,
+                       const float* req, int32_t zp_out)
 {
     constexpr bool kU8 = std::is_same_v<TOut, uint8_t>;
     constexpr float kMin = kU8 ? 0.0f : -128.0f;
@@ -450,26 +451,26 @@ void requant_oc_row_i8(TOut* dp, const Src* rp, int64_t nc,
     const float zpf = static_cast<float>(zp_out);
     int64_t c = 0;
 #if defined(NNOPS_ARCH_X86_64)
-    const __m256i vzp  = _mm256_set1_epi32(zp_out);
-    const __m256 vmin  = _mm256_set1_ps(kMin - zpf);
-    const __m256 vmax  = _mm256_set1_ps(kMax - zpf);
+    const __m256i vzp = _mm256_set1_epi32(zp_out);
+    const __m256 vmin = _mm256_set1_ps(kMin - zpf);
+    const __m256 vmax = _mm256_set1_ps(kMax - zpf);
     const __m256 vsign = _mm256_set1_ps(-0.0f);
     const __m256 vhalf = _mm256_set1_ps(0.5f);
     for (; c + 8 <= nc; c += 8) {
         __m256i v = v_acc_to_i32(rp + c);
         if (bias) {
-            v = _mm256_add_epi32(
-                v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bias + c)));
+            v = _mm256_add_epi32(v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bias + c)));
         }
-        if (relu) { v = _mm256_max_epi32(v, _mm256_setzero_si256()); }
+        if (relu) {
+            v = _mm256_max_epi32(v, _mm256_setzero_si256());
+        }
         __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(v), _mm256_loadu_ps(req + c));
         f = _mm256_min_ps(_mm256_max_ps(f, vmin), vmax);
         f = _mm256_add_ps(f, _mm256_or_ps(_mm256_and_ps(f, vsign), vhalf));
         const __m256i q = _mm256_add_epi32(_mm256_cvttps_epi32(f), vzp);
-        const __m128i i16 = _mm_packs_epi32(_mm256_castsi256_si128(q),
-                                            _mm256_extracti128_si256(q, 1));
-        const __m128i v8 = kU8 ? _mm_packus_epi16(i16, i16)
-                               : _mm_packs_epi16(i16, i16);
+        const __m128i i16 =
+            _mm_packs_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+        const __m128i v8 = kU8 ? _mm_packus_epi16(i16, i16) : _mm_packs_epi16(i16, i16);
         _mm_storel_epi64(reinterpret_cast<__m128i*>(dp + c), v8);
     }
 #elif defined(NNOPS_ARCH_AARCH64)
@@ -478,27 +479,33 @@ void requant_oc_row_i8(TOut* dp, const Src* rp, int64_t nc,
     const float32x4_t vmax = vdupq_n_f32(kMax - zpf);
     for (; c + 4 <= nc; c += 4) {
         int32x4_t v = v_acc_to_i32(rp + c);
-        if (bias) { v = vaddq_s32(v, vld1q_s32(bias + c)); }
-        if (relu) { v = vmaxq_s32(v, vdupq_n_s32(0)); }
+        if (bias) {
+            v = vaddq_s32(v, vld1q_s32(bias + c));
+        }
+        if (relu) {
+            v = vmaxq_s32(v, vdupq_n_s32(0));
+        }
         float32x4_t f = vmulq_f32(vcvtq_f32_s32(v), vld1q_f32(req + c));
         f = vminq_f32(vmaxq_f32(f, vmin), vmax);
         const int32x4_t q = vaddq_s32(vcvtaq_s32_f32(f), vzp);
         const int16x4_t i16 = vqmovn_s32(q);
         if constexpr (kU8) {
             const uint8x8_t v8 = vqmovun_s16(vcombine_s16(i16, i16));
-            vst1_lane_u32(reinterpret_cast<uint32_t*>(dp + c),
-                          vreinterpret_u32_u8(v8), 0);
+            vst1_lane_u32(reinterpret_cast<uint32_t*>(dp + c), vreinterpret_u32_u8(v8), 0);
         } else {
             const int8x8_t v8 = vqmovn_s16(vcombine_s16(i16, i16));
-            vst1_lane_s32(reinterpret_cast<int32_t*>(dp + c),
-                          vreinterpret_s32_s8(v8), 0);
+            vst1_lane_s32(reinterpret_cast<int32_t*>(dp + c), vreinterpret_s32_s8(v8), 0);
         }
     }
 #endif
     for (; c < nc; ++c) {
         int32_t v = acc_to_i32(rp[c]);
-        if (bias) { v += bias[c]; }
-        if (relu) { v = std::max(v, 0); }
+        if (bias) {
+            v += bias[c];
+        }
+        if (relu) {
+            v = std::max(v, 0);
+        }
         dp[c] = matmul_int8_requant<TOut>(v, req[c], zp_out);
     }
 }
@@ -507,9 +514,9 @@ void requant_oc_row_i8(TOut* dp, const Src* rp, int64_t nc,
 /// f32→f16 row store, and the quant stage indexes its table by channel, which
 /// the vector passes do not carry.
 template <typename TOut, class Src>
-void dequant_oc_row_scalar(TOut* orow, const Src* row, int64_t OW, int64_t nc,
-                           int64_t OC, const TOut* bo, const QuantParams& qw,
-                           int64_t oc_base, float s_x, const Epilogue& ep)
+void dequant_oc_row_scalar(TOut* orow, const Src* row, int64_t OW, int64_t nc, int64_t OC,
+                           const TOut* bo, const QuantParams& qw, int64_t oc_base, float s_x,
+                           const Epilogue& ep)
 {
     for (int64_t ow = 0; ow < OW; ++ow) {
         const Src* rp = row + ow * nc;
@@ -517,7 +524,9 @@ void dequant_oc_row_scalar(TOut* orow, const Src* row, int64_t OW, int64_t nc,
         for (int64_t c = 0; c < nc; ++c) {
             const int64_t oc = oc_base + c;
             float f = acc_at(rp[c]) * (quant_scale_at(qw, oc) * s_x);
-            if (bo) { f += s_load(&bo[c]); }
+            if (bo) {
+                f += s_load(&bo[c]);
+            }
             f = nnops::apply_epilogue(ep, f, oc);
             s_store(&dp[c], f);
         }
@@ -546,8 +555,7 @@ inline bool epilogue_is_vector_exact(const Epilogue& ep) noexcept
 /// The fp form: dequantize with the per-lane s_w·s_x, add the bias, then the
 /// clip and the activation the fp route applies.
 template <class Src>
-void dequant_oc_row_f32(float* dp, const Src* rp, int64_t nc,
-                        const float* w_sx, const float* bias,
+void dequant_oc_row_f32(float* dp, const Src* rp, int64_t nc, const float* w_sx, const float* bias,
                         const Epilogue& ep)
 {
     constexpr int L = simd_default_lane_f32;
@@ -555,13 +563,17 @@ void dequant_oc_row_f32(float* dp, const Src* rp, int64_t nc,
     int64_t c = 0;
     for (; c + L <= nc; c += L) {
         vec_for<float> acc = v_mul(v_acc_to_f32(rp + c), v_load(w_sx + c));
-        if (bias) { acc = v_add(acc, v_load(bias + c)); }
+        if (bias) {
+            acc = v_add(acc, v_load(bias + c));
+        }
         acc = apply_epilogue_vec<float>(ep, tag, acc);
         v_store(dp + c, acc);
     }
     for (; c < nc; ++c) {
         float f = acc_at(rp[c]) * w_sx[c];
-        if (bias) { f += bias[c]; }
+        if (bias) {
+            f += bias[c];
+        }
         dp[c] = nnops::apply_epilogue(ep, f);
     }
 }
@@ -576,27 +588,31 @@ void dequant_oc_row_f32(float* dp, const Src* rp, int64_t nc,
 /// and no GEMM.
 template <typename TOut>
 bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
-                                         std::span<const TensorView> inputs,
-                                         const ActPlane& act,
+                                         std::span<const TensorView> inputs, const ActPlane& act,
                                          const ComputeContext& ctx)
 {
-    constexpr bool kIntOut =
-        std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+    constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
-    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) { return false; }
+    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) {
+        return false;
+    }
 
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
-    if (weight.row_stride_elems() != gm.KW) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
 
     const int64_t karea = gm.KH * gm.KW;
-    const int64_t C     = gm.IC;
-    const int64_t npix  = gm.IH * gm.IW;
+    const int64_t C = gm.IC;
+    const int64_t npix = gm.IH * gm.IW;
     const int64_t slots = std::max(1, ctx.cpu.worker_count());
     const int64_t row_len = gm.OW * C;
     const int64_t plane_elems = gm.N * npix * C;
     // 255·255·karea has to stay an exact integer in f32.
-    if (karea > 256) { return false; }
+    if (karea > 256) {
+        return false;
+    }
 
     const int64_t elem_cap = kColCapBytes / static_cast<int64_t>(sizeof(float));
     if (C <= 0 || npix <= 0 || slots * row_len + plane_elems > elem_cap) {
@@ -607,7 +623,9 @@ bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
     PoolArray<float> rows(static_cast<size_t>(slots * row_len));
     PoolArray<float> plane(static_cast<size_t>(plane_elems));
     PoolArray<float> lane_scale(static_cast<size_t>(C));
-    if (!wd || !rows || !plane || !lane_scale) { return false; }
+    if (!wd || !rows || !plane || !lane_scale) {
+        return false;
+    }
 
     const auto* w_ptr = weight.ptr<int8_t>();
     const QuantParams& qw = weight.quant_params();
@@ -623,8 +641,7 @@ bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
     for (int64_t c = 0; c < C; ++c) {
         const float s_w = quant_scale_at(qw, c);
         const float zw = static_cast<float>(quant_zp_at(qw, c));
-        lane_scale.data()[c] = kIntOut
-            ? matmul_int8_requant_scale(s_w, s_x, out_scale) : s_w * s_x;
+        lane_scale.data()[c] = kIntOut ? matmul_int8_requant_scale(s_w, s_x, out_scale) : s_w * s_x;
         for (int64_t t = 0; t < karea; ++t) {
             wd.data()[t * C + c] = static_cast<float>(w_ptr[c * karea + t]) - zw;
         }
@@ -643,8 +660,7 @@ bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
             const int8_t* sp = src + nb * act.n_stride + (r % gm.IH) * row_width;
             float* dp = plane.data() + r * row_width;
             int64_t i = 0;
-            for (; i + simd_default_lane_f32 <= row_width;
-                 i += simd_default_lane_f32) {
+            for (; i + simd_default_lane_f32 <= row_width; i += simd_default_lane_f32) {
                 v_store(dp + i, v_sub(v_cvt_s8_to_f32(sp + i), zvec));
             }
             for (; i < row_width; ++i) {
@@ -654,15 +670,14 @@ bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
     }
 
     auto* out_ptr = output.ptr<TOut>();
-    const int64_t out_n_stride   = output.stride_elems(0);
+    const int64_t out_n_stride = output.stride_elems(0);
     const int64_t out_row_stride = output.row_stride_elems();
-    const Tconv2dColGeom cg      = gm.col_geom();
+    const Tconv2dColGeom cg = gm.col_geom();
 
     ctx.cpu.run(0, gm.N * gm.OH, [&](int64_t task) {
-        const int64_t n  = task / gm.OH;
+        const int64_t n = task / gm.OH;
         const int64_t oh = task % gm.OH;
-        float* row = rows.data() +
-                     static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
+        float* row = rows.data() + static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
         const float* in_n = plane.data() + n * act.n_stride;
 
         row_fill(row, row_len, 0.0f);
@@ -678,19 +693,17 @@ bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
             TOut* dp = orow + ow * gm.OC;
             const float* rp = row + ow * C;
             if constexpr (kIntOut) {
-                requant_oc_row_i8<TOut>(dp, rp, C, b_i32, relu,
-                                        lane_scale.data(), zp_out);
+                requant_oc_row_i8<TOut>(dp, rp, C, b_i32, relu, lane_scale.data(), zp_out);
             } else if constexpr (std::is_same_v<TOut, float>) {
                 if (epilogue_is_vector_exact(gm.epilogue)) {
-                    dequant_oc_row_f32(dp, rp, C, lane_scale.data(), b_fp,
-                                       gm.epilogue);
+                    dequant_oc_row_f32(dp, rp, C, lane_scale.data(), b_fp, gm.epilogue);
                 } else {
                     dequant_oc_row_scalar(dp, rp, 1, C, gm.OC, b_fp, qw,
                                           /*oc_base=*/0, s_x, gm.epilogue);
                 }
             } else {
-                dequant_oc_row_scalar(dp, rp, 1, C, gm.OC, b_fp, qw, /*oc_base=*/0,
-                                      s_x, gm.epilogue);
+                dequant_oc_row_scalar(dp, rp, 1, C, gm.OC, b_fp, qw, /*oc_base=*/0, s_x,
+                                      gm.epilogue);
             }
         }
     });
@@ -704,28 +717,32 @@ bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
 /// order, so the merge is per element, as in the channel-first GEMM route.
 template <typename TOut>
 bool tconv2d_int8_channel_first_depthwise(const Geom& gm, TensorView& output,
-                                          std::span<const TensorView> inputs,
-                                          const ActPlane& act,
+                                          std::span<const TensorView> inputs, const ActPlane& act,
                                           const ComputeContext& ctx)
 {
-    constexpr bool kIntOut =
-        std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+    constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
-    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) { return false; }
+    if (gm.IC_per_G != 1 || gm.OC_per_G != 1) {
+        return false;
+    }
 
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
-    if (weight.row_stride_elems() != gm.KW) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
 
     const int64_t karea = gm.KH * gm.KW;
-    const int64_t C     = gm.IC;
-    const int64_t npix  = gm.IH * gm.IW;
+    const int64_t C = gm.IC;
+    const int64_t npix = gm.IH * gm.IW;
     const int64_t slots = std::max(1, ctx.cpu.worker_count());
     const Tconv2dColGeom cg = gm.col_geom();
     const int64_t row_len = cg.row_len;
     const int64_t plane_elems = gm.N * C * npix;
     // 255·255·karea has to stay an exact integer in f32.
-    if (karea > 256) { return false; }
+    if (karea > 256) {
+        return false;
+    }
 
     const int64_t elem_cap = kColCapBytes / static_cast<int64_t>(sizeof(float));
     if (C <= 0 || npix <= 0 || slots * row_len + plane_elems > elem_cap) {
@@ -736,7 +753,9 @@ bool tconv2d_int8_channel_first_depthwise(const Geom& gm, TensorView& output,
     PoolArray<float> rows(static_cast<size_t>(slots * row_len));
     PoolArray<float> plane(static_cast<size_t>(plane_elems));
     PoolArray<float> lane_scale(static_cast<size_t>(C));
-    if (!wd || !rows || !plane || !lane_scale) { return false; }
+    if (!wd || !rows || !plane || !lane_scale) {
+        return false;
+    }
 
     const auto* w_ptr = weight.ptr<int8_t>();
     const QuantParams& qw = weight.quant_params();
@@ -753,8 +772,7 @@ bool tconv2d_int8_channel_first_depthwise(const Geom& gm, TensorView& output,
     for (int64_t c = 0; c < C; ++c) {
         const float s_w = quant_scale_at(qw, c);
         const float zw = static_cast<float>(quant_zp_at(qw, c));
-        lane_scale.data()[c] = kIntOut
-            ? matmul_int8_requant_scale(s_w, s_x, out_scale) : s_w * s_x;
+        lane_scale.data()[c] = kIntOut ? matmul_int8_requant_scale(s_w, s_x, out_scale) : s_w * s_x;
         for (int64_t t = 0; t < karea; ++t) {
             wd.data()[c * karea + t] = static_cast<float>(w_ptr[c * karea + t]) - zw;
         }
@@ -775,21 +793,22 @@ bool tconv2d_int8_channel_first_depthwise(const Geom& gm, TensorView& output,
             for (; k + simd_default_lane_f32 <= npix; k += simd_default_lane_f32) {
                 v_store(dp + k, v_sub(v_cvt_s8_to_f32(sp + k), zvec));
             }
-            for (; k < npix; ++k) { dp[k] = static_cast<float>(sp[k]) - zx; }
+            for (; k < npix; ++k) {
+                dp[k] = static_cast<float>(sp[k]) - zx;
+            }
         });
     }
 
     auto* out_ptr = output.ptr<TOut>();
-    const int64_t out_n_stride   = output.stride_elems(0);
-    const int64_t out_c_stride   = output.stride_elems(1);
+    const int64_t out_n_stride = output.stride_elems(0);
+    const int64_t out_c_stride = output.stride_elems(1);
     const int64_t out_row_stride = output.row_stride_elems();
 
     ctx.cpu.run(0, gm.N * C * gm.OH, [&](int64_t task) {
         const int64_t oh = task % gm.OH;
-        const int64_t c  = (task / gm.OH) % C;
-        const int64_t n  = task / (gm.OH * C);
-        float* row = rows.data() +
-                     static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
+        const int64_t c = (task / gm.OH) % C;
+        const int64_t n = task / (gm.OH * C);
+        float* row = rows.data() + static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
         const float* w_c = wd.data() + c * karea;
 
         row_fill(row, row_len, 0.0f);
@@ -798,29 +817,36 @@ bool tconv2d_int8_channel_first_depthwise(const Geom& gm, TensorView& output,
             cg, plane.data() + (n * C + c) * npix, row, oh,
             [&](float* dst, const float* src, int64_t len, int64_t tap) {
                 row_fma_scalar(dst, src, w_c[tap], len);
-            }, /*tap_stride=*/0);
+            },
+            /*tap_stride=*/0);
 
         // Groups == channels: the output channel is the input channel.
         const int64_t oc = c;
         const float s_w = quant_scale_at(qw, oc);
-        const float req = kIntOut
-            ? matmul_int8_requant_scale(s_w, s_x, out_scale) : 0.0f;
-        TOut* orow = out_ptr + n * out_n_stride + oc * out_c_stride +
-                     oh * out_row_stride;
+        const float req = kIntOut ? matmul_int8_requant_scale(s_w, s_x, out_scale) : 0.0f;
+        TOut* orow = out_ptr + n * out_n_stride + oc * out_c_stride + oh * out_row_stride;
         for (int64_t r = 0; r < gm.SW; ++r) {
-            if (r >= gm.OW) { break; }
+            if (r >= gm.OW) {
+                break;
+            }
             const int64_t nr = (gm.OW - r + gm.SW - 1) / gm.SW;
             const float* rp = row + r * cg.mic;
             for (int64_t t = 0; t < nr; ++t) {
                 const int64_t ow = r + t * gm.SW;
                 if constexpr (kIntOut) {
                     int32_t v = static_cast<int32_t>(rp[t]);
-                    if (b_i32) { v += b_i32[oc]; }
-                    if (relu) { v = std::max(v, int32_t{0}); }
+                    if (b_i32) {
+                        v += b_i32[oc];
+                    }
+                    if (relu) {
+                        v = std::max(v, int32_t{0});
+                    }
                     orow[ow] = matmul_int8_requant<TOut>(v, req, zp_out);
                 } else {
                     float f = rp[t] * (s_w * s_x);
-                    if (b_fp) { f += s_load(&b_fp[oc]); }
+                    if (b_fp) {
+                        f += s_load(&b_fp[oc]);
+                    }
                     apply_epilogue_store<TOut>(&orow[ow], f, gm.epilogue, oc,
                                                /*add_to=*/false, /*pre_act=*/false);
                 }
@@ -835,41 +861,48 @@ bool tconv2d_int8_channel_first_depthwise(const Geom& gm, TensorView& output,
 /// those int32 rows into a scratch row before the merge requantizes.
 template <typename TOut>
 bool tconv2d_int8_channel_first(const Geom& gm, TensorView& output,
-                                std::span<const TensorView> inputs,
-                                const ActPlane& act, const ComputeContext& ctx)
+                                std::span<const TensorView> inputs, const ActPlane& act,
+                                const ComputeContext& ctx)
 {
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
-    constexpr bool kIntOut =
-        std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+    constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
-    if (weight.row_stride_elems() != gm.KW) { return false; }
-    if (gm.KH > kMaxRowTaps) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
+    if (gm.KH > kMaxRowTaps) {
+        return false;
+    }
 
     const int64_t karea = gm.KH * gm.KW;
-    const int64_t npix  = gm.IH * gm.IW;
-    const int64_t icg   = gm.IC_per_G;
-    const int64_t ocg   = gm.OC_per_G;
-    if (npix <= 0 || icg <= 0 || ocg <= 0) { return false; }
+    const int64_t npix = gm.IH * gm.IW;
+    const int64_t icg = gm.IC_per_G;
+    const int64_t ocg = gm.OC_per_G;
+    if (npix <= 0 || icg <= 0 || ocg <= 0) {
+        return false;
+    }
 
-    const int64_t out_n_stride   = output.stride_elems(0);
-    const int64_t out_c_stride   = output.stride_elems(1);
+    const int64_t out_n_stride = output.stride_elems(0);
+    const int64_t out_c_stride = output.stride_elems(1);
     const int64_t out_row_stride = output.row_stride_elems();
 
     const Tconv2dColGeom cg = gm.col_geom();
     const int64_t row_len = cg.row_len;
-    const int64_t slots   = std::max(1, ctx.cpu.worker_count());
+    const int64_t slots = std::max(1, ctx.cpu.worker_count());
 
     const int64_t elems_per_oc = karea * npix;
     const int64_t cap = kColCapBytes / static_cast<int64_t>(sizeof(int32_t));
-    const int64_t chunk = std::max<int64_t>(
-        1, std::min(ocg, cap / std::max<int64_t>(elems_per_oc, 1)));
+    const int64_t chunk =
+        std::max<int64_t>(1, std::min(ocg, cap / std::max<int64_t>(elems_per_oc, 1)));
 
     PoolArray<int32_t> col(static_cast<size_t>(chunk * elems_per_oc));
     PoolArray<int32_t> rows(static_cast<size_t>(slots * row_len));
     PoolArray<float> w_scale(static_cast<size_t>(chunk * karea));
     PoolArray<int32_t> w_zp(static_cast<size_t>(chunk * karea));
-    if (!col || !rows || !w_scale || !w_zp) { return false; }
+    if (!col || !rows || !w_scale || !w_zp) {
+        return false;
+    }
 
     const auto* w_ptr = weight.ptr<int8_t>();
     const QuantParams& qw = weight.quant_params();
@@ -898,12 +931,12 @@ bool tconv2d_int8_channel_first(const Geom& gm, TensorView& output,
             // B: the group's whole input plane, [IC/G] × [IH·IW].
             const int64_t bshape[] = {icg, npix};
             TensorView bm(std::span<const int64_t>(bshape, 2), DataType::s8,
-                          const_cast<int8_t*>(in_n + g * icg * npix),
-                          static_cast<int64_t>(npix), TensorLayout::NCHW, act_qp);
+                          const_cast<int8_t*>(in_n + g * icg * npix), static_cast<int64_t>(npix),
+                          TensorLayout::NCHW, act_qp);
 
             for (int64_t oc0 = 0; oc0 < ocg; oc0 += chunk) {
                 const int64_t cc = std::min(chunk, ocg - oc0);
-                const int64_t m  = cc * karea;
+                const int64_t m = cc * karea;
 
                 // A channel's karea taps are consecutive GEMM rows, so its
                 // (scale, zero point) fills karea entries.
@@ -923,46 +956,53 @@ bool tconv2d_int8_channel_first(const Geom& gm, TensorView& output,
                               static_cast<int64_t>(ocg * karea), TensorLayout::NCHW,
                               qp_per_channel(w_scale.data(), w_zp.data(), m));
                 const int64_t cshape[] = {m, npix};
-                TensorView cm(std::span<const int64_t>(cshape, 2), DataType::s32,
-                              col.data(),
-                              static_cast<int64_t>(npix * sizeof(int32_t)),
-                              TensorLayout::NCHW);
+                TensorView cm(std::span<const int64_t>(cshape, 2), DataType::s32, col.data(),
+                              static_cast<int64_t>(npix * sizeof(int32_t)), TensorLayout::NCHW);
 
                 const TensorView mins[] = {am, bm};
                 matmul_cpu(mm, cm, mins, ctx, nullptr);
 
                 ctx.cpu.run(0, cc * gm.OH, [&](int64_t task) {
                     const int64_t oc_l = task / gm.OH;
-                    const int64_t oh   = task % gm.OH;
-                    int32_t* row = rows.data() +
-                        static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
+                    const int64_t oh = task % gm.OH;
+                    int32_t* row =
+                        rows.data() + static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
                     std::fill_n(row, row_len, int32_t{0});
 
                     tconv2d_col2im_channel_major<int32_t>(
                         cg, col.data() + oc_l * karea * npix, row, oh,
                         [](int32_t* dst, const int32_t* src, int64_t len, int64_t) {
                             row_add_i32(dst, src, len);
-                        }, npix);
+                        },
+                        npix);
 
                     const int64_t oc = g * ocg + oc0 + oc_l;
                     const float s_w = quant_scale_at(qw, oc);
-                    const float req = kIntOut
-                        ? matmul_int8_requant_scale(s_w, s_x, out_scale) : 0.0f;
+                    const float req =
+                        kIntOut ? matmul_int8_requant_scale(s_w, s_x, out_scale) : 0.0f;
                     TOut* orow = out_n + oc * out_c_stride + oh * out_row_stride;
                     for (int64_t r = 0; r < gm.SW; ++r) {
-                        if (r >= gm.OW) { break; }
+                        if (r >= gm.OW) {
+                            break;
+                        }
                         const int64_t nr = (gm.OW - r + gm.SW - 1) / gm.SW;
                         const int32_t* rp = row + r * cg.mic;
                         for (int64_t t = 0; t < nr; ++t) {
                             const int64_t ow = r + t * gm.SW;
                             if constexpr (kIntOut) {
                                 int32_t v = rp[t];
-                                if (b_i32) { v += b_i32[oc]; }
-                                if (relu) { v = std::max(v, int32_t{0}); }
+                                if (b_i32) {
+                                    v += b_i32[oc];
+                                }
+                                if (relu) {
+                                    v = std::max(v, int32_t{0});
+                                }
                                 orow[ow] = matmul_int8_requant<TOut>(v, req, zp_out);
                             } else {
                                 float f = static_cast<float>(rp[t]) * (s_w * s_x);
-                                if (b_fp) { f += s_load(&b_fp[oc]); }
+                                if (b_fp) {
+                                    f += s_load(&b_fp[oc]);
+                                }
                                 apply_epilogue_store<TOut>(&orow[ow], f, gm.epilogue, oc,
                                                            /*add_to=*/false,
                                                            /*pre_act=*/false);
@@ -983,26 +1023,29 @@ bool tconv2d_int8_channel_first(const Geom& gm, TensorView& output,
 /// parameters, which the raw [oc][tap] order does not line up with.
 template <typename TOut>
 bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
-                               std::span<const TensorView> inputs,
-                               const ActPlane& act, const ComputeContext& ctx)
+                               std::span<const TensorView> inputs, const ActPlane& act,
+                               const ComputeContext& ctx)
 {
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
-    constexpr bool kIntOut =
-        std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+    constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
-    if (weight.row_stride_elems() != gm.KW) { return false; }
+    if (weight.row_stride_elems() != gm.KW) {
+        return false;
+    }
 
     const int64_t karea = gm.KH * gm.KW;
-    const int64_t npix  = gm.IH * gm.IW;
-    const int64_t icg   = gm.IC_per_G;
-    const int64_t ocg   = gm.OC_per_G;
-    if (npix <= 0 || karea <= 0 || icg <= 0) { return false; }
+    const int64_t npix = gm.IH * gm.IW;
+    const int64_t icg = gm.IC_per_G;
+    const int64_t ocg = gm.OC_per_G;
+    if (npix <= 0 || karea <= 0 || icg <= 0) {
+        return false;
+    }
 
-    const int64_t out_n_stride   = output.stride_elems(0);
+    const int64_t out_n_stride = output.stride_elems(0);
     const int64_t out_row_stride = output.row_stride_elems();
-    const int64_t slots          = std::max(1, ctx.cpu.worker_count());
-    const Tconv2dColGeom cg      = gm.col_geom();
+    const int64_t slots = std::max(1, ctx.cpu.worker_count());
+    const Tconv2dColGeom cg = gm.col_geom();
 
     // The col and the per-worker row scratch both scale with the oc chunk.
     const int64_t elem_cap = kColCapBytes / static_cast<int64_t>(sizeof(int32_t));
@@ -1016,7 +1059,9 @@ bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
     PoolArray<float> b_scale(static_cast<size_t>(karea * cc));
     PoolArray<int32_t> b_zp(static_cast<size_t>(karea * cc));
     PoolArray<float> lane_scale(static_cast<size_t>(cc));
-    if (!col || !aux || !rows || !b_scale || !b_zp || !lane_scale) { return false; }
+    if (!col || !aux || !rows || !b_scale || !b_zp || !lane_scale) {
+        return false;
+    }
 
     const auto* w_ptr = weight.ptr<int8_t>();
     const QuantParams& qw = weight.quant_params();
@@ -1037,7 +1082,9 @@ bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
     for (int64_t g = 0; g < gm.G; ++g) {
         for (int64_t oc0 = 0; oc0 < ocg; oc0 += cc) {
             const int64_t nc = std::min(cc, ocg - oc0);
-            if (nc <= 0) { continue; }
+            if (nc <= 0) {
+                continue;
+            }
             const int64_t m = nc * karea;
 
             // Per-column (tap, oc) parameters: B's columns are the
@@ -1047,8 +1094,8 @@ bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
                 const int64_t oc = g * ocg + oc0 + o;
                 const float s = quant_scale_at(qw, oc);
                 const int32_t z = quant_zp_at(qw, oc);
-                lane_scale.data()[o] = kIntOut
-                    ? matmul_int8_requant_scale(s, s_x, out_scale) : s * s_x;
+                lane_scale.data()[o] =
+                    kIntOut ? matmul_int8_requant_scale(s, s_x, out_scale) : s * s_x;
                 for (int64_t t = 0; t < karea; ++t) {
                     b_scale.data()[t * nc + o] = s;
                     b_zp.data()[t * nc + o] = z;
@@ -1068,15 +1115,17 @@ bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
                         for (int64_t o = o0; o < o1; ++o) {
                             int8_t* d = dst + t0 * nc + o;
                             const int8_t* s = src + o * karea + t0;
-                            for (int64_t t = 0; t < t1 - t0; ++t) { d[t * nc] = s[t]; }
+                            for (int64_t t = 0; t < t1 - t0; ++t) {
+                                d[t * nc] = s[t];
+                            }
                         }
                     }
                 }
             }
 
             const int64_t bshape[] = {icg, m};
-            TensorView bm(std::span<const int64_t>(bshape, 2), DataType::s8,
-                          aux.data(), static_cast<int64_t>(m), TensorLayout::NCHW,
+            TensorView bm(std::span<const int64_t>(bshape, 2), DataType::s8, aux.data(),
+                          static_cast<int64_t>(m), TensorLayout::NCHW,
                           qp_per_channel(b_scale.data(), b_zp.data(), m));
 
             for (int64_t n = 0; n < gm.N; ++n) {
@@ -1087,22 +1136,18 @@ bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
                 // pixel stride of IC, so the group offset is g·IC/G elements in.
                 const int64_t ashape[] = {npix, icg};
                 TensorView am(std::span<const int64_t>(ashape, 2), DataType::s8,
-                              const_cast<int8_t*>(in_n + g * icg),
-                              static_cast<int64_t>(gm.IC), TensorLayout::NCHW,
-                              act_qp);
+                              const_cast<int8_t*>(in_n + g * icg), static_cast<int64_t>(gm.IC),
+                              TensorLayout::NCHW, act_qp);
                 const int64_t cshape[] = {npix, m};
-                TensorView cm(std::span<const int64_t>(cshape, 2), DataType::s32,
-                              col.data(),
-                              static_cast<int64_t>(m * sizeof(int32_t)),
-                              TensorLayout::NCHW);
+                TensorView cm(std::span<const int64_t>(cshape, 2), DataType::s32, col.data(),
+                              static_cast<int64_t>(m * sizeof(int32_t)), TensorLayout::NCHW);
 
                 const TensorView mins[] = {am, bm};
                 matmul_cpu(mm, cm, mins, ctx, nullptr);
 
                 ctx.cpu.run(0, gm.OH, [&](int64_t oh) {
                     int32_t* row = rows.data() +
-                        static_cast<int64_t>(ctx.cpu.current_thread_id()) *
-                            (gm.OW * nc);
+                                   static_cast<int64_t>(ctx.cpu.current_thread_id()) * (gm.OW * nc);
                     std::fill_n(row, gm.OW * nc, int32_t{0});
 
                     tconv2d_col2im_pixel_major<int32_t>(
@@ -1117,26 +1162,22 @@ bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
                     if constexpr (kIntOut) {
                         const int32_t* bo = b_i32 ? b_i32 + oc_base : nullptr;
                         for (int64_t ow = 0; ow < gm.OW; ++ow) {
-                            requant_oc_row_i8<TOut>(orow + ow * gm.OC, row + ow * nc,
-                                                    nc, bo, relu,
+                            requant_oc_row_i8<TOut>(orow + ow * gm.OC, row + ow * nc, nc, bo, relu,
                                                     lane_scale.data(), zp_out);
                         }
                     } else if constexpr (std::is_same_v<TOut, float>) {
                         if (epilogue_is_vector_exact(gm.epilogue)) {
                             for (int64_t ow = 0; ow < gm.OW; ++ow) {
-                                dequant_oc_row_f32(orow + ow * gm.OC,
-                                                   row + ow * nc, nc,
-                                                   lane_scale.data(), bo_fp,
-                                                   gm.epilogue);
+                                dequant_oc_row_f32(orow + ow * gm.OC, row + ow * nc, nc,
+                                                   lane_scale.data(), bo_fp, gm.epilogue);
                             }
                         } else {
-                            dequant_oc_row_scalar(orow, row, gm.OW, nc, gm.OC,
-                                                  bo_fp, qw, oc_base, s_x,
-                                                  gm.epilogue);
+                            dequant_oc_row_scalar(orow, row, gm.OW, nc, gm.OC, bo_fp, qw, oc_base,
+                                                  s_x, gm.epilogue);
                         }
                     } else {
-                        dequant_oc_row_scalar(orow, row, gm.OW, nc, gm.OC, bo_fp,
-                                              qw, oc_base, s_x, gm.epilogue);
+                        dequant_oc_row_scalar(orow, row, gm.OW, nc, gm.OC, bo_fp, qw, oc_base, s_x,
+                                              gm.epilogue);
                     }
                 });
             }
@@ -1150,14 +1191,12 @@ bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
 /// operands cannot be read as flat matrices or the kernel is too tall for the
 /// per-row tap list.
 template <typename TOut>
-void tconv2d_int8_scalar(const Geom& gm, TensorView& output,
-                         std::span<const TensorView> inputs, const ActPlane& act,
-                         bool channel_last, const ComputeContext& ctx)
+void tconv2d_int8_scalar(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
+                         const ActPlane& act, bool channel_last, const ComputeContext& ctx)
 {
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
-    constexpr bool kIntOut =
-        std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+    constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
     const int64_t npix = gm.IH * gm.IW;
     const auto* w_ptr = weight.ptr<int8_t>();
@@ -1170,7 +1209,7 @@ void tconv2d_int8_scalar(const Geom& gm, TensorView& output,
     const int32_t zp_out = kIntOut ? quant_zp_at(qo, 0) : 0;
     const bool relu = gm.epilogue.type == EpilogueActivateType::Relu;
 
-    const int64_t in_c_stride  = channel_last ? 1 : npix;
+    const int64_t in_c_stride = channel_last ? 1 : npix;
     const int64_t in_row_stride = channel_last ? gm.IC : gm.IW;
     const int64_t out_c_stride = output.stride_elems(1);
     const int64_t out_row_stride = output.row_stride_elems();
@@ -1178,7 +1217,7 @@ void tconv2d_int8_scalar(const Geom& gm, TensorView& output,
     auto* out_ptr = output.ptr<TOut>();
 
     const auto process = [&](int64_t task) {
-        const int64_t n  = task / gm.OC;
+        const int64_t n = task / gm.OC;
         const int64_t oc = task % gm.OC;
         const int64_t g = oc / gm.OC_per_G;
         const int64_t oc_l = oc % gm.OC_per_G;
@@ -1193,17 +1232,26 @@ void tconv2d_int8_scalar(const Geom& gm, TensorView& output,
                 int32_t acc = 0;
                 for (int64_t kh = 0; kh < gm.KH; ++kh) {
                     const int64_t num_h = oh + gm.PH - kh * gm.DH;
-                    if (num_h < 0 || num_h % gm.SH != 0) { continue; }
+                    if (num_h < 0 || num_h % gm.SH != 0) {
+                        continue;
+                    }
                     const int64_t ih = num_h / gm.SH;
-                    if (ih >= gm.IH) { continue; }
+                    if (ih >= gm.IH) {
+                        continue;
+                    }
                     for (int64_t kw = 0; kw < gm.KW; ++kw) {
                         const int64_t num_w = ow + gm.PW - kw * gm.DW;
-                        if (num_w < 0 || num_w % gm.SW != 0) { continue; }
+                        if (num_w < 0 || num_w % gm.SW != 0) {
+                            continue;
+                        }
                         const int64_t iw = num_w / gm.SW;
-                        if (iw >= gm.IW) { continue; }
-                        const int8_t* xp = in_n +
-                            (channel_last ? (ih * gm.IW + iw) * gm.IC + g * gm.IC_per_G
-                                          : (g * gm.IC_per_G) * npix + ih * in_row_stride + iw);
+                        if (iw >= gm.IW) {
+                            continue;
+                        }
+                        const int8_t* xp =
+                            in_n + (channel_last ?
+                                        (ih * gm.IW + iw) * gm.IC + g * gm.IC_per_G :
+                                        (g * gm.IC_per_G) * npix + ih * in_row_stride + iw);
                         for (int64_t ic_l = 0; ic_l < gm.IC_per_G; ++ic_l) {
                             const int64_t ic = g * gm.IC_per_G + ic_l;
                             const int32_t xv = static_cast<int32_t>(xp[ic_l * in_c_stride]);
@@ -1216,13 +1264,19 @@ void tconv2d_int8_scalar(const Geom& gm, TensorView& output,
 
                 if constexpr (kIntOut) {
                     int32_t v = acc;
-                    if (b_i32) { v += b_i32[oc]; }
-                    if (relu) { v = std::max(v, int32_t{0}); }
+                    if (b_i32) {
+                        v += b_i32[oc];
+                    }
+                    if (relu) {
+                        v = std::max(v, int32_t{0});
+                    }
                     orow[ow] = matmul_int8_requant<TOut>(
                         v, matmul_int8_requant_scale(s_w, s_x, out_scale), zp_out);
                 } else {
                     float f = static_cast<float>(acc) * (s_w * s_x);
-                    if (b_fp) { f += s_load(&b_fp[oc]); }
+                    if (b_fp) {
+                        f += s_load(&b_fp[oc]);
+                    }
                     apply_epilogue_store<TOut>(&orow[ow], f, gm.epilogue, oc,
                                                /*add_to=*/false, /*pre_act=*/false);
                 }
@@ -1234,47 +1288,42 @@ void tconv2d_int8_scalar(const Geom& gm, TensorView& output,
 }
 
 template <typename TOut>
-void tconv2d_int8_layout(const Geom& gm, TensorView& output,
-                         std::span<const TensorView> inputs, const ActPlane& act,
-                         const ComputeContext& ctx)
+void tconv2d_int8_layout(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
+                         const ActPlane& act, const ComputeContext& ctx)
 {
     if (is_channel_last(inputs[0].layout())) {
         if (tconv2d_int8_channel_last_depthwise<TOut>(gm, output, inputs, act, ctx)) {
             return;
         }
-        if (tconv2d_int8_channel_last<TOut>(gm, output, inputs, act, ctx)) { return; }
-    } else if (tconv2d_int8_channel_first_depthwise<TOut>(gm, output, inputs, act,
-                                                           ctx)) {
+        if (tconv2d_int8_channel_last<TOut>(gm, output, inputs, act, ctx)) {
+            return;
+        }
+    } else if (tconv2d_int8_channel_first_depthwise<TOut>(gm, output, inputs, act, ctx)) {
         return;
     } else if (tconv2d_int8_channel_first<TOut>(gm, output, inputs, act, ctx)) {
         return;
     }
-    tconv2d_int8_scalar<TOut>(gm, output, inputs, act,
-                              is_channel_last(inputs[0].layout()), ctx);
+    tconv2d_int8_scalar<TOut>(gm, output, inputs, act, is_channel_last(inputs[0].layout()), ctx);
 }
 
 /// One activation storage type of the quantized route: build the plane, then
 /// dispatch the output dtype.
 template <class TAct>
-Status tconv2d_int8_act(const TransposeConv2DAttributes& attrs, const Geom& gm,
-                        TensorView& output, std::span<const TensorView> inputs,
-                        const ComputeContext& ctx)
+Status tconv2d_int8_act(const TransposeConv2DAttributes& attrs, const Geom& gm, TensorView& output,
+                        std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    constexpr bool kFpAct =
-        !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
+    constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
     const auto& input = inputs[0];
     const DataType adt = input.data_type();
-    const bool target_u8 = kFpAct ? (attrs.act_quant_dtype == DataType::u8)
-                                  : (adt == DataType::u8);
+    const bool target_u8 = kFpAct ? (attrs.act_quant_dtype == DataType::u8) : (adt == DataType::u8);
     const QuantParams& qa = input.quant_params();
-    const float s_x    = quant_scale_at(qa, 0);
+    const float s_x = quant_scale_at(qa, 0);
     const int32_t zp_x = quant_zp_at(qa, 0);
 
     const bool channel_last = is_channel_last(input.layout());
     const int64_t npix = gm.IH * gm.IW;
-    const bool dense = channel_last
-        ? (input.row_stride_elems() == gm.IW * gm.IC)
-        : (input.row_stride_elems() == gm.IW);
+    const bool dense = channel_last ? (input.row_stride_elems() == gm.IW * gm.IC) :
+                                      (input.row_stride_elems() == gm.IW);
     // A pre-quantized s8 activation with dense rows needs no plane at all.
     const bool in_place = !kFpAct && adt == DataType::s8 && dense;
 
@@ -1292,9 +1341,11 @@ Status tconv2d_int8_act(const TransposeConv2DAttributes& attrs, const Geom& gm,
     } else if (npix > 0) {
         const int64_t total = gm.N * gm.IC * npix;
         plane.reset(static_cast<size_t>(total));
-        if (!plane) { return Status::out_of_memory; }
-        build_activation_plane<TAct>(input, plane.data(), s_x, act.zero,
-                                     channel_last, gm.IC, gm.IH, gm.IW, ctx);
+        if (!plane) {
+            return Status::out_of_memory;
+        }
+        build_activation_plane<TAct>(input, plane.data(), s_x, act.zero, channel_last, gm.IC, gm.IH,
+                                     gm.IW, ctx);
         act.ptr = plane.data();
         act.n_stride = gm.IC * npix;
     }
@@ -1317,9 +1368,8 @@ Status tconv2d_int8_act(const TransposeConv2DAttributes& attrs, const Geom& gm,
 }
 
 /// dtype gate of the quantized route, then the activation dispatch.
-Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs,
-                                 const Geom& gm, TensorView& output,
-                                 std::span<const TensorView> inputs,
+Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs, const Geom& gm,
+                                 TensorView& output, std::span<const TensorView> inputs,
                                  const ComputeContext& ctx)
 {
     const DataType adt = inputs[0].data_type();
@@ -1335,16 +1385,24 @@ Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs,
     }
     // An fp activation keeps its own dtype on an fp destination; a pre-quantized
     // one is dequantized to whatever output_dtype asked for.
-    if (!int_out && fp_act && odt != adt) { return Status::unsupported; }
+    if (!int_out && fp_act && odt != adt) {
+        return Status::unsupported;
+    }
     if (inputs.size() > 2) {
         const DataType bdt = inputs[2].data_type();
-        if (bdt != (int_out ? DataType::s32 : odt)) { return Status::unsupported; }
+        if (bdt != (int_out ? DataType::s32 : odt)) {
+            return Status::unsupported;
+        }
     }
     // add_to would have to keep the pre-existing destination out of the
     // scatter; the integer accumulate has no fold for it.
-    if (attrs.add_to) { return Status::unsupported; }
+    if (attrs.add_to) {
+        return Status::unsupported;
+    }
 
-    if (gm.N == 0 || gm.OC == 0 || gm.OH == 0 || gm.OW == 0) { return Status::ok; }
+    if (gm.N == 0 || gm.OC == 0 || gm.OH == 0 || gm.OW == 0) {
+        return Status::ok;
+    }
 
     switch (adt) {
     case DataType::f32:
@@ -1359,20 +1417,18 @@ Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs,
 }
 
 template <typename T>
-void tconv2d_impl(const Geom& gm,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
+void tconv2d_impl(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
                   const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t N  = gm.N;
+    const int64_t N = gm.N;
     const int64_t IH = gm.IH;
     const int64_t IW = gm.IW;
 
-    const int64_t IC       = gm.IC;
+    const int64_t IC = gm.IC;
     const int64_t OC_per_G = gm.OC_per_G;
     const int64_t KH = gm.KH;
     const int64_t KW = gm.KW;
@@ -1391,29 +1447,33 @@ void tconv2d_impl(const Geom& gm,
     const int64_t PH = gm.PH;
     const int64_t PW = gm.PW;
 
-    if (N == 0 || OC == 0 || OH == 0 || OW == 0) { return; }
+    if (N == 0 || OC == 0 || OH == 0 || OW == 0) {
+        return;
+    }
 
     auto* out_ptr = output.ptr<T>();
     const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr  = weight.ptr<T>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const auto* w_ptr = weight.ptr<T>();
+    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
 
-    const int64_t in_row_stride  = input.row_stride_elems();
+    const int64_t in_row_stride = input.row_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
-    const int64_t in_n_stride    = input.stride_elems(0);
-    const int64_t out_n_stride   = output.stride_elems(0);
+    const int64_t in_n_stride = input.stride_elems(0);
+    const int64_t out_n_stride = output.stride_elems(0);
 
     const auto epilogue = gm.epilogue;
     const T* type_tag = nullptr;
 
     if (!is_channel_last(input.layout())) {
-        if (tconv2d_channel_first_gemm<T>(gm, output, inputs, ctx)) { return; }
+        if (tconv2d_channel_first_gemm<T>(gm, output, inputs, ctx)) {
+            return;
+        }
 
-        const int64_t in_c_stride  = input.stride_elems(1);
+        const int64_t in_c_stride = input.stride_elems(1);
         const int64_t out_c_stride = output.stride_elems(1);
 
         const auto process = [&](int64_t task) {
-            const int64_t n  = task / OC;
+            const int64_t n = task / OC;
             const int64_t oc = task % OC;
             const int64_t g = oc / OC_per_G;
             const int64_t oc_l = oc % OC_per_G;
@@ -1429,30 +1489,37 @@ void tconv2d_impl(const Geom& gm,
 
                     for (int64_t kh = 0; kh < KH; ++kh) {
                         const int64_t num_h = oh + PH - kh * DH;
-                        if (num_h < 0 || num_h % SH != 0) { continue; }
+                        if (num_h < 0 || num_h % SH != 0) {
+                            continue;
+                        }
                         const int64_t ih = num_h / SH;
-                        if (ih >= IH) { continue; }
+                        if (ih >= IH) {
+                            continue;
+                        }
 
                         for (int64_t kw = 0; kw < KW; ++kw) {
                             const int64_t num_w = ow + PW - kw * DW;
-                            if (num_w < 0 || num_w % SW != 0) { continue; }
+                            if (num_w < 0 || num_w % SW != 0) {
+                                continue;
+                            }
                             const int64_t iw = num_w / SW;
-                            if (iw >= IW) { continue; }
+                            if (iw >= IW) {
+                                continue;
+                            }
 
                             for (int64_t ic_l = 0; ic_l < IC_per_G; ++ic_l) {
                                 const int64_t ic = g * IC_per_G + ic_l;
-                                const T* xp = in_n + ic * in_c_stride
-                                            + ih * in_row_stride + iw;
-                                const int64_t wi =
-                                    ((ic * OC_per_G + oc_l) * KH + kh) * KW + kw;
+                                const T* xp = in_n + ic * in_c_stride + ih * in_row_stride + iw;
+                                const int64_t wi = ((ic * OC_per_G + oc_l) * KH + kh) * KW + kw;
                                 acc += s_load(xp) * s_load(&w_ptr[wi]);
                             }
                         }
                     }
 
-                    if (b_ptr) { acc += s_load(&b_ptr[oc]); }
-                    apply_epilogue_store<T>(&orow[ow], acc, epilogue, oc,
-                                            gm.add_to, gm.pre_act);
+                    if (b_ptr) {
+                        acc += s_load(&b_ptr[oc]);
+                    }
+                    apply_epilogue_store<T>(&orow[ow], acc, epilogue, oc, gm.add_to, gm.pre_act);
                 }
             }
         };
@@ -1472,16 +1539,16 @@ void tconv2d_impl(const Geom& gm,
     // filter from DRAM. Both other cases go through a col matrix, which walks
     // the filter once per (n, group) whatever the geometry. Depthwise fits
     // neither — its channels, not its pixels, are the vector axis.
-    if (tconv2d_channel_last_depthwise<T>(gm, output, inputs, ctx)) { return; }
+    if (tconv2d_channel_last_depthwise<T>(gm, output, inputs, ctx)) {
+        return;
+    }
 
     // In f16 every vector FMA is a convert pair, so the pixel kernel's
     // broadcast-and-reuse does not pay for itself the way it does in f32; the
     // GEMM kernels convert whole panels and win on every shape.
-    const int64_t wbytes = gm.IC * OC_span * gm.KH * gm.KW *
-                           static_cast<int64_t>(sizeof(T));
-    const bool pixel_form = std::is_same_v<T, float> &&
-                            gm.KH * gm.KW <= 3 * gm.SH * gm.SW &&
-                            wbytes <= (512 << 10);
+    const int64_t wbytes = gm.IC * OC_span * gm.KH * gm.KW * static_cast<int64_t>(sizeof(T));
+    const bool pixel_form =
+        std::is_same_v<T, float> && gm.KH * gm.KW <= 3 * gm.SH * gm.SW && wbytes <= (512 << 10);
     if (!pixel_form && tconv2d_channel_last_gemm<T>(gm, output, inputs, ctx)) {
         return;
     }
@@ -1493,11 +1560,13 @@ void tconv2d_impl(const Geom& gm,
     // Per-worker tap lists: the output row's (kh, ih) pairs, then one output
     // column residue's (kw, iw shift) pairs. Both are per-*class* facts, so the
     // divisibility tests leave the pixel loop entirely.
-    const int64_t slots   = std::max(1, ctx.cpu.worker_count());
+    const int64_t slots = std::max(1, ctx.cpu.worker_count());
     const int64_t tap_cap = KH + SW * KW;
     PoolArray<int64_t> tap_keys(static_cast<size_t>(slots * tap_cap));
     PoolArray<int64_t> tap_vals(static_cast<size_t>(slots * tap_cap));
-    if (!wt || !tap_keys || !tap_vals) { return; }
+    if (!wt || !tap_keys || !tap_vals) {
+        return;
+    }
 
     // Group-relative index into one [KH][KW][IC/G][OC/G] block.
     const auto wt_index = [&](int64_t kh, int64_t kw, int64_t ic_l, int64_t oc_l) {
@@ -1505,14 +1574,13 @@ void tconv2d_impl(const Geom& gm,
     };
 
     for (int64_t ic = 0; ic < IC; ++ic) {
-        const int64_t g    = ic / IC_per_G;
+        const int64_t g = ic / IC_per_G;
         const int64_t ic_l = ic % IC_per_G;
         for (int64_t oc_l = 0; oc_l < OC_span; ++oc_l) {
             const int64_t w_base = (ic * OC_span + oc_l) * KH * KW;
             for (int64_t kh = 0; kh < KH; ++kh) {
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    wt[static_cast<size_t>(g * wt_g_stride +
-                                           wt_index(kh, kw, ic_l, oc_l))] =
+                    wt[static_cast<size_t>(g * wt_g_stride + wt_index(kh, kw, ic_l, oc_l))] =
                         w_ptr[w_base + kh * KW + kw];
                 }
             }
@@ -1520,7 +1588,7 @@ void tconv2d_impl(const Geom& gm,
     }
 
     const auto process = [&](int64_t task) {
-        const int64_t n  = task / OH;
+        const int64_t n = task / OH;
         const int64_t oh = task % OH;
         const int64_t slot = static_cast<int64_t>(ctx.cpu.current_thread_id());
 
@@ -1535,9 +1603,13 @@ void tconv2d_impl(const Geom& gm,
         int64_t nt = 0;
         for (int64_t kh = 0; kh < KH; ++kh) {
             const int64_t num_h = oh + PH - kh * DH;
-            if (num_h < 0 || num_h % SH != 0) { continue; }
+            if (num_h < 0 || num_h % SH != 0) {
+                continue;
+            }
             const int64_t ih = num_h / SH;
-            if (ih >= IH) { continue; }
+            if (ih >= IH) {
+                continue;
+            }
             kh_of[nt] = kh;
             ih_of[nt] = ih;
             ++nt;
@@ -1562,7 +1634,9 @@ void tconv2d_impl(const Geom& gm,
                     // not: pixel t of the class sees t·SW more, so the tap
                     // starts to apply at t = -sh, which is what t_lo is.
                     const int64_t num_w = r + PW - kw * DW;
-                    if (num_w % SW != 0) { continue; }
+                    if (num_w % SW != 0) {
+                        continue;
+                    }
                     const int64_t sh = num_w / SW;
                     kw_of[nk] = kw;
                     sh_of[nk] = sh;
@@ -1583,10 +1657,12 @@ void tconv2d_impl(const Geom& gm,
                             const T* row = in_g + ih_of[a] * in_row_stride;
                             for (int64_t k = 0; k < nk; ++k) {
                                 const int64_t iw = t + sh_of[k];
-                                if (iw < 0 || iw >= IW) { continue; }
+                                if (iw < 0 || iw >= IW) {
+                                    continue;
+                                }
                                 const T* pix = row + iw * IC;
-                                const T* wrow = wg + ((kh_of[a] * KW + kw_of[k])
-                                                    * IC_per_G * OC_span + c0);
+                                const T* wrow =
+                                    wg + ((kh_of[a] * KW + kw_of[k]) * IC_per_G * OC_span + c0);
                                 for (int64_t ic = 0; ic < IC_per_G; ++ic) {
                                     acc = v_fmadd(v_set1(type_tag, s_load(&pix[ic])),
                                                   v_load(wrow + ic * OC_span), acc);
@@ -1595,9 +1671,8 @@ void tconv2d_impl(const Geom& gm,
                         }
 
                         acc = v_add(acc, bg ? v_load(bg + c0) : v_zero(type_tag));
-                        acc = apply_epilogue_vec_dst<T>(epilogue, type_tag, acc,
-                                                        dst + c0, gm.add_to,
-                                                        gm.pre_act);
+                        acc = apply_epilogue_vec_dst<T>(epilogue, type_tag, acc, dst + c0,
+                                                        gm.add_to, gm.pre_act);
                         v_store(dst + c0, acc);
                     }
 
@@ -1608,20 +1683,22 @@ void tconv2d_impl(const Geom& gm,
                             const T* row = in_g + ih_of[a] * in_row_stride;
                             for (int64_t k = 0; k < nk; ++k) {
                                 const int64_t iw = t + sh_of[k];
-                                if (iw < 0 || iw >= IW) { continue; }
+                                if (iw < 0 || iw >= IW) {
+                                    continue;
+                                }
                                 const T* pix = row + iw * IC;
                                 for (int64_t ic = 0; ic < IC_per_G; ++ic) {
                                     acc += s_load(&pix[ic]) *
-                                           s_load(&wg[wt_index(kh_of[a], kw_of[k],
-                                                               ic, c0)]);
+                                           s_load(&wg[wt_index(kh_of[a], kw_of[k], ic, c0)]);
                                 }
                             }
                         }
 
-                        if (bg) { acc += s_load(&bg[c0]); }
-                        apply_epilogue_store<T>(&dst[c0], acc, epilogue,
-                                                g * OC_span + c0, gm.add_to,
-                                                gm.pre_act);
+                        if (bg) {
+                            acc += s_load(&bg[c0]);
+                        }
+                        apply_epilogue_store<T>(&dst[c0], acc, epilogue, g * OC_span + c0,
+                                                gm.add_to, gm.pre_act);
                     }
                 };
 
@@ -1643,14 +1720,13 @@ void tconv2d_impl(const Geom& gm,
                             const T* row = in_g + ih_of[a] * in_row_stride;
                             for (int64_t k = 0; k < nk; ++k) {
                                 const T* pix = row + (t0 + sh_of[k]) * IC;
-                                const T* wrow = wg + ((kh_of[a] * KW + kw_of[k])
-                                                    * IC_per_G * OC_span + c0);
+                                const T* wrow =
+                                    wg + ((kh_of[a] * KW + kw_of[k]) * IC_per_G * OC_span + c0);
                                 for (int64_t ic = 0; ic < IC_per_G; ++ic) {
                                     const auto w0 = v_load(wrow + ic * OC_span);
                                     const auto w1 = v_load(wrow + ic * OC_span + L);
                                     for (int64_t j = 0; j < kPix; ++j) {
-                                        const auto x = v_set1(
-                                            type_tag, s_load(pix + j * IC + ic));
+                                        const auto x = v_set1(type_tag, s_load(pix + j * IC + ic));
                                         a0[j] = v_fmadd(x, w0, a0[j]);
                                         a1[j] = v_fmadd(x, w1, a1[j]);
                                     }
@@ -1664,18 +1740,18 @@ void tconv2d_impl(const Geom& gm,
                             T* dst = d0 + j * SW * OC;
                             vec_for<T> s0 = v_add(a0[j], b0);
                             vec_for<T> s1 = v_add(a1[j], b1);
-                            s0 = apply_epilogue_vec_dst<T>(epilogue, type_tag, s0,
-                                                           dst + c0, gm.add_to,
-                                                           gm.pre_act);
-                            s1 = apply_epilogue_vec_dst<T>(epilogue, type_tag, s1,
-                                                           dst + c0 + L,
+                            s0 = apply_epilogue_vec_dst<T>(epilogue, type_tag, s0, dst + c0,
+                                                           gm.add_to, gm.pre_act);
+                            s1 = apply_epilogue_vec_dst<T>(epilogue, type_tag, s1, dst + c0 + L,
                                                            gm.add_to, gm.pre_act);
                             v_store(dst + c0, s0);
                             v_store(dst + c0 + L, s1);
                         }
                     }
                     if (c0 < OC_span) {
-                        for (int64_t j = 0; j < kPix; ++j) { pixel(t0 + j, c0); }
+                        for (int64_t j = 0; j < kPix; ++j) {
+                            pixel(t0 + j, c0);
+                        }
                     }
                 };
 
@@ -1685,9 +1761,15 @@ void tconv2d_impl(const Geom& gm,
                 // kPix, which on a short row is the difference between reusing
                 // the weights and not.
                 int64_t t0 = 0;
-                for (; t0 < t_lo && t0 < mic_r; ++t0) { pixel(t0, 0); }
-                for (; t0 + kPix <= t_hi; t0 += kPix) { tile(t0); }
-                for (; t0 < mic_r; ++t0) { pixel(t0, 0); }
+                for (; t0 < t_lo && t0 < mic_r; ++t0) {
+                    pixel(t0, 0);
+                }
+                for (; t0 + kPix <= t_hi; t0 += kPix) {
+                    tile(t0);
+                }
+                for (; t0 < mic_r; ++t0) {
+                    pixel(t0, 0);
+                }
             }
         }
     };
@@ -1695,26 +1777,24 @@ void tconv2d_impl(const Geom& gm,
     ctx.cpu.run(0, N * OH, process);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
-                            TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx,
+Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs, TensorView& output,
+                            std::span<const TensorView> inputs, const ComputeContext& ctx,
                             void* /*workspace*/)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
     Geom gm{};
-    gm.N  = input.shape(0);
+    gm.N = input.shape(0);
     gm.IH = input.shape(input.rank() - 2);
     gm.IW = input.shape(input.rank() - 1);
     gm.IC = weight.shape(0);
     gm.OC_per_G = weight.shape(1);
     gm.KH = attrs.kernel_size[0];
     gm.KW = attrs.kernel_size[1];
-    gm.G  = attrs.groups;
+    gm.G = attrs.groups;
     gm.OC = gm.OC_per_G * gm.G;
     gm.IC_per_G = gm.IC / gm.G;
     gm.OH = output.shape(2);
@@ -1740,4 +1820,4 @@ Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

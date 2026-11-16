@@ -25,7 +25,7 @@
 /// tiled route.
 
 #include "matmul_internal.h"
-#include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // tile_scale / epilogue_inplace
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp" // tile_scale / epilogue_inplace
 
 #include <algorithm>
 
@@ -40,59 +40,56 @@ namespace {
 constexpr int QBLOCK_FUSED_NTILE = 2 * arch::Q4Block::block_elems;
 
 template <class BQ, class AC, bool ZERO, bool TRANS, int MR>
-inline void qblock_fused_rows(int mr, int nc, int K, AC* c, int ldc,
-                              const AC* a, int lda, const uint8_t* B,
-                              int64_t row_blocks, int n_start, float alpha,
-                              float cmin, float cmax) {
+inline void qblock_fused_rows(int mr, int nc, int K, AC* c, int ldc, const AC* a, int lda,
+                              const uint8_t* B, int64_t row_blocks, int n_start, float alpha,
+                              float cmin, float cmax)
+{
     if (mr >= MR) {
         if constexpr (TRANS) {
-            arch::mma_qblock_trans<BQ, AC, MR, ZERO>(
-                nc, K, c, ldc, a, lda, B, row_blocks, n_start, alpha, cmin, cmax);
+            arch::mma_qblock_trans<BQ, AC, MR, ZERO>(nc, K, c, ldc, a, lda, B, row_blocks, n_start,
+                                                     alpha, cmin, cmax);
         } else {
-            arch::mma_qblock_copy<BQ, AC, MR, ZERO>(
-                nc, K, c, ldc, a, lda, B, row_blocks, n_start, alpha, cmin, cmax);
+            arch::mma_qblock_copy<BQ, AC, MR, ZERO>(nc, K, c, ldc, a, lda, B, row_blocks, n_start,
+                                                    alpha, cmin, cmax);
         }
     } else if constexpr (MR > 1) {
-        qblock_fused_rows<BQ, AC, ZERO, TRANS, MR - 1>(
-            mr, nc, K, c, ldc, a, lda, B, row_blocks, n_start, alpha, cmin, cmax);
+        qblock_fused_rows<BQ, AC, ZERO, TRANS, MR - 1>(mr, nc, K, c, ldc, a, lda, B, row_blocks,
+                                                       n_start, alpha, cmin, cmax);
     }
 }
 
 template <class BQ, class AC, bool ZERO, bool TRANS>
-inline void qblock_fused_dispatch(int M, int nc, int K, AC* C, int ldc,
-                                  const AC* A, int lda, const uint8_t* B,
-                                  int64_t row_blocks, int n_start, float alpha,
-                                  float cmin, float cmax) {
+inline void qblock_fused_dispatch(int M, int nc, int K, AC* C, int ldc, const AC* A, int lda,
+                                  const uint8_t* B, int64_t row_blocks, int n_start, float alpha,
+                                  float cmin, float cmax)
+{
     constexpr int kPanel = TRANS ? BQ::panel_trans : BQ::panel_copy;
     for (int m = 0; m < M; m += kPanel) {
         qblock_fused_rows<BQ, AC, ZERO, TRANS, kPanel>(
-            std::min(kPanel, M - m), nc, K, C + static_cast<int64_t>(m) * ldc,
-            ldc, A + static_cast<int64_t>(m) * lda, lda, B, row_blocks,
-            n_start, alpha, cmin, cmax);
+            std::min(kPanel, M - m), nc, K, C + static_cast<int64_t>(m) * ldc, ldc,
+            A + static_cast<int64_t>(m) * lda, lda, B, row_blocks, n_start, alpha, cmin, cmax);
     }
 }
 
 template <class BQ, class AC, bool ZERO>
-inline void qblock_fused_run(bool trans, int M, int nc, int K, AC* C, int ldc,
-                             const AC* A, int lda, const uint8_t* B,
-                             int64_t row_blocks, int n_start, float alpha,
-                             float cmin, float cmax) {
+inline void qblock_fused_run(bool trans, int M, int nc, int K, AC* C, int ldc, const AC* A, int lda,
+                             const uint8_t* B, int64_t row_blocks, int n_start, float alpha,
+                             float cmin, float cmax)
+{
     if (trans) {
-        qblock_fused_dispatch<BQ, AC, ZERO, true>(M, nc, K, C, ldc, A, lda, B,
-                                                  row_blocks, n_start, alpha,
-                                                  cmin, cmax);
+        qblock_fused_dispatch<BQ, AC, ZERO, true>(M, nc, K, C, ldc, A, lda, B, row_blocks, n_start,
+                                                  alpha, cmin, cmax);
     } else {
-        qblock_fused_dispatch<BQ, AC, ZERO, false>(M, nc, K, C, ldc, A, lda, B,
-                                                   row_blocks, n_start, alpha,
-                                                   cmin, cmax);
+        qblock_fused_dispatch<BQ, AC, ZERO, false>(M, nc, K, C, ldc, A, lda, B, row_blocks, n_start,
+                                                   alpha, cmin, cmax);
     }
 }
 
 template <class BQ, class AC>
 inline void qblock_fused_all(const MatMulAttributes& attrs, TensorView& output,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx, bool trans, int M,
-                             int N, int K) {
+                             std::span<const TensorView> inputs, const ComputeContext& ctx,
+                             bool trans, int M, int N, int K)
+{
     const auto& a = inputs[0];
     const auto& b = inputs[1];
 
@@ -137,30 +134,30 @@ inline void qblock_fused_all(const MatMulAttributes& attrs, TensorView& output,
 
         // The clamp belongs on the finished sum, not on the partial.
         if (beta == 0.0f && !prime_c) {
-            qblock_fused_run<BQ, AC, true>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p,
-                                           row_blocks, n_start, attrs.alpha, cmin,
-                                           cmax);
+            qblock_fused_run<BQ, AC, true>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p, row_blocks,
+                                           n_start, attrs.alpha, cmin, cmax);
         } else {
-            qblock_fused_run<BQ, AC, false>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p,
-                                            row_blocks, n_start, attrs.alpha, cmin,
-                                            cmax);
+            qblock_fused_run<BQ, AC, false>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p, row_blocks,
+                                            n_start, attrs.alpha, cmin, cmax);
         }
 
         if (epilogue) {
-            epilogue_inplace(M, nc, c_p, ldc,
-                             static_cast<const AC*>(nullptr), attrs.epilogue);
+            epilogue_inplace(M, nc, c_p, ldc, static_cast<const AC*>(nullptr), attrs.epilogue);
         }
     });
 }
 
 template <class BQ, class AC>
 inline bool qblock_fused_try(const MatMulAttributes& attrs, TensorView& output,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx, int M, int N, int K) {
+                             std::span<const TensorView> inputs, const ComputeContext& ctx, int M,
+                             int N, int K)
+{
     const bool trans = attrs.transpose_b;
     int max_m = trans ? BQ::fused_max_m_trans : BQ::fused_max_m_copy;
     if constexpr (std::is_same_v<AC, half>) {
-        if (trans) { max_m = BQ::fused_max_m_trans_f16; }
+        if (trans) {
+            max_m = BQ::fused_max_m_trans_f16;
+        }
     }
     if (qblock_fused_max_m_override >= 0) {
         max_m = qblock_fused_max_m_override;
@@ -172,13 +169,11 @@ inline bool qblock_fused_try(const MatMulAttributes& attrs, TensorView& output,
     return true;
 }
 
-}  // namespace
+} // namespace
 
-bool matmul_qblock_fused(const MatMulAttributes& attrs,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         int M, int N, int K)
+bool matmul_qblock_fused(const MatMulAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs, const ComputeContext& ctx, int M,
+                         int N, int K)
 {
     if (K <= 0 || N <= 0) {
         return false;
@@ -188,15 +183,19 @@ bool matmul_qblock_fused(const MatMulAttributes& attrs,
     }
     // The activation and the output share a dtype in an fp product.
     switch (inputs[0].data_type()) {
-    case DataType::f32: return qblock_fused_try<arch::Q4Block, float>(attrs, output, inputs, ctx, M, N, K);
-    case DataType::f16: return qblock_fused_try<arch::Q4Block, half>(attrs, output, inputs, ctx, M, N, K);
+    case DataType::f32:
+        return qblock_fused_try<arch::Q4Block, float>(attrs, output, inputs, ctx, M, N, K);
+    case DataType::f16:
+        return qblock_fused_try<arch::Q4Block, half>(attrs, output, inputs, ctx, M, N, K);
 #ifdef NNOPS_ARCH_AARCH64
-    case DataType::bf16: return qblock_fused_try<arch::Q4Block, bfloat16>(attrs, output, inputs, ctx, M, N, K);
+    case DataType::bf16:
+        return qblock_fused_try<arch::Q4Block, bfloat16>(attrs, output, inputs, ctx, M, N, K);
 #endif
-    default:            return false;
+    default:
+        return false;
     }
 }
 
-#endif  // NNOPS_ARCH_X86_64 || NNOPS_ARCH_AARCH64
+#endif // NNOPS_ARCH_X86_64 || NNOPS_ARCH_AARCH64
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

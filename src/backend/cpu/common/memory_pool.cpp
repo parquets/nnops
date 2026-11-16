@@ -17,10 +17,10 @@ namespace nnops::backend::cpu {
 
 namespace {
 
-constexpr size_t kAlignment = 64;                  // matches mma_pack_align
-constexpr size_t kMinClass  = 64;                  // smallest pooled size
-constexpr size_t kMaxClass  = 32u * 1024u * 1024u; // 32 MiB cap
-constexpr int    kNumClasses = 20;                 // 64 B .. 32 MiB (powers of two)
+constexpr size_t kAlignment = 64;                 // matches mma_pack_align
+constexpr size_t kMinClass = 64;                  // smallest pooled size
+constexpr size_t kMaxClass = 32u * 1024u * 1024u; // 32 MiB cap
+constexpr int kNumClasses = 20;                   // 64 B .. 32 MiB (powers of two)
 
 // Retention budget: bytes allowed in the central free lists; past it the largest
 // blocks go back to the OS, trading reuse for a bounded idle footprint.
@@ -30,24 +30,28 @@ constexpr size_t kMaxPooledBytes = 64u * 1024u * 1024u;
 // block bounds worst-case retention across many threads.
 constexpr size_t kMaxTlsBytes = kMaxClass;
 
-constexpr uint32_t kMagic = 0x4E4E4F50u;           // "NNOP" — block sanity tag
+constexpr uint32_t kMagic = 0x4E4E4F50u; // "NNOP" — block sanity tag
 
 // Header immediately before the 64-byte-aligned payload: alignas(64) rounds
 // sizeof up to 64, so `header + 1` is 64-aligned given the aligned operator new.
 struct alignas(kAlignment) PoolHeader {
-    PoolHeader* next;    // central free-list link; nullptr while live / in a TLS slot
-    size_t      size;    // payload bytes actually allocated (class size if pooled)
-    uint32_t    pooled;  // 1 = recyclable size class, 0 = direct oversize
-    uint32_t    magic;   // kMagic
+    PoolHeader* next; // central free-list link; nullptr while live / in a TLS slot
+    size_t size;      // payload bytes actually allocated (class size if pooled)
+    uint32_t pooled;  // 1 = recyclable size class, 0 = direct oversize
+    uint32_t magic;   // kMagic
 };
 static_assert(sizeof(PoolHeader) == kAlignment, "header must occupy one cache line");
 
-inline size_t round_up_class(size_t n) noexcept {
-    if (n < kMinClass) { n = kMinClass; }
+inline size_t round_up_class(size_t n) noexcept
+{
+    if (n < kMinClass) {
+        n = kMinClass;
+    }
     return std::bit_ceil(n);
 }
 
-inline int class_index(size_t cls) noexcept {
+inline int class_index(size_t cls) noexcept
+{
     // cls is a power of two in [kMinClass, kMaxClass].
     return static_cast<int>(std::countr_zero(cls) - std::countr_zero(kMinClass));
 }
@@ -58,11 +62,14 @@ inline int class_index(size_t cls) noexcept {
 // block to exactly one taker.
 struct ThreadCache {
     std::array<std::atomic<PoolHeader*>, kNumClasses> free;
-    std::atomic<size_t> bytes{0};    // payload bytes cached here (for stats)
-    std::atomic<size_t> blocks{0};   // block count cached here (for stats)
+    std::atomic<size_t> bytes{0};  // payload bytes cached here (for stats)
+    std::atomic<size_t> blocks{0}; // block count cached here (for stats)
 
-    ThreadCache() {
-        for (auto& slot : free) { slot.store(nullptr, std::memory_order_relaxed); }
+    ThreadCache()
+    {
+        for (auto& slot : free) {
+            slot.store(nullptr, std::memory_order_relaxed);
+        }
     }
 };
 
@@ -72,11 +79,16 @@ thread_local ThreadCache* t_cache = nullptr;
 /// On thread exit, hand this thread's cached blocks back to the OS. The node
 /// stays registered so no thread is left with a dangling pointer; it empties.
 struct TlsCacheReaper {
-    ~TlsCacheReaper() {
-        if (t_cache == nullptr) { return; }
+    ~TlsCacheReaper()
+    {
+        if (t_cache == nullptr) {
+            return;
+        }
         for (int i = 0; i < kNumClasses; ++i) {
             PoolHeader* h = t_cache->free[i].exchange(nullptr, std::memory_order_relaxed);
-            if (h != nullptr) { ::operator delete(h, std::align_val_t{kAlignment}); }
+            if (h != nullptr) {
+                ::operator delete(h, std::align_val_t{kAlignment});
+            }
         }
         t_cache->bytes.store(0, std::memory_order_relaxed);
         t_cache->blocks.store(0, std::memory_order_relaxed);
@@ -84,29 +96,30 @@ struct TlsCacheReaper {
 };
 thread_local TlsCacheReaper t_reaper;
 
-}  // anonymous namespace
+} // anonymous namespace
 
 struct MemoryPool::Impl {
-    std::array<PoolHeader*, kNumClasses> buckets{};  // central free lists
+    std::array<PoolHeader*, kNumClasses> buckets{}; // central free lists
 
-    std::mutex mutex;   // guards buckets + the central counters below
-    size_t   central_pooled_bytes_  = 0;   // bytes in the central free lists
-    size_t   central_pooled_blocks_ = 0;   // blocks in the central free lists
+    std::mutex mutex;                  // guards buckets + the central counters below
+    size_t central_pooled_bytes_ = 0;  // bytes in the central free lists
+    size_t central_pooled_blocks_ = 0; // blocks in the central free lists
 
     // Shared counters touched by both the lock-free thread-local path and the
     // locked central path; relaxed atomics suffice (statistics only).
-    std::atomic<size_t>   live_bytes_{0};
+    std::atomic<size_t> live_bytes_{0};
     std::atomic<uint64_t> allocations_{0};
     std::atomic<uint64_t> reuses_{0};
 
     // Registry of every thread's cache, so release_all() can drain them all.
-    std::mutex registry_mutex;        // guards thread_caches_
+    std::mutex registry_mutex; // guards thread_caches_
     std::vector<ThreadCache*> thread_caches_;
 };
 
 MemoryPool::MemoryPool() : impl_(new Impl) {}
 
-MemoryPool::~MemoryPool() {
+MemoryPool::~MemoryPool()
+{
     // Process exit: no concurrent operators remain, so drain pooled memory. The
     // ThreadCache registry nodes are deliberately not deleted: their reapers may
     // run after this destructor (thread-local vs. static destruction order is not
@@ -116,12 +129,14 @@ MemoryPool::~MemoryPool() {
     impl_ = nullptr;
 }
 
-MemoryPool& MemoryPool::instance() {
+MemoryPool& MemoryPool::instance()
+{
     static MemoryPool pool;
     return pool;
 }
 
-void* MemoryPool::allocate(size_t size) {
+void* MemoryPool::allocate(size_t size)
+{
     impl_->allocations_.fetch_add(1, std::memory_order_relaxed);
 
     // Above the cap: bypass the pool, direct aligned alloc, never recycled.
@@ -182,11 +197,14 @@ void* MemoryPool::allocate(size_t size) {
     return fresh + 1;
 }
 
-void MemoryPool::deallocate(void* ptr) noexcept {
-    if (ptr == nullptr) { return; }
+void MemoryPool::deallocate(void* ptr) noexcept
+{
+    if (ptr == nullptr) {
+        return;
+    }
     PoolHeader* h = static_cast<PoolHeader*>(ptr) - 1;
-    NNOPS_ASSERT(h->magic == kMagic);  // foreign pointer / corrupted header
-    const size_t size = h->size;       // read before h is possibly recycled below
+    NNOPS_ASSERT(h->magic == kMagic); // foreign pointer / corrupted header
+    const size_t size = h->size;      // read before h is possibly recycled below
 
     if (!h->pooled) {
         ::operator delete(h, std::align_val_t{kAlignment});
@@ -209,8 +227,7 @@ void MemoryPool::deallocate(void* ptr) noexcept {
         // emptiness test atomic so a racing release_all() can't lose the block.
         PoolHeader* expected = nullptr;
         if (c->bytes.load(std::memory_order_relaxed) + size <= kMaxTlsBytes &&
-            c->free[idx].compare_exchange_strong(expected, h,
-                                                 std::memory_order_relaxed)) {
+            c->free[idx].compare_exchange_strong(expected, h, std::memory_order_relaxed)) {
             c->bytes.fetch_add(size, std::memory_order_relaxed);
             c->blocks.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -222,12 +239,11 @@ void MemoryPool::deallocate(void* ptr) noexcept {
 
             // Bound the footprint: return surplus blocks largest-first, keeping
             // the small hot classes intact.
-            for (int i = kNumClasses - 1;
-                 i >= 0 && impl_->central_pooled_bytes_ > kMaxPooledBytes; --i) {
+            for (int i = kNumClasses - 1; i >= 0 && impl_->central_pooled_bytes_ > kMaxPooledBytes;
+                 --i) {
                 const size_t cls = size_t{kMinClass} << i;
                 PoolHeader* cur = impl_->buckets[i];
-                while (cur != nullptr &&
-                       impl_->central_pooled_bytes_ > kMaxPooledBytes) {
+                while (cur != nullptr && impl_->central_pooled_bytes_ > kMaxPooledBytes) {
                     PoolHeader* next = cur->next;
                     ::operator delete(cur, std::align_val_t{kAlignment});
                     --impl_->central_pooled_blocks_;
@@ -241,7 +257,8 @@ void MemoryPool::deallocate(void* ptr) noexcept {
     impl_->live_bytes_.fetch_sub(size, std::memory_order_relaxed);
 }
 
-void MemoryPool::release_all() {
+void MemoryPool::release_all()
+{
     // Drain every thread's cache, then the central lists. Assumes no concurrent
     // allocate/deallocate (force-release / teardown), so the two locks are taken
     // one at a time, never nested.
@@ -273,10 +290,12 @@ void MemoryPool::release_all() {
     impl_->central_pooled_blocks_ = 0;
 }
 
-size_t MemoryPool::live_bytes() const noexcept {
+size_t MemoryPool::live_bytes() const noexcept
+{
     return impl_->live_bytes_.load(std::memory_order_relaxed);
 }
-size_t MemoryPool::pooled_bytes() const noexcept {
+size_t MemoryPool::pooled_bytes() const noexcept
+{
     size_t tls = 0;
     {
         std::lock_guard<std::mutex> lock(impl_->registry_mutex);
@@ -287,7 +306,8 @@ size_t MemoryPool::pooled_bytes() const noexcept {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return tls + impl_->central_pooled_bytes_;
 }
-size_t MemoryPool::pooled_blocks() const noexcept {
+size_t MemoryPool::pooled_blocks() const noexcept
+{
     size_t tls = 0;
     {
         std::lock_guard<std::mutex> lock(impl_->registry_mutex);
@@ -298,20 +318,21 @@ size_t MemoryPool::pooled_blocks() const noexcept {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return tls + impl_->central_pooled_blocks_;
 }
-uint64_t MemoryPool::allocation_count() const noexcept {
+uint64_t MemoryPool::allocation_count() const noexcept
+{
     return impl_->allocations_.load(std::memory_order_relaxed);
 }
-uint64_t MemoryPool::reuse_count() const noexcept {
+uint64_t MemoryPool::reuse_count() const noexcept
+{
     return impl_->reuses_.load(std::memory_order_relaxed);
 }
 
 PoolPtr::~PoolPtr() { reset(); }
 
-PoolPtr::PoolPtr(PoolPtr&& o) noexcept : ptr_(o.ptr_) {
-    o.ptr_ = nullptr;
-}
+PoolPtr::PoolPtr(PoolPtr&& o) noexcept : ptr_(o.ptr_) { o.ptr_ = nullptr; }
 
-PoolPtr& PoolPtr::operator=(PoolPtr&& o) noexcept {
+PoolPtr& PoolPtr::operator=(PoolPtr&& o) noexcept
+{
     if (this != &o) {
         reset();
         ptr_ = o.ptr_;
@@ -320,21 +341,20 @@ PoolPtr& PoolPtr::operator=(PoolPtr&& o) noexcept {
     return *this;
 }
 
-void PoolPtr::reset() noexcept {
+void PoolPtr::reset() noexcept
+{
     if (ptr_ != nullptr) {
         MemoryPool::instance().deallocate(ptr_);
     }
     ptr_ = nullptr;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu
 
 // ---- public force-release interface (include/nnops/core/backend.hpp) ----
 
 namespace nnops {
 
-void release_scratch_memory() {
-    backend::cpu::MemoryPool::instance().release_all();
-}
+void release_scratch_memory() { backend::cpu::MemoryPool::instance().release_all(); }
 
-}  // namespace nnops
+} // namespace nnops

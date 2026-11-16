@@ -10,11 +10,9 @@ namespace nnops {
 
 NNOPS_DECLARE_CPU(ClampAttributes, clamp_cpu)
 
-NNOPS_OP_BOILERPLATE(Clamp, ClampAttributes,
-        backend::cpu::clamp_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Clamp, ClampAttributes, backend::cpu::clamp_cpu, nullptr, nullptr)
 
-std::vector<TensorDesc> Clamp::getOutputTensorDesc(
-    std::span<const TensorDesc> inputs) const
+std::vector<TensorDesc> Clamp::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
     return {identity_output_shape(inputs)};
 }
@@ -25,15 +23,15 @@ Status Clamp::validate(std::span<const TensorDesc> inputs,
     return detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1);
 }
 
-Status Clamp::compute(std::span<TensorView> outputs,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace)
+Status Clamp::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                      const ComputeContext& ctx, void* workspace)
 {
     NNOPS_TRY(detail::check_views(backend_, outputs, inputs, 1, 1, 1));
     NNOPS_TRY(validate_views(outputs, inputs));
-    if (!impl_->kernel_fn) { return Status::unsupported; }
+    if (!impl_->kernel_fn) {
+        return Status::unsupported;
+    }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-}  // namespace nnops
+} // namespace nnops

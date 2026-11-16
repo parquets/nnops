@@ -26,113 +26,87 @@ using namespace simd;
 
 /// Row-by-row SIMD + scalar tail loop for binary ops (Nin = 2).
 template <typename T, typename SimdK, typename ScalarK>
-inline void tiled_eltwise_simd(
-    const T* a, const T* b, T* out,
-    int64_t m, int64_t n,
-    int64_t a_pitch, int64_t b_pitch, int64_t out_pitch,
-    bool add_to,
-    SimdK&& simd_kernel,
-    ScalarK&& scalar_kernel)
+inline void tiled_eltwise_simd(const T* a, const T* b, T* out, int64_t m, int64_t n,
+                               int64_t a_pitch, int64_t b_pitch, int64_t out_pitch, bool add_to,
+                               SimdK&& simd_kernel, ScalarK&& scalar_kernel)
 {
-    tiled_map_simd<T, 2>({a, b}, {a_pitch, b_pitch}, out, out_pitch, m, n, add_to,
-                         simd_kernel, scalar_kernel);
+    tiled_map_simd<T, 2>({a, b}, {a_pitch, b_pitch}, out, out_pitch, m, n, add_to, simd_kernel,
+                         scalar_kernel);
 }
 
 /// Row-by-row scalar-only loop for binary ops without SIMD intrinsics.
 template <typename T, typename ScalarK>
-inline void tiled_eltwise_scalar(
-    const T* a, const T* b, T* out,
-    int64_t m, int64_t n,
-    int64_t a_pitch, int64_t b_pitch, int64_t out_pitch,
-    bool add_to,
-    ScalarK&& scalar_kernel)
+inline void tiled_eltwise_scalar(const T* a, const T* b, T* out, int64_t m, int64_t n,
+                                 int64_t a_pitch, int64_t b_pitch, int64_t out_pitch, bool add_to,
+                                 ScalarK&& scalar_kernel)
 {
-    tiled_map_scalar<T, 2>({a, b}, {a_pitch, b_pitch}, out, out_pitch, m, n, add_to,
-                           scalar_kernel);
+    tiled_map_scalar<T, 2>({a, b}, {a_pitch, b_pitch}, out, out_pitch, m, n, add_to, scalar_kernel);
 }
 
 template <typename T>
-inline void add(
-    const T* a, const T* b, T* out,
-    int64_t m, int64_t n,
-    int64_t a_pitch, int64_t b_pitch, int64_t out_pitch,
-    bool add_to = false)
+inline void add(const T* a, const T* b, T* out, int64_t m, int64_t n, int64_t a_pitch,
+                int64_t b_pitch, int64_t out_pitch, bool add_to = false)
 {
-    tiled_eltwise_simd(a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
-        [](auto va, auto vb) { return v_add(va, vb); },
-        [](float fa, float fb) { return fa + fb; });
+    tiled_eltwise_simd(
+        a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
+        [](auto va, auto vb) { return v_add(va, vb); }, [](float fa, float fb) { return fa + fb; });
 }
 
 template <typename T>
-inline void sub(
-    const T* a, const T* b, T* out,
-    int64_t m, int64_t n,
-    int64_t a_pitch, int64_t b_pitch, int64_t out_pitch,
-    bool add_to = false)
+inline void sub(const T* a, const T* b, T* out, int64_t m, int64_t n, int64_t a_pitch,
+                int64_t b_pitch, int64_t out_pitch, bool add_to = false)
 {
-    tiled_eltwise_simd(a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
-        [](auto va, auto vb) { return v_sub(va, vb); },
-        [](float fa, float fb) { return fa - fb; });
+    tiled_eltwise_simd(
+        a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
+        [](auto va, auto vb) { return v_sub(va, vb); }, [](float fa, float fb) { return fa - fb; });
 }
 
 template <typename T>
-inline void mul(
-    const T* a, const T* b, T* out,
-    int64_t m, int64_t n,
-    int64_t a_pitch, int64_t b_pitch, int64_t out_pitch,
-    bool add_to = false)
+inline void mul(const T* a, const T* b, T* out, int64_t m, int64_t n, int64_t a_pitch,
+                int64_t b_pitch, int64_t out_pitch, bool add_to = false)
 {
-    tiled_eltwise_simd(a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
-        [](auto va, auto vb) { return v_mul(va, vb); },
-        [](float fa, float fb) { return fa * fb; });
+    tiled_eltwise_simd(
+        a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
+        [](auto va, auto vb) { return v_mul(va, vb); }, [](float fa, float fb) { return fa * fb; });
 }
 
 template <typename T>
-inline void div(
-    const T* a, const T* b, T* out,
-    int64_t m, int64_t n,
-    int64_t a_pitch, int64_t b_pitch, int64_t out_pitch,
-    bool add_to = false)
+inline void div(const T* a, const T* b, T* out, int64_t m, int64_t n, int64_t a_pitch,
+                int64_t b_pitch, int64_t out_pitch, bool add_to = false)
 {
-    tiled_eltwise_simd(a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
-        [](auto va, auto vb) { return v_div(va, vb); },
-        [](float fa, float fb) { return fa / fb; });
+    tiled_eltwise_simd(
+        a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
+        [](auto va, auto vb) { return v_div(va, vb); }, [](float fa, float fb) { return fa / fb; });
 }
 
 template <typename T>
-inline void min(
-    const T* a, const T* b, T* out,
-    int64_t m, int64_t n,
-    int64_t a_pitch, int64_t b_pitch, int64_t out_pitch,
-    bool add_to = false)
+inline void min(const T* a, const T* b, T* out, int64_t m, int64_t n, int64_t a_pitch,
+                int64_t b_pitch, int64_t out_pitch, bool add_to = false)
 {
-    tiled_eltwise_simd(a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
+    tiled_eltwise_simd(
+        a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
         [](auto va, auto vb) { return v_min(va, vb); },
         [](float fa, float fb) { return fa < fb ? fa : fb; });
 }
 
 template <typename T>
-inline void max(
-    const T* a, const T* b, T* out,
-    int64_t m, int64_t n,
-    int64_t a_pitch, int64_t b_pitch, int64_t out_pitch,
-    bool add_to = false)
+inline void max(const T* a, const T* b, T* out, int64_t m, int64_t n, int64_t a_pitch,
+                int64_t b_pitch, int64_t out_pitch, bool add_to = false)
 {
-    tiled_eltwise_simd(a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
+    tiled_eltwise_simd(
+        a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
         [](auto va, auto vb) { return v_max(va, vb); },
         [](float fa, float fb) { return fa > fb ? fa : fb; });
 }
 
 template <typename T>
-inline void pow(
-    const T* a, const T* b, T* out,
-    int64_t m, int64_t n,
-    int64_t a_pitch, int64_t b_pitch, int64_t out_pitch,
-    bool add_to = false)
+inline void pow(const T* a, const T* b, T* out, int64_t m, int64_t n, int64_t a_pitch,
+                int64_t b_pitch, int64_t out_pitch, bool add_to = false)
 {
-    tiled_eltwise_simd(a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
+    tiled_eltwise_simd(
+        a, b, out, m, n, a_pitch, b_pitch, out_pitch, add_to,
         [](auto va, auto vb) { return v_pow(va, vb); },
         [](float fa, float fb) { return std::pow(fa, fb); });
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

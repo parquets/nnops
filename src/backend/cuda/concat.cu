@@ -29,8 +29,8 @@ Status concat_entry(const ConcatAttributes& attrs, TensorView& output,
         for (const auto& in : inputs) {
             const size_t bytes = static_cast<size_t>(in.numel()) * sizeof(T);
             if (bytes != 0) {
-                CUDA_CHECK(cudaMemcpyAsync(dst + off, in.ptr<T>(), bytes,
-                                           cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(dst + off, in.ptr<T>(), bytes, cudaMemcpyDeviceToDevice,
+                                           stream));
             }
             off += in.numel();
         }
@@ -46,8 +46,12 @@ Status concat_entry(const ConcatAttributes& attrs, TensorView& output,
         const int64_t total = in.numel();
         if (total != 0) {
             int64_t dims[8], src_strides[8];
-            for (int64_t d = 0; d < rank; ++d) { dims[d] = in.shape(d); }
-            for (int64_t d = rank; d < 8; ++d) { dims[d] = 1; }
+            for (int64_t d = 0; d < rank; ++d) {
+                dims[d] = in.shape(d);
+            }
+            for (int64_t d = rank; d < 8; ++d) {
+                dims[d] = 1;
+            }
             fill_view_strides(in, src_strides);
 
             MovePlan p;
@@ -71,11 +75,11 @@ Status concat_entry(const ConcatAttributes& attrs, TensorView& output,
     return Status::ok;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 Status concat_cuda(const ConcatAttributes& attrs, TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx, void* /*workspace*/)
+                   std::span<const TensorView> inputs, const ComputeContext& ctx,
+                   void* /*workspace*/)
 {
     const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     switch (inputs[0].data_type()) {
@@ -90,4 +94,4 @@ Status concat_cuda(const ConcatAttributes& attrs, TensorView& output,
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

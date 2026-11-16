@@ -85,9 +85,13 @@ inline RowWalk make_row_walk(const TensorView& x, const TensorView& y, int64_t a
     RowWalk w;
     const int64_t rank = x.rank();
     w.rows = 1;
-    for (int64_t d = 0; d < ax; ++d) { w.rows *= x.shape(d); }
+    for (int64_t d = 0; d < ax; ++d) {
+        w.rows *= x.shape(d);
+    }
     w.size = 1;
-    for (int64_t d = ax; d < rank; ++d) { w.size *= x.shape(d); }
+    for (int64_t d = ax; d < rank; ++d) {
+        w.size *= x.shape(d);
+    }
 
     w.pre = make_head_group(x, ax);
     w.out_pre = make_head_group(y, ax);
@@ -167,18 +171,15 @@ __device__ inline void block_sums2(float& a, float& b, float* smem) noexcept
 /// flattens dense and lands on the 16 B bound — the tail and a row that does not
 /// (a stranded axis, a pitched or channel-last post group) keep the scalar walk.
 template <class T, bool HasMean, bool HasScale, bool HasBias, bool HasRes>
-__global__ void norm_row_kernel(const T* __restrict__ x,
-                                const T* __restrict__ scale,
-                                const T* __restrict__ bias,
-                                const T* __restrict__ res,
-                                T* __restrict__ y, RowWalk w, float eps,
-                                bool scale_scalar, bool add_to,
-                                bool row_resident)
+__global__ void norm_row_kernel(const T* __restrict__ x, const T* __restrict__ scale,
+                                const T* __restrict__ bias, const T* __restrict__ res,
+                                T* __restrict__ y, RowWalk w, float eps, bool scale_scalar,
+                                bool add_to, bool row_resident)
 {
     constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
 
     extern __shared__ float shared_buf[];
-    float* row  = row_resident ? shared_buf : nullptr;
+    float* row = row_resident ? shared_buf : nullptr;
     float* smem = shared_buf + (row_resident ? w.size : 0);
 
     // A dense post group puts element i at base + i; anything else is decoded.
@@ -198,31 +199,36 @@ __global__ void norm_row_kernel(const T* __restrict__ x,
 
         const T* x_row = x + xb;
         const T* r_row = HasRes ? res + rb : nullptr;
-        T*       y_row = y + yb;
+        T* y_row = y + yb;
 
-        const int64_t vec_end =
-            (x_flat && y_flat && r_flat && aligned16(x_row, y_row) &&
-             (!HasRes || aligned16(r_row)))
-                ? (w.size / VEC) * VEC
-                : 0;
+        const int64_t vec_end = (x_flat && y_flat && r_flat && aligned16(x_row, y_row) &&
+                                 (!HasRes || aligned16(r_row))) ?
+                                    (w.size / VEC) * VEC :
+                                    0;
 
         float sum = 0.0f;
         float sum_sq = 0.0f;
-        for (int64_t i = int64_t(threadIdx.x) * VEC; i < vec_end;
-             i += int64_t(blockDim.x) * VEC) {
+        for (int64_t i = int64_t(threadIdx.x) * VEC; i < vec_end; i += int64_t(blockDim.x) * VEC) {
             float v[VEC];
             load_channels<T, VEC>(&x_row[i], v);
             if (HasRes) {
                 float r[VEC];
                 load_channels<T, VEC>(&r_row[i], r);
-                #pragma unroll
-                for (int k = 0; k < VEC; ++k) { v[k] += r[k]; }
+#pragma unroll
+                for (int k = 0; k < VEC; ++k) {
+                    v[k] += r[k];
+                }
             }
-            #pragma unroll
-            for (int k = 0; k < VEC; ++k) { sum += v[k]; sum_sq += v[k] * v[k]; }
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                sum += v[k];
+                sum_sq += v[k] * v[k];
+            }
             if (row != nullptr) {
-                #pragma unroll
-                for (int k = 0; k < VEC; ++k) { row[i + k] = v[k]; }
+#pragma unroll
+                for (int k = 0; k < VEC; ++k) {
+                    row[i + k] = v[k];
+                }
             }
         }
         for (int64_t i = vec_end + threadIdx.x; i < w.size; i += blockDim.x) {
@@ -232,7 +238,9 @@ __global__ void norm_row_kernel(const T* __restrict__ x,
             }
             sum += v;
             sum_sq += v * v;
-            if (row != nullptr) { row[i] = v; }
+            if (row != nullptr) {
+                row[i] = v;
+            }
         }
         block_sums2(sum, sum_sq, smem);
 
@@ -242,7 +250,9 @@ __global__ void norm_row_kernel(const T* __restrict__ x,
         if (HasMean) {
             mean = sum * inv_n;
             float var = sum_sq * inv_n - mean * mean;
-            if (var < 0.0f) { var = 0.0f; }
+            if (var < 0.0f) {
+                var = 0.0f;
+            }
             inv_std = rsqrtf(var + eps);
         } else if (HasScale) {
             inv_std = rsqrtf(sum_sq * inv_n + eps);
@@ -250,75 +260,96 @@ __global__ void norm_row_kernel(const T* __restrict__ x,
             inv_std = rsqrtf(sum_sq + eps);
         }
 
-        for (int64_t i = int64_t(threadIdx.x) * VEC; i < vec_end;
-             i += int64_t(blockDim.x) * VEC) {
+        for (int64_t i = int64_t(threadIdx.x) * VEC; i < vec_end; i += int64_t(blockDim.x) * VEC) {
             float v[VEC];
             if (row != nullptr) {
-                #pragma unroll
-                for (int k = 0; k < VEC; ++k) { v[k] = row[i + k]; }
+#pragma unroll
+                for (int k = 0; k < VEC; ++k) {
+                    v[k] = row[i + k];
+                }
             } else {
                 load_channels<T, VEC>(&x_row[i], v);
                 if (HasRes) {
                     float r[VEC];
                     load_channels<T, VEC>(&r_row[i], r);
-                    #pragma unroll
-                    for (int k = 0; k < VEC; ++k) { v[k] += r[k]; }
+#pragma unroll
+                    for (int k = 0; k < VEC; ++k) {
+                        v[k] += r[k];
+                    }
                 }
             }
-            #pragma unroll
-            for (int k = 0; k < VEC; ++k) { v[k] = (v[k] - mean) * inv_std; }
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                v[k] = (v[k] - mean) * inv_std;
+            }
 
             if (HasScale) {
                 if (scale_scalar) {
                     const float s = s_load(scale);
-                    #pragma unroll
-                    for (int k = 0; k < VEC; ++k) { v[k] *= s; }
+#pragma unroll
+                    for (int k = 0; k < VEC; ++k) {
+                        v[k] *= s;
+                    }
                 } else if (s_lane) {
                     float s[VEC];
                     load_channels<T, VEC>(&scale[i], s);
-                    #pragma unroll
-                    for (int k = 0; k < VEC; ++k) { v[k] *= s[k]; }
+#pragma unroll
+                    for (int k = 0; k < VEC; ++k) {
+                        v[k] *= s[k];
+                    }
                 } else {
-                    #pragma unroll
-                    for (int k = 0; k < VEC; ++k) { v[k] *= s_load(&scale[i + k]); }
+#pragma unroll
+                    for (int k = 0; k < VEC; ++k) {
+                        v[k] *= s_load(&scale[i + k]);
+                    }
                 }
             }
             if (HasBias) {
                 if (scale_scalar) {
                     const float b = s_load(bias);
-                    #pragma unroll
-                    for (int k = 0; k < VEC; ++k) { v[k] += b; }
+#pragma unroll
+                    for (int k = 0; k < VEC; ++k) {
+                        v[k] += b;
+                    }
                 } else if (b_lane) {
                     float b[VEC];
                     load_channels<T, VEC>(&bias[i], b);
-                    #pragma unroll
-                    for (int k = 0; k < VEC; ++k) { v[k] += b[k]; }
+#pragma unroll
+                    for (int k = 0; k < VEC; ++k) {
+                        v[k] += b[k];
+                    }
                 } else {
-                    #pragma unroll
-                    for (int k = 0; k < VEC; ++k) { v[k] += s_load(&bias[i + k]); }
+#pragma unroll
+                    for (int k = 0; k < VEC; ++k) {
+                        v[k] += s_load(&bias[i + k]);
+                    }
                 }
             }
 
             if (add_to) {
                 float o[VEC];
                 load_channels<T, VEC>(&y_row[i], o);
-                #pragma unroll
-                for (int k = 0; k < VEC; ++k) { v[k] += o[k]; }
+#pragma unroll
+                for (int k = 0; k < VEC; ++k) {
+                    v[k] += o[k];
+                }
             }
             store_channels<T, VEC>(&y_row[i], v);
         }
 
         for (int64_t i = vec_end + threadIdx.x; i < w.size; i += blockDim.x) {
-            float v = (row != nullptr)
-                ? row[i]
-                : s_load(&x[xb + axis_group_offset(i, w.post)]);
+            float v = (row != nullptr) ? row[i] : s_load(&x[xb + axis_group_offset(i, w.post)]);
             if (row == nullptr && HasRes) {
                 v += s_load(&res[rb + axis_group_offset(i, w.res_post)]);
             }
             float val = (v - mean) * inv_std;
             const int64_t si = scale_scalar ? 0 : i;
-            if (HasScale) { val *= s_load(&scale[si]); }
-            if (HasBias) { val += s_load(&bias[si]); }
+            if (HasScale) {
+                val *= s_load(&scale[si]);
+            }
+            if (HasBias) {
+                val += s_load(&bias[si]);
+            }
 
             const int64_t oe = yb + axis_group_offset(i, w.out_post);
             if (add_to) {
@@ -338,18 +369,15 @@ __global__ void norm_row_kernel(const T* __restrict__ x,
 /// rank above two means the plane has an interior to walk, and a dense one of
 /// those moves a 128-bit lane per step.
 template <class T>
-__global__ void batch_norm_plane_block_kernel(const T* __restrict__ x,
-                                              const T* __restrict__ scale,
+__global__ void batch_norm_plane_block_kernel(const T* __restrict__ x, const T* __restrict__ scale,
                                               const T* __restrict__ bias,
-                                              const T* __restrict__ mean,
-                                              const T* __restrict__ var,
-                                              T* __restrict__ y, int64_t rows,
-                                              int64_t channels, int64_t plane,
-                                              SpatWalk w, float eps, bool add_to)
+                                              const T* __restrict__ mean, const T* __restrict__ var,
+                                              T* __restrict__ y, int64_t rows, int64_t channels,
+                                              int64_t plane, SpatWalk w, float eps, bool add_to)
 {
     constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
-    const bool flat = w.sp.n == 0 && w.sp.flat_step == 1 &&
-                      w.out_sp.n == 0 && w.out_sp.flat_step == 1;
+    const bool flat =
+        w.sp.n == 0 && w.sp.flat_step == 1 && w.out_sp.n == 0 && w.out_sp.flat_step == 1;
 
     for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
         const int64_t n = row / channels;
@@ -360,21 +388,23 @@ __global__ void batch_norm_plane_block_kernel(const T* __restrict__ x,
         const int64_t yb = n * w.out_n_step + c * w.out_c_step;
 
         const T* x_plane = x + xb;
-        T*       y_plane = y + yb;
-        const int64_t vec_end =
-            (flat && aligned16(x_plane, y_plane)) ? (plane / VEC) * VEC : 0;
+        T* y_plane = y + yb;
+        const int64_t vec_end = (flat && aligned16(x_plane, y_plane)) ? (plane / VEC) * VEC : 0;
 
-        for (int64_t p = int64_t(threadIdx.x) * VEC; p < vec_end;
-             p += int64_t(blockDim.x) * VEC) {
+        for (int64_t p = int64_t(threadIdx.x) * VEC; p < vec_end; p += int64_t(blockDim.x) * VEC) {
             float v[VEC];
             load_channels<T, VEC>(&x_plane[p], v);
-            #pragma unroll
-            for (int k = 0; k < VEC; ++k) { v[k] = v[k] * ns + nb; }
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                v[k] = v[k] * ns + nb;
+            }
             if (add_to) {
                 float o[VEC];
                 load_channels<T, VEC>(&y_plane[p], o);
-                #pragma unroll
-                for (int k = 0; k < VEC; ++k) { v[k] += o[k]; }
+#pragma unroll
+                for (int k = 0; k < VEC; ++k) {
+                    v[k] += o[k];
+                }
             }
             store_channels<T, VEC>(&y_plane[p], v);
         }
@@ -390,18 +420,14 @@ __global__ void batch_norm_plane_block_kernel(const T* __restrict__ x,
 /// A thread per plane, for the shapes whose plane is one element or a few — the
 /// block-per-plane kernel would spend a block on them.
 template <class T>
-__global__ void batch_norm_plane_thread_kernel(const T* __restrict__ x,
-                                               const T* __restrict__ scale,
-                                               const T* __restrict__ bias,
-                                               const T* __restrict__ mean,
-                                               const T* __restrict__ var,
-                                               T* __restrict__ y, int64_t rows,
-                                               int64_t channels, int64_t plane,
-                                               SpatWalk w, float eps, bool add_to)
+__global__ void
+batch_norm_plane_thread_kernel(const T* __restrict__ x, const T* __restrict__ scale,
+                               const T* __restrict__ bias, const T* __restrict__ mean,
+                               const T* __restrict__ var, T* __restrict__ y, int64_t rows,
+                               int64_t channels, int64_t plane, SpatWalk w, float eps, bool add_to)
 {
     const int64_t step = int64_t(gridDim.x) * blockDim.x;
-    for (int64_t row = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; row < rows;
-         row += step) {
+    for (int64_t row = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; row < rows; row += step) {
         const int64_t n = row / channels;
         const int64_t c = row - n * channels;
         const float ns = s_load(&scale[c]) * rsqrtf(s_load(&var[c]) + eps);
@@ -420,17 +446,13 @@ __global__ void batch_norm_plane_thread_kernel(const T* __restrict__ x,
 /// Non-spatial: scale / bias / mean / var are per element, so the pass is a flat
 /// elementwise map (the CPU route walks the same linear range).
 template <class T>
-__global__ void batch_norm_element_kernel(const T* __restrict__ x,
-                                          const T* __restrict__ scale,
-                                          const T* __restrict__ bias,
-                                          const T* __restrict__ mean,
-                                          const T* __restrict__ var,
-                                          T* __restrict__ y, int64_t n, float eps,
-                                          bool add_to)
+__global__ void batch_norm_element_kernel(const T* __restrict__ x, const T* __restrict__ scale,
+                                          const T* __restrict__ bias, const T* __restrict__ mean,
+                                          const T* __restrict__ var, T* __restrict__ y, int64_t n,
+                                          float eps, bool add_to)
 {
     const int64_t step = int64_t(gridDim.x) * blockDim.x;
-    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
-         i += step) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step) {
         const float ns = s_load(&scale[i]) * rsqrtf(s_load(&var[i]) + eps);
         const float nb = s_load(&bias[i]) - s_load(&mean[i]) * ns;
         const float v = s_load(&x[i]) * ns + nb;
@@ -443,11 +465,9 @@ __global__ void batch_norm_element_kernel(const T* __restrict__ x,
 // ============================================================
 
 template <class T, bool HasBias>
-__global__ void group_norm_kernel(const T* __restrict__ x,
-                                  const T* __restrict__ scale,
-                                  const T* __restrict__ bias,
-                                  T* __restrict__ y, int64_t ng, int64_t groups,
-                                  int64_t cpg, int64_t spatial, SpatWalk w,
+__global__ void group_norm_kernel(const T* __restrict__ x, const T* __restrict__ scale,
+                                  const T* __restrict__ bias, T* __restrict__ y, int64_t ng,
+                                  int64_t groups, int64_t cpg, int64_t spatial, SpatWalk w,
                                   float eps, bool add_to)
 {
     __shared__ float smem[2 * (kCudaBlockSize / kCudaWarpSize)];
@@ -477,7 +497,9 @@ __global__ void group_norm_kernel(const T* __restrict__ x,
 
         const float mean = sum * inv_n;
         float var = sum_sq * inv_n - mean * mean;
-        if (var < 0.0f) { var = 0.0f; }
+        if (var < 0.0f) {
+            var = 0.0f;
+        }
         const float inv_std = rsqrtf(var + eps);
 
         for (int64_t e = threadIdx.x; e < per_group; e += blockDim.x) {
@@ -502,62 +524,61 @@ __global__ void group_norm_kernel(const T* __restrict__ x,
 inline int block_for(int64_t size)
 {
     int b = 32;
-    while (b < kCudaBlockSize && b < size) { b <<= 1; }
+    while (b < kCudaBlockSize && b < size) {
+        b <<= 1;
+    }
     return b;
 }
 
 template <class T, bool HasMean, bool HasScale, bool HasBias, bool HasRes>
-void launch_rows(const T* x, const T* scale, const T* bias, const T* res, T* y,
-                 const RowWalk& w, float eps, bool scale_scalar, bool add_to,
-                 cudaStream_t stream)
+void launch_rows(const T* x, const T* scale, const T* bias, const T* res, T* y, const RowWalk& w,
+                 float eps, bool scale_scalar, bool add_to, cudaStream_t stream)
 {
-    const unsigned grid = static_cast<unsigned>(
-        std::min<int64_t>(std::max<int64_t>(w.rows, 1), 65535));
+    const unsigned grid =
+        static_cast<unsigned>(std::min<int64_t>(std::max<int64_t>(w.rows, 1), 65535));
     const int block_size = block_for(w.size);
 
     // The row is held in shared memory when it fits beside the reduction
     // scratch, which trades a second global read for occupancy.
     const int64_t row_bytes = w.size * static_cast<int64_t>(sizeof(float));
-    const bool row_resident = row_resident_worth(
-        w.size, static_cast<int64_t>(sizeof(T)),
-        block_size * static_cast<int64_t>(sizeof(float)));
-    const int shared_bytes = static_cast<int>(
-        block_size * sizeof(float) + (row_resident ? row_bytes : 0));
+    const bool row_resident = row_resident_worth(w.size, static_cast<int64_t>(sizeof(T)),
+                                                 block_size * static_cast<int64_t>(sizeof(float)));
+    const int shared_bytes =
+        static_cast<int>(block_size * sizeof(float) + (row_resident ? row_bytes : 0));
 
     norm_row_kernel<T, HasMean, HasScale, HasBias, HasRes>
-        <<<grid, block_size, shared_bytes, stream>>>(
-            x, scale, bias, res, y, w, eps, scale_scalar, add_to, row_resident);
+        <<<grid, block_size, shared_bytes, stream>>>(x, scale, bias, res, y, w, eps, scale_scalar,
+                                                     add_to, row_resident);
 }
 
 template <class T, bool HasMean, bool HasScale>
-void launch_rows_bias(const T* x, const T* scale, const T* bias, const T* res,
-                      T* y, const RowWalk& w, float eps, bool scale_scalar,
-                      bool add_to, bool has_bias, bool has_res,
-                      cudaStream_t stream)
+void launch_rows_bias(const T* x, const T* scale, const T* bias, const T* res, T* y,
+                      const RowWalk& w, float eps, bool scale_scalar, bool add_to, bool has_bias,
+                      bool has_res, cudaStream_t stream)
 {
     if (has_bias) {
         if (has_res) {
-            launch_rows<T, HasMean, HasScale, true, true>(
-                x, scale, bias, res, y, w, eps, scale_scalar, add_to, stream);
+            launch_rows<T, HasMean, HasScale, true, true>(x, scale, bias, res, y, w, eps,
+                                                          scale_scalar, add_to, stream);
         } else {
-            launch_rows<T, HasMean, HasScale, true, false>(
-                x, scale, bias, nullptr, y, w, eps, scale_scalar, add_to, stream);
+            launch_rows<T, HasMean, HasScale, true, false>(x, scale, bias, nullptr, y, w, eps,
+                                                           scale_scalar, add_to, stream);
         }
     } else {
         if (has_res) {
-            launch_rows<T, HasMean, HasScale, false, true>(
-                x, scale, nullptr, res, y, w, eps, scale_scalar, add_to, stream);
+            launch_rows<T, HasMean, HasScale, false, true>(x, scale, nullptr, res, y, w, eps,
+                                                           scale_scalar, add_to, stream);
         } else {
-            launch_rows<T, HasMean, HasScale, false, false>(
-                x, scale, nullptr, nullptr, y, w, eps, scale_scalar, add_to, stream);
+            launch_rows<T, HasMean, HasScale, false, false>(x, scale, nullptr, nullptr, y, w, eps,
+                                                            scale_scalar, add_to, stream);
         }
     }
 }
 
 template <class T, bool HasMean, bool HasScale>
 Status run_row_norm(const NormAttributes& attrs, TensorView& output,
-                  std::span<const TensorView> inputs, int64_t scale_slot,
-                  int64_t bias_slot, int64_t res_slot, cudaStream_t stream)
+                    std::span<const TensorView> inputs, int64_t scale_slot, int64_t bias_slot,
+                    int64_t res_slot, cudaStream_t stream)
 {
     const auto& x = inputs[0];
     auto& y = output;
@@ -566,8 +587,7 @@ Status run_row_norm(const NormAttributes& attrs, TensorView& output,
     // A slot past the end of the call is absent, not empty: LayerNorm and
     // RMSNorm drop the bias entirely unless a residual holds the slot.
     const auto present = [&](int64_t slot) {
-        return slot >= 0 && slot < static_cast<int64_t>(inputs.size()) &&
-               !inputs[slot].is_empty();
+        return slot >= 0 && slot < static_cast<int64_t>(inputs.size()) && !inputs[slot].is_empty();
     };
     const bool has_bias = present(bias_slot);
     const bool has_res = present(res_slot);
@@ -579,11 +599,11 @@ Status run_row_norm(const NormAttributes& attrs, TensorView& output,
         return Status::ok;
     }
 
-    launch_rows_bias<T, HasMean, HasScale>(
-        x.ptr<T>(), scale ? scale->ptr<T>() : nullptr,
-        has_bias ? inputs[bias_slot].ptr<T>() : nullptr,
-        has_res ? inputs[res_slot].ptr<T>() : nullptr, y.ptr<T>(), w,
-        attrs.epsilon, scale_scalar, attrs.add_to, has_bias, has_res, stream);
+    launch_rows_bias<T, HasMean, HasScale>(x.ptr<T>(), scale ? scale->ptr<T>() : nullptr,
+                                           has_bias ? inputs[bias_slot].ptr<T>() : nullptr,
+                                           has_res ? inputs[res_slot].ptr<T>() : nullptr,
+                                           y.ptr<T>(), w, attrs.epsilon, scale_scalar, attrs.add_to,
+                                           has_bias, has_res, stream);
     return Status::ok;
 }
 
@@ -594,7 +614,9 @@ Status batch_norm_launch(const NormAttributes& attrs, TensorView& output,
     const auto& x = inputs[0];
     auto& y = output;
     const int64_t rank = x.rank();
-    if (rank == 0) { return Status::invalid_argument; }
+    if (rank == 0) {
+        return Status::invalid_argument;
+    }
 
     const T* s_ptr = inputs[1].ptr<T>();
     const T* b_ptr = inputs[2].ptr<T>();
@@ -603,37 +625,41 @@ Status batch_norm_launch(const NormAttributes& attrs, TensorView& output,
 
     if (!attrs.spatial) {
         const int64_t total = x.numel();
-        if (total == 0) { return Status::ok; }
+        if (total == 0) {
+            return Status::ok;
+        }
         const unsigned grid = static_cast<unsigned>(
             std::min<int64_t>(ceil_div(total, int64_t(kCudaBlockSize)), 65535));
         batch_norm_element_kernel<T><<<grid, kCudaBlockSize, 0, stream>>>(
-            x.ptr<T>(), s_ptr, b_ptr, m_ptr, v_ptr, y.ptr<T>(), total,
-            attrs.epsilon, attrs.add_to);
+            x.ptr<T>(), s_ptr, b_ptr, m_ptr, v_ptr, y.ptr<T>(), total, attrs.epsilon, attrs.add_to);
         return Status::ok;
     }
 
     const int64_t N = x.shape(0);
     const int64_t C = (rank >= 2) ? x.shape(1) : 1;
     int64_t plane = 1;
-    for (int64_t d = 2; d < rank; ++d) { plane *= x.shape(d); }
+    for (int64_t d = 2; d < rank; ++d) {
+        plane *= x.shape(d);
+    }
     // Rank one has no channel axis of its own, and rank two's channel is the
     // last dim: both leave one element per (sample, channel) plane.
     const int64_t rows = N * C;
-    if (rows == 0 || plane == 0) { return Status::ok; }
+    if (rows == 0 || plane == 0) {
+        return Status::ok;
+    }
 
     const SpatWalk w = make_spat_walk(x, y);
     if (plane <= 32) {
         const unsigned grid = static_cast<unsigned>(
             std::min<int64_t>(ceil_div(rows, int64_t(kCudaBlockSize)), 65535));
         batch_norm_plane_thread_kernel<T><<<grid, kCudaBlockSize, 0, stream>>>(
-            x.ptr<T>(), s_ptr, b_ptr, m_ptr, v_ptr, y.ptr<T>(), rows, C, plane, w,
-            attrs.epsilon, attrs.add_to);
+            x.ptr<T>(), s_ptr, b_ptr, m_ptr, v_ptr, y.ptr<T>(), rows, C, plane, w, attrs.epsilon,
+            attrs.add_to);
     } else {
-        const unsigned grid = static_cast<unsigned>(
-            std::min<int64_t>(rows, 65535));
+        const unsigned grid = static_cast<unsigned>(std::min<int64_t>(rows, 65535));
         batch_norm_plane_block_kernel<T><<<grid, kCudaBlockSize, 0, stream>>>(
-            x.ptr<T>(), s_ptr, b_ptr, m_ptr, v_ptr, y.ptr<T>(), rows, C, plane, w,
-            attrs.epsilon, attrs.add_to);
+            x.ptr<T>(), s_ptr, b_ptr, m_ptr, v_ptr, y.ptr<T>(), rows, C, plane, w, attrs.epsilon,
+            attrs.add_to);
     }
     return Status::ok;
 }
@@ -645,31 +671,38 @@ Status group_norm_launch(const NormAttributes& attrs, TensorView& output,
     const auto& x = inputs[0];
     auto& y = output;
     const int64_t rank = x.rank();
-    if (rank < 2) { return Status::invalid_argument; }
+    if (rank < 2) {
+        return Status::invalid_argument;
+    }
 
     const int64_t N = x.shape(0);
     const int64_t C = x.shape(1);
     const int64_t G = attrs.num_groups > 0 ? attrs.num_groups : 1;
-    if (G <= 0 || C % G != 0) { return Status::invalid_argument; }
+    if (G <= 0 || C % G != 0) {
+        return Status::invalid_argument;
+    }
     const int64_t cpg = C / G;
 
     int64_t spatial = 1;
-    for (int64_t d = 2; d < rank; ++d) { spatial *= x.shape(d); }
-    if (N == 0 || spatial == 0 || cpg == 0) { return Status::ok; }
+    for (int64_t d = 2; d < rank; ++d) {
+        spatial *= x.shape(d);
+    }
+    if (N == 0 || spatial == 0 || cpg == 0) {
+        return Status::ok;
+    }
 
     const bool has_bias = inputs.size() >= 3 && !inputs[2].is_empty();
     const SpatWalk w = make_spat_walk(x, y);
-    const unsigned grid = static_cast<unsigned>(
-        std::min<int64_t>(N * G, 65535));
+    const unsigned grid = static_cast<unsigned>(std::min<int64_t>(N * G, 65535));
 
     if (has_bias) {
         group_norm_kernel<T, true><<<grid, kCudaBlockSize, 0, stream>>>(
-            x.ptr<T>(), inputs[1].ptr<T>(), inputs[2].ptr<T>(), y.ptr<T>(), N * G,
-            G, cpg, spatial, w, attrs.epsilon, attrs.add_to);
+            x.ptr<T>(), inputs[1].ptr<T>(), inputs[2].ptr<T>(), y.ptr<T>(), N * G, G, cpg, spatial,
+            w, attrs.epsilon, attrs.add_to);
     } else {
         group_norm_kernel<T, false><<<grid, kCudaBlockSize, 0, stream>>>(
-            x.ptr<T>(), inputs[1].ptr<T>(), nullptr, y.ptr<T>(), N * G, G, cpg,
-            spatial, w, attrs.epsilon, attrs.add_to);
+            x.ptr<T>(), inputs[1].ptr<T>(), nullptr, y.ptr<T>(), N * G, G, cpg, spatial, w,
+            attrs.epsilon, attrs.add_to);
     }
     return Status::ok;
 }
@@ -683,8 +716,8 @@ Status norm_entry(const NormAttributes& attrs, TensorView& output,
         return batch_norm_launch<T>(attrs, output, inputs, stream);
     case NormType::LayerNorm:
         // [X, scale, bias?, residual?]
-        return run_row_norm<T, true, true>(attrs, output, inputs, 1, 2,
-                                           attrs.add_residual ? 3 : -1, stream);
+        return run_row_norm<T, true, true>(attrs, output, inputs, 1, 2, attrs.add_residual ? 3 : -1,
+                                           stream);
     case NormType::RMSNorm:
         // [X, scale, residual?]
         return run_row_norm<T, false, true>(attrs, output, inputs, 1, -1,
@@ -699,18 +732,19 @@ Status norm_entry(const NormAttributes& attrs, TensorView& output,
     return Status::invalid_argument;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // ============================================================
 // Entry point
 // ============================================================
 
 Status norm_cuda(const NormAttributes& attrs, TensorView& output,
-                 std::span<const TensorView> inputs, const ComputeContext& ctx,
-                 void* /*workspace*/)
+                 std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
     const auto& x = inputs[0];
-    if (is_quantized_dtype(x.data_type())) { return Status::unsupported; }
+    if (is_quantized_dtype(x.data_type())) {
+        return Status::unsupported;
+    }
 
     const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     switch (x.data_type()) {
@@ -725,4 +759,4 @@ Status norm_cuda(const NormAttributes& attrs, TensorView& output,
     }
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

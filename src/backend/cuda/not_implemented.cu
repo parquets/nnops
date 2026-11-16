@@ -18,27 +18,22 @@
 
 namespace nnops::backend::cuda {
 
-Status linear_attention_cuda(const LinearAttentionAttributes&,
-                             std::span<TensorView>,
-                             std::span<const TensorView>,
-                             const ComputeContext&,
-                             void*)
+Status linear_attention_cuda(const LinearAttentionAttributes&, std::span<TensorView>,
+                             std::span<const TensorView>, const ComputeContext&, void*)
 {
     return Status::unsupported;
 }
 
-Status quantize_linear_cuda(const QuantLinearAttributes&, TensorView&,
-                            std::span<const TensorView>, const ComputeContext&,
-                            void*)
+Status quantize_linear_cuda(const QuantLinearAttributes&, TensorView&, std::span<const TensorView>,
+                            const ComputeContext&, void*)
 {
     return Status::unsupported;
 }
 
 Status dequantize_linear_cuda(const QuantLinearAttributes&, TensorView&,
-                              std::span<const TensorView>, const ComputeContext&,
-                              void*)
+                              std::span<const TensorView>, const ComputeContext&, void*)
 {
     return Status::unsupported;
 }
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

@@ -31,17 +31,18 @@ bool is_compact(const TensorView& v)
 {
     int64_t want = 1;
     for (int64_t d = v.rank() - 1; d >= 0; --d) {
-        if (v.shape(d) != 1 && v.stride_elems(d) != want) { return false; }
+        if (v.shape(d) != 1 && v.stride_elems(d) != want) {
+            return false;
+        }
         want *= v.shape(d);
     }
     return true;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 template <typename T>
-void permute_last_two_swap_impl(TensorView& output,
-                                std::span<const TensorView> inputs,
+void permute_last_two_swap_impl(TensorView& output, std::span<const TensorView> inputs,
                                 const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -56,29 +57,23 @@ void permute_last_two_swap_impl(TensorView& output,
     const int64_t K = input.shape(rank - 1);
     const int64_t slice_elems = M * K;
 
-    const T* in_ptr  = input.ptr<T>();
-    T*       out_ptr = output.ptr<T>();
+    const T* in_ptr = input.ptr<T>();
+    T* out_ptr = output.ptr<T>();
 
     const int64_t in_batch_stride = slice_elems;
     const int64_t out_batch_stride = slice_elems;
 
     auto body = [&](int64_t b) {
-        kernel::tiled_transpose_2d<T>(
-            in_ptr  + b * in_batch_stride,
-            out_ptr + b * out_batch_stride,
-            M, K,
-            K,
-            M);
+        kernel::tiled_transpose_2d<T>(in_ptr + b * in_batch_stride, out_ptr + b * out_batch_stride,
+                                      M, K, K, M);
     };
 
     ctx.cpu.run(0, batch, body);
 }
 
 template <typename T>
-void permute_impl(const PermuteAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx)
+void permute_impl(const PermuteAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
@@ -91,12 +86,16 @@ void permute_impl(const PermuteAttributes& attrs,
     }
 
     const int64_t total = output.numel();
-    if (total == 0) { return; }
+    if (total == 0) {
+        return;
+    }
 
     // The view's own strides, so a pitched row (pitch > shape[rank-1]) and a
     // channel-last view both read what the buffer actually holds.
     int64_t in_strides[TensorDesc::kMaxRank];
-    for (int64_t i = 0; i < rank; ++i) { in_strides[i] = input.stride_elems(i); }
+    for (int64_t i = 0; i < rank; ++i) {
+        in_strides[i] = input.stride_elems(i);
+    }
 
     // Strides over dims 0..rank-2 only: outer_idx has the inner dim divided out.
     int64_t outer_strides[TensorDesc::kMaxRank];
@@ -107,8 +106,8 @@ void permute_impl(const PermuteAttributes& attrs,
         }
     }
 
-    const T* in_ptr  = input.ptr<T>();
-    T*       out_ptr = output.ptr<T>();
+    const T* in_ptr = input.ptr<T>();
+    T* out_ptr = output.ptr<T>();
 
     const int64_t inner_dim = output.shape(rank - 1);
     const int64_t outer_total = total / inner_dim;
@@ -128,8 +127,7 @@ void permute_impl(const PermuteAttributes& attrs,
         T* out_row = out_ptr + outer_idx * inner_dim;
 
         if (in_inner_step == 1) {
-            std::memcpy(out_row, in_ptr + in_base,
-                        static_cast<size_t>(inner_dim) * sizeof(T));
+            std::memcpy(out_row, in_ptr + in_base, static_cast<size_t>(inner_dim) * sizeof(T));
         } else {
             for (int64_t i = 0; i < inner_dim; ++i) {
                 out_row[i] = in_ptr[in_base + i * in_inner_step];
@@ -140,11 +138,9 @@ void permute_impl(const PermuteAttributes& attrs,
     ctx.cpu.run(0, outer_total, body);
 }
 
-Status permute_cpu(const PermuteAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* /*workspace*/)
+Status permute_cpu(const PermuteAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx,
+                   void* /*workspace*/)
 {
     const auto dtype = inputs[0].data_type();
     const int64_t rank = inputs[0].rank();
@@ -158,10 +154,9 @@ Status permute_cpu(const PermuteAttributes& attrs,
             }
         }
         if (is_last_two_swap) {
-            is_last_two_swap =
-                (attrs.perm[static_cast<size_t>(rank - 2)] == rank - 1 &&
-                 attrs.perm[static_cast<size_t>(rank - 1)] == rank - 2) &&
-                is_compact(inputs[0]) && is_compact(output);
+            is_last_two_swap = (attrs.perm[static_cast<size_t>(rank - 2)] == rank - 1 &&
+                                attrs.perm[static_cast<size_t>(rank - 1)] == rank - 2) &&
+                               is_compact(inputs[0]) && is_compact(output);
         }
     }
 
@@ -180,4 +175,4 @@ Status permute_cpu(const PermuteAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

@@ -36,14 +36,13 @@ namespace nnops::backend::cuda {
 ///    hands a thread one per piece -- so this is what buys a wider tile without
 ///    a wider warp.
 ///  - `group` sizes the L2 raster, in tiles along m.
-template <int ThreadsV, int BMV, int BNV, int BKV, int StagesV, int WMV, int WNV,
-          int MmaMV, int MmaNV, int GroupV>
-struct GemmTileH
-{
+template <int ThreadsV, int BMV, int BNV, int BKV, int StagesV, int WMV, int WNV, int MmaMV,
+          int MmaNV, int GroupV>
+struct GemmTileH {
     static constexpr int threads = ThreadsV;
     static constexpr int bM = BMV;
     static constexpr int bN = BNV;
-    static constexpr int bK = BKV;  // 64-multiples take the swizzle, the rest a pad
+    static constexpr int bK = BKV; // 64-multiples take the swizzle, the rest a pad
     static constexpr int stages = StagesV;
     static constexpr int wm = WMV;
     static constexpr int wn = WNV;
@@ -90,8 +89,7 @@ constexpr auto gemm_copy_half()
         static_assert(Threads % t_c == 0 && Rows % t_o == 0,
                       "the copy tiling overshoots the panel");
         return cute::make_tiled_copy(
-            cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
-                            Elem>{},
+            cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, Elem>{},
             cute::Layout<cute::Shape<cute::Int<t_o>, cute::Int<t_c>>>{},
             cute::Layout<cute::Shape<cute::_1, cute::Int<V>>>{});
     } else {
@@ -101,8 +99,7 @@ constexpr auto gemm_copy_half()
         static_assert(Threads % t_r == 0 && Cols % t_c == 0,
                       "the copy tiling overshoots the panel");
         return cute::make_tiled_copy(
-            cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
-                            Elem>{},
+            cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, Elem>{},
             cute::Layout<cute::Shape<cute::Int<t_r>, cute::Int<t_c>>>{},
             cute::Layout<cute::Shape<cute::Int<V>, cute::_1>>{});
     }
@@ -111,16 +108,14 @@ constexpr auto gemm_copy_half()
 /// The 16x8x16 tensor-core atom for a 2-byte float. f16 and bf16 have the same
 /// MMA shape; only the operand format differs.
 template <class Elem>
-using gemm_mma_atom = std::conditional_t<std::is_same_v<Elem, cute::bfloat16_t>,
-                                         cute::SM80_16x8x16_F32BF16BF16F32_TN,
-                                         cute::SM80_16x8x16_F32F16F16F32_TN>;
+using gemm_mma_atom =
+    std::conditional_t<std::is_same_v<Elem, cute::bfloat16_t>, cute::SM80_16x8x16_F32BF16BF16F32_TN,
+                       cute::SM80_16x8x16_F32F16F16F32_TN>;
 
-}  // namespace detail
+} // namespace detail
 
-template <class Tile, class Elem, bool TransA, bool TransB, bool Vectorized,
-          int Groups = 1>
-__global__ __launch_bounds__(Tile::threads * Groups)
-void dense_gemm_h_kernel(GemmParams p)
+template <class Tile, class Elem, bool TransA, bool TransB, bool Vectorized, int Groups = 1>
+__global__ __launch_bounds__(Tile::threads* Groups) void dense_gemm_h_kernel(GemmParams p)
 {
     using namespace cute;
     using In = Elem;
@@ -170,15 +165,12 @@ void dense_gemm_h_kernel(GemmParams p)
     const int batch = detail::gemm_block_batch(p);
     const int split = detail::gemm_block_split(p);
 
-    In const* A = static_cast<In const*>(p.a) +
-                  detail::gemm_batch_offset(p, p.a_batch, batch);
-    In const* B = static_cast<In const*>(p.b) +
-                  detail::gemm_batch_offset(p, p.b_batch, batch);
+    In const* A = static_cast<In const*>(p.a) + detail::gemm_batch_offset(p, p.a_batch, batch);
+    In const* B = static_cast<In const*>(p.b) + detail::gemm_batch_offset(p, p.b_batch, batch);
     In const* bias = static_cast<In const*>(p.bias);
-    Out* C = static_cast<Out*>(p.c) +
-             detail::gemm_batch_offset(p, p.c_batch, batch);
-    Out const* residual = static_cast<Out const*>(p.residual) +
-                          detail::gemm_batch_offset(p, p.r_batch, batch);
+    Out* C = static_cast<Out*>(p.c) + detail::gemm_batch_offset(p, p.c_batch, batch);
+    Out const* residual =
+        static_cast<Out const*>(p.residual) + detail::gemm_batch_offset(p, p.r_batch, batch);
 
     Tensor mA = [&] {
         if constexpr (TransA) {
@@ -198,8 +190,7 @@ void dense_gemm_h_kernel(GemmParams p)
                                make_stride(Int<1>{}, int(p.ldb)));
         }
     }();
-    Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N),
-                            make_stride(int(p.ldc), Int<1>{}));
+    Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N), make_stride(int(p.ldc), Int<1>{}));
 
     auto cta_tiler = make_shape(Int<bM>{}, Int<bN>{}, Int<bK>{});
     auto cta_coord = make_coord(tile_m, tile_n, _);
@@ -207,19 +198,18 @@ void dense_gemm_h_kernel(GemmParams p)
     Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{});
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{});
 
-    constexpr auto sA_layout = detail::gemm_smem_layout<!TransA>(
-        Int<bM>{}, Int<bK>{}, Int<kStages>{});
-    constexpr auto sB_layout = detail::gemm_smem_layout<TransB>(
-        Int<bN>{}, Int<bK>{}, Int<kStages>{});
+    constexpr auto sA_layout =
+        detail::gemm_smem_layout<!TransA>(Int<bM>{}, Int<bK>{}, Int<kStages>{});
+    constexpr auto sB_layout =
+        detail::gemm_smem_layout<TransB>(Int<bN>{}, Int<bK>{}, Int<kStages>{});
 
     constexpr int kSmemA = int(cosize(sA_layout));
-    constexpr int kSmemB = int(cosize(sB_layout));  // one group's panel
+    constexpr int kSmemB = int(cosize(sB_layout)); // one group's panel
 
     extern __shared__ char gemm_smem[];
     Tensor sA = make_tensor(make_smem_ptr(reinterpret_cast<In*>(gemm_smem)), sA_layout);
     Tensor sB = make_tensor(
-        make_smem_ptr(reinterpret_cast<In*>(gemm_smem + (kSmemA + wg * kSmemB) * 2)),
-        sB_layout);
+        make_smem_ptr(reinterpret_cast<In*>(gemm_smem + (kSmemA + wg * kSmemB) * 2)), sB_layout);
 
     TiledMMA mma = make_tiled_mma(detail::gemm_mma_atom<Elem>{},
                                   Layout<Shape<Int<Tile::wm>, Int<Tile::wn>, _1>>{},
@@ -248,8 +238,7 @@ void dense_gemm_h_kernel(GemmParams p)
             const int col = i - row * bK;
             const int m = m0 + row;
             const int k = k0 + col;
-            sA(row, col, stage) =
-                (m < M && k < K) ? gA(row, col, kt) : In(0);
+            sA(row, col, stage) = (m < M && k < K) ? gA(row, col, kt) : In(0);
         }
     };
     auto fill_b = [&](int kt, int stage) {
@@ -259,8 +248,7 @@ void dense_gemm_h_kernel(GemmParams p)
             const int col = i - row * bK;
             const int n = n0 + row;
             const int k = k0 + col;
-            sB(row, col, stage) =
-                (n < N && k < K) ? gB(row, col, kt) : In(0);
+            sB(row, col, stage) = (n < N && k < K) ? gB(row, col, kt) : In(0);
         }
     };
     auto load_a = [&](int kt, int stage) {
@@ -292,7 +280,9 @@ void dense_gemm_h_kernel(GemmParams p)
         load_b(k_tile_next, pipe);
         cp_async_fence();
         --k_tile_count;
-        if (k_tile_count > 0) { ++k_tile_next; }
+        if (k_tile_count > 0) {
+            ++k_tile_next;
+        }
     }
 
     ThrMMA thr_mma = mma.get_slice(lane);
@@ -351,8 +341,7 @@ void dense_gemm_h_kernel(GemmParams p)
                 cp_async_wait<kStages - 2>();
                 __syncthreads();
             }
-            const int k_block_next =
-                (k_block + 1) % decltype(K_BLOCK_MAX)::value;
+            const int k_block_next = (k_block + 1) % decltype(K_BLOCK_MAX)::value;
             copy(s2r_atom_a, tXsA_p(_, _, k_block_next), tXrA(_, _, k_block_next));
             copy(s2r_atom_b, tXsB_p(_, _, k_block_next), tXrB(_, _, k_block_next));
             if (k_block == 0) {
@@ -360,10 +349,11 @@ void dense_gemm_h_kernel(GemmParams p)
                 load_b(k_tile_next, smem_pipe_write);
                 cp_async_fence();
                 --k_tile_count;
-                if (k_tile_count > 0) { ++k_tile_next; }
+                if (k_tile_count > 0) {
+                    ++k_tile_next;
+                }
                 smem_pipe_write = smem_pipe_read;
-                smem_pipe_read =
-                    (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
+                smem_pipe_read = (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
             }
             gemm(mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
         }
@@ -373,8 +363,7 @@ void dense_gemm_h_kernel(GemmParams p)
     // applies the thread partition, so handing it the whole (M, N) would give
     // every block the coordinates of block (0, 0).
     Tensor cC = make_identity_tensor(make_shape(M, N));
-    Tensor tCcC = thr_mma.partition_C(
-        local_tile(cC, cta_tiler, cta_coord, Step<_1, _1, X>{}));
+    Tensor tCcC = thr_mma.partition_C(local_tile(cC, cta_tiler, cta_coord, Step<_1, _1, X>{}));
 
     // A split's block stops at its accumulator: the sum, the bias and the
     // activation all belong to the reduce kernel, which sees every plane.
@@ -389,7 +378,9 @@ void dense_gemm_h_kernel(GemmParams p)
         auto coord = tCcC(i);
         const int m = int(get<0>(coord));
         const int n = int(get<1>(coord));
-        if (m >= M || n >= N) { continue; }
+        if (m >= M || n >= N) {
+            continue;
+        }
         if (part != nullptr) {
             part[static_cast<int64_t>(m) * N + n] = float(tCrC(i));
             continue;
@@ -413,8 +404,7 @@ void dense_gemm_h_kernel(GemmParams p)
 
 namespace detail {
 
-template <class Tile, class Elem, bool TransA, bool TransB, bool Vectorized,
-          int Groups = 1>
+template <class Tile, class Elem, bool TransA, bool TransB, bool Vectorized, int Groups = 1>
 inline void launch_dense_h(const GemmParams& p, cudaStream_t stream)
 {
     using namespace cute;
@@ -425,16 +415,15 @@ inline void launch_dense_h(const GemmParams& p, cudaStream_t stream)
     static_assert(smem <= kSmemPerSm, "one block has to fit");
 
     auto kernel = dense_gemm_h_kernel<Tile, Elem, TransA, TransB, Vectorized, Groups>;
-    static const cudaError_t cfg = cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    static const cudaError_t cfg =
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
     // One flat tile index: the kernel turns it into an L2-grouped (m, n) pair.
-    dim3 grid(ceil_div(p.m, bM) * ceil_div(p.n, bN * Groups), 1,
-              gemm_batch_count(p) * p.k_splits);
+    dim3 grid(ceil_div(p.m, bM) * ceil_div(p.n, bN * Groups), 1, gemm_batch_count(p) * p.k_splits);
     kernel<<<grid, Tile::threads * Groups, smem, stream>>>(p);
 }
 
-}  // namespace detail
+} // namespace detail
 
-}  // namespace nnops::backend::cuda
+} // namespace nnops::backend::cuda

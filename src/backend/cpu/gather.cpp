@@ -24,8 +24,7 @@ namespace nnops::backend::cpu {
 
 namespace {
 
-template <typename I>
-bool index_in_range(const TensorView& indices, int64_t limit)
+template <typename I> bool index_in_range(const TensorView& indices, int64_t limit)
 {
     const I* p = indices.ptr<I>();
     int64_t st[8];
@@ -39,11 +38,15 @@ bool index_in_range(const TensorView& indices, int64_t limit)
     int64_t off = 0;
     for (int64_t i = 0; i < n; ++i) {
         const int64_t k = static_cast<int64_t>(p[off]);
-        if (k < -limit || k >= limit) { return false; }
+        if (k < -limit || k >= limit) {
+            return false;
+        }
         for (int64_t d = indices.rank() - 1; d >= 0; --d) {
             ++idx[d];
             off += st[d];
-            if (idx[d] < dims[d]) { break; }
+            if (idx[d] < dims[d]) {
+                break;
+            }
             idx[d] = 0;
             off -= st[d] * dims[d];
         }
@@ -52,32 +55,37 @@ bool index_in_range(const TensorView& indices, int64_t limit)
 }
 
 template <typename I>
-bool gather_nd_indices_valid(const TensorView& indices, const TensorView& data,
-                             int64_t batch, int64_t k)
+bool gather_nd_indices_valid(const TensorView& indices, const TensorView& data, int64_t batch,
+                             int64_t k)
 {
     const I* p = indices.ptr<I>();
     const int64_t qr = indices.rank();
-    const int64_t tuples = (qr >= 1)
-        ? indices.numel() / indices.shape(qr - 1) : 0;
+    const int64_t tuples = (qr >= 1) ? indices.numel() / indices.shape(qr - 1) : 0;
 
     int64_t st[8];
     logical_strides(indices, st);
     const int64_t last_stride = st[qr - 1];
 
     int64_t dims[8];
-    for (int64_t d = 0; d < qr - 1; ++d) { dims[d] = indices.shape(d); }
+    for (int64_t d = 0; d < qr - 1; ++d) {
+        dims[d] = indices.shape(d);
+    }
     int64_t idx[8] = {};
     int64_t base = 0;
     for (int64_t t = 0; t < tuples; ++t) {
         for (int64_t j = 0; j < k; ++j) {
             const int64_t v = static_cast<int64_t>(p[base + j * last_stride]);
             const int64_t limit = data.shape(batch + j);
-            if (v < -limit || v >= limit) { return false; }
+            if (v < -limit || v >= limit) {
+                return false;
+            }
         }
         for (int64_t d = qr - 2; d >= 0; --d) {
             ++idx[d];
             base += st[d];
-            if (idx[d] < dims[d]) { break; }
+            if (idx[d] < dims[d]) {
+                break;
+            }
             idx[d] = 0;
             base -= st[d] * dims[d];
         }
@@ -86,20 +94,21 @@ bool gather_nd_indices_valid(const TensorView& indices, const TensorView& data,
 }
 
 template <typename T, typename I>
-void gather_impl(const GatherAttributes& attrs, TensorView& output,
-                 const TensorView& data, const TensorView& indices,
-                 const ComputeContext& ctx)
+void gather_impl(const GatherAttributes& attrs, TensorView& output, const TensorView& data,
+                 const TensorView& indices, const ComputeContext& ctx)
 {
     const int64_t rank = data.rank();
     const int64_t axis = resolve_axis(attrs.axis, rank);
-    const int64_t ir   = indices.rank();
+    const int64_t ir = indices.rank();
     const int64_t orank = output.rank();
 
     int64_t dstr[8], istr[8], ostr[8], odims[8];
     logical_strides(data, dstr);
     logical_strides(indices, istr);
     logical_strides(output, ostr);
-    for (int64_t d = 0; d < orank; ++d) { odims[d] = output.shape(d); }
+    for (int64_t d = 0; d < orank; ++d) {
+        odims[d] = output.shape(d);
+    }
 
     const T* dptr = data.ptr<T>();
     const I* iptr = indices.ptr<I>();
@@ -107,13 +116,19 @@ void gather_impl(const GatherAttributes& attrs, TensorView& output,
 
     walk_logical(odims, orank, output.numel(), ctx, [&](const int64_t* o) {
         int64_t ds = 0;
-        for (int64_t d = 0; d < axis; ++d) { ds += o[d] * dstr[d]; }
+        for (int64_t d = 0; d < axis; ++d) {
+            ds += o[d] * dstr[d];
+        }
 
         int64_t io = 0;
-        for (int64_t j = 0; j < ir; ++j) { io += o[axis + j] * istr[j]; }
+        for (int64_t j = 0; j < ir; ++j) {
+            io += o[axis + j] * istr[j];
+        }
 
         int64_t k = static_cast<int64_t>(iptr[io]);
-        if (k < 0) { k += data.shape(axis); }
+        if (k < 0) {
+            k += data.shape(axis);
+        }
         ds += k * dstr[axis];
 
         for (int64_t m = 0; m < rank - axis - 1; ++m) {
@@ -125,9 +140,9 @@ void gather_impl(const GatherAttributes& attrs, TensorView& output,
 }
 
 template <typename T, typename I>
-void gather_elements_impl(const GatherElementsAttributes& attrs,
-                          TensorView& output, const TensorView& data,
-                          const TensorView& indices, const ComputeContext& ctx)
+void gather_elements_impl(const GatherElementsAttributes& attrs, TensorView& output,
+                          const TensorView& data, const TensorView& indices,
+                          const ComputeContext& ctx)
 {
     const int64_t rank = data.rank();
     const int64_t axis = resolve_axis(attrs.axis, rank);
@@ -136,7 +151,9 @@ void gather_elements_impl(const GatherElementsAttributes& attrs,
     logical_strides(data, dstr);
     logical_strides(indices, istr);
     logical_strides(output, ostr);
-    for (int64_t d = 0; d < rank; ++d) { odims[d] = output.shape(d); }
+    for (int64_t d = 0; d < rank; ++d) {
+        odims[d] = output.shape(d);
+    }
 
     const T* dptr = data.ptr<T>();
     const I* iptr = indices.ptr<I>();
@@ -147,22 +164,25 @@ void gather_elements_impl(const GatherElementsAttributes& attrs,
         for (int64_t d = 0; d < rank; ++d) {
             io += o[d] * istr[d];
             os += o[d] * ostr[d];
-            if (d != axis) { ds += o[d] * dstr[d]; }
+            if (d != axis) {
+                ds += o[d] * dstr[d];
+            }
         }
         int64_t k = static_cast<int64_t>(iptr[io]);
-        if (k < 0) { k += data.shape(axis); }
+        if (k < 0) {
+            k += data.shape(axis);
+        }
         ds += k * dstr[axis];
         optr[os] = dptr[ds];
     });
 }
 
 template <typename T, typename I>
-void gather_nd_impl(const GatherNDAttributes& attrs, TensorView& output,
-                    const TensorView& data, const TensorView& indices,
-                    const ComputeContext& ctx)
+void gather_nd_impl(const GatherNDAttributes& attrs, TensorView& output, const TensorView& data,
+                    const TensorView& indices, const ComputeContext& ctx)
 {
-    const int64_t qr    = indices.rank();
-    const int64_t k     = indices.shape(qr - 1);
+    const int64_t qr = indices.rank();
+    const int64_t k = indices.shape(qr - 1);
     const int64_t batch = attrs.batch_dims;
     const int64_t orank = output.rank();
 
@@ -170,7 +190,9 @@ void gather_nd_impl(const GatherNDAttributes& attrs, TensorView& output,
     logical_strides(data, dstr);
     logical_strides(indices, istr);
     logical_strides(output, ostr);
-    for (int64_t d = 0; d < orank; ++d) { odims[d] = output.shape(d); }
+    for (int64_t d = 0; d < orank; ++d) {
+        odims[d] = output.shape(d);
+    }
     const int64_t last_stride = istr[qr - 1];
 
     const T* dptr = data.ptr<T>();
@@ -179,15 +201,21 @@ void gather_nd_impl(const GatherNDAttributes& attrs, TensorView& output,
 
     walk_logical(odims, orank, output.numel(), ctx, [&](const int64_t* o) {
         int64_t ds = 0;
-        for (int64_t d = 0; d < batch; ++d) { ds += o[d] * dstr[d]; }
+        for (int64_t d = 0; d < batch; ++d) {
+            ds += o[d] * dstr[d];
+        }
 
         int64_t io = 0;
-        for (int64_t d = 0; d < qr - 1; ++d) { io += o[d] * istr[d]; }
+        for (int64_t d = 0; d < qr - 1; ++d) {
+            io += o[d] * istr[d];
+        }
 
         for (int64_t j = 0; j < k; ++j) {
             int64_t v = static_cast<int64_t>(iptr[io + j * last_stride]);
             const int64_t limit = data.shape(batch + j);
-            if (v < 0) { v += limit; }
+            if (v < 0) {
+                v += limit;
+            }
             ds += v * dstr[batch + j];
         }
 
@@ -199,12 +227,10 @@ void gather_nd_impl(const GatherNDAttributes& attrs, TensorView& output,
     });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-Status gather_cpu(const GatherAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
+Status gather_cpu(const GatherAttributes& attrs, TensorView& output,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx,
                   void* /*workspace*/)
 {
     const auto& data = inputs[0];
@@ -234,10 +260,8 @@ Status gather_cpu(const GatherAttributes& attrs,
     return Status::ok;
 }
 
-Status gather_elements_cpu(const GatherElementsAttributes& attrs,
-                           TensorView& output,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx,
+Status gather_elements_cpu(const GatherElementsAttributes& attrs, TensorView& output,
+                           std::span<const TensorView> inputs, const ComputeContext& ctx,
                            void* /*workspace*/)
 {
     const auto& data = inputs[0];
@@ -263,10 +287,8 @@ Status gather_elements_cpu(const GatherElementsAttributes& attrs,
     return Status::ok;
 }
 
-Status gather_nd_cpu(const GatherNDAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
+Status gather_nd_cpu(const GatherNDAttributes& attrs, TensorView& output,
+                     std::span<const TensorView> inputs, const ComputeContext& ctx,
                      void* /*workspace*/)
 {
     const auto& data = inputs[0];
@@ -292,4 +314,4 @@ Status gather_nd_cpu(const GatherNDAttributes& attrs,
     return Status::ok;
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

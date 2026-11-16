@@ -42,68 +42,76 @@ namespace k = nnops::kernel;
 // ============================================================
 
 template <typename T>
-void dwconv_channel_first_impl(
-    const DepthwiseConvAttributes& attrs,
-    TensorView& output,
-    std::span<const TensorView> inputs,
-    const ComputeContext& ctx)
+void dwconv_channel_first_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
+                               std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t rank  = input.rank();
+    const int64_t rank = input.rank();
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
 
     // One "block" per channel: a channel-first tensor has no channel vector.
-    const int64_t N      = input.shape(0);
+    const int64_t N = input.shape(0);
     const int64_t blocks = input.num_channel_blocks();
 
-    const int64_t ID  = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH  = input.shape(srank);
-    const int64_t IW  = input.shape(srank + 1);
+    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
+    const int64_t IH = input.shape(srank);
+    const int64_t IW = input.shape(srank + 1);
 
-    const int64_t KD  = attrs.kernel_size[0];
-    const int64_t KH  = attrs.kernel_size[1];
-    const int64_t KW  = attrs.kernel_size[2];
+    const int64_t KD = attrs.kernel_size[0];
+    const int64_t KH = attrs.kernel_size[1];
+    const int64_t KW = attrs.kernel_size[2];
 
-    const int64_t OD  = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH  = output.shape(srank);
-    const int64_t OW  = output.shape(srank + 1);
+    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
+    const int64_t OH = output.shape(srank);
+    const int64_t OW = output.shape(srank + 1);
 
-    const int64_t SD  = attrs.stride[0];
-    const int64_t SH  = attrs.stride[1];
-    const int64_t SW  = attrs.stride[2];
-    const int64_t DD  = attrs.dilation[0];
-    const int64_t DH  = attrs.dilation[1];
-    const int64_t DW  = attrs.dilation[2];
-    const int64_t PD  = attrs.padding[0];
-    const int64_t PH  = attrs.padding[1];
-    const int64_t PW  = attrs.padding[2];
+    const int64_t SD = attrs.stride[0];
+    const int64_t SH = attrs.stride[1];
+    const int64_t SW = attrs.stride[2];
+    const int64_t DD = attrs.dilation[0];
+    const int64_t DH = attrs.dilation[1];
+    const int64_t DW = attrs.dilation[2];
+    const int64_t PD = attrs.padding[0];
+    const int64_t PH = attrs.padding[1];
+    const int64_t PW = attrs.padding[2];
 
     auto* out_ptr = output.ptr<T>();
-    const auto* in_ptr  = input.ptr<T>();
-    const auto* w_ptr   = weight.ptr<T>();
-    const auto* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const auto* in_ptr = input.ptr<T>();
+    const auto* w_ptr = weight.ptr<T>();
+    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
 
-    const int64_t in_row_stride  = input.row_stride_elems();
-    const int64_t in_d_stride    = IH * in_row_stride;
+    const int64_t in_row_stride = input.row_stride_elems();
+    const int64_t in_d_stride = IH * in_row_stride;
     const int64_t out_row_stride = output.row_stride_elems();
-    const int64_t out_d_stride   = OH * out_row_stride;
-    const int64_t in_ch_stride   = input.channel_block_stride_elems();
-    const int64_t out_ch_stride  = output.channel_block_stride_elems();
-    const int64_t taps           = KD * KH * KW;
+    const int64_t out_d_stride = OH * out_row_stride;
+    const int64_t in_ch_stride = input.channel_block_stride_elems();
+    const int64_t out_ch_stride = output.channel_block_stride_elems();
+    const int64_t taps = KD * KH * KW;
 
     k::DwConvParams p{};
-    p.ID = ID; p.IH = IH; p.IW = IW;
-    p.OH = OH; p.OW = OW;
-    p.KD = KD; p.KH = KH; p.KW = KW;
-    p.SD = SD; p.SH = SH; p.SW = SW;
-    p.DD = DD; p.DH = DH; p.DW = DW;
-    p.PD = PD; p.PH = PH; p.PW = PW;
+    p.ID = ID;
+    p.IH = IH;
+    p.IW = IW;
+    p.OH = OH;
+    p.OW = OW;
+    p.KD = KD;
+    p.KH = KH;
+    p.KW = KW;
+    p.SD = SD;
+    p.SH = SH;
+    p.SW = SW;
+    p.DD = DD;
+    p.DH = DH;
+    p.DW = DW;
+    p.PD = PD;
+    p.PH = PH;
+    p.PW = PW;
     p.out_row_stride = out_row_stride;
-    p.in_d_stride    = in_d_stride;
-    p.in_row_stride  = in_row_stride;
+    p.in_d_stride = in_d_stride;
+    p.in_row_stride = in_row_stride;
 
     // Channel-first edge masks: only the first and last width vector of a row read past
     // it, and a mask zeroes the lanes outside the row so a tap stays a load and
@@ -125,21 +133,21 @@ void dwconv_channel_first_impl(
     // start. A block the tensor cannot back keeps the checked path.
     const int64_t mask_span = (SW == 2) ? 2 * kMaskLanes : kMaskLanes;
     const int64_t mask_last_ow = ((OW + kMaskLanes - 1) / kMaskLanes - 1) * kMaskLanes;
-    const int64_t mask_hi = (ID - 1) * in_d_stride + (IH - 1) * in_row_stride +
-                            mask_last_ow * SW + (KW - 1) * DW - PW + mask_span;
+    const int64_t mask_hi = (ID - 1) * in_d_stride + (IH - 1) * in_row_stride + mask_last_ow * SW +
+                            (KW - 1) * DW - PW + mask_span;
     const int64_t mask_lo = PW;
 
     // At most one of the two: the pre-activation order folds the destination
     // into the accumulator, so nothing is left for the post-epilogue add.
     const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
-    const bool add_to  = attrs.add_to && !pre_act;
+    const bool add_to = attrs.add_to && !pre_act;
 
     const auto compute_block = [&](int64_t n, int64_t blk) {
-        const T* in_base  = in_ptr  + n * blocks * in_ch_stride  + blk * in_ch_stride;
-        T*       out_base = out_ptr + n * blocks * out_ch_stride + blk * out_ch_stride;
+        const T* in_base = in_ptr + n * blocks * in_ch_stride + blk * in_ch_stride;
+        T* out_base = out_ptr + n * blocks * out_ch_stride + blk * out_ch_stride;
         // The raw [C, 1, (KD,) KH, KW] filter, one tap block per channel.
-        const T* w_base   = w_ptr + blk * taps;
-        const float bias  = b_ptr ? s_load(&b_ptr[blk]) : 0.0f;
+        const T* w_base = w_ptr + blk * taps;
+        const float bias = b_ptr ? s_load(&b_ptr[blk]) : 0.0f;
 
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
         k::DwConvParams pc = p;
@@ -164,21 +172,19 @@ void dwconv_channel_first_impl(
             for (; oh + 3 < OH; oh += 4) {
                 pc.od = od;
                 pc.oh = oh;
-                k::dwconv_channel_first_h4(out_d + oh * pc.out_row_stride, in_base,
-                                    w_base, bias, pc, attrs.epilogue, add_to, pre_act,
-                                    blk_edges);
+                k::dwconv_channel_first_h4(out_d + oh * pc.out_row_stride, in_base, w_base, bias,
+                                           pc, attrs.epilogue, add_to, pre_act, blk_edges);
             }
             for (; oh < OH; ++oh) {
                 pc.od = od;
                 pc.oh = oh;
-                k::dwconv_channel_first(out_d + oh * pc.out_row_stride, in_base, w_base,
-                                 bias, pc, attrs.epilogue, add_to, pre_act, blk_edges);
+                k::dwconv_channel_first(out_d + oh * pc.out_row_stride, in_base, w_base, bias, pc,
+                                        attrs.epilogue, add_to, pre_act, blk_edges);
             }
         }
     };
 
-    ctx.cpu.run(0, N * blocks,
-            [&](int64_t tid) { compute_block(tid / blocks, tid % blocks); });
+    ctx.cpu.run(0, N * blocks, [&](int64_t tid) { compute_block(tid / blocks, tid % blocks); });
 }
 
 // ============================================================
@@ -187,17 +193,17 @@ void dwconv_channel_first_impl(
 
 template <typename T>
 void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
-                      std::span<const TensorView> inputs, const ComputeContext& ctx)
+                              std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
     // At most one of the two: the pre-activation order folds the destination
     // into the accumulator, so nothing is left for the post-epilogue add.
     const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
-    const bool add_to  = attrs.add_to && !pre_act;
+    const bool add_to = attrs.add_to && !pre_act;
 
-    const int64_t rank  = input.rank();
+    const int64_t rank = input.rank();
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
 
     const int64_t N = input.shape(0);
@@ -211,8 +217,11 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
     const int64_t OW = output.shape(srank + 1);
 
     k::DwConvParams p{};
-    p.ID = ID; p.IH = IH; p.IW = IW;
-    p.OH = OH; p.OW = OW;
+    p.ID = ID;
+    p.IH = IH;
+    p.IW = IW;
+    p.OH = OH;
+    p.OW = OW;
     p.KD = attrs.kernel_size[0];
     p.KH = attrs.kernel_size[1];
     p.KW = attrs.kernel_size[2];
@@ -226,10 +235,10 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
     p.PH = attrs.padding[1];
     p.PW = attrs.padding[2];
     p.out_row_stride = output.row_stride_elems();
-    p.in_row_stride  = input.row_stride_elems();
-    p.in_d_stride    = IH * p.in_row_stride;
-    p.pix_stride     = C;   // a pixel holds all C channels, and so does a tap
-    p.w_tap_stride   = C;   // the raw HWCM filter is [tap][C]
+    p.in_row_stride = input.row_stride_elems();
+    p.in_d_stride = IH * p.in_row_stride;
+    p.pix_stride = C;   // a pixel holds all C channels, and so does a tap
+    p.w_tap_stride = C; // the raw HWCM filter is [tap][C]
 
     // Sixteen channels a chunk: a pixel's sixteen f32 are one 64-byte line, so
     // the block sweep touches every line exactly once. An eight-channel chunk
@@ -241,8 +250,8 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
 
     auto* out_ptr = output.ptr<T>();
     const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr  = weight.ptr<T>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const auto* w_ptr = weight.ptr<T>();
+    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
 
     const int64_t out_d_stride = OH * p.out_row_stride;
 
@@ -253,7 +262,7 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
     // each sweep came back from DRAM and measured 3x slower. A strip that fits
     // L2 stays resident across the sweep.
     const int64_t hgroups = (OH + 3) / 4;
-    const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH;  // rows a group reads
+    const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH; // rows a group reads
     constexpr int64_t kStripBytes = 128 * 1024;
     int64_t strip = OW;
     {
@@ -264,8 +273,8 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
             strip = std::clamp<int64_t>(w & ~int64_t{15}, 16, OW);
         }
     }
-    const int64_t strips  = (OW + strip - 1) / strip;
-    const int64_t groups  = N * OD * hgroups * strips;
+    const int64_t strips = (OW + strip - 1) / strip;
+    const int64_t groups = N * OD * hgroups * strips;
     const int64_t nt = ctx.cpu.thread_count();
     // The filter axis splits a group only when the grid cannot fill the pool;
     // one chunk keeps the block loop inside the task and the strip in cache. The
@@ -288,11 +297,11 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
 
     ctx.cpu.run(0, groups * chunks, [&](int64_t tid) {
         const int64_t cc = tid % chunks;
-        const int64_t g  = tid / chunks;
+        const int64_t g = tid / chunks;
         const int64_t st = g % strips;
         const int64_t hg = (g / strips) % hgroups;
         const int64_t od = (g / (strips * hgroups)) % OD;
-        const int64_t n  = g / (strips * hgroups * OD);
+        const int64_t n = g / (strips * hgroups * OD);
 
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
         k::DwConvParams pc = p;
@@ -304,8 +313,8 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
         const T* in_img = in_ptr + n * ID * p.in_d_stride;
         // The kernel indexes the store by the absolute column, so the base stays
         // at the row start even though the loop covers only this strip.
-    T* out_rows = out_ptr + n * OD * out_d_stride + od * out_d_stride
-                + pc.oh * p.out_row_stride;
+        T* out_rows =
+            out_ptr + n * OD * out_d_stride + od * out_d_stride + pc.oh * p.out_row_stride;
 
         const int64_t rows_here = std::min<int64_t>(4, OH - pc.oh);
         const int64_t blk0 = cc * blocks_per;
@@ -332,24 +341,24 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
                 // row table is built from `in_img`, which serves every tap.
                 const int64_t co = c0 + seg_off[s];
                 const T* in_blk = in_img + co;
-                const T* w_blk  = w_ptr + co;
-                const T* b_blk  = b_ptr ? b_ptr + co : nullptr;
+                const T* w_blk = w_ptr + co;
+                const T* b_blk = b_ptr ? b_ptr + co : nullptr;
                 // The short last group runs as one call at its own height
                 // rather than one call per row: on a 7-row plane the tail is 3
                 // of the 7 rows, and at R = 1 a row is a quarter of the ILP and
                 // shares no input row with its neighbour.
                 if (rows_here == 4) {
                     k::dwconv_channel_last<4>(out_rows + co, in_blk, w_blk, b_blk, pc,
-                                      attrs.epilogue, add_to, pre_act, seg_lanes[s]);
+                                              attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 } else if (rows_here == 3) {
                     k::dwconv_channel_last<3>(out_rows + co, in_blk, w_blk, b_blk, pc,
-                                      attrs.epilogue, add_to, pre_act, seg_lanes[s]);
+                                              attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 } else if (rows_here == 2) {
                     k::dwconv_channel_last<2>(out_rows + co, in_blk, w_blk, b_blk, pc,
-                                      attrs.epilogue, add_to, pre_act, seg_lanes[s]);
+                                              attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 } else {
                     k::dwconv_channel_last<1>(out_rows + co, in_blk, w_blk, b_blk, pc,
-                                      attrs.epilogue, add_to, pre_act, seg_lanes[s]);
+                                              attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 }
             }
         }
@@ -366,19 +375,18 @@ void dwconv_channel_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
 
 template <typename InT, typename OutT>
 Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx)
+                                      std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& input  = inputs[0];
+    const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
     NNOPS_ASSERT(!has_bias || inputs[2].data_type() == DataType::f32);
     // At most one of the two: the pre-activation order folds the destination
     // into the accumulator, so nothing is left for the post-epilogue add.
     const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
-    const bool add_to  = attrs.add_to && !pre_act;
+    const bool add_to = attrs.add_to && !pre_act;
 
-    const int64_t rank  = input.rank();
+    const int64_t rank = input.rank();
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
 
     const int64_t N = input.shape(0);
@@ -392,26 +400,27 @@ Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, Tens
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    if (attrs.kernel_size[0] * attrs.kernel_size[1] * attrs.kernel_size[2] >
-        k::kMaxLastQuantTaps) {
-        return Status::unsupported;   // the staging buffer is sized for 9x9x9
+    if (attrs.kernel_size[0] * attrs.kernel_size[1] * attrs.kernel_size[2] > k::kMaxLastQuantTaps) {
+        return Status::unsupported; // the staging buffer is sized for 9x9x9
     }
 
-    const auto& in_qp  = input.quant_params();
+    const auto& in_qp = input.quant_params();
     const auto& out_qp = output.quant_params();
-    const auto& w_qp   = weight.quant_params();
-    if (w_qp.granularity != QuantGranularity::PerChannel ||
-        w_qp.scale_data == nullptr) {
+    const auto& w_qp = weight.quant_params();
+    if (w_qp.granularity != QuantGranularity::PerChannel || w_qp.scale_data == nullptr) {
         return Status::invalid_argument;
     }
-    const float in_scale  = in_qp.scale;
-    const float in_zero   = static_cast<float>(in_qp.zero_point);
+    const float in_scale = in_qp.scale;
+    const float in_zero = static_cast<float>(in_qp.zero_point);
     const float out_scale = out_qp.scale;
-    const float out_zero  = static_cast<float>(out_qp.zero_point);
+    const float out_zero = static_cast<float>(out_qp.zero_point);
 
     k::DwConvParams p{};
-    p.ID = ID; p.IH = IH; p.IW = IW;
-    p.OH = OH; p.OW = OW;
+    p.ID = ID;
+    p.IH = IH;
+    p.IW = IW;
+    p.OH = OH;
+    p.OW = OW;
     p.KD = attrs.kernel_size[0];
     p.KH = attrs.kernel_size[1];
     p.KW = attrs.kernel_size[2];
@@ -425,20 +434,20 @@ Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, Tens
     p.PH = attrs.padding[1];
     p.PW = attrs.padding[2];
     p.out_row_stride = output.row_stride_elems();
-    p.in_row_stride  = input.row_stride_elems();
-    p.in_d_stride    = IH * p.in_row_stride;
-    p.pix_stride     = C;
-    p.w_tap_stride   = C;   // the raw HWCM filter is [tap][C]
+    p.in_row_stride = input.row_stride_elems();
+    p.in_d_stride = IH * p.in_row_stride;
+    p.pix_stride = C;
+    p.w_tap_stride = C; // the raw HWCM filter is [tap][C]
 
     auto* out_ptr = output.ptr<OutT>();
     const auto* in_ptr = input.ptr<InT>();
-    const auto* w_ptr  = weight.ptr<InT>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<float>() : nullptr;
+    const auto* w_ptr = weight.ptr<InT>();
+    const auto* b_ptr = has_bias ? inputs[2].ptr<float>() : nullptr;
 
     const int64_t out_d_stride = OH * p.out_row_stride;
 
     const int64_t hgroups = (OH + 3) / 4;
-    const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH;  // rows a group reads
+    const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH; // rows a group reads
     constexpr int64_t kStripBytes = 128 * 1024;
     int64_t strip = OW;
     {
@@ -449,8 +458,8 @@ Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, Tens
             strip = std::clamp<int64_t>(w & ~int64_t{15}, 16, OW);
         }
     }
-    const int64_t strips  = (OW + strip - 1) / strip;
-    const int64_t groups  = N * OD * hgroups * strips;
+    const int64_t strips = (OW + strip - 1) / strip;
+    const int64_t groups = N * OD * hgroups * strips;
     const int64_t nt = ctx.cpu.thread_count();
     int64_t cchunks = 1;
     if (groups < nt && nblocks > 1) {
@@ -460,11 +469,11 @@ Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, Tens
 
     ctx.cpu.run(0, groups * cchunks, [&](int64_t tid) {
         const int64_t cc = tid % cchunks;
-        const int64_t g  = tid / cchunks;
+        const int64_t g = tid / cchunks;
         const int64_t st = g % strips;
         const int64_t hg = (g / strips) % hgroups;
         const int64_t od = (g / (strips * hgroups)) % OD;
-        const int64_t n  = g / (strips * hgroups * OD);
+        const int64_t n = g / (strips * hgroups * OD);
 
         k::DwConvParams pc = p;
         pc.od = od;
@@ -473,8 +482,8 @@ Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, Tens
         pc.ow_end = std::min(pc.ow0 + strip, OW);
 
         const InT* in_img = in_ptr + n * ID * p.in_d_stride;
-        OutT* out_rows = out_ptr + n * OD * out_d_stride + od * out_d_stride
-                       + pc.oh * p.out_row_stride;
+        OutT* out_rows =
+            out_ptr + n * OD * out_d_stride + od * out_d_stride + pc.oh * p.out_row_stride;
 
         const int64_t rows_here = std::min<int64_t>(4, OH - pc.oh);
         const int64_t blk0 = cc * blocks_per;
@@ -483,28 +492,27 @@ Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, Tens
             const int64_t c0 = blk * 8;
             const int64_t lanes = std::min<int64_t>(8, C - c0);
             const InT* in_blk = in_img + c0;
-            const InT* w_blk  = w_ptr + c0;
+            const InT* w_blk = w_ptr + c0;
             const float* b_blk = b_ptr ? b_ptr + c0 : nullptr;
             const float* ws = w_qp.scale_data + c0;
-            const int32_t* wz = w_qp.zero_point_data ? w_qp.zero_point_data + c0
-                                                     : nullptr;
+            const int32_t* wz = w_qp.zero_point_data ? w_qp.zero_point_data + c0 : nullptr;
             // One call at the short group's own height, as in the f32 driver.
             if (rows_here == 4) {
                 k::dwconv_channel_last_quant<4, InT, OutT>(
-                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
-                    add_to, pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
+                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue, add_to,
+                    pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             } else if (rows_here == 3) {
                 k::dwconv_channel_last_quant<3, InT, OutT>(
-                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
-                    add_to, pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
+                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue, add_to,
+                    pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             } else if (rows_here == 2) {
                 k::dwconv_channel_last_quant<2, InT, OutT>(
-                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
-                    add_to, pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
+                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue, add_to,
+                    pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             } else {
                 k::dwconv_channel_last_quant<1, InT, OutT>(
-                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
-                    add_to, pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
+                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue, add_to,
+                    pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             }
         }
     });
@@ -515,19 +523,16 @@ Status dwconv_channel_last_quant_impl(const DepthwiseConvAttributes& attrs, Tens
 // Entry point with dtype dispatch
 // ============================================================
 
-Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         void* /*workspace*/)
+Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs, TensorView& output,
+                          std::span<const TensorView> inputs, const ComputeContext& ctx,
+                          void* /*workspace*/)
 {
     const auto dtype = inputs[0].data_type();
     const auto odtype = output.data_type();
 
     // Quantized depthwise conv lives on the channel lane: its dequantize-on-load
     // kernels read a channel vector, which a channel-first plane does not have.
-    if (!is_channel_last(inputs[0].layout()) &&
-        (dtype == DataType::s8 || dtype == DataType::u8)) {
+    if (!is_channel_last(inputs[0].layout()) && (dtype == DataType::s8 || dtype == DataType::u8)) {
         return Status::unsupported;
     }
 
@@ -578,8 +583,8 @@ Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
         return Status::ok;
 #endif
     default:
-        return Status::unsupported;   // Channel-first has no quantized route
+        return Status::unsupported; // Channel-first has no quantized route
     }
 }
 
-}  // namespace nnops::backend::cpu
+} // namespace nnops::backend::cpu

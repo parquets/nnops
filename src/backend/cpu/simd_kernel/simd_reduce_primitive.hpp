@@ -30,43 +30,32 @@ using namespace simd;
 // ============================================================
 
 struct ReduceAdd {
-    template <typename P>
-    static auto vec_identity(const P* p) { return v_zero(p); }
-    template <typename V>
-    static V combine(V a, V b) { return v_add(a, b); }
-    template <typename V>
-    static float horizontal(V v) { return v_reduce_sum(v); }
+    template <typename P> static auto vec_identity(const P* p) { return v_zero(p); }
+    template <typename V> static V combine(V a, V b) { return v_add(a, b); }
+    template <typename V> static float horizontal(V v) { return v_reduce_sum(v); }
     static float scalar_identity() { return 0.0f; }
     static float combine_scalar(float a, float b) { return a + b; }
 };
 
 struct ReduceMax {
-    template <typename P>
-    static auto vec_identity(const P* p) {
+    template <typename P> static auto vec_identity(const P* p)
+    {
         return v_set1(p, -std::numeric_limits<float>::infinity());
     }
-    template <typename V>
-    static V combine(V a, V b) { return v_max(a, b); }
-    template <typename V>
-    static float horizontal(V v) { return v_reduce_max(v); }
-    static float scalar_identity() {
-        return -std::numeric_limits<float>::infinity();
-    }
+    template <typename V> static V combine(V a, V b) { return v_max(a, b); }
+    template <typename V> static float horizontal(V v) { return v_reduce_max(v); }
+    static float scalar_identity() { return -std::numeric_limits<float>::infinity(); }
     static float combine_scalar(float a, float b) { return a > b ? a : b; }
 };
 
 struct ReduceMin {
-    template <typename P>
-    static auto vec_identity(const P* p) {
+    template <typename P> static auto vec_identity(const P* p)
+    {
         return v_set1(p, std::numeric_limits<float>::infinity());
     }
-    template <typename V>
-    static V combine(V a, V b) { return v_min(a, b); }
-    template <typename V>
-    static float horizontal(V v) { return v_reduce_min(v); }
-    static float scalar_identity() {
-        return std::numeric_limits<float>::infinity();
-    }
+    template <typename V> static V combine(V a, V b) { return v_min(a, b); }
+    template <typename V> static float horizontal(V v) { return v_reduce_min(v); }
+    static float scalar_identity() { return std::numeric_limits<float>::infinity(); }
     static float combine_scalar(float a, float b) { return a < b ? a : b; }
 };
 
@@ -74,8 +63,7 @@ struct ReduceMin {
 // Contiguous row reduction
 // ============================================================
 
-template <typename T, typename Op>
-inline float row_reduce(const T* x, int64_t n)
+template <typename T, typename Op> inline float row_reduce(const T* x, int64_t n)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
@@ -111,8 +99,7 @@ inline float row_reduce(const T* x, int64_t n)
     return s;
 }
 
-template <typename T>
-inline std::pair<float, float> row_reduce_sum_sq(const T* x, int64_t n)
+template <typename T> inline std::pair<float, float> row_reduce_sum_sq(const T* x, int64_t n)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
@@ -144,8 +131,7 @@ inline std::pair<float, float> row_reduce_sum_sq(const T* x, int64_t n)
             v_sum_sq3 = v_fmadd(v3, v3, v_sum_sq3);
         }
         auto v_sum = v_add(v_add(v_sum0, v_sum1), v_add(v_sum2, v_sum3));
-        auto v_sum_sq = v_add(v_add(v_sum_sq0, v_sum_sq1),
-                              v_add(v_sum_sq2, v_sum_sq3));
+        auto v_sum_sq = v_add(v_add(v_sum_sq0, v_sum_sq1), v_add(v_sum_sq2, v_sum_sq3));
 
         auto v_sum4 = v_zero(x);
         auto v_sum_sq4 = v_zero(x);
@@ -181,4 +167,4 @@ inline std::pair<float, float> row_reduce_sum_sq(const T* x, int64_t n)
     return {sum, sum_sq};
 }
 
-}  // namespace nnops::kernel
+} // namespace nnops::kernel

@@ -80,8 +80,8 @@ __device__ inline int tgcd(int a, int b)
 /// store helpers already understand, plus the two base offsets the class moves.
 struct TClass {
     ConvParams q;
-    int64_t out_off = 0;   ///< oh0·out_h + ow0·out_w of the class's first output
-    int64_t w_off = 0;     ///< k0h·w_kh + k0w·w_kw, the class's first tap
+    int64_t out_off = 0; ///< oh0·out_h + ow0·out_w of the class's first output
+    int64_t w_off = 0;   ///< k0h·w_kh + k0w·w_kw, the class's first tap
     bool empty = true;
 };
 
@@ -105,12 +105,18 @@ __device__ inline TClass tconv_class(const ConvParams& p, int cls)
     int k0h = -1, k0w = -1;
     if (ch % gh == 0) {
         for (int k = 0; k < p.sh; ++k) {
-            if ((k * p.dh) % p.sh == ch) { k0h = k; break; }
+            if ((k * p.dh) % p.sh == ch) {
+                k0h = k;
+                break;
+            }
         }
     }
     if (cw % gw == 0) {
         for (int k = 0; k < p.sw; ++k) {
-            if ((k * p.dw) % p.sw == cw) { k0w = k; break; }
+            if ((k * p.dw) % p.sw == cw) {
+                k0w = k;
+                break;
+            }
         }
     }
     const int steph = p.sh / gh;
@@ -148,8 +154,8 @@ __device__ inline TClass tconv_class(const ConvParams& p, int cls)
     c.q.out_h = p.out_h * p.sh;
     c.q.out_w = p.out_w * p.sw;
 
-    c.out_off = int64_t(ch - p.ph + p.sh * m_lo_h) * p.out_h +
-                int64_t(cw - p.pw + p.sw * m_lo_w) * p.out_w;
+    c.out_off =
+        int64_t(ch - p.ph + p.sh * m_lo_h) * p.out_h + int64_t(cw - p.pw + p.sw * m_lo_w) * p.out_w;
     c.w_off = int64_t(k0h > 0 ? k0h : 0) * p.w_kh + int64_t(k0w > 0 ? k0w : 0) * p.w_kw;
     return c;
 }
@@ -158,21 +164,25 @@ __device__ inline TClass tconv_class(const ConvParams& p, int cls)
 /// the pre-activation form folds the residual into the sum, the default one
 /// lands after the activation.
 template <class Elem>
-__device__ inline void tconv_store(const ConvParams& p, Elem* dst, float v, int n,
-                                   const Elem* bias)
+__device__ inline void tconv_store(const ConvParams& p, Elem* dst, float v, int n, const Elem* bias)
 {
-    if (bias != nullptr) { v += gemm_to_float(bias[n]); }
-    if (p.add_to && p.pre_act) { v += float(*dst); }
+    if (bias != nullptr) {
+        v += gemm_to_float(bias[n]);
+    }
+    if (p.add_to && p.pre_act) {
+        v += float(*dst);
+    }
     v = fminf(fmaxf(v, p.min_clip), p.max_clip);
     v = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, v);
-    if (p.add_to && !p.pre_act) { v += float(*dst); }
+    if (p.add_to && !p.pre_act) {
+        v += float(*dst);
+    }
     *dst = Elem(v);
 }
 
 /// Depthwise route, in depthwise_transpose_conv.cu. Returns false when the
 /// geometry or the grid does not fit that route, and the caller falls back.
-bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max,
-                                     bool channel_last, DataType dtype,
-                                     cudaStream_t stream);
+bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max, bool channel_last,
+                                     DataType dtype, cudaStream_t stream);
 
-}  // namespace nnops::backend::cuda::tconv
+} // namespace nnops::backend::cuda::tconv

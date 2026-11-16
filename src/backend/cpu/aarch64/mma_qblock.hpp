@@ -81,7 +81,8 @@ struct Q4Block {
 
     /// Decode one block into eight 4-lane vectors: values 4j..4j+3 land in
     /// v[j]. Same arithmetic as decode_q4_1_block, one rounding fewer.
-    static inline void decode_v(const uint8_t* p, float32x4_t v[8]) noexcept {
+    static inline void decode_v(const uint8_t* p, float32x4_t v[8]) noexcept
+    {
         uint16_t d_bits, m_bits;
         std::memcpy(&d_bits, p + 0, sizeof(d_bits));
         std::memcpy(&m_bits, p + 2, sizeof(m_bits));
@@ -98,16 +99,16 @@ struct Q4Block {
             r0 = vfmaq_f32(vm, vcvtq_f32_u32(vmovl_u16(vget_low_u16(w))), vd);
             r1 = vfmaq_f32(vm, vcvtq_f32_u32(vmovl_u16(vget_high_u16(w))), vd);
         };
-        conv(vget_low_u8(lo),  v[0], v[1]);   // values  0..7
-        conv(vget_high_u8(lo), v[2], v[3]);   // values  8..15
-        conv(vget_low_u8(hi),  v[4], v[5]);   // values 16..23
-        conv(vget_high_u8(hi), v[6], v[7]);   // values 24..31
+        conv(vget_low_u8(lo), v[0], v[1]);  // values  0..7
+        conv(vget_high_u8(lo), v[2], v[3]); // values  8..15
+        conv(vget_low_u8(hi), v[4], v[5]);  // values 16..23
+        conv(vget_high_u8(hi), v[6], v[7]); // values 24..31
     }
 
     /// The trailing partial block, through the portable decoder: at most 31
     /// values, so the vector path above never sees it.
-    template <class T>
-    static inline void decode(const uint8_t* p, T* out) noexcept {
+    template <class T> static inline void decode(const uint8_t* p, T* out) noexcept
+    {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> ||
                           std::is_same_v<T, bfloat16>,
                       "decode: T must be float, half or bfloat16");
@@ -138,24 +139,28 @@ static_assert(Q4Block::block_elems == 32,
 /// vector instead of a dense f32 copy of A.
 
 inline float32x4_t qblock_load4(const float* p) noexcept { return vld1q_f32(p); }
-inline float32x4_t qblock_load4(const half* p) noexcept {
+inline float32x4_t qblock_load4(const half* p) noexcept
+{
     return vcvt_f32_f16(vld1_f16(reinterpret_cast<const float16_t*>(p)));
 }
 /// bf16 is the top half of f32: widening is a left shift.
-inline float32x4_t qblock_load4(const bfloat16* p) noexcept {
+inline float32x4_t qblock_load4(const bfloat16* p) noexcept
+{
     const uint16x4_t u = vld1_u16(reinterpret_cast<const uint16_t*>(p));
     return vreinterpretq_f32_u32(vshll_n_u16(u, 16));
 }
 
 inline void qblock_store4(float* p, float32x4_t v) noexcept { vst1q_f32(p, v); }
-inline void qblock_store4(half* p, float32x4_t v) noexcept {
+inline void qblock_store4(half* p, float32x4_t v) noexcept
+{
     vst1_f16(reinterpret_cast<float16_t*>(p), vcvt_f16_f32(v));
 }
 /// Round-to-nearest-even, the same narrowing `pack_bf16.hpp` uses.
-inline void qblock_store4(bfloat16* p, float32x4_t v) noexcept {
+inline void qblock_store4(bfloat16* p, float32x4_t v) noexcept
+{
     uint32x4_t u = vreinterpretq_u32_f32(v);
-    u = vaddq_u32(u, vaddq_u32(vdupq_n_u32(0x7FFFu),
-                               vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(1u))));
+    u = vaddq_u32(u,
+                  vaddq_u32(vdupq_n_u32(0x7FFFu), vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(1u))));
     vst1_u16(reinterpret_cast<uint16_t*>(p), vshrn_n_u32(u, 16));
 }
 
@@ -165,23 +170,21 @@ inline float qblock_load1(const bfloat16* p) noexcept { return *p; }
 
 inline void qblock_store1(float* p, float v) noexcept { *p = v; }
 inline void qblock_store1(half* p, float v) noexcept { *p = float_to_half(v); }
-inline void qblock_store1(bfloat16* p, float v) noexcept {
-    *p = float_to_bfloat16(v);
-}
+inline void qblock_store1(bfloat16* p, float v) noexcept { *p = float_to_bfloat16(v); }
 
 /// One trans row's k step: its eight A vectors against the eight decoded ones,
 /// folded into four interleaved chains.
-#define NNOPS_QBLOCK_DOT_ROW(A0, A1, A2, A3, ROW)                         \
-    do {                                                                  \
-        const AC* a = A + static_cast<int64_t>(ROW) * lda + k;            \
-        A0 = vfmaq_f32(A0, b0, qblock_load4(a + 0));                      \
-        A0 = vfmaq_f32(A0, b4, qblock_load4(a + 16));                     \
-        A1 = vfmaq_f32(A1, b1, qblock_load4(a + 4));                      \
-        A1 = vfmaq_f32(A1, b5, qblock_load4(a + 20));                     \
-        A2 = vfmaq_f32(A2, b2, qblock_load4(a + 8));                      \
-        A2 = vfmaq_f32(A2, b6, qblock_load4(a + 24));                     \
-        A3 = vfmaq_f32(A3, b3, qblock_load4(a + 12));                     \
-        A3 = vfmaq_f32(A3, b7, qblock_load4(a + 28));                     \
+#define NNOPS_QBLOCK_DOT_ROW(A0, A1, A2, A3, ROW)              \
+    do {                                                       \
+        const AC* a = A + static_cast<int64_t>(ROW) * lda + k; \
+        A0 = vfmaq_f32(A0, b0, qblock_load4(a + 0));           \
+        A0 = vfmaq_f32(A0, b4, qblock_load4(a + 16));          \
+        A1 = vfmaq_f32(A1, b1, qblock_load4(a + 4));           \
+        A1 = vfmaq_f32(A1, b5, qblock_load4(a + 20));          \
+        A2 = vfmaq_f32(A2, b2, qblock_load4(a + 8));           \
+        A2 = vfmaq_f32(A2, b6, qblock_load4(a + 24));          \
+        A3 = vfmaq_f32(A3, b3, qblock_load4(a + 12));          \
+        A3 = vfmaq_f32(A3, b7, qblock_load4(a + 28));          \
     } while (0)
 
 // =========================================================================
@@ -194,13 +197,11 @@ inline void qblock_store1(bfloat16* p, float v) noexcept {
 /// @param A A[m0][0], row stride @p lda.
 /// @param B first block of the batch element's [N][K] stream.
 template <class BQ, class AC, int MR, bool ZERO>
-void mma_qblock_trans(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc,
-                      const AC* NNOPS_RESTRICT A, int lda,
-                      const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks,
-                      int n_start, float alpha, float clamp_min,
-                      float clamp_max) noexcept {
-    static_assert(MR >= 1 && MR <= BQ::panel_trans,
-                  "trans qblock kernel: MR in [1, panel_trans]");
+void mma_qblock_trans(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc, const AC* NNOPS_RESTRICT A,
+                      int lda, const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks, int n_start,
+                      float alpha, float clamp_min, float clamp_max) noexcept
+{
+    static_assert(MR >= 1 && MR <= BQ::panel_trans, "trans qblock kernel: MR in [1, panel_trans]");
 
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(BQ::block_bytes);
     const uint8_t* src = B + static_cast<int64_t>(n_start) * row_bytes;
@@ -221,43 +222,63 @@ void mma_qblock_trans(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc,
             const float32x4_t b4 = bv[4], b5 = bv[5], b6 = bv[6], b7 = bv[7];
 
             NNOPS_QBLOCK_DOT_ROW(q00, q01, q02, q03, 0);
-            if constexpr (MR > 1) { NNOPS_QBLOCK_DOT_ROW(q10, q11, q12, q13, 1); }
-            if constexpr (MR > 2) { NNOPS_QBLOCK_DOT_ROW(q20, q21, q22, q23, 2); }
-            if constexpr (MR > 3) { NNOPS_QBLOCK_DOT_ROW(q30, q31, q32, q33, 3); }
+            if constexpr (MR > 1) {
+                NNOPS_QBLOCK_DOT_ROW(q10, q11, q12, q13, 1);
+            }
+            if constexpr (MR > 2) {
+                NNOPS_QBLOCK_DOT_ROW(q20, q21, q22, q23, 2);
+            }
+            if constexpr (MR > 3) {
+                NNOPS_QBLOCK_DOT_ROW(q30, q31, q32, q33, 3);
+            }
         }
 
         // Trailing partial block: scalar, at most 31 values.
         float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
         if (k < kc) {
             float vals[BQ::block_elems];
-            BQ::template decode<float>(
-                src + static_cast<int64_t>(nblk) * BQ::block_bytes, vals);
+            BQ::template decode<float>(src + static_cast<int64_t>(nblk) * BQ::block_bytes, vals);
             const int rem = kc - k;
             for (int i = 0; i < rem; ++i) {
                 const int kk = k + i;
                 const float bv = vals[i];
                 t0 += bv * qblock_load1(A + kk);
-                if constexpr (MR > 1) { t1 += bv * qblock_load1(A + static_cast<int64_t>(lda) + kk); }
-                if constexpr (MR > 2) { t2 += bv * qblock_load1(A + 2 * static_cast<int64_t>(lda) + kk); }
-                if constexpr (MR > 3) { t3 += bv * qblock_load1(A + 3 * static_cast<int64_t>(lda) + kk); }
+                if constexpr (MR > 1) {
+                    t1 += bv * qblock_load1(A + static_cast<int64_t>(lda) + kk);
+                }
+                if constexpr (MR > 2) {
+                    t2 += bv * qblock_load1(A + 2 * static_cast<int64_t>(lda) + kk);
+                }
+                if constexpr (MR > 3) {
+                    t3 += bv * qblock_load1(A + 3 * static_cast<int64_t>(lda) + kk);
+                }
             }
         }
 
         AC* c = C + n;
-        auto finish = [&](int row, float32x4_t a0, float32x4_t a1,
-                          float32x4_t a2, float32x4_t a3, float tail) {
+        auto finish = [&](int row, float32x4_t a0, float32x4_t a1, float32x4_t a2, float32x4_t a3,
+                          float tail) {
             AC* cp = c + static_cast<int64_t>(row) * ldc;
-            float v = vaddvq_f32(a0) + vaddvq_f32(a1) + vaddvq_f32(a2) +
-                      vaddvq_f32(a3) + tail;
-            if (alpha != 1.0f) { v *= alpha; }
-            if constexpr (!ZERO) { v += qblock_load1(cp); }
+            float v = vaddvq_f32(a0) + vaddvq_f32(a1) + vaddvq_f32(a2) + vaddvq_f32(a3) + tail;
+            if (alpha != 1.0f) {
+                v *= alpha;
+            }
+            if constexpr (!ZERO) {
+                v += qblock_load1(cp);
+            }
             qblock_store1(cp, std::min(std::max(v, clamp_min), clamp_max));
         };
 
         finish(0, q00, q01, q02, q03, t0);
-        if constexpr (MR > 1) { finish(1, q10, q11, q12, q13, t1); }
-        if constexpr (MR > 2) { finish(2, q20, q21, q22, q23, t2); }
-        if constexpr (MR > 3) { finish(3, q30, q31, q32, q33, t3); }
+        if constexpr (MR > 1) {
+            finish(1, q10, q11, q12, q13, t1);
+        }
+        if constexpr (MR > 2) {
+            finish(2, q20, q21, q22, q23, t2);
+        }
+        if constexpr (MR > 3) {
+            finish(3, q30, q31, q32, q33, t3);
+        }
     }
 }
 
@@ -272,11 +293,10 @@ void mma_qblock_trans(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc,
 /// @param n_start first column of the tile; must be a multiple of 32, so each
 ///                decoded block is one panel.
 template <class BQ, class AC, int MR, bool ZERO>
-void mma_qblock_copy(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc,
-                     const AC* NNOPS_RESTRICT A, int lda,
-                     const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks,
-                     int n_start, float alpha, float clamp_min,
-                     float clamp_max) noexcept {
+void mma_qblock_copy(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc, const AC* NNOPS_RESTRICT A,
+                     int lda, const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks, int n_start,
+                     float alpha, float clamp_min, float clamp_max) noexcept
+{
     static_assert(MR == 1 || MR == 2, "copy qblock kernel: MR in {1, 2}");
 
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(BQ::block_bytes);
@@ -292,24 +312,25 @@ void mma_qblock_copy(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc,
         const int width = std::min(BQ::block_elems, nc - n);
         const int64_t blk = blk0 + (n / BQ::block_elems);
 
-        float32x4_t r0[8] = {vzero, vzero, vzero, vzero,
-                             vzero, vzero, vzero, vzero};
-        float32x4_t r1[8] = {vzero, vzero, vzero, vzero,
-                             vzero, vzero, vzero, vzero};
+        float32x4_t r0[8] = {vzero, vzero, vzero, vzero, vzero, vzero, vzero, vzero};
+        float32x4_t r1[8] = {vzero, vzero, vzero, vzero, vzero, vzero, vzero, vzero};
 
         for (int k = 0; k < kc; ++k) {
-            const uint8_t* src = B + static_cast<int64_t>(k) * row_bytes
-                               + blk * static_cast<int64_t>(BQ::block_bytes);
+            const uint8_t* src = B + static_cast<int64_t>(k) * row_bytes +
+                                 blk * static_cast<int64_t>(BQ::block_bytes);
             float32x4_t bv[8];
             BQ::decode_v(src, bv);
 
             const float32x4_t va = vdupq_n_f32(qblock_load1(A + k));
-            for (int j = 0; j < 8; ++j) { r0[j] = vfmaq_f32(r0[j], va, bv[j]); }
+            for (int j = 0; j < 8; ++j) {
+                r0[j] = vfmaq_f32(r0[j], va, bv[j]);
+            }
 
             if constexpr (MR > 1) {
-                const float32x4_t vb = vdupq_n_f32(
-                    qblock_load1(A + static_cast<int64_t>(lda) + k));
-                for (int j = 0; j < 8; ++j) { r1[j] = vfmaq_f32(r1[j], vb, bv[j]); }
+                const float32x4_t vb = vdupq_n_f32(qblock_load1(A + static_cast<int64_t>(lda) + k));
+                for (int j = 0; j < 8; ++j) {
+                    r1[j] = vfmaq_f32(r1[j], vb, bv[j]);
+                }
             }
         }
 
@@ -327,22 +348,32 @@ void mma_qblock_copy(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc,
             } else {
                 float tmp[BQ::block_elems];
                 float* tp = tmp;
-                vst1q_f32(tp + 0,  q[0]); vst1q_f32(tp + 4,  q[1]);
-                vst1q_f32(tp + 8,  q[2]); vst1q_f32(tp + 12, q[3]);
-                vst1q_f32(tp + 16, q[4]); vst1q_f32(tp + 20, q[5]);
-                vst1q_f32(tp + 24, q[6]); vst1q_f32(tp + 28, q[7]);
+                vst1q_f32(tp + 0, q[0]);
+                vst1q_f32(tp + 4, q[1]);
+                vst1q_f32(tp + 8, q[2]);
+                vst1q_f32(tp + 12, q[3]);
+                vst1q_f32(tp + 16, q[4]);
+                vst1q_f32(tp + 20, q[5]);
+                vst1q_f32(tp + 24, q[6]);
+                vst1q_f32(tp + 28, q[7]);
                 for (int i = 0; i < width; ++i) {
                     float v = tmp[i];
-                    if (scaled) { v *= alpha; }
-                    if constexpr (!ZERO) { v += qblock_load1(cp + i); }
+                    if (scaled) {
+                        v *= alpha;
+                    }
+                    if constexpr (!ZERO) {
+                        v += qblock_load1(cp + i);
+                    }
                     qblock_store1(cp + i, std::min(std::max(v, clamp_min), clamp_max));
                 }
             }
         };
 
         emit(0, r0);
-        if constexpr (MR > 1) { emit(1, r1); }
+        if constexpr (MR > 1) {
+            emit(1, r1);
+        }
     }
 }
 
-}  // namespace nnops::backend::cpu::aarch64
+} // namespace nnops::backend::cpu::aarch64
