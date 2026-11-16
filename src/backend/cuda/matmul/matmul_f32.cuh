@@ -681,7 +681,9 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void manual_gemm_f_kernel
 }
 
 /// Sum the split-K planes and write the destination, one thread per element.
-__global__ void manual_gemm_f_reduce_kernel(ManualFParams p)
+/// Internal linkage: this header is included by more than one translation unit,
+/// and a kernel has no `inline`.
+static __global__ void manual_gemm_f_reduce_kernel(ManualFParams p)
 {
     const int64_t plane = int64_t(p.m) * p.n;
     const int splits = int(gridDim.y);
