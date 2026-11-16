@@ -1401,7 +1401,8 @@ __global__ __launch_bounds__(ConvTileI8::threads) void conv_gemm_i8_kernel(ConvP
         const int32_t zpw = p.zp_w != nullptr ? p.zp_w[gi + n] : p.zp_w_scalar;
         int32_t v = int32_t(tCrC(i));
         v -= p.zp_x * p.r_b[gi + n];
-        v -= (s_ra[m] - K * p.zp_x) * zpw;
+        // `m` is the global pixel; the per-pixel sums are indexed by tile row.
+        v -= (s_ra[m - m0] - K * p.zp_x) * zpw;
 
         switch (kind) {
         case I8OutKind::S32:

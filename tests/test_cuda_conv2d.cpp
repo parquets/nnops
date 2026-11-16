@@ -226,6 +226,10 @@ NNOPS_TEST(cuda_conv2d_i8) {
         {1, 16, 8, 8, 8, 3, 3, 1, 1, 2, 1, 1, 1, 1, DataType::s8, DataType::f16, true, true, 125, true},
         // Groups split ICG to 8, so this one takes the scalar channel-last fill.
         {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 2, DataType::u8, DataType::s8, true, true, 127, true},
+        // Planes wider than the 64-pixel tile, on both fills: the per-pixel
+        // activation sums are shared memory indexed by tile row.
+        {1, 16, 16, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::s8, true, true, 133, true},
+        {1, 16, 12, 12, 16, 3, 3, 1, 1, 1, 1, 1, 1, 2, DataType::u8, DataType::u8, true, true, 137, true},
 
         // Depthwise-shaped groups (IC/G = OC/G = 1) stay on the quantized GEMM.
         {1, 16, 8, 8, 16, 3, 3, 1, 1, 1, 1, 1, 1, 16, DataType::s8, DataType::u8, true, true, 131, true},
