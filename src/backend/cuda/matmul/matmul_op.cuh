@@ -1,4 +1,4 @@
-/// @file gemm_op.cuh
+/// @file matmul_op.cuh
 /// @brief Shared front end of the dense GEMM operators — batch broadcasting,
 ///        the 16 B vectorisable test, and the launch wrapper that turns a
 ///        configured GemmParams into a Status.
@@ -21,6 +21,11 @@ namespace nnops::backend::cuda {
 /// Fill the broadcast batch shape and the per-axis batch strides of every
 /// operand. `c` (and the optional residual `r`) supply their own strides;
 /// a broadcast axis carries stride 0, so every batch slice reads the same data.
+///
+/// The call is refused rather than truncated when it has more than four batch
+/// axes (rank above six) or when the flattened batch outgrows a 16-bit grid
+/// axis: the batch rides blockIdx.z in the tile kernels, multiplied by the k
+/// splits, and blockIdx.y in the split-K reduce pass.
 inline bool gemm_batch_layout(const TensorView& a, const TensorView& b,
                               const TensorView& c, const TensorView* r,
                               GemmParams& p)
@@ -28,9 +33,10 @@ inline bool gemm_batch_layout(const TensorView& a, const TensorView& b,
     const int64_t al = a.rank() - 2;
     const int64_t bl = b.rank() - 2;
     const int64_t rank = std::max<int64_t>(al, bl);
-    if (rank > 4) { return false; }
+    if (rank > kGemmMaxBatchRank) { return false; }
 
     p.batch_rank = static_cast<int>(rank);
+    int64_t count = 1;
     for (int64_t d = 0; d < rank; ++d) {
         const int64_t ai = al - 1 - d;
         const int64_t bi = bl - 1 - d;
@@ -47,7 +53,11 @@ inline bool gemm_batch_layout(const TensorView& a, const TensorView& b,
         p.c_batch[slot] = ci >= 0 ? c.stride_elems(ci) : 0;
         p.r_batch[slot] = (r != nullptr && ci >= 0) ? r->stride_elems(ci) : 0;
 
-        if (p.batch_size[slot] > 65535) { return false; }
+        // Capping each axis first keeps the running product inside int64 and
+        // makes the two checks below the same bound.
+        if (p.batch_size[slot] > kGemmMaxGridAxis) { return false; }
+        count *= p.batch_size[slot];
+        if (count > kGemmMaxGridAxis) { return false; }
     }
     return true;
 }
@@ -77,7 +87,12 @@ inline Status dense_gemm_status(const GemmParams& p, DataType dtype,
         return Status::unsupported;
     }
     if (p.m <= 0 || p.n <= 0 || p.k <= 0) { return Status::unsupported; }
-    if (p.n > 65535) { return Status::unsupported; }
+    // The f32 tile walks the n axis on blockIdx.y, which is 16-bit. 64 is the
+    // narrowest n tile, so this bound covers both of them (and the f16 tile,
+    // whose grid is flat along x, never hits it).
+    if ((int64_t(p.n) + 63) / 64 > kGemmMaxGridAxis) {
+        return Status::unsupported;
+    }
 
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
     if (!dense_gemm_launch(p, elem, transpose_a,

@@ -1352,7 +1352,7 @@ NNOPS_TEST(conv2d_i8_plan) {
     at.add_to = true;
     NNOPS_EXPECT_EQ(plan_of(at).icn_block, 0);
 
-    // An unsupported output dtype is refused too (s32 has no fp epilogue).
+    // An unsupported output dtype is refused too (s32 has no epilogue here).
     Case bad;
     bad.ishape = {1, 4, 7, 7};
     bad.wshape = {6, 4, 3, 3};

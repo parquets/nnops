@@ -42,7 +42,7 @@
 
 #include "common/bench_harness.hpp"
 
-#include "backend/cuda/gemm/cute_gemm.cuh"
+#include "backend/cuda/matmul/cute_gemm.cuh"
 
 #include <algorithm>
 #include <cstdio>

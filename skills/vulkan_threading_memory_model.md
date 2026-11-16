@@ -6,6 +6,7 @@
 
 ## 目录
 
+0. [读前必读：先分清三个词](#0-读前必读先分清三个词)
 1. [Host 端线程模型](#1-host-端线程模型)
 2. [GPU 端执行模型](#2-gpu-端执行模型)
 3. [队列模型与异步计算](#3-队列模型与异步计算)
@@ -17,6 +18,44 @@
 9. [多线程实用模式](#9-多线程实用模式)
 10. [nnops 相关考量](#10-nnops-相关考量)
 11. [快速参考卡片](#11-快速参考卡片)
+
+---
+
+## 0. 读前必读：先分清三个词
+
+本文是进阶内容。如果你还没建立 Vulkan 的对象模型，先读 [Vulkan 零基础入门](vulkan_zero_basics.md)。在进入线程与同步之前，先把这四样东西分清：
+
+| 概念 | 是什么 | CPU/GPU 谁等谁 | 一句话 |
+| --- | --- | --- | --- |
+| `VkCommandBuffer` | 录制下来的一串命令 | — | "脚本"，录制时不执行 |
+| `VkQueue` | 向 GPU 提交工作的单通道 | — | 同一队列内部按提交顺序执行（除非显式并行） |
+| `VkFence` | 一个可查询的"完成"标志 | **CPU 等 GPU** | `vkWaitForFences` → CPU 阻塞到 GPU 完成 |
+| `VkSemaphore` | 队列之间的信号 | **GPU 等 GPU** | 提交时写 `waitSemaphore` / `signalSemaphore` |
+| `vkCmdPipelineBarrier` | GPU 内部阶段间的依赖 | **GPU 内部** | 保证前一个 dispatch 的写对后一个可见 |
+
+### 为什么 Vulkan 需要你自己同步
+
+CUDA 的默认流会隐式串行化，OpenGL 驱动会兜底。Vulkan 不会：
+
+```
+你录制：  dispatch(A)   dispatch(B)        B 读 A 的输出
+你提交：  vkQueueSubmit
+GPU 执行：A 和 B 可能重叠 —— 除非你插了 barrier
+```
+
+- **同一队列内**：提交顺序是执行顺序的**必要不充分**条件。没有 barrier，阶段之间可以重叠。
+- **不同队列间**：完全并行，必须用 semaphore。
+- **CPU 与 GPU 间**：必须用 fence 或 `vkQueueWaitIdle`。
+
+### nnops 目前的简化
+
+nnops 测试环境采用最保守的做法：
+
+```
+录制一整个 command buffer → vkQueueSubmit → vkQueueWaitIdle
+```
+
+队列整个空闲后才读回、回收资源。因此**当前代码里没有显式 barrier 也能正确工作**——代价是完全没有 CPU/GPU 重叠。要理解"为什么以后需要 barrier""多线程录制怎么做""timeline semaphore 怎么替代 fence"，再往下读。
 
 ---
 
@@ -1343,25 +1382,35 @@ void cpu_read_from_ring(PersistentRingBuffer* rb, size_t offset,
 ### 10.1 当前 nnops 的同步模式
 
 ```
-当前 nnops Vulkan 后端的同步模型：
+当前 nnops Vulkan 后端的同步模型（见 tests/common/vulkan_test_helper.hpp）：
 
-每个 operator 调用：
-  vkBeginCommandBuffer(cmd)
-  ├─ vkCmdPipelineBarrier  (buffer ownership transfer, if needed)
-  ├─ vkCmdBindDescriptorSets
-  ├─ vkCmdPushConstants
-  ├─ vkCmdBindPipeline
-  ├─ vkCmdDispatch
-  └─ vkEndCommandBuffer(cmd)
+调用方：
+  vkAllocateCommandBuffers + vkBeginCommandBuffer
+  │
+  ├─ operator compute()
+  │    ├─ vkCmdBindPipeline
+  │    ├─ vkAllocateDescriptorSets / vkUpdateDescriptorSets
+  │    ├─ vkCmdBindDescriptorSets
+  │    ├─ vkCmdPushConstants
+  │    └─ vkCmdDispatch
+  │
+  vkEndCommandBuffer
+  vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE)   // 无 fence
+  vkQueueWaitIdle(queue)                            // 整个队列等空
+  vkFreeCommandBuffers
+  vkResetDescriptorPool(pool, 0)                    // 批量回收描述符集
 
-  vkQueueSubmit(queue, 1, &submit, fence)
-  vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX)
-  vkResetFences(...)
+说明：
+  - 算子只录制，不负责 begin/end/submit；一个 command buffer
+    里可以录制多个算子（测试里通常是"一算子一提交"）。
+  - 代码里没有显式 vkCmdPipelineBarrier：vkQueueWaitIdle 已经
+    把前一批命令完整执行完，跨 dispatch 的内存依赖由队列空闲保证。
+  - 没有 fence：vkQueueWaitIdle 比 fence 更粗暴，但语义足够。
 
 特点：
-  ✅ 简单、正确
-  ⚠️ 每次 dispatch 后全 stall（wait-before-next-op）
-  ⚠️ 无法利用 GPU 流水线并发（dispatch N+1 要等 N 的 readback）
+  ✅ 简单、正确，适合测试
+  ⚠️ 每次提交后 CPU 完全 stall，无法与 GPU 重叠
+  ⚠️ 无法利用 GPU 流水线并发（dispatch N+1 要等 N 完成）
 ```
 
 ### 10.2 可以改进的方向
@@ -1388,7 +1437,7 @@ Shader 内：
 
 Shader 间（Host 端同步）：
   所有 operator 顺序执行
-  fence-stall 保证前一个 dispatch 的内存写入全部可见
+  vkQueueWaitIdle 保证前一个 dispatch 的内存写入全部可见
   → 隐式满足内存模型要求
 
 对 nnops 的意义：

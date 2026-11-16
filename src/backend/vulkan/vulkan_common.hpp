@@ -4,9 +4,10 @@
 ///
 /// A pipeline is cached for the process lifetime under (device, SPIR-V blob,
 /// specialization constants, binding count), since building one is expensive.
-/// Descriptor sets are one-shot: vulkan_record_dispatch allocates one
-/// per call from a caller-owned VkDescriptorPool, so ComputeContext requires
-/// that pool to carry VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT. Every
+/// Descriptor sets are one-shot: vulkan_record_dispatch allocates one per call
+/// from a caller-owned VkDescriptorPool and never frees it individually, so the
+/// caller resets the pool after the work completes (or frees sets individually
+/// if the pool carries VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT). Every
 /// binding is a whole storage buffer; the only runtime parameter is the element
 /// count, pushed as a ComputePushConstants. The caller supplies the device, pool,
 /// command buffer and per-tensor VkBuffers through ComputeContext.

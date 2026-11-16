@@ -20,6 +20,7 @@
 /// Only compiled under NNOPS_HAS_CUDA.
 
 #include "nnops/ops/activation.hpp"
+#include "nnops/detail/bench_knobs.hpp"
 #include "nnops/ops/argminmax.hpp"
 #include "nnops/ops/concat.hpp"
 #include "nnops/ops/conv2d.hpp"
@@ -257,6 +258,57 @@ NNOPS_TEST(cuda_bf16_matmul) {
         run_op_bf16([attrs](Backend be) { return MatMul::create(attrs, be); },
                     std::span<const HostTensor>(in), kTolAbs, kTolRel,
                     "cuda_bf16_matmul_epilogue");
+    }
+}
+
+NNOPS_TEST(cuda_bf16_matmul_ptx) {
+    // The hand-written PTX kernel counts bf16 as its own element type -- same
+    // registers, different mma opcode -- so it is checked on both B layouts and
+    // on a geometry the grid gate would otherwise keep on the CuTe engine.
+    auto& knob = nnops::detail::cuda_ptx_h;
+    const int saved = knob.exchange(1);
+    struct Restore {
+        std::atomic<int>& k;
+        int v;
+        ~Restore() { k.store(v); }
+    } restore{knob, saved};
+
+    {
+        HostTensor a = rnd({512, 96}, true, 17);
+        HostTensor b = rnd({96, 640}, true, 29);
+        const HostTensor in[] = {a, b};
+        run_op_bf16([](Backend be) { return MatMul::create(MatMulAttributes{}, be); },
+                    std::span<const HostTensor>(in), kTolAbs, kTolRel,
+                    "cuda_bf16_matmul_ptx_nn");
+    }
+    {
+        MatMulAttributes attrs;
+        attrs.transpose_b = true;
+        HostTensor a = rnd({512, 96}, false, 17);
+        HostTensor b = rnd({640, 96}, false, 29);
+        const HostTensor in[] = {a, b};
+        run_op_bf16([attrs](Backend be) { return MatMul::create(attrs, be); },
+                    std::span<const HostTensor>(in), kTolAbs, kTolRel,
+                    "cuda_bf16_matmul_ptx_tn_even");
+    }
+    {
+        MatMulAttributes attrs;
+        attrs.transpose_b = true;
+        HostTensor a = rnd({2057, 96}, false, 17);
+        HostTensor b = rnd({4103, 96}, false, 29);
+        const HostTensor in[] = {a, b};
+        run_op_bf16([attrs](Backend be) { return MatMul::create(attrs, be); },
+                    std::span<const HostTensor>(in), kTolAbs, kTolRel,
+                    "cuda_bf16_matmul_ptx_tn");
+    }
+    {
+        LinearAttributes attrs;
+        HostTensor x = rnd({640, 96}, true, 17);
+        HostTensor w = rnd({512, 96}, true, 29);
+        const HostTensor in[] = {x, w};
+        run_op_bf16([attrs](Backend be) { return Linear::create(attrs, be); },
+                    std::span<const HostTensor>(in), kTolAbs, kTolRel,
+                    "cuda_bf16_linear_ptx");
     }
 }
 

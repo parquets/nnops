@@ -1,4 +1,4 @@
-/// @file gemm_tile_f.cuh
+/// @file matmul_tile_f.cuh
 /// @brief The f32 SIMT engine: a 64x128x16 UniversalFMA tile once the grid is
 ///        wide enough to refill the machine, 64x64x16 otherwise, streamed
 ///        through a cp.async pipeline.
@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include "gemm_common.cuh"
+#include "matmul_common.cuh"
 
 #include <cuda_runtime.h>
 

@@ -1,4 +1,4 @@
-/// @file gemm_narrow.cuh
+/// @file matmul_narrow.cuh
 /// @brief The hand-written narrow-m engines: a product of at most sixteen rows
 ///        is a bandwidth problem, and neither tensor-core tile serves it.
 ///
@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "gemm_splitk.cuh"
+#include "matmul_splitk.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>

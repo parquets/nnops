@@ -4,8 +4,15 @@
 
 ---
 
+> **读前提示**：本文假设你已读过 [Vulkan 零基础入门](vulkan_zero_basics.md)，或至少知道「着色器 / 管线 / 布局 / 描述符集 / 推送常量」分别是什么。如果对 `VkPipeline`、`VkPipelineLayout`、`VkDescriptorSetLayout` 三者的关系还没底，请先看本文 [§0](#0-读前必读三个对象到底是什么)，它用 C++ 类比讲清楚这三样东西。
+>
+> 本文只讲 **nnops 实际用到的那一小片 Vulkan**：一个 compute 阶段、一个描述符集、4 字节推送常量、无图形管线、无 WSI。
+
+---
+
 ## 目录
 
+0. [读前必读：三个对象到底是什么](#0-读前必读三个对象到底是什么)
 1. [架构总览](#1-架构总览)
 2. [ComputeContext — 上下文传递](#2-computecontext--上下文传递)
 3. [SpirvBlob — SPIR-V 着色器载体](#3-spirvblob--spir-v-着色器载体)
@@ -20,6 +27,83 @@
 12. [算子实现标准模板](#12-算子实现标准模板)
 13. [数据流全景图](#13-数据流全景图)
 14. [常量与约定](#14-常量与约定)
+15. [延伸阅读](#15-延伸阅读)
+
+---
+
+## 0. 读前必读：三个对象到底是什么
+
+如果你从 CUDA / OpenGL 过来，最容易卡住的不是 API 名字，而是**为什么一个"跑个 kernel"需要三样东西**：`VkDescriptorSetLayout`、`VkPipelineLayout`、`VkPipeline`。这里用一段 C++ 把它们对上号。
+
+### 0.1 一句话类比
+
+```cpp
+// C++ 世界：一个函数 + 一次调用
+void eltwise_kernel(const float* a, const float* b, float* c, int total, int op);
+
+eltwise_kernel(a, b, c, 1000, /*Add*/0);
+```
+
+```cpp
+// Vulkan 世界：把"函数"和"调用"拆成显式对象
+VkPipeline            ← 编译好的 eltwise_kernel（含 op 这个编译期常量）
+VkDescriptorSetLayout ← 参数表类型签名：三个 storage buffer
+VkPipelineLayout      ← 完整调用约定：(三个 buffer) + (4 字节 total)
+VkDescriptorSet       ← 实参：本次的 a、b、c 三个 VkBuffer
+ComputePushConstants  ← 实参：本次的 total
+vkCmdDispatch         ← 真正"调用"
+```
+
+### 0.2 三者关系
+
+```
+        shader 源码                              C++ 侧对象
+┌────────────────────────────┐
+│ layout(set=0, binding=0..2)│───→ VkDescriptorSetLayout ──┐
+└────────────────────────────┘    "参数包里有哪几个槽"      │
+                                                           ├──→ VkPipelineLayout
+┌────────────────────────────┐                            │      "这个管线接受什么"
+│ layout(push_constant)      │───→ VkPushConstantRange ────┘
+│   uniform { int total; }   │
+└────────────────────────────┘
+
+                                              │ 建管线时传入
+                                              ▼
+                                    VkComputePipelineCreateInfo
+                                              │
+                                              ▼
+                                         VkPipeline
+                                    "编译好的、op 已固化"
+```
+
+### 0.3 为什么不把三者合成一个对象
+
+| 对象 | 回答的问题 | 复用粒度 | 类比 |
+| --- | --- | --- | --- |
+| `VkDescriptorSetLayout` | "参数包长什么样？" | 同一套 binding 可被多条管线共享 | `using Fn = void(*)(const float*, const float*, float*, int);` |
+| `VkPipelineLayout` | "这条管线接受哪些参数包 + 哪些推送常量？" | 同签名可被多条管线共享 | 函数原型 / ABI |
+| `VkPipeline` | "具体编译成什么机器码？" | **最贵**，一 op 一条 | 编译产物 |
+
+把它们分开，是为了让**签名相同的不同 kernel 共享 layout**，只重新编译真正变化的 `VkPipeline`。nnops 为了简单，每条管线都自带一套 layout 并一起缓存；语义上它们仍然可以独立复用。
+
+### 0.4 绑定时的对应关系
+
+```cpp
+// 建管线时：layout 已经写进 VkPipeline
+vkCreateComputePipelines(device, ..., &pipeline_ci);
+//   pipeline_ci.layout = VkPipelineLayout（内含 set_layout）
+
+// 录制时：
+vkCmdBindPipeline(cmd, COMPUTE, pipeline.pipeline);       // ① 选函数
+vkCmdBindDescriptorSets(cmd, COMPUTE, pipeline.layout,    // ② 用同一个 layout
+                        0, 1, &desc_set, 0, nullptr);     //    绑第 0 个参数包
+vkCmdPushConstants(cmd, pipeline.layout, COMPUTE,         // ③ 同一个 layout
+                   0, sizeof(pc), &pc);
+```
+
+**硬规则**：`vkCmdBindDescriptorSets` 用的 `layout` 必须和创建 `pipeline` 时用的 `layout` 是同一条（或兼容）。`desc_set` 又必须按 `set_layout` 分配。三者版本错配 = 未定义行为。
+
+> 想看更完整的 Vulkan 全景（Instance / Device / Buffer / CommandBuffer / 同步原语），见 [Vulkan 零基础入门](vulkan_zero_basics.md)。
 
 ---
 
@@ -212,6 +296,46 @@ struct VulkanPipeline {
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;  // 描述符集布局 (binding 定义)
 };
 ```
+
+### 从 C++ 视角看这三个对象
+
+`VulkanPipeline` 把三样东西打包在一起，因为它们的生命周期必须一致。用 C++ 类比：
+
+```cpp
+// 1. 参数类型签名 —— 有几个参数、每个是什么类型
+using Signature = void(const float*, const float*, float*);
+
+// 2. 完整调用约定 —— 签名 + 按值传的小参数
+void CompiledFn(const float* a, const float* b, float* c, int total);
+
+// 3. 编译产物 —— 具体机器码（op 已经固化，没有分支）
+void CompiledFn_Add(const float* a, const float* b, float* c, int total);
+```
+
+| nnops 字段 | Vulkan 对象 | C++ 类比 | 创建代价 |
+| --- | --- | --- | :---: |
+| `set_layout` | `VkDescriptorSetLayout` | 参数类型签名 | 低 |
+| `layout` | `VkPipelineLayout` | 调用约定 / ABI | 低 |
+| `pipeline` | `VkPipeline` | 编译产物 | **高（毫秒级）** |
+
+所以缓存的是**整套三件套**，不是只有 `VkPipeline`。把 layout 单独缓存会导致"管线与 layout 版本错配"这一类最难查的 bug。
+
+### 管线里到底固化了什么
+
+`vkCreateComputePipelines` 之后，下面这些东西**再也不能改**：
+
+| 固化项 | 在 nnops 里的来源 | 改了的后果 |
+| --- | --- | --- |
+| 着色器代码 | `spirv_data` / `spirv_size` | 必须新建管线 |
+| 特化常量 | `spec_op`, `spec_add_to` | 必须新建管线 |
+| 参数形状 | `num_bindings` → `set_layout` | 必须新建管线 |
+| 推送常量范围 | `sizeof(ComputePushConstants)` | 必须新建管线 |
+| workgroup 大小 | shader 里的 `local_size_x` | 必须改 shader 并重建 |
+
+这解释了两件常被问到的事：
+
+1. **为什么 `local_size_x` 不能像 CUDA 那样运行时指定？** 因为它编译进了 SPIR-V，是管线的一部分。CUDA 的 `<<<grid, block>>>` 在 Vulkan 里对应的是 `vkCmdDispatch` 的 grid 部分；block 部分已经固化。
+2. **为什么换个 op 就要新管线？** `OP` 是特化常量，驱动在编译时把其他分支整段删掉了。同一份 `.comp` 源码编译出的两条管线，机器码是不同的。
 
 ### 三个 Vulkan 对象的关系
 
@@ -493,13 +617,15 @@ public:
 VulkanTestEnv()
   ├─ vkCreateInstance()
   ├─ vkEnumeratePhysicalDevices() → 优先选 DISCRETE_GPU
-  │   └─ 查询 VK_KHR_16bit_storage 扩展支持
+  │   └─ 仅在没找到独显、走回退路径时才查询 VK_KHR_16bit_storage
   ├─ vkCreateDevice()
-  │   ├─ 条件启用 VK_KHR_16bit_storage
+  │   ├─ 仅在回退路径上条件启用 VK_KHR_16bit_storage
   │   └─ 获取 Compute Queue
   ├─ vkCreateCommandPool(RESET_COMMAND_BUFFER_BIT)
   └─ vkCreateDescriptorPool(STORAGE_BUFFER × 256, maxSets=256)
 ```
+
+> ⚠️ 已知不一致：`supports_fp16()` 只在回退路径上才可能为 true，独显机器上恒为 false；而现有的 f16 测试并没有按这个返回值跳过。跑 f16 用例前请确认目标驱动对 16-bit storage 的处理。
 
 ### 资源销毁顺序
 
@@ -556,11 +682,11 @@ create_buffer(size, usage)
 Host → Device:
   copy_to_device(buf, data, size)
     ├─ memcpy(buf.mapped, data, size)     // 写入映射内存
-    └─ vkFlushMappedMemoryRanges()        // 确保 GPU 可见
+    └─ vkFlushMappedMemoryRanges()        // HOST_COHERENT 下非必需；代码里防御性调用
 
 Device → Host:
   copy_from_device(buf, data, size)
-    ├─ vkInvalidateMappedMemoryRanges()   // 使 CPU 缓存失效
+    ├─ vkInvalidateMappedMemoryRanges()   // HOST_COHERENT 下非必需；代码里防御性调用
     └─ memcpy(data, buf.mapped, size)     // 读取
 ```
 
@@ -718,3 +844,14 @@ void eltwise_vulkan(
 | PipelineCache 线程安全 | `std::mutex` + 双检查锁定 | vulkan_common.cpp | 读写均安全 |
 | 描述符池容量 (测试) | `maxSets=256`, `STORAGE_BUFFER×256` | vulkan_test_helper.hpp | 绰绰有余 |
 | Vulkan API 版本 (测试) | `VK_API_VERSION_1_3` | vulkan_test_helper.hpp | Instance 级别 |
+
+---
+
+## 15. 延伸阅读
+
+| 文档 | 读它的时机 |
+| --- | --- |
+| [Vulkan 零基础入门](vulkan_zero_basics.md) | 对象地图、三个 layout 的区别、一次 dispatch 的完整旅程、术语表 |
+| [Vulkan Compute Shader 语法参考](vulkan_compute_shader_grammar.md) | 要写或改 `.comp` 时：workgroup、SSBO、shared、subgroup、atomic |
+| [Vulkan 算子开发指南](how_to_add_vulkan_op.md) | 要从零加一个算子时：shader → 后端 → 调度 → 测试的完整清单 |
+| [Vulkan 线程模型与内存模型](vulkan_threading_memory_model.md) | 要多线程录制、去掉 `vkQueueWaitIdle`、理解 barrier 时 |

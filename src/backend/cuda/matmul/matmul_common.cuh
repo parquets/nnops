@@ -1,4 +1,4 @@
-/// @file gemm_common.cuh
+/// @file matmul_common.cuh
 /// @brief The dense GEMM kernel contract: the parameter struct every kernel
 ///        takes, the shared epilogue, and the shared-memory layouts and block
 ///        geometry the tile engines are built from.
@@ -11,6 +11,8 @@
 /// Batching is numpy-style broadcast over up to four leading dimensions, each
 /// carried as a (size, stride) pair and with stride 0 meaning broadcast;
 /// blockIdx.z walks the flattened batch and the offsets are resolved in-kernel.
+/// Four batch axes over the two matrix axes make rank six the CUDA ceiling; a
+/// higher rank is refused by the front end, not truncated.
 
 #pragma once
 
@@ -30,6 +32,16 @@ namespace nnops::backend::cuda {
 /// The dense GEMM's element formats: the f32 SIMT tile, or one of the two
 /// 2-byte tensor-core formats (same MMA shape, different operand format).
 enum class GemmElem { F32, F16, BF16 };
+
+/// The batch axes a kernel carries: with the two matrix axes a CUDA MatMul or
+/// Linear is rank six at most. `GemmParams::batch_size` is sized by this.
+inline constexpr int kGemmMaxBatchRank = 4;
+
+/// gridDim is 16-bit on every axis. Three counts have to stay under it: the
+/// flattened batch on blockIdx.z (times the k splits), the same batch on
+/// blockIdx.y in the split-K reduce pass, and the f32 tile's n axis, which walks
+/// blockIdx.y. The front end refuses a call that would overflow any of them.
+inline constexpr int64_t kGemmMaxGridAxis = 65535;
 
 /// Everything a dense GEMM needs besides the element type and the two
 /// transpose flags (which are template parameters, since they pick the copy

@@ -204,8 +204,11 @@ if(NNOPS_BUILD_CUDA)
         # Convolutions and the pooling that goes with them, one file an
         # operator family: Conv2D (both memory orders via the CuTe GEMM),
         # depthwise, and spatial pooling.
-        backend/cuda/gemm/matmul.cu
-        backend/cuda/gemm/linear.cu
+        backend/cuda/matmul/matmul.cu
+        backend/cuda/matmul/linear.cu
+        backend/cuda/matmul/matmul_f16.cu
+        backend/cuda/matmul/matmul_f32.cu
+        backend/cuda/matmul/matmul_i8_ptx.cu
         backend/cuda/conv/conv2d.cu
         backend/cuda/conv/transpose_conv2d.cu
         backend/cuda/conv/depthwise_transpose_conv.cu
@@ -223,6 +226,22 @@ if(NNOPS_BUILD_CUDA)
         ${NNOPS_CUTLASS_DIR}/include)
     target_compile_options(nnops_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --expt-extended-lambda>)
+    # A fat translation unit -- matmul_i8_ptx.cu carries three tiles x four poses
+    # x two element types x two destination families -- spends nearly all of its
+    # wall clock in cicc's optimizer, on one core. This lets those phases spread
+    # over the machine; nvcc documents it as having no effect on the emitted code
+    # (`--threads` does nothing here: it is ignored for a single architecture,
+    # which is all we generate).
+    target_compile_options(nnops_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>)
+    # The sources are UTF-8 (the comments use ×, −, ² …); without this the host
+    # pass reads them as the ANSI code page and prints a C4819 per file per
+    # translation unit — thousands of warnings, and a real hazard for a byte
+    # that ends in a backslash.
+    if(MSVC)
+        target_compile_options(nnops_cuda PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+    endif()
     target_compile_definitions(nnops_cpu PUBLIC NNOPS_HAS_CUDA)
     target_link_libraries(nnops_cpu PUBLIC nnops_cuda)
 endif()

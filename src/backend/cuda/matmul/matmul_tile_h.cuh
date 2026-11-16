@@ -1,4 +1,4 @@
-/// @file gemm_tile_h.cuh
+/// @file matmul_tile_h.cuh
 /// @brief The f16/bf16 tensor-core engine: an SM80 16x8x16 MMA tile with f32
 ///        accumulators, streamed through a cp.async pipeline.
 ///
@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "gemm_common.cuh"
+#include "matmul_common.cuh"
 
 #include <cuda_runtime.h>
 #include <type_traits>
@@ -80,28 +80,31 @@ namespace detail {
 template <class Elem, int Threads, int Rows, int Cols, bool ContigCols>
 constexpr auto gemm_copy_half()
 {
+    // One 16 B vector per copy step; the element count follows the operand's
+    // size, so the same tiling serves 2-byte floats and 1-byte integers.
+    constexpr int V = 16 / int(sizeof(Elem));
     if constexpr (ContigCols) {
-        constexpr int t_c = Cols / 8;
+        constexpr int t_c = Cols / V;
         constexpr int t_o = Threads / t_c;
-        static_assert(Cols % 8 == 0, "a 16 B vector does not divide the panel");
+        static_assert(Cols % V == 0, "a 16 B vector does not divide the panel");
         static_assert(Threads % t_c == 0 && Rows % t_o == 0,
                       "the copy tiling overshoots the panel");
         return cute::make_tiled_copy(
             cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
                             Elem>{},
             cute::Layout<cute::Shape<cute::Int<t_o>, cute::Int<t_c>>>{},
-            cute::Layout<cute::Shape<cute::_1, cute::_8>>{});
+            cute::Layout<cute::Shape<cute::_1, cute::Int<V>>>{});
     } else {
-        constexpr int t_r = Rows / 8;
+        constexpr int t_r = Rows / V;
         constexpr int t_c = Threads / t_r;
-        static_assert(Rows % 8 == 0, "a 16 B vector does not divide the panel");
+        static_assert(Rows % V == 0, "a 16 B vector does not divide the panel");
         static_assert(Threads % t_r == 0 && Cols % t_c == 0,
                       "the copy tiling overshoots the panel");
         return cute::make_tiled_copy(
             cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
                             Elem>{},
             cute::Layout<cute::Shape<cute::Int<t_r>, cute::Int<t_c>>>{},
-            cute::Layout<cute::Shape<cute::_8, cute::_1>>{});
+            cute::Layout<cute::Shape<cute::Int<V>, cute::_1>>{});
     }
 }
 

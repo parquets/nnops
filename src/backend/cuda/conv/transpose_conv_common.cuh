@@ -23,7 +23,7 @@
 #pragma once
 
 #include "../cuda_common.cuh"
-#include "../gemm/cute_gemm.cuh"
+#include "../matmul/cute_gemm.cuh"
 #include "nnops/core/data_type.hpp"
 
 #include <limits>

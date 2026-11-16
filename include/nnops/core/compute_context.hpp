@@ -6,10 +6,13 @@
 /// dispatches on expected_backend — an operator is bound to its backend at
 /// creation — so it is informational for callers and tests.
 ///
-/// Vulkan: vulkan_descriptor_pool must be created with
-/// VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, since per-call descriptor
-/// sets are allocated from it and freed. vulkan_buffers holds one VkBuffer per
-/// tensor, inputs first — [A, B, output] for eltwise, [input, output] for unary.
+/// Vulkan: descriptor sets are one-shot. vulkan_record_dispatch allocates one
+/// per call from vulkan_descriptor_pool and never frees it individually; the
+/// caller reclaims them by resetting the pool once the submitted work has
+/// completed. The pool must therefore outlive the command buffer. (A pool
+/// created with VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT may instead
+/// free sets individually.) vulkan_buffers holds one VkBuffer per tensor,
+/// inputs first — [A, B, output] for eltwise, [input, output] for unary.
 
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/core/backend.hpp"

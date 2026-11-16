@@ -44,11 +44,11 @@
 /// The engines live in their own headers, in dependency order: the shared
 /// contract, the two CuTe tile kernels, the k-split launcher built on both, and
 /// the hand-written narrow-m pair. What stays here is the choice between them.
-#include "gemm_common.cuh"
-#include "gemm_tile_h.cuh"
-#include "gemm_tile_f.cuh"
-#include "gemm_splitk.cuh"
-#include "gemm_narrow.cuh"
+#include "matmul_common.cuh"
+#include "matmul_tile_h.cuh"
+#include "matmul_tile_f.cuh"
+#include "matmul_splitk.cuh"
+#include "matmul_narrow.cuh"
 
 namespace nnops::backend::cuda {
 
@@ -154,13 +154,13 @@ inline bool dense_gemm_launch(const GemmParams& p, GemmElem elem,
         p, trans_a, trans_b, vectorized,
         [&]<bool TA, bool TB, bool V>() {
             if (elem == GemmElem::F16) {
-                if (pair_h) {
-                    detail::launch_dense_split<cute::half_t, kF16Narrow, TA, TB, V, 2>(
-                        p, stream);
-                } else {
-                    detail::launch_dense_split<cute::half_t, kF16Narrow, TA, TB, V>(p,
-                                                                                    stream);
-                }
+                // The f16 kernel's two-level accumulator (an f16 MMA fragment
+                // plus the f32 running sum) costs about eighteen more registers
+                // than the f32-accumulate twin, which puts the paired CTA at one
+                // block a SM. The four-warp CTA keeps three blocks there, and
+                // that occupancy is worth more than the pairing.
+                detail::launch_dense_split<cute::half_t, kF16Narrow, TA, TB, V>(
+                    p, stream);
             } else if (elem == GemmElem::BF16) {
                 if (pair_h) {
                     detail::launch_dense_split<cute::bfloat16_t, kF16Narrow, TA, TB, V,

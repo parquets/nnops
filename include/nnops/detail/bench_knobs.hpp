@@ -29,6 +29,21 @@ inline std::atomic<int> depthwise_3x3_roll{0};
 /// the same rules as the auto choice).
 inline std::atomic<int> cuda_splitk{-1};
 
+/// CUDA f16 GEMM: 0 automatic (the hand-written PTX kernel once its pose holds),
+/// -1 force the CuTe engine, 1 force the PTX kernel. The pose gate still applies
+/// to the forced value: alpha, beta, bias, epilogue and dtype are checked first.
+inline std::atomic<int> cuda_ptx_h{0};
+
+/// CUDA f32 GEMM: 0 automatic (the hand-written SIMT kernel once its grid fills
+/// the machine), -1 force the CuTe engine, 1 force the SIMT kernel.
+inline std::atomic<int> cuda_ptx_f{0};
+
+/// CUDA int8 GEMM: 0 automatic (the hand-written PTX tile once its pose holds),
+/// -1 force the CuTe engine, 1 force the PTX tile, N >= 2 force it with menu row
+/// N - 2. The pose gate still applies: destination kind, alignment and the
+/// transposed-side fills are checked first.
+inline std::atomic<int> cuda_ptx_i8{0};
+
 /// CPU int8: 1 hides NEON i8mm (SMMLA) so the SDOT route is taken. The feature
 /// scan runs once, so set this before the first CpuFeatures::get().
 inline std::atomic<int> disable_i8mm{0};

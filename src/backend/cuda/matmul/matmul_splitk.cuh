@@ -1,4 +1,4 @@
-/// @file gemm_splitk.cuh
+/// @file matmul_splitk.cuh
 /// @brief The k-split path: cutting the reduction when the grid has no other
 ///        axis left to fill, and the scratch plane it lands in.
 ///
@@ -18,8 +18,8 @@
 
 #pragma once
 
-#include "gemm_tile_h.cuh"
-#include "gemm_tile_f.cuh"
+#include "matmul_tile_h.cuh"
+#include "matmul_tile_f.cuh"
 #include "nnops/detail/bench_knobs.hpp"
 
 #include <cuda_runtime.h>

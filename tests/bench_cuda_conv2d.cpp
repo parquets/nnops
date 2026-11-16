@@ -178,6 +178,97 @@ std::vector<ConvBenchCase> cnn_layers()
     return v;
 }
 
+/// int8: a pre-quantized u8 activation against an s8 filter, per-tensor
+/// activation parameters and per-channel weight ones, into an s8 destination.
+/// The same layer set as the fp tables, so the rows are comparable.
+double run_conv_i8(const ConvBenchCase& c, const char* label)
+{
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {c.kh, c.kw};
+    attrs.stride = {c.sh, c.sw};
+    attrs.dilation = {c.dh, c.dw};
+    attrs.padding = {c.ph, c.pw};
+    attrs.groups = c.groups;
+    attrs.output_dtype = DataType::s8;
+
+    const bool last = c.channel_last;
+    const int64_t icg = c.icg();
+    test::XorShift128 rng(23);
+
+    std::vector<uint8_t> a(static_cast<size_t>(c.n * c.ic * c.ih * c.iw));
+    for (auto& e : a) { e = static_cast<uint8_t>(rng.next_u64() & 0xFFu); }
+    std::vector<int8_t> w(static_cast<size_t>(c.oc * icg * c.kh * c.kw));
+    for (auto& e : w) {
+        e = static_cast<int8_t>(int32_t(rng.next_u64() % 25) - 12);
+    }
+    std::vector<float> w_s(static_cast<size_t>(c.oc));
+    std::vector<int32_t> w_zp(static_cast<size_t>(c.oc));
+    for (int64_t i = 0; i < c.oc; ++i) {
+        w_s[static_cast<size_t>(i)] = 0.008f + 0.001f * float(i % 5);
+        w_zp[static_cast<size_t>(i)] = int32_t(i % 7) - 3;
+    }
+
+    QuantParams qa;
+    qa.scale = 0.0078125f;
+    qa.zero_point = 128;
+    QuantParams qw;
+    qw.granularity = QuantGranularity::PerChannel;
+    qw.scale_data = w_s.data();
+    qw.zero_point_data = w_zp.data();
+    qw.num_scales = c.oc;
+    qw.scale = 0.008f;
+    qw.zero_point = 0;
+    QuantParams qc;
+    qc.scale = 0.03f;
+    qc.zero_point = 0;
+
+    const auto view = [](const std::vector<int64_t>& sh, DataType dt, void* d,
+                         TensorLayout lay, const QuantParams& qp) {
+        return TensorView(std::span<const int64_t>(sh.data(), sh.size()), dt, d,
+                          lay, qp);
+    };
+    const TensorLayout alay = last ? TensorLayout::NHWC : TensorLayout::NCHW;
+    const TensorLayout wlay = last ? TensorLayout::HWIO : TensorLayout::NCHW;
+    const std::vector<int64_t> ashape = {c.n, c.ic, c.ih, c.iw};
+    const std::vector<int64_t> wshape =
+        last ? std::vector<int64_t>{c.kh, c.kw, icg, c.oc}
+             : std::vector<int64_t>{c.oc, icg, c.kh, c.kw};
+
+    TensorView av = view(ashape, DataType::u8, a.data(), alay, qa);
+    TensorView wv = view(wshape, DataType::s8, w.data(), wlay, qw);
+    const TensorDesc descs[] = {av.desc(), wv.desc()};
+    auto op_cpu = Conv2D::create(attrs, Backend::CPU);
+    const TensorDesc od = op_cpu->getOutputTensorDesc(descs).front();
+    const std::vector<int64_t> odims(od.dims.begin(), od.dims.begin() + od.rank);
+    int64_t on = 1;
+    for (auto d : odims) { on *= d; }
+
+    CudaBuffer da(a.size()), dw(w.size());
+    CudaBuffer dout(static_cast<size_t>(on));
+    da.upload(a.data(), a.size());
+    dw.upload(w.data(), w.size());
+    dout.zero();
+    TensorView dav = view(ashape, DataType::u8, da.data(), alay, qa);
+    TensorView dwv = view(wshape, DataType::s8, dw.data(), wlay, qw);
+    TensorView dcv = view(odims, od.dtype, dout.data(), od.layout, qc);
+
+    auto op = Conv2D::create(attrs, Backend::CUDA);
+    const TensorView ins[] = {dav, dwv};
+    const double ms = cuda_median_ms([&] { cuda_launch(*op, dcv, ins); });
+    print_cuda_row(label,
+                   conv_geometry(c, last ? "channel_last" : "channel_first"), ms,
+                   cuda_gflops(ms, c.flops()));
+    return cuda_gflops(ms, c.flops());
+}
+
+void run_table_i8(bool channel_last, const char* label)
+{
+    for (ConvBenchCase c : cnn_layers()) {
+        c.channel_last = channel_last;
+        run_conv_i8(c, label);
+    }
+}
+
 void run_table(DataType dt, bool channel_last, const char* label)
 {
     for (ConvBenchCase c : cnn_layers()) {
@@ -197,6 +288,12 @@ NNOPS_BENCH(cuda_conv2d_channel_first) {
 NNOPS_BENCH(cuda_conv2d_channel_last) {
     print_cuda_header("CUDA Conv2D channel-last (f32)");
     run_table(DataType::f32, true, "f32");
+}
+
+NNOPS_BENCH(cuda_conv2d_i8) {
+    print_cuda_header("CUDA Conv2D int8 (u8 x s8 -> s8)");
+    run_table_i8(false, "i8 nchw");
+    run_table_i8(true, "i8 nhwc");
 }
 
 NNOPS_BENCH(cuda_conv2d_f16) {
