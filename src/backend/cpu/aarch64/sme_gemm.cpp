@@ -408,6 +408,83 @@ void pack_b_f16_generic(int nc, int kc, half* dst, const half* src, int64_t ldb,
     }
 }
 
+/// int8: one SMOPA per K group of four per tile. The lane groups are the tile
+/// rows (a 4-way dot over the group's four K), so the predicate is b8 and the
+/// row extent is 4*mlive lanes — a b32 predicate would leave most of the tile
+/// inactive and silently drop products.
+__arm_locally_streaming __arm_new("za")
+void gemm_i8_impl(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t* a, const int8_t* b,
+                  bool zero_mode, int32_t lo, int32_t hi)
+{
+    const int m_tiles = (mc + kMr - 1) / kMr;
+    const int n_blocks = (nc + kNB - 1) / kNB;
+    const int k_groups = (kc + 3) / 4;
+    const svint32_t vlo = svdup_n_s32(lo);
+    const svint32_t vhi = svdup_n_s32(hi);
+    for (int nb = 0; nb < n_blocks; ++nb) {
+        const int n0 = nb * kNB;
+        const bool t1 = n0 + kPanel < nc;
+        const bool t2 = n0 + 2 * kPanel < nc;
+        const bool t3 = n0 + 3 * kPanel < nc;
+        const int live0 = std::min(kPanel, nc - n0);
+        const int live1 = t1 ? std::min(kPanel, nc - n0 - kPanel) : 0;
+        const int live2 = t2 ? std::min(kPanel, nc - n0 - 2 * kPanel) : 0;
+        const int live3 = t3 ? std::min(kPanel, nc - n0 - 3 * kPanel) : 0;
+        const svbool_t pn0 = svwhilelt_b8(0, 4 * live0);
+        const svbool_t pn1 = t1 ? svwhilelt_b8(0, 4 * live1) : svpfalse_b();
+        const svbool_t pn2 = t2 ? svwhilelt_b8(0, 4 * live2) : svpfalse_b();
+        const svbool_t pn3 = t3 ? svwhilelt_b8(0, 4 * live3) : svpfalse_b();
+        const svbool_t s0 = svwhilelt_b32(0, live0);
+        const svbool_t s1 = t1 ? svwhilelt_b32(0, live1) : svpfalse_b();
+        const svbool_t s2 = t2 ? svwhilelt_b32(0, live2) : svpfalse_b();
+        const svbool_t s3 = t3 ? svwhilelt_b32(0, live3) : svpfalse_b();
+        const int8_t* bp = b + static_cast<int64_t>(nb) * k_groups * (4 * kNB);
+
+        for (int m0 = 0; m0 < m_tiles; ++m0) {
+            const int mlive = std::min(kMr, mc - m0 * kMr);
+            const svbool_t pm = svwhilelt_b8(0, 4 * mlive);
+            const int8_t* ap = a + static_cast<int64_t>(m0) * k_groups * 64;
+
+            svzero_za();
+            const int8_t* brow = bp;
+            for (int g = 0; g < k_groups; ++g, brow += 4 * kNB) {
+                const svint8_t av = svld1_s8(pm, ap + static_cast<int64_t>(g) * 64);
+                svmopa_za32_s8_m(0, pm, pn0, av, svld1_s8(pn0, brow));
+                svmopa_za32_s8_m(1, pm, pn1, av, svld1_s8(pn1, brow + kPanel * 4));
+                svmopa_za32_s8_m(2, pm, pn2, av, svld1_s8(pn2, brow + 2 * kPanel * 4));
+                svmopa_za32_s8_m(3, pm, pn3, av, svld1_s8(pn3, brow + 3 * kPanel * 4));
+            }
+
+            for (int i = 0; i < mlive; ++i) {
+                int32_t* row = c + static_cast<int64_t>(m0 * kMr + i) * ldc + n0;
+                {
+                    svint32_t v = svread_hor_za32_s32_m(svundef_s32(), s0, 0, i);
+                    if (!zero_mode) { v = svadd_s32_x(s0, v, svld1_s32(s0, row)); }
+                    svst1_s32(s0, row, svmin_s32_x(s0, svmax_s32_x(s0, v, vlo), vhi));
+                }
+                if (t1) {
+                    int32_t* p = row + kPanel;
+                    svint32_t v = svread_hor_za32_s32_m(svundef_s32(), s1, 1, i);
+                    if (!zero_mode) { v = svadd_s32_x(s1, v, svld1_s32(s1, p)); }
+                    svst1_s32(s1, p, svmin_s32_x(s1, svmax_s32_x(s1, v, vlo), vhi));
+                }
+                if (t2) {
+                    int32_t* p = row + 2 * kPanel;
+                    svint32_t v = svread_hor_za32_s32_m(svundef_s32(), s2, 2, i);
+                    if (!zero_mode) { v = svadd_s32_x(s2, v, svld1_s32(s2, p)); }
+                    svst1_s32(s2, p, svmin_s32_x(s2, svmax_s32_x(s2, v, vlo), vhi));
+                }
+                if (t3) {
+                    int32_t* p = row + 3 * kPanel;
+                    svint32_t v = svread_hor_za32_s32_m(svundef_s32(), s3, 3, i);
+                    if (!zero_mode) { v = svadd_s32_x(s3, v, svld1_s32(s3, p)); }
+                    svst1_s32(s3, p, svmin_s32_x(s3, svmax_s32_x(s3, v, vlo), vhi));
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 bool available() noexcept
@@ -445,6 +522,60 @@ void pack_b_f32(int nc, int kc, float* dst, const float* src, int64_t ldb, bool 
 void pack_b_f16(int nc, int kc, half* dst, const half* src, int64_t ldb, bool trans) noexcept
 {
     pack_b_f16_generic(nc, kc, dst, src, ldb, trans);
+}
+
+void pack_a_i8(int mc, int kc, int8_t* dst, const int8_t* src, int64_t lds, bool trans,
+               bool xor_bias) noexcept
+{
+    const int k_groups = (kc + 3) / 4;
+    for (int m = 0; m < mc; ++m) {
+        int8_t* out = dst + static_cast<int64_t>(m / kMr) * k_groups * 64 + (m % kMr) * 4;
+        for (int g = 0; g < k_groups; ++g) {
+            for (int p = 0; p < 4; ++p) {
+                const int k = 4 * g + p;
+                int8_t v = 0;
+                if (k < kc) {
+                    v = trans ? src[static_cast<int64_t>(k) * lds + m] :
+                                src[static_cast<int64_t>(m) * lds + k];
+                    if (xor_bias) { v = static_cast<int8_t>(static_cast<uint8_t>(v) ^ 0x80u); }
+                }
+                out[static_cast<int64_t>(g) * 64 + p] = v;
+            }
+        }
+    }
+}
+
+void pack_b_i8(int nc, int kc, int8_t* dst, const int8_t* src, int64_t ldb, bool trans) noexcept
+{
+    const int n_blocks = (nc + kNB - 1) / kNB;
+    const int k_groups = (kc + 3) / 4;
+    for (int nb = 0; nb < n_blocks; ++nb) {
+        const int n0 = nb * kNB;
+        const int cols = std::min(kNB, nc - n0);
+        int8_t* blk = dst + static_cast<int64_t>(nb) * k_groups * (4 * kNB);
+        for (int g = 0; g < k_groups; ++g) {
+            int8_t* out = blk + static_cast<int64_t>(g) * (4 * kNB);
+            for (int j = 0; j < kNB; ++j) {
+                int8_t* cell = out + static_cast<int64_t>(j / kPanel) * (4 * kPanel) +
+                               (j % kPanel) * 4;
+                for (int p = 0; p < 4; ++p) {
+                    const int k = 4 * g + p;
+                    int8_t v = 0;
+                    if (j < cols && k < kc) {
+                        v = trans ? src[static_cast<int64_t>(n0 + j) * ldb + k] :
+                                    src[static_cast<int64_t>(k) * ldb + n0 + j];
+                    }
+                    cell[p] = v;
+                }
+            }
+        }
+    }
+}
+
+void gemm_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t* a, const int8_t* b,
+             bool zero_mode, int32_t lo, int32_t hi) noexcept
+{
+    gemm_i8_impl(mc, nc, kc, c, ldc, a, b, zero_mode, lo, hi);
 }
 
 void gemm_f32(int mc, int nc, int kc, float* c, int ldc, const float* a, const float* b,

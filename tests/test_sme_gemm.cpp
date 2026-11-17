@@ -146,6 +146,35 @@ void run_f16(int mc, int nc, int kc)
     }
 }
 
+/// int8: 4-way dot (1024 MACs per instruction), so tails on every axis and a K
+/// that is not a multiple of four are the interesting cases.
+void run_i8(int mc, int nc, int kc)
+{
+    std::vector<int8_t> a(static_cast<size_t>(mc) * kc), b(static_cast<size_t>(kc) * nc);
+    uint32_t st = 1234u;
+    for (auto& v : a) { st = st * 1664525u + 1013904223u; v = static_cast<int8_t>((st >> 16) % 251 - 125); }
+    for (auto& v : b) { st = st * 1664525u + 1013904223u; v = static_cast<int8_t>((st >> 16) % 251 - 125); }
+
+    std::vector<int8_t> pa(backend::cpu::sme::packed_a_elems_i8(mc, kc));
+    std::vector<int8_t> pb(backend::cpu::sme::packed_b_elems_i8(nc, kc));
+    backend::cpu::sme::pack_a_i8(mc, kc, pa.data(), a.data(), kc, false, false);
+    backend::cpu::sme::pack_b_i8(nc, kc, pb.data(), b.data(), nc, false);
+
+    std::vector<int32_t> c(static_cast<size_t>(mc) * nc);
+    backend::cpu::sme::gemm_i8(mc, nc, kc, c.data(), nc, pa.data(), pb.data(),
+                               /*zero_mode=*/true, INT32_MIN, INT32_MAX);
+    for (int m = 0; m < mc; ++m) {
+        for (int n = 0; n < nc; ++n) {
+            int32_t want = 0;
+            for (int k = 0; k < kc; ++k) {
+                want += static_cast<int32_t>(a[static_cast<size_t>(m) * kc + k]) *
+                        static_cast<int32_t>(b[static_cast<size_t>(k) * nc + n]);
+            }
+            NNOPS_EXPECT_EQ(c[static_cast<size_t>(m) * nc + n], want);
+        }
+    }
+}
+
 } // namespace
 
 NNOPS_TEST(sme_gemm_matches_reference) {
@@ -158,6 +187,10 @@ NNOPS_TEST(sme_gemm_matches_reference) {
     run_f32(40, 70, 17); // m and n tails, odd kc
     run_f32(16, 12, 1);  // single panel, k = 1
     run_f32(1, 13, 5);   // one row
+    run_i8(64, 64, 32);   // full tiles
+    run_i8(40, 70, 17);   // tails on every axis, K not a multiple of four
+    run_i8(16, 12, 1);    // one K group, one panel
+    run_i8(1, 13, 5);     // one row
     run_f16(64, 64, 32);
     run_f16(40, 70, 17); // odd kc pads the last K pair
     run_f16(1, 13, 5);

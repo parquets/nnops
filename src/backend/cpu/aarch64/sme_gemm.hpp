@@ -111,6 +111,31 @@ void gemm_f16(int mc, int nc, int kc, half* c, int ldc, const half* a, const hal
               bool zero_mode, float lo, float hi, const half* col_bias,
               int64_t b_block_stride = 0) noexcept;
 
+/// int8 (s8 x s8 -> int32). One `SMOPA ZA.S` is a 4-way dot: 16 rows x 16
+/// columns x 4 K = 1024 MACs, four times the f32 form. The pack interleaves K
+/// in groups of four, which is how the instruction reads its lanes: operand
+/// lane 4i..4i+3 are row (column) i's four K values.
+///   A: [m/16][ceil(kc/4)][64]    B: [n/64][ceil(kc/4)][256]
+inline int64_t packed_a_elems_i8(int mc, int kc) noexcept
+{
+    return static_cast<int64_t>((mc + 15) / 16) * ((kc + 3) / 4) * 64;
+}
+inline int64_t packed_b_elems_i8(int nc, int kc) noexcept
+{
+    return static_cast<int64_t>((nc + kNB - 1) / kNB) * ((kc + 3) / 4) * (4 * kNB);
+}
+
+/// @p xor_bias applies the u8-activation shift (XOR 0x80) the NEON pack uses;
+/// padded K slots stay 0, which is the identity in the shifted domain.
+void pack_a_i8(int mc, int kc, int8_t* dst, const int8_t* src, int64_t lds, bool trans,
+               bool xor_bias) noexcept;
+void pack_b_i8(int nc, int kc, int8_t* dst, const int8_t* src, int64_t ldb,
+               bool trans) noexcept;
+
+/// C[m][n] += A[m][k] * B[k][n] as int32, clamped to [@p lo, @p hi].
+void gemm_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t* a, const int8_t* b,
+             bool zero_mode, int32_t lo, int32_t hi) noexcept;
+
 #else
 
 inline bool available() noexcept { return false; }
