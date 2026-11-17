@@ -98,7 +98,7 @@ auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm) -> Conv2D::
 /// owns the (k, col) lane of every position, so the split needs no scratch.
 template <class T>
 void wino_pack_weight_hwio(const TensorView& weight, TensorView& u_out,
-                           const backend::cpu::WinoChannelLastU& ug, int64_t ICG, int64_t OCG,
+                           const backend::cpu::WinoU& ug, int64_t ICG, int64_t OCG,
                            int64_t G, const ComputeContext& ctx)
 {
     const T* g = weight.ptr<T>();
@@ -393,8 +393,8 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
     const int64_t OCG = OC / G;
 
     const backend::cpu::WinoOrder order = pick_order(ICG, OCG);
-    const backend::cpu::WinoChannelLastU ug =
-        backend::cpu::wino_channel_last_u(ICG, OCG, G, dtype, order);
+    const backend::cpu::WinoU ug =
+        backend::cpu::wino_u(ICG, OCG, G, dtype, order);
     NNOPS_ASSERT(ug.total > 0 && "Conv2D::prepackWeights: unsupported dtype");
 
     if (outputs[0].is_empty()) {

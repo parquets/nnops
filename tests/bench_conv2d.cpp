@@ -240,7 +240,7 @@ constexpr DataType dtype_of() {
 /// One table row: the entry point.
 struct AbLayer {
     virtual ~AbLayer() = default;
-    virtual void run_channel_last(const ComputeContext&) = 0;
+    virtual void run_nhwc(const ComputeContext&) = 0;
     double work = 0.0;   ///< 2 * MACs, for the GFLOPS column
 };
 
@@ -271,9 +271,9 @@ struct AbFp : AbLayer {
                                           c.N, c.IC, c.IH, c.IW);
         w_cl     = w_raw;
 
-        in_channel_last = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
+        in_nhwc = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
                              TensorLayout::NHWC);
-        w_channel_last  = TensorView(std::span<const int64_t>(wsh, 4), dt, w_cl.data(),
+        w_nhwc  = TensorView(std::span<const int64_t>(wsh, 4), dt, w_cl.data(),
                              TensorLayout::HWIO);
         b_v     = TensorView(std::span<const int64_t>(bsh, 1), dt, bias.data());
 
@@ -284,29 +284,29 @@ struct AbFp : AbLayer {
         attrs.groups = c.groups;
         op = Conv2D::create(attrs, Backend::CPU);
 
-        const TensorDesc d0[] = {in_channel_last.desc(), w_channel_last.desc()};
+        const TensorDesc d0[] = {in_nhwc.desc(), w_nhwc.desc()};
         const auto od = op->getOutputTensorDesc(d0);
         OH = od[0].dims[2];
         OW = od[0].dims[3];
         work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
 
-        out_channel_last_buf.assign(static_cast<size_t>(od[0].numel()), T{});
-        out_channel_last = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
-                              out_channel_last_buf.data(), TensorLayout::NHWC);
+        out_nhwc_buf.assign(static_cast<size_t>(od[0].numel()), T{});
+        out_nhwc = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
+                              out_nhwc_buf.data(), TensorLayout::NHWC);
     }
 
-    void run_channel_last(const ComputeContext& ctx) override {
-        const TensorView ins[] = {in_channel_last, w_channel_last, b_v};
-        op->compute(std::span<TensorView>(&out_channel_last, 1), ins, ctx, nullptr);
+    void run_nhwc(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_nhwc, w_nhwc, b_v};
+        op->compute(std::span<TensorView>(&out_nhwc, 1), ins, ctx, nullptr);
     }
 
     Shape s;
     int64_t icg = 1, OH = 0, OW = 0;
     std::unique_ptr<Conv2D> op;
     std::vector<T> in_cl, w_cl, bias;
-    std::vector<T> out_channel_last_buf;
-    TensorView in_channel_last, w_channel_last, b_v;
-    TensorView out_channel_last;
+    std::vector<T> out_nhwc_buf;
+    TensorView in_nhwc, w_nhwc, b_v;
+    TensorView out_nhwc;
 };
 
 // ============================================================
@@ -373,21 +373,21 @@ struct AbI8 : AbLayer {
         qw.zero_point_data = w_zp.data();
         qw.num_scales = c.OC;
 
-        in_channel_last = TensorView(std::span<const int64_t>(ish, 4), DataType::u8,
+        in_nhwc = TensorView(std::span<const int64_t>(ish, 4), DataType::u8,
                              act_cl.data(), TensorLayout::NHWC, qa);
-        w_channel_last  = TensorView(std::span<const int64_t>(wsh_cl, 4), DataType::s8,
+        w_nhwc  = TensorView(std::span<const int64_t>(wsh_cl, 4), DataType::s8,
                              w_hwio.data(), TensorLayout::HWIO, qw);
         b_v     = TensorView(std::span<const int64_t>(bsh, 1), DataType::f32, bias.data());
 
-        const TensorDesc d0[] = {in_channel_last.desc(), w_channel_last.desc(), b_v.desc()};
+        const TensorDesc d0[] = {in_nhwc.desc(), w_nhwc.desc(), b_v.desc()};
         const auto od = op->getOutputTensorDesc(d0);
         OH = od[0].dims[2];
         OW = od[0].dims[3];
         work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
 
-        out_channel_last_buf.assign(static_cast<size_t>(od[0].numel()), 0.0f);
-        out_channel_last = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), DataType::f32,
-                              out_channel_last_buf.data(), TensorLayout::NHWC);
+        out_nhwc_buf.assign(static_cast<size_t>(od[0].numel()), 0.0f);
+        out_nhwc = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), DataType::f32,
+                              out_nhwc_buf.data(), TensorLayout::NHWC);
     }
 
     static int32_t quant_u8(float x, float inv, int32_t zp) {
@@ -400,9 +400,9 @@ struct AbI8 : AbLayer {
         return std::min(std::max(q, -128), 127);
     }
 
-    void run_channel_last(const ComputeContext& ctx) override {
-        const TensorView ins[] = {in_channel_last, w_channel_last, b_v};
-        op->compute(std::span<TensorView>(&out_channel_last, 1), ins, ctx, nullptr);
+    void run_nhwc(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_nhwc, w_nhwc, b_v};
+        op->compute(std::span<TensorView>(&out_nhwc, 1), ins, ctx, nullptr);
     }
 
     Shape s;
@@ -412,9 +412,9 @@ struct AbI8 : AbLayer {
     std::vector<int8_t> w_oihw, w_hwio;
     std::vector<float> w_s, bias;
     std::vector<int32_t> w_zp;
-    std::vector<float> out_channel_last_buf;
-    TensorView in_channel_last, w_channel_last, b_v;
-    TensorView out_channel_last;
+    std::vector<float> out_nhwc_buf;
+    TensorView in_nhwc, w_nhwc, b_v;
+    TensorView out_nhwc;
 };
 
 // ============================================================
@@ -719,9 +719,9 @@ struct AbPackedI8 : AbI8 {
         attrs.algorithm = ConvAlgorithm::ImplicitGemm;
         p_op = Conv2D::create(attrs, Backend::CPU);
 
-        in  = &in_channel_last;
-        w   = &w_channel_last;
-        out = &out_channel_last;
+        in  = &in_nhwc;
+        w   = &w_nhwc;
+        out = &out_nhwc;
 
         TensorView q;
         const TensorView wi[] = {*w};
@@ -851,7 +851,7 @@ NNOPS_BENCH(conv2d_mobile_graph) {
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
-        for (auto& op : ops) { op->run_channel_last(use_ctx); }   // warm-up
+        for (auto& op : ops) { op->run_nhwc(use_ctx); }   // warm-up
 
         std::vector<std::vector<double>> row(ops.size());
         std::vector<double> pass_ms;
@@ -859,7 +859,7 @@ NNOPS_BENCH(conv2d_mobile_graph) {
             double sum = 0.0;
             for (size_t i = 0; i < ops.size(); ++i) {
                 const auto t0 = std::chrono::steady_clock::now();
-                ops[i]->run_channel_last(use_ctx);
+                ops[i]->run_nhwc(use_ctx);
                 const double ms = std::chrono::duration<double, std::milli>(
                                       std::chrono::steady_clock::now() - t0).count();
                 row[i].push_back(ms);

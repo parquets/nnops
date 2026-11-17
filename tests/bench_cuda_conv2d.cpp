@@ -282,7 +282,7 @@ NNOPS_BENCH(cuda_conv2d_f16) {
 }
 
 NNOPS_BENCH(cuda_conv2d_shapes) {
-    print_cuda_header("CUDA Conv2D stride, dilation and small planes (f32 channel_last)");
+    print_cuda_header("CUDA Conv2D stride, dilation and small planes (f32 nhwc)");
     // The shapes the implicit GEMM is most likely to mis-tile: planes whose
     // pixel count is not a multiple of the 64-pixel tile (49 and 196 pixels), a
     // stride-2 border, and a dilated 3x3 whose taps leave the plane.

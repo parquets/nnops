@@ -42,7 +42,7 @@ namespace {
 /// The vector store of one Vec-wide lane: bias, clamp, activation, as a single
 /// 16 B write. add_to takes the scalar path instead, which re-reads the pixel.
 template <class Elem, int Vec>
-__device__ inline void dw_last_store(const ConvParams& p, Elem* dst, const float* acc, int c0)
+__device__ inline void dw_store(const ConvParams& p, Elem* dst, const float* acc, int c0)
 {
     using V = std::conditional_t<sizeof(Elem) == 2, uint4, float4>;
     const Elem* bias = static_cast<const Elem*>(p.bias);
@@ -63,7 +63,7 @@ __device__ inline void dw_last_store(const ConvParams& p, Elem* dst, const float
 
 /// Depthwise on one class: one output per thread on a 16 B channel lane.
 template <class Elem, int Vec>
-__global__ void dw_last_kernel(ConvParams pin, int th_max, int col_blocks)
+__global__ void dw_kernel(ConvParams pin, int th_max, int col_blocks)
 {
     using V = std::conditional_t<sizeof(Elem) == 2, uint4, float4>;
     const int cls = int(blockIdx.z) / col_blocks;
@@ -131,7 +131,7 @@ __global__ void dw_last_kernel(ConvParams pin, int th_max, int col_blocks)
             tconv_store<Elem>(p, dst + v, acc[v], c0 + v, bias);
         }
     } else {
-        dw_last_store<Elem, Vec>(p, dst, acc, c0);
+        dw_store<Elem, Vec>(p, dst, acc, c0);
     }
 }
 
@@ -140,18 +140,18 @@ __global__ void dw_last_kernel(ConvParams pin, int th_max, int col_blocks)
 // ============================================================
 
 template <class Elem>
-void launch_last(const ConvParams& p, int th_max, int col_blocks, int by, cudaStream_t stream)
+void launch_impl(const ConvParams& p, int th_max, int col_blocks, int by, cudaStream_t stream)
 {
     constexpr int Vec = 16 / int(sizeof(Elem));
     const int chunks = p.oc / Vec;
     const int bx = chunks < 32 ? chunks : 32;
     dim3 grid(unsigned(p.batch * th_max), unsigned((chunks + bx - 1) / bx),
               unsigned(p.classes * col_blocks));
-    dw_last_kernel<Elem, Vec><<<grid, dim3(bx, by), 0, stream>>>(p, th_max, col_blocks);
+    dw_kernel<Elem, Vec><<<grid, dim3(bx, by), 0, stream>>>(p, th_max, col_blocks);
 }
 
 template <class Elem>
-bool run_last(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
+bool run_impl(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
 {
     constexpr int Vec = 16 / int(sizeof(Elem));
     constexpr int64_t esz = int64_t(sizeof(Elem));
@@ -183,7 +183,7 @@ bool run_last(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
         return false;
     }
 
-    launch_last<Elem>(p, th_max, col_blocks, by, stream);
+    launch_impl<Elem>(p, th_max, col_blocks, by, stream);
     return true;
 }
 
@@ -194,7 +194,7 @@ bool run_last(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
 /// One output element per thread with the channel innermost, for a geometry the
 /// 16 B lane declines. The tap search is the CPU's: a tap counts
 /// when (o + P − k·D) divides by S and the pixel it names exists.
-template <class Elem> __global__ void dw_last_scalar_kernel(ConvParams p)
+template <class Elem> __global__ void dw_scalar_kernel(ConvParams p)
 {
     const int64_t total = int64_t(p.batch) * p.oc * p.oh * p.ow;
     const int64_t step = int64_t(blockDim.x) * gridDim.x;
@@ -243,12 +243,12 @@ template <class Elem> __global__ void dw_last_scalar_kernel(ConvParams p)
     }
 }
 
-template <class Elem> void launch_last_scalar(const ConvParams& p, cudaStream_t stream)
+template <class Elem> void launch_scalar(const ConvParams& p, cudaStream_t stream)
 {
     const int64_t total = int64_t(p.batch) * p.oc * p.oh * p.ow;
     const int64_t blocks = (total + kCudaBlockSize - 1) / kCudaBlockSize;
     const unsigned grid = unsigned(blocks < 65535 ? blocks : 65535);
-    dw_last_scalar_kernel<Elem><<<grid, kCudaBlockSize, 0, stream>>>(p);
+    dw_scalar_kernel<Elem><<<grid, kCudaBlockSize, 0, stream>>>(p);
 }
 
 } // namespace
@@ -264,11 +264,11 @@ bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max
     }
     switch (dtype) {
     case DataType::f16:
-        return run_last<__half>(p, th_max, tw_max, stream);
+        return run_impl<__half>(p, th_max, tw_max, stream);
     case DataType::bf16:
-        return run_last<__nv_bfloat16>(p, th_max, tw_max, stream);
+        return run_impl<__nv_bfloat16>(p, th_max, tw_max, stream);
     default:
-        return run_last<float>(p, th_max, tw_max, stream);
+        return run_impl<float>(p, th_max, tw_max, stream);
     }
 }
 
@@ -367,11 +367,11 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
         // The class view declines a geometry or a grid it cannot hold; the
         // scalar script still covers it.
         if (dt == DataType::bf16) {
-            tconv::launch_last_scalar<__nv_bfloat16>(p, stream);
+            tconv::launch_scalar<__nv_bfloat16>(p, stream);
         } else if (half_elem) {
-            tconv::launch_last_scalar<__half>(p, stream);
+            tconv::launch_scalar<__half>(p, stream);
         } else {
-            tconv::launch_last_scalar<float>(p, stream);
+            tconv::launch_scalar<float>(p, stream);
         }
     }
     return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;

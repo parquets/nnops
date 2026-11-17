@@ -18,7 +18,7 @@
 ///     get_conv2d_implicit_gemm_plan;
 ///   * one scratch layout (Conv2DGemmScratch / gemm_scratch_layout): every
 ///     region 64-byte aligned, all offsets computed in that one function;
-///   * the prepacked-filter geometry (ConvPackedWeightLast) — a function of the
+///   * the prepacked-filter geometry (ConvPackedWeight) — a function of the
 ///     attributes and the channel counts alone, no activation and no thread
 ///     count. The plan adopts its block sizes, so the panels prepackWeights
 ///     builds and the panels the kernel addresses are one decision;
@@ -133,7 +133,7 @@ inline int64_t gemm_set_elems(int64_t panels_per_oc, int64_t kdim, int64_t nr_ma
 /// task) — so one oc block's whole filter is one contiguous run taken in order,
 /// and a cold filter streams once instead of in `panels_oc`-strided slices.
 /// The trailing k block packs a shorter k, hence a shorter panel stride.
-struct ConvPackedWeightLast {
+struct ConvPackedWeight {
     int64_t nr = 0;           ///< panel width (output channels per panel)
     int64_t icn_block = 0;    ///< k block
     int64_t ocn_block = 0;    ///< oc block (the plan's N tile)
@@ -182,7 +182,7 @@ struct ConvPackedWeightLast {
 /// Resolve the prepacked geometry; it is also the im2col plan's block sizes
 /// (the plan reads icn_block/ocn_block from here), so the
 /// panels it sizes and the panels prepackWeights builds cannot disagree.
-ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs, int64_t ic_per_group,
+ConvPackedWeight conv_packed_weight(const Conv2DAttributes& attrs, int64_t ic_per_group,
                                              int64_t oc_per_group, DataType weight_dtype);
 
 /// The blob @p weight prepacks into — the query half of the two-step prepack,

@@ -141,7 +141,7 @@ template <class T> inline void wino_store_lanes(T* p, const v_f32x8& v, int lane
 
 /// Transform one 4×4 input window into V = Bᵀ d B, one channel vector at a time.
 template <class T>
-inline void winograd_input(const T* in_plane, int64_t in_row, int64_t ic_stride,
+inline void winograd_input(const T* in_plane, int64_t in_row, int64_t pix_stride,
                                         int ih0, int iw0, int IH, int IW, T* v, int64_t v_plane,
                                         int lanes) noexcept
 {
@@ -156,7 +156,7 @@ inline void winograd_input(const T* in_plane, int64_t in_row, int64_t ic_stride,
         for (int c = 0; c < 4; ++c) {
             const int w = iw0 + c;
             d[c] = (row != nullptr && w >= 0 && w < IW) ?
-                       wino_load_lanes<T>(row + w * ic_stride, lanes) :
+                       wino_load_lanes<T>(row + w * pix_stride, lanes) :
                        zero;
         }
         v_store(&e[r][0][0], v_sub(d[0], d[2]));
@@ -293,7 +293,7 @@ inline void wino43_bt(v_f32x8 d[6]) noexcept
 
 /// Transform one 6×6 input window into V = Bᵀ d B, one channel vector at a time.
 template <class T>
-inline void winograd43_input(const T* in_plane, int64_t in_row, int64_t ic_stride,
+inline void winograd43_input(const T* in_plane, int64_t in_row, int64_t pix_stride,
                                           int ih0, int iw0, int IH, int IW, T* v, int64_t v_plane,
                                           int lanes) noexcept
 {
@@ -309,7 +309,7 @@ inline void winograd43_input(const T* in_plane, int64_t in_row, int64_t ic_strid
         for (int c = 0; c < 6; ++c) {
             const int w = iw0 + c;
             d[c] = (row != nullptr && w >= 0 && w < IW) ?
-                       wino_load_lanes<T>(row + w * ic_stride, lanes) :
+                       wino_load_lanes<T>(row + w * pix_stride, lanes) :
                        zero;
         }
         wino43_bt(d);

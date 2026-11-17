@@ -75,7 +75,7 @@ int64_t build_reduced_runs(const TensorView& input, const int64_t* axes, int64_t
 }
 
 template <typename T>
-void reduce_channel_last(const ReduceAttributes& attrs, TensorView& output, const TensorView& input,
+void reduce_spatial(const ReduceAttributes& attrs, TensorView& output, const TensorView& input,
                          int64_t axis, const ComputeContext& ctx)
 {
     const int64_t rank = input.rank();
@@ -546,7 +546,7 @@ void reduce_single_axis(const ReduceAttributes& attrs, TensorView& output, const
     const int64_t rank = input.rank();
 
     if (is_channel_last(input.layout())) {
-        reduce_channel_last<T>(attrs, output, input, axis, ctx);
+        reduce_spatial<T>(attrs, output, input, axis, ctx);
         return;
     }
 

@@ -204,7 +204,7 @@ struct Layer {
         in_cl       = test::channel_first_to_channel_last<T>(
             std::span<const T>(in_raw.data(), in_raw.size()), c.N, c.IC, c.IH, c.IW);
 
-        in_channel_last = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
+        in_nhwc = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
                              TensorLayout::NHWC);
         w       = TensorView(std::span<const int64_t>(wsh, 4), dt, weight.data(),
                              TensorLayout::Dense);
@@ -219,30 +219,30 @@ struct Layer {
 
         op = TransposeConv2D::create(attrs, Backend::CPU);
 
-        const TensorDesc dn[] = {in_channel_last.desc(), w.desc(), b.desc()};
+        const TensorDesc dn[] = {in_nhwc.desc(), w.desc(), b.desc()};
         const auto od = op->getOutputTensorDesc(dn);
         OH = od[0].dims[2];
         OW = od[0].dims[3];
         out_cl.assign(static_cast<size_t>(od[0].numel()), T{});
 
-        out_channel_last = TensorView(od[0].dims, dt, out_cl.data(), TensorLayout::NHWC);
+        out_nhwc = TensorView(od[0].dims, dt, out_cl.data(), TensorLayout::NHWC);
 
-        ins_channel_last = {in_channel_last, w, b};
+        ins_nhwc = {in_nhwc, w, b};
         // Contributions, not output-taps: each input pixel runs its whole
         // kernel once, so a stride-2 layer costs a quarter, not a whole.
         work = 2.0 * static_cast<double>(c.N) * c.OC * c.IH * c.IW *
                static_cast<double>(icg) * c.KH * c.KW;
     }
 
-    void run_channel_last(const ComputeContext& ctx) { op->compute(out_channel_last, ins_channel_last, ctx, nullptr); }
+    void run_nhwc(const ComputeContext& ctx) { op->compute(out_nhwc, ins_nhwc, ctx, nullptr); }
 
     Shape s;
     TransposeConv2DAttributes attrs{};
     std::unique_ptr<TransposeConv2D> op;
     std::vector<T> in_cl, weight, bias;
     std::vector<T> out_cl;
-    TensorView in_channel_last, w, b, out_channel_last;
-    std::vector<TensorView> ins_channel_last;
+    TensorView in_nhwc, w, b, out_nhwc;
+    std::vector<TensorView> ins_nhwc;
     int64_t OH = 0, OW = 0;
     double work = 0.0;
 };
@@ -257,10 +257,10 @@ double time_median_ms(int nt, Layer<T>& l, int iters, int rounds) {
     ComputeContext ctx;
     ctx.cpu = pool.cpu;
     const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
-    l.run_channel_last(use_ctx);   // warm-up / page faults
+    l.run_nhwc(use_ctx);   // warm-up / page faults
     std::vector<double> t;
     for (int r = 0; r < rounds; ++r) {
-        t.push_back(time_ms([&] { l.run_channel_last(use_ctx); }, iters));
+        t.push_back(time_ms([&] { l.run_nhwc(use_ctx); }, iters));
     }
     return median_of(t);
 }
@@ -320,7 +320,7 @@ QuantParams q_per_channel(const float* scale, const int32_t* zp, int64_t n) {
 }
 
 /// Dense [N][C][H][W] → dense [N][H][W][C], byte-wise so any storage width works.
-std::vector<uint8_t> permute_to_channel_last(const Shape& s, const std::vector<uint8_t>& src,
+std::vector<uint8_t> permute_to_nhwc(const Shape& s, const std::vector<uint8_t>& src,
                                              size_t esz) {
     std::vector<uint8_t> dst(src.size());
     for (int64_t n = 0; n < s.N; ++n) {
@@ -366,7 +366,7 @@ struct Int8Layer {
                 in_raw_buf[static_cast<size_t>(i)] = static_cast<uint8_t>(q);
             }
         }
-        in_cl_buf = permute_to_channel_last(s, in_raw_buf, esz_in);
+        in_cl_buf = permute_to_nhwc(s, in_raw_buf, esz_in);
 
         // ---- weight + per-channel scales ----
         const int64_t wnumel = s.IC * (s.OC / s.groups) * s.KH * s.KW;
@@ -419,7 +419,7 @@ struct Int8Layer {
                static_cast<double>(s.IC / s.groups) * s.KH * s.KW;
     }
 
-    Status run_channel_last(const ComputeContext& ctx) {
+    Status run_nhwc(const ComputeContext& ctx) {
         return op->compute(out_cl, ins_cl, ctx, nullptr);
     }
 
@@ -449,7 +449,7 @@ void run_int8_table(DataType act_dt, DataType out_dt, const char* tag) {
     double sum_ms = 0.0, sum_work = 0.0;
     for (const Shape& c : sweep()) {
         Int8Layer l(c, act_dt, out_dt);
-        const Status probe = l.run_channel_last(ComputeContext{});
+        const Status probe = l.run_nhwc(ComputeContext{});
         if (probe != Status::ok) {
             std::printf("    %-45s int8: n/a (compute returned %d)\n", c.name,
                         static_cast<int>(probe));
@@ -462,10 +462,10 @@ void run_int8_table(DataType act_dt, DataType out_dt, const char* tag) {
             ComputeContext ctx;
             ctx.cpu = pool.cpu;
             const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
-            l.run_channel_last(use_ctx);
+            l.run_nhwc(use_ctx);
             std::vector<double> t;
             for (int r = 0; r < rounds; ++r) {
-                t.push_back(time_ms([&] { l.run_channel_last(use_ctx); }, iters));
+                t.push_back(time_ms([&] { l.run_nhwc(use_ctx); }, iters));
             }
             const double ms = median_of(t);
             std::printf("    %-45s %6lld %6lld %6.1f | %8.3f | %7.1f\n",

@@ -178,7 +178,7 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
         }
         const double tc = median_of(cl);
 
-        std::printf("    %2dT  channel_last %8.1f us (%6.1f GFLOPS)\n",
+        std::printf("    %2dT  nhwc %8.1f us (%6.1f GFLOPS)\n",
                     nt, tc, flops / (tc * 1e3));
     }
 }

@@ -109,7 +109,7 @@ TapList col_taps(const DwtConvGeom& gm, int64_t r, int64_t mic) noexcept
 // ============================================================
 
 template <typename T>
-void dwtconv_scalar_last(const DwtConvGeom& gm, TensorView& output,
+void dwtconv_scalar(const DwtConvGeom& gm, TensorView& output,
                          std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -173,7 +173,7 @@ void dwtconv_scalar_last(const DwtConvGeom& gm, TensorView& output,
 
 
 template <typename T>
-void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
+void dwtconv_impl(const DwtConvGeom& gm, TensorView& output,
                           std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -518,7 +518,7 @@ Status dwtconv_i8_weight(const TensorView& weight, int64_t KH, int64_t KW, int64
 /// Spatial int8: the lane spans channels, one 16-channel block of one pixel
 /// per accumulate step, the filter read from the staged int16 copy.
 template <typename TOut>
-Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
+Status dwtconv_i8(const DwtConvGeom& gm, TensorView& output,
                        std::span<const TensorView> inputs, const DwtI8Plane& pl, const int16_t* wq,
                        int64_t wq_c, const ComputeContext& ctx)
 {
@@ -764,7 +764,7 @@ Status dwtconv_i8_layout(const DwtConvGeom& gm, TensorView& output,
     if (!is_ok(st)) {
         return st;
     }
-    return dwtconv_i8_last<TOut>(gm, output, inputs, pl, wq.data(), wq_c, ctx);
+    return dwtconv_i8<TOut>(gm, output, inputs, pl, wq.data(), wq_c, ctx);
 }
 
 template <class TAct>
@@ -846,9 +846,9 @@ void dwtconv_fp(const DwtConvGeom& gm, TensorView& output, std::span<const Tenso
                 const ComputeContext& ctx)
 {
     if (gm.KH > kMaxTaps || gm.KW > kMaxTaps) {
-        dwtconv_scalar_last<T>(gm, output, inputs, ctx);
+        dwtconv_scalar<T>(gm, output, inputs, ctx);
     } else {
-        dwtconv_channel_last<T>(gm, output, inputs, ctx);
+        dwtconv_impl<T>(gm, output, inputs, ctx);
     }
 }
 

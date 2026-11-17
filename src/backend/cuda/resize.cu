@@ -153,7 +153,7 @@ template <class T> __device__ inline void rsz_store(T* dst, float v, bool add_to
 /// block's channel chunk and threadIdx.y consecutive output pixels, so a warp
 /// touches one contiguous run of the pixel-major image.
 template <class T, int Mode, int Vec, bool ThreeD>
-__global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__ out, ResizeGeom g,
+__global__ void resize_vec_kernel(const T* __restrict__ in, T* __restrict__ out, ResizeGeom g,
                                        int c_blocks)
 {
     using V = std::conditional_t<sizeof(T) == 2, pack8<T>, float4>;
@@ -327,7 +327,7 @@ __global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__
 /// that is not a 16 B multiple (an RGB image) or too narrow to fill
 /// a warp's worth of vectors.
 template <class T, int Mode, bool ThreeD>
-__global__ void resize_last_scalar_kernel(const T* __restrict__ in, T* __restrict__ out,
+__global__ void resize_scalar_kernel(const T* __restrict__ in, T* __restrict__ out,
                                           ResizeGeom g)
 {
     const int64_t ow = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -420,7 +420,7 @@ __global__ void resize_last_scalar_kernel(const T* __restrict__ in, T* __restric
 // ============================================================
 
 template <class T, int Mode, int Vec, bool ThreeD>
-void launch_last_vec(const ResizeGeom& g, const T* in, T* out, int bx, int by, cudaStream_t stream)
+void launch_vec(const ResizeGeom& g, const T* in, T* out, int bx, int by, cudaStream_t stream)
 {
     const int c_blocks = static_cast<int>(ceil_div(g.c / Vec, int64_t(bx)));
     const int w_blocks = static_cast<int>(ceil_div(g.ow, int64_t(by)));
@@ -428,17 +428,17 @@ void launch_last_vec(const ResizeGeom& g, const T* in, T* out, int bx, int by, c
     const dim3 grid(static_cast<unsigned>(int64_t(c_blocks) * w_blocks),
                     static_cast<unsigned>(std::min<int64_t>(g.od * g.oh, 65535)),
                     static_cast<unsigned>(std::min<int64_t>(g.n, 65535)));
-    resize_last_vec_kernel<T, Mode, Vec, ThreeD><<<grid, block, 0, stream>>>(in, out, g, c_blocks);
+    resize_vec_kernel<T, Mode, Vec, ThreeD><<<grid, block, 0, stream>>>(in, out, g, c_blocks);
 }
 
 template <class T, int Mode, bool ThreeD>
-void launch_last_scalar(const ResizeGeom& g, const T* in, T* out, cudaStream_t stream)
+void launch_scalar(const ResizeGeom& g, const T* in, T* out, cudaStream_t stream)
 {
     constexpr int kThreads = 128;
     const dim3 grid(static_cast<unsigned>(ceil_div(g.ow, int64_t(kThreads))),
                     static_cast<unsigned>(std::min<int64_t>(g.od * g.oh, 65535)),
                     static_cast<unsigned>(std::min<int64_t>(g.n, 65535)));
-    resize_last_scalar_kernel<T, Mode, ThreeD>
+    resize_scalar_kernel<T, Mode, ThreeD>
         <<<grid, dim3(kThreads, 1, 1), 0, stream>>>(in, out, g);
 }
 
@@ -474,10 +474,10 @@ void resize_launch(const ResizeGeom& g, const T* in, T* out, cudaStream_t stream
         const int64_t cvecs = g.c / Vec;
         const int bx = static_cast<int>(std::min<int64_t>(cvecs, 64));
         const int by = std::max(1, 256 / bx);
-        launch_last_vec<T, Mode, Vec, ThreeD>(g, in, out, bx, by, stream);
+        launch_vec<T, Mode, Vec, ThreeD>(g, in, out, bx, by, stream);
         return;
     }
-    launch_last_scalar<T, Mode, ThreeD>(g, in, out, stream);
+    launch_scalar<T, Mode, ThreeD>(g, in, out, stream);
 }
 
 // ============================================================

@@ -63,7 +63,7 @@ static int64_t pool_spatial_elems(const Shape& shape)
 }
 
 template <typename T>
-static void test_channel_last_vs_ref(const std::vector<int64_t>& shape,
+static void test_vs_ref(const std::vector<int64_t>& shape,
                              const PoolingAttributes& attrs,
                              float tol)
 {
@@ -141,7 +141,7 @@ NNOPS_TEST(pooling_max_padding) {
     attrs.kernel_shape = {1, 3, 3};
     attrs.stride       = {1, 1, 1};
     attrs.padding      = {0, 1, 1};
-    test_channel_last_vs_ref<float>({1, 8, 10, 10}, attrs, 1e-4f);
+    test_vs_ref<float>({1, 8, 10, 10}, attrs, 1e-4f);
 }
 
 NNOPS_TEST(pooling_max_stride2_odd_width) {
@@ -152,7 +152,7 @@ NNOPS_TEST(pooling_max_stride2_odd_width) {
     attrs.kernel_shape = {1, 3, 3};
     attrs.stride       = {1, 2, 2};
     attrs.padding      = {0, 1, 1};
-    test_channel_last_vs_ref<float>({2, 5, 13, 15}, attrs, 1e-4f);
+    test_vs_ref<float>({2, 5, 13, 15}, attrs, 1e-4f);
 }
 
 NNOPS_TEST(pooling_avg_padding) {
@@ -161,7 +161,7 @@ NNOPS_TEST(pooling_avg_padding) {
     attrs.kernel_shape = {1, 3, 3};
     attrs.stride       = {1, 1, 1};
     attrs.padding      = {0, 1, 1};
-    test_channel_last_vs_ref<float>({1, 16, 9, 9}, attrs, 1e-4f);
+    test_vs_ref<float>({1, 16, 9, 9}, attrs, 1e-4f);
 }
 
 NNOPS_TEST(pooling_avg_exclude_pad) {
@@ -171,7 +171,7 @@ NNOPS_TEST(pooling_avg_exclude_pad) {
     attrs.kernel_shape = {1, 3, 3};
     attrs.stride       = {1, 1, 1};
     attrs.padding      = {0, 1, 1};
-    test_channel_last_vs_ref<float>({1, 3, 7, 7}, attrs, 1e-4f);
+    test_vs_ref<float>({1, 3, 7, 7}, attrs, 1e-4f);
 }
 
 NNOPS_TEST(pooling_add_to) {
@@ -180,7 +180,7 @@ NNOPS_TEST(pooling_add_to) {
     attrs.add_to       = true;
     attrs.kernel_shape = {1, 2, 2};
     attrs.stride       = {1, 2, 2};
-    test_channel_last_vs_ref<float>({1, 8, 8, 8}, attrs, 1e-4f);
+    test_vs_ref<float>({1, 8, 8, 8}, attrs, 1e-4f);
 }
 
 NNOPS_TEST(pooling_f16) {
@@ -188,7 +188,7 @@ NNOPS_TEST(pooling_f16) {
     attrs.type = PoolingType::Average;
     attrs.kernel_shape = {1, 2, 2};
     attrs.stride       = {1, 2, 2};
-    test_channel_last_vs_ref<backend::cpu::half>({1, 8, 8, 8}, attrs, 5e-3f);
+    test_vs_ref<backend::cpu::half>({1, 8, 8, 8}, attrs, 5e-3f);
 }
 
 NNOPS_TEST(pooling_global) {
@@ -197,11 +197,11 @@ NNOPS_TEST(pooling_global) {
     PoolingAttributes attrs;
     attrs.type   = PoolingType::Average;
     attrs.global = true;
-    test_channel_last_vs_ref<float>({2, 11, 9, 13}, attrs, 1e-4f);
+    test_vs_ref<float>({2, 11, 9, 13}, attrs, 1e-4f);
 
     PoolingAttributes mx = attrs;
     mx.type = PoolingType::Max;
-    test_channel_last_vs_ref<float>({2, 11, 9, 13}, mx, 1e-4f);
+    test_vs_ref<float>({2, 11, 9, 13}, mx, 1e-4f);
 }
 
 NNOPS_TEST(pooling_3d) {
@@ -209,7 +209,7 @@ NNOPS_TEST(pooling_3d) {
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {2, 2, 2};
     attrs.stride       = {2, 2, 2};
-    test_channel_last_vs_ref<float>({1, 4, 6, 8, 8}, attrs, 1e-4f);
+    test_vs_ref<float>({1, 4, 6, 8, 8}, attrs, 1e-4f);
 }
 
 NNOPS_TEST(pooling_3d_avg_padding) {
@@ -218,7 +218,7 @@ NNOPS_TEST(pooling_3d_avg_padding) {
     attrs.kernel_shape = {2, 2, 2};
     attrs.stride       = {1, 1, 1};
     attrs.padding      = {1, 1, 1};
-    test_channel_last_vs_ref<float>({1, 5, 4, 5, 6}, attrs, 1e-4f);
+    test_vs_ref<float>({1, 5, 4, 5, 6}, attrs, 1e-4f);
 }
 
 NNOPS_TEST(pooling_2d_dilation) {
@@ -228,18 +228,18 @@ NNOPS_TEST(pooling_2d_dilation) {
     attrs.type         = PoolingType::Max;
     attrs.kernel_shape = {1, 3, 3};
     attrs.dilation     = {1, 2, 2};
-    test_channel_last_vs_ref<float>({1, 5, 7, 9}, attrs, 1e-4f);
+    test_vs_ref<float>({1, 5, 7, 9}, attrs, 1e-4f);
 
     attrs.type        = PoolingType::Average;
     attrs.exclude_pad = true;
     attrs.padding     = {0, 1, 1};
-    test_channel_last_vs_ref<float>({2, 8, 9, 11}, attrs, 1e-4f);
+    test_vs_ref<float>({2, 8, 9, 11}, attrs, 1e-4f);
 
     attrs.exclude_pad = false;
     attrs.padding     = {0, 0, 0};
     attrs.kernel_shape = {1, 2, 2};
     attrs.dilation     = {1, 2, 2};
-    test_channel_last_vs_ref<backend::cpu::half>({1, 16, 8, 8}, attrs, 5e-3f);
+    test_vs_ref<backend::cpu::half>({1, 16, 8, 8}, attrs, 5e-3f);
 }
 
 NNOPS_TEST(pooling_3d_dilation) {
@@ -247,13 +247,13 @@ NNOPS_TEST(pooling_3d_dilation) {
     attrs.type         = PoolingType::Average;
     attrs.kernel_shape = {2, 2, 2};
     attrs.dilation     = {2, 2, 1};
-    test_channel_last_vs_ref<float>({1, 6, 5, 6, 7}, attrs, 1e-4f);
+    test_vs_ref<float>({1, 6, 5, 6, 7}, attrs, 1e-4f);
 }
 
 // ---- Quantized ---------------------------------------------------------
 
 template <typename InT, typename OutT>
-static void pooling_q_channel_last_test(const std::vector<int64_t>& shape,
+static void pooling_q_test(const std::vector<int64_t>& shape,
                                 const PoolingAttributes& attrs,
                                 const QuantParams& in_qp,
                                 const QuantParams& out_qp)
@@ -332,7 +332,7 @@ NNOPS_TEST(pooling_q_max_fast_path) {
     attrs.kernel_shape = {1, 3, 3};
     attrs.stride       = {1, 1, 1};
     attrs.padding      = {0, 1, 1};
-    pooling_q_channel_last_test<int8_t, int8_t>({1, 8, 8, 8}, attrs,
+    pooling_q_test<int8_t, int8_t>({1, 8, 8, 8}, attrs,
         make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
 }
 
@@ -343,7 +343,7 @@ NNOPS_TEST(pooling_q_max_short_block) {
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {1, 2, 2};
     attrs.stride       = {1, 2, 2};
-    pooling_q_channel_last_test<int8_t, int8_t>({1, 5, 6, 6}, attrs,
+    pooling_q_test<int8_t, int8_t>({1, 5, 6, 6}, attrs,
         make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
 }
 
@@ -354,7 +354,7 @@ NNOPS_TEST(pooling_q_max_scale_change) {
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {1, 2, 2};
     attrs.stride       = {1, 2, 2};
-    pooling_q_channel_last_test<int8_t, uint8_t>({1, 4, 8, 8}, attrs,
+    pooling_q_test<int8_t, uint8_t>({1, 4, 8, 8}, attrs,
         make_per_tensor_q(2.0f, 0), make_per_tensor_q(1.0f, 128));
 }
 
@@ -364,7 +364,7 @@ NNOPS_TEST(pooling_q_u8_to_s8) {
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {1, 2, 2};
     attrs.stride       = {1, 2, 2};
-    pooling_q_channel_last_test<uint8_t, int8_t>({1, 8, 8, 8}, attrs,
+    pooling_q_test<uint8_t, int8_t>({1, 8, 8, 8}, attrs,
         make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
 }
 
@@ -375,7 +375,7 @@ NNOPS_TEST(pooling_q_avg_exclude_pad) {
     attrs.kernel_shape = {1, 3, 3};
     attrs.stride       = {1, 1, 1};
     attrs.padding      = {0, 1, 1};
-    pooling_q_channel_last_test<int8_t, int8_t>({1, 3, 5, 5}, attrs,
+    pooling_q_test<int8_t, int8_t>({1, 3, 5, 5}, attrs,
         make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
 }
 
@@ -385,7 +385,7 @@ NNOPS_TEST(pooling_q_avg_reqantize) {
     attrs.kernel_shape = {1, 3, 3};
     attrs.stride       = {1, 1, 1};
     attrs.padding      = {0, 1, 1};
-    pooling_q_channel_last_test<int8_t, uint8_t>({1, 6, 6, 7}, attrs,
+    pooling_q_test<int8_t, uint8_t>({1, 6, 6, 7}, attrs,
         make_per_tensor_q(2.0f, 0), make_per_tensor_q(1.0f, 128));
 }
 
@@ -396,11 +396,11 @@ NNOPS_TEST(pooling_q_global) {
     PoolingAttributes attrs;
     attrs.type   = PoolingType::Average;
     attrs.global = true;
-    pooling_q_channel_last_test<int8_t, int8_t>({2, 11, 9, 13}, attrs, qp, qp);
+    pooling_q_test<int8_t, int8_t>({2, 11, 9, 13}, attrs, qp, qp);
 
     PoolingAttributes mx = attrs;
     mx.type = PoolingType::Max;
-    pooling_q_channel_last_test<int8_t, int8_t>({2, 11, 9, 13}, mx, qp, qp);
+    pooling_q_test<int8_t, int8_t>({2, 11, 9, 13}, mx, qp, qp);
 }
 
 // ============================================================
@@ -413,25 +413,25 @@ NNOPS_TEST(pooling_adaptive) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.output_size = {0, 3, 4};
-    test_channel_last_vs_ref<float>({2, 5, 9, 11}, attrs, 1e-4f);
+    test_vs_ref<float>({2, 5, 9, 11}, attrs, 1e-4f);
 
     PoolingAttributes mx = attrs;
     mx.type = PoolingType::Max;
-    test_channel_last_vs_ref<float>({2, 11, 7, 13}, mx, 1e-4f);
+    test_vs_ref<float>({2, 11, 7, 13}, mx, 1e-4f);
 }
 
 NNOPS_TEST(pooling_adaptive_3d) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
     attrs.output_size = {2, 2, 3};
-    test_channel_last_vs_ref<float>({1, 4, 5, 6, 7}, attrs, 1e-4f);
+    test_vs_ref<float>({1, 4, 5, 6, 7}, attrs, 1e-4f);
 }
 
 NNOPS_TEST(pooling_adaptive_f16) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.output_size = {0, 3, 3};
-    test_channel_last_vs_ref<backend::cpu::half>({1, 8, 8, 8}, attrs, 5e-3f);
+    test_vs_ref<backend::cpu::half>({1, 8, 8, 8}, attrs, 5e-3f);
 }
 
 NNOPS_TEST(pooling_adaptive_rejects_quantized) {

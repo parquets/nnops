@@ -45,7 +45,7 @@ namespace nnops::backend::cpu::reference {
 /// One case: the operator runs on NDHWC tensors, and the result — transposed
 /// back element for element — is compared against the scalar golden on the same
 /// values. The weight order stays dense in both.
-static void test_cl_vs_ref(const std::vector<int64_t>& in_shape,
+static void test_vs_ref(const std::vector<int64_t>& in_shape,
                            const std::vector<int64_t>& w_shape,
                            const TransposeConv3DAttributes& attrs,
                            bool has_bias = false,
@@ -144,7 +144,7 @@ NNOPS_TEST(tconv3d_stride1) {
     attrs.kernel_size = {3, 3, 3};
     attrs.padding     = {1, 1, 1};
 
-    test_cl_vs_ref({1, 8, 4, 5, 6}, {8, 16, 3, 3, 3}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 8, 4, 5, 6}, {8, 16, 3, 3, 3}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(tconv3d_stride2) {
@@ -155,7 +155,7 @@ NNOPS_TEST(tconv3d_stride2) {
     attrs.stride      = {2, 2, 2};
     attrs.padding     = {1, 1, 1};
 
-    test_cl_vs_ref({2, 8, 3, 4, 5}, {8, 8, 3, 3, 3}, attrs);
+    test_vs_ref({2, 8, 3, 4, 5}, {8, 8, 3, 3, 3}, attrs);
 }
 
 NNOPS_TEST(tconv3d_residual) {
@@ -169,7 +169,7 @@ NNOPS_TEST(tconv3d_residual) {
     attrs.add_to      = true;
     attrs.residual_pre_activation = true;
 
-    test_cl_vs_ref({1, 8, 3, 4, 4}, {8, 8, 3, 3, 3}, attrs, /*has_bias=*/true,
+    test_vs_ref({1, 8, 3, 4, 4}, {8, 8, 3, 3, 3}, attrs, /*has_bias=*/true,
                    /*residual=*/true);
 }
 
@@ -181,7 +181,7 @@ NNOPS_TEST(tconv3d_depthwise) {
     attrs.padding     = {1, 1, 1};
     attrs.groups      = 8;
 
-    test_cl_vs_ref({1, 8, 3, 4, 4}, {8, 1, 3, 3, 3}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 8, 3, 4, 4}, {8, 1, 3, 3, 3}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(tconv3d_grouped) {
@@ -192,7 +192,7 @@ NNOPS_TEST(tconv3d_grouped) {
     attrs.padding     = {0, 1, 0};
     attrs.groups      = 4;
 
-    test_cl_vs_ref({1, 8, 3, 4, 3}, {8, 3, 2, 3, 2}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 8, 3, 4, 3}, {8, 3, 2, 3, 2}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(tconv3d_gather_fallback) {
@@ -200,7 +200,7 @@ NNOPS_TEST(tconv3d_gather_fallback) {
     TransposeConv3DAttributes attrs;
     attrs.kernel_size = {17, 1, 1};
 
-    test_cl_vs_ref({1, 2, 1, 2, 3}, {2, 3, 17, 1, 1}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 2, 1, 2, 3}, {2, 3, 17, 1, 1}, attrs, /*has_bias=*/true);
 }
 
 // ============================================================

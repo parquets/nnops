@@ -60,7 +60,7 @@ static int64_t dwt_spatial_elems(const Shape& shape)
 }
 
 template <typename T>
-static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
+static void test_vs_ref(const std::vector<int64_t>& in_shape,
                                      const std::vector<int64_t>& w_shape,
                                      const DepthwiseTransposeConv2DAttributes& attrs,
                                      bool has_bias = false,
@@ -183,14 +183,14 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
 // ============================================================
 
 NNOPS_TEST(dwtconv_vs_ref_basic) {
-    test_channel_last_vs_ref<float>({2, 16, 10, 10}, {16, 1, 3, 3},
+    test_vs_ref<float>({2, 16, 10, 10}, {16, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}, {0, 0}},
         false, 1e-4f);
 }
 
 NNOPS_TEST(dwtconv_vs_ref_partial_block) {
     // Five channels: one vector chunk, a scalar tail.
-    test_channel_last_vs_ref<float>({1, 5, 8, 9}, {5, 1, 3, 3},
+    test_vs_ref<float>({1, 5, 8, 9}, {5, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}},
         false, 1e-4f);
 }
@@ -198,13 +198,13 @@ NNOPS_TEST(dwtconv_vs_ref_partial_block) {
 NNOPS_TEST(dwtconv_vs_ref_multi_block) {
     // Seventeen channels cross the 16-wide chunk boundary and end on a
     // one-channel tail.
-    test_channel_last_vs_ref<float>({1, 17, 7, 9}, {17, 1, 3, 3},
+    test_vs_ref<float>({1, 17, 7, 9}, {17, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}},
         true, 1e-4f);
 }
 
 NNOPS_TEST(dwtconv_vs_ref_stride2_dilation) {
-    test_channel_last_vs_ref<float>({1, 8, 9, 10}, {8, 1, 3, 3},
+    test_vs_ref<float>({1, 8, 9, 10}, {8, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {2, 2}, {0, 0}, {0, 0}},
         false, 1e-4f);
 }
@@ -213,7 +213,7 @@ NNOPS_TEST(dwtconv_vs_ref_add_to_relu) {
     DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}};
     attrs.add_to = true;
     attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_last_vs_ref<float>({1, 6, 6, 11}, {6, 1, 3, 3}, attrs, false, 1e-4f);
+    test_vs_ref<float>({1, 6, 6, 11}, {6, 1, 3, 3}, attrs, false, 1e-4f);
 }
 
 NNOPS_TEST(dwtconv_vs_ref_pre_act) {
@@ -223,7 +223,7 @@ NNOPS_TEST(dwtconv_vs_ref_pre_act) {
     attrs.epilogue.type = EpilogueActivateType::Relu;
     attrs.add_to = true;
     attrs.residual_pre_activation = true;
-    test_channel_last_vs_ref<float>({1, 17, 7, 9}, {17, 1, 3, 3}, attrs, true, 1e-4f);
+    test_vs_ref<float>({1, 17, 7, 9}, {17, 1, 3, 3}, attrs, true, 1e-4f);
 }
 
 NNOPS_TEST(dwtconv_vs_ref_f16_pre_act) {
@@ -231,27 +231,27 @@ NNOPS_TEST(dwtconv_vs_ref_f16_pre_act) {
     attrs.epilogue.type = EpilogueActivateType::Relu;
     attrs.add_to = true;
     attrs.residual_pre_activation = true;
-    test_channel_last_vs_ref<half>({1, 24, 9, 9}, {24, 1, 3, 3}, attrs, false,
+    test_vs_ref<half>({1, 24, 9, 9}, {24, 1, 3, 3}, attrs, false,
                                    test::kF16AccumTol);
 }
 
 NNOPS_TEST(dwtconv_vs_ref_output_padding) {
-    test_channel_last_vs_ref<float>({2, 4, 6, 8}, {4, 1, 3, 3},
+    test_vs_ref<float>({2, 4, 6, 8}, {4, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {0, 0}, {1, 1}},
         true, 1e-4f);
 }
 
 NNOPS_TEST(dwtconv_vs_ref_1x1_stride2) {
-    test_channel_last_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1},
+    test_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1},
         DepthwiseTransposeConv2DAttributes{{1, 1}, {2, 2}, {1, 1}, {0, 0}, {0, 0}},
         false, 1e-4f);
 }
 
 NNOPS_TEST(dwtconv_vs_ref_f16) {
-    test_channel_last_vs_ref<half>({1, 8, 8, 10}, {8, 1, 3, 3},
+    test_vs_ref<half>({1, 8, 8, 10}, {8, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}},
         true, test::kF16AccumTol);
-    test_channel_last_vs_ref<half>({1, 24, 9, 9}, {24, 1, 3, 3},
+    test_vs_ref<half>({1, 24, 9, 9}, {24, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}},
         false, test::kF16AccumTol);
 }

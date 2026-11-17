@@ -35,7 +35,7 @@
 /// is correct for every shape.
 
 #include "nnops/ops/transpose_conv2d.hpp"
-#include "backend/cpu/conv/tconv_cl.h"
+#include "backend/cpu/conv/tconv_common.h"
 #include "backend/cpu/simd_kernel/simd_col2im.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -78,9 +78,9 @@ struct Geom {
 /// is output channel g, so the vector axis is the channel itself: an output
 /// pixel accumulates the whole C-wide tap vector at once, and the "col" the
 /// scatter reads is the input plane. The skeleton — the repack to [KH·KW][C],
-/// the row scratch, the merge — is tconv_cl.h's; only the walk is 2-D.
+/// the row scratch, the merge — is tconv_common.h's; only the walk is 2-D.
 template <typename T>
-bool tconv2d_channel_last_depthwise(const Geom& gm, TensorView& output,
+bool tconv2d_depthwise(const Geom& gm, TensorView& output,
                                     std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     if (gm.IC_per_G != 1 || gm.OC_per_G != 1) {
@@ -98,7 +98,7 @@ bool tconv2d_channel_last_depthwise(const Geom& gm, TensorView& output,
     }
 
     const Tconv2dColGeom cg = gm.col_geom();
-    return tconv_cl_depthwise<T>(
+    return tconv_depthwise<T>(
         gm, output, inputs, ctx, gm.OH, gm.KH * gm.KW, gm.IC,
         [cg](const T* src, T* row, int64_t oh, const T* wd, int64_t m, int64_t nc) {
             // The tap indexes the repacked filter, not a source stride.
@@ -115,10 +115,10 @@ bool tconv2d_channel_last_depthwise(const Geom& gm, TensorView& output,
 /// once per group instead of once per pixel tile, and a stride-residue scatter
 /// then adds whole oc vectors out of the col. That pass over the filter is the
 /// entire point on a layer where the pixel kernel's re-read goes to DRAM.
-/// The chunk skeleton is tconv_cl.h's; only the walk is 2-D.
+/// The chunk skeleton is tconv_common.h's; only the walk is 2-D.
 /// Returns false when the operands cannot be read as flat matrices.
 template <typename T>
-bool tconv2d_channel_last_gemm(const Geom& gm, TensorView& output,
+bool tconv2d_gemm(const Geom& gm, TensorView& output,
                                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -145,7 +145,7 @@ bool tconv2d_channel_last_gemm(const Geom& gm, TensorView& output,
     const bool direct_w = npix * gm.N < gm.IC_per_G;
 
     const Tconv2dColGeom cg = gm.col_geom();
-    return tconv_cl_route<T>(
+    return tconv_route<T>(
         gm, output, inputs, ctx, npix, gm.OH, gm.KH * gm.KW, direct_w,
         [cg](const T* col, T* row, int64_t oh, int64_t m, int64_t nc) {
             tconv2d_col2im_pixel_major<T>(
@@ -447,7 +447,7 @@ void dequant_oc_row_f32(float* dp, const Src* rp, int64_t nc, const float* w_sx,
 /// therefore held as (q_x − zp_x) and the encode stage is one row pass, no col
 /// and no GEMM.
 template <typename TOut>
-bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
+bool tconv2d_int8_depthwise(const Geom& gm, TensorView& output,
                                          std::span<const TensorView> inputs, const ActPlane& act,
                                          const ComputeContext& ctx)
 {
@@ -576,7 +576,7 @@ bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
 /// the fp route's in-place orientation: its columns carry the per-channel
 /// parameters, which the raw [oc][tap] order does not line up with.
 template <typename TOut>
-bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
+bool tconv2d_int8(const Geom& gm, TensorView& output,
                                std::span<const TensorView> inputs, const ActPlane& act,
                                const ComputeContext& ctx)
 {
@@ -841,10 +841,10 @@ template <typename TOut>
 void tconv2d_int8_layout(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
                          const ActPlane& act, const ComputeContext& ctx)
 {
-    if (tconv2d_int8_channel_last_depthwise<TOut>(gm, output, inputs, act, ctx)) {
+    if (tconv2d_int8_depthwise<TOut>(gm, output, inputs, act, ctx)) {
         return;
     }
-    if (tconv2d_int8_channel_last<TOut>(gm, output, inputs, act, ctx)) {
+    if (tconv2d_int8<TOut>(gm, output, inputs, act, ctx)) {
         return;
     }
     tconv2d_int8_scalar<TOut>(gm, output, inputs, act, ctx);
@@ -1016,7 +1016,7 @@ void tconv2d_impl(const Geom& gm, TensorView& output, std::span<const TensorView
     // filter from DRAM. Both other cases go through a col matrix, which walks
     // the filter once per (n, group) whatever the geometry. Depthwise fits
     // neither — its channels, not its pixels, are the vector axis.
-    if (tconv2d_channel_last_depthwise<T>(gm, output, inputs, ctx)) {
+    if (tconv2d_depthwise<T>(gm, output, inputs, ctx)) {
         return;
     }
 
@@ -1026,7 +1026,7 @@ void tconv2d_impl(const Geom& gm, TensorView& output, std::span<const TensorView
     const int64_t wbytes = gm.IC * OC_span * gm.KH * gm.KW * static_cast<int64_t>(sizeof(T));
     const bool pixel_form =
         std::is_same_v<T, float> && gm.KH * gm.KW <= 3 * gm.SH * gm.SW && wbytes <= (512 << 10);
-    if (!pixel_form && tconv2d_channel_last_gemm<T>(gm, output, inputs, ctx)) {
+    if (!pixel_form && tconv2d_gemm<T>(gm, output, inputs, ctx)) {
         return;
     }
 

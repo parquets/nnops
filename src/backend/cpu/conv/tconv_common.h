@@ -1,5 +1,5 @@
 #pragma once
-/// @file tconv_cl.h
+/// @file tconv_common.h
 /// @brief The spatial route of transposed convolution, shared by the 2-D
 ///        and 3-D operators: the col chunk driver and the depthwise driver.
 ///
@@ -62,7 +62,7 @@ inline constexpr int64_t kColCapBytes = 8 << 20;
 
 /// One NHWC col GEMM call, resolved to flat operands: the chunk walk
 /// varies only the group and the oc chunk.
-template <typename T, typename G> struct TconvClCall {
+template <typename T, typename G> struct TconvChunkCall {
     const G& gm;
     const T *in, *w, *b;
     T *out, *col, *aux, *rows;
@@ -75,7 +75,7 @@ template <typename T, typename G> struct TconvClCall {
 /// The oc chunk: how many output channels one GEMM plus one per-worker row
 /// scratch fit the col cap — half of it when the filter is walked per call
 /// (direct_w), because `aux` then also holds a col copy.
-inline int64_t tconv_cl_oc_chunk(int64_t ocg, int64_t npix, int64_t karea, int64_t OW,
+inline int64_t tconv_oc_chunk(int64_t ocg, int64_t npix, int64_t karea, int64_t OW,
                                  int64_t slots, int64_t esz, bool direct_w)
 {
     const int64_t elem_cap = kColCapBytes / esz;
@@ -91,7 +91,7 @@ inline int64_t tconv_cl_oc_chunk(int64_t ocg, int64_t npix, int64_t karea, int64
 /// axis — then per batch item the GEMM, the direct-weight col transpose, and the
 /// scatter and merge of each output row.
 template <typename T, typename G, class Walk>
-void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk, const ComputeContext& ctx, int64_t g,
+void tconv_chunk(const TconvChunkCall<T, G>& c, Walk&& walk, const ComputeContext& ctx, int64_t g,
                     int64_t oc0, int64_t nc)
 {
     const int64_t m = nc * c.karea;
@@ -152,7 +152,7 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk, const ComputeContex
 /// The whole NHWC col route: the col, the filter staging and the row
 /// scratch are pooled once, then one chunk call per (group, oc chunk).
 template <typename T, typename G, class Walk>
-bool tconv_cl_route(const G& gm, TensorView& output, std::span<const TensorView> inputs,
+bool tconv_route(const G& gm, TensorView& output, std::span<const TensorView> inputs,
                     const ComputeContext& ctx, int64_t npix, int64_t rows_per_n, int64_t karea,
                     int64_t direct_w, Walk&& walk)
 {
@@ -167,7 +167,7 @@ bool tconv_cl_route(const G& gm, TensorView& output, std::span<const TensorView>
     }
 
     const int64_t slots = std::max(1, ctx.cpu.worker_count());
-    const int64_t cc = tconv_cl_oc_chunk(ocg, npix, karea, gm.OW, slots,
+    const int64_t cc = tconv_oc_chunk(ocg, npix, karea, gm.OW, slots,
                                          static_cast<int64_t>(sizeof(T)), direct_w != 0);
 
     PoolArray<T> col(static_cast<size_t>(npix * karea * cc));
@@ -177,7 +177,7 @@ bool tconv_cl_route(const G& gm, TensorView& output, std::span<const TensorView>
         return false;
     }
 
-    const TconvClCall<T, G> call{gm,
+    const TconvChunkCall<T, G> call{gm,
                                  input.ptr<T>(),
                                  weight.ptr<T>(),
                                  has_bias ? inputs[2].ptr<T>() : nullptr,
@@ -200,7 +200,7 @@ bool tconv_cl_route(const G& gm, TensorView& output, std::span<const TensorView>
         for (int64_t oc0 = 0; oc0 < ocg; oc0 += cc) {
             const int64_t nc = std::min(cc, ocg - oc0);
             if (nc > 0) {
-                tconv_cl_chunk(call, walk, ctx, g, oc0, nc);
+                tconv_chunk(call, walk, ctx, g, oc0, nc);
             }
         }
     }
@@ -213,7 +213,7 @@ bool tconv_cl_route(const G& gm, TensorView& output, std::span<const TensorView>
 /// filter so its tap indexes `wd` rather than the source. Returns false when the
 /// row scratch would not fit.
 template <typename T, typename G, class Walk>
-bool tconv_cl_depthwise(const G& gm, TensorView& output, std::span<const TensorView> inputs,
+bool tconv_depthwise(const G& gm, TensorView& output, std::span<const TensorView> inputs,
                         const ComputeContext& ctx, int64_t rows_per_n, int64_t karea, int64_t C,
                         Walk&& walk)
 {

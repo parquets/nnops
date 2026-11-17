@@ -22,11 +22,11 @@
 /// Dispatch:
 ///   pooling_cpu
 ///     adaptive all-ones  -> global
-///     s8/u8              -> pooling_channel_last_quant_impl (full extent)
+///     s8/u8              -> pooling_quant_impl (full extent)
 ///     f32/f16/bf16       -> pooling_fp
 ///       global           -> pooling_global_impl
-///       adaptive         -> pooling_adaptive_channel_last_impl
-///       otherwise        -> pooling_channel_last_impl       (lane on C)
+///       adaptive         -> pooling_adaptive_impl
+///       otherwise        -> pooling_impl       (lane on C)
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/ops/pool1d.hpp"
@@ -54,7 +54,7 @@ namespace {
 // ============================================================
 
 template <bool IsMax, typename T>
-void pooling_channel_last_impl(const PoolingAttributes& attrs, TensorView& output,
+void pooling_impl(const PoolingAttributes& attrs, TensorView& output,
                                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -272,7 +272,7 @@ inline int64_t adaptive_end(int64_t o, int64_t in, int64_t out) noexcept
 /// Spatial adaptive: the lane is the channel, so the window walk is a
 /// vector min/add over whole pixels and only the channel tail runs scalar.
 template <bool IsMax, typename T>
-void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs, TensorView& output,
+void pooling_adaptive_impl(const PoolingAttributes& attrs, TensorView& output,
                                         std::span<const TensorView> inputs,
                                         const ComputeContext& ctx)
 {
@@ -386,16 +386,16 @@ void pooling_fp(const PoolingAttributes& attrs, TensorView& output,
     }
     if (attrs.adaptive()) {
         if (attrs.type == PoolingType::Max) {
-            pooling_adaptive_channel_last_impl<true, T>(attrs, output, inputs, ctx);
+            pooling_adaptive_impl<true, T>(attrs, output, inputs, ctx);
         } else {
-            pooling_adaptive_channel_last_impl<false, T>(attrs, output, inputs, ctx);
+            pooling_adaptive_impl<false, T>(attrs, output, inputs, ctx);
         }
         return;
     }
     if (attrs.type == PoolingType::Max) {
-        pooling_channel_last_impl<true, T>(attrs, output, inputs, ctx);
+        pooling_impl<true, T>(attrs, output, inputs, ctx);
     } else {
-        pooling_channel_last_impl<false, T>(attrs, output, inputs, ctx);
+        pooling_impl<false, T>(attrs, output, inputs, ctx);
     }
 }
 
@@ -428,7 +428,7 @@ inline PoolingAttributes full_extent_window(PoolingAttributes attrs, const Tenso
 /// strip, over dequantize/requantize kernels; full blocks keep the raw-integer
 /// max (exact when scales and zero points match).
 template <bool IsMax, typename InT, typename OutT>
-void pooling_channel_last_quant_impl(const PoolingAttributes& attrs, TensorView& output,
+void pooling_quant_impl(const PoolingAttributes& attrs, TensorView& output,
                                      std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -539,9 +539,9 @@ void pooling_quant(const PoolingAttributes& attrs, TensorView& output,
                    std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     if (attrs.type == PoolingType::Max) {
-        pooling_channel_last_quant_impl<true, InT, OutT>(attrs, output, inputs, ctx);
+        pooling_quant_impl<true, InT, OutT>(attrs, output, inputs, ctx);
     } else {
-        pooling_channel_last_quant_impl<false, InT, OutT>(attrs, output, inputs, ctx);
+        pooling_quant_impl<false, InT, OutT>(attrs, output, inputs, ctx);
     }
 }
 

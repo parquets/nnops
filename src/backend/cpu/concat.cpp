@@ -53,8 +53,8 @@ void concat_impl(const ConcatAttributes& attrs, TensorView& output,
             axis_offset[static_cast<size_t>(i)] + inputs[static_cast<size_t>(i)].shape(ax);
     }
 
-    const bool channel_last = is_channel_last(output.layout());
-    const int64_t line_axis = channel_last ? 1 : rank - 1;
+    const bool spatial = is_channel_last(output.layout());
+    const int64_t line_axis = spatial ? 1 : rank - 1;
     const int64_t line_len = output.shape(line_axis);
 
     // Every dimension except the line axis is walked as one output line.

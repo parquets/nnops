@@ -24,7 +24,7 @@
 ///    block only (partial sums accumulate unclamped). Measured 11% of the conv2d
 ///    row at one thread, bit-identical checkpoints. add_to adds the residual
 ///    *after* the activation, so it keeps the separate epilogue pass.
-///  * The prepacked filter's geometry comes from conv_packed_weight_last, and
+///  * The prepacked filter's geometry comes from conv_packed_weight, and
 ///    the plan ADOPTS its icn_block/ocn_block from there instead of choosing
 ///    again: prepackWeights built the panels against that function, with no
 ///    activation to resolve a plan from. A plan that picked its own block would
@@ -92,7 +92,7 @@ constexpr bool is_fp_activation_dtype(DataType d) noexcept
 //  Im2col route — pixels on M, the packed HWIO weight on N
 // =========================================================================
 
-namespace channel_last {
+namespace impl {
 namespace {
 
 using nnops::simd::s_load;
@@ -105,7 +105,7 @@ namespace k = nnops::kernel; // pure SIMD kernels: the stem's direct 3x3
 /// Input-channel block: kdim = ic_block × karea lands in ~144–256, and the
 /// packed-B panel (nr_max × kdim) stays near L1/L2. A 1x1 filter has neither a
 /// gather nor a karea multiplier, so K runs four times as wide.
-inline int64_t get_ic_block_channel_last(int64_t karea, int64_t ic_per_group) noexcept
+inline int64_t get_ic_block(int64_t karea, int64_t ic_per_group) noexcept
 {
     if (karea == 1) {
         return 256;
@@ -255,7 +255,7 @@ void stem_conv_plane(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in, const T*
 // ---- main kernel ----------------------------------------------------------
 
 template <class T>
-void conv2d_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
+void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
                               std::span<const TensorView> inputs, const ComputeContext& ctx,
                               const Conv2DGemmPlan& plan, void* workspace)
 {
@@ -418,8 +418,8 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
 
     // ---- block geometry ----------------------------------------------------
     // Same function prepackWeights built the blob with; it must never disagree.
-    const ConvPackedWeightLast pg =
-        conv_packed_weight_last(attrs, ic_per_group, oc_per_group, weight.data_type());
+    const ConvPackedWeight pg =
+        conv_packed_weight(attrs, ic_per_group, oc_per_group, weight.data_type());
     NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block && pg.nr == nr_max);
     const int64_t num_ic_blocks = pg.nfull_ic + (pg.tail_ic ? 1 : 0);
     const int64_t kdim_max = pg.kdim_max;
@@ -753,7 +753,7 @@ inline void pack_block_i8(int8_t* dst, int64_t panel_slot, int8_t* stage, const 
 // ---- main kernel ----------------------------------------------------------
 
 template <class TAct, class TOut>
-void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
+void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                                    const Conv2DGemmPlan& plan, void* workspace)
 {
@@ -808,8 +808,8 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs, TensorView& ou
     const int64_t w_tap_stride = prepacked ? 0 : weight.shape(2) * w_row;
 
     // Same geometry prepackWeights used (see the float kernel).
-    const ConvPackedWeightLast pg =
-        conv_packed_weight_last(attrs, ic_per_group, oc_per_group, weight.data_type());
+    const ConvPackedWeight pg =
+        conv_packed_weight(attrs, ic_per_group, oc_per_group, weight.data_type());
     NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block && pg.nr == NR_MAX_I8);
     constexpr int64_t nr_max = NR_MAX_I8;
 
@@ -1245,11 +1245,11 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     plan.pointwise = (karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
                       attrs.padding[0] == 0 && attrs.padding[1] == 0);
 
-    // The block sizes are the prepacked filter's geometry: conv_packed_weight_last
+    // The block sizes are the prepacked filter's geometry: conv_packed_weight
     // resolves them from the attributes and the filter's dims alone, and a plan
     // choosing again would size panels the blob does not hold.
-    const ConvPackedWeightLast pg =
-        conv_packed_weight_last(attrs, ic_per_group, oc_per_group, wt.dtype);
+    const ConvPackedWeight pg =
+        conv_packed_weight(attrs, ic_per_group, oc_per_group, wt.dtype);
     plan.icn_block = pg.icn_block;
     plan.ocn_block = pg.ocn_block;
     const int64_t nr_for_split = pg.nr;
@@ -1365,7 +1365,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
 }
 
 } // anonymous namespace
-} // namespace channel_last
+} // namespace impl
 
 // =========================================================================
 //  Public API — one route per axis, chosen from the activation's layout
@@ -1377,13 +1377,13 @@ namespace {
 /// leaves the shared ladders below call. Everything route-independent — the
 /// pool, the plan prologue, the column split, the dtype switches — lives outside.
 
-struct ChannelLastRoute {
+struct GemmRoute {
     static Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
                                     std::span<const TensorDesc> inputs,
                                     std::span<const TensorDesc> outputs, int num_threads,
                                     bool use_thread_slots, int64_t num_slots)
     {
-        return channel_last::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+        return impl::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
                                        num_slots);
     }
 
@@ -1392,7 +1392,7 @@ struct ChannelLastRoute {
                         std::span<const TensorView> inputs, const ComputeContext& ctx,
                         const Conv2DGemmPlan& plan, void* workspace)
     {
-        channel_last::conv2d_channel_last_impl<T>(attrs, output, inputs, ctx, plan, workspace);
+        impl::conv2d_impl<T>(attrs, output, inputs, ctx, plan, workspace);
     }
 
     /// The storage choice is a runtime flag inside this route's kernel, not a
@@ -1402,7 +1402,7 @@ struct ChannelLastRoute {
                            std::span<const TensorView> inputs, const ComputeContext& ctx,
                            const Conv2DGemmPlan& plan, void* workspace)
     {
-        channel_last::conv2d_channel_last_int8_impl<TAct, TOut>(attrs, output, inputs, ctx, plan,
+        impl::conv2d_int8_impl<TAct, TOut>(attrs, output, inputs, ctx, plan,
                                                                 workspace);
     }
 };
@@ -1619,17 +1619,17 @@ Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
 // two-step contract as the Winograd U. It is safe because the geometry comes from
 // the attributes plus the filter's own dims, never the activation (hence these
 // take channel counts, not a plan), and the plan adopts icn_block/ocn_block from
-// conv_packed_weight_last rather than choosing again — so "the panels
+// conv_packed_weight rather than choosing again — so "the panels
 // prepackWeights built" and "the panels the plan sized for" are one decision.
 //
 // The packed blob is addressed by *panel*: panel p holds output channels
 // [p·nr, (p+1)·nr) of one k block, for every k block of the group — so any
 // panel-aligned oc range is readable and the plan's N tile stops constraining it.
 
-ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs, int64_t ic_per_group,
+ConvPackedWeight conv_packed_weight(const Conv2DAttributes& attrs, int64_t ic_per_group,
                                              int64_t oc_per_group, DataType weight_dtype)
 {
-    ConvPackedWeightLast g;
+    ConvPackedWeight g;
     if (ic_per_group <= 0 || oc_per_group <= 0 || attrs.groups <= 0) {
         return g;
     }
@@ -1646,15 +1646,15 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs, int6
     g.nr = quant ? NR_MAX_I8 : nr_max_dt(weight_dtype);
     g.icn_block =
         unit_1x1 ? ic_per_group :
-                   std::min<int64_t>(channel_last::get_ic_block_channel_last(karea, ic_per_group),
+                   std::min<int64_t>(impl::get_ic_block(karea, ic_per_group),
                                      ic_per_group);
     // Balance the oc blocks rather than taking kOcnBlock and leaving a sliver:
     // 144 is 80 + 64, not 128 + 16 (an eighth-full block paying every per-block
     // cost: accumulator fill, A pack, epilogue).
     const int64_t oc_blocks_wanted =
-        oc_per_group <= channel_last::kOcnSingleCap ?
+        oc_per_group <= impl::kOcnSingleCap ?
             1 :
-            (oc_per_group + channel_last::kOcnBlock - 1) / channel_last::kOcnBlock;
+            (oc_per_group + impl::kOcnBlock - 1) / impl::kOcnBlock;
     const int64_t per_block = (oc_per_group + oc_blocks_wanted - 1) / oc_blocks_wanted;
     g.ocn_block = std::min<int64_t>(oc_per_group, ((per_block + g.nr - 1) / g.nr) * g.nr);
 
@@ -1728,7 +1728,7 @@ TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs, const TensorDe
         return TensorDesc{};
     }
 
-    const ConvPackedWeightLast g = conv_packed_weight_last(attrs, ICG, OC / G, weight.dtype);
+    const ConvPackedWeight g = conv_packed_weight(attrs, ICG, OC / G, weight.dtype);
     return packed_weight_desc(OC / G, G, g.total, weight.dtype, TensorLayout::PackedHWIO);
 }
 
@@ -1766,7 +1766,7 @@ void with_stage(const ComputeContext& ctx, int64_t n, int64_t stage_len, Body bo
 /// split is (group, oc block, k block) — the layout's own unit, so every task
 /// writes a contiguous region without the panels of two oc blocks interleaving.
 template <class T>
-void pack_weight_last(const TensorView& weight, TensorView& packed, const ConvPackedWeightLast& g,
+void pack_weight(const TensorView& weight, TensorView& packed, const ConvPackedWeight& g,
                       int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
                       const ComputeContext& ctx)
 {
@@ -1801,7 +1801,7 @@ void pack_weight_last(const TensorView& weight, TensorView& packed, const ConvPa
                    const int64_t w_tap = ic_per_group * w_ic; // between filter taps
                    for (int64_t ocn = oc0; ocn < oc1; ocn += g.nr) {
                        const int64_t ocnc = std::min(g.nr, oc_per_group - ocn);
-                       channel_last::pack_block<T>(blob + g.offset(gg, ib, ocn), slot, stage,
+                       impl::pack_block<T>(blob + g.offset(gg, ib, ocn), slot, stage,
                                                    w + gg * oc_per_group + ocn + icn * w_ic, w_ic,
                                                    w_tap, ocnc, icnc, static_cast<int>(karea), g.nr,
                                                    static_cast<int>(kdim));
@@ -1810,8 +1810,8 @@ void pack_weight_last(const TensorView& weight, TensorView& packed, const ConvPa
 }
 
 /// pack_block_i8's sibling of the float pack above: same split, same loop.
-void pack_weight_last_i8(const TensorView& weight, TensorView& packed,
-                         const ConvPackedWeightLast& g, int64_t ic_per_group, int64_t oc_per_group,
+void pack_weight_i8(const TensorView& weight, TensorView& packed,
+                         const ConvPackedWeight& g, int64_t ic_per_group, int64_t oc_per_group,
                          int64_t groups, const ComputeContext& ctx)
 {
     const int64_t karea = g.kdim_max / g.icn_block;
@@ -1842,7 +1842,7 @@ void pack_weight_last_i8(const TensorView& weight, TensorView& packed,
         const int64_t w_tap = ic_per_group * w_ic;
         for (int64_t ocn = oc0; ocn < oc1; ocn += g.nr) {
             const int64_t ocnc = std::min(g.nr, oc_per_group - ocn);
-            channel_last::pack_block_i8(blob + g.offset(gg, ib, ocn), slot, stage,
+            impl::pack_block_i8(blob + g.offset(gg, ib, ocn), slot, stage,
                                         w + gg * oc_per_group + ocn + icn * w_ic, w_ic, w_tap, ocnc,
                                         icnc, static_cast<int>(karea), g.nr, static_cast<int>(kdim),
                                         a_biased);
@@ -1887,23 +1887,23 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs, const TensorView& we
 
     // No zero-fill here: the panel packers mask-load a short panel and zero-fill
     // the lanes past its width, so every byte a consumer reads is written.
-    const ConvPackedWeightLast g = conv_packed_weight_last(attrs, ICG, OCG, dtype);
+    const ConvPackedWeight g = conv_packed_weight(attrs, ICG, OCG, dtype);
     NNOPS_ASSERT(packed.numel() >= g.total &&
                  "conv_packed_weight_pack: buffer smaller than the panels");
     switch (dtype) {
     case DataType::f32:
-        pack_weight_last<float>(weight, packed, g, ICG, OCG, G, ctx);
+        pack_weight<float>(weight, packed, g, ICG, OCG, G, ctx);
         break;
     case DataType::f16:
-        pack_weight_last<half>(weight, packed, g, ICG, OCG, G, ctx);
+        pack_weight<half>(weight, packed, g, ICG, OCG, G, ctx);
         break;
 #ifdef NNOPS_ARCH_AARCH64
     case DataType::bf16:
-        pack_weight_last<bfloat16>(weight, packed, g, ICG, OCG, G, ctx);
+        pack_weight<bfloat16>(weight, packed, g, ICG, OCG, G, ctx);
         break;
 #endif
     case DataType::s8:
-        pack_weight_last_i8(weight, packed, g, ICG, OCG, G, ctx);
+        pack_weight_i8(weight, packed, g, ICG, OCG, G, ctx);
         break;
     default:
         NNOPS_ASSERT(!"conv_packed_weight_pack: unsupported filter dtype");
@@ -1924,7 +1924,7 @@ Conv2DGemmPlan get_conv2d_implicit_gemm_plan(const Conv2DAttributes& attrs,
                                              std::span<const TensorDesc> outputs, int num_threads,
                                              bool use_thread_slots, int64_t num_slots)
 {
-    return ChannelLastRoute::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+    return GemmRoute::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
                                        num_slots);
 }
 
@@ -1932,7 +1932,7 @@ Status conv2d_implicit_gemm_kernel(const Conv2DAttributes& attrs, TensorView& ou
                                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                                    void* /*workspace*/)
 {
-    return conv2d_gemm_run<ChannelLastRoute>(attrs, output, inputs, ctx);
+    return conv2d_gemm_run<GemmRoute>(attrs, output, inputs, ctx);
 }
 
 } // namespace nnops::backend::cpu

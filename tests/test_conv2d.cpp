@@ -901,8 +901,8 @@ NNOPS_TEST(conv2d_wino_plan_and_auto) {
     TensorView output(std::span<const int64_t>(oshape, 4), DataType::f32,
                       out_buf.data(), TensorLayout::NHWC);
 
-    const backend::cpu::WinoChannelLastU ug =
-        backend::cpu::wino_channel_last_u(32, 32, 1, DataType::f32);
+    const backend::cpu::WinoU ug =
+        backend::cpu::wino_u(32, 32, 1, DataType::f32);
     // The U is laid out in the arch's MMA panels, so both the panel width and
     // the panel count it implies follow NR_MAX_F32 (16 on x86, 12 on aarch64).
     const int64_t nr_max = backend::cpu::NR_MAX_F32;
@@ -936,8 +936,8 @@ NNOPS_TEST(conv2d_wino_plan_and_auto) {
     // and a 4x4 tile grid over the same 14x14 output. The panels are otherwise
     // the same shape (32 channels, 32 oc), so only the position count differs.
     {
-        const backend::cpu::WinoChannelLastU ug43 =
-            backend::cpu::wino_channel_last_u(32, 32, 1, DataType::f32,
+        const backend::cpu::WinoU ug43 =
+            backend::cpu::wino_u(32, 32, 1, DataType::f32,
                                               backend::cpu::WinoOrder::F43);
         NNOPS_EXPECT_EQ(ug43.pos, int64_t{36});
         const int64_t s43[] = {36, ug43.nb, ug43.jbg, ug43.ldd};
@@ -1249,7 +1249,7 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
         test::XorShift128 rng(c.seed);
         rng.fill_float(act_channel_first.data(), static_cast<int64_t>(act_channel_first.size()), -1.0f, 1.0f);
     }
-    const auto act_channel_last = test::channel_first_to_channel_last<float>(act_channel_first, N, IC, IH, IW);
+    const auto act_nhwc = test::channel_first_to_channel_last<float>(act_channel_first, N, IC, IH, IW);
 
     auto store_act = [&](const std::vector<float>& v) {
         std::vector<uint8_t> dst(v.size() * esz);
@@ -1266,7 +1266,7 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
         return dst;
     };
     auto act_ref = store_act(act_channel_first);
-    auto act_op  = store_act(act_channel_last);
+    auto act_op  = store_act(act_nhwc);
 
     std::vector<int8_t> w_oihw(static_cast<size_t>(OC * ICG * c.kh * c.kw));
     {
@@ -1398,8 +1398,8 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
     auto compare = [&](auto tag) -> std::string {
         using T = decltype(tag);
         const T* src = reinterpret_cast<const T*>(op_buf.data());
-        std::vector<T> channel_last(src, src + out_n);
-        const auto got = test::channel_last_to_channel_first<T>(channel_last, N, OC, OH, OW);
+        std::vector<T> nhwc(src, src + out_n);
+        const auto got = test::channel_last_to_channel_first<T>(nhwc, N, OC, OH, OW);
         const T* want = reinterpret_cast<const T*>(ref_buf.data());
         int64_t nbad = 0;
         int64_t first = -1;

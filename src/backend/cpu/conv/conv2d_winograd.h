@@ -119,7 +119,7 @@ constexpr int64_t wino_alpha(WinoOrder o) noexcept { return wino_tile(o) + 2; }
 /// [kc][nr] k-major — exactly what the packer would have written — and the
 /// output channels run zero-padded to whole panels, so a partial panel's dead
 /// columns are computed and dropped.
-struct WinoChannelLastU {
+struct WinoU {
     WinoOrder order = WinoOrder::F23; ///< which transform produced these panels
     int64_t pos = 0;                  ///< transform positions = wino_pos(order)
     int64_t nr = 0;                   ///< panel width: the arch's nr_max for the dtype
@@ -134,8 +134,8 @@ struct WinoChannelLastU {
 };
 
 /// Resolve the U geometry for a dtype and transform order (see
-/// WinoChannelLastU).
-WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
+/// WinoU).
+WinoU wino_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
                                      DataType dt, WinoOrder order = WinoOrder::F23) noexcept;
 
 /// Which order a prepack should build. The trade is F(4,3)'s 1.78x fewer
@@ -175,7 +175,7 @@ struct Conv2DWinogradPlan {
                                  ///< unless the plane is too small for the pool
     int64_t num_tasks = 0;       ///< N · G · num_tile_blocks · oc_chunks
 
-    WinoChannelLastU u;      ///< the prepacked U's panel geometry
+    WinoU u;      ///< the prepacked U's panel geometry
     int64_t v_lda = 0;       ///< elements per tile row of one V position =
                              ///< IC/G rounded up to the vector (the GEMM's lda)
     int64_t m_oc_stride = 0; ///< M's row (tile) stride in oc

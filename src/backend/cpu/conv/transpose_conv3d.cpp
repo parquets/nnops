@@ -24,7 +24,7 @@
 /// The weight stays [IC, OC/G, KD, KH, KW].
 
 #include "nnops/ops/transpose_conv3d.hpp"
-#include "backend/cpu/conv/tconv_cl.h"
+#include "backend/cpu/conv/tconv_common.h"
 #include "backend/cpu/simd_kernel/simd_col2im.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
@@ -76,11 +76,11 @@ struct Geom3 {
 /// NDHWC through a col matrix — the 2-D route one axis deeper, and what
 /// MNN's NC4HW4 deconvolution does: one GEMM per (batch, group) does the channel
 /// reduction for the whole volume, and a depth/height tap list plus a
-/// stride-residue scatter fold the col back. The chunk skeleton is tconv_cl.h's;
+/// stride-residue scatter fold the col back. The chunk skeleton is tconv_common.h's;
 /// only the walk is 3-D. Returns false when the operands cannot be read as flat
 /// matrices.
 template <typename T>
-bool tconv3d_channel_last_gemm(const Geom3& gm, TensorView& output,
+bool tconv3d_gemm(const Geom3& gm, TensorView& output,
                                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -113,7 +113,7 @@ bool tconv3d_channel_last_gemm(const Geom3& gm, TensorView& output,
 
     const Tconv3dColGeom cg = gm.col_geom();
     const int64_t OH = gm.OH;
-    return tconv_cl_route<T>(
+    return tconv_route<T>(
         gm, output, inputs, ctx, npix, gm.OD * gm.OH, gm.KD * gm.KH * gm.KW, direct_w,
         [cg, OH](const T* col, T* row, int64_t task, int64_t m, int64_t nc) {
             tconv3d_col2im_pixel_major<T>(
@@ -126,9 +126,9 @@ bool tconv3d_channel_last_gemm(const Geom3& gm, TensorView& output,
 /// is output channel g, so the vector axis is the channel itself and an output
 /// voxel accumulates the whole C-wide tap vector at once, the "col" being the
 /// input volume. The skeleton — the repack to [KD·KH·KW][C], the row scratch,
-/// the merge — is tconv_cl.h's; only the walk is 3-D.
+/// the merge — is tconv_common.h's; only the walk is 3-D.
 template <typename T>
-bool tconv3d_channel_last_depthwise(const Geom3& gm, TensorView& output,
+bool tconv3d_depthwise(const Geom3& gm, TensorView& output,
                                     std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     if (gm.IC_per_G != 1 || gm.OC_per_G != 1) {
@@ -150,7 +150,7 @@ bool tconv3d_channel_last_depthwise(const Geom3& gm, TensorView& output,
 
     const Tconv3dColGeom cg = gm.col_geom();
     const int64_t OH = gm.OH;
-    return tconv_cl_depthwise<T>(
+    return tconv_depthwise<T>(
         gm, output, inputs, ctx, gm.OD * gm.OH, gm.KD * gm.KH * gm.KW, gm.IC,
         [cg, OH](const T* src, T* row, int64_t task, const T* wd, int64_t m, int64_t nc) {
             // The tap indexes the repacked filter, not a source stride.
@@ -268,10 +268,10 @@ void tconv3d_impl(const Geom3& gm, TensorView& output, std::span<const TensorVie
     if (gm.N == 0 || gm.OC == 0 || gm.OD == 0 || gm.OH == 0 || gm.OW == 0) {
         return;
     }
-    if (tconv3d_channel_last_depthwise<T>(gm, output, inputs, ctx)) {
+    if (tconv3d_depthwise<T>(gm, output, inputs, ctx)) {
         return;
     }
-    if (tconv3d_channel_last_gemm<T>(gm, output, inputs, ctx)) {
+    if (tconv3d_gemm<T>(gm, output, inputs, ctx)) {
         return;
     }
     tconv3d_gather<T>(gm, output, inputs, ctx);

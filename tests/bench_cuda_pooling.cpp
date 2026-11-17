@@ -147,9 +147,9 @@ void run_table(DataType dt, const char* label)
 }  // namespace
 
 NNOPS_BENCH(cuda_pooling) {
-    print_cuda_header("CUDA pooling (f32 channel_last)");
+    print_cuda_header("CUDA pooling (f32 nhwc)");
     run_table(DataType::f32, "f32");
-    print_cuda_header("CUDA pooling (f16 channel_last)");
+    print_cuda_header("CUDA pooling (f16 nhwc)");
     run_table(DataType::f16, "f16");
 }
 

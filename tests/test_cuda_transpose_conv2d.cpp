@@ -164,12 +164,12 @@ NNOPS_TEST(cuda_transpose_conv2d_groups) {
     TConvCase c;
     c.ic = 16; c.oc = 32; c.groups = 4;
     c.sh = c.sw = 2;
-    run_case(c, "cuda_tconv_channel_last_groups");
+    run_case(c, "cuda_tconv_groups");
 
     TConvCase d;
     d.ic = 32; d.oc = 128; d.groups = 2;
     d.ih = d.iw = 10; d.dh = d.dw = 2; d.ph = d.pw = 2;
-    run_case(d, "cuda_tconv_channel_last_groups");
+    run_case(d, "cuda_tconv_groups");
 }
 
 // ============================================================

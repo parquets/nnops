@@ -42,7 +42,7 @@ namespace nnops::backend::cpu::reference {
 
 /// Roundtrip: convert input to NHWC -> TransposeConv2D::compute -> convert back
 /// -> compare with the scalar golden.
-static void test_channel_last_vs_ref(
+static void test_vs_ref(
     const std::vector<int64_t>& in_shape,
     const std::vector<int64_t>& w_shape,
     const TransposeConv2DAttributes& attrs,
@@ -721,7 +721,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32) {
     attrs.padding      = {1, 1};
     attrs.groups       = 1;
 
-    test_channel_last_vs_ref({1, 4, 8, 8}, {4, 8, 3, 3}, attrs);
+    test_vs_ref({1, 4, 8, 8}, {4, 8, 3, 3}, attrs);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_bias) {
@@ -732,7 +732,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32_bias) {
     attrs.padding      = {1, 1};
     attrs.groups       = 1;
 
-    test_channel_last_vs_ref({1, 4, 8, 8}, {4, 8, 3, 3}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 4, 8, 8}, {4, 8, 3, 3}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_groups) {
@@ -743,7 +743,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32_groups) {
     attrs.padding      = {0, 0};
     attrs.groups       = 2;
 
-    test_channel_last_vs_ref({1, 4, 4, 4}, {4, 4, 3, 3}, attrs);
+    test_vs_ref({1, 4, 4, 4}, {4, 4, 3, 3}, attrs);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_nopad) {
@@ -754,7 +754,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32_nopad) {
     attrs.padding      = {0, 0};
     attrs.groups       = 1;
 
-    test_channel_last_vs_ref({1, 4, 4, 4}, {4, 6, 2, 2}, attrs);
+    test_vs_ref({1, 4, 4, 4}, {4, 6, 2, 2}, attrs);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_dilation) {
@@ -765,7 +765,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32_dilation) {
     attrs.padding      = {0, 0};
     attrs.groups       = 1;
 
-    test_channel_last_vs_ref({1, 4, 8, 8}, {4, 4, 3, 3}, attrs);
+    test_vs_ref({1, 4, 8, 8}, {4, 4, 3, 3}, attrs);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_multi_channel) {
@@ -777,13 +777,13 @@ NNOPS_TEST(tconv2d_roundtrip_f32_multi_channel) {
     attrs.padding      = {1, 1};
     attrs.groups       = 1;
 
-    test_channel_last_vs_ref({1, 16, 8, 8}, {16, 32, 3, 3}, attrs);
+    test_vs_ref({1, 16, 8, 8}, {16, 32, 3, 3}, attrs);
 }
 
 /// Roundtrip against the scalar golden with a mixed-sign
 /// residual in the destination, so that the pre- and post-activation orders of
 /// add_to cannot agree by accident.
-static void test_channel_last_residual_vs_ref(
+static void test_residual_vs_ref(
     const std::vector<int64_t>& in_shape,
     const std::vector<int64_t>& w_shape,
     const TransposeConv2DAttributes& attrs,
@@ -957,7 +957,7 @@ NNOPS_TEST(tconv2d_wide_oc) {
     attrs.padding     = {1, 1};
     attrs.groups      = 1;
 
-    test_channel_last_vs_ref({1, 64, 16, 16}, {64, 128, 3, 3}, attrs);
+    test_vs_ref({1, 64, 16, 16}, {64, 128, 3, 3}, attrs);
 }
 
 // ============================================================
@@ -975,7 +975,7 @@ NNOPS_TEST(tconv2d_depthwise) {
     attrs.padding     = {1, 1};
     attrs.groups      = 16;
 
-    test_channel_last_vs_ref({1, 16, 9, 9}, {16, 1, 3, 3}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 16, 9, 9}, {16, 1, 3, 3}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(tconv2d_depthwise_stride1) {
@@ -988,7 +988,7 @@ NNOPS_TEST(tconv2d_depthwise_stride1) {
     attrs.epilogue    = {EpilogueActivateType::LeakyRelu};
     attrs.epilogue.alpha = 0.05f;
 
-    test_channel_last_vs_ref({1, 12, 10, 10}, {12, 1, 3, 3}, attrs);
+    test_vs_ref({1, 12, 10, 10}, {12, 1, 3, 3}, attrs);
 }
 
 NNOPS_TEST(tconv2d_direct_weight) {
@@ -1003,7 +1003,7 @@ NNOPS_TEST(tconv2d_direct_weight) {
     attrs.groups      = 2;
     attrs.epilogue    = {EpilogueActivateType::Relu6};
 
-    test_channel_last_vs_ref({1, 32, 3, 3}, {32, 12, 4, 4}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 32, 3, 3}, {32, 12, 4, 4}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(tconv2d_col_chunked) {
@@ -1016,7 +1016,7 @@ NNOPS_TEST(tconv2d_col_chunked) {
     attrs.padding     = {2, 2};
     attrs.groups      = 1;
 
-    test_channel_last_vs_ref({1, 16, 64, 64}, {16, 256, 5, 5}, attrs);
+    test_vs_ref({1, 16, 64, 64}, {16, 256, 5, 5}, attrs);
 }
 
 NNOPS_TEST(tconv2d_batched_groups) {
@@ -1029,7 +1029,7 @@ NNOPS_TEST(tconv2d_batched_groups) {
     attrs.padding     = {1, 1};
     attrs.groups      = 2;
 
-    test_channel_last_vs_ref({3, 16, 10, 10}, {16, 8, 3, 3}, attrs, /*has_bias=*/true);
+    test_vs_ref({3, 16, 10, 10}, {16, 8, 3, 3}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(tconv2d_add_to) {
@@ -1108,7 +1108,7 @@ NNOPS_TEST(tconv2d_pre_act) {
     attrs.add_to      = true;
     attrs.residual_pre_activation = true;
 
-    test_channel_last_residual_vs_ref({1, 16, 8, 8}, {16, 32, 4, 4}, attrs);
+    test_residual_vs_ref({1, 16, 8, 8}, {16, 32, 4, 4}, attrs);
 }
 
 NNOPS_TEST(tconv2d_pre_act_bias_groups) {
@@ -1124,7 +1124,7 @@ NNOPS_TEST(tconv2d_pre_act_bias_groups) {
     attrs.add_to      = true;
     attrs.residual_pre_activation = true;
 
-    test_channel_last_residual_vs_ref({2, 8, 9, 10}, {8, 8, 3, 3}, attrs, true);
+    test_residual_vs_ref({2, 8, 9, 10}, {8, 8, 3, 3}, attrs, true);
 }
 
 NNOPS_TEST(tconv2d_pixel_pre_act) {
@@ -1140,7 +1140,7 @@ NNOPS_TEST(tconv2d_pixel_pre_act) {
     attrs.add_to      = true;
     attrs.residual_pre_activation = true;
 
-    test_channel_last_residual_vs_ref({1, 16, 10, 11}, {16, 32, 2, 2}, attrs, true);
+    test_residual_vs_ref({1, 16, 10, 11}, {16, 32, 2, 2}, attrs, true);
 }
 
 NNOPS_TEST(tconv2d_depthwise_pre_act) {
@@ -1156,7 +1156,7 @@ NNOPS_TEST(tconv2d_depthwise_pre_act) {
     attrs.add_to      = true;
     attrs.residual_pre_activation = true;
 
-    test_channel_last_residual_vs_ref({1, 16, 9, 9}, {16, 1, 3, 3}, attrs, true);
+    test_residual_vs_ref({1, 16, 9, 9}, {16, 1, 3, 3}, attrs, true);
 }
 
 // ============================================================
@@ -1203,7 +1203,7 @@ NNOPS_TEST(tconv2d_threaded_matches_serial) {
     // The kernels split the image, and an output row's merge stays inside its
     // own task, so a thread count may only change a GEMM's accumulation order.
     // The residual is off here: the add_to cases live in
-    // test_channel_last_residual_vs_ref, where the destination is built permuted.
+    // test_residual_vs_ref, where the destination is built permuted.
     const std::vector<int64_t> in_shape = {2, 32, 12, 12};
     const std::vector<int64_t> w_shape  = {32, 16, 3, 3};
 

@@ -62,10 +62,10 @@ WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_grou
     return (out_h >= floor && out_w >= floor) ? WinoOrder::F43 : WinoOrder::F23;
 }
 
-WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
+WinoU wino_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
                                      DataType dt, WinoOrder order) noexcept
 {
-    WinoChannelLastU u;
+    WinoU u;
     if (ic_per_group <= 0 || oc_per_group <= 0 || groups <= 0) {
         return u;
     }
@@ -99,7 +99,7 @@ WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group,
     return u;
 }
 
-namespace channel_last {
+namespace impl {
 namespace {
 
 using namespace nnops::simd;
@@ -117,7 +117,7 @@ constexpr int64_t kOcnBlock = 64;
 /// count, the tile size and the two transforms' shapes — everything else about
 /// the task is order-independent.
 template <class T, WinoOrder O>
-void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
+void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
                                        std::span<const TensorView> inputs,
                                        const ComputeContext& ctx, const Conv2DWinogradPlan& plan,
                                        void* workspace)
@@ -128,17 +128,22 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
     const auto& u_tensor = inputs[1]; // prepacked transform-domain weight
     const bool has_bias = inputs.size() > 2;
 
-    // Logical [N, C, H, W]; NHWC stores [N][H][W][C], so a "row" is one spatial
-    // line and a pixel's channels are contiguous.
+    // NHWC: the descriptor keeps [N, C, H, W]; one W step is a channel block and
+    // one H step is a row pitch, taken from the view so a padded pitch and the
+    // batch step cannot disagree with it.
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
     const int64_t IC = input.shape(1);
-    const int64_t in_row = input.row_stride_elems();
+    const int64_t in_pix = input.stride_elems(3);
+    const int64_t in_row = input.stride_elems(2);
+    const int64_t in_batch = input.stride_elems(0);
 
     const int64_t OC = output.shape(1);
     const int64_t OH = output.shape(2);
     const int64_t OW = output.shape(3);
-    const int64_t out_row = output.row_stride_elems();
+    const int64_t out_pix = output.stride_elems(3);
+    const int64_t out_row = output.stride_elems(2);
+    const int64_t out_batch = output.stride_elems(0);
 
     const int64_t G = attrs.groups;
     const int64_t ic_per_group = IC / G;
@@ -148,7 +153,7 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
 
     // U: [pos][nb][G·jb][ldd] — the GEMM's B panels, one set per transform
     // position, and the dims must match the geometry prepack derived them under.
-    const WinoChannelLastU& ug = plan.u;
+    const WinoU& ug = plan.u;
     NNOPS_ASSERT(u_tensor.shape(0) == kpos && u_tensor.shape(1) == ug.nb &&
                  u_tensor.shape(2) == ug.jbg && u_tensor.shape(3) == ug.ldd);
 
@@ -169,9 +174,6 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
     const T* in_ptr = input.ptr<T>();
     const T* u_ptr = u_tensor.ptr<T>();
     const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
-
-    const int64_t ib_step = IH * in_row;
-    const int64_t ob_step = OH * out_row;
 
     // One channel block is one vector — 8 lanes for both dtypes (NEON f32 is
     // two float32x4_t behind the same abstraction).
@@ -204,8 +206,8 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
         T* v_all = scratch;
         T* m_all = v_all + plan.v_size;
 
-        const T* task_in = in_ptr + n * ib_step + g * ic_per_group;
-        T* task_out = out_ptr + n * ob_step + g * oc_per_group;
+        const T* task_in = in_ptr + n * in_batch + g * ic_per_group;
+        T* task_out = out_ptr + n * out_batch + g * oc_per_group;
 
         // Input transform, tile by tile: the tile's window is swept across the
         // channel blocks while its input lines are still hot.
@@ -222,11 +224,11 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
                 T* v_tile = v_all + tl * v_lda + ic;
                 if constexpr (O == WinoOrder::F23) {
                     k::winograd_input<T>(
-                        task_in + ic, in_row, IC, static_cast<int>(ih0), static_cast<int>(iw0),
+                        task_in + ic, in_row, in_pix, static_cast<int>(ih0), static_cast<int>(iw0),
                         static_cast<int>(IH), static_cast<int>(IW), v_tile, v_p_stride, lanes);
                 } else {
                     k::winograd43_input<T>(
-                        task_in + ic, in_row, IC, static_cast<int>(ih0), static_cast<int>(iw0),
+                        task_in + ic, in_row, in_pix, static_cast<int>(ih0), static_cast<int>(iw0),
                         static_cast<int>(IH), static_cast<int>(IW), v_tile, v_p_stride, lanes);
                 }
             }
@@ -269,11 +271,11 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
                 const int64_t ow = ktile * tw;
                 for (int64_t oc = 0; oc < ocnc; oc += vec) {
                     const int lanes = static_cast<int>(std::min<int64_t>(vec, ocnc - oc));
-                    T* base = task_out + oh * out_row + ow * OC + ocn0 + oc;
+                    T* base = task_out + oh * out_row + ow * out_pix + ocn0 + oc;
                     T* dst[ktile][ktile];
                     for (int r = 0; r < ktile; ++r) {
                         for (int c = 0; c < ktile; ++c) {
-                            dst[r][c] = (oh + r < OH && ow + c < OW) ? base + r * out_row + c * OC :
+                            dst[r][c] = (oh + r < OH && ow + c < OW) ? base + r * out_row + c * out_pix :
                                                                        nullptr;
                         }
                     }
@@ -359,7 +361,7 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const Tens
         (u.dims[0] == wino_pos(WinoOrder::F43)) ? WinoOrder::F43 : WinoOrder::F23;
     // The panels' geometry is derived, not read: the same function ran at prepack
     // time, so matching it against the descriptor keeps the two ends from drifting.
-    const WinoChannelLastU ug = wino_channel_last_u(ic_per_group, oc_per_group, G, dt, order);
+    const WinoU ug = wino_u(ic_per_group, oc_per_group, G, dt, order);
     if (ug.total == 0 || u.dims[0] != ug.pos || u.dims[1] != ug.nb || u.dims[2] != ug.jbg ||
         u.dims[3] != ug.ldd) {
         return plan;
@@ -457,14 +459,14 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const Tens
 }
 
 } // namespace
-} // namespace channel_last
+} // namespace impl
 
 Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
                                             std::span<const TensorDesc> inputs,
                                             std::span<const TensorDesc> outputs, int num_threads,
                                             bool use_thread_slots, int64_t num_slots)
 {
-    return channel_last::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+    return impl::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
                                    num_slots);
 }
 
@@ -513,17 +515,17 @@ Status conv2d_winograd_kernel(const Conv2DAttributes& attrs, TensorView& output,
     const bool f43 = plan.order == WinoOrder::F43;
     if (dt == DataType::f32) {
         if (f43) {
-            channel_last::conv2d_winograd_channel_last_impl<float, WinoOrder::F43>(
+            impl::conv2d_winograd_impl<float, WinoOrder::F43>(
                 attrs, output, inputs, ctx, plan, scratch.as<float>());
         } else {
-            channel_last::conv2d_winograd_channel_last_impl<float, WinoOrder::F23>(
+            impl::conv2d_winograd_impl<float, WinoOrder::F23>(
                 attrs, output, inputs, ctx, plan, scratch.as<float>());
         }
     } else if (f43) {
-        channel_last::conv2d_winograd_channel_last_impl<half, WinoOrder::F43>(
+        impl::conv2d_winograd_impl<half, WinoOrder::F43>(
             attrs, output, inputs, ctx, plan, scratch.as<half>());
     } else {
-        channel_last::conv2d_winograd_channel_last_impl<half, WinoOrder::F23>(
+        impl::conv2d_winograd_impl<half, WinoOrder::F23>(
             attrs, output, inputs, ctx, plan, scratch.as<half>());
     }
     return Status::ok;

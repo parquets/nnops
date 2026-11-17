@@ -59,7 +59,7 @@ struct PoolGeom {
 /// One output vector per thread, its position carried by the block axes: x is
 /// the channel chunk, y the output width, z the (image, depth plane, row).
 template <typename T, int Vec, bool IsMax>
-__global__ void pooling_last_flat_kernel(const T* __restrict__ input, T* __restrict__ output,
+__global__ void pooling_flat_kernel(const T* __restrict__ input, T* __restrict__ output,
                                          PoolGeom g, int64_t c_begin, int64_t chunks)
 {
     const int64_t oh = int64_t(blockIdx.z) % g.OH;
@@ -141,7 +141,7 @@ __global__ void pooling_last_flat_kernel(const T* __restrict__ input, T* __restr
 /// row-independent, so the per-row divisor folds into one count multiplied by
 /// the valid row and depth taps.
 template <typename T, int Vec, int K, int ROWS, bool IsMax>
-__global__ void pooling_last_rows_kernel(const T* __restrict__ input, T* __restrict__ output,
+__global__ void pooling_rows_kernel(const T* __restrict__ input, T* __restrict__ output,
                                          PoolGeom g, int64_t c_begin, int64_t chunks)
 {
     const int64_t row_blocks = (g.OH + ROWS - 1) / ROWS;
@@ -271,7 +271,7 @@ __global__ void pooling_last_rows_kernel(const T* __restrict__ input, T* __restr
 /// channel vectors, the spatial index is decoded by division. Reached only by a
 /// geometry whose block axes cannot hold its task count.
 template <typename T, int Vec>
-__global__ void pooling_last_linear_kernel(const T* __restrict__ input, T* __restrict__ output,
+__global__ void pooling_linear_kernel(const T* __restrict__ input, T* __restrict__ output,
                                            PoolGeom g, int64_t c_begin, int64_t chunks)
 {
     const int64_t pix_per_image = g.OD * g.OH * g.OW;
@@ -365,7 +365,7 @@ __global__ void pooling_last_linear_kernel(const T* __restrict__ input, T* __res
 /// thread's serial walk.
 template <typename T, int Vec, bool IsMax>
 __global__ void
-pooling_global_last_kernel(const T* __restrict__ input, T* __restrict__ output, int64_t c_begin,
+pooling_global_kernel(const T* __restrict__ input, T* __restrict__ output, int64_t c_begin,
                            int64_t chunks, int64_t rows, int64_t width, int64_t in_img_stride,
                            int64_t in_row_stride, int64_t in_pix_stride, int64_t out_img_stride,
                            int64_t out_pix_stride, bool add_to)
@@ -488,7 +488,7 @@ inline PoolGeom pooling_geom(const PoolingAttributes& attrs, const TensorView& i
 }
 
 template <typename T, int Vec>
-void pooling_last_launch(const PoolGeom& g, TensorView& output, const TensorView& input,
+void pooling_launch(const PoolGeom& g, TensorView& output, const TensorView& input,
                          int64_t c_begin, int64_t c_count, cudaStream_t stream)
 {
     if (c_count <= 0) {
@@ -517,39 +517,39 @@ void pooling_last_launch(const PoolGeom& g, TensorView& output, const TensorView
             if (g.type == PoolingType::Max) {
                 switch (int(g.KH)) {
                 case 2:
-                    pooling_last_rows_kernel<T, Vec, 2, kRows, true>
+                    pooling_rows_kernel<T, Vec, 2, kRows, true>
                         <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
                     return;
                 case 3:
-                    pooling_last_rows_kernel<T, Vec, 3, kRows, true>
+                    pooling_rows_kernel<T, Vec, 3, kRows, true>
                         <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
                     return;
                 default:
-                    pooling_last_rows_kernel<T, Vec, 5, kRows, true>
+                    pooling_rows_kernel<T, Vec, 5, kRows, true>
                         <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
                     return;
                 }
             }
             switch (int(g.KH)) {
             case 2:
-                pooling_last_rows_kernel<T, Vec, 2, kRows, false>
+                pooling_rows_kernel<T, Vec, 2, kRows, false>
                     <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
                 return;
             case 3:
-                pooling_last_rows_kernel<T, Vec, 3, kRows, false>
+                pooling_rows_kernel<T, Vec, 3, kRows, false>
                     <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
                 return;
             default:
-                pooling_last_rows_kernel<T, Vec, 5, kRows, false>
+                pooling_rows_kernel<T, Vec, 5, kRows, false>
                     <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
                 return;
             }
         }
         if (g.type == PoolingType::Max) {
-            pooling_last_flat_kernel<T, Vec, true>
+            pooling_flat_kernel<T, Vec, true>
                 <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
         } else {
-            pooling_last_flat_kernel<T, Vec, false>
+            pooling_flat_kernel<T, Vec, false>
                 <<<grid, block, 0, stream>>>(in, out, g, c_begin, chunks);
         }
         return;
@@ -557,13 +557,13 @@ void pooling_last_launch(const PoolGeom& g, TensorView& output, const TensorView
 
     const int64_t tasks = g.N * g.OD * g.OH * g.OW * chunks;
     const int64_t blocks = (tasks + kCudaBlockSize - 1) / kCudaBlockSize;
-    pooling_last_linear_kernel<T, Vec>
+    pooling_linear_kernel<T, Vec>
         <<<static_cast<unsigned>(blocks), kCudaBlockSize, 0, stream>>>(
             input.ptr<T>(), output.ptr<T>(), g, c_begin, chunks);
 }
 
 template <typename T>
-void pooling_last_impl(const PoolingAttributes& attrs, TensorView& output,
+void pooling_impl(const PoolingAttributes& attrs, TensorView& output,
                        std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -576,8 +576,8 @@ void pooling_last_impl(const PoolingAttributes& attrs, TensorView& output,
                         g.out_row_stride % kVec == 0;
 
     const int64_t full = vec_ok ? (g.C / kVec) * kVec : 0;
-    pooling_last_launch<T, kVec>(g, output, input, 0, full, stream);
-    pooling_last_launch<T, 1>(g, output, input, full, g.C - full, stream);
+    pooling_launch<T, kVec>(g, output, input, 0, full, stream);
+    pooling_launch<T, 1>(g, output, input, full, g.C - full, stream);
 }
 
 template <typename T, int Vec>
@@ -598,11 +598,11 @@ void pooling_global_last_launch(const PoolingAttributes& attrs, TensorView& outp
     const T* in = input.ptr<T>();
     T* out = output.ptr<T>();
     if (attrs.type == PoolingType::Max) {
-        pooling_global_last_kernel<T, Vec, true><<<grid, block, 0, stream>>>(
+        pooling_global_kernel<T, Vec, true><<<grid, block, 0, stream>>>(
             in, out, c_begin, chunks, g.ID * g.IH, g.IW, in_img_stride, g.in_row_stride,
             g.in_pix_stride, out_img_stride, g.out_pix_stride, attrs.add_to);
     } else {
-        pooling_global_last_kernel<T, Vec, false><<<grid, block, 0, stream>>>(
+        pooling_global_kernel<T, Vec, false><<<grid, block, 0, stream>>>(
             in, out, c_begin, chunks, g.ID * g.IH, g.IW, in_img_stride, g.in_row_stride,
             g.in_pix_stride, out_img_stride, g.out_pix_stride, attrs.add_to);
     }
@@ -642,7 +642,7 @@ void pooling_dispatch(const PoolingAttributes& attrs, TensorView& output,
     if (attrs.global) {
         pooling_global_impl<T>(attrs, output, inputs, ctx);
     } else {
-        pooling_last_impl<T>(attrs, output, inputs, ctx);
+        pooling_impl<T>(attrs, output, inputs, ctx);
     }
 }
 

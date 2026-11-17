@@ -140,7 +140,7 @@ inline void resize_pixel_2d(T* dst, const T* a0, const T* a1, const T* b0, const
 }
 
 template <typename T>
-void resize_last_2d(T* out, const T* in, int64_t C, int64_t OH, int64_t OW, const int64_t* y0,
+void resize_2d(T* out, const T* in, int64_t C, int64_t OH, int64_t OW, const int64_t* y0,
                     const int64_t* y1, const float* wy, const int64_t* x0, const int64_t* x1,
                     const float* wx, int64_t in_row_stride, int64_t out_row_stride, bool linear,
                     bool add_to)
@@ -161,7 +161,7 @@ void resize_last_2d(T* out, const T* in, int64_t C, int64_t OH, int64_t OW, cons
 }
 
 template <typename T>
-void resize_last_3d(T* out, const T* in, int64_t C, int64_t OD, int64_t OH, int64_t OW,
+void resize_3d(T* out, const T* in, int64_t C, int64_t OD, int64_t OH, int64_t OW,
                     const int64_t* z0, const int64_t* z1, const float* wz, const int64_t* y0,
                     const int64_t* y1, const float* wy, const int64_t* x0, const int64_t* x1,
                     const float* wx, int64_t in_d_stride, int64_t in_row_stride,
@@ -299,7 +299,7 @@ inline void resize_pixel_2d_cubic(T* dst, const T* const* rows, const ResizeCubi
 }
 
 template <typename T>
-void resize_last_2d_cubic(T* out, const T* in, int64_t C, int64_t OH, int64_t OW,
+void resize_2d_cubic(T* out, const T* in, int64_t C, int64_t OH, int64_t OW,
                           const ResizeCubicTap* yt, const ResizeCubicTap* xt, int64_t in_row_stride,
                           int64_t out_row_stride, bool add_to)
 {

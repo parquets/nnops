@@ -378,14 +378,14 @@ void softmax_cuda_impl(const SoftmaxAttributes& attrs, TensorView& output,
     // is D contiguous elements and the groups are `group_stride` apart.
     // ============================================================
 
-    const bool channel_last = is_channel_last(X.layout()) && rank > 1;
+    const bool spatial = is_channel_last(X.layout()) && rank > 1;
     int64_t in_group_stride = 0;
     int64_t out_group_stride = 0;
     bool contiguous_axis = false;
     if (rank == 1) {
         contiguous_axis = true;
         in_group_stride = out_group_stride = 1;
-    } else if (channel_last) {
+    } else if (spatial) {
         // The groups are the layout's own rows, so both sides share the shape's
         // stride whatever their pitches are.
         if (axis == 1) {

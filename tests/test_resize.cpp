@@ -31,7 +31,7 @@ namespace {
 
 /// 2D+3D roundtrip: convert -> resize -> convert back -> compare with the
 /// reference.
-void test_channel_last_vs_channel_first(const std::vector<int64_t>& in_shape,
+void test_nhwc_vs_dense(const std::vector<int64_t>& in_shape,
                           const ResizeAttributes& attrs)
 {
     const int64_t rank = static_cast<int64_t>(in_shape.size());
@@ -251,7 +251,7 @@ NNOPS_TEST(resize_2d_nearest_identity) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 8, 8};
-    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 3, 8, 8}, attrs);
 }
 
 // ============================================================
@@ -286,7 +286,7 @@ NNOPS_TEST(resize_2d_linear_identity) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 4, 4};
-    test_channel_last_vs_channel_first({1, 1, 4, 4}, attrs);
+    test_nhwc_vs_dense({1, 1, 4, 4}, attrs);
 }
 
 NNOPS_TEST(resize_2d_linear_upsample_no_nan) {
@@ -294,7 +294,7 @@ NNOPS_TEST(resize_2d_linear_upsample_no_nan) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 20, 20};
-    test_channel_last_vs_channel_first({1, 2, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 2, 8, 8}, attrs);
 }
 
 // ============================================================
@@ -306,7 +306,7 @@ NNOPS_TEST(resize_2d_cubic_identity) {
     attrs.mode = ResizeMode::Cubic;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 8, 8};
-    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 3, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_2d_cubic_upsample) {
@@ -314,7 +314,7 @@ NNOPS_TEST(resize_2d_cubic_upsample) {
     attrs.mode = ResizeMode::Cubic;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 20, 20};
-    test_channel_last_vs_channel_first({1, 2, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 2, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_2d_cubic_downsample) {
@@ -322,7 +322,7 @@ NNOPS_TEST(resize_2d_cubic_downsample) {
     attrs.mode = ResizeMode::Cubic;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 5, 7};
-    test_channel_last_vs_channel_first({1, 3, 11, 13}, attrs);
+    test_nhwc_vs_dense({1, 3, 11, 13}, attrs);
 }
 
 NNOPS_TEST(resize_2d_cubic_align_corners) {
@@ -330,7 +330,7 @@ NNOPS_TEST(resize_2d_cubic_align_corners) {
     attrs.mode = ResizeMode::Cubic;
     attrs.coord_mode = CoordinateTransformMode::AlignCorners;
     attrs.output_size = {0, 12, 12};
-    test_channel_last_vs_channel_first({1, 2, 6, 6}, attrs);
+    test_nhwc_vs_dense({1, 2, 6, 6}, attrs);
 }
 
 NNOPS_TEST(resize_2d_cubic_partial_channels) {
@@ -338,7 +338,7 @@ NNOPS_TEST(resize_2d_cubic_partial_channels) {
     attrs.mode = ResizeMode::Cubic;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 16, 16};
-    test_channel_last_vs_channel_first({1, 5, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 5, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_2d_cubic_add_to) {
@@ -347,7 +347,7 @@ NNOPS_TEST(resize_2d_cubic_add_to) {
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 8, 8};
     attrs.add_to = true;
-    test_channel_last_vs_channel_first({1, 3, 4, 4}, attrs);
+    test_nhwc_vs_dense({1, 3, 4, 4}, attrs);
 }
 
 NNOPS_TEST(resize_2d_cubic_coeff_half) {
@@ -356,7 +356,7 @@ NNOPS_TEST(resize_2d_cubic_coeff_half) {
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 20, 20};
     attrs.cubic_coeff_a = -0.5f;  // PIL's BICUBIC
-    test_channel_last_vs_channel_first({1, 3, 10, 10}, attrs);
+    test_nhwc_vs_dense({1, 3, 10, 10}, attrs);
 }
 
 NNOPS_TEST(resize_2d_cubic_constant_preserved) {
@@ -465,7 +465,7 @@ NNOPS_TEST(resize_3d_nearest_basic) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {4, 4, 4};
-    test_channel_last_vs_channel_first({1, 1, 2, 2, 2}, attrs);
+    test_nhwc_vs_dense({1, 1, 2, 2, 2}, attrs);
 }
 
 NNOPS_TEST(resize_3d_nearest_identity) {
@@ -473,7 +473,7 @@ NNOPS_TEST(resize_3d_nearest_identity) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {4, 4, 4};
-    test_channel_last_vs_channel_first({1, 2, 4, 4, 4}, attrs);
+    test_nhwc_vs_dense({1, 2, 4, 4, 4}, attrs);
 }
 
 // ============================================================
@@ -485,7 +485,7 @@ NNOPS_TEST(resize_3d_linear_basic) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {8, 12, 12};
-    test_channel_last_vs_channel_first({1, 1, 4, 6, 6}, attrs);
+    test_nhwc_vs_dense({1, 1, 4, 6, 6}, attrs);
 }
 
 NNOPS_TEST(resize_3d_linear_identity) {
@@ -493,7 +493,7 @@ NNOPS_TEST(resize_3d_linear_identity) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {4, 4, 4};
-    test_channel_last_vs_channel_first({1, 2, 4, 4, 4}, attrs);
+    test_nhwc_vs_dense({1, 2, 4, 4, 4}, attrs);
 }
 
 // ============================================================
@@ -505,7 +505,7 @@ NNOPS_TEST(resize_2d_multichannel) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 16, 16};
-    test_channel_last_vs_channel_first({2, 3, 32, 32}, attrs);
+    test_nhwc_vs_dense({2, 3, 32, 32}, attrs);
 }
 
 NNOPS_TEST(resize_3d_multichannel) {
@@ -513,7 +513,7 @@ NNOPS_TEST(resize_3d_multichannel) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {4, 8, 8};
-    test_channel_last_vs_channel_first({1, 3, 8, 16, 16}, attrs);
+    test_nhwc_vs_dense({1, 3, 8, 16, 16}, attrs);
 }
 
 NNOPS_TEST(resize_add_to) {
@@ -522,7 +522,7 @@ NNOPS_TEST(resize_add_to) {
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 8, 8};
     attrs.add_to = true;
-    test_channel_last_vs_channel_first({1, 1, 4, 4}, attrs);
+    test_nhwc_vs_dense({1, 1, 4, 4}, attrs);
 }
 
 NNOPS_TEST(resize_2d_linear_half_pixel) {
@@ -530,7 +530,7 @@ NNOPS_TEST(resize_2d_linear_half_pixel) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 16, 16};
-    test_channel_last_vs_channel_first({1, 1, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 1, 8, 8}, attrs);
 }
 
 // ============================================================
@@ -542,7 +542,7 @@ NNOPS_TEST(resize_partial_channels_nearest) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 16, 16};
-    test_channel_last_vs_channel_first({1, 5, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 5, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_partial_channels_linear) {
@@ -550,7 +550,7 @@ NNOPS_TEST(resize_partial_channels_linear) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 16, 16};
-    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 3, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_single_channel) {
@@ -558,7 +558,7 @@ NNOPS_TEST(resize_single_channel) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 12, 12};
-    test_channel_last_vs_channel_first({1, 1, 4, 4}, attrs);
+    test_nhwc_vs_dense({1, 1, 4, 4}, attrs);
 }
 
 NNOPS_TEST(resize_multi_channel_nearest) {
@@ -566,7 +566,7 @@ NNOPS_TEST(resize_multi_channel_nearest) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 8, 8};
-    test_channel_last_vs_channel_first({2, 17, 16, 16}, attrs);
+    test_nhwc_vs_dense({2, 17, 16, 16}, attrs);
 }
 
 // ============================================================
@@ -580,7 +580,7 @@ NNOPS_TEST(resize_2d_crop_nearest_upsample) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 2, 2};
     attrs.crop_end   = {0, 6, 6};
-    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 3, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_nearest_downsample) {
@@ -590,7 +590,7 @@ NNOPS_TEST(resize_2d_crop_nearest_downsample) {
     attrs.output_size = {0, 4, 4};
     attrs.crop_start = {0, 4, 4};
     attrs.crop_end   = {0, 12, 12};
-    test_channel_last_vs_channel_first({1, 3, 16, 16}, attrs);
+    test_nhwc_vs_dense({1, 3, 16, 16}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_bilinear_upsample) {
@@ -600,7 +600,7 @@ NNOPS_TEST(resize_2d_crop_bilinear_upsample) {
     attrs.output_size = {0, 12, 12};
     attrs.crop_start = {0, 3, 3};
     attrs.crop_end   = {0, 7, 7};
-    test_channel_last_vs_channel_first({1, 3, 10, 10}, attrs);
+    test_nhwc_vs_dense({1, 3, 10, 10}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_bilinear_align_corners) {
@@ -610,7 +610,7 @@ NNOPS_TEST(resize_2d_crop_bilinear_align_corners) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 1, 1};
     attrs.crop_end   = {0, 5, 5};
-    test_channel_last_vs_channel_first({1, 1, 6, 6}, attrs);
+    test_nhwc_vs_dense({1, 1, 6, 6}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_full_image) {
@@ -621,7 +621,7 @@ NNOPS_TEST(resize_2d_crop_full_image) {
     attrs.output_size = {0, 16, 16};
     attrs.crop_start = {0, 0, 0};
     attrs.crop_end   = {0, 8, 8};
-    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 3, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_single_pixel_output) {
@@ -631,7 +631,7 @@ NNOPS_TEST(resize_2d_crop_single_pixel_output) {
     attrs.output_size = {0, 1, 1};
     attrs.crop_start = {0, 3, 5};
     attrs.crop_end   = {0, 5, 7};
-    test_channel_last_vs_channel_first({1, 3, 8, 12}, attrs);
+    test_nhwc_vs_dense({1, 3, 8, 12}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_asymmetric_edge) {
@@ -641,7 +641,7 @@ NNOPS_TEST(resize_2d_crop_asymmetric_edge) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 0, 0};
     attrs.crop_end   = {0, 6, 6};
-    test_channel_last_vs_channel_first({1, 3, 10, 10}, attrs);
+    test_nhwc_vs_dense({1, 3, 10, 10}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_bottom_right_corner) {
@@ -651,7 +651,7 @@ NNOPS_TEST(resize_2d_crop_bottom_right_corner) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 6, 6};
     attrs.crop_end   = {0, 12, 12};
-    test_channel_last_vs_channel_first({1, 3, 12, 12}, attrs);
+    test_nhwc_vs_dense({1, 3, 12, 12}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_multichannel) {
@@ -661,7 +661,7 @@ NNOPS_TEST(resize_2d_crop_multichannel) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 4, 4};
     attrs.crop_end   = {0, 12, 12};
-    test_channel_last_vs_channel_first({2, 7, 16, 16}, attrs);
+    test_nhwc_vs_dense({2, 7, 16, 16}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_partial_channels) {
@@ -672,7 +672,7 @@ NNOPS_TEST(resize_2d_crop_partial_channels) {
     attrs.output_size = {0, 16, 16};
     attrs.crop_start = {0, 2, 2};
     attrs.crop_end   = {0, 10, 10};
-    test_channel_last_vs_channel_first({1, 3, 12, 12}, attrs);
+    test_nhwc_vs_dense({1, 3, 12, 12}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_add_to) {
@@ -683,7 +683,7 @@ NNOPS_TEST(resize_2d_crop_add_to) {
     attrs.add_to = true;
     attrs.crop_start = {0, 3, 3};
     attrs.crop_end   = {0, 9, 9};
-    test_channel_last_vs_channel_first({1, 3, 12, 12}, attrs);
+    test_nhwc_vs_dense({1, 3, 12, 12}, attrs);
 }
 
 // ============================================================
@@ -697,7 +697,7 @@ NNOPS_TEST(resize_3d_crop_nearest) {
     attrs.output_size = {4, 4, 4};
     attrs.crop_start = {1, 2, 2};
     attrs.crop_end   = {3, 6, 6};
-    test_channel_last_vs_channel_first({1, 3, 4, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 3, 4, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_3d_crop_trilinear) {
@@ -707,7 +707,7 @@ NNOPS_TEST(resize_3d_crop_trilinear) {
     attrs.output_size = {4, 6, 6};
     attrs.crop_start = {2, 2, 2};
     attrs.crop_end   = {6, 10, 10};
-    test_channel_last_vs_channel_first({1, 3, 8, 12, 12}, attrs);
+    test_nhwc_vs_dense({1, 3, 8, 12, 12}, attrs);
 }
 
 NNOPS_TEST(resize_3d_crop_full_volume) {
@@ -718,7 +718,7 @@ NNOPS_TEST(resize_3d_crop_full_volume) {
     attrs.output_size = {4, 8, 8};
     attrs.crop_start = {0, 0, 0};
     attrs.crop_end   = {4, 8, 8};
-    test_channel_last_vs_channel_first({1, 1, 4, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 1, 4, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_3d_crop_partial_channels) {
@@ -728,7 +728,7 @@ NNOPS_TEST(resize_3d_crop_partial_channels) {
     attrs.output_size = {4, 8, 8};
     attrs.crop_start = {1, 2, 2};
     attrs.crop_end   = {5, 10, 10};
-    test_channel_last_vs_channel_first({1, 5, 6, 12, 12}, attrs);
+    test_nhwc_vs_dense({1, 5, 6, 12, 12}, attrs);
 }
 
 NNOPS_TEST(resize_3d_crop_align_corners) {
@@ -738,7 +738,7 @@ NNOPS_TEST(resize_3d_crop_align_corners) {
     attrs.output_size = {4, 6, 6};
     attrs.crop_start = {1, 1, 1};
     attrs.crop_end   = {5, 7, 7};
-    test_channel_last_vs_channel_first({1, 2, 6, 8, 8}, attrs);
+    test_nhwc_vs_dense({1, 2, 6, 8, 8}, attrs);
 }
 
 // ============================================================

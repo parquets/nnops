@@ -153,15 +153,15 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
         T* out_base = out_ptr + n * out_n_stride;
 
         if (cubic) {
-            k::resize_last_2d_cubic<T>(out_base, in_base, C, OH, OW, ky.taps.data(),
+            k::resize_2d_cubic<T>(out_base, in_base, C, OH, OW, ky.taps.data(),
                                        kx.taps.data(), in_row_stride, out_row_stride, add_to);
         } else if (srank == 3) {
-            k::resize_last_3d<T>(out_base, in_base, C, OD, OH, OW, cz.i0.data(), cz.i1.data(),
+            k::resize_3d<T>(out_base, in_base, C, OD, OH, OW, cz.i0.data(), cz.i1.data(),
                                  cz.w.data(), cy.i0.data(), cy.i1.data(), cy.w.data(),
                                  cx.i0.data(), cx.i1.data(), cx.w.data(), in_d_stride,
                                  in_row_stride, out_d_stride, out_row_stride, linear, add_to);
         } else {
-            k::resize_last_2d<T>(out_base, in_base, C, OH, OW, cy.i0.data(), cy.i1.data(),
+            k::resize_2d<T>(out_base, in_base, C, OH, OW, cy.i0.data(), cy.i1.data(),
                                  cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
                                  in_row_stride, out_row_stride, linear, add_to);
         }

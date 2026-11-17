@@ -86,7 +86,7 @@ static int64_t dw_spatial_elems(const Shape& shape)
 }
 
 template <typename T>
-static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
+static void test_vs_ref(const std::vector<int64_t>& in_shape,
                              const std::vector<int64_t>& w_shape,
                              const DepthwiseConvAttributes& attrs,
                              bool has_bias,
@@ -207,32 +207,32 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
 }
 
 NNOPS_TEST(dwconv_vs_ref_basic) {
-    test_channel_last_vs_ref<float>({2, 8, 16, 16}, {8, 1, 3, 3},
+    test_vs_ref<float>({2, 8, 16, 16}, {8, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}},
         false, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_partial_block) {
     // C=5: an 8-lane call with three lanes masked; OH=7 leaves a three-row group.
-    test_channel_last_vs_ref<float>({1, 5, 9, 11}, {5, 1, 3, 3},
+    test_vs_ref<float>({1, 5, 9, 11}, {5, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}},
         false, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_stride2_padding) {
-    test_channel_last_vs_ref<float>({1, 6, 14, 13}, {6, 1, 3, 3},
+    test_vs_ref<float>({1, 6, 14, 13}, {6, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}},
         false, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_dilation) {
-    test_channel_last_vs_ref<float>({1, 4, 10, 10}, {4, 1, 3, 3},
+    test_vs_ref<float>({1, 4, 10, 10}, {4, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 2, 2}, {0, 0, 0}},
         false, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_bias) {
-    test_channel_last_vs_ref<float>({2, 8, 8, 8}, {8, 1, 3, 3},
+    test_vs_ref<float>({2, 8, 8, 8}, {8, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         true, 1e-4f);
 }
@@ -240,13 +240,13 @@ NNOPS_TEST(dwconv_vs_ref_bias) {
 NNOPS_TEST(dwconv_vs_ref_add_to) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     attrs.add_to = true;
-    test_channel_last_vs_ref<float>({1, 3, 8, 8}, {3, 1, 3, 3}, attrs, false, 1e-4f);
+    test_vs_ref<float>({1, 3, 8, 8}, {3, 1, 3, 3}, attrs, false, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_relu) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_last_vs_ref<float>({1, 5, 6, 11}, {5, 1, 3, 3}, attrs, false, 1e-4f);
+    test_vs_ref<float>({1, 5, 6, 11}, {5, 1, 3, 3}, attrs, false, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_pre_act) {
@@ -254,7 +254,7 @@ NNOPS_TEST(dwconv_vs_ref_pre_act) {
     attrs.add_to = true;
     attrs.residual_pre_activation = true;
     attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_last_vs_ref<float>({1, 5, 6, 11}, {5, 1, 3, 3}, attrs, false, 1e-4f);
+    test_vs_ref<float>({1, 5, 6, 11}, {5, 1, 3, 3}, attrs, false, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_pre_act_wide) {
@@ -264,7 +264,7 @@ NNOPS_TEST(dwconv_vs_ref_pre_act_wide) {
     attrs.add_to = true;
     attrs.residual_pre_activation = true;
     attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_last_vs_ref<float>({1, 17, 7, 7}, {17, 1, 3, 3}, attrs, true, 1e-4f);
+    test_vs_ref<float>({1, 17, 7, 7}, {17, 1, 3, 3}, attrs, true, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_pre_act_generic) {
@@ -274,7 +274,7 @@ NNOPS_TEST(dwconv_vs_ref_pre_act_generic) {
     attrs.add_to = true;
     attrs.residual_pre_activation = true;
     attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_last_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1}, attrs, false, 1e-4f);
+    test_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1}, attrs, false, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_f16_pre_act) {
@@ -282,12 +282,12 @@ NNOPS_TEST(dwconv_vs_ref_f16_pre_act) {
     attrs.add_to = true;
     attrs.residual_pre_activation = true;
     attrs.epilogue.type = EpilogueActivateType::Relu;
-    test_channel_last_vs_ref<backend::cpu::half>({1, 8, 10, 10}, {8, 1, 3, 3},
+    test_vs_ref<backend::cpu::half>({1, 8, 10, 10}, {8, 1, 3, 3},
         attrs, false, 5e-3f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_1x1_stride2) {
-    test_channel_last_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1},
+    test_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1},
         DepthwiseConvAttributes{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}},
         false, 1e-4f);
 }
@@ -295,13 +295,13 @@ NNOPS_TEST(dwconv_vs_ref_1x1_stride2) {
 NNOPS_TEST(dwconv_vs_ref_multi_block) {
     // C=17: one full sixteen-wide block plus a one-lane block; the plane is
     // small enough that the filter axis splits across tasks.
-    test_channel_last_vs_ref<float>({1, 17, 7, 7}, {17, 1, 3, 3},
+    test_vs_ref<float>({1, 17, 7, 7}, {17, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         true, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_vs_ref_f16) {
-    test_channel_last_vs_ref<backend::cpu::half>({1, 8, 10, 10}, {8, 1, 3, 3},
+    test_vs_ref<backend::cpu::half>({1, 8, 10, 10}, {8, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         false, 5e-3f);
 }
@@ -309,7 +309,7 @@ NNOPS_TEST(dwconv_vs_ref_f16) {
 NNOPS_TEST(dwconv_vs_ref_f16_wide) {
     // The two-vector 3x3 kernel is generic over T; half is a different
     // `v_load`/`v_fmadd`, so it gets its own wide case.
-    test_channel_last_vs_ref<backend::cpu::half>({1, 32, 10, 10}, {32, 1, 3, 3},
+    test_vs_ref<backend::cpu::half>({1, 32, 10, 10}, {32, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         true, 5e-3f);
 }
@@ -318,7 +318,7 @@ NNOPS_TEST(dwconv_vs_ref_wide_stride2) {
     // C=16 is exactly one sixteen-wide block: the two-vector 3x3 kernel's
     // stride-2 instantiation, whose row table reads R*2+2 input rows instead of
     // R+2 — a different index set from the stride-1 cases above.
-    test_channel_last_vs_ref<float>({1, 16, 15, 15}, {16, 1, 3, 3},
+    test_vs_ref<float>({1, 16, 15, 15}, {16, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}},
         true, 1e-4f);
 }
@@ -328,13 +328,13 @@ NNOPS_TEST(dwconv_vs_ref_wide_block) {
     // kernel at its own width. Passing the *remaining* channel count instead
     // routes the full blocks through the generic path — the same values, so
     // only a timing run would notice.
-    test_channel_last_vs_ref<float>({1, 48, 9, 9}, {48, 1, 3, 3},
+    test_vs_ref<float>({1, 48, 9, 9}, {48, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         false, 1e-4f);
 }
 
 NNOPS_TEST(dwconv_ndhwc_vs_ref_3d) {
-    test_channel_last_vs_ref<float>({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3},
+    test_vs_ref<float>({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3},
         DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}},
         true, 1e-4f);
 }

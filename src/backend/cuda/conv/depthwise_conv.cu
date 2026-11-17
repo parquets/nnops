@@ -77,7 +77,7 @@ __device__ inline float device_apply_epilogue(EpilogueActivateType ep_type, floa
 
 /// One launch's geometry: the window, the strides of both operands,
 /// and the channel span this launch covers. All scalars, passed by value.
-struct DwLastGeom {
+struct DwGeom {
     int64_t c_begin;
     int64_t chunks;
     int64_t N;
@@ -104,11 +104,11 @@ struct DwLastGeom {
 /// neighbour's), y lanes walk output columns. Every index a thread needs then
 /// comes out of a block coordinate, which is what the first kernel spent four
 /// 64-bit divisions on.
-struct DwLastBlock {
+struct DwBlock {
     int bx, by;
 };
 
-inline DwLastBlock dw_last_block(int64_t chunks)
+inline DwBlock dw_block(int64_t chunks)
 {
     const int bx = int(std::min<int64_t>(chunks, kCudaWarpSize));
     return {bx, kCudaBlockSize / bx};
@@ -120,7 +120,7 @@ template <typename T, int Vec>
 __global__ void depthwise_conv_last_flat_kernel(const T* __restrict__ input,
                                                 const T* __restrict__ weight,
                                                 const T* __restrict__ bias, // may be nullptr
-                                                T* __restrict__ output, DwLastGeom g)
+                                                T* __restrict__ output, DwGeom g)
 {
     const int64_t chunk = int64_t(blockIdx.y) * blockDim.x + threadIdx.x;
     const int64_t ow = int64_t(blockIdx.z) * blockDim.y + threadIdx.y;
@@ -206,7 +206,7 @@ template <typename T, int Vec, int K, int ROWS>
 __global__ void depthwise_conv_last_rows_kernel(const T* __restrict__ input,
                                                 const T* __restrict__ weight,
                                                 const T* __restrict__ bias, // may be nullptr
-                                                T* __restrict__ output, DwLastGeom g)
+                                                T* __restrict__ output, DwGeom g)
 {
     const int64_t chunk = int64_t(blockIdx.y) * blockDim.x + threadIdx.x;
     const int64_t ow = int64_t(blockIdx.z) * blockDim.y + threadIdx.y;
@@ -312,7 +312,7 @@ __global__ void depthwise_conv_last_rows_kernel(const T* __restrict__ input,
 // ============================================================
 
 template <typename T, int Vec>
-void depthwise_last_launch(DwLastGeom g, int64_t c_begin, int64_t c_count, const TensorView& input,
+void depthwise_launch(DwGeom g, int64_t c_begin, int64_t c_count, const TensorView& input,
                            const TensorView& weight, const TensorView* bias, TensorView& output,
                            cudaStream_t stream)
 {
@@ -323,7 +323,7 @@ void depthwise_last_launch(DwLastGeom g, int64_t c_begin, int64_t c_count, const
     g.chunks = (c_count + Vec - 1) / Vec;
     g.has_bias = bias != nullptr;
 
-    const DwLastBlock blk = dw_last_block(g.chunks);
+    const DwBlock blk = dw_block(g.chunks);
     const dim3 block(unsigned(blk.bx), unsigned(blk.by), 1);
     const unsigned gy = unsigned((g.chunks + blk.bx - 1) / blk.bx);
     const unsigned gz = unsigned((g.OW + blk.by - 1) / blk.by);
@@ -362,7 +362,7 @@ void depthwise_last_launch(DwLastGeom g, int64_t c_begin, int64_t c_count, const
 }
 
 template <typename T>
-void depthwise_conv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
+void depthwise_conv_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
                               std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -372,7 +372,7 @@ void depthwise_conv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
     const bool three_d = rank == 5;
     const int64_t C = input.shape(1);
 
-    DwLastGeom g{};
+    DwGeom g{};
     g.N = input.shape(0);
     g.ID = three_d ? input.shape(2) : 1;
     g.IH = input.shape(rank - 2);
@@ -420,8 +420,8 @@ void depthwise_conv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
 
     const TensorView* bias = has_bias ? &inputs[2] : nullptr;
     const int64_t full = vec_ok ? (C / kVec) * kVec : 0;
-    depthwise_last_launch<T, kVec>(g, 0, full, input, weight, bias, output, stream);
-    depthwise_last_launch<T, 1>(g, full, C - full, input, weight, bias, output, stream);
+    depthwise_launch<T, kVec>(g, 0, full, input, weight, bias, output, stream);
+    depthwise_launch<T, 1>(g, full, C - full, input, weight, bias, output, stream);
 }
 
 // ============================================================
@@ -434,13 +434,13 @@ Status depthwise_conv_cuda(const DepthwiseConvAttributes& attrs, TensorView& out
 {
     switch (inputs[0].data_type()) {
     case DataType::f32:
-        depthwise_conv_last_impl<float>(attrs, output, inputs, ctx);
+        depthwise_conv_impl<float>(attrs, output, inputs, ctx);
         return Status::ok;
     case DataType::f16:
-        depthwise_conv_last_impl<__half>(attrs, output, inputs, ctx);
+        depthwise_conv_impl<__half>(attrs, output, inputs, ctx);
         return Status::ok;
     case DataType::bf16:
-        depthwise_conv_last_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
+        depthwise_conv_impl<__nv_bfloat16>(attrs, output, inputs, ctx);
         return Status::ok;
     default:
         return Status::unsupported;

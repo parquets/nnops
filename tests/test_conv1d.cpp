@@ -69,7 +69,7 @@ struct Geom {
 
 /// NHWC activation + HWIO filter, compared with the 2D reference on the same
 /// logical values lifted into dense order.
-void run_channel_last(const Geom& g)
+void run_case(const Geom& g)
 {
     const int64_t ICG = g.IC / g.G;
     auto [in_vec, in] = test::make_random_tensor({g.N, g.IC, g.L});
@@ -127,8 +127,8 @@ void run_channel_last(const Geom& g)
 }  // namespace
 
 NNOPS_TEST(conv1d_nhwc_f32) {
-    run_channel_last({"cl_basic",  2, 4, 23, 6, 1, 3, 1, 1, 1, false});
-    run_channel_last({"cl_stride2", 1, 6, 37, 8, 1, 3, 2, 1, 1, false});
-    run_channel_last({"cl_groups", 1, 8, 19, 8, 2, 3, 1, 1, 1, false});
-    run_channel_last({"cl_depthwise", 1, 6, 27, 6, 6, 3, 1, 1, 1, false});
+    run_case({"basic",  2, 4, 23, 6, 1, 3, 1, 1, 1, false});
+    run_case({"stride2", 1, 6, 37, 8, 1, 3, 2, 1, 1, false});
+    run_case({"groups", 1, 8, 19, 8, 2, 3, 1, 1, 1, false});
+    run_case({"depthwise", 1, 6, 27, 6, 6, 3, 1, 1, 1, false});
 }

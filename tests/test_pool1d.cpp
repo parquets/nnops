@@ -106,7 +106,7 @@ void ref1d(const Pool1DAttributes& a, const std::vector<float>& in, int64_t N,
 }
 
 /// The NHWC route against the scalar 1D oracle on the same values.
-void run_channel_last(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shape)
+void run_case(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shape)
 {
     auto [in_vec, in_view] = test::make_random_tensor(shape, -4.0f, 4.0f, 9);
     (void)in_view;
@@ -217,12 +217,12 @@ NNOPS_TEST(pool1d_f32) {
     a.kernel_shape = 3;
     a.stride = 2;
     a.padding = 1;
-    run_channel_last(a, {1, 5, 23});
+    run_case(a, {1, 5, 23});
     a.type = Pool1DType::Average;
     a.exclude_pad = true;
-    run_channel_last(a, {2, 3, 17});
+    run_case(a, {2, 3, 17});
     a.global = true;
-    run_channel_last(a, {1, 4, 31});
+    run_case(a, {1, 4, 31});
 }
 
 NNOPS_TEST(pool1d_int8) {
