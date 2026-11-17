@@ -128,26 +128,26 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
     const auto& u_tensor = inputs[1]; // prepacked transform-domain weight
     const bool has_bias = inputs.size() > 2;
 
-    // NHWC: the descriptor keeps [N, C, H, W]; one W step is a channel block and
-    // one H step is a row pitch, taken from the view so a padded pitch and the
-    // batch step cannot disagree with it.
-    const int64_t IH = input.shape(2);
-    const int64_t IW = input.shape(3);
-    const int64_t IC = input.shape(1);
-    const int64_t in_pix = input.stride_elems(3);
-    const int64_t in_row = input.stride_elems(2);
-    const int64_t in_batch = input.stride_elems(0);
+    // Shape is the logical [N, C, H, W]; NHWC is the physical order, so the
+    // memory steps come from the view's strides, not from the shape product
+    // (a row may be pitch-padded).
+    const int64_t logical_h = input.shape(2);
+    const int64_t logical_w = input.shape(3);
+    const int64_t logical_c = input.shape(1);
+    const int64_t in_w_stride = input.stride_elems(3);
+    const int64_t in_h_stride = input.stride_elems(2);
+    const int64_t in_n_stride = input.stride_elems(0);
 
-    const int64_t OC = output.shape(1);
-    const int64_t OH = output.shape(2);
-    const int64_t OW = output.shape(3);
-    const int64_t out_pix = output.stride_elems(3);
-    const int64_t out_row = output.stride_elems(2);
-    const int64_t out_batch = output.stride_elems(0);
+    const int64_t logical_oc = output.shape(1);
+    const int64_t logical_oh = output.shape(2);
+    const int64_t logical_ow = output.shape(3);
+    const int64_t out_w_stride = output.stride_elems(3);
+    const int64_t out_h_stride = output.stride_elems(2);
+    const int64_t out_n_stride = output.stride_elems(0);
 
     const int64_t G = attrs.groups;
-    const int64_t ic_per_group = IC / G;
-    const int64_t oc_per_group = OC / G;
+    const int64_t ic_per_group = logical_c / G;
+    const int64_t oc_per_group = logical_oc / G;
     const int64_t PH = attrs.padding[0];
     const int64_t PW = attrs.padding[1];
 
@@ -206,8 +206,8 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
         T* v_all = scratch;
         T* m_all = v_all + plan.v_size;
 
-        const T* task_in = in_ptr + n * in_batch + g * ic_per_group;
-        T* task_out = out_ptr + n * out_batch + g * oc_per_group;
+        const T* task_in = in_ptr + n * in_n_stride + g * ic_per_group;
+        T* task_out = out_ptr + n * out_n_stride + g * oc_per_group;
 
         // Input transform, tile by tile: the tile's window is swept across the
         // channel blocks while its input lines are still hot.
@@ -224,12 +224,14 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
                 T* v_tile = v_all + tl * v_lda + ic;
                 if constexpr (O == WinoOrder::F23) {
                     k::winograd_input<T>(
-                        task_in + ic, in_row, in_pix, static_cast<int>(ih0), static_cast<int>(iw0),
-                        static_cast<int>(IH), static_cast<int>(IW), v_tile, v_p_stride, lanes);
+                        task_in + ic, in_h_stride, in_w_stride, static_cast<int>(ih0),
+                        static_cast<int>(iw0), static_cast<int>(logical_h),
+                        static_cast<int>(logical_w), v_tile, v_p_stride, lanes);
                 } else {
                     k::winograd43_input<T>(
-                        task_in + ic, in_row, in_pix, static_cast<int>(ih0), static_cast<int>(iw0),
-                        static_cast<int>(IH), static_cast<int>(IW), v_tile, v_p_stride, lanes);
+                        task_in + ic, in_h_stride, in_w_stride, static_cast<int>(ih0),
+                        static_cast<int>(iw0), static_cast<int>(logical_h),
+                        static_cast<int>(logical_w), v_tile, v_p_stride, lanes);
                 }
             }
         }
@@ -271,12 +273,13 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
                 const int64_t ow = ktile * tw;
                 for (int64_t oc = 0; oc < ocnc; oc += vec) {
                     const int lanes = static_cast<int>(std::min<int64_t>(vec, ocnc - oc));
-                    T* base = task_out + oh * out_row + ow * out_pix + ocn0 + oc;
+                    T* base = task_out + oh * out_h_stride + ow * out_w_stride + ocn0 + oc;
                     T* dst[ktile][ktile];
                     for (int r = 0; r < ktile; ++r) {
                         for (int c = 0; c < ktile; ++c) {
-                            dst[r][c] = (oh + r < OH && ow + c < OW) ? base + r * out_row + c * out_pix :
-                                                                       nullptr;
+                            dst[r][c] = (oh + r < logical_oh && ow + c < logical_ow) ?
+                                            base + r * out_h_stride + c * out_w_stride :
+                                            nullptr;
                         }
                     }
                     const T* bias_oc = b_ptr ? b_ptr + g * oc_per_group + ocn0 + oc : nullptr;
