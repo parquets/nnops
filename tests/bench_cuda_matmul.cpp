@@ -37,7 +37,7 @@
 #include "common/bench_harness.hpp"
 #include "common/cuda_test_helper.hpp"
 #include "common/cuda_bench_helper.hpp"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "backend/cuda/matmul/matmul_f16_host.hpp"
 #include "backend/cuda/matmul/matmul_f32_host.hpp"
 

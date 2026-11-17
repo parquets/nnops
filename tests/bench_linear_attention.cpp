@@ -19,7 +19,7 @@
 /// calls, median across rounds. `NNOPS_BENCH_THREADS=1,4` pins the ladder.
 
 #include "nnops/ops/linear_attention.hpp"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "common/bench_harness.hpp"

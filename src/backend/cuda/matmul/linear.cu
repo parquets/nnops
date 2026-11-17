@@ -13,7 +13,7 @@
 #include "matmul_i8.cuh"
 #include "matmul_f32_host.hpp"
 #include "matmul_f16_host.hpp"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "matmul_op.cuh"
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp" // is_int8_matmul

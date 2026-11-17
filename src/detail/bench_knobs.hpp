@@ -1,13 +1,12 @@
 #pragma once
 /// @file bench_knobs.hpp
-/// @brief Experiment-only switches. Production code never reads the environment:
-///        a test or benchmark stores to these atomics directly, and the decision
-///        point does one relaxed load.
+/// @brief Experiment-only switches for the test and benchmark binaries.
 ///
-/// This is not an application-facing tuning API — the values are process-wide and
-/// the arms they select are the ones a bench compares. Keeping the knobs off the
-/// environment matters on Windows in particular, where a per-call getenv costs
-/// microseconds and can swamp a small operator.
+/// A bench stores to these atomics directly and the decision point in the
+/// backend does one relaxed load. Nothing here is an application-facing tuning
+/// API: the values are process-wide, they default to the automatic route, and
+/// the arms they select are only the ones a bench compares. The header lives
+/// under src/ so it is not part of the installed interface.
 
 #include <atomic>
 

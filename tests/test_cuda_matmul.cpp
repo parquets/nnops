@@ -27,7 +27,7 @@
 /// Only compiled under NNOPS_HAS_CUDA.
 
 #include "nnops/ops/matmul.hpp"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "nnops/detail/half.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"

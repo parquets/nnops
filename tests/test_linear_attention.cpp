@@ -21,7 +21,7 @@
 /// past order 1 therefore needs a looser atol.
 
 #include "nnops/ops/linear_attention.hpp"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"

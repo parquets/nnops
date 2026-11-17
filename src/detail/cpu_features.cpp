@@ -15,7 +15,7 @@
 /// already even.
 
 #include "nnops/detail/simd/cpu_features.hpp"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 
 #include <vector>
 

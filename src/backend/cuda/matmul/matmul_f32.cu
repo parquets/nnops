@@ -9,7 +9,7 @@
 #include "matmul_f32_host.hpp"
 #include <nnops/core/epilogue.hpp>
 #include "matmul_f32.cuh"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 
 #include <algorithm>
 

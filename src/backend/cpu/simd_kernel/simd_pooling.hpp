@@ -30,7 +30,7 @@
 /// square, stride-matched and count-free; everything else takes `pool_rows`.
 /// Global pooling bypasses the window walk entirely.
 
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_access.hpp"
 #include "simd_window.hpp"
@@ -857,8 +857,8 @@ inline void pool_3x3_run(const PoolingKernelParams& p, float scale,
 /// Route override for A/B measurement: a nonzero store in
 /// `detail::pooling_3x3_roll` forces the rolled walk and skips the straight-line
 /// 3x3 path, so a bench times both routes over the same buffers. The hot check
-/// is one relaxed load; no environment is consulted (a per-call getenv costs
-/// microseconds on Windows and would swamp a small plane).
+/// is one relaxed load; the knob is a variable a bench stores to, not something
+/// read out of the process environment.
 inline bool pool_3x3_route_enabled()
 {
     return ::nnops::detail::pooling_3x3_roll.load(std::memory_order_relaxed) == 0;

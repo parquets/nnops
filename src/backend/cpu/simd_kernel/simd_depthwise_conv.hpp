@@ -51,7 +51,7 @@
 /// staging block (9 vectors for a 3x3 against the group's thousands of FMAs), then
 /// runs `dwconv_rows` on the f32 weights; a pad lane gets scale 0.
 
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/core/epilogue.hpp"
 #include "simd_epilogue.hpp"

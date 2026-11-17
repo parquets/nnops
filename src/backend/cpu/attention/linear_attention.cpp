@@ -83,7 +83,7 @@
 
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 

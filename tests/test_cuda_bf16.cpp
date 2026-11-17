@@ -20,7 +20,7 @@
 /// Only compiled under NNOPS_HAS_CUDA.
 
 #include "nnops/ops/activation.hpp"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "nnops/ops/argminmax.hpp"
 #include "nnops/ops/concat.hpp"
 #include "nnops/ops/conv2d.hpp"

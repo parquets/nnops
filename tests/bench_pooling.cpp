@@ -14,7 +14,7 @@
 /// `NNOPS_BENCH_THREADS=1` (or "1,4") pins the ladder, as in the other benches.
 
 #include "nnops/ops/pooling.hpp"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 #include "nnops/ops/reduce.hpp"
 #include "common/bench_harness.hpp"
 #include "common/channel_last.hpp"

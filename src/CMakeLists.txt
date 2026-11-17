@@ -219,6 +219,7 @@ if(NNOPS_BUILD_CUDA)
     add_library(nnops_cuda STATIC ${NNOPS_CUDA_SOURCES})
     target_link_libraries(nnops_cuda PUBLIC nnops)
     target_include_directories(nnops_cuda PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/include
         ${NNOPS_CUTLASS_DIR}/include)
     target_compile_options(nnops_cuda PRIVATE

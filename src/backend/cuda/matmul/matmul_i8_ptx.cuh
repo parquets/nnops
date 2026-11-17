@@ -43,7 +43,7 @@
 
 #include "matmul_i8_common.cuh"
 #include "ptx.h"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 
 #include <cuda_runtime.h>
 #include <cstdint>

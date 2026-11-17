@@ -10,7 +10,7 @@
 #pragma once
 
 #include <nnops/core/epilogue.hpp>
-#include <nnops/detail/bench_knobs.hpp>
+#include <detail/bench_knobs.hpp>
 
 #include <cuda_runtime.h>
 #include <algorithm>

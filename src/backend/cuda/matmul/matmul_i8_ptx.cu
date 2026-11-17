@@ -14,7 +14,7 @@
 #include "matmul_i8_ptx_host.hpp"
 
 #include "matmul_i8_ptx.cuh"
-#include "nnops/detail/bench_knobs.hpp"
+#include "detail/bench_knobs.hpp"
 
 namespace nnops::backend::cuda {
 
