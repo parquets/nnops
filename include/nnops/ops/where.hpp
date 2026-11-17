@@ -5,7 +5,7 @@
 /// The condition broadcasts against x and y under the NumPy rules (all three
 /// share one output shape). A condition element is true when its byte is
 /// nonzero; the condition is u8/s8, the branches and the output share one dtype
-/// (f32/f16/s8/u8/s32/s64). Channel-first.
+/// (f32/f16/s8/u8/s32/s64).
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

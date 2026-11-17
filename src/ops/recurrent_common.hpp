@@ -132,8 +132,8 @@ inline bool recurrent_activation_ok(RnnActivation a) noexcept
 }
 
 /// Descriptor-only twin of recurrent_run's checks: every rule the ONNX schema
-/// states about the shapes, plus the ones this library adds (channel-first layout,
-/// peepholes unsupported). An absent optional is a rank-0 descriptor.
+/// states about the shapes, plus the ones this library adds (peepholes
+/// unsupported). An absent optional is a rank-0 descriptor.
 inline Status recurrent_check(Backend be, const RecurrentSpec& s,
                               std::span<const TensorDesc> inputs,
                               std::span<const TensorDesc> outputs, bool with_cell)

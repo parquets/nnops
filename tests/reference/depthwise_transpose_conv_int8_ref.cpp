@@ -1,7 +1,7 @@
 /// @file depthwise_transpose_conv_int8_ref.cpp
 /// @brief Naive CPU reference for the quantized DepthwiseTransposeConv2D route
 ///        — s8 per-channel weight × u8/s8/f16/f32 activation → f32/f16 or s8/u8
-///        output (channel-first).
+///        output (dense order).
 ///
 /// The correctness baseline for the quantized kernel in both layouts. Gather
 /// form, matching the forward route's output-driven indexing: an output pixel
@@ -65,8 +65,8 @@ void depthwise_transpose_conv_int8_ref_impl(
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    // Input: [N, C, IH, IW]; a channel-last call reaches this through the
-    // caller's permutation, so only the channel-first storage is read here.
+    // Input: [N, C, IH, IW]; an NHWC call reaches this through the caller's
+    // permutation, so only the dense storage is read here.
     const int64_t N  = input.shape(0);
     const int64_t C  = input.shape(1);
     const int64_t IH = input.shape(2);

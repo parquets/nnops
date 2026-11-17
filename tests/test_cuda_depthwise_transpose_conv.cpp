@@ -10,7 +10,7 @@
 /// The cases take the 16 B channel lane, plus cases whose channel count is not
 /// a whole vector so the entry's scalar fallback runs. Both filter forms
 /// appear: the [C][1][KH][KW] the grouped route hands over, and the [KH][KW][C]
-/// a channel-last graph carries.
+/// an NHWC graph carries.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -39,7 +39,7 @@ struct DwCase {
     bool use_bias = false;
     bool add_to = false;
     bool pre_act = false;
-    /// Channel-last activation carrying the [C][1][KH][KW] filter, the form the
+    /// NHWC activation carrying the [C][1][KH][KW] filter, the form the
     /// grouped TransposeConv2D passes through unconverted.
     bool filter_channel_first = false;
     Epilogue epilogue{};
@@ -115,10 +115,10 @@ void run_case(const DwCase& c, const char* what)
 }  // namespace
 
 // ============================================================
-// Channel-last
+// NHWC
 // ============================================================
 
-NNOPS_TEST(cuda_dwt_channel_last) {
+NNOPS_TEST(cuda_dwt_nhwc) {
     for (DataType dt : {DataType::f32, DataType::f16}) {
         DwCase c;
         c.c = 16; c.dtype = dt; c.use_bias = true;
@@ -128,7 +128,7 @@ NNOPS_TEST(cuda_dwt_channel_last) {
     }
 }
 
-NNOPS_TEST(cuda_dwt_channel_last_narrow) {
+NNOPS_TEST(cuda_dwt_nhwc_narrow) {
     // Channels that are not a whole 16 B vector and a row that is not aligned:
     // the entry's scalar fallback, not the 16 B lane.
     for (DataType dt : {DataType::f32, DataType::f16}) {
@@ -140,8 +140,8 @@ NNOPS_TEST(cuda_dwt_channel_last_narrow) {
     }
 }
 
-NNOPS_TEST(cuda_dwt_channel_last_filter_form) {
-    // The grouped route hands a channel-last activation its [C][1][KH][KW]
+NNOPS_TEST(cuda_dwt_nhwc_filter_form) {
+    // The grouped route hands an NHWC activation its [C][1][KH][KW]
     // filter; the entry reads it in place rather than repacking.
     DwCase c;
     c.c = 12; c.ih = c.iw = 6; c.filter_channel_first = true;

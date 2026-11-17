@@ -1,8 +1,8 @@
-/// @file bench_conv2d_channel_last.cpp
-/// @brief Channel-last Conv2D throughput, plus the algorithm and filter-order
-///        tables that ride the same instrument.
+/// @file bench_conv2d.cpp
+/// @brief Conv2D throughput on NHWC activations, plus the algorithm and
+///        filter-order tables that ride the same instrument.
 ///
-/// The activation is channel-last (HWIO weight, pixel tiles straight out of the
+/// The activation is NHWC (HWIO weight, pixel tiles straight out of the
 /// row). Every row is timed on identical values, prepared once outside the
 /// timed region, so what a row shows is the algorithm — and for the MobileNetV2
 /// graph table, the cold cost its neighbours leave each layer.
@@ -11,14 +11,14 @@
 /// the two arms alternate, the second run of A is the null control, and a
 /// verdict is only real when it clears that drift floor.
 ///
-/// The shapes are the layers a channel-last framework actually runs — 1x1
+/// The shapes are the layers a CNN actually runs — 1x1
 /// expansions and projections, 3x3 stacks, 5x5/7x7 stems, grouped and batched
 /// layers — not one square. The depthwise row is the one exception to "Conv2D":
 /// it runs the DepthwiseConv operator, whose layouts are the ones a depthwise
 /// layer actually dispatches with (bench_depthwise has that operator's table).
 ///
 /// Three more comparisons ride the same instrument:
-///  - Winograd vs implicit GEMM, both channel-last on the same activation with U
+///  - Winograd vs implicit GEMM on the same NHWC activation, with U
 ///    prepacked outside every timer; only k3s1 routes to Winograd.
 ///  - Raw filter vs Conv2D::prepackWeights, which packs the filter once outside
 ///    every timer. The packed arm must never lose — the caller already paid.
@@ -237,7 +237,7 @@ constexpr DataType dtype_of() {
     return std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
 }
 
-/// One table row: the channel-last entry point.
+/// One table row: the entry point.
 struct AbLayer {
     virtual ~AbLayer() = default;
     virtual void run_channel_last(const ComputeContext&) = 0;
@@ -418,11 +418,11 @@ struct AbI8 : AbLayer {
 };
 
 // ============================================================
-// Channel-last Winograd vs channel-last implicit GEMM
+// Winograd vs implicit GEMM
 // ============================================================
 //
 // A = implicit GEMM on the raw HWIO filter, B = Winograd with U prepacked; both
-// write the same channel-last output, so the row is purely the algorithm.
+// write the same NHWC output, so the row is purely the algorithm.
 
 /// k3s1 shapes from 224 down to 7x7 — how far the Winograd policy should reach.
 const std::vector<Shape>& wino_sweep() {
@@ -587,10 +587,10 @@ void run_wino_table(const char* title) {
 }
 
 // ============================================================
-// The transform order: F(2,3) against F(4,3), channel-last
+// The transform order: F(2,3) against F(4,3)
 // ============================================================
 //
-// Both arms run the same channel-last Winograd kernel on the same activation and
+// Both arms run the same Winograd kernel on the same activation and
 // differ only in U — 16 positions over 2x2 tiles against 36 over 4x4 — so a row
 // prices the order, and the totals say whether the 1.78x fewer multiplies reach
 // the wall clock on this route.
@@ -837,9 +837,9 @@ const std::vector<Shape>& mobile_graph() {
 }  // namespace
 
 /// MobileNetV2's convs in graph order; rows and the total are medians over @c passes.
-NNOPS_BENCH(conv2d_channel_last_mobile_graph) {
+NNOPS_BENCH(conv2d_mobile_graph) {
     const int passes = 5;
-    std::printf("\n== f32 channel-last: MobileNetV2's convs as a graph (cold) ==\n");
+    std::printf("\n== f32: MobileNetV2's convs as a graph (cold) ==\n");
     for (int nt : bench_threads()) {
         std::printf("  %d thread%s\n", nt, nt == 1 ? "" : "s");
         std::vector<std::unique_ptr<AbFp<float>>> ops;
@@ -884,22 +884,22 @@ NNOPS_BENCH(conv2d_channel_last_mobile_graph) {
     }
 }
 
-NNOPS_BENCH(conv2d_channel_last_wino_order_ab_f32) {
-    run_wino_order_ab<float>("f32: channel-last Winograd, F(2,3) vs F(4,3)");
+NNOPS_BENCH(conv2d_wino_order_ab_f32) {
+    run_wino_order_ab<float>("f32: Winograd, F(2,3) vs F(4,3)");
 }
 
-NNOPS_BENCH(conv2d_channel_last_wino_order_ab_f16) {
-    run_wino_order_ab<half>("f16: channel-last Winograd, F(2,3) vs F(4,3)");
+NNOPS_BENCH(conv2d_wino_order_ab_f16) {
+    run_wino_order_ab<half>("f16: Winograd, F(2,3) vs F(4,3)");
 }
 
-NNOPS_BENCH(conv2d_channel_last_wino_vs_implicit_f32) {
+NNOPS_BENCH(conv2d_wino_vs_implicit_f32) {
     run_wino_table<float>(
-        "f32: channel-last implicit GEMM (HWIO) vs channel-last Winograd (U panels)");
+        "f32: implicit GEMM (HWIO) vs Winograd (U panels)");
 }
 
-NNOPS_BENCH(conv2d_channel_last_wino_vs_implicit_f16) {
+NNOPS_BENCH(conv2d_wino_vs_implicit_f16) {
     run_wino_table<half>(
-        "f16: channel-last implicit GEMM (HWIO) vs channel-last Winograd (U panels)");
+        "f16: implicit GEMM (HWIO) vs Winograd (U panels)");
 }
 
 NNOPS_BENCH(conv2d_filter_prepacked_f32) {

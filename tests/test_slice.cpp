@@ -1,5 +1,5 @@
 /// @file test_slice.cpp
-/// @brief Slice operator tests (CPU, channel-first, f32/f16).
+/// @brief Slice operator tests (CPU, dense, f32/f16).
 ///
 /// Covers 1-D..4-D, multi-axis, negative axes, step > 1, empty axes (identity),
 /// f16, and descriptor-only shape inference. Slice is a strided sub-tensor

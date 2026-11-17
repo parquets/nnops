@@ -2,7 +2,7 @@
 /// @brief Conv2D operator dispatch — descriptor checks, kernel selection, and
 ///        the two prepacked weight products.
 ///
-/// validate() makes the filter order pair with the activation: a channel-last
+/// validate() makes the filter order pair with the activation: an NHWC
 /// activation takes HWIO, PackedHWIO or PackedWinoWeightLast. compute() forces
 /// the implicit-GEMM kernel for three cases whatever the algorithm says — a
 /// quantized (s8) filter, a prepacked im2col filter, and a raw filter — and
@@ -51,8 +51,8 @@ Conv2D::~Conv2D() = default;
 namespace {
 
 /// A group that is one input channel wide and one output channel wide makes the
-/// whole convolution depthwise: groups == OC and IC/G == 1. The channel-last
-/// filter [KH, KW, 1, OC] lays out as tap·C + c — the order the depthwise
+/// whole convolution depthwise: groups == OC and IC/G == 1. The filter
+/// [KH, KW, 1, OC] lays out as tap·C + c — the order the depthwise
 /// kernels read, unwrapped. A packed blob is excluded on purpose: it is a
 /// caller asking for the im2col route.
 bool is_depthwise_geometry(const Conv2DAttributes& attrs, const TensorView& weight)
@@ -91,7 +91,7 @@ auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm) -> Conv2D::
     }
 }
 
-/// Pack HWIO ([KH][KW][IC/G][OC], OC contiguous) into the channel-last B panels:
+/// Pack HWIO ([KH][KW][IC/G][OC], OC contiguous) into the B panels:
 /// the same G g Gᵀ, one 3×3 gather per (ic, oc), written [pos][kb][g·jb + j][ldd]
 /// k-major. The oc padding must arrive zeroed. Scalar per element because the
 /// gather is a stride-tap walk, but one output channel is still one task: it
@@ -182,7 +182,7 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     NNOPS_TRY(detail::require(is_channel_last(inputs[0].layout)));
     // The filter order must pair with the activation: HWIO, its prepacked form,
-    // or the channel-last Winograd U.
+    // or the Winograd U.
     const TensorLayout wl = inputs[1].layout;
     NNOPS_TRY(detail::require(is_channel_last_weight(wl) ||
                               wl == TensorLayout::PackedWinoWeightLast ||
@@ -311,9 +311,9 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
           attrs_.stride[1] == 1 && attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1));
 
     if (!wino_product) {
-        // A square 3x3/5x5/7x7 over at most four channels has no packed form on
-        // the channel-last side: the direct route convolves the raw filter in
-        // place, and one call per inference leaves nothing to amortize. The
+        // A square 3x3/5x5/7x7 over at most four channels has no packed form:
+        // the direct route convolves the raw filter in place, and one call per
+        // inference leaves nothing to amortize. The
         // conditions mirror that route's, so a shape it will not take still
         // packs (a declined pack is a per-call pack at compute time).
         const int64_t ks = attrs_.kernel_size[0];
@@ -335,8 +335,9 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
         const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));
 
         if (outputs[0].is_empty()) {
-            // The pitch is the row length in bytes: a packed filter is not
-            // channel-packed, so the default alignment would not describe it.
+            // The pitch is the row length in bytes: a packed filter's rows are
+            // not aligned to the default, so the default alignment would not
+            // describe it.
             outputs[0] = TensorView(shape, d.dtype, nullptr, d.row_stride_elems * esz, d.layout,
                                     weight.quant_params());
             return;
@@ -397,8 +398,8 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
     NNOPS_ASSERT(ug.total > 0 && "Conv2D::prepackWeights: unsupported dtype");
 
     if (outputs[0].is_empty()) {
-        // Query: the panels [pos][nb][G·jb][ldd], pitched at ldd — not
-        // channel-packed, so the default 32 B row alignment would not fit.
+        // Query: the panels [pos][nb][G·jb][ldd], pitched at ldd — not aligned
+        // to the default 32 B row, so the default alignment would not fit.
         const int64_t u_shape[] = {ug.pos, ug.nb, ug.jbg, ug.ldd};
         outputs[0] = TensorView(std::span<const int64_t>(u_shape, 4), dtype, nullptr,
                                 ug.ldd * elem_size, TensorLayout::PackedWinoWeightLast);

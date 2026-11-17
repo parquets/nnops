@@ -1,11 +1,11 @@
 #pragma once
 /// @file pool1d.hpp
-/// @brief Pool1D — max/average pooling over one spatial axis, channel-last.
+/// @brief Pool1D — max/average pooling over one spatial axis (NWC).
 ///
 /// The 2D pooling kernel with a 1-wide second spatial axis: [N, C, L] is lifted
 /// to [N, C, 1, L] and Pooling is called with a window of {1, K}. The lift keeps
 /// the caller's pitch and layout, so the window walk, the auto-pad resolution
-/// and the channel-last strip split are the 2D ones.
+/// and the strip split are the 2D ones.
 ///
 /// The output's layout follows the input's (NWC). f32/f16 and the quantized
 /// s8/u8 pairs are supported; the lane is the channel.

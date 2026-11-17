@@ -1,5 +1,5 @@
 /// @file depthwise_conv.cpp
-/// @brief SIMD CPU depthwise 2D/3D convolution, channel-last.
+/// @brief SIMD CPU depthwise 2D/3D convolution on NHWC/NDHWC.
 ///
 /// Keeps the raw HWCM filter [KH][KW][C] (TF depthwise order, multiplier
 /// dropped) and puts the lane on channels; all channel blocks of a row group are
@@ -32,7 +32,7 @@ using namespace nnops::simd;
 namespace k = nnops::kernel;
 
 // ============================================================
-// Channel-last depthwise — the lane spans channels
+// Spatial depthwise — the lane spans channels
 // ============================================================
 
 template <typename T>
@@ -210,7 +210,7 @@ void dwconv_fp_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
 }
 
 // ============================================================
-// Channel-last depthwise, quantized (s8/u8 activation, s8/u8 weight)
+// Spatial depthwise, quantized (s8/u8 activation, s8/u8 weight)
 // ============================================================
 //
 // Same task grid as the fp route; the HWCM weight is dequantized per row per

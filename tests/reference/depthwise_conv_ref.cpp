@@ -1,5 +1,5 @@
 /// @file depthwise_conv_ref.cpp
-/// @brief Naive CPU reference for 2D/3D depthwise convolution (channel-first).
+/// @brief Naive CPU reference for 2D/3D depthwise convolution, in dense order.
 ///
 /// The correctness baseline: plain nested loops, one task per (batch, channel),
 /// spatial rank auto-detected from the input rank (4 → 2D, 5 → 3D).
@@ -46,7 +46,7 @@ inline OutT quantize_float(float val, float out_scale, float out_zero) {
 }  // anonymous namespace
 
 // ============================================================
-// 2D reference (channel-first)
+// 2D reference (dense order)
 // ============================================================
 
 template <typename T>
@@ -135,7 +135,7 @@ void dwconv_impl_2d_ref(const DepthwiseConvAttributes& attrs,
 }
 
 // ============================================================
-// 3D reference (channel-first 3D)
+// 3D reference (dense order)
 // ============================================================
 
 template <typename T>

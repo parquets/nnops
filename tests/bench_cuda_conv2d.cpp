@@ -1,9 +1,9 @@
 /// @file bench_cuda_conv2d.cpp
-/// @brief CUDA Conv2D throughput, channel-last.
+/// @brief CUDA Conv2D throughput.
 ///
 /// M is the output pixels, N is the output channels per group, K is
-/// IC/G·KH·KW. The channel-last route reads a coalesced activation row and an
-/// HWIO filter n-major.
+/// IC/G·KH·KW. The route reads a coalesced activation row and an HWIO filter
+/// n-major.
 ///
 /// The layers are the ones a CNN actually runs: a 7x7 stride-2 stem, the 3x3
 /// stack of a ResNet stage, the 1x1 expansions and projections of a MobileNet
@@ -113,7 +113,7 @@ double measure(const ConvBenchCase& c)
 double run_conv(const ConvBenchCase& c, const char* label)
 {
     const double ms = measure(c);
-    print_cuda_row(label, conv_geometry(c, "channel_last"), ms,
+    print_cuda_row(label, conv_geometry(c, "nhwc"), ms,
                    cuda_gflops(ms, c.flops()));
     return cuda_gflops(ms, c.flops());
 }
@@ -244,7 +244,7 @@ double run_conv_i8(const ConvBenchCase& c, const char* label)
     const TensorView ins[] = {dav, dwv};
     const double ms = cuda_median_ms([&] { cuda_launch(*op, dcv, ins); });
     print_cuda_row(label,
-                   conv_geometry(c, "channel_last"), ms,
+                   conv_geometry(c, "nhwc"), ms,
                    cuda_gflops(ms, c.flops()));
     return cuda_gflops(ms, c.flops());
 }
@@ -266,8 +266,8 @@ void run_table(DataType dt, const char* label)
 
 }  // namespace
 
-NNOPS_BENCH(cuda_conv2d_channel_last) {
-    print_cuda_header("CUDA Conv2D channel-last (f32)");
+NNOPS_BENCH(cuda_conv2d) {
+    print_cuda_header("CUDA Conv2D (f32)");
     run_table(DataType::f32, "f32");
 }
 
@@ -278,7 +278,7 @@ NNOPS_BENCH(cuda_conv2d_i8) {
 
 NNOPS_BENCH(cuda_conv2d_f16) {
     print_cuda_header("CUDA Conv2D f16 (tensor core)");
-    run_table(DataType::f16, "f16 channel_last");
+    run_table(DataType::f16, "f16");
 }
 
 NNOPS_BENCH(cuda_conv2d_shapes) {
@@ -290,17 +290,17 @@ NNOPS_BENCH(cuda_conv2d_shapes) {
         ConvBenchCase c;
         c.ic = c.oc = 64;
         c.ih = c.iw = side;
-        run_conv(c, "channel_last s1");
+        run_conv(c, "s1");
     }
     {
         ConvBenchCase c;
         c.ic = c.oc = 128; c.ih = c.iw = 56; c.sh = c.sw = 2; c.ph = c.pw = 0;
-        run_conv(c, "channel_last s2");
+        run_conv(c, "s2");
     }
     {
         ConvBenchCase c;
         c.ic = c.oc = 64; c.ih = c.iw = 28; c.dh = c.dw = 2; c.ph = c.pw = 2;
-        run_conv(c, "channel_last d2");
+        run_conv(c, "d2");
     }
 }
 

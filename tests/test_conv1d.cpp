@@ -1,8 +1,8 @@
 /// @file test_conv1d.cpp
 /// @brief Conv1D against the 2D reference computed on the equivalent lift.
 ///
-/// Conv1D takes a channel-last activation [N, L, C] and an HWIO filter
-/// [K, IC/G, OC]. The oracle here is conv2d_ref handed a rank-4 channel-first
+/// Conv1D takes an NHWC activation [N, L, C] and an HWIO filter
+/// [K, IC/G, OC]. The oracle here is conv2d_ref handed a rank-4 dense
 /// view of the same logical values, with the lift written out locally rather
 /// than taken from conv1d_common.h — so a lift the operator got wrong cannot
 /// hide behind the same mistake in the expectation.
@@ -67,8 +67,8 @@ struct Geom {
     bool bias;
 };
 
-/// Channel-last activation + HWIO filter, compared with the 2D reference on the
-/// same logical values lifted into the channel-first order.
+/// NHWC activation + HWIO filter, compared with the 2D reference on the same
+/// logical values lifted into dense order.
 void run_channel_last(const Geom& g)
 {
     const int64_t ICG = g.IC / g.G;
@@ -84,7 +84,7 @@ void run_channel_last(const Geom& g)
 
     auto op = Conv1D::create(attrs);
 
-    // Channel-last activation [N, L, C], filter [K, IC/G, OC].
+    // NHWC activation [N, L, C], filter [K, IC/G, OC].
     auto cl_in_vec = test::to_channel_last<float>(in_vec, g.N, g.IC, g.L);
     auto hwio_vec = test::oihw_to_hwio<float>(w_vec, g.OC, ICG, 1, g.K);
     const int64_t cl_shape[] = {g.N, g.IC, g.L};
@@ -100,7 +100,7 @@ void run_channel_last(const Geom& g)
     const int64_t OL = cl_out_d[0].dims[2];
 
     // The expectation: the 2D reference on the same logical values, in the
-    // channel-first order it reads.
+    // dense order it reads.
     std::vector<float> ref_buf(static_cast<size_t>(cl_out_d[0].numel()));
     {
         TensorView ref3(std::span<const int64_t>(cl_out_d[0].dims.data(), 3),
@@ -126,7 +126,7 @@ void run_channel_last(const Geom& g)
 
 }  // namespace
 
-NNOPS_TEST(conv1d_channel_last_f32) {
+NNOPS_TEST(conv1d_nhwc_f32) {
     run_channel_last({"cl_basic",  2, 4, 23, 6, 1, 3, 1, 1, 1, false});
     run_channel_last({"cl_stride2", 1, 6, 37, 8, 1, 3, 2, 1, 1, false});
     run_channel_last({"cl_groups", 1, 8, 19, 8, 2, 3, 1, 1, 1, false});

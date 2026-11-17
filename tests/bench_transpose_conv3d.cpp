@@ -1,5 +1,5 @@
 /// @file bench_transpose_conv3d.cpp
-/// @brief TransposeConv3D throughput, channel-last.
+/// @brief TransposeConv3D throughput.
 ///
 /// One arm: the operator on an NDHWC activation, converted once outside every
 /// timer, so a row prices the kernel and the route it selects.

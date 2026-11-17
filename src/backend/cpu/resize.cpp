@@ -1,5 +1,5 @@
 /// @file resize.cpp
-/// @brief CPU implementation of 2D/3D spatial resize, channel-last.
+/// @brief CPU implementation of 2D/3D spatial resize on NHWC/NDHWC.
 ///
 /// The coordinate tables are built once per call: for each output coordinate,
 /// the source index (or the two neighbours and their weight). The kernel

@@ -101,11 +101,11 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/matmul/linear.cpp
     backend/cpu/matmul/moe.cpp
 
-    # CPU convolution kernels: the implicit-GEMM route (both layouts — planar
-    # Channel-first and channel-last, fp and quantized, one file since they share a
-    # plan, a scratch layout and a driver), the Winograd F(2x2,3x3) route, the
-    # depthwise kernel and pooling (which sweeps the same windows the two above
-    # do, and shares their channel-lane / width-lane split).
+    # CPU convolution kernels: the implicit-GEMM route (NHWC, fp and quantized,
+    # one file since they share a plan, a scratch layout and a driver), the
+    # Winograd F(2x2,3x3) route, the depthwise kernel and pooling (which sweeps
+    # the same windows the two above do, and shares their channel-lane /
+    # width-lane split).
     backend/cpu/conv/conv2d_implicit_gemm.cpp
     backend/cpu/conv/conv2d_winograd.cpp
     backend/cpu/conv/depthwise_conv.cpp
@@ -151,11 +151,12 @@ if(NNOPS_BUILD_CUDA)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-    # The GEMM/Conv kernels are built on CuTe only (cute/ headers); the CUTLASS
-    # host-side GEMM layer is not used. CuTe's own headers still reach into
-    # cutlass/numeric_types.h, so the checkout's include/ root is on the path.
+    # Only the dense MatMul engines still use CuTe (the hand-written PTX engines
+    # carry Linear and the conv family); the CUTLASS host-side GEMM layer is not
+    # used. CuTe's own headers still reach into cutlass/numeric_types.h, so the
+    # checkout's include/ root is on the path.
     set(NNOPS_CUTLASS_DIR "" CACHE PATH
-        "CUTLASS checkout whose include/cute the CUDA GEMM kernels build on")
+        "CUTLASS checkout whose include/cute the dense CUDA MatMul engines build on")
     if(NOT NNOPS_CUTLASS_DIR)
         foreach(_candidate "D:/git/cutlass" "$ENV{CUTLASS_DIR}"
                            "${CMAKE_SOURCE_DIR}/third_party/cutlass")
@@ -198,8 +199,8 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/gather.cu
         backend/cuda/scatter.cu
         # Convolutions and the pooling that goes with them, one file an
-        # operator family: Conv2D (both memory orders via the CuTe GEMM),
-        # depthwise, and spatial pooling.
+        # operator family: Conv2D (the PTX implicit GEMM), depthwise, and
+        # spatial pooling.
         backend/cuda/matmul/matmul.cu
         backend/cuda/matmul/linear.cu
         backend/cuda/matmul/matmul_f16.cu

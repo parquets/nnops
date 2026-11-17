@@ -1,12 +1,12 @@
 /// @file depthwise_transpose_conv_ref.cpp
 /// @brief Naive CPU reference for depthwise transposed 2D convolution
-///        (channel-first).
+///        (dense order).
 ///
-/// The correctness baseline for both the channel-first and the channel-last
+/// The correctness baseline for both the dense-order and the NHWC
 /// kernels: plain nested loops over (batch, channel, output pixel, tap), one
-/// task per (batch, channel) pair. The channel-last tests feed the same values
+/// task per (batch, channel) pair. The NHWC tests feed the same values
 /// in the other order and compare after converting the result back, so this
-/// file only ever reads the channel-first [C, 1, KH, KW] filter.
+/// file only ever reads the dense [C, 1, KH, KW] filter.
 ///
 /// The gather form matches the kernel's indexing exactly: output (oh, ow) reads
 /// input (ih, iw) where oh + PH - kh·DH == ih·SH, so no output is ever visited

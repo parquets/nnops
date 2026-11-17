@@ -4,8 +4,7 @@
 ///
 /// N >= 2. All inputs share rank, dtype and layout; every non-axis dimension
 /// must match, and the output axis dimension is their sum. Layout-agnostic:
-/// Channel-first and channel-last are both walked by logical
-/// axis; f32 and f16.
+/// every layout is walked by its logical axis; f32 and f16.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

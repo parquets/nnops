@@ -32,7 +32,7 @@
 
 using namespace nnops;
 
-// The layout-aware scalar norm reference (channel-first or channel-last).
+// The layout-aware scalar norm reference (dense or NHWC).
 namespace nnops::backend::cpu::reference {
 void norm_ref(const NormAttributes& attrs,
               TensorView& output,
@@ -45,7 +45,7 @@ void norm_ref(const NormAttributes& attrs,
 // BatchNorm
 // ============================================================
 
-NNOPS_TEST(norm_batchnorm_channel_last_spatial) {
+NNOPS_TEST(norm_batchnorm_spatial) {
     const int64_t N = 2, C = 8, H = 3, W = 4;
 
     auto [in_vec, in_channel_first] = test::make_random_tensor({N, C, H, W}, -1.0f, 1.0f, 300);
@@ -70,7 +70,7 @@ NNOPS_TEST(norm_batchnorm_channel_last_spatial) {
     attrs.spatial = true;
     auto op = Norm::create(attrs, Backend::CPU);
 
-    // Golden: the layout-aware scalar reference on the channel-first input.
+    // Golden: the layout-aware scalar reference on the dense input.
     auto dx = in_channel_first.desc();
     auto ds = s.desc();
     auto db = b.desc();
@@ -87,7 +87,7 @@ NNOPS_TEST(norm_batchnorm_channel_last_spatial) {
         backend::cpu::reference::norm_ref(attrs, ref_out, ref_ins, ctx, nullptr);
     }
 
-    // Channel-last: convert in, normalize, convert back.
+    // NHWC: convert in, normalize, convert back.
     const int64_t S = H * W;
     std::vector<float> cl_buf = test::to_channel_last(
         std::span<const float>(in_channel_first.ptr<float>(),

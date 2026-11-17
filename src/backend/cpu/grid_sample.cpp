@@ -1,7 +1,7 @@
 /// @file grid_sample.cpp
-/// @brief CPU implementation of 2D/3D grid sampling, channel-last.
+/// @brief CPU implementation of 2D/3D grid sampling on NHWC/NDHWC.
 ///
-/// The image tensor is channel-last; the grid is always dense f32
+/// The image tensor is NHWC/NDHWC; the grid is always dense f32
 /// ([N, (OD,) OH, OW, 2|3]), because its last axis is a coordinate pair/triple,
 /// not a channel. The dispatch is one task per n and keeps the SIMD lane on C,
 /// so a pixel interpolates all its channels at once. The grid coordinate is per

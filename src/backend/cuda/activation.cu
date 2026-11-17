@@ -261,7 +261,7 @@ void activation_cuda_impl(const ActivationAttributes& attrs, TensorView& output,
             input.ptr<T>(), output.ptr<T>(), total, attrs.type, attrs.alpha, attrs.beta,
             attrs.add_to);
     } else {
-        // Row-by-row processing, respecting pitch. A channel-last row is one
+        // Row-by-row processing, respecting pitch. An NHWC row is one
         // spatial line — W pixels × C channels.
         const int64_t last_dim = (rank >= 3 && is_channel_last(input.layout())) ?
                                      input.shape(1) * input.shape(rank - 1) :

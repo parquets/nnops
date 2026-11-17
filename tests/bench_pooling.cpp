@@ -1,11 +1,11 @@
 /// @file bench_pooling.cpp
-/// @brief Channel-last pooling micro-benchmarks: the global mean against a
+/// @brief Pooling micro-benchmarks: the global mean against a
 ///        full-extent window, and the 3x3 window routes.
 ///
 /// The layouts bench holds shape and kernel fixed: a global mean and a 3x3
-/// stride-2 max, both channel-last, with the pixel channels dense.
+/// stride-2 max, with the pixel channels dense.
 ///
-/// The window bench isolates the channel-last 3x3 route: the straight-line
+/// The window bench isolates the 3x3 route: the straight-line
 /// `pool_3x3_rows` against the rolled `pool_rows` walk, over the same buffers,
 /// by flipping `detail::pooling_3x3_roll`. Max/avg, stride 1/2, one-block and
 /// multi-block shapes, so a per-call or per-block cost shows up separately
@@ -119,7 +119,7 @@ double time_us(int iters, Fn&& fn) {
 }
 
 // ============================================================
-// Layouts: channel-last
+// Layouts
 // ============================================================
 
 struct LayoutCase {
@@ -137,7 +137,7 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
     auto [in_vec, in_raw] = make_random<T>(shape, 11);
     (void)in_raw;
 
-    // Channel-last: all C channels dense per pixel.
+    // NHWC: all C channels dense per pixel.
     auto cl_vec = test::to_channel_last<T>(
         std::span<const T>(in_vec.data(), in_vec.size()), 1, c.C, c.H * c.W);
     TensorView in_cl(shape, dt, cl_vec.data(), TensorLayout::NHWC);
@@ -245,7 +245,7 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
                     int64_t at = 0;
                     for (int64_t ch = 0; ch < c.C; ++ch) {
                         for (int64_t e = 0; e < ((m == 0) ? 1 : OH * OW); ++e) {
-                            // Channel-last: a pixel's channels are dense.
+                            // NHWC: a pixel's channels are dense.
                             const int64_t k = (m == 0) ? ch : e * c.C + ch;
                             const double got = static_cast<double>(
                                 simd::s_load(arm.buf.data() + k));
@@ -269,7 +269,7 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
             }
             const double ms = median(t);
 
-            std::printf("    %-12s %2dT  channel-last %8.2f us\n",
+            std::printf("    %-12s %2dT  %8.2f us\n",
                         mode_names[m], nt, ms);
         }
     }
@@ -393,12 +393,12 @@ void run_window_case(const WindowCase& c, const std::vector<int>& threads,
 
 }  // namespace
 
-NNOPS_BENCH(pooling_channel_last) {
+NNOPS_BENCH(pooling) {
     const std::vector<int> threads = bench_threads();
     const int rounds = 5;
     const int iters = 50;
 
-    std::printf("pooling channel-last over one shape and kernel\n");
+    std::printf("pooling over one shape and kernel\n");
     std::printf("  pool=%s threads=", nnops::test::bench_pool_name());
     for (size_t i = 0; i < threads.size(); ++i) {
         std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");

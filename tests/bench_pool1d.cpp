@@ -1,6 +1,6 @@
 /// @file bench_pool1d.cpp
 /// @brief Pool1D against Pooling on the identical lift — the acceptance bench
-///        for the 1D route, channel-last, in both quantized types.
+///        for the 1D route, in both quantized types.
 ///
 /// Pool1D *is* 2D pooling on the [N, C, 1, L] lift with a {1, K} window, so the
 /// only thing to prove is that wrapping the 2D operator costs nothing. Each row
@@ -18,9 +18,9 @@
 /// measuring the barrier. Everything here is bandwidth as a result, and the
 /// tables print GB/s of activation read plus output written next to the time.
 ///
-/// The 2D kernel's channel-last route lanes the channel four rows at a time and
-/// must survive the wrap. The quantized route exists only
-/// channel-last (the SIMD lane is the channel) and has no adaptive form, which
+/// The 2D kernel's route lanes the channel four rows at a time and
+/// must survive the wrap. The quantized route exists only on NHWC storage (the
+/// SIMD lane is the channel) and has no adaptive form, which
 /// the unsupported rows say outright rather than timing a rejected call.
 ///
 /// Measurement rules follow the other benches: interleaved A/B with the second
@@ -204,7 +204,7 @@ struct PoolShape {
     int64_t adaptive = 0;
 };
 
-/// Audio-model pooling, channel-last: the squeeze-excite global mean, the
+/// Audio-model pooling: the squeeze-excite global mean, the
 /// backbone max-pools, and the adaptive head.
 const std::vector<PoolShape>& pool_sweep() {
     static const std::vector<PoolShape> s = {
@@ -281,8 +281,8 @@ std::vector<T> random_vec(int64_t n, uint64_t seed) {
 }
 
 /// One Pool1D layer and the Pooling call on its lift. @p quant selects the
-/// integer route, which carries a QuantParams on both views and is
-/// channel-last only.
+/// integer route, which carries a QuantParams on both views and only runs on
+/// NHWC storage.
 template <class T>
 struct PoolPair {
     explicit PoolPair(const PoolShape& c, bool quant = false) : s(c) {
@@ -423,9 +423,9 @@ NNOPS_BENCH(pool1d_f16_vs_pooling_lift) {
 }
 
 NNOPS_BENCH(pool1d_int8_u8_vs_pooling_lift) {
-    run_table<uint8_t>("pool1d u8 (act/out), channel-last", true);
+    run_table<uint8_t>("pool1d u8 (act/out)", true);
 }
 
 NNOPS_BENCH(pool1d_int8_s8_vs_pooling_lift) {
-    run_table<int8_t>("pool1d s8 (act/out), channel-last", true);
+    run_table<int8_t>("pool1d s8 (act/out)", true);
 }

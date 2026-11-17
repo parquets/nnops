@@ -3,8 +3,8 @@
 /// @brief Layout-free striding for a one-axis reduction.
 ///
 /// The walk wants one thing from the view: the element stride of every dim.
-/// Nothing else about the layout enters it — planar and channel-last are the
-/// same problem, and so is a pitched row — so each side of the reduced axis
+/// Nothing else about the layout enters it — a dense and a spatial view are
+/// the same problem, and so is a pitched row — so each side of the reduced axis
 /// reduces to either a single flat step, when the dims nest dense, or one
 /// (extent, step) term per dim that a mixed-radix decode walks. Which of the
 /// two a side gets is decided by the strides, never by a layout flag.

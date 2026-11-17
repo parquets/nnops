@@ -1,5 +1,5 @@
 /// @file bench_cuda_pooling.cpp
-/// @brief CUDA pooling throughput, channel-last.
+/// @brief CUDA pooling throughput.
 ///
 /// Pooling performs no MACs, so the throughput column is not a FLOP rate: the
 /// numerator is the number of window taps the op reads (N·C·OH·OW·K·K, twice
@@ -103,7 +103,7 @@ double measure(const PoolBenchCase& c)
 void run_pool(const PoolBenchCase& c, const char* label)
 {
     const double ms = measure(c);
-    print_cuda_row(label, pool_geometry(c, "channel_last"), ms,
+    print_cuda_row(label, pool_geometry(c, "nhwc"), ms,
                    cuda_gflops(ms, c.taps()));
 }
 

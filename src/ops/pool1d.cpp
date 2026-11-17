@@ -1,6 +1,6 @@
 /// @file pool1d.cpp
-/// @brief Pool1D operator dispatch — channel-last I/O, output layout follows
-///        the input's.
+/// @brief Pool1D operator dispatch — NHWC/NDHWC I/O, output layout follows the
+///        input's.
 ///
 /// The dtype rules are Pooling's, read off a rank-3 tensor: f32/f16 and the
 /// quantized s8/u8 pairs, whose lane is the channel; adaptive has no quantized

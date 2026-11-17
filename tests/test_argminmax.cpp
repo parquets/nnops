@@ -321,10 +321,10 @@ NNOPS_TEST(argmax_pitched_row) {
     }
 }
 
-/// Channel-last memory: (n, h, w, c) with the channel innermost, reduced over
+/// NHWC memory: (n, h, w, c) with the channel innermost, reduced over
 /// the channel — the dims after the axis are interleaved, so the flat inner
 /// index has to be decoded, not added.
-NNOPS_TEST(argmax_channel_last) {
+NNOPS_TEST(argmax_nhwc) {
     constexpr int64_t N = 2, C = 4, H = 3, W = 5;
 
     // Memory order (n, h, w, c).
@@ -347,7 +347,7 @@ NNOPS_TEST(argmax_channel_last) {
     const TensorDesc desc_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // The output inherits the input layout, so it is channel-last too: the
+    // The output inherits the input layout, so it is NHWC too: the
     // values are read back through its own strides.
     std::vector<int64_t> out_data(N * H * W, -1);
     auto output = test::make_channel_first(descs[0], out_data.data());

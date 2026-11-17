@@ -136,7 +136,7 @@ inline void copy_like(TensorView& dst, const TensorView& src)
     const int64_t d_step = dst.row_stride_elems() * esz;
     const int64_t s_step = src.row_stride_elems() * esz;
     // Tight on both sides: the rows are adjacent in both, so it is one run. The
-    // row loop exists for a pitch, and a channel-last residual never has one —
+    // row loop exists for a pitch, and an NHWC residual never has one —
     // without this a 56x56x24 residual is 3136 memcpys of 96 bytes, and the
     // call overhead is most of the copy.
     if (d_step == inner * esz && s_step == inner * esz) {
@@ -176,7 +176,7 @@ Buf run(const char* what, Op& op, std::span<const TensorView> inputs,
 
 namespace detail {
 
-/// A filter reordered into the order a channel-last activation reads.
+/// A filter reordered into the order an NHWC activation reads.
 struct WeightCopy {
     std::vector<int64_t> shape;  ///< the source's, to catch a reused address
     Buf buf;
@@ -209,7 +209,7 @@ inline const TensorView& store_copy(std::map<const void*, WeightCopy>& cache,
 }  // namespace detail
 
 /// The conv filter in TensorFlow's order — torch's [OC, IC/G, KH, KW] to
-/// [KH, KW, IC/G, OC] — which is what a channel-last activation reads: the
+/// [KH, KW, IC/G, OC] — which is what an NHWC activation reads: the
 /// output channel is the contiguous axis, so a B panel is a copy, not a gather.
 /// A load-time transform cached per weight buffer, like the Winograd U below.
 inline const TensorView& hwio_weight(const TensorView& w)
@@ -279,8 +279,8 @@ inline const TensorView& hwcm_weight(const TensorView& w)
 /// identifies it, and a runner that calls conv2d per layer pays for the
 /// transform once.
 ///
-/// The weight's layout picks the U form: OIHW gives the channel-first [16][OC][IC/G],
-/// HWIO the channel-last panels, so a channel-last caller passes the HWIO view
+/// The weight's layout picks the U form: OIHW gives the [16][OC][IC/G] form,
+/// HWIO the HWIO panels, so an NHWC caller passes the HWIO view
 /// (a distinct buffer, hence a distinct cache entry).
 inline const TensorView& winograd_weight(const TensorView& w,
                                          const TensorView& x,
@@ -403,7 +403,7 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
                       const TensorView* residual = nullptr)
 {
     // The layout of the activation picks the filter order: torch's OIHW for a
-    // channel-first input, HWIO for a channel-last one. Both read the same numbers —
+    // Dense input, HWIO for an NHWC one. Both read the same numbers —
     // the copy is a load-time transform, cached per weight buffer.
     const TensorView wl =
         nnops::is_channel_last(x.layout()) ? hwio_weight(w) : w;
@@ -482,15 +482,15 @@ inline Buf conv2d(const TensorView& x, const TensorView& w,
 }
 
 /// The depthwise filter in the order @p x's layout reads: torch's
-/// [C, 1, KH, KW] as it is for a channel-first activation, HWCM [KH, KW, C] for a
-/// channel-last one. Either way no prepack step is involved.
+/// [C, 1, KH, KW] as it is for a Dense activation, HWCM [KH, KW, C] for an NHWC
+/// one. Either way no prepack step is involved.
 inline TensorView depthwise_weight(const TensorView& x, const TensorView& w)
 {
     return nnops::is_channel_last(x.layout()) ? hwcm_weight(w) : w;
 }
 
 /// Depthwise 2D convolution. The torch weight [C, 1, KH, KW] and bias [C] go in
-/// as they are: a channel-first input takes the raw filter, with no prepack.
+/// as they are: a Dense input takes the raw filter, with no prepack.
 inline Buf depthwise_conv(const TensorView& x, const TensorView& w, const TensorView& b,
                           int64_t kernel, int64_t stride, int64_t pad)
 {
@@ -726,9 +726,8 @@ inline Buf add(const TensorView& a, const TensorView& b)
     return run("add", *op, in);
 }
 
-/// MaxPool2d on the tensor as it is: the pooling operator reads a channel-first input
-/// on its channel-first route and a channel-last one on its channel-last route, so the
-/// runner's layout carries through.
+/// MaxPool2d on the tensor as it is: the pooling operator takes NHWC activations,
+/// so the runner's layout carries through.
 inline Buf max_pool(const TensorView& x, int64_t kernel, int64_t stride,
                     int64_t pad)
 {
@@ -793,17 +792,17 @@ inline Buf linear(const TensorView& x, const TensorView& w, const TensorView& b)
 }
 
 /// A [N, C, 1, 1] pooled tensor seen as [N, C] — the reshape is a no-op on
-/// contiguous data, and Linear takes its reduction over the last axis. True in
-/// either layout: a global pool has one pixel, so [N][1][1][C] is [N][C] too.
+/// contiguous data, and Linear takes its reduction over the last axis. A global
+/// pool has one pixel, so [N][1][1][C] is [N][C] too.
 inline TensorView flatten_to_2d(TensorView& pooled)
 {
     const int64_t shape[] = {pooled.shape(0), pooled.shape(1)};
     return TensorView(shape, pooled.data_type(), pooled.ptr<uint8_t>());
 }
 
-/// @p x — [N, C, H, W] — with its pixels on the inside, the graph boundary of a
-/// channel-last run. Copied channel by channel: the artifact's tensors are
-/// channel-first, and this runs once per forward on the 3×224×224 input.
+/// @p x — [N, C, H, W] — with its pixels on the inside, the graph boundary of an
+/// NHWC run. Copied channel by channel: the artifact's tensors are NCHW, and
+/// this runs once per forward on the 3×224×224 input.
 inline Buf to_channel_last(const TensorView& x)
 {
     const int64_t N = x.shape(0), C = x.shape(1);
@@ -831,8 +830,8 @@ inline Buf to_channel_last(const TensorView& x)
     return out;
 }
 
-/// The inverse, for a comparison against the channel-first checkpoints in the
-/// artifact. Verification only — a timed pass does not call it.
+/// The inverse, for a comparison against the NCHW checkpoints in the artifact.
+/// Verification only — a timed pass does not call it.
 inline Buf channel_first_copy_of(const TensorView& x)
 {
     const int64_t N = x.shape(0), C = x.shape(1);
@@ -861,8 +860,8 @@ inline Buf channel_first_copy_of(const TensorView& x)
     return out;
 }
 
-/// Compare @p actual against the artifact's channel-first @p expected, reordering a
-/// channel-last activation first — every checkpoint in an artifact is channel-first.
+/// Compare @p actual against the artifact's NCHW @p expected, reordering the NHWC
+/// activation first — every checkpoint in an artifact is NCHW.
 inline void compare_checkpoint(ModelCheck& check, const std::string& name,
                                const TensorView& actual, const TensorView& expected)
 {
@@ -871,7 +870,7 @@ inline void compare_checkpoint(ModelCheck& check, const std::string& name,
         // in (other) only on a verification pass — but it is a full transpose
         // of every activation, so a disabled check has to skip it, not just
         // skip the sweep it feeds (0.6 ms of a 3.2 ms MobileNetV2 pass at 20
-        // threads, all of it charged to the channel-last arm).
+        // threads, all of it charged to the NHWC arm).
         if (!check.enabled()) { return; }
         const Buf channel_first = channel_first_copy_of(actual);
         check.compare(name, channel_first.view, expected);

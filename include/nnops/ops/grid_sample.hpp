@@ -2,7 +2,7 @@
 /// @file grid_sample.hpp
 /// @brief GridSample operator — 2D/3D sampling at grid points.
 ///
-/// The image tensor is channel-last (NHWC/NDHWC); the output carries its layout.
+/// The image tensor is NHWC/NDHWC; the output carries its layout.
 /// The grid is a dense f32 tensor of normalized coordinates in [-1, 1]: -1 is
 /// the outer left/top/front border and 1 the right/bottom/back one. f32/f16
 /// images only.

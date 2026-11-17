@@ -272,7 +272,7 @@ void unary_cuda_impl(const UnaryAttributes& attrs, TensorView& output,
         unary_flat_kernel<<<grid_size, block_size, 0, stream>>>(input.ptr<T>(), output.ptr<T>(),
                                                                 total, attrs.type, attrs.add_to);
     } else {
-        // Row-by-row processing, respecting pitch. A channel-last row is one
+        // Row-by-row processing, respecting pitch. An NHWC row is one
         // spatial line — W pixels × C channels.
         const int64_t last_dim = (rank >= 3 && is_channel_last(input.layout())) ?
                                      input.shape(1) * input.shape(rank - 1) :

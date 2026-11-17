@@ -1,15 +1,14 @@
 /// @file test_pool1d.cpp
-/// @brief Pool1D (channel-last) against a scalar 1D oracle and, where it
-///        applies, the 2D pooling reference.
+/// @brief Pool1D against a scalar 1D oracle and, where it applies, the 2D
+///        pooling reference.
 ///
-/// Pool1D is Pooling on [N, C, 1, L] with a {1, K} window, and its activation
-/// is channel-last only. The f32 arm uses ref1d, written out below: the 2D
+/// Pool1D is Pooling on [N, C, 1, L] with a {1, K} window, on NHWC storage. The
+/// f32 arm uses ref1d, written out below: the 2D
 /// reference's windowed walk computes `id = od·SD + kd - PD` and so never
 /// applies dilation, while a 1D window's dilation stretches the very axis that
 /// walk advances along. The quantized arm hands pooling_ref a rank-4 view of
 /// the same bytes, lifted here rather than by the operator's own helper.
-/// Covered: the channel-last f32 route against the scalar oracle, and the
-/// quantized channel-last route.
+/// Covered: the f32 route against the scalar oracle, and the quantized route.
 
 #include "nnops/ops/pool1d.hpp"
 #include "nnops/ops/pooling.hpp"   // the reference's attribute type
@@ -62,7 +61,7 @@ PoolingAttributes to_2d(const Pool1DAttributes& a) {
     return c;
 }
 
-/// The 1D pooling semantics written out once, over channel-first data. It
+/// The 1D pooling semantics written out once, over dense-ordered data. It
 /// carries its own window walk rather than reusing the 2D reference: the rows
 /// are handed to it flat, and a 1D window has no H axis to fold into.
 void ref1d(const Pool1DAttributes& a, const std::vector<float>& in, int64_t N,
@@ -106,7 +105,7 @@ void ref1d(const Pool1DAttributes& a, const std::vector<float>& in, int64_t N,
     }
 }
 
-/// Channel-last activation against the scalar 1D oracle on the same values.
+/// The NHWC route against the scalar 1D oracle on the same values.
 void run_channel_last(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shape)
 {
     auto [in_vec, in_view] = test::make_random_tensor(shape, -4.0f, 4.0f, 9);
@@ -126,7 +125,7 @@ void run_channel_last(const Pool1DAttributes& attrs, std::initializer_list<int64
     NNOPS_EXPECT_TRUE(cl_out_d[0].layout == TensorLayout::NHWC);
     const int64_t OL = cl_out_d[0].dims[2];
 
-    // Ground truth: the scalar oracle over the channel-first values.
+    // Ground truth: the scalar oracle over the dense-order values.
     std::vector<float> ref_buf(static_cast<size_t>(N * C * OL));
     ref1d(attrs, in_vec, N, C, L, OL, ref_buf);
 
@@ -151,8 +150,8 @@ QuantParams per_tensor(float scale, int32_t zp) {
     return qp;
 }
 
-/// Quantized pooling is channel-last only; the reference is channel-first, so
-/// the two arms hold the same values in different orders and are compared
+/// The reference reads dense order, so the two arms hold the same values in
+/// different orders and are compared
 /// dequantized, within one output step.
 template <class T>
 void run_int8(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shape,
@@ -212,7 +211,7 @@ void run_int8(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shap
 
 }  // namespace
 
-NNOPS_TEST(pool1d_channel_last_f32) {
+NNOPS_TEST(pool1d_f32) {
     Pool1DAttributes a;
     a.type = Pool1DType::Max;
     a.kernel_shape = 3;
@@ -226,7 +225,7 @@ NNOPS_TEST(pool1d_channel_last_f32) {
     run_channel_last(a, {1, 4, 31});
 }
 
-NNOPS_TEST(pool1d_int8_channel_last) {
+NNOPS_TEST(pool1d_int8) {
     const QuantParams qp = per_tensor(1.0f / 32.0f, 0);
     Pool1DAttributes a;
     a.type = Pool1DType::Max;

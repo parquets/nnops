@@ -22,9 +22,9 @@
 ///
 /// The filter is [IC, OC/G, KH, KW] — the output channel sits *inside* the
 /// reduction — so no k-flattening of it is contiguous and B is always gathered
-/// element by element; only the activation keeps the 16 B lane, and a
-/// channel-last activation has a channel axis dense enough to use it. That also
-/// rules out the dense-filter copy atom Conv2D's B side has.
+/// element by element; only the activation keeps the 16 B lane, and an NHWC
+/// activation has a channel axis dense enough to use it. That also rules out the
+/// vectorized filter fill Conv2D's B side has.
 ///
 /// Two geometries do not reach the GEMM. A group one channel wide on both sides
 /// — a depthwise transposed convolution, where a 64-wide n tile would run
@@ -32,7 +32,7 @@
 /// depthwise_transpose_conv.cu, the same split the CPU backend makes. A grid
 /// too deep for blockIdx.z goes to an output-per-thread script instead.
 ///
-/// f32, f16 and bf16, channel-last; the quantized route (an s8 weight) returns
+/// f32, f16 and bf16; the quantized route (an s8 weight) returns
 /// unsupported.
 
 #include "../cuda_common.cuh"
@@ -64,7 +64,7 @@ __device__ inline Elem tconv_weight(const ConvParams& p, const Elem* base, int n
                 int64_t(kw) * p.w_kw];
 }
 
-/// The rows of an A tile one thread feeds on the channel-last vector walk, and
+/// The rows of an A tile one thread feeds on the channel-vector walk, and
 /// the two pixel coordinates each of them starts from. The thread-to-(row,
 /// k-group) mapping is fixed for the whole kernel, so the division that turns a
 /// pixel into (oh, ow) is paid once, and `oh0`/`ow0` already carry the class's
@@ -110,8 +110,8 @@ __device__ inline ConvRows conv_rows(const ConvParams& p, int pixel0)
     return r;
 }
 
-/// Channel-last fill, one 16 B vector per (row, k-group): k is the innermost
-/// axis there, so a group of `kGroup` consecutive k is a run of whole channels
+/// The vector fill, one 16 B vector per (row, k-group): k is the innermost
+/// axis, so a group of `kGroup` consecutive k is a run of whole channels
 /// inside a single tap -- contiguous in the activation and in the shared tile,
 /// so both the load and the store are one 16 B move.
 template <class Elem, int bK, class SmemA>
@@ -152,8 +152,8 @@ __device__ inline void conv_fill_a_vec(const ConvParams& p, SmemA sA, int stage,
 }
 
 /// Fill one shared-memory A tile with the gathered activation. Threads spread
-/// over the k axis in the channel-last order (consecutive threads read
-/// consecutive channels).
+/// over the k axis in channel order (consecutive threads read consecutive
+/// channels).
 ///
 /// Every address is a 32-bit offset from the block's already-shifted input
 /// pointer, and the walk decodes its starting index once and then steps it: a
@@ -689,7 +689,7 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     p.w_kh = wgt.stride_elems(2);
     p.w_kw = wgt.stride_elems(3);
 
-    // The channel-last 16 B A-fill needs whole channels of one tap on a dense
+    // The 16 B A-fill needs whole channels of one tap on a dense
     // channel axis: in_c == 1 puts consecutive channels next to each other, IC/G a
     // multiple of the vector makes a k-group never straddle a tap, and the
     // channel stride is what has to be 16 B aligned.

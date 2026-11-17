@@ -1,14 +1,14 @@
 /// @file transpose_conv3d_ref.cpp
-/// @brief channel-first scalar reference — used as correctness baseline for tests.
+/// @brief Dense-order scalar reference — used as correctness baseline for tests.
 ///
 /// The scatter-add (input-driven) form, one axis further out than the 2-D
 /// reference: each input voxel, scaled by kernel weights, is accumulated into the
 /// appropriate output region. It never reads the output before the epilogue pass,
 /// so it is independent of the routes the kernel under test takes.
 ///
-/// Weight layout: channel-first [IC, OC/G, KD, KH, KW].
-/// Input:  channel-first [N, IC, ID, IH, IW]
-/// Output: channel-first [N, OC, OD, OH, OW]
+/// Weight layout: [IC, OC/G, KD, KH, KW].
+/// Input:  [N, IC, ID, IH, IW]
+/// Output: [N, OC, OD, OH, OW]
 
 #include "nnops/ops/transpose_conv3d.hpp"
 #include "nnops/core/parallel_for.hpp"

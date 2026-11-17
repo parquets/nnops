@@ -1,5 +1,5 @@
 /// @file test_cuda_conv2d.cpp
-/// @brief CUDA Conv2D, channel-last, against the CPU backend.
+/// @brief CUDA Conv2D against the CPU backend.
 ///
 /// Each case builds one activation/filter pair, runs the operator on both
 /// backends over the same bytes, and compares. The CPU route is the oracle, so
@@ -129,54 +129,54 @@ Outputs run_case(const ConvCase& c, const char* what)
 
 }  // namespace
 
-NNOPS_TEST(cuda_conv2d_channel_last_geometry) {
+NNOPS_TEST(cuda_conv2d_geometry) {
     {
         ConvCase c;
-        c.ic = 8; c.oc = 16;         run_case(c, "cuda_conv2d_channel_last_geometry");
+        c.ic = 8; c.oc = 16;         run_case(c, "cuda_conv2d_geometry");
     }
     {
         ConvCase c;   // stride 2
         c.ic = 8; c.oc = 16; c.sh = c.sw = 2;
         c.ph = c.pw = 0;
-        run_case(c, "cuda_conv2d_channel_last_geometry");
+        run_case(c, "cuda_conv2d_geometry");
     }
     {
         ConvCase c;   // 1x1
         c.ic = 16; c.oc = 32; c.kh = c.kw = 1;
         c.ph = c.pw = 0;
-        run_case(c, "cuda_conv2d_channel_last_geometry");
+        run_case(c, "cuda_conv2d_geometry");
     }
     {
         ConvCase c;   // non-square filter, dilation 2
         c.ic = 6; c.oc = 12; c.kh = 3; c.kw = 2;
         c.dh = c.dw = 2; c.ph = 2; c.pw = 0;
-        run_case(c, "cuda_conv2d_channel_last_geometry");
+        run_case(c, "cuda_conv2d_geometry");
     }
     {
         ConvCase c;   // 7x7 plane, several batches
         c.n = 2; c.ic = 16; c.oc = 24;         c.ih = c.iw = 7;
-        run_case(c, "cuda_conv2d_channel_last_geometry");
+        run_case(c, "cuda_conv2d_geometry");
     }
 }
 
-NNOPS_TEST(cuda_conv2d_channel_last_groups) {
+NNOPS_TEST(cuda_conv2d_groups) {
     ConvCase c;
     c.ic = 8; c.oc = 16; c.groups = 2;
-    run_case(c, "cuda_conv2d_channel_last_groups");
+    run_case(c, "cuda_conv2d_groups");
 
     ConvCase d;
     d.ic = 8; d.oc = 8; d.groups = 8;
-    run_case(d, "cuda_conv2d_channel_last_groups");
+    run_case(d, "cuda_conv2d_groups");
 }
 
-NNOPS_TEST(cuda_conv2d_channel_last_f16_add_to) {
+NNOPS_TEST(cuda_conv2d_f16_add_to) {
     Epilogue ep;
     ep.type = EpilogueActivateType::Relu;
 
     ConvCase c;
     c.ic = 8; c.oc = 16; c.dtype = DataType::f16;
     c.use_bias = true; c.add_to = true; c.epilogue = ep;
-    run_case(c, "cuda_conv2d_channel_last_f16_add_to");
+    run_case(c, "cuda_conv2d_f16_add_to");
 }
 
 NNOPS_TEST(cuda_conv2d_wide_channels) {
@@ -191,7 +191,7 @@ NNOPS_TEST(cuda_conv2d_wide_channels) {
 
 NNOPS_TEST(cuda_conv2d_i8) {
     // The quantized route on CUDA: a pre-quantized u8/s8 activation against an
-    // s8 HWIO filter, channel-last, compared bit for bit with the CPU route.
+    // s8 HWIO filter, compared bit for bit with the CPU route.
     // Integer destinations are exact by construction (the accumulate is int32);
     // the dequantizing ones use the fp tolerance.
     struct I8Conv {
@@ -204,7 +204,7 @@ NNOPS_TEST(cuda_conv2d_i8) {
         bool sym_w = false;  // all-zero per-channel weight zero points
     };
     // Every (activation, destination) pair the quantized route resolves,
-    // channel-last (NHWC activation + HWIO filter).
+    // (NHWC activation + HWIO filter).
     const I8Conv cases[] = {
         // Isolation: s8 activation with a zero point of 0 and symmetric weights,
         // so the raw accumulate is the whole answer.
@@ -215,7 +215,7 @@ NNOPS_TEST(cuda_conv2d_i8) {
         // point is zero).
         {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::s8, false, false, 78, true, 0, false},
 
-        // Channel-last: IC/G a multiple of 16 so the vector A-fill runs.
+        // IC/G a multiple of 16 so the vector A-fill runs.
         {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::s8, true, true, 111, true},
         {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::s8, true, false, 113, true},
         {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::u8, true, true, 115, true},
@@ -224,7 +224,7 @@ NNOPS_TEST(cuda_conv2d_i8) {
         {1, 16, 8, 8, 8, 1, 1, 1, 1, 1, 1, 0, 0, 1, DataType::s8, DataType::f32, false, false, 121, true},
         {1, 16, 8, 8, 8, 3, 3, 2, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::f16, true, true, 123, true},
         {1, 16, 8, 8, 8, 3, 3, 1, 1, 2, 1, 1, 1, 1, DataType::s8, DataType::f16, true, true, 125, true},
-        // Groups split ICG to 8, so this one takes the scalar channel-last fill.
+        // Groups split ICG to 8, so this one takes the scalar fill.
         {1, 16, 8, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 2, DataType::u8, DataType::s8, true, true, 127, true},
         // Planes wider than the 64-pixel tile, on both fills: the per-pixel
         // activation sums are shared memory indexed by tile row.

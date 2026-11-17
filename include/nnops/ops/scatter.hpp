@@ -7,7 +7,7 @@
 /// last write under Reduction::None (concurrent duplicates are unordered) and
 /// accumulates under Add/Mul. Indices are s64/s32 and may be negative,
 /// wrapping from the end of the axis (ScatterElements) or of each axis the
-/// tuple addresses (ScatterND). Data may be f32/f16/s8/u8/s32/s64. Channel-first.
+/// tuple addresses (ScatterND). Data may be f32/f16/s8/u8/s32/s64.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

@@ -2,9 +2,8 @@
 /// @file clamp.hpp
 /// @brief Element-wise clamp to [min, max].
 ///
-/// output[i] = max(min_val, min(max_val, input[i])). Any shape, rank or layout
-/// (channel-first and Packed), processed a row at a time by row stride; output matches
-/// input.
+/// output[i] = max(min_val, min(max_val, input[i])). Any shape, rank or layout,
+/// processed a row at a time by row stride; output matches input.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

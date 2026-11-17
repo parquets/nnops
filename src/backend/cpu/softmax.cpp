@@ -1,11 +1,10 @@
 /// @file softmax.cpp
-/// @brief SIMD-optimized CPU implementation of softmax / log-softmax,
-///        channel-last.
+/// @brief SIMD-optimized CPU implementation of softmax / log-softmax on NHWC.
 ///
 /// One templated implementation covers f32 and f16; the operator refuses
-/// channel-packed layouts (Softmax::validate). Two dispatch paths, chosen by
+/// packed layouts (Softmax::validate). Two dispatch paths, chosen by
 /// where the normalization axis sits in memory:
-///   - The axis is the innermost axis of the storage — channel-last's C (or the
+///   - The axis is the innermost axis of the storage — NHWC's C (or the
 ///     last dim when C == 1). Every group is then `D` contiguous elements and
 ///     the groups are a constant stride apart, so each one is one
 ///     kernel::softmax_process_standard_row call (horizontal reduction).
@@ -34,7 +33,7 @@ using namespace nnops::simd;
 
 namespace {
 
-/// True when the axis is the innermost axis of the storage: channel-last's C is
+/// True when the axis is the innermost axis of the storage: NHWC's C is
 /// one contiguous run, and the runs are a constant stride apart, so the
 /// contiguous-row kernel can take the whole axis.
 bool axis_is_innermost(const TensorView& x, int64_t axis, int64_t& unit_stride)
@@ -90,7 +89,7 @@ void softmax_group_scalar(const T* x, T* y, int64_t D, int64_t stride, int64_t s
 }
 
 /// The dims whose flat index selects a group's position — everything but the
-/// softmax axis, and (channel-last) the channel axis, which supplies the lanes.
+/// softmax axis, and (in NHWC) the channel axis, which supplies the lanes.
 struct PositionWalk {
     int64_t count = 1;
     int64_t n = 0;
@@ -130,7 +129,7 @@ void softmax_strided_axis(const T* x_ptr, T* y_ptr, const TensorView& X, const T
     const int64_t axis_stride = X.stride_elems(axis);
     const int64_t axis_stride_y = Y.stride_elems(axis);
 
-    // Lanes: the channels of a channel-last tensor are one vector.
+    // Lanes: the channels of an NHWC tensor are one vector.
     const bool lanes_are_channels = rank > 1 && axis != 1;
     const int64_t nlanes = lanes_are_channels ? X.shape(1) : 1;
 

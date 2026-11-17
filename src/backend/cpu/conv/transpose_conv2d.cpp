@@ -1,5 +1,5 @@
 /// @file transpose_conv2d.cpp
-/// @brief CPU implementation of 2D transposed convolution, channel-last.
+/// @brief CPU implementation of 2D transposed convolution on NHWC.
 ///
 /// Gather formulation (output-driven), the exact inverse of regular conv's
 /// indexing: output (oh, ow) reads input (ih, iw) where
@@ -7,7 +7,7 @@
 /// accumulated independently and add_to needs no save/restore pass — in either
 /// order: residual_pre_activation reads the destination into the sum before
 /// the epilogue at every merge site. Weights are [IC, OC/G, KH, KW]; the image
-/// tensor is channel-last.
+/// tensor is NHWC.
 ///
 /// Three routes. The pixel kernel repacks the weight once to
 /// [G][KH][KW][IC/G][OC/G] (so consecutive output channels are contiguous) and
@@ -74,7 +74,7 @@ struct Geom {
 };
 
 
-/// Depthwise channel-last. One channel per group means group g's input channel
+/// Depthwise. One channel per group means group g's input channel
 /// is output channel g, so the vector axis is the channel itself: an output
 /// pixel accumulates the whole C-wide tap vector at once, and the "col" the
 /// scatter reads is the input plane. The skeleton — the repack to [KH·KW][C],
@@ -109,7 +109,7 @@ bool tconv2d_channel_last_depthwise(const Geom& gm, TensorView& output,
         });
 }
 
-/// Channel-last through a col matrix — onnxruntime's channels-last structure,
+/// NHWC through a col matrix — onnxruntime's NHWC structure,
 /// and what MNN's NC4HW4 deconvolution does: one GEMM per (batch, group) does
 /// the channel reduction for the whole input plane, so the filter is walked
 /// once per group instead of once per pixel tile, and a stride-residue scatter
@@ -139,7 +139,7 @@ bool tconv2d_channel_last_gemm(const Geom& gm, TensorView& output,
     // Two col orientations. Ordered [tap][oc] the GEMM needs the filter
     // permuted to [IC/G][KH·KW·OC/G], but the col feeds the scatter as it is.
     // Ordered [oc][tap] the raw filter slice *is* B — oc runs faster than tap
-    // in the channel-first weight already — and the col pays a transpose instead, per
+    // in the [IC][OC/G][taps] weight already — and the col pays a transpose instead, per
     // batch item. One of the two is walked twice either way, so walk the
     // smaller: the filter once, or the col per batch item.
     const bool direct_w = npix * gm.N < gm.IC_per_G;
@@ -172,10 +172,10 @@ bool tconv2d_channel_last_gemm(const Geom& gm, TensorView& output,
 // pre-quantized s8 activation whose rows are dense is read in place.
 //
 // The weight keeps its per-channel parameters. The GEMM's reduction axis is the
-// input channel, so an output channel owns karea consecutive rows (channel-
-// first) or columns (channel-last) and its (scale, zero point) has to be
-// replicated across them — the one thing the operand views need that the raw
-// tensors do not have. Replication is cheap and per chunk: the taps of one
+// input channel, so an output channel owns karea consecutive rows (taps-major)
+// or columns (NHWC) and its (scale, zero point) has to be replicated across
+// them — the one thing the operand views need that the raw tensors do not
+// have. Replication is cheap and per chunk: the taps of one
 // channel always sit together.
 
 namespace k = nnops::kernel;
@@ -189,7 +189,7 @@ inline QuantParams qp_per_tensor(float scale, int32_t zero)
     return q;
 }
 
-/// One (scale, zero point) per row (channel-first) or column (channel-last).
+/// One (scale, zero point) per row ([OC/G][taps]) or column (NHWC).
 inline QuantParams qp_per_channel(const float* scale, const int32_t* zero, int64_t n)
 {
     QuantParams q;
@@ -438,7 +438,7 @@ void dequant_oc_row_f32(float* dp, const Src* rp, int64_t nc, const float* w_sx,
     }
 }
 
-/// Depthwise quantized, channel-last. One channel per group, so group g is
+/// Depthwise quantized. One channel per group, so group g is
 /// channel g and the vector axis is the channel — the fp depthwise route's shape,
 /// with the col being the input plane itself. The GEMM route computes
 /// Σ (q_x − zp_x)·(q_w − zp_w) in int32; here the same sum is accumulated in f32
@@ -507,7 +507,7 @@ bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
         }
     }
 
-    // The plane: (q_x − zp_x) channel-last, which is the layout the pixel-major
+    // The plane: (q_x − zp_x) in NHWC order, which is the layout the pixel-major
     // walk reads; one pass, shared by every tap of every output row.
     {
         const int8_t* src = act.ptr;
@@ -570,7 +570,7 @@ bool tconv2d_int8_channel_last_depthwise(const Geom& gm, TensorView& output,
     return true;
 }
 
-/// Channel-last quantized route: one int8 GEMM per (group, oc chunk, batch)
+/// Quantized route: one int8 GEMM per (group, oc chunk, batch)
 /// gives [pixel] × [tap·oc], and the fp route's stride-residue scatter adds the
 /// int32 columns before the merge. The filter is always permuted here, unlike
 /// the fp route's in-place orientation: its columns carry the per-channel
@@ -657,7 +657,7 @@ bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
             }
 
             // B: the group's filter slice as [IC/G] × [KH·KW·nc], a blocked
-            // transpose of the channel-first [IC/G][OC/G][KH·KW] rows.
+            // transpose of the [IC/G][OC/G][KH·KW] rows.
             for (int64_t ic = 0; ic < icg; ++ic) {
                 const int8_t* src = w_ptr + ((g * icg + ic) * ocg + oc0) * karea;
                 int8_t* dst = aux.data() + ic * m;
@@ -686,7 +686,7 @@ bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
                 const int8_t* in_n = act.ptr + n * act.n_stride;
                 TOut* out_n = out_ptr + n * out_n_stride;
 
-                // A: the channel-last image as [IH·IW] × [IC/G] pixels — one
+                // A: the NHWC image as [IH·IW] × [IC/G] pixels — one
                 // pixel stride of IC, so the group offset is g·IC/G elements in.
                 const int64_t ashape[] = {npix, icg};
                 TensorView am(std::span<const int64_t>(ashape, 2), DataType::s8,
@@ -1005,7 +1005,7 @@ void tconv2d_impl(const Geom& gm, TensorView& output, std::span<const TensorView
     const auto epilogue = gm.epilogue;
     const T* type_tag = nullptr;
 
-    // ---- channel-last ----
+    // ---- NHWC ----
     constexpr int L = simd_lane_for<T>;
     constexpr int64_t kPix = 4;
     const int64_t OC_span = OC_per_G;

@@ -3,10 +3,9 @@
 ///
 /// One grouped geometry is not a GEMM either: a group of one input and one
 /// output channel is a depthwise transposed convolution, and compute() hands it
-/// to the depthwise kernels. The filter is [IC, OC/G, KH, KW] = [C, 1, KH, KW]
-/// in both layouts — the channel-first depthwise form the kernels read in
-/// place; on a channel-last activation its channel axis is the outer one, so
-/// the depthwise entry repacks it to [KH][KW][C] once per call.
+/// to the depthwise kernels. The filter is [IC, OC/G, KH, KW] = [C, 1, KH, KW],
+/// whose channel axis is the outer one, so the depthwise entry repacks it to
+/// [KH][KW][C] once per call.
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/ops/depthwise_transpose_conv.hpp"

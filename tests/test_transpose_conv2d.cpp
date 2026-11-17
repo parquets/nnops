@@ -1,17 +1,17 @@
 /// @file test_transpose_conv2d.cpp
-/// @brief TransposeConv2D correctness tests — channel-last.
+/// @brief TransposeConv2D correctness tests on NHWC activations.
 ///
-/// Every case round-trips the channel-last path: channel-first input ->
-/// channel-last view -> compute -> channel-first copy, then compare.
-/// Weight stays channel-first [IC, OC/G, KH, KW] (no prepacking), so one weight
-/// tensor feeds both the channel-last op and the scalar golden.
+/// Every case round-trips: the input is built in the reference's dense order,
+/// moved to NHWC, computed, moved back, then compared. Weight stays OIHW
+/// [IC, OC/G, KH, KW] (no prepacking), so one weight tensor feeds both the op
+/// and the scalar golden.
 ///
 /// Two kinds of case: hand-computed small shapes that pin exact output values
 /// and output geometry, and random roundtrips against
 /// reference::transpose_conv2d_channel_first_ref (tests/reference).
 ///
-/// Channel-last input:  logical [N, IC, IH, IW] stored [N, IH, IW, IC]
-/// Channel-last output: logical [N, OC, OH, OW] stored [N, OH, OW, OC]
+/// Input:  logical [N, IC, IH, IW] stored [N, IH, IW, IC]
+/// Output: logical [N, OC, OH, OW] stored [N, OH, OW, OC]
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "common/test_harness.hpp"
@@ -31,7 +31,7 @@
 
 using namespace nnops;
 
-// Defined in tests/reference/; the channel-first scalar golden used for cross-checks.
+// Defined in tests/reference/; the scalar golden, in dense order, used for cross-checks.
 namespace nnops::backend::cpu::reference {
     void transpose_conv2d_channel_first_ref(const TransposeConv2DAttributes& attrs,
                                     TensorView& output,
@@ -40,8 +40,8 @@ namespace nnops::backend::cpu::reference {
                                     void* workspace);
 }
 
-/// Roundtrip: convert input to channel-last -> TransposeConv2D::compute -> convert back
-/// -> compare with the channel-first scalar golden.
+/// Roundtrip: convert input to NHWC -> TransposeConv2D::compute -> convert back
+/// -> compare with the scalar golden.
 static void test_channel_last_vs_ref(
     const std::vector<int64_t>& in_shape,
     const std::vector<int64_t>& w_shape,
@@ -710,7 +710,7 @@ NNOPS_TEST(tconv2d_dilation) {
 }
 
 // ============================================================
-// Channel-last roundtrip tests (random data, compare with channel-first ref golden)
+// Roundtrip tests (random data, compare with the scalar golden)
 // ============================================================
 
 NNOPS_TEST(tconv2d_roundtrip_f32) {
@@ -780,7 +780,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32_multi_channel) {
     test_channel_last_vs_ref({1, 16, 8, 8}, {16, 32, 3, 3}, attrs);
 }
 
-/// Channel-last roundtrip against the channel-first golden with a mixed-sign
+/// Roundtrip against the scalar golden with a mixed-sign
 /// residual in the destination, so that the pre- and post-activation orders of
 /// add_to cannot agree by accident.
 static void test_channel_last_residual_vs_ref(
@@ -936,7 +936,7 @@ static void test_f16_vs_ref(const std::vector<int64_t>& in_shape,
                                      test::kF16AccumTol));
 }
 
-NNOPS_TEST(tconv2d_f16_channel_last) {
+NNOPS_TEST(tconv2d_f16) {
     TransposeConv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
     attrs.stride      = {2, 2};
@@ -947,8 +947,8 @@ NNOPS_TEST(tconv2d_f16_channel_last) {
     test_f16_vs_ref({1, 32, 12, 12}, {32, 64, 3, 3}, attrs);
 }
 
-NNOPS_TEST(tconv2d_channel_last_wide_oc) {
-    // Wide enough that the channel-last tile repeats its oc block several times
+NNOPS_TEST(tconv2d_wide_oc) {
+    // Wide enough that the tile repeats its oc block several times
     // over one row of pixels.
     TransposeConv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
@@ -961,10 +961,10 @@ NNOPS_TEST(tconv2d_channel_last_wide_oc) {
 }
 
 // ============================================================
-// Channel-last col routes (depthwise, in-place filter, chunked col)
+// Col routes (depthwise, in-place filter, chunked col)
 // ============================================================
 
-NNOPS_TEST(tconv2d_channel_last_depthwise) {
+NNOPS_TEST(tconv2d_depthwise) {
     // g == IC == OC, so every group holds one channel and the route vectorises
     // across groups. The group offset has to be exactly g on both operands or
     // the channels silently swap.
@@ -978,7 +978,7 @@ NNOPS_TEST(tconv2d_channel_last_depthwise) {
     test_channel_last_vs_ref({1, 16, 9, 9}, {16, 1, 3, 3}, attrs, /*has_bias=*/true);
 }
 
-NNOPS_TEST(tconv2d_channel_last_depthwise_stride1) {
+NNOPS_TEST(tconv2d_depthwise_stride1) {
     TransposeConv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
     attrs.stride      = {1, 1};
@@ -991,9 +991,9 @@ NNOPS_TEST(tconv2d_channel_last_depthwise_stride1) {
     test_channel_last_vs_ref({1, 12, 10, 10}, {12, 1, 3, 3}, attrs);
 }
 
-NNOPS_TEST(tconv2d_channel_last_direct_weight) {
+NNOPS_TEST(tconv2d_direct_weight) {
     // Fewer pixels than the filter has input channels: the col is transposed
-    // per pixel instead of the weight, so B is the channel-first filter read in place.
+    // per pixel instead of the weight, so B is the OIHW filter read in place.
     // OC/G = 12 leaves the vector loop a tail as well.
     TransposeConv2DAttributes attrs;
     attrs.kernel_size = {4, 4};
@@ -1006,7 +1006,7 @@ NNOPS_TEST(tconv2d_channel_last_direct_weight) {
     test_channel_last_vs_ref({1, 32, 3, 3}, {32, 12, 4, 4}, attrs, /*has_bias=*/true);
 }
 
-NNOPS_TEST(tconv2d_channel_last_col_chunked) {
+NNOPS_TEST(tconv2d_col_chunked) {
     // The 8 MiB col budget from the other side: the col is [pixels][tap·oc]
     // here, so it splits on oc and each chunk runs its own GEMM and scatter.
     TransposeConv2DAttributes attrs;
@@ -1019,7 +1019,7 @@ NNOPS_TEST(tconv2d_channel_last_col_chunked) {
     test_channel_last_vs_ref({1, 16, 64, 64}, {16, 256, 5, 5}, attrs);
 }
 
-NNOPS_TEST(tconv2d_channel_last_batched_groups) {
+NNOPS_TEST(tconv2d_batched_groups) {
     // Every batch item runs its own GEMM against the one packed filter, so the
     // group and batch offsets both have to survive.
     TransposeConv2DAttributes attrs;
@@ -1032,7 +1032,7 @@ NNOPS_TEST(tconv2d_channel_last_batched_groups) {
     test_channel_last_vs_ref({3, 16, 10, 10}, {16, 8, 3, 3}, attrs, /*has_bias=*/true);
 }
 
-NNOPS_TEST(tconv2d_channel_last_add_to) {
+NNOPS_TEST(tconv2d_add_to) {
     // add_to through the col route: only the merge writes, so the destination's
     // own values are still there to add into.
     TransposeConv2DAttributes attrs;
@@ -1092,10 +1092,10 @@ NNOPS_TEST(tconv2d_channel_last_add_to) {
 }
 
 // ============================================================
-// residual_pre_activation — channel-last routes
+// residual_pre_activation — CPU routes
 // ============================================================
 
-NNOPS_TEST(tconv2d_channel_last_pre_act) {
+NNOPS_TEST(tconv2d_pre_act) {
     // 4x4 stride 2 is past the pixel kernel's tap budget, so this is the col
     // route: the merge is the only writer and folds the destination in first.
     TransposeConv2DAttributes attrs;
@@ -1111,7 +1111,7 @@ NNOPS_TEST(tconv2d_channel_last_pre_act) {
     test_channel_last_residual_vs_ref({1, 16, 8, 8}, {16, 32, 4, 4}, attrs);
 }
 
-NNOPS_TEST(tconv2d_channel_last_pre_act_bias_groups) {
+NNOPS_TEST(tconv2d_pre_act_bias_groups) {
     // Two groups and a bias, with an odd output width so the oc tail and the
     // row edges both carry the residual.
     TransposeConv2DAttributes attrs;
@@ -1127,7 +1127,7 @@ NNOPS_TEST(tconv2d_channel_last_pre_act_bias_groups) {
     test_channel_last_residual_vs_ref({2, 8, 9, 10}, {8, 8, 3, 3}, attrs, true);
 }
 
-NNOPS_TEST(tconv2d_channel_last_pixel_pre_act) {
+NNOPS_TEST(tconv2d_pixel_pre_act) {
     // 2x2 stride 2 keeps the filter under the pixel kernel's threshold, so this
     // runs the four-pixel tile and the per-pixel edge path with the residual.
     TransposeConv2DAttributes attrs;
@@ -1143,8 +1143,8 @@ NNOPS_TEST(tconv2d_channel_last_pixel_pre_act) {
     test_channel_last_residual_vs_ref({1, 16, 10, 11}, {16, 32, 2, 2}, attrs, true);
 }
 
-NNOPS_TEST(tconv2d_channel_last_depthwise_pre_act) {
-    // g == IC == OC, so this takes the channel-last depthwise merge.
+NNOPS_TEST(tconv2d_depthwise_pre_act) {
+    // g == IC == OC, so this takes the depthwise merge.
     TransposeConv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
     attrs.stride      = {2, 2};
@@ -1200,11 +1200,10 @@ struct SimplePool {
 };
 
 NNOPS_TEST(tconv2d_threaded_matches_serial) {
-    // The channel-last kernels split the image, and an output row's merge stays
-    // inside its own task, so a thread count may only change a GEMM's
-    // accumulation order. The residual is off here: the add_to channel-last
-    // cases live in test_channel_last_residual_vs_ref, where the destination is
-    // built permuted.
+    // The kernels split the image, and an output row's merge stays inside its
+    // own task, so a thread count may only change a GEMM's accumulation order.
+    // The residual is off here: the add_to cases live in
+    // test_channel_last_residual_vs_ref, where the destination is built permuted.
     const std::vector<int64_t> in_shape = {2, 32, 12, 12};
     const std::vector<int64_t> w_shape  = {32, 16, 3, 3};
 

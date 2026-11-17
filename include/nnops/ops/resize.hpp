@@ -1,6 +1,6 @@
 #pragma once
 /// @file resize.hpp
-/// @brief Resize operator — 2D/3D spatial interpolation, channel-last.
+/// @brief Resize operator — 2D/3D spatial interpolation over NHWC/NDHWC.
 ///
 /// Per-axis arrays are [D, H, W]; a rank-4 (2D) input reads only H/W (index 0
 /// is ignored), a rank-5 input all three. The output carries the input's layout

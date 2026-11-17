@@ -1,16 +1,16 @@
 /// @file test_transpose_conv3d.cpp
-/// @brief TransposeConv3D correctness tests — channel-last (NDHWC).
+/// @brief TransposeConv3D correctness tests on NDHWC activations.
 ///
 /// Hand-computed small shapes pin exact output values, and random cases compare
 /// against reference::transpose_conv3d_channel_first_ref (tests/reference),
 /// which scatters input-driven and so shares no code with any route the kernel
-/// takes. The channel-last cases run the operator on NDHWC tensors and transpose
+/// takes. The cases run the operator on NDHWC tensors and transpose
 /// the result back element for element before comparing, so one golden serves
 /// both orders — including the depthwise route, whose channel is the vector
 /// axis, and the layout-aware gather fallback.
 ///
 /// Input:   [N, IC, ID, IH, IW]
-/// Weight:  [IC, OC/G, KD, KH, KW], channel-first in both layouts
+/// Weight:  [IC, OC/G, KD, KH, KW], dense in both layouts
 /// Output:  [N, OC, OD, OH, OW], in the input's layout
 
 #include "nnops/ops/transpose_conv3d.hpp"
@@ -29,7 +29,7 @@
 
 using namespace nnops;
 
-// Defined in tests/reference/; the channel-first scalar golden.
+// Defined in tests/reference/; the scalar golden, in dense order.
 namespace nnops::backend::cpu::reference {
     void transpose_conv3d_channel_first_ref(const TransposeConv3DAttributes& attrs,
                                             TensorView& output,
@@ -39,12 +39,12 @@ namespace nnops::backend::cpu::reference {
 }
 
 // =========================================================================
-//  Channel-last (NDHWC)
+//  NDHWC
 // =========================================================================
 
-/// One channel-last case: the operator runs on NDHWC tensors, and the result —
-/// transposed back element for element — is compared against the channel-first
-/// scalar golden on the same values. The weight stays channel-first in both.
+/// One case: the operator runs on NDHWC tensors, and the result — transposed
+/// back element for element — is compared against the scalar golden on the same
+/// values. The weight order stays dense in both.
 static void test_cl_vs_ref(const std::vector<int64_t>& in_shape,
                            const std::vector<int64_t>& w_shape,
                            const TransposeConv3DAttributes& attrs,
@@ -67,7 +67,7 @@ static void test_cl_vs_ref(const std::vector<int64_t>& in_shape,
         b_view = p.second;
     }
 
-    // The same values in NDHWC, and the descriptors asked of a channel-last call
+    // The same values in NDHWC, and the descriptors asked of an NDHWC call
     // — so the output layout the operator reports is part of what is checked.
     const auto in_cl = test::to_channel_last<float>(in_vec, N, IC, S_in);
     TensorView in_cl_view(in_shape, DataType::f32,
@@ -94,7 +94,7 @@ static void test_cl_vs_ref(const std::vector<int64_t>& in_shape,
                    .first;
     }
 
-    // The golden: channel-first in, channel-first out — the descriptor says
+    // The golden: dense in, dense out — the descriptor says
     // NDHWC, so the golden's view is built by hand in the layout it reads.
     const auto out_dims = std::span<const int64_t>(
         out_descs[0].dims.data(), static_cast<size_t>(out_descs[0].rank));
@@ -139,7 +139,7 @@ static void test_cl_vs_ref(const std::vector<int64_t>& in_shape,
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
 }
 
-NNOPS_TEST(tconv3d_channel_last_stride1) {
+NNOPS_TEST(tconv3d_stride1) {
     TransposeConv3DAttributes attrs;
     attrs.kernel_size = {3, 3, 3};
     attrs.padding     = {1, 1, 1};
@@ -147,7 +147,7 @@ NNOPS_TEST(tconv3d_channel_last_stride1) {
     test_cl_vs_ref({1, 8, 4, 5, 6}, {8, 16, 3, 3, 3}, attrs, /*has_bias=*/true);
 }
 
-NNOPS_TEST(tconv3d_channel_last_stride2) {
+NNOPS_TEST(tconv3d_stride2) {
     // SW = 2 splits each output row into residue classes, SD and SH do the same
     // above it — the pixel-major scatter's whole geometry.
     TransposeConv3DAttributes attrs;
@@ -158,7 +158,7 @@ NNOPS_TEST(tconv3d_channel_last_stride2) {
     test_cl_vs_ref({2, 8, 3, 4, 5}, {8, 8, 3, 3, 3}, attrs);
 }
 
-NNOPS_TEST(tconv3d_channel_last_residual) {
+NNOPS_TEST(tconv3d_residual) {
     // The merge is the only writer: bias, pre-activation residual, epilogue and
     // add_to all happen there, on an output that already holds values.
     TransposeConv3DAttributes attrs;
@@ -173,7 +173,7 @@ NNOPS_TEST(tconv3d_channel_last_residual) {
                    /*residual=*/true);
 }
 
-NNOPS_TEST(tconv3d_channel_last_depthwise) {
+NNOPS_TEST(tconv3d_depthwise) {
     // One channel per group: the depthwise route, whose col is the input itself.
     TransposeConv3DAttributes attrs;
     attrs.kernel_size = {3, 3, 3};
@@ -184,7 +184,7 @@ NNOPS_TEST(tconv3d_channel_last_depthwise) {
     test_cl_vs_ref({1, 8, 3, 4, 4}, {8, 1, 3, 3, 3}, attrs, /*has_bias=*/true);
 }
 
-NNOPS_TEST(tconv3d_channel_last_grouped) {
+NNOPS_TEST(tconv3d_grouped) {
     // IC/G = 2 with G = 4: neither depthwise nor the plain one-group shape.
     TransposeConv3DAttributes attrs;
     attrs.kernel_size = {2, 3, 2};
@@ -195,7 +195,7 @@ NNOPS_TEST(tconv3d_channel_last_grouped) {
     test_cl_vs_ref({1, 8, 3, 4, 3}, {8, 3, 2, 3, 2}, attrs, /*has_bias=*/true);
 }
 
-NNOPS_TEST(tconv3d_channel_last_gather_fallback) {
+NNOPS_TEST(tconv3d_gather_fallback) {
     // KD = 17 is past the per-row tap list, so this is the layout-aware gather.
     TransposeConv3DAttributes attrs;
     attrs.kernel_size = {17, 1, 1};
@@ -278,7 +278,7 @@ NNOPS_TEST(tconv3d_threaded_matches_serial) {
     const int64_t OC = out_descs[0].dims[1];
     const int64_t outS = static_cast<int64_t>(numel) / (N * OC);
 
-    // A logical channel-first residual, permuted into each destination's order.
+    // A logical residual built in dense order, permuted into each destination's order.
     const auto seed_cf = test::make_random_tensor(out_dims).first;
     const auto seed_cl = test::to_channel_last<float>(seed_cf, N, OC, outS);
 

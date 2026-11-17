@@ -1,6 +1,6 @@
 /// @file depthwise_conv.cu
-/// @brief CUDA implementation of 2D/3D depthwise convolution on a channel-last
-///        tensor.
+/// @brief CUDA implementation of 2D/3D depthwise convolution on NHWC/NDHWC
+///        tensors.
 ///
 /// Spatial rank comes from the input rank (4 -> 2D, 5 -> 3D).
 ///
@@ -72,10 +72,10 @@ __device__ inline float device_apply_epilogue(EpilogueActivateType ep_type, floa
 }
 
 // ============================================================
-// Channel-last — the lane spans channels
+// The vector kernel — the lane spans channels
 // ============================================================
 
-/// One channel-last launch's geometry: the window, the strides of both operands,
+/// One launch's geometry: the window, the strides of both operands,
 /// and the channel span this launch covers. All scalars, passed by value.
 struct DwLastGeom {
     int64_t c_begin;
@@ -99,7 +99,7 @@ struct DwLastGeom {
     bool add_to;
 };
 
-/// The block both channel-last kernels share: x lanes walk channel vectors (a
+/// The block both vector kernels share: x lanes walk channel vectors (a
 /// warp covers consecutive chunks of one pixel, so each lane's 16 B abuts its
 /// neighbour's), y lanes walk output columns. Every index a thread needs then
 /// comes out of a block coordinate, which is what the first kernel spent four
@@ -394,7 +394,7 @@ void depthwise_conv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& 
     g.PH = attrs.padding[1];
     g.PW = attrs.padding[2];
 
-    // Channel-last: a pixel is C channels wide, a row IW of them, and the filter
+    // The pixel stride: a pixel is C channels wide, a row IW of them, and the filter
     // is [tap][C].
     g.in_pix_stride = C;
     g.in_row_stride = input.row_stride_elems();

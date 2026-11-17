@@ -1,14 +1,14 @@
 /// @file bench_cuda_transpose_conv2d.cpp
-/// @brief CUDA TransposeConv2D throughput, channel-last.
+/// @brief CUDA TransposeConv2D throughput.
 ///
 /// The residue-class GEMM poses one stride-1 correlation per output class, with
 /// M the output pixels of that class, N the output channels per group and K the
 /// (IC/G)-times-taps reduction (the taps are the ones the class actually hits).
-/// The channel-last activation is read per channel lane.
+/// The activation row is read per channel lane.
 ///
 /// The layers are the ones a decoder runs — stride-2 4x4 / 3x3 upsamplers, a
 /// 2x2 pixel shuffle, stride-1 refinement passes — plus the awkward cases: a 5x5
-/// kernel, a grouped layer, a depthwise group (the channel-last 16 B lane), a
+/// kernel, a grouped layer, a depthwise group (the 16 B channel lane), a
 /// batch, and a dilated 3x3.
 ///
 /// GFLOPS is 2·N·OC·(IC/G)·IH·IW·KH·KW — the contributions, one full kernel per
@@ -114,7 +114,7 @@ double measure(const TConvBenchCase& c)
 double run_tconv(const TConvBenchCase& c, const char* label)
 {
     const double ms = measure(c);
-    print_cuda_row(label, tconv_geometry(c, "channel_last"),
+    print_cuda_row(label, tconv_geometry(c, "nhwc"),
                    ms, cuda_gflops(ms, c.flops()));
     return cuda_gflops(ms, c.flops());
 }
@@ -164,14 +164,14 @@ void run_table(DataType dt, const char* label)
 
 }  // namespace
 
-NNOPS_BENCH(cuda_transpose_conv2d_channel_last) {
-    print_cuda_header("CUDA TransposeConv2D channel-last (f32)");
+NNOPS_BENCH(cuda_transpose_conv2d) {
+    print_cuda_header("CUDA TransposeConv2D (f32)");
     run_table(DataType::f32, "f32");
 }
 
 NNOPS_BENCH(cuda_transpose_conv2d_f16) {
     print_cuda_header("CUDA TransposeConv2D f16 (tensor core)");
-    run_table(DataType::f16, "f16 channel_last");
+    run_table(DataType::f16, "f16");
 }
 
 NNOPS_BENCH(cuda_transpose_conv2d_small) {
@@ -186,13 +186,13 @@ NNOPS_BENCH(cuda_transpose_conv2d_small) {
         c.ic = c.oc = 64;
         c.ih = c.iw = side;
         c.sh = c.sw = 2;
-        run_tconv(c, "channel_last");
+        run_tconv(c, "nhwc");
     }
     TConvBenchCase p;
     p.name = "s2 outpad";
     p.ic = p.oc = 64; p.ih = p.iw = 16; p.sh = p.sw = 2;
     p.oph = p.opw = 1;
-    run_tconv(p, "channel_last");
+    run_tconv(p, "nhwc");
 }
 
 #endif  // NNOPS_HAS_CUDA

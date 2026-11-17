@@ -35,8 +35,8 @@
 ///
 /// `zero_mode`: false accumulates into C (read-modify-write), true overwrites.
 /// `seed` sets the accumulator's initial value on both routes: 0 zero, 1 a
-/// per-row bias (channel-first -- a row is an output channel), 2 a per-column bias
-/// (channel-last -- rows are pixels, so the bias lands on the panel's 16 lanes;
+/// per-row bias (dense -- a row is an output channel), 2 a per-column bias
+/// (NHWC -- rows are pixels, so the bias lands on the panel's 16 lanes;
 /// two loads per panel where seeding the tile first costs a full write and
 /// read-back of the output).
 

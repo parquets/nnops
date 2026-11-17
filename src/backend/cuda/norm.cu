@@ -3,7 +3,7 @@
 ///
 /// One entry point dispatches on NormAttributes::type, as the CPU route does,
 /// and every kernel reads the view's strides (see axis_walk.hpp) rather than
-/// assuming a dense tail: a padded pitch and a channel-last view are the same
+/// assuming a dense tail: a padded pitch and an NHWC view are the same
 /// walk with different groups, so neither needs a kernel of its own.
 ///
 /// LayerNorm / RMSNorm / L2Norm run one block per normalization row: the block
@@ -22,7 +22,7 @@
 /// BatchNorm is one block per (sample, channel) plane — or one thread per plane
 /// when the plane is a handful of elements — with the per-channel factors folded
 /// once per block. GroupNorm is one block per (sample, group); the channel step
-/// and the spatial walk come from the view, which covers channel-last and dense
+/// and the spatial walk come from the view, which covers NHWC and dense
 /// in the same kernel.
 ///
 /// f32, f16 and bf16 in, f32 compute. s8/u8 input stays on the CPU (its dequantize /
@@ -169,7 +169,7 @@ __device__ inline void block_sums2(float& a, float& b, float* smem) noexcept
 ///
 /// Both passes move a 128-bit lane per step whenever every side of the row
 /// flattens dense and lands on the 16 B bound — the tail and a row that does not
-/// (a stranded axis, a pitched or channel-last post group) keep the scalar walk.
+/// (a stranded axis, a pitched row, or an NHWC tail) keep the scalar walk.
 template <class T, bool HasMean, bool HasScale, bool HasBias, bool HasRes>
 __global__ void norm_row_kernel(const T* __restrict__ x, const T* __restrict__ scale,
                                 const T* __restrict__ bias, const T* __restrict__ res,
@@ -483,7 +483,7 @@ __global__ void group_norm_kernel(const T* __restrict__ x, const T* __restrict__
         const int64_t yb = n * w.out_n_step + c_start * w.out_c_step;
 
         // A group is channels_per_group channel planes: the channel step and the
-        // spatial walk keep both layouts on the same two offsets.
+        // spatial walk keep NHWC and Dense on the same two offsets.
         float sum = 0.0f;
         float sum_sq = 0.0f;
         for (int64_t e = threadIdx.x; e < per_group; e += blockDim.x) {

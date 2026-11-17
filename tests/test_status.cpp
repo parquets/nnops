@@ -214,7 +214,7 @@ NNOPS_TEST(status_validate_descriptors_only) {
         NNOPS_EXPECT_TRUE(op->validate(odd_w, out) == Status::unsupported);
     }
 
-    // Softmax is channel-last only, and quantized input has no route at all.
+    // Softmax runs on NHWC only, and quantized input has no route at all.
     {
         auto op = Softmax::create(SoftmaxAttributes{}, Backend::CPU);
         const TensorDesc cf[] = {desc_of({2, 8}, DataType::f32)};

@@ -22,7 +22,7 @@
 /// per-row guards.
 ///
 /// Bias seed: 1 is per-row (a dense row is an output channel), 2 is per-column
-/// (channel-last, rows are pixels, so the bias lands on the panel's 16 lanes). Seed 2 reads all 16 lanes, so the caller's bias
+/// (NHWC, rows are pixels, so the bias lands on the panel's 16 lanes). Seed 2 reads all 16 lanes, so the caller's bias
 /// buffer must be padded to the panel width. Seeding costs two loads per row per
 /// panel; priming C first would cost a write and a read-back. The row seed goes
 /// through the same alias index as A and C, so a partial M stays in range. The

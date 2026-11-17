@@ -8,7 +8,7 @@
 ///
 ///   scores = Q·Kᵀ·scale (+ mask);  output = softmax(scores, -1)·V
 ///
-/// Inputs, channel-first only:
+/// Inputs:
 ///   [0] Q [B, Sq, H·D]    or [B, H,   Sq, D]
 ///   [1] K [B, Sk, H_kv·D] or [B, H_kv, Sk, D]
 ///   [2] V [B, Sk, H_kv·D] or [B, H_kv, Sk, D]

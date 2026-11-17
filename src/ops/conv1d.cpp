@@ -1,10 +1,10 @@
 /// @file conv1d.cpp
 /// @brief Conv1D operator dispatch — descriptor checks and the kernel table.
 ///
-/// The filter order pairs with the activation exactly as it does on Conv2D: a
-/// channel-last activation takes HWIO [K, IC/G, OC], a channel-first one any
-/// other filter tag. Only the raw orders are accepted — a prepacked blob has no
-/// 1D form, since the filter already is the [OC][IC/G·K] matrix the GEMM wants.
+/// The filter order pairs with the activation exactly as it does on Conv2D: an
+/// NHWC activation takes HWIO [K, IC/G, OC]. Only the raw order is accepted — a
+/// prepacked blob has no 1D form, since the filter already is the [OC][IC/G·K]
+/// matrix the GEMM wants.
 ///
 /// Everything else — the depthwise hand-off, the int8 route, the L-axis chunk
 /// split — lives in the CPU entry (backend/cpu/conv/conv1d.cpp).

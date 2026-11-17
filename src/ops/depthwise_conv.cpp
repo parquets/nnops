@@ -1,12 +1,11 @@
 /// @file depthwise_conv.cpp
 /// @brief DepthwiseConv operator dispatch — descriptor checks and backend binding.
 ///
-/// Both routes read the raw filter: channel-first the [C, 1, (KD,) KH, KW]
-/// form with a [C] bias, channel-last the HWCM [KH][KW][C] form, whose
-/// every tap is a contiguous run of C channels — the pattern the channel-lane
-/// kernel already reads a vector at a time, so no prepack is involved either way.
-/// The channel lane also covers the quantized s8/u8 pairs; the channel-first route is
-/// f32/f16 only. Spatial rank follows the input rank (4→2D, 5→3D).
+/// The filter is the HWCM [KH][KW][C] form (3D: [KD][KH][KW][C]) with a [C]
+/// bias, whose every tap is a contiguous run of C channels — the pattern the
+/// channel-lane kernel already reads a vector at a time, so there is no
+/// prepack. The channel lane also covers the quantized s8/u8 pairs. Spatial
+/// rank follows the input rank (4→2D, 5→3D).
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"

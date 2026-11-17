@@ -1,5 +1,5 @@
 /// @file conv2d_implicit_gemm.cpp
-/// @brief Conv2D as implicit GEMM, channel-last.
+/// @brief Conv2D as implicit GEMM over NHWC activations.
 ///
 /// M = pixels, N = oc block, K tap-major. The gathered activation tile is A and
 /// the packed HWIO weight is B, either prepacked once per call (shared arena
@@ -89,7 +89,7 @@ constexpr bool is_fp_activation_dtype(DataType d) noexcept
 }
 
 // =========================================================================
-//  Channel-last route — pixels on M, the packed HWIO weight on N
+//  Im2col route — pixels on M, the packed HWIO weight on N
 // =========================================================================
 
 namespace channel_last {
@@ -263,7 +263,7 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    // Logical [N, C, H, W]; channel-last stores [N][H][W][C], so a "row" is one spatial
+    // Logical [N, C, H, W]; NHWC stores [N][H][W][C], so a "row" is one spatial
     // line and a pixel's channel vector is contiguous.
     const int64_t N = input.shape(0);
     const int64_t IC = input.shape(1);
@@ -300,7 +300,7 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs, TensorView& output,
     const int64_t ph_block = plan.ph_block;
     const int64_t oc_chunks = plan.oc_chunks;
 
-    // A sample is IH rows of the channel-last pitch.
+    // A sample is IH rows of the NHWC pitch.
     const int64_t ib_step = IH * in_row_stride;
     const int64_t ob_step = OH * out_row_stride;
 
@@ -1223,7 +1223,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
 
     const int64_t N = in.dims[0];
     const int64_t IC = in.dims[1];
-    // The channel-last weight is TensorFlow's [KH, KW, IC/G, OC]; anything else
+    // The weight is TensorFlow's [KH, KW, IC/G, OC]; anything else
     // is not this route's — except the prepacked blob, whose shape leads with OC
     // (see conv_packed_weight_desc).
     const bool prepacked = wt.layout == TensorLayout::PackedHWIO;
@@ -1348,7 +1348,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     plan.orig_size = keep_orig ? pass_tiles * plan.ocn_block : 0;
     // The int32 accumulator is a per-slot tile set shaped like the residual.
     plan.acc_size = quant ? pass_tiles * plan.ocn_block : 0;
-    // An fp activation is materialized into a compact s8 channel-last plane once per
+    // An fp activation is materialized into a compact s8 NHWC plane once per
     // call. A pre-quantized u8 one is materialized too
     // when it takes the pointwise route, whose in-row A read cannot shift bytes.
     const bool fp_act = (dt == DataType::f32 || dt == DataType::f16);
@@ -1622,7 +1622,7 @@ Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
 // conv_packed_weight_last rather than choosing again — so "the panels
 // prepackWeights built" and "the panels the plan sized for" are one decision.
 //
-// The channel-last blob is addressed by *panel*: panel p holds output channels
+// The packed blob is addressed by *panel*: panel p holds output channels
 // [p·nr, (p+1)·nr) of one k block, for every k block of the group — so any
 // panel-aligned oc range is readable and the plan's N tile stops constraining it.
 
@@ -1734,7 +1734,7 @@ TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs, const TensorDe
 
 namespace {
 
-/// Run @p body over [0, n) with one staging tile per worker — the channel-last
+/// Run @p body over [0, n) with one staging tile per worker — the NHWC
 /// pack's only scratch. Falls back to one tile and a serial loop when the
 /// backend reports no thread ids: a shared tile would race.
 template <class Body>
@@ -1759,7 +1759,7 @@ void with_stage(const ComputeContext& ctx, int64_t n, int64_t stage_len, Body bo
     }
 }
 
-/// Pack the channel-last panels (PackedHWIO): one panel per (group, oc block,
+/// Pack the HWIO panels (PackedHWIO): one panel per (group, oc block,
 /// k block, panel), `nr` output channels wide.
 ///
 /// A panel is what pack_block builds for an oc run one panel wide. The task

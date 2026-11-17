@@ -1,11 +1,11 @@
 /// @file test_softmax.cpp
 /// @brief Softmax operator tests (CPU, class API): softmax and log-softmax
-///        along an axis, temperature and f16, channel-last only.
+///        along an axis, temperature and f16, on NHWC storage only.
 ///
 /// The layout tests run every axis of a 4-D tensor against a reference that
-/// walks the same physical indexing (channel-last [N][H][W][C]) in its own
-/// code, so an axis handled through the wrong stride cannot pass. Channel-packed
-/// weight tags are rejected.
+/// walks the same physical indexing (NHWC [N][H][W][C]) in its own code, so an
+/// axis handled through the wrong stride cannot pass. Channel-packed weight
+/// tags are rejected.
 
 #include "nnops/ops/softmax.hpp"
 #include "common/test_harness.hpp"
@@ -161,7 +161,7 @@ NNOPS_TEST(softmax_random) {
 }
 
 // ============================================================
-// Layout coverage — channel-first and channel-last
+// Layout coverage — dense and NHWC
 // ============================================================
 //
 // Both families keep the logical dims [N][C][H][W]; only the physical order
@@ -244,9 +244,9 @@ static void check_all_axes(std::vector<float>& in, const int64_t dims[4],
     }
 }
 
-NNOPS_TEST(softmax_channel_last_all_axes) {
+NNOPS_TEST(softmax_all_axes) {
     // The strided path lanes across channels, so C = 5 is a partial vector and
-    // C = 12 is a full one plus a half; the channel axis itself is a channel-last
+    // C = 12 is a full one plus a half; the channel axis itself is one NHWC
     // row, whose own tail is the last group's.
     for (const int64_t C : {int64_t{5}, int64_t{12}}) {
         const int64_t dims[4] = {2, C, 3, 4};
@@ -262,8 +262,8 @@ NNOPS_TEST(softmax_channel_last_all_axes) {
     }
 }
 
-NNOPS_TEST(softmax_channel_last_2d_channel) {
-    // Rank-2 channel-last is still [N][C]: axis 1 is one contiguous pixel.
+NNOPS_TEST(softmax_2d_channel) {
+    // Rank-2 NHWC is still [N][C]: axis 1 is one contiguous pixel.
     const int64_t N = 3, C = 5;
     const int64_t shape[] = {N, C};
 
@@ -293,7 +293,7 @@ NNOPS_TEST(softmax_channel_last_2d_channel) {
     }
 }
 
-NNOPS_TEST(softmax_channel_last_channel_axis_f16) {
+NNOPS_TEST(softmax_channel_axis_f16) {
     const int64_t N = 1, C = 10, H = 2, W = 2;
     const int64_t shape[] = {N, C, H, W};
 

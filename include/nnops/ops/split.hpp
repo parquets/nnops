@@ -5,7 +5,7 @@
 /// `split` gives the slice lengths; when empty, `num_outputs` equal slices are
 /// taken and the axis must divide evenly. The slices cover the axis in order, so
 /// their lengths sum to it. Each output is a plain copy of a contiguous axis
-/// region. Channel-first.
+/// region. Logical order.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

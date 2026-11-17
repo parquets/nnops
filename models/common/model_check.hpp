@@ -130,7 +130,7 @@ public:
         if (!dense_rows(actual) || !dense_rows(expected)) {
             row.shape_ok = false;
             if (verbose_) {
-                std::printf("  %-24s LAYOUT: expected dense channel-first, got packed "
+                std::printf("  %-24s LAYOUT: expected dense row-major, got packed "
                             "or pitch-padded\n", name.c_str());
             }
             rows_.push_back(row);

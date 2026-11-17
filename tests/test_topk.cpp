@@ -489,7 +489,7 @@ NNOPS_TEST(topk_k_equals_axis_dim) {
 }
 
 NNOPS_TEST(topk_negative_axis) {
-    // Negative axis: -3 means C axis in channel-first (0=N, 1=C, 2=H, 3=W)
+    // Negative axis: -3 means C axis in dense order (0=N, 1=C, 2=H, 3=W)
     const int64_t shape[] = {1, 3, 1, 2};  // Channel-first
     float data[] = {5.0f, 1.0f,   // C=0
                     2.0f, 4.0f,   // C=1

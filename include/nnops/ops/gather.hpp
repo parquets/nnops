@@ -6,7 +6,7 @@
 ///
 /// Indices are s64 or s32 and may be negative, wrapping from the end of the
 /// gathered axis. Data may be f32/f16/s8/u8/s32/s64 — a gather moves elements
-/// without touching them. Channel-first order.
+/// without touching them. Logical order.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

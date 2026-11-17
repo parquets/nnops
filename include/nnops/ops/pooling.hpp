@@ -1,6 +1,6 @@
 #pragma once
 /// @file pooling.hpp
-/// @brief Pooling operator — 2D/3D spatial pooling, channel-last.
+/// @brief Pooling operator — 2D/3D spatial pooling over NHWC/NDHWC.
 ///
 /// The output's layout follows the input's (NHWC/NDHWC). f32/f16 and the
 /// quantized s8/u8 pairs are supported; the kernel lanes the channel. Per-axis

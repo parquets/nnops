@@ -113,7 +113,7 @@ struct Buf {
 /// when one of this exact size is on the free list; a zeroed one otherwise.
 ///
 /// The buffer is dense: rows abut, so the view takes the descriptor's dense
-/// shape and the storage is exactly what nbytes() asks for (a channel-last row
+/// shape and the storage is exactly what nbytes() asks for (an NHWC row
 /// is a whole spatial line — W pixels × C channels — and abuts the next one the
 /// same way). A desc naming a *padded* row pitch is not what the operators that
 /// hand one back produce, and a pitched activation would make the checkpoint

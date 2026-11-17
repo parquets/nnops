@@ -85,7 +85,7 @@ void apply_activation_flt(ActivationType type, const T* in, T* out, int64_t M, i
 
 } // anonymous namespace
 
-/// PRelu: one slope per logical channel (dim 1). Channel-last packs C inside
+/// PRelu: one slope per logical channel (dim 1). NHWC packs C inside
 /// every pixel, so the slope vector loads alongside the pixel vector.
 template <typename T>
 void prelu_impl(const ActivationAttributes& attrs, TensorView& output,
@@ -109,7 +109,7 @@ void prelu_impl(const ActivationAttributes& attrs, TensorView& output,
         return;
     }
 
-    // Pixel-major: channel = column % C. A channel-last row is W pixels of C
+    // Pixel-major: channel = column % C. An NHWC row is W pixels of C
     // channels; a rank-2 row is the channel vector itself.
     constexpr int L = simd_lane_for<T>;
     constexpr int64_t kTileRows = 32;

@@ -211,7 +211,7 @@ __device__ inline pack8<T> pack8_add(pack8<T> base, float r0, float r1, float r2
 }
 
 // ============================================================
-// Channel-lane vectors — the loads a channel-last kernel wants
+// Channel-lane vectors — the loads a spatial kernel wants
 // ============================================================
 // The channel axis is contiguous there, so a thread owns one 16 B vector of it:
 // `Vec` is 4 for f32 and 8 for a 2-byte type, or 1 for the scalar script that a

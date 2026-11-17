@@ -2,7 +2,7 @@
 /// @file topk.hpp
 /// @brief TopK operator — top-k (or bottom-k) values and indices along an axis.
 ///
-/// Channel-first layouts, f32/f16 input. Two outputs: Values (same dtype,
+/// Dense and spatial layouts, f32/f16 input. Two outputs: Values (same dtype,
 /// axis dim replaced by k) and Indices (int64, same shape as Values).
 
 #include "nnops/core/op_base.hpp"

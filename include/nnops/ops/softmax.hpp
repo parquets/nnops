@@ -4,7 +4,7 @@
 ///
 /// softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max)); log-softmax subtracts
 /// log(sum) instead. A temperature T divides the max-shifted logits by T
-/// (equivalently softmax(x/T)). f32/f16 input only; channel-last layouts.
+/// (equivalently softmax(x/T)). f32/f16 input only; NHWC/NDHWC.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -54,7 +54,7 @@ public:
     OpType  getOpType()  const override { return OpType::Softmax; }
     Backend getBackend() const override { return backend_; }
 
-    /// Channel-last only; channel-packed layouts are refused.
+    /// NHWC/NDHWC only; packed layouts are refused.
     LayoutSupport getLayoutSupport() const noexcept override {
         return LayoutSupport::ChannelLastOnly;
     }

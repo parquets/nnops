@@ -1,8 +1,8 @@
 /// @file test_depthwise_transpose_conv.cpp
-/// @brief DepthwiseTransposeConv2D tests — channel-last.
+/// @brief DepthwiseTransposeConv2D tests on NHWC activations.
 ///
-/// The same values in both orders — channel-first plus the raw channel-first
-/// filter for the reference, channel-last plus TensorFlow's [KH][KW][C] filter
+/// The same values in both orders — dense order plus the raw [C, 1, KH, KW]
+/// filter for the reference, NHWC plus TensorFlow's [KH][KW][C] filter (HWCM)
 /// for the kernel. The route reads the filter as the graph holds it, so the
 /// only plumbing is the transpose between the orders.
 ///
@@ -48,7 +48,7 @@ namespace nnops::backend::cpu::reference {
 }
 
 // ============================================================
-// Channel-last
+// The route
 // ============================================================
 
 template <class Shape>
@@ -98,7 +98,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
 
     auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
 
-    // ---- Reference, in the channel-first order ---------------------------------
+    // ---- Reference, in dense order ---------------------------------------------
     const TensorDesc ref_in[] = {
         in_channel_first.desc(), w_channel_first.desc(), b_channel_first.desc()};
     auto ref_descs = op->getOutputTensorDesc(
@@ -123,7 +123,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
             attrs, ref, std::span<const TensorView>(r, has_bias ? 3 : 2), ctx, nullptr);
     }
 
-    // ---- The same values, in the channel-last order ----------------------------
+    // ---- The same values, in NHWC/HWCM order -----------------------------------
     const auto in_cl_f = test::to_channel_last<float>(in_vec, N, C, inS);
     const auto w_cl_f  = test::depthwise_to_hwcm<float>(w_vec, C, taps);
     std::vector<T> in_cl(in_cl_f.size());
@@ -154,7 +154,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
     NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
     NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
 
-    // The same residual, permuted into the channel-last order the kernel writes.
+    // The same residual, permuted into the NHWC order the kernel writes.
     std::vector<T> out_buf(static_cast<size_t>(out_n), to_T(0.0f));
     if (attrs.add_to) {
         const auto res_cl = test::to_channel_last<float>(res_cf, N, C, outS);
@@ -170,7 +170,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
     if (has_bias) { ins.push_back(b_v); }
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out_v, ins)));
 
-    // ---- Back to the channel-first order for the comparison --------------------
+    // ---- Back to dense order for the comparison --------------------------------
     const auto got = test::to_channel_first<T>(out_buf, N, C, outS);
     for (int64_t i = 0; i < out_n; ++i) {
         NNOPS_EXPECT_NEAR(as_f(got[static_cast<size_t>(i)]),
@@ -179,23 +179,23 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
 }
 
 // ============================================================
-// Channel-last table
+// Shape table
 // ============================================================
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_basic) {
+NNOPS_TEST(dwtconv_vs_ref_basic) {
     test_channel_last_vs_ref<float>({2, 16, 10, 10}, {16, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}, {0, 0}},
         false, 1e-4f);
 }
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_partial_block) {
+NNOPS_TEST(dwtconv_vs_ref_partial_block) {
     // Five channels: one vector chunk, a scalar tail.
     test_channel_last_vs_ref<float>({1, 5, 8, 9}, {5, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}},
         false, 1e-4f);
 }
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_multi_block) {
+NNOPS_TEST(dwtconv_vs_ref_multi_block) {
     // Seventeen channels cross the 16-wide chunk boundary and end on a
     // one-channel tail.
     test_channel_last_vs_ref<float>({1, 17, 7, 9}, {17, 1, 3, 3},
@@ -203,20 +203,20 @@ NNOPS_TEST(dwtconv_channel_last_vs_ref_multi_block) {
         true, 1e-4f);
 }
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_stride2_dilation) {
+NNOPS_TEST(dwtconv_vs_ref_stride2_dilation) {
     test_channel_last_vs_ref<float>({1, 8, 9, 10}, {8, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {2, 2}, {0, 0}, {0, 0}},
         false, 1e-4f);
 }
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_add_to_relu) {
+NNOPS_TEST(dwtconv_vs_ref_add_to_relu) {
     DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}};
     attrs.add_to = true;
     attrs.epilogue.type = EpilogueActivateType::Relu;
     test_channel_last_vs_ref<float>({1, 6, 6, 11}, {6, 1, 3, 3}, attrs, false, 1e-4f);
 }
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_pre_act) {
+NNOPS_TEST(dwtconv_vs_ref_pre_act) {
     // Seventeen channels end on a one-lane tail past the vector chunks, so the
     // residual load runs through the same partial-block staging as the store.
     DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
@@ -226,7 +226,7 @@ NNOPS_TEST(dwtconv_channel_last_vs_ref_pre_act) {
     test_channel_last_vs_ref<float>({1, 17, 7, 9}, {17, 1, 3, 3}, attrs, true, 1e-4f);
 }
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_f16_pre_act) {
+NNOPS_TEST(dwtconv_vs_ref_f16_pre_act) {
     DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}};
     attrs.epilogue.type = EpilogueActivateType::Relu;
     attrs.add_to = true;
@@ -235,19 +235,19 @@ NNOPS_TEST(dwtconv_channel_last_vs_ref_f16_pre_act) {
                                    test::kF16AccumTol);
 }
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_output_padding) {
+NNOPS_TEST(dwtconv_vs_ref_output_padding) {
     test_channel_last_vs_ref<float>({2, 4, 6, 8}, {4, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {0, 0}, {1, 1}},
         true, 1e-4f);
 }
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_1x1_stride2) {
+NNOPS_TEST(dwtconv_vs_ref_1x1_stride2) {
     test_channel_last_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1},
         DepthwiseTransposeConv2DAttributes{{1, 1}, {2, 2}, {1, 1}, {0, 0}, {0, 0}},
         false, 1e-4f);
 }
 
-NNOPS_TEST(dwtconv_channel_last_vs_ref_f16) {
+NNOPS_TEST(dwtconv_vs_ref_f16) {
     test_channel_last_vs_ref<half>({1, 8, 8, 10}, {8, 1, 3, 3},
         DepthwiseTransposeConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}},
         true, test::kF16AccumTol);
@@ -413,9 +413,9 @@ NNOPS_TEST(dwtconv_refusals) {
     std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
     auto out = test::make_channel_first(out_descs[0], out_buf.data());
 
-    // A channel-last activation takes the transpose-conv [C, 1, KH, KW] filter
-    // as well as HWCM, but one filter per channel is the geometry here: a
-    // multiplier is refused.
+    // An NHWC activation takes the transpose-conv [C, 1, KH, KW] filter as well
+    // as HWCM, but one filter per channel is the geometry here: a multiplier is
+    // refused.
     {
         auto [wm_vec, wm] = test::make_random_tensor({4, 2, 3, 3});
         const TensorView ins[] = {in, wm};
@@ -449,7 +449,7 @@ NNOPS_TEST(dwtconv_refusals) {
 /// A TransposeConv2D whose group count equals its input channels is the
 /// depthwise geometry, and compute() hands it to these kernels instead of the
 /// per-group col GEMM. Its filter is [IC, OC/G, KH, KW] = [C, 1, KH, KW], which
-/// a channel-last activation has repacked. Compare against
+/// an NHWC activation has repacked. Compare against
 /// depthwise_transpose_conv_ref on the same values.
 static void transpose_conv2d_depthwise_vs_ref(
     const std::vector<int64_t>& in_shape,
@@ -511,8 +511,8 @@ static void transpose_conv2d_depthwise_vs_ref(
 
     auto conv = TransposeConv2D::create(attrs, Backend::CPU);
 
-    // A residual is a logical [N,C,OH,OW] value, so the channel-last buffer
-    // takes it permuted rather than in the channel-first order it was built in.
+    // A residual is a logical [N,C,OH,OW] value, so the NHWC buffer takes it
+    // permuted rather than in the dense order it was built in.
     std::vector<float> out_buf(res_cf);
     if (dw.add_to) {
         out_buf = test::to_channel_last<float>(res_cf, N, C, out_S);
@@ -539,13 +539,13 @@ static void transpose_conv2d_depthwise_vs_ref(
     }
 }
 
-NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last) {
+NNOPS_TEST(tconv2d_group_eq_channels_depthwise) {
     DepthwiseTransposeConv2DAttributes dw{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
     dw.epilogue.type = EpilogueActivateType::Relu;
     transpose_conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true);
 }
 
-NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_add_to) {
+NNOPS_TEST(tconv2d_group_eq_channels_depthwise_add_to) {
     // C=17 leaves a one-lane tail past two full vectors; stride 2 makes the
     // output plane a different size from the input's.
     DepthwiseTransposeConv2DAttributes dw{{2, 2}, {2, 2}, {1, 1}, {0, 0}, {0, 0}};
@@ -553,7 +553,7 @@ NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_add_to) {
     transpose_conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false);
 }
 
-NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_pre_act) {
+NNOPS_TEST(tconv2d_group_eq_channels_depthwise_pre_act) {
     DepthwiseTransposeConv2DAttributes dw{{2, 2}, {2, 2}, {1, 1}, {0, 0}, {0, 0}};
     dw.epilogue.type = EpilogueActivateType::Relu;
     dw.add_to = true;

@@ -20,14 +20,14 @@
 namespace nnops {
 namespace test {
 
-/// Create a channel-first TensorView from a TensorDesc.
+/// Create a dense TensorView from a TensorDesc.
 inline TensorView make_channel_first(const TensorDesc& desc, void* data) {
     auto shape = std::span<const int64_t>(desc.dims.data(), static_cast<size_t>(desc.rank));
     return TensorView(shape, desc.dtype, data, desc.layout);
 }
 
 /// Create a pitched TensorView from a TensorDesc (uses row_pitch for the pitch
-/// parameter); needed by channel-last tests, whose row is one spatial line.
+/// parameter); needed by NHWC tests, whose row is one spatial line.
 inline TensorView make_packed(const TensorDesc& desc, void* data, int64_t alignment = 32) {
     auto shape = std::span<const int64_t>(desc.dims.data(), static_cast<size_t>(desc.rank));
     return TensorView(shape, desc.dtype, data, desc.row_pitch(alignment), desc.layout);

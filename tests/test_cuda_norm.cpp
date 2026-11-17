@@ -11,7 +11,7 @@
 /// The cases split the way the CUDA file does: one block per row for
 /// LayerNorm / RMSNorm / L2Norm (tail axis and an interior one), one block per
 /// channel for the spatial BatchNorm and GroupNorm routes, and the flat
-/// non-spatial BatchNorm map. The spatial routes are channel-last.
+/// non-spatial BatchNorm map. The spatial routes take NHWC.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -41,7 +41,7 @@ struct NormCase {
     bool add_to = false;
     bool scalar_scale = false;
     bool spatial = true;
-    /// Force a dense channel-first view: the non-spatial BatchNorm map reads a
+    /// Force a dense view: the non-spatial BatchNorm map reads a
     /// flat range, which only means anything when the rows have no padding.
     bool dense = false;
 };
@@ -232,7 +232,7 @@ NNOPS_TEST(cuda_layer_norm_inner_axis) {
 
 NNOPS_TEST(cuda_layer_norm_residual) {
     // The residual slot trails the bias, so every residual case carries one.
-    // Channel-last is left out on purpose: its tail is strided, which the CPU
+    // NHWC is left out on purpose: its tail is strided, which the CPU
     // route's fused `norm(x + r)` does not define (it asserts on it and, in a
     // release build, drops the residual).
     NormCase c;
@@ -260,17 +260,17 @@ NNOPS_TEST(cuda_layer_norm_row_span) {
     run_case(c, "cuda_layer_norm_row_over_budget_residual");
 }
 
-NNOPS_TEST(cuda_layer_norm_channel_last) {
+NNOPS_TEST(cuda_layer_norm_nhwc) {
     NormCase c;
     c.shape = {2, 6, 5};
     c.layout = TensorLayout::NHWC;
-    run_case(c, "cuda_layer_norm_channel_last");
+    run_case(c, "cuda_layer_norm_nhwc");
     c.bias = true;
-    run_case(c, "cuda_layer_norm_channel_last_bias");
+    run_case(c, "cuda_layer_norm_nhwc_bias");
     // Over the spatial dims as well as the channels.
     c.bias = false;
     c.axis = 1;
-    run_case(c, "cuda_layer_norm_channel_last_inner");
+    run_case(c, "cuda_layer_norm_nhwc_inner");
 }
 
 NNOPS_TEST(cuda_layer_norm_f16) {
@@ -281,7 +281,7 @@ NNOPS_TEST(cuda_layer_norm_f16) {
     run_case(c, "cuda_layer_norm_f16");
     c.layout = TensorLayout::NHWC;
     c.shape = {2, 4, 8};
-    run_case(c, "cuda_layer_norm_f16_channel_last");
+    run_case(c, "cuda_layer_norm_f16");
     // A one-element scale tensor: the row kernel broadcasts it, and the CPU's
     // SIMD path has to as well instead of loading a lane past its end.
     c.layout = TensorLayout::Dense;
@@ -323,12 +323,12 @@ NNOPS_TEST(cuda_rms_norm_residual) {
     run_case(c, "cuda_rms_norm_residual");
 }
 
-NNOPS_TEST(cuda_rms_norm_channel_last_and_f16) {
+NNOPS_TEST(cuda_rms_norm_and_f16) {
     NormCase c;
     c.type = NormType::RMSNorm;
     c.shape = {2, 7, 8};
     c.layout = TensorLayout::NHWC;
-    run_case(c, "cuda_rms_norm_channel_last");
+    run_case(c, "cuda_rms_norm");
     c.dtype = DataType::f16;
     run_case(c, "cuda_rms_norm_f16");
 }
@@ -358,7 +358,7 @@ NNOPS_TEST(cuda_l2_norm_inner_axis) {
     run_case(c, "cuda_l2_norm_inner_axis");
     c.layout = TensorLayout::NHWC;
     c.axis = 2;
-    run_case(c, "cuda_l2_norm_inner_axis_channel_last");
+    run_case(c, "cuda_l2_norm_inner_axis");
 }
 
 // ============================================================
@@ -382,13 +382,13 @@ NNOPS_TEST(cuda_group_norm_group_shapes) {
     run_case(c, "cuda_group_norm_rank3");
 }
 
-NNOPS_TEST(cuda_group_norm_channel_last_and_f16) {
+NNOPS_TEST(cuda_group_norm_and_f16) {
     NormCase c;
     c.type = NormType::GroupNorm;
     c.shape = {2, 8, 5, 6};   // dims stay [N][C][spatial] in either layout
     c.layout = TensorLayout::NHWC;
     c.groups = 4;
-    run_case(c, "cuda_group_norm_channel_last");
+    run_case(c, "cuda_group_norm");
     c.dtype = DataType::f16;
     c.bias = true;
     run_case(c, "cuda_group_norm_f16");
@@ -398,12 +398,12 @@ NNOPS_TEST(cuda_group_norm_channel_last_and_f16) {
 // BatchNorm
 // ============================================================
 
-NNOPS_TEST(cuda_batch_norm_channel_last) {
+NNOPS_TEST(cuda_batch_norm_nhwc) {
     NormCase c;
     c.type = NormType::BatchNorm;
     c.shape = {2, 5, 4, 3};
     c.layout = TensorLayout::NHWC;
-    run_case(c, "cuda_batch_norm_channel_last");
+    run_case(c, "cuda_batch_norm_nhwc");
 }
 
 NNOPS_TEST(cuda_batch_norm_nonspatial) {
@@ -423,7 +423,7 @@ NNOPS_TEST(cuda_batch_norm_f16) {
     c.shape = {2, 8, 3};
     c.dtype = DataType::f16;
     c.layout = TensorLayout::NHWC;
-    run_case(c, "cuda_batch_norm_f16_channel_last");
+    run_case(c, "cuda_batch_norm_f16");
 }
 
 #endif  // NNOPS_HAS_CUDA

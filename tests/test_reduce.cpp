@@ -1,19 +1,18 @@
 /// @file test_reduce.cpp
 /// @brief Tests for the Reduce operator (Sum, Min, Max, Mean).
 ///
-/// Channel-first 1D/2D/3D, keepdims, negative axes, channel-last and f16. The 1D/2D
+/// Dense 1D/2D/3D, keepdims, negative axes, NHWC and f16. The 1D/2D
 /// expected values are hand-computed next to the asserts; the random-data
 /// tests build a scalar reference over the same buffer. A negative axis wraps
 /// from the end, so the negative-axis test runs axis=2 and axis=-1 on one
 /// input and compares the two outputs.
 ///
-/// The channel-last section converts a channel-first input to channel-last, reduces, and
-/// compares the result against the channel-first reduce in logical order. The layout
-/// only changes where the values live: the axis means the same thing either
-/// way. A rank-dropping reduce on a channel-last input produces a channel-first
-/// output -- dropping an axis shifts whichever axis C sat on, so the tag cannot
-/// describe the shorter rank any more -- while keepdims keeps the rank and the
-/// Channel-last tag.
+/// The layout section converts a dense input to NHWC, reduces, and compares the
+/// result against the dense reduce in logical order. The layout only changes
+/// where the values live: the axis means the same thing either way. A
+/// rank-dropping reduce on an NHWC input produces a Dense output -- dropping an
+/// axis shifts whichever axis C sat on, so the tag cannot describe the shorter
+/// rank any more -- while keepdims keeps the rank and the NHWC tag.
 ///
 /// f16 goes through the SIMD f16 path and is compared against the f32
 /// reference at 5e-2 rather than round-tripped.
@@ -585,12 +584,12 @@ NNOPS_TEST(reduce_3d_first_axis) {
 }
 
 // ============================================================
-// Channel-last layout tests
+// Layout tests
 // ============================================================
 
 namespace {
 
-/// Convert a channel-first view into `target` and return the view; `buf` outlives it.
+/// Convert a dense view into `target` and return the view; `buf` outlives it.
 TensorView to_layout(const TensorView& channel_first, TensorLayout target,
                      std::vector<float>& buf)
 {
@@ -641,8 +640,8 @@ bool same_logical_f32(const TensorView& a, const TensorView& b)
     return true;
 }
 
-/// Run the reduce on a channel-first input and on its channel-last twin; the results
-/// must agree element for element in logical order.
+/// Run the reduce on a dense input and on its NHWC twin; the results must agree
+/// element for element in logical order.
 void check_reduce_layout(const std::vector<int64_t>& shape,
                          ReduceType type, const std::vector<int64_t>& axes,
                          bool keepdims)
@@ -677,7 +676,7 @@ void check_reduce_layout(const std::vector<int64_t>& shape,
         NNOPS_EXPECT_EQ(cl_desc[0].dims[static_cast<size_t>(d)],
                         ref_desc[0].dims[static_cast<size_t>(d)]);
     }
-    // A rank-preserving output stays channel-last; a rank-dropping one is channel-first.
+    // A rank-preserving output stays NHWC; a rank-dropping one is Dense.
     const TensorLayout channel_first_layout =
         TensorLayout::Dense;
     NNOPS_EXPECT_EQ(cl_desc[0].layout, keepdims ? cl_layout : channel_first_layout);
@@ -779,8 +778,8 @@ std::vector<float> reduce_reference(const std::vector<int64_t>& shape,
 
 }  // anonymous namespace
 
-NNOPS_TEST(reduce_channel_last_axis_c_sum) {
-    // Hand-checked: C is contiguous in channel-last, so this is the SIMD row path.
+NNOPS_TEST(reduce_nhwc_axis_c_sum) {
+    // Hand-checked: C is contiguous in NHWC, so this is the SIMD row path.
     const int64_t N = 1, C = 4, H = 1, W = 3;
     float in_channel_first_data[] = {
         1.0f, 2.0f, 3.0f,        // c=0
@@ -814,12 +813,12 @@ NNOPS_TEST(reduce_channel_last_axis_c_sum) {
     NNOPS_EXPECT_NEAR(out_buf[2], 3.0f + 30.0f + 300.0f - 3.0f, 1e-4f);
 }
 
-NNOPS_TEST(reduce_channel_last_axis_c_keepdims) {
+NNOPS_TEST(reduce_nhwc_axis_c_keepdims) {
     check_reduce_layout({2, 5, 3, 4}, ReduceType::Sum, 1, true);
     check_reduce_layout({2, 5, 3, 4}, ReduceType::Mean, 1, true);
 }
 
-NNOPS_TEST(reduce_channel_last_all_axes) {
+NNOPS_TEST(reduce_nhwc_all_axes) {
     const std::vector<int64_t> shape = {2, 4, 3, 5};
     const ReduceType types[] = {ReduceType::Sum, ReduceType::Max,
                                 ReduceType::Min, ReduceType::Mean};
@@ -1017,7 +1016,7 @@ NNOPS_TEST(reduce_multi_output_shape) {
     }
 }
 
-NNOPS_TEST(reduce_multi_channel_last) {
+NNOPS_TEST(reduce_multi) {
     const std::vector<int64_t> shape = {2, 4, 3, 5};
     const ReduceType types[] = {ReduceType::Sum, ReduceType::Max,
                                 ReduceType::Min, ReduceType::Mean};
@@ -1084,7 +1083,7 @@ NNOPS_TEST(reduce_multi_noop_empty_axes) {
     }
 }
 
-NNOPS_TEST(reduce_noop_empty_axes_channel_last) {
+NNOPS_TEST(reduce_noop_empty_axes) {
     auto [in_vec, cf] = test::make_random_tensor({2, 4, 3, 5}, -1.0f, 1.0f, 1234);
     std::vector<float> cl_buf;
     auto cl = to_layout(cf, TensorLayout::NHWC, cl_buf);

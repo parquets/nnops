@@ -1,7 +1,7 @@
 /// @file permute.cpp
 /// @brief SIMD-optimized CPU implementation of dimension permute (transpose).
 ///
-/// Channel-first data: each output element comes from a permuted input position. Two
+/// Dense data: each output element comes from a permuted input position. Two
 /// routes, picked from `perm`:
 ///   1. Last-two-dims swap (perm[i]==i for i<rank-2, and the last two
 ///      exchanged): tiled 8x8 SIMD transpose via kernel::tiled_transpose_2d,
@@ -10,8 +10,8 @@
 ///   2. General n-D: scalar strided copy, parallel over the outer index; a row
 ///      whose innermost output dim maps to input stride 1 is a memcpy.
 ///
-/// The batch stride between slices is M*K: channel-first data makes dims rank-2 and
-/// rank-1 the innermost and contiguous. A pitched row or a channel-last view
+/// The batch stride between slices is M*K: dense data makes dims rank-2 and
+/// rank-1 the innermost and contiguous. A pitched row or a spatial view
 /// breaks that, so the tiled route is gated on both operands being compact and
 /// such a call falls through to the stride-driven walk.
 
@@ -91,7 +91,7 @@ void permute_impl(const PermuteAttributes& attrs, TensorView& output,
     }
 
     // The view's own strides, so a pitched row (pitch > shape[rank-1]) and a
-    // channel-last view both read what the buffer actually holds.
+    // spatial view both read what the buffer actually holds.
     int64_t in_strides[TensorDesc::kMaxRank];
     for (int64_t i = 0; i < rank; ++i) {
         in_strides[i] = input.stride_elems(i);

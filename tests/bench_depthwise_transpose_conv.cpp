@@ -1,6 +1,6 @@
 /// @file bench_depthwise_transpose_conv.cpp
 /// @brief DepthwiseTransposeConv2D: the dedicated depthwise route against the
-///        general TransposeConv2D one, channel-last.
+///        general TransposeConv2D one.
 ///
 /// A depthwise transposed convolution is a general one with groups == channels
 /// and one tap block per channel, so the same shapes can always be run either
@@ -152,7 +152,7 @@ void run_case(const DwtCase& c, const std::vector<int>& threads, int iters, int 
     gen_attrs.padding     = {c.PH, c.PW};
     gen_attrs.groups      = c.C;
 
-    // ---- the two fp arms: two routes, both channel-last ----------------
+    // ---- the two fp arms: two routes on the same storage ---------------
     auto dwt_op = DepthwiseTransposeConv2D::create(dwt_attrs, Backend::CPU);
     auto gen_op = TransposeConv2D::create(gen_attrs, Backend::CPU);
 
@@ -166,7 +166,7 @@ void run_case(const DwtCase& c, const std::vector<int>& threads, int iters, int 
     const int64_t w_hwcm_shape[] = {c.KH, c.KW, c.C};
     TensorView w_hwcm(std::span<const int64_t>(w_hwcm_shape, 3), DataType::f32,
                       w_hmcw_vec.data(), TensorLayout::HWCM);
-    // The general route keeps the channel-first filter.
+    // The general route keeps the dense [IC, OC/G, KH, KW] filter.
     TensorView w_cf(std::span<const int64_t>(wshape, 4), DataType::f32,
                     w_vec.data(), TensorLayout::Dense);
     const TensorView cl_ins[] = {in_cl, w_hwcm};
@@ -235,7 +235,7 @@ void run_case(const DwtCase& c, const std::vector<int>& threads, int iters, int 
     }
 }
 
-/// The quantized arm, channel-last: the s8 operands in TensorFlow's orders.
+/// The quantized arm: the s8 operands in TensorFlow's orders.
 void run_quantized_arm(const DwtCase& c, const std::vector<int>& threads, int iters) {
     const int64_t ishape[] = {1, c.C, c.IH, c.IW};
 

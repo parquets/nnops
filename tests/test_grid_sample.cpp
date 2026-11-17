@@ -1,10 +1,10 @@
 /// @file test_grid_sample.cpp
-/// @brief GridSample tests — channel-first and channel-last activations.
+/// @brief GridSample tests on NHWC activations.
 ///
-/// Every case runs the class API end-to-end on a channel-last input:
-///   Channel-first -> channel-last view -> GridSample -> channel-first copy
-/// and checks the channel-first result against known values where the sample position
-/// is predictable, else only finiteness. The grid stays channel-first.
+/// Every case runs the class API end-to-end on an NHWC input:
+///   dense -> NHWC view -> GridSample -> dense copy
+/// and checks the dense-order result against known values where the sample
+/// position is predictable, else only finiteness. The grid stays dense.
 /// Covers bilinear/nearest, zeros/border/reflection padding, align_corners,
 /// add_to (residual onto a pre-filled output), batch, 3D, and an odd C.
 
@@ -24,7 +24,7 @@ using namespace nnops;
 
 namespace {
 
-/// Pixel-major reorder of a dense channel-first view.
+/// Pixel-major reorder of a dense view.
 std::vector<float> to_channel_last_data(const TensorView& cf)
 {
     const int64_t N = cf.shape(0);
@@ -35,7 +35,7 @@ std::vector<float> to_channel_last_data(const TensorView& cf)
         N, C, S);
 }
 
-/// Logical channel-first copy of a dense channel-last view.
+/// Logical [N,C,S] copy of an NHWC view.
 std::vector<float> to_channel_first_data(const TensorView& cl)
 {
     const int64_t N = cl.shape(0);

@@ -3,7 +3,7 @@
 /// @brief Permute operator — dimension reordering (transpose).
 ///
 /// Equivalent to `np.transpose()` / `torch.permute()`, with
-/// output.shape[i] = input.shape[perm[i]]. Channel-first layout only; packed layouts
+/// output.shape[i] = input.shape[perm[i]]. Dense layout only; packed layouts
 /// must be dense.
 
 #include "nnops/core/op_base.hpp"

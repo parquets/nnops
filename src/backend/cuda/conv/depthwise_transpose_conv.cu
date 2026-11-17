@@ -10,7 +10,7 @@
 /// flipped, cropped filter (see the header) — and nothing is left to do but
 /// multiply-accumulate.
 ///
-/// The channel-last walk lanes the channel inside a 16 B vector, so a tap is
+/// The walk lanes the channel inside a 16 B vector, so a tap is
 /// one activation vector against one strided weight vector. The weight is the
 /// scalar side — the filter is [C][1][KH][KW], so a channel step is w_ic
 /// elements — and one output per thread is what measured fastest here: a window
@@ -23,7 +23,7 @@
 /// [KH][KW][C] repack plus its launch does not pay for itself on kernels this
 /// short.
 ///
-/// A channel-last geometry the 16 B lane cannot take — a channel count the
+/// A geometry the 16 B lane cannot take — a channel count the
 /// vector does not divide, or a row it cannot align to — falls to a second
 /// script, one output element per thread with the channel innermost (which is
 /// the coalesced order on that layout) and the tap search written out the way
@@ -39,7 +39,7 @@
 namespace nnops::backend::cuda::tconv {
 namespace {
 
-/// Channel-last store of one Vec-wide lane: bias, clamp, activation, as a single
+/// The vector store of one Vec-wide lane: bias, clamp, activation, as a single
 /// 16 B write. add_to takes the scalar path instead, which re-reads the pixel.
 template <class Elem, int Vec>
 __device__ inline void dw_last_store(const ConvParams& p, Elem* dst, const float* acc, int c0)
@@ -61,8 +61,7 @@ __device__ inline void dw_last_store(const ConvParams& p, Elem* dst, const float
     *reinterpret_cast<V*>(dst) = out;
 }
 
-/// Depthwise on one class, channel-last: one output per thread on a 16 B channel
-/// lane.
+/// Depthwise on one class: one output per thread on a 16 B channel lane.
 template <class Elem, int Vec>
 __global__ void dw_last_kernel(ConvParams pin, int th_max, int col_blocks)
 {
@@ -189,11 +188,11 @@ bool run_last(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
 }
 
 // ============================================================
-// Channel-last fallback
+// Scalar fallback
 // ============================================================
 
-/// One output element per thread with the channel innermost, for a channel-last
-/// geometry the 16 B lane declines. The tap search is the CPU's: a tap counts
+/// One output element per thread with the channel innermost, for a geometry the
+/// 16 B lane declines. The tap search is the CPU's: a tap counts
 /// when (o + P − k·D) divides by S and the pixel it names exists.
 template <class Elem> __global__ void dw_last_scalar_kernel(ConvParams p)
 {
@@ -339,7 +338,7 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
 
     // The kernels address the filter by these three strides alone, so both
     // accepted forms are read in place — [C][1][KH][KW], and the per-tap
-    // [KH][KW][C] a channel-last activation may carry.
+    // [KH][KW][C] an NHWC activation may carry.
     if (wgt.rank() == 3) {
         p.w_kh = wgt.stride_elems(0);
         p.w_kw = wgt.stride_elems(1);

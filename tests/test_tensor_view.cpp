@@ -2,7 +2,7 @@
 /// @brief TensorView construction and the pitch/stride accessors, plus TensorDesc.
 ///
 /// pitch is the row stride in bytes and stride_elems derives from it; in the
-/// Channel-last layouts C is the innermost axis, so a pixel holds a whole
+/// In NHWC layouts C is the innermost axis, so a pixel holds a whole
 /// channel block and a spatial row is W * C elements.
 
 #include "nnops/core/tensor_view.hpp"
@@ -11,7 +11,7 @@
 using namespace nnops;
 
 NNOPS_TEST(tensor_view_dense_construction) {
-    // 2x3x4 tensor, f32, channel-first
+    // 2x3x4 tensor, f32, dense
     const int64_t shape[] = {2, 3, 4};
     float data[2 * 3 * 4] = {};
 
@@ -89,10 +89,10 @@ NNOPS_TEST(tensor_view_1d_pitch) {
 }
 
 // ============================================================
-// Channel-last layout-aware accessors
+// NHWC layout-aware accessors
 // ============================================================
 
-NNOPS_TEST(channel_last_dense_construction) {
+NNOPS_TEST(dense_construction) {
     // Logical: [N=2, C=16, H=3, W=4]. A row is one spatial line of W pixels
     // times C channels: 4 * 16 = 64 elements, pitch = 256 bytes.
     const int64_t shape[] = {2, 16, 3, 4};
@@ -112,7 +112,7 @@ NNOPS_TEST(channel_last_dense_construction) {
     NNOPS_EXPECT_EQ(tv.numel(), 2 * 16 * 3 * 4);  // logical numel
 }
 
-NNOPS_TEST(channel_last_total_rows_and_storage) {
+NNOPS_TEST(total_rows_and_storage) {
     const int64_t shape[] = {2, 8, 4, 5};
     float data[2 * 4 * 5 * 8] = {};
 
@@ -126,7 +126,7 @@ NNOPS_TEST(channel_last_total_rows_and_storage) {
     NNOPS_EXPECT_EQ(tv_channel_first.total_rows(), 2 * 8 * 4);
 }
 
-NNOPS_TEST(channel_last_explicit_pitch) {
+NNOPS_TEST(explicit_pitch) {
     // W*C = 64 floats = 256 bytes; give it 288 so the pad is visible.
     const int64_t shape[] = {1, 16, 2, 4};
     std::vector<float> data(2 * 288 / sizeof(float));
@@ -139,7 +139,7 @@ NNOPS_TEST(channel_last_explicit_pitch) {
 }
 
 // ============================================================
-// Channel-last 3D accessors
+// NDHWC accessors
 // ============================================================
 
 NNOPS_TEST(ndhwc_dense_construction) {

@@ -1,7 +1,7 @@
 /// @file bench_transpose_conv2d.cpp
-/// @brief TransposeConv2D throughput, channel-last.
+/// @brief TransposeConv2D throughput.
 ///
-/// One row per layer: a channel-last activation, the [IC, OC/G, KH, KW] filter,
+/// One row per layer: an NHWC activation, the [IC, OC/G, KH, KW] filter,
 /// and the output channels vectorised. The activation is converted once,
 /// outside every timer, so a row prices the kernel, nothing else.
 ///
@@ -164,7 +164,7 @@ const std::vector<Shape>& sweep() {
 }
 
 // ============================================================
-// One layer, channel-last
+// One layer
 // ============================================================
 
 template <class T>
@@ -270,9 +270,9 @@ void run_table(const char* tag) {
     const std::vector<int> threads = bench_threads();
     const int iters = 20, rounds = 5;
 
-    std::printf("  %s — channel-last\n", tag);
+    std::printf("  %s\n", tag);
     std::printf("    %-45s %6s %6s %6s | %8s | %7s\n",
-                "case", "OH", "OW", "taps", "channel_last ms", "GF");
+                "case", "OH", "OW", "taps", "ms", "GF");
 
     double sum_ms = 0.0, sum_work = 0.0;
     for (const Shape& c : sweep()) {
@@ -444,7 +444,7 @@ void run_int8_table(DataType act_dt, DataType out_dt, const char* tag) {
 
     std::printf("  %s — same columns as the fp tables, rates in int8 GOP/s\n", tag);
     std::printf("    %-45s %6s %6s %6s | %8s | %7s\n",
-                "case", "OH", "OW", "taps", "channel_last ms", "GOP");
+                "case", "OH", "OW", "taps", "ms", "GOP");
 
     double sum_ms = 0.0, sum_work = 0.0;
     for (const Shape& c : sweep()) {

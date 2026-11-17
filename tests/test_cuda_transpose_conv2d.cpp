@@ -1,5 +1,5 @@
 /// @file test_cuda_transpose_conv2d.cpp
-/// @brief CUDA TransposeConv2D, channel-last, against the CPU backend.
+/// @brief CUDA TransposeConv2D against the CPU backend.
 ///
 /// Every case builds one activation/filter pair, runs the operator on both
 /// backends over the same bytes, and compares. The CPU route is the oracle, so
@@ -9,7 +9,7 @@
 ///
 /// The cases split along the dispatch. The residue-class GEMM takes any stride
 /// and dilation with OC/G wide enough for an n tile. A depthwise group (one
-/// channel on both sides) falls to the channel-last 16 B lane.
+/// channel on both sides) falls to the 16 B channel lane.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -126,7 +126,7 @@ Outputs run_case(const TConvCase& c, const char* what)
 }  // namespace
 
 NNOPS_TEST(cuda_transpose_conv2d_depthwise) {
-    // One channel on both sides of every group: the channel-last 16 B lane.
+    // One channel on both sides of every group: the 16 B channel lane.
     for (DataType dt : {DataType::f32, DataType::f16}) {
         TConvCase c;
         c.ic = 16; c.oc = 16; c.groups = 16; c.dtype = dt;
@@ -138,29 +138,29 @@ NNOPS_TEST(cuda_transpose_conv2d_depthwise) {
 }
 
 // ============================================================
-// Channel-last
+// NHWC
 // ============================================================
 
-NNOPS_TEST(cuda_transpose_conv2d_channel_last) {
+NNOPS_TEST(cuda_transpose_conv2d) {
     for (DataType dt : {DataType::f32, DataType::f16}) {
         TConvCase c;
         c.ic = 16; c.oc = 32; c.dtype = dt;
         c.ih = c.iw = 11;
-        run_case(c, "cuda_tconv_channel_last");
+        run_case(c, "cuda_tconv");
         c.sh = c.sw = 2;
-        run_case(c, "cuda_tconv_channel_last");
+        run_case(c, "cuda_tconv");
         c.kh = c.kw = 4;
         c.oph = 1; c.opw = 1;
-        run_case(c, "cuda_tconv_channel_last");
+        run_case(c, "cuda_tconv");
     }
     {   // A channel count the 16 B lane does not divide.
         TConvCase c;
         c.ic = 6; c.oc = 12; c.ih = c.iw = 8;
-        run_case(c, "cuda_tconv_channel_last");
+        run_case(c, "cuda_tconv");
     }
 }
 
-NNOPS_TEST(cuda_transpose_conv2d_channel_last_groups) {
+NNOPS_TEST(cuda_transpose_conv2d_groups) {
     TConvCase c;
     c.ic = 16; c.oc = 32; c.groups = 4;
     c.sh = c.sw = 2;

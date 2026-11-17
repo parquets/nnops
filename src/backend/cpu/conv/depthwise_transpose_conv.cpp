@@ -1,5 +1,5 @@
 /// @file depthwise_transpose_conv.cpp
-/// @brief SIMD CPU depthwise transposed 2D convolution, channel-last.
+/// @brief SIMD CPU depthwise transposed 2D convolution on NHWC.
 ///
 /// Gather form, the exact inverse of depthwise conv's indexing: output (oh, ow)
 /// reads input (ih, iw) where oh + PH - kh·DH == ih·SH, so a tap contributes
@@ -382,8 +382,8 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
 //
 // The activation is normalised to one s8 plane per call (dwtconv_i8_plane), so
 // every storage type meets one zero-point convention. The weight's zero point
-// folds into the product — a channel-first filter broadcasts (w − zp_w) as a
-// scalar, a channel-last HWCM filter is staged as int16 lanes once per call.
+// folds into the product — a [C, 1, KH, KW] filter broadcasts (w − zp_w) as a
+// scalar, the HWCM filter is staged as int16 lanes once per call.
 // The activation's cannot: (x − zp_x) does not fit a byte, so it becomes the
 // accumulator's seed, −zp_x·Σ(w − zp_w) over the taps live across the whole
 // window, and the boundary pixels, whose tap set is filtered, take the explicit
@@ -395,7 +395,7 @@ struct DwtI8Plane {
     const int8_t* ptr = nullptr;
     int64_t n_stride = 0;   ///< elements between batches
     int64_t row_stride = 0; ///< elements between rows of one plane
-    int64_t ch_stride = 0;  ///< 0: channels are contiguous in the channel-last plane
+    int64_t ch_stride = 0;  ///< 0: channels are contiguous in the NHWC plane
     float scale = 1.0f;
     int32_t zero = 0;
 };
@@ -515,7 +515,7 @@ Status dwtconv_i8_weight(const TensorView& weight, int64_t KH, int64_t KW, int64
 }
 
 
-/// Channel-last int8: the lane spans channels, one 16-channel block of one pixel
+/// Spatial int8: the lane spans channels, one 16-channel block of one pixel
 /// per accumulate step, the filter read from the staged int16 copy.
 template <typename TOut>
 Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
@@ -888,8 +888,8 @@ Status depthwise_transpose_conv_cpu(const DepthwiseTransposeConv2DAttributes& at
         return Status::unsupported;
     }
 
-    // The per-tap form is what a channel-last lane reads; a filter in the
-    // channel-first [C, 1, KH, KW] order — what a grouped TransposeConv2D hands
+    // The per-tap form is what the channel lane reads; a filter in the
+    // [C, 1, KH, KW] order — what a grouped TransposeConv2D hands
     // over — has its channels a plane apart, so it is repacked once here rather
     // than read strided through every tap.
     PoolArray<std::byte> w_per_tap;

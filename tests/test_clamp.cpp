@@ -1,8 +1,8 @@
 /// @file test_clamp.cpp
 /// @brief Clamp operator tests (CPU backend) — hand-checked bounds, a missing
-///        min or max, add_to, f32/f16, and a channel-last input.
+///        min or max, add_to, f32/f16, and an NHWC input.
 ///
-/// Clamp is elementwise, so a re-layout cannot change a value: the channel-last
+/// Clamp is elementwise, so a re-layout cannot change a value: the NHWC
 /// case converts in, clamps, converts back and compares against a scalar clamp
 /// of the logical input. The class API test only checks that two independently
 /// created instances of the same attributes agree.
@@ -187,10 +187,10 @@ NNOPS_TEST(clamp_add_to) {
 }
 
 // ============================================================
-// Channel-last input
+// NHWC input
 // ============================================================
 
-NNOPS_TEST(clamp_channel_last_layout) {
+NNOPS_TEST(clamp_nhwc_layout) {
     const int64_t N = 1, C = 16, H = 4, W = 4;
     auto [in_vec, input_channel_first] = test::make_random_tensor({N, C, H, W}, -10.0f, 10.0f, 444);
 
@@ -214,7 +214,7 @@ NNOPS_TEST(clamp_channel_last_layout) {
     const TensorView ins[] = {input_cl};
     op->compute(output_cl, ins);
 
-    // Back to channel-first so the comparison is against logical order.
+    // Back to dense order so the comparison is against logical order.
     std::vector<float> out_channel_first = test::to_channel_first(
         std::span<const float>(output_cl.ptr<float>(), static_cast<size_t>(output_cl.numel())),
         N, C, S);

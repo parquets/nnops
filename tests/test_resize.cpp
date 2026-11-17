@@ -1,11 +1,8 @@
 /// @file test_resize.cpp
-/// @brief Tests for the Resize (interpolation) operator — channel-first and
-/// channel-last.
+/// @brief Tests for the Resize (interpolation) operator on NHWC/NDHWC tensors.
 ///
-/// All tests use the class API path:
-/// channel-first in -> channel-last view -> Resize::compute -> channel-first
-/// copy -> compare. The parity check between the two paths also runs the
-/// channel-first Resize directly.
+/// All tests use the class API path: dense in -> NHWC view -> Resize::compute ->
+/// dense copy -> compare with the scalar reference, which reads dense order.
 
 #include "nnops/ops/resize.hpp"
 #include "common/test_harness.hpp"
@@ -21,7 +18,7 @@
 
 using namespace nnops;
 
-// Channel-first scalar reference — the ground truth.
+// Scalar reference, in dense order — the ground truth.
 namespace nnops::backend::cpu::reference {
     void resize_ref(const ResizeAttributes& attrs,
                     TensorView& output,
@@ -32,8 +29,8 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-/// 2D+3D roundtrip: convert -> resize channel-last -> convert back -> compare
-/// with the channel-first reference.
+/// 2D+3D roundtrip: convert -> resize -> convert back -> compare with the
+/// reference.
 void test_channel_last_vs_channel_first(const std::vector<int64_t>& in_shape,
                           const ResizeAttributes& attrs)
 {
@@ -137,8 +134,8 @@ void test_channel_last_vs_channel_first(const std::vector<int64_t>& in_shape,
     }
 }
 
-/// convert -> resize channel-last -> convert back, then hand the channel-first result
-/// to the caller's validator.
+/// convert -> resize -> convert back, then hand the dense-order result to the
+/// caller's validator.
 template <typename ValidateFn>
 void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
                            const std::vector<int64_t>& out_shape,

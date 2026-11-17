@@ -1,6 +1,6 @@
 #pragma once
 /// @file conv1d.hpp
-/// @brief 1D convolution — channel-last, with groups and dilation.
+/// @brief 1D convolution — NHWC input and HWIO filter, with groups and dilation.
 ///
 /// 1D is the 2D convolution with a 1-wide second spatial axis, and that is
 /// exactly how it runs: the activation is lifted from [N, C, L] to

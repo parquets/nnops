@@ -33,7 +33,7 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
     if (!is_channel_last(inputs[0].layout)) {
         return Status::unsupported;
     }
-    // A quantized input needed the channel-first dequantizing walk, which is gone.
+    // A quantized input would need a dequantizing walk that no longer exists.
     if (is_quantized_dtype(inputs[0].dtype)) {
         return Status::unsupported;
     }

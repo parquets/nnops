@@ -165,9 +165,9 @@ NNOPS_TEST(shape_conv3d_stride2) {
 // 3. DepthwiseConv
 // ============================================================
 
-NNOPS_TEST(shape_depthwise_conv_2d_channel_last) {
-    // Channel-last: dims stay logical [N, C, H, W]; the layout tag alone sets
-    // memory order, so the shape math is the channel-first math.
+NNOPS_TEST(shape_depthwise_conv_2d) {
+    // NHWC: dims stay logical [N, C, H, W]; the layout tag alone sets memory
+    // order, so the shape math is unchanged.
     auto op = DepthwiseConv::create(Backend::CPU);
     auto& attrs = const_cast<DepthwiseConvAttributes&>(op->attributes());
     attrs.kernel_size = {1, 3, 3};
@@ -187,7 +187,7 @@ NNOPS_TEST(shape_depthwise_conv_2d_channel_last) {
 // 4. Pooling
 // ============================================================
 
-NNOPS_TEST(shape_pooling_2d_channel_last) {
+NNOPS_TEST(shape_pooling_2d) {
     auto op = Pooling::create(Backend::CPU);
     auto& attrs = const_cast<PoolingAttributes&>(op->attributes());
     attrs.kernel_shape = {2, 3, 3};
@@ -632,7 +632,7 @@ NNOPS_TEST(shape_reduce_mean_keepdims) {
     validate_output(descs[0], 4, {2, 8, 1, 32}, TensorLayout::Dense);
 }
 
-NNOPS_TEST(shape_reduce_channel_last) {
+NNOPS_TEST(shape_reduce) {
     auto op = Reduce::create(Backend::CPU);
     auto& attrs = const_cast<ReduceAttributes&>(op->attributes());
     attrs.type = ReduceType::Max;
@@ -643,11 +643,11 @@ NNOPS_TEST(shape_reduce_channel_last) {
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // Dropping an axis shifts the channel axis, so the result is channel-first.
+    // Dropping an axis shifts the channel axis, so the result is Dense.
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::Dense));
     validate_dims(descs[0], 3, {32, 28, 28});
 
-    // keepdims keeps the rank, so the channel-last tag still describes it.
+    // keepdims keeps the rank, so the NHWC tag still describes it.
     attrs.keepdims = true;
     auto kept = op->getOutputTensorDesc(desc_arr);
     NNOPS_EXPECT_EQ(static_cast<int>(kept[0].layout), static_cast<int>(TensorLayout::NHWC));
@@ -706,7 +706,7 @@ NNOPS_TEST(shape_storage_bytes_packed_exceeds_nbytes) {
 }
 
 // ============================================================
-// Channel-last layout propagation
+// NHWC layout propagation
 // ============================================================
 
 NNOPS_TEST(shape_nchwc16_layout_propagation) {

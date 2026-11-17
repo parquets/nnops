@@ -1,12 +1,12 @@
-/// @file test_conv2d_channel_last.cpp
-/// @brief The channel-last CPU Conv2D route, against the channel-first reference.
+/// @file test_conv2d.cpp
+/// @brief The CPU Conv2D route on NHWC activations, against an independent OIHW reference.
 ///
-/// Channel-last activations with an HWIO weight (TensorFlow's [KH][KW][IC/G][OC]
-/// filter), floating point (f32/f16) and quantized. Every case keeps the same
-/// values in both orders — channel-first/OIHW for the reference, channel-last/HWIO
-/// for the kernel — and compares the kernel's output, converted back to
-/// channel-first, against the reference. The conversion is only plumbing, so a
-/// case that fails is a kernel bug.
+/// Activations are NHWC and the weight HWIO (TensorFlow's [KH][KW][IC/G][OC]
+/// filter), floating point (f32/f16) and quantized. The reference
+/// (reference/conv2d_ref) implements OIHW itself, independent of the kernel's
+/// order, so every case compares values that were written through a different
+/// layout; the conversion between them is only plumbing, and a case that fails
+/// is a kernel bug.
 ///
 /// Contracts these cases pin beyond "matches the reference":
 /// - A prepacked filter is invisible. Conv2D::prepackWeights is query then
@@ -20,8 +20,8 @@
 ///   tolerance, except in the prepacked-filter cases, which already demand bit
 ///   equality. The quantized prepack carries the per-channel sums the
 ///   compensation terms read, so each live term gets a case of its own.
-/// - Winograd's channel-last U is the GEMM's B panels, not U[16][OC][IC/G], and
-///   its leading dimension carries the transform order.
+/// - Winograd's U is the GEMM's B panels, not U[16][OC][IC/G], and its leading
+///   dimension carries the transform order.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -183,11 +183,11 @@ TensorView prepack_filter(const TensorView& w, Conv2D& op, std::vector<T>& blob)
     return v;
 }
 
-/// Run one case on the channel-last route and on the channel-first reference, on the
-/// same values, and report the worst scaled deviation of the output. @p ep /
-/// @p add_to extend the case to the epilogue paths, the residual permuted into
-/// each side's own order; @p packed_filter additionally requires the run on the
-/// raw HWIO filter to come out byte-identical.
+/// Run one case through the CPU route and the OIHW reference on the same values,
+/// and report the worst scaled deviation of the output. @p ep / @p add_to extend
+/// the case to the epilogue paths, the residual permuted into each side's own
+/// order; @p packed_filter additionally requires the run on the raw HWIO filter
+/// to come out byte-identical.
 FpResult run_fp_case(const FpCase& c, DataType dt,
                      EpilogueActivateType ep = EpilogueActivateType::None,
                      bool add_to = false, uint64_t seed = 900,
@@ -342,7 +342,7 @@ void expect_fp_close(const FpCase& c, DataType dt, float tol,
     if (r.worst > tol) {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "conv2d_channel_last vs reference (case %d): |got %.6g - ref %.6g| / (1+|ref|) "
+                      "conv2d vs reference (case %d): |got %.6g - ref %.6g| / (1+|ref|) "
                       "= %.3g at elem %lld (tol %.3g)",
                       idx, double(r.got), double(r.want), double(r.worst),
                       static_cast<long long>(r.idx), double(tol));
@@ -356,15 +356,14 @@ void expect_fp_close(const FpCase& c, DataType dt, float tol,
 // Hand-verified geometry
 // ============================================================
 
-NNOPS_TEST(conv2d_channel_last_fp_hand_exact) {
+NNOPS_TEST(conv2d_fp_hand_exact) {
     // 1x1x4x4 all-ones, 3x3 kernel all-0.5, stride 1, pad 0, bias 0.5: each of
-    // the 2x2 outputs is 9 · 1 · 0.5 + 0.5 = 5.0, in channel-last / HWIO as in
-    // channel-first.
+    // the 2x2 outputs is 9 · 1 · 0.5 + 0.5 = 5.0, in HWIO as in OIHW.
     const int64_t ishape[] = {1, 1, 4, 4};
     const int64_t wshape[] = {3, 3, 1, 1};
     const int64_t bshape[] = {1};
 
-    std::vector<float> in_buf(16, 1.0f);   // Channel-last [1][4][4][1]
+    std::vector<float> in_buf(16, 1.0f);   // NHWC [1][4][4][1]
     std::vector<float> w_buf(9, 0.5f);     // HWIO [3][3][1][1]
     std::vector<float> b_buf = {0.5f};
 
@@ -392,10 +391,10 @@ NNOPS_TEST(conv2d_channel_last_fp_hand_exact) {
     for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(i)], 5.0f, 1e-5f); }
 }
 
-/// The input is [N][H][W][C]: a transposed or channel-channel-first read shows up
-/// immediately here.
-NNOPS_TEST(conv2d_channel_last_fp_channel_order) {
-    // 1x1x2x2 channel-last input, 2 output channels, per-channel 1x1 filters that pick
+/// The input is [N][H][W][C]: a read that assumes the channel is outermost shows
+/// up immediately here.
+NNOPS_TEST(conv2d_fp_channel_order) {
+    // 1x1x2x2 NHWC input, 2 output channels, per-channel 1x1 filters that pick
     // one input channel each: out[oc=0] = 2·c0, out[oc=1] = 3·c1.
     const int64_t ishape[] = {1, 2, 2, 2};
     const int64_t wshape[] = {1, 1, 2, 2};   // HWIO [1][1][IC=2][OC=2]
@@ -427,10 +426,10 @@ NNOPS_TEST(conv2d_channel_last_fp_channel_order) {
 }
 
 // ============================================================
-// Floating point vs the channel-first reference
+// Floating point vs the OIHW reference
 // ============================================================
 
-NNOPS_TEST(conv2d_channel_last_fp_matches_ref) {
+NNOPS_TEST(conv2d_fp_matches_ref) {
     struct Case { FpCase c; uint64_t seed; };
     const Case cases[] = {
         // ---- 3x3, the dominant shape --------------------------------------
@@ -513,7 +512,7 @@ NNOPS_TEST(conv2d_channel_last_fp_matches_ref) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_f16_matches_ref) {
+NNOPS_TEST(conv2d_f16_matches_ref) {
     struct Case { FpCase c; uint64_t seed; };
     const Case cases[] = {
         {{{1, 3, 16, 16},  8, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  31},
@@ -545,7 +544,7 @@ NNOPS_TEST(conv2d_channel_last_f16_matches_ref) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_fp_epilogues) {
+NNOPS_TEST(conv2d_fp_epilogues) {
     // The finish pass is per column here (a tile's rows are pixels).
     const FpCase c = {{1, 6, 11, 11}, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, true};
 
@@ -616,7 +615,7 @@ NNOPS_TEST(conv2d_channel_last_fp_epilogues) {
 // every compute(). The blob carries everything the per-call prepack used to
 // compute, the int8 compensation sums among them, so packing cannot lose.
 
-NNOPS_TEST(conv2d_channel_last_prepack_query) {
+NNOPS_TEST(conv2d_prepack_query) {
     const int64_t ish[] = {1, 8, 10, 10};
     const int64_t wsh[] = {3, 3, 8, 16};   // HWIO: [KH][KW][IC/G][OC]
     std::vector<float> in_buf(1 * 8 * 10 * 10, 0.0f);
@@ -665,7 +664,7 @@ NNOPS_TEST(conv2d_channel_last_prepack_query) {
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out_v, paired)));
 }
 
-NNOPS_TEST(conv2d_channel_last_fp_prepacked_filter) {
+NNOPS_TEST(conv2d_fp_prepacked_filter) {
     // One case per path the pack has: the panel ladder (icn_block 16/8/2/1),
     // an ic tail, several oc blocks, the wide-K pointwise rule, a filter that
     // outgrows the shared arena (per-task packing), and a real ResNet stage.
@@ -729,15 +728,15 @@ NNOPS_TEST(conv2d_channel_last_fp_prepacked_filter) {
 }
 
 // ============================================================
-// Winograd F(2×2, 3×3) on the channel-last route
+// Winograd F(2×2, 3×3)
 // ============================================================
 //
-// The same f2,3 transform as the channel-first route with the GEMM's operands swapped:
+// The f2,3 transform with the GEMM's operands swapped:
 // pixels are M and output channels N, so U goes into the MMA's B panels instead
 // of [16][OC][IC/G] planes. The bias, the epilogue and the residual must still
 // land on the reference's values.
 
-NNOPS_TEST(conv2d_channel_last_wino_matches_ref) {
+NNOPS_TEST(conv2d_wino_matches_ref) {
     struct Case { FpCase c; uint64_t seed; };
     const Case f32_cases[] = {
         // The shapes Winograd is selected for: >= 32 channels per group and a
@@ -806,7 +805,7 @@ NNOPS_TEST(conv2d_channel_last_wino_matches_ref) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_wino_epilogues) {
+NNOPS_TEST(conv2d_wino_epilogues) {
     // Bias and epilogue land on the real 2×2 outputs, in a single write-back.
     const FpCase c = {{1, 32, 15, 14}, 24, 3, 3, 1, 1, 1, 1, 1, 1, 1, true};
     const EpilogueActivateType eps[] = {
@@ -830,7 +829,7 @@ NNOPS_TEST(conv2d_channel_last_wino_epilogues) {
                     true, 901, -1, ConvAlgorithm::Winograd);
 }
 
-NNOPS_TEST(conv2d_channel_last_wino_hand_exact) {
+NNOPS_TEST(conv2d_wino_hand_exact) {
     // A 3x3 filter whose only nonzero tap is the center, with per-channel
     // deltas: out[oc] == in[oc] pixel for pixel, which pins the tile
     // flattening, the 2x2 write-back, the channel mapping and the transform
@@ -889,8 +888,8 @@ NNOPS_TEST(conv2d_channel_last_wino_hand_exact) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_wino_plan_and_auto) {
-    // Auto follows the U it is handed: the panels pair with a channel-last
+NNOPS_TEST(conv2d_wino_plan_and_auto) {
+    // Auto follows the U it is handed: the panels pair with an NHWC
     // activation, and a U that is not the panels must not resolve to a plan at
     // all.
     const int64_t ishape[] = {1, 32, 16, 16};
@@ -968,7 +967,7 @@ NNOPS_TEST(conv2d_channel_last_wino_plan_and_auto) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_threaded_matches_serial) {
+NNOPS_TEST(conv2d_threaded_matches_serial) {
     struct Case { FpCase c; uint64_t seed; };
     const Case cases[] = {
         {{{1, 3, 32, 32},   8, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  61},
@@ -1063,7 +1062,7 @@ NNOPS_TEST(conv2d_channel_last_threaded_matches_serial) {
             if (std::memcmp(serial_buf.data(), threaded_buf.data(),
                             static_cast<size_t>(out_n) * sizeof(float)) != 0) {
                 throw std::runtime_error(
-                    "conv2d_channel_last threaded run differs from serial at " +
+                    "conv2d threaded run differs from serial at " +
                     std::to_string(nthreads) + " threads, case " +
                     std::to_string(case_i) + " (" + std::to_string(IC) + "x" +
                     std::to_string(IH) + "x" + std::to_string(IW) + " -> " +
@@ -1093,7 +1092,7 @@ TensorDesc shape_desc(std::array<int64_t, 4> s, DataType dt, TensorLayout lay) {
 
 }  // namespace
 
-NNOPS_TEST(conv2d_channel_last_plan_blocks) {
+NNOPS_TEST(conv2d_plan_blocks) {
     using namespace nnops::backend::cpu;
 
     struct Case {
@@ -1167,10 +1166,10 @@ NNOPS_TEST(conv2d_channel_last_plan_blocks) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_layout_pairing) {
-    // Only channel-last is supported: the activation must be NHWC and the filter
-    // HWIO (or one of its packed forms). A channel-first descriptor is a caller
-    // error, not something to guess at with a per-call weight reshape.
+NNOPS_TEST(conv2d_layout_pairing) {
+    // Only NHWC is supported: the activation must be NHWC and the filter HWIO
+    // (or one of its packed forms). A dense descriptor is a caller error,
+    // not something to guess at with a per-call weight reshape.
     const int64_t ishape[] = {1, 4, 8, 8};
     const int64_t wshape[] = {3, 3, 4, 8};   // HWIO [KH][KW][IC/G][OC]
     std::vector<float> in_buf(4 * 8 * 8, 0.0f);
@@ -1226,8 +1225,8 @@ struct QCase {
     uint64_t seed = 1;
 };
 
-/// Run one quantized case through the channel-last kernel and the channel-first
-/// reference on the same stored values, and require agreement: an integer
+/// Run one quantized case through the kernel and the OIHW reference on the
+/// same stored values, and require agreement: an integer
 /// destination bit for bit, an fp one within a small relative tolerance (a
 /// last-bit dequant difference is not worth failing on). @p packed_w repeats
 /// the call with a prepacked filter and requires it byte for byte.
@@ -1355,7 +1354,7 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
     std::vector<TensorDesc> op_descs;
     for (const auto& v : op_ins) { op_descs.push_back(v.desc()); }
     const auto od2 = op->getOutputTensorDesc(op_descs);
-    if (od2[0].layout != TensorLayout::NHWC) { return "output layout is not channel-last"; }
+    if (od2[0].layout != TensorLayout::NHWC) { return "output layout is not NHWC"; }
     if (od2[0].dtype != odt || od2[0].numel() != out_n) { return "output desc mismatch"; }
 
     std::vector<uint8_t> op_buf(od2[0].nbytes(), 0);
@@ -1438,15 +1437,15 @@ void expect_q_match(const QCase& c, int idx, const ComputeContext& ctx = {},
 {
     const std::string diff = run_q_case(c, ctx, exact, packed_w);
     if (!diff.empty()) {
-        throw std::runtime_error("conv2d_channel_last int8 vs reference (case " +
+        throw std::runtime_error("conv2d int8 vs reference (case " +
                                  std::to_string(idx) + "): " + diff);
     }
 }
 
 }  // namespace
 
-NNOPS_TEST(conv2d_channel_last_i8_hand_exact) {
-    // The channel-first hand case, in channel-last orders:
+NNOPS_TEST(conv2d_i8_hand_exact) {
+    // The hand case, in NHWC/HWIO orders:
     //   input  [1,1,3,3] = 1 2 3 / 4 5 6 / 7 8 9     s8, zp_x = 2,  s_x = 0.25
     //   weight [KH,KW,IC,OC] = [2,2,1,1] = 1 -1 / 2 0    s8, zp_w = 1,  s_w = 0.5
     //   accumulators  -1, -3, -7, -9   →  -0.125, -0.375, -0.875, -1.125
@@ -1486,7 +1485,7 @@ NNOPS_TEST(conv2d_channel_last_i8_hand_exact) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_i8_matches_ref_all_routes) {
+NNOPS_TEST(conv2d_i8_matches_ref_all_routes) {
     std::vector<QCase> cases;
     auto add = [&](QCase c) { cases.push_back(c); };
 
@@ -1578,7 +1577,7 @@ NNOPS_TEST(conv2d_channel_last_i8_matches_ref_all_routes) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_i8_prepacked_filter) {
+NNOPS_TEST(conv2d_i8_prepacked_filter) {
     // Every compensation term reads the packed per-channel sums on a different
     // path, so each gets a case.
     std::vector<QCase> cases;
@@ -1623,7 +1622,7 @@ NNOPS_TEST(conv2d_channel_last_i8_prepacked_filter) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_i8_epilogues) {
+NNOPS_TEST(conv2d_i8_epilogues) {
     const EpilogueActivateType eps[] = {
         EpilogueActivateType::None,      EpilogueActivateType::Relu,
         EpilogueActivateType::Relu6,     EpilogueActivateType::Gelu,
@@ -1650,7 +1649,7 @@ NNOPS_TEST(conv2d_channel_last_i8_epilogues) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_i8_int_out) {
+NNOPS_TEST(conv2d_i8_int_out) {
     // Integer destination: int32 bias, requant to s8/u8, bit-exact.
     for (DataType odt : {DataType::s8, DataType::u8}) {
         QCase c;
@@ -1670,7 +1669,7 @@ NNOPS_TEST(conv2d_channel_last_i8_int_out) {
     }
 }
 
-NNOPS_TEST(conv2d_channel_last_i8_threaded_matches_serial) {
+NNOPS_TEST(conv2d_i8_threaded_matches_serial) {
     // Two shapes: a narrow-oc 20x20 plane, and a wide-output one on a plane too
     // small to fill the pool — 64 channels into 512, where the filter axis has
     // to split and a chunk starts mid-oc-block.

@@ -2,13 +2,12 @@
 /// @brief Flatten tests — every accepted layout unpacks to dense contiguous
 /// Channel-first data of the input's logical rank and dtype.
 ///
-/// Coverage: an already-dense channel-first input (the memcpy identity path),
-/// channel-last with a partial / full / single channel plane and several batches,
-/// channel-last 3D for the 3D case, and SIMD output against the reference
-/// flatten.
+/// Coverage: an already-dense input (the memcpy identity path), NHWC with a
+/// partial / full / single channel plane and several batches, NDHWC for the 3D
+/// case, and SIMD output against the reference flatten.
 ///
-/// Every channel-last input is produced by reordering the channel-first view's
-/// values into pixel-major order and wrapping them in a dense channel-last view.
+/// Every NHWC input is produced by reordering a dense view's values into
+/// pixel-major order and wrapping them in an NHWC view.
 
 #include "nnops/ops/flatten.hpp"
 #include "common/test_harness.hpp"
@@ -32,7 +31,7 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-/// Convert a channel-first view into `target` (channel-last) and return the view; the
+/// Convert a dense view into `target` (NHWC) and return the view; the
 /// caller keeps `buf` alive.
 TensorView to_channel_last(const TensorView& channel_first, TensorLayout target,
                            std::vector<float>& buf)
@@ -75,7 +74,7 @@ NNOPS_TEST(flatten_channel_first_identity) {
     NNOPS_EXPECT_TRUE(test::allclose(output, input, 1e-7f, 1e-7f));
 }
 
-NNOPS_TEST(flatten_channel_last_to_channel_first) {
+NNOPS_TEST(flatten_nhwc_to_dense) {
     const std::vector<int64_t> shape = {2, 5, 4, 4};  // odd C
 
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -1.0f, 1.0f, 123);
@@ -99,7 +98,7 @@ NNOPS_TEST(flatten_channel_last_to_channel_first) {
     NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, in_channel_first, 1e-5f, 1e-5f));
 }
 
-NNOPS_TEST(flatten_channel_last_full_c) {
+NNOPS_TEST(flatten_full_c) {
     const std::vector<int64_t> shape = {1, 8, 6, 6};
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -1.0f, 1.0f, 456);
 
@@ -119,7 +118,7 @@ NNOPS_TEST(flatten_channel_last_full_c) {
     NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, in_channel_first, 1e-5f, 1e-5f));
 }
 
-NNOPS_TEST(flatten_channel_last_single_channel) {
+NNOPS_TEST(flatten_single_channel) {
     const std::vector<int64_t> shape = {1, 1, 8, 8};
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -1.0f, 1.0f, 789);
 
@@ -165,7 +164,7 @@ NNOPS_TEST(flatten_ndhwc_to_ncdhw) {
     NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, in_channel_first, 1e-5f, 1e-5f));
 }
 
-NNOPS_TEST(flatten_channel_last_multibatch) {
+NNOPS_TEST(flatten_multibatch) {
     const std::vector<int64_t> shape = {3, 7, 4, 4};
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -1.0f, 1.0f, 222);
 

@@ -23,8 +23,8 @@
 /// `exp(x/T - max/T)`, so the two agree past the last bit.
 ///
 /// Two paths, chosen by where the normalization axis sits in memory (mirrors
-/// the CPU backend), over channel-last layouts:
-///   - The axis is the innermost axis of the storage (channel-last's C, or the
+/// the CPU backend), over NHWC/NDHWC layouts:
+///   - The axis is the innermost axis of the storage (NHWC's C, or the
 ///     only dim of a rank-1 tensor): every group is D contiguous elements, one
 ///     block per group (softmax_kernel).
 ///   - Every other axis: reference-style outer/D/inner decomposition with

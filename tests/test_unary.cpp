@@ -4,7 +4,7 @@
 /// Desk-checked scalar cases for Exp/Log/Sin/Cos/Tanh/Abs/Neg/Sqrt on small
 /// rank-1 tensors, compared against std:: or literal values (Sin/Cos feed 0,
 /// pi/2 and pi). The f32 cases first check getOutputTensorDesc preserves rank,
-/// dims, channel-first layout and dtype; the f16 cases check the output dtype. `add_to`
+/// dims, dense layout and dtype; the f16 cases check the output dtype. `add_to`
 /// is the accumulating form: the output buffer arrives pre-filled and the op
 /// adds into it instead of overwriting. Random data sweeps for Abs and Exp and
 /// a rank-2 Sqrt case round out the float side.

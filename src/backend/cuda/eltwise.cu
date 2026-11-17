@@ -766,7 +766,7 @@ void eltwise_cuda_impl(const EltwiseAttributes& attrs, TensorView& output,
         eltwise_flat_kernel<<<grid_size, block_size, 0, stream>>>(
             A.ptr<T>(), B.ptr<T>(), output.ptr<T>(), total, attrs.type, attrs.add_to);
     } else {
-        // Row-by-row processing, respecting pitch. A channel-last row is one
+        // Row-by-row processing, respecting pitch. An NHWC row is one
         // spatial line — W pixels × C channels.
         const int64_t last_dim = (rank >= 3 && is_channel_last(A.layout())) ?
                                      A.shape(1) * A.shape(rank - 1) :

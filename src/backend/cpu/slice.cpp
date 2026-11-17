@@ -1,7 +1,7 @@
 /// @file slice.cpp
 /// @brief SIMD-optimized CPU implementation of Slice.
 ///
-/// For channel-first data, slice is a strided sub-tensor extraction.
+/// For dense data, slice is a strided sub-tensor extraction.
 ///
 /// Optimization tiers:
 ///   1. Inner-dim contiguous (innermost output dim maps to step-1 input):
@@ -56,7 +56,7 @@ void slice_impl(const SliceAttributes& attrs, TensorView& output,
         eff_step[static_cast<size_t>(ax)] = (a < attrs.steps.size()) ? attrs.steps[a] : int64_t(1);
     }
 
-    // The view's own strides, so a pitched row and a channel-last view both read
+    // The view's own strides, so a pitched row and a spatial view both read
     // what the buffer actually holds.
     int64_t in_strides[TensorDesc::kMaxRank];
     for (int64_t d = 0; d < rank; ++d) {

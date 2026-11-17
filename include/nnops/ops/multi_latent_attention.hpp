@@ -12,7 +12,7 @@
 ///
 ///   scores = Q·KVᵀ·scale (+ mask);  output = softmax(scores, -1)·KV[:, :v_head_dim]
 ///
-/// Inputs, channel-first only (the layout onnxruntime's latent PagedAttention reads):
+/// Inputs (the layout onnxruntime's latent PagedAttention reads):
 ///   [0] Q  [B, Sq, H·Dkv]     or [B, H,    Sq, Dkv]
 ///   [1] KV [B, Sk, H_kv·Dkv]  or [B, H_kv, Sk, Dkv]
 ///   [2] optional additive mask, flat [Sq, Sk] shared by every batch and head,

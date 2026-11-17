@@ -16,10 +16,10 @@
 /// Exit:   0 all checkpoints pass, 1 a checkpoint failed, 77 no artifact
 ///         (the test is skipped — export it first, see models/README.md).
 ///
-/// The graph runs channel-last (see net_ops.hpp): the convs read HWIO filters,
-/// the maxpool its channel-last route, and each checkpoint is reordered back to
-/// channel-first before it is compared. The BN fold is mandatory — the Norm
-/// operator is channel-first — and the fused path does it.
+/// The graph runs NHWC (see net_ops.hpp): the convs read HWIO filters, the
+/// maxpool reduces over NHWC, and each checkpoint is reordered back to NCHW
+/// before it is compared. The BN fold is mandatory — the runner builds only the
+/// fused graph — and the fused path does it.
 
 #include "common/model_check.hpp"
 #include "common/model_io.hpp"
@@ -195,10 +195,10 @@ int main(int argc, char** argv)
     }
 
     if (!model::fuse_enabled()) {
-        // The Norm operator reads channel-first tensors, so the channel-last
-        // graph has to fold the BN into the conv — which fusion does.
+        // The runner builds only the fused graph, so the BN has to be folded
+        // into the conv — which is what fusion does.
         std::fprintf(stderr,
-                     "resnet18: the channel-last graph needs the BN fold "
+                     "resnet18: the NHWC graph needs the BN fold "
                      "(unset NNOPS_MODEL_FUSE)\n");
         return 2;
     }
@@ -207,7 +207,7 @@ int main(int argc, char** argv)
     cl_input = model::to_channel_last(input);
     input = cl_input.view;
 
-    std::printf("resnet18: %zu tensors from %s (conv+bn+relu folded, channel_last)\n",
+    std::printf("resnet18: %zu tensors from %s (conv+bn+relu folded, NHWC)\n",
                 artifact.count(), dir.c_str());
     // The untimed pass is the model-load step: it prepacks the Winograd weights
     // (and first-touches every buffer) and it is the pass that checks every

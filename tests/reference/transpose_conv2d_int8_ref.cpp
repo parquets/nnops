@@ -1,7 +1,7 @@
 /// @file transpose_conv2d_int8_ref.cpp
 /// @brief Naive CPU reference for the quantized TransposeConv2D route — s8
 ///        weight × u8/s8/f16/f32 activation → f32/f16 or s8/u8 output
-///        (channel-first).
+///        (dense order).
 ///
 /// The correctness baseline for the quantized routes in the CPU backend. Gather
 /// form, matching the forward route's output-driven indexing: an output pixel
@@ -60,8 +60,8 @@ void transpose_conv2d_int8_ref_impl(const TransposeConv2DAttributes& attrs,
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    // Input: [N, IC, IH, IW]; the channel-last plane is handled by the caller,
-    // this reference is channel-first.
+    // Input: [N, IC, IH, IW]; the NHWC plane is handled by the caller, this
+    // reference reads dense order.
     const int64_t N  = input.shape(0);
     const int64_t IC = input.shape(1);
     const int64_t IH = input.shape(2);

@@ -1,11 +1,11 @@
 /// @file flatten_ref.cpp
 /// @brief Naive CPU reference implementation of Flatten.
 ///
-/// Reads any input layout (channel-first or channel-last, 2D or 3D, with or
+/// Reads any input layout and rank (2D or 3D, with or
 /// without pitch padding) and writes dense contiguous output in logical
-/// (channel-first) order. Each logical flat index maps to a physical offset
+/// (dense) order. Each logical flat index maps to a physical offset
 /// through stride_elems(), which is what makes the same walk cover
-/// channel-first and channel-last inputs.
+/// dense and NHWC inputs.
 
 #include "nnops/ops/flatten.hpp"
 #include "nnops/detail/assert.hpp"

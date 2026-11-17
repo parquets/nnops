@@ -12,7 +12,7 @@
 ///
 /// The cases cover each kernel family the backend dispatches: the elementwise
 /// pack8 path, the CuTe GEMM with its bf16 MMA atom (and the split-K reduce,
-/// whose partial planes are f32), the channel-last conv / transpose-conv /
+/// whose partial planes are f32), the NHWC conv / transpose-conv /
 /// depthwise routes, and the movement, index and k-selection operators. Operands of
 /// equal shape only: the CUDA elementwise kernel walks both in lockstep, so a
 /// broadcast second operand is unsupported for every dtype, not just bf16.

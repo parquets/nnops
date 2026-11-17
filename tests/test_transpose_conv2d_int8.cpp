@@ -1,6 +1,5 @@
 /// @file test_transpose_conv2d_int8.cpp
-/// @brief Bit-exactness tests for the quantized CPU TransposeConv2D
-///        channel-last route.
+/// @brief Bit-exactness tests for the quantized CPU TransposeConv2D route.
 ///
 /// Route matrix: activation u8 / s8 / f16 / f32 (per-tensor QuantParams) ×
 /// weight s8 (per-channel QuantParams) → f32 / f16 / s8 / u8 output, across
@@ -13,9 +12,9 @@
 /// share the dequant/requant expression. The fp-activation cases use a
 /// power-of-two activation scale, which makes x·(1/scale) exact.
 ///
-/// The kernel runs on channel-last storage and the reference on the same values
-/// in channel-first order, converting the result back before the comparison:
-/// the layouts are a permutation, so the bits must survive it.
+/// The kernel runs on NHWC storage and the reference on the same values in
+/// dense order, converting the result back before the comparison: the layouts
+/// are a permutation, so the bits must survive it.
 ///
 /// Integer destinations run the epilogue activation on the int32 accumulator
 /// before the requant; the asymmetric-activation / symmetric-weight cases give
@@ -113,8 +112,8 @@ struct Case {
     uint64_t seed = 1;
 };
 
-/// Owns a case's channel-first buffers and the views over them — views last, so
-/// a resize dangles. A channel-last case permutes these on the way in and out.
+/// Owns a case's dense-order buffers and the views over them — views last, so a
+/// resize dangles. A case permutes these on the way in and out.
 struct Fixture {
     Case c;
     std::vector<uint8_t> act;         // activation storage
@@ -325,8 +324,8 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     Fixture f(c);
     auto op = TransposeConv2D::create(f.attrs, Backend::CPU);
 
-    // The channel-first descriptor carries the logical output geometry either
-    // way; a channel-last call only changes the storage order.
+    // The dense descriptor carries the logical output geometry either way; the
+    // call only changes the storage order.
     std::vector<TensorDesc> cf_ins = f.descs();
     const auto cf_outs = op->getOutputTensorDesc(cf_ins);
     const int64_t N  = cf_outs[0].dims[0];
@@ -349,7 +348,7 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
         return r;
     }
 
-    // ---- channel-last: permute the activation in, the output back ----
+    // ---- permute the activation in, the output back ----
     const int64_t IC = c.ishape[1], IH = c.ishape[2], IW = c.ishape[3];
     const int64_t in_pitch = c.in_pitch ? c.in_pitch : IW;
     std::vector<uint8_t> act_cl =
@@ -428,7 +427,7 @@ void expect_matches_ref(const Case& c, const ComputeContext& ctx = {}, int idx =
     }
 }
 
-/// Every case runs channel-last.
+/// Every case compares against the dense-order reference.
 void expect_matches_ref_both(Case c, int idx) {
     expect_matches_ref(c, {}, idx);
 }

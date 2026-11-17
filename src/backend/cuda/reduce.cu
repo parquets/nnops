@@ -195,13 +195,13 @@ void reduce_cuda_impl(const ReduceAttributes& attrs, TensorView& output, const T
     const int grid = std::min(static_cast<int>(outer_dim_count), 65535);
 
     if (axis == rank - 1 && !is_channel_last(input.layout())) {
-        // Contiguous tail fast path: Dense only — channel-last has C innermost.
+        // Contiguous tail fast path: Dense only — NHWC keeps C innermost.
         const int64_t row_stride = (axis > 0) ? input.stride_elems(axis - 1) : input.numel();
         reduce_fast_kernel<T><<<grid, block_size, shared_bytes, stream>>>(x_ptr, y_ptr, norm_size,
                                                                           row_stride, reduce_type);
     } else {
         // General axis: pre-compute inner offsets, upload to device.
-        // stride_elems() is layout-aware, so channel-last works unchanged.
+        // stride_elems() is layout-aware, so NHWC works unchanged.
         std::vector<int64_t> h_offsets(norm_size);
         for (int64_t flat = 0; flat < norm_size; ++flat) {
             int64_t off = 0;

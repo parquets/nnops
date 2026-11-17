@@ -1,5 +1,5 @@
 /// @file conv3d_ref.cpp
-/// @brief channel-first scalar reference — used as correctness baseline for tests.
+/// @brief Dense-order scalar reference — used as correctness baseline for tests.
 ///
 /// The input-driven (scatter) form, which is the inverse of the gather every
 /// kernel route takes: each input voxel, scaled by a kernel weight, lands on the
@@ -7,9 +7,9 @@
 /// divides the numerator. So the two derivations share no index arithmetic, and
 /// a stride or padding sign error in one cannot cancel in the other.
 ///
-/// Weight layout: channel-first [OC, IC/G, KD, KH, KW].
-/// Input:  channel-first [N, IC, ID, IH, IW]
-/// Output: channel-first [N, OC, OD, OH, OW]
+/// Weight layout: dense [OC, IC/G, KD, KH, KW].
+/// Input:  [N, IC, ID, IH, IW]
+/// Output: [N, OC, OD, OH, OW]
 
 #include "nnops/ops/conv3d.hpp"
 #include "nnops/core/parallel_for.hpp"

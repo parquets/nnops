@@ -110,7 +110,7 @@ void bench_activation(DataType dt, int64_t n, ActivationType type, const char* n
 
 void bench_softmax(DataType dt, int64_t rows, int64_t v)
 {
-    // Softmax is channel-last only: with [rows, v] under NHWC the last axis is
+    // Softmax runs on NHWC only: with [rows, v] the last axis is
     // the channel axis, so the op sees one contiguous group per row.
     HostTensor a = make_host_random(std::vector<int64_t>{rows, v}, dt, false, 11, -4.0f, 4.0f,
                                     TensorLayout::NHWC);

@@ -1,5 +1,5 @@
 /// @file pooling_ref.cpp
-/// @brief Naive CPU reference for 2D/3D spatial pooling, channel-first.
+/// @brief Naive CPU reference for 2D/3D spatial pooling, in dense order.
 ///
 /// f32 and f16 pool in fp32, loading and storing through the dtype-overloaded
 /// s_load/s_store. s8/u8 dequantize on load, pool in float and requantize on

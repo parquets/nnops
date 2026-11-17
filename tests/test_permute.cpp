@@ -102,7 +102,7 @@ NNOPS_TEST(permute_3d_batch_transpose) {
     }
 }
 
-NNOPS_TEST(permute_4d_channel_first_to_channel_last) {
+NNOPS_TEST(permute_4d_nchw_to_nhwc) {
     // 4D: [1, 3, 2, 2] → [1, 2, 2, 3]  (perm = [0, 2, 3, 1])
     float in_data[] = {
         // C=0
@@ -374,7 +374,7 @@ NNOPS_TEST(permute_random_f32) {
     auto [in_vec, input] = test::make_random_tensor({N, C, H, W}, -5.0f, 5.0f, 444);
 
     PermuteAttributes attrs;
-    const int64_t p5[] = {0, 2, 3, 1};  // Channel-first → channel-last
+    const int64_t p5[] = {0, 2, 3, 1};  // [N,C,H,W] -> NHWC
     attrs.perm = std::span<const int64_t>(p5, 4);
     auto op = Permute::create(attrs, Backend::CPU);
 

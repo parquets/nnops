@@ -1,10 +1,10 @@
 #pragma once
 /// @file tconv_cl.h
-/// @brief The channel-last route of transposed convolution, shared by the 2-D
+/// @brief The spatial route of transposed convolution, shared by the 2-D
 ///        and 3-D operators: the col chunk driver and the depthwise driver.
 ///
 /// Both ranks run the same structure — one GEMM per (batch, group, oc chunk) over
-/// the channel-last image, then a stride-residue scatter of the col into a
+/// the NHWC image, then a stride-residue scatter of the col into a
 /// scratch row and a merge that owns that row — and differ only in the geometry
 /// and in which walk folds the col back (simd_col2im.hpp). So the rank supplies
 /// a walk and everything else lives here: the filter permutation, the operand
@@ -39,7 +39,7 @@ namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
 
-/// Merge one channel-last scratch row into the output: bias, then the
+/// Merge one NHWC scratch row into the output: bias, then the
 /// pre-activation residual, the epilogue and add_to, over `nc` of the row's
 /// channels starting at @p oc_base. The caller has this row to itself, which is
 /// what keeps add_to's original value — this is the only read and the only write.
@@ -60,7 +60,7 @@ void merge_oc_row(T* orow, const T* row, const T* bias, int64_t oc_base, const G
 /// Largest col one GEMM call may materialise; past it the oc chunk shrinks.
 inline constexpr int64_t kColCapBytes = 8 << 20;
 
-/// One channel-last col GEMM call, resolved to flat operands: the chunk walk
+/// One NHWC col GEMM call, resolved to flat operands: the chunk walk
 /// varies only the group and the oc chunk.
 template <typename T, typename G> struct TconvClCall {
     const G& gm;
@@ -87,9 +87,9 @@ inline int64_t tconv_cl_oc_chunk(int64_t ocg, int64_t npix, int64_t karea, int64
 }
 
 /// One oc chunk: B for the chunk — the filter as [IC/G] × [KH·KW·nc], permuted,
-/// or the channel-first rows read in place with oc still the faster axis — then
-/// per batch item the GEMM, the direct-weight col transpose, and the scatter and
-/// merge of each output row.
+/// or its own [IC][OC/G][taps] rows read in place with oc still the faster
+/// axis — then per batch item the GEMM, the direct-weight col transpose, and the
+/// scatter and merge of each output row.
 template <typename T, typename G, class Walk>
 void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk, const ComputeContext& ctx, int64_t g,
                     int64_t oc0, int64_t nc)
@@ -97,7 +97,7 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk, const ComputeContex
     const int64_t m = nc * c.karea;
 
     if (!c.direct_w) {
-        // A blocked transpose of the channel-first [IC/G][OC/G][taps] rows.
+        // A blocked transpose of the [IC/G][OC/G][taps] rows.
         for (int64_t ic = 0; ic < c.icg; ++ic) {
             const T* src = c.w + ((g * c.icg + ic) * c.ocg + oc0) * c.karea;
             nnops::kernel::permute_taps(src, c.aux + ic * c.karea * nc, nc, c.karea);
@@ -113,7 +113,7 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk, const ComputeContex
         const T* in_n = c.in + n * c.in_n_stride;
         T* out_n = c.out + n * c.out_n_stride;
 
-        // A: the channel-last image as [pixels] × [IC/G] — one pixel stride of
+        // A: the NHWC image as [pixels] × [IC/G] — one pixel stride of
         // IC, so the group offset is g·IC/G elements in.
         const int64_t ashape[] = {c.npix, c.icg};
         TensorView am(std::span<const int64_t>(ashape, 2), c.vdt, const_cast<T*>(in_n + g * c.icg),
@@ -149,7 +149,7 @@ void tconv_cl_chunk(const TconvClCall<T, G>& c, Walk&& walk, const ComputeContex
     }
 }
 
-/// The whole channel-last col route: the col, the filter staging and the row
+/// The whole NHWC col route: the col, the filter staging and the row
 /// scratch are pooled once, then one chunk call per (group, oc chunk).
 template <typename T, typename G, class Walk>
 bool tconv_cl_route(const G& gm, TensorView& output, std::span<const TensorView> inputs,
@@ -207,7 +207,7 @@ bool tconv_cl_route(const G& gm, TensorView& output, std::span<const TensorView>
     return true;
 }
 
-/// The channel-last depthwise route: the input itself is the col, so there is no
+/// The depthwise route: the input itself is the col, so there is no
 /// GEMM — the filter is permuted to [taps][C] and each tap is one weighted vector
 /// add over the image. `walk(src, row, row_index, wd, m, nc)` gets the permuted
 /// filter so its tap indexes `wd` rather than the source. Returns false when the

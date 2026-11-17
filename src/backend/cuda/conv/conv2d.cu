@@ -1,19 +1,19 @@
 /// @file conv2d.cu
-/// @brief CUDA Conv2D — one implicit-GEMM kernel for channel-last activations.
+/// @brief CUDA Conv2D — one implicit-GEMM kernel on NHWC activations.
 ///
 /// The convolution is posed as a GEMM: M is the output pixel axis, N the output
 /// channels of one group, K the reduction over IC/G × KH × KW. The activation is
 /// the gathered operand and therefore lives on A, whose shared-memory tile is
 /// filled tap by tap with a bounds check that zeroes the padding ring; the filter
-/// is B, read straight out of global memory. A channel-last activation carries
-/// the channels innermost, so the filter is HWIO and the k-flattening is
-/// channel-major inside a tap (k = tap·ICG + ic); the filter's copy atom and the
+/// is B, read straight out of global memory. An NHWC activation carries the
+/// channels innermost, so the filter is HWIO and the k-flattening is
+/// channel-major inside a tap (k = tap·ICG + ic); the filter's fill and the
 /// gather walk are both built for that order.
 ///
 /// Shape indices follow the library's convention: they are the logical [N, C, H,
 /// W] ones, and the layout tag only changes the element strides. The epilogue
 /// writes through the operator's own address arithmetic rather than a strided C
-/// tensor, because a channel-last row is padded to a 32 B pitch and the pixel
+/// tensor, because an NHWC row is padded to a 32 B pitch and the pixel
 /// axis is only uniform inside one row. add_to reads the old output at that same
 /// address before overwriting it, so the residual lands after the activation as
 /// it does on the CPU.
@@ -31,7 +31,7 @@
 /// (the dispatch refuses it) and a prepacked filter is opaque to them. The
 /// quantized family (an s8 filter against a pre-quantized u8/s8 activation) is
 /// its own kernel at the bottom of this file: 16x8x32 s8 MMA over the same CTA
-/// tile, channel-last only, MatMulInteger compensation with the per-pixel
+/// tile, MatMulInteger compensation with the per-pixel
 /// activation sums folded in during the gather.
 
 #include "../cuda_common.cuh"
@@ -84,7 +84,7 @@ struct ConvParams {
     int k_splits = 1;
     float* partial = nullptr; ///< [(batch·group)][split][M][OC/G], row-major
 
-    // ---- int8 route (channel-last, pre-quantized activation) --------------
+    // ---- int8 route (pre-quantized activation) ----------------------------
     // The activation's parameters are per-tensor; the filter's per-channel
     // arrays are device copies staged by the host entry. R_b is the per-output-
     // channel filter sum the compensation needs, also device-resident.
@@ -115,7 +115,7 @@ __device__ inline Elem conv_weight(const ConvParams& p, const void* base, int n,
                                           int64_t(kh) * p.w_kh + int64_t(kw) * p.w_kw];
 }
 
-/// The rows of an A tile one thread feeds on the channel-last vector walk, and
+/// The rows of an A tile one thread feeds on the channel-vector walk, and
 /// the two pixel coordinates each of them starts from. The thread-to-(row,
 /// k-group) mapping is fixed for the whole kernel, so the division that turns a
 /// pixel into (oh, ow) is paid once instead of once per k tile, and `oh0`/`ow0`
@@ -196,8 +196,8 @@ __device__ inline void conv_split_range(int K, int bK, int splits, int split, in
     kt_count = int(int64_t(k_tiles) * (split + 1) / splits) - kt_begin;
 }
 
-/// Channel-last fill, one 16 B vector per (row, k-group): k is the innermost
-/// axis there, so a group of `kGroup` consecutive k is a run of whole channels
+/// The vector fill, one 16 B vector per (row, k-group): k is the innermost
+/// axis, so a group of `kGroup` consecutive k is a run of whole channels
 /// inside a single tap -- contiguous in the activation and contiguous in the
 /// shared tile, so both the load and the store are one 16 B move. This is the
 /// im2col pack the reference kernels do; element-at-a-time it cost 40-70% of the
@@ -241,8 +241,8 @@ __device__ inline void conv_fill_a_vec(const ConvParams& p, SmemA sA, int stage,
 }
 
 /// Fill one shared-memory A tile with the gathered activation. Threads spread
-/// over the k axis in the channel-last order (consecutive threads read
-/// consecutive channels).
+/// over the k axis in channel order (consecutive threads read consecutive
+/// channels).
 ///
 /// The walk decodes its starting index once and then steps it, and every
 /// address is a 32-bit offset from the block's already-shifted input pointer.
@@ -290,8 +290,7 @@ __device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage, con
     }
 }
 
-/// Output element (pixel, channel): channel-last puts the channel in the
-/// innermost slot.
+/// Output element (pixel, channel): the channel is the innermost slot.
 template <class Elem>
 __device__ inline Elem* conv_out_addr(const ConvParams& p, int64_t base, int pixel, int n)
 {
@@ -660,7 +659,7 @@ void conv_gemm_f_kernel(ConvParams p)
 /// Sum the k-split planes of one conv and run the epilogue once, exactly as the
 /// single-pass kernel would have. One thread per (pixel, channel), planes in
 /// split order so a split count is deterministic. The output goes through the
-/// operator's own addressing, since a channel-last row is pitch-padded.
+/// operator's own addressing, since an NHWC row is pitch-padded.
 template <class Elem> __global__ void conv_splitk_reduce_kernel(ConvParams p)
 {
     const int M = p.oh * p.ow;
@@ -713,9 +712,9 @@ template <class Elem> __global__ void conv_splitk_reduce_kernel(ConvParams p)
 /// f16 goes 0.075 -> 0.028 ms at four splits, 28x28x128 k5 f32 0.34 -> 0.14 ms.
 ///
 /// Half a wave is too eager at two splits for f16: the 56x56x64 3x3 plane has
-/// 49 blocks against 114 resident and a shallow cut already costs it 13%
-/// channel-last, because two blocks per k range repeat the gather while the
-/// plane was wide enough to hide it. A quarter-wave gate leaves every deeper
+/// 49 blocks against 114 resident and a shallow cut already costs it 13%,
+/// because two blocks per k range repeat the gather while the plane was wide
+/// enough to hide it. A quarter-wave gate leaves every deeper
 /// case untouched (7x7x512 has 8 blocks, 14x14x256 16) and only declines that
 /// one.
 ///
@@ -723,15 +722,15 @@ template <class Elem> __global__ void conv_splitk_reduce_kernel(ConvParams p)
 /// cut costs a fixed two launches and a stream-ordered workspace round trip, so
 /// a plane only pays for it when one undivided wave lasts longer than that. The
 /// same 49-block f16 plane takes 0.031 ms and loses 13% at two splits, while the
-/// f32 twin takes 0.086 ms and gains 20% (0.087 -> 0.070 channel-last), and the
+/// f32 twin takes 0.086 ms and gains 20% (0.087 -> 0.070), and the
 /// gate is the only thing that tells them apart. The f16 kernel therefore needs
 /// the quarter-wave gate and f32 the half.
 ///
 /// The smallest cut is left in place at the very shallow end. f16 7x7x512 is
-/// 12.8M MACs against a fixed cut cost of about 20 us, and channel-last lands at
-/// 0.0184 ms in five runs out of six and 0.0417 ms in the sixth -- the arm where
-/// the cut does not cover itself. It still stays: the same layer in the previous
-/// channel-first order took 0.0440 ms cut against 0.0705 ms whole, every run,
+/// 12.8M MACs against a fixed cut cost of about 20 us, and it lands at 0.0184 ms
+/// in five runs out of six and 0.0417 ms in the sixth -- the arm where the cut
+/// does not cover itself. It still stays: the same layer in the earlier NCHW
+/// order took 0.0440 ms cut against 0.0705 ms whole, every run,
 /// and a MAC floor high enough to decline them both (which is what a first
 /// attempt did) costs that 1.6x to buy back nothing but the sixth run.
 inline int conv_pick_splits(int m, int n, int K, int64_t zg, int bM, int bN, int bK, int capacity,
@@ -862,7 +861,7 @@ struct ConvI8Panel {
     }
 };
 
-/// Channel-last gather for the int8 route. Each thread owns one output pixel's
+/// The int8 gather. Each thread owns one output pixel's
 /// tile row, so the same walk returns that thread's share of R_a[pixel]; the
 /// pixel a padded or out-of-range tap contributes is the real value 0, which is
 /// also what it adds to the sum.
@@ -916,7 +915,7 @@ __device__ inline int32_t conv_fill_a_i8(const ConvParams& p, SmemA sA, int stag
     return sum;
 }
 
-/// Channel-last gather, one 16 B vector per (row, k-group): 16 consecutive k are
+/// The int8 vector fill, one 16 B vector per (row, k-group): 16 consecutive k are
 /// 16 consecutive channels inside one tap, contiguous in the activation and in
 /// the shared tile. A thread owns `rows.count` pixels, so it keeps one partial
 /// per owned row and folds them into shared memory once, after the k loop.
@@ -1230,7 +1229,7 @@ template <class AElem> void launch_conv_i8(ConvParams& p, cudaStream_t stream)
 }
 
 /// The quantized route's CUDA entry: pre-quantized u8/s8 activation against an
-/// s8 HWIO filter, channel-last, MatMulInteger-shaped output. The weight's
+/// s8 HWIO filter, MatMulInteger-shaped output. The weight's
 /// per-channel parameters are host arrays by contract and staged here, exactly
 /// as the dense GEMM does.
 Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
@@ -1253,8 +1252,7 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
     if (is_packed_conv_weight(wgt.layout()) || is_wino_weight(wgt.layout())) {
         return Status::unsupported;
     }
-    // The channel-last route reads 16 whole channels per vector and gathers the
-    // HWIO filter byte-wise (its k axis is not contiguous).
+    // The int8 store has no residual stage, so an add_to conv is refused.
     if (attrs.add_to) {
         return Status::unsupported;
     }
@@ -1316,8 +1314,8 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
                   p.w_kh == int64_t(p.kw) * p.icg * p.oc;
     p.weight_vec = false;
 
-    // The channel-last 16 B A-fill needs a dense channel axis and 16 channels of
-    // one tap per vector (k/groups is tap-major there).
+    // The 16 B A-fill needs a dense channel axis and 16 channels of one tap per
+    // vector (k/groups is tap-major there).
     const int kGroup = 16; // one 16 B vector of s8
     p.fill_vec = p.in_c == 1 && p.icg % kGroup == 0 && (p.in_w % 16 == 0) &&
                  (reinterpret_cast<uintptr_t>(p.input) % 16 == 0);
@@ -1488,7 +1486,7 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
     p.weight_vec =
         p.w_k_dense && (reinterpret_cast<uintptr_t>(p.weight) % 16 == 0) && (row % 16 == 0);
 
-    // The channel-last 16 B A-fill needs four (or eight) whole channels of one
+    // The 16 B A-fill needs four (or eight) whole channels of one
     // tap on a dense channel axis: in_c == 1 puts consecutive channels next to
     // each other, IC/G a multiple of the vector makes a k-group never straddle
     // a tap, and the channel stride is what has to be 16 B aligned.

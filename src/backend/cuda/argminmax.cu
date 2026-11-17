@@ -3,7 +3,7 @@
 ///
 /// The reduction is described the way the CPU describes it — an outer group,
 /// the axis, an inner group — and both groups come from the view's strides
-/// alone (see axis_walk.hpp), so a padded row and a channel-last view need no
+/// alone (see axis_walk.hpp), so a padded row and an NHWC view need no
 /// case of their own: either can flatten or ask for one term per dim.
 /// The axis walk itself is the CPU's: a strict compare, so the first of equal
 /// values keeps the index, and a NaN never beats a number. The one place the CPU
@@ -18,9 +18,9 @@
 ///     This is the argmax-over-logits shape, where the row is contiguous.
 ///   - arg_strided: inner > 1, so every output is one thread walking the axis
 ///     itself. Adjacent threads take adjacent inner offsets, which is the
-///     coalesced order for a planar tail, and no cross-thread combine is needed.
+///     coalesced order for a Dense tail, and no cross-thread combine is needed.
 ///
-/// Any layout: the operator reads only the strides, so channel-last and a
+/// Any layout: the operator reads only the strides, so NHWC and a
 /// padded pitch are the same walk with different groups.
 ///
 /// f32, f16 and bf16 in, s64 out. Workspace: not used.

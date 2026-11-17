@@ -8,7 +8,7 @@ set(TEST_SOURCES
     test_matmul_int8.cpp
     test_matmul_dq.cpp
     test_conv2d_winograd.cpp
-    test_conv2d_channel_last.cpp
+    test_conv2d.cpp
     test_conv3d.cpp
     test_activation.cpp
     test_pooling.cpp
@@ -167,7 +167,7 @@ if(NNOPS_BUILD_BENCHMARKS)
     set(BENCH_SOURCES
         bench_matmul.cpp
         bench_linear.cpp
-        bench_conv2d_channel_last.cpp
+        bench_conv2d.cpp
         bench_conv3d.cpp
         bench_transpose_conv2d.cpp
         bench_transpose_conv3d.cpp

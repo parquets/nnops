@@ -1,5 +1,5 @@
 /// @file pooling.cpp
-/// @brief SIMD CPU 2D/3D pooling, channel-last.
+/// @brief SIMD CPU 2D/3D pooling on NHWC/NDHWC.
 ///
 /// The lane spans channels and a plane's last block runs short. The fp route
 /// pools four output rows per call (the row driver skips rows past OH, so there
@@ -50,7 +50,7 @@ namespace {
 
 
 // ============================================================
-// Channel-last pooling — the lane spans channels
+// Spatial pooling — the lane spans channels
 // ============================================================
 
 template <bool IsMax, typename T>
@@ -189,7 +189,7 @@ void pooling_channel_last_impl(const PoolingAttributes& attrs, TensorView& outpu
 }
 
 // ============================================================
-// Global pooling — one output per channel plane, no window walk
+// Global pooling — one output per (sample, channel), no window walk
 // ============================================================
 
 template <bool IsMax, typename T>
@@ -269,7 +269,7 @@ inline int64_t adaptive_end(int64_t o, int64_t in, int64_t out) noexcept
 }
 
 
-/// Channel-last adaptive: the lane is the channel, so the window walk is a
+/// Spatial adaptive: the lane is the channel, so the window walk is a
 /// vector min/add over whole pixels and only the channel tail runs scalar.
 template <bool IsMax, typename T>
 void pooling_adaptive_channel_last_impl(const PoolingAttributes& attrs, TensorView& output,
@@ -424,7 +424,7 @@ inline PoolingAttributes full_extent_window(PoolingAttributes attrs, const Tenso
 // when input and output share dtype, scale and zero_point (and !add_to) — then
 // `max` is exact in the integer domain.
 
-/// Channel-last quantized pooling: the fp four-row grid without the width
+/// Spatial quantized pooling: the fp four-row grid without the width
 /// strip, over dequantize/requantize kernels; full blocks keep the raw-integer
 /// max (exact when scales and zero points match).
 template <bool IsMax, typename InT, typename OutT>
@@ -573,7 +573,7 @@ Status pooling_cpu(const PoolingAttributes& attrs, TensorView& output,
         }
     }
 
-    // Quantized pooling needs a channel lane: channel-last only, and the
+    // Quantized pooling needs a channel lane, and the
     // quantized kernels have no per-output adaptive window.
     if (quant && (!is_channel_last(inputs[0].layout()) || a.adaptive())) {
         return Status::unsupported;
@@ -623,7 +623,7 @@ Status pooling_cpu(const PoolingAttributes& attrs, TensorView& output,
 /// and the translate is a slot shift (the 2D activation reads the H/W entries of
 /// the per-axis spans, [1] and [2], and skips [0]). auto_pad is resolved here
 /// because the kernel only sees an explicit pad; quantized pooling stays
-/// channel-last and has no adaptive form, both inherited from the 2D kernel.
+/// NHWC and has no adaptive form, both inherited from the 2D kernel.
 Status pool1d_cpu(const Pool1DAttributes& attrs, TensorView& output,
                   std::span<const TensorView> inputs, const ComputeContext& ctx, void* workspace)
 {

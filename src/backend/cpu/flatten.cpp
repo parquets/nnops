@@ -59,12 +59,12 @@ void flatten_impl(const FlattenAttributes& /*attrs*/, TensorView& output,
 
         int64_t w = 0;
         if (i_w_stride == 1) {
-            // Channel-first input: contiguous row → SIMD vector copy
+            // Dense input: contiguous row → SIMD vector copy
             for (; w + L <= oW; w += L) {
                 v_store(o_row + w, v_load(i_ptr + i_off + w));
             }
         } else {
-            // Channel-last input: strided element access
+            // Spatial input: strided element access
             for (; w + L <= oW; w += L) {
                 T tmp[16]; // max simd lane width
                 for (int k = 0; k < L; ++k) {

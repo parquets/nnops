@@ -2,8 +2,8 @@
 /// @file transpose_conv2d.hpp
 /// @brief TransposeConv2D — transposed 2D convolution (deconvolution).
 ///
-/// The backward of a regular convolution. The image tensor is channel-last
-/// (NHWC; the output carries its layout); the weight is [IC, OC/G, KH, KW];
+/// The backward of a regular convolution. The image tensor is NHWC (the output
+/// carries its layout); the weight is [IC, OC/G, KH, KW];
 /// bias [OC] optional. Reference: ncnn Deconvolution.
 ///
 /// Data types: f32/f16 on every input and output (the floating-point route), or

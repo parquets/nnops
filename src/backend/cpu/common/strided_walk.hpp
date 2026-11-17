@@ -6,7 +6,7 @@
 /// index space) is walked in logical row-major order and the body maps that
 /// tuple to one or more storage offsets. Doing the mapping per element keeps one
 /// implementation correct for any rank, any layout (stride_elems carries
-/// channel-last) and a pitched view; the chunk start is decomposed once, so the
+/// NHWC) and a pitched view; the chunk start is decomposed once, so the
 /// increment inside the loop is amortized O(1).
 
 #include "nnops/core/compute_context.hpp"

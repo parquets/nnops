@@ -1,6 +1,6 @@
 #pragma once
 /// @file conv2d_winograd.h
-/// @brief Winograd Conv2D — the k3s1 fast path, channel-last, two tile sizes.
+/// @brief Winograd Conv2D — the k3s1 fast path on NHWC, two tile sizes.
 ///
 /// Winograd replaces the 3×3 convolution with `pos` batched GEMMs in the
 /// transform domain: for each transform position p,
@@ -83,7 +83,7 @@
 /// and M alone — a window is read straight from the input, and the prepacked U
 /// is read in place by every task.
 ///
-/// Against the channel-last implicit GEMM (bench_conv2d_channel_last, same method)
+/// Against the implicit GEMM (bench_conv2d, same method)
 /// this route is 0.47-0.73x of its time at 1T and 0.26-0.84x at 4T/20T for f32,
 /// 0.46-0.63x and 0.32-0.75x for f16, over 7x7 to 224x224. Only a 3-channel stem
 /// still loses (2.1-3.3x), which winograd_applicable() never lets through.
@@ -112,7 +112,7 @@ constexpr int64_t wino_tile(WinoOrder o) noexcept { return o == WinoOrder::F43 ?
 /// Input window per side: one tile plus the two kernel taps.
 constexpr int64_t wino_alpha(WinoOrder o) noexcept { return wino_tile(o) + 2; }
 
-/// Geometry of the channel-last U (TensorLayout::PackedWinoWeightLast).
+/// Geometry of the Winograd U (TensorLayout::PackedWinoWeightLast).
 ///
 /// Resolved by the same function at prepack time and inside the kernel, so the
 /// producer and the consumer of those panels cannot drift. One panel is
@@ -133,7 +133,7 @@ struct WinoChannelLastU {
     int64_t total = 0;                ///< pos · plane — the whole U
 };
 
-/// Resolve the channel-last U geometry for a dtype and transform order (see
+/// Resolve the U geometry for a dtype and transform order (see
 /// WinoChannelLastU).
 WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
                                      DataType dt, WinoOrder order = WinoOrder::F23) noexcept;
@@ -198,7 +198,7 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
                                             std::span<const TensorDesc> outputs, int num_threads,
                                             bool use_thread_slots = false, int64_t num_slots = 0);
 
-/// Winograd Conv2D kernel (f32 / f16, k3s1, channel-last, F(2,3) or F(4,3)).
+/// Winograd Conv2D kernel (f32 / f16, k3s1, NHWC, F(2,3) or F(4,3)).
 ///
 /// inputs[1] must be the prepacked U (PackedWinoWeightLast) produced by
 /// Conv2D::prepackWeights. Scratch is pooled internally (sized by

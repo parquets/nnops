@@ -13,11 +13,6 @@
 /// live bytes on store, and it is a separate instantiation, so the common path
 /// pays nothing: C % 8 == 0 never reaches it.
 ///
-/// @c channel_first_load is the other lane layout — output width instead of channels:
-/// lane l reads input column iw0 + l*sw, and a lane outside the row takes @p fill,
-/// which must be the accumulate's identity so a padded tap contributes nothing.
-/// Unit and doubled stride take a plain or deinterleaving load; any other stride
-/// gathers scalar-wise.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_quant.hpp"
@@ -88,27 +83,6 @@ template <typename InT, bool Full = true> struct QuantSrc {
     v_f32x8 zero() const { return v_zero_f32x8(); }
     v_f32x8 set1(float s) const { return v_set1_f32x8(s); }
 };
-
-/// One input row, lane l at input column iw0 + l*sw.
-template <typename T>
-inline auto channel_first_load(const T* row, int64_t iw0, int64_t sw, int64_t iw, T fill)
-{
-    constexpr int64_t L = simd_lane_for<T>;
-    if (iw0 >= 0) {
-        if (sw == 1 && iw0 + L <= iw) {
-            return v_load(row + iw0);
-        }
-        if (sw == 2 && iw0 + 2 * L <= iw) {
-            return v_load_even(row + iw0);
-        }
-    }
-    T tmp[L];
-    for (int64_t l = 0; l < L; ++l) {
-        const int64_t i = iw0 + l * sw;
-        tmp[l] = (i >= 0 && i < iw) ? row[i] : fill;
-    }
-    return v_load(tmp);
-}
 
 /// Stores for R rows, r == 0 being the current output row; @c pix is the element
 /// distance between adjacent output positions (the channel count).

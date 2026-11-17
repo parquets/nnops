@@ -1,5 +1,5 @@
 /// @file conv2d_winograd.cpp
-/// @brief Winograd Conv2D kernel (k3s1, f32/f16, channel-last, F(2,3) and
+/// @brief Winograd Conv2D kernel (k3s1, f32/f16, NHWC, F(2,3) and
 /// F(4,3)).
 ///
 /// One plan, one dispatch, and the numeric order and scratch conventions
@@ -23,7 +23,7 @@ namespace nnops::backend::cpu {
 namespace k = nnops::kernel;
 
 // =========================================================================
-//  Channel-last route (channel-last)
+//  Winograd route (NHWC)
 // =========================================================================
 
 WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_group, int64_t out_h,
@@ -112,7 +112,7 @@ constexpr int64_t kTileBlockMin(WinoOrder o) noexcept { return o == WinoOrder::F
 /// plus one more B read).
 constexpr int64_t kOcnBlock = 64;
 
-/// Channel-last kernel: per-slot scratch is V then M, and U is read in place.
+/// Winograd kernel: per-slot scratch is V then M, and U is read in place.
 /// The transform order is a template parameter because it fixes the position
 /// count, the tile size and the two transforms' shapes — everything else about
 /// the task is order-independent.
@@ -128,7 +128,7 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
     const auto& u_tensor = inputs[1]; // prepacked transform-domain weight
     const bool has_bias = inputs.size() > 2;
 
-    // Logical [N, C, H, W]; channel-last stores [N][H][W][C], so a "row" is one spatial
+    // Logical [N, C, H, W]; NHWC stores [N][H][W][C], so a "row" is one spatial
     // line and a pixel's channels are contiguous.
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
@@ -296,7 +296,7 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs, TensorView
     ctx.cpu.run(0, plan.num_tasks, run_task);
 }
 
-/// Resolve the channel-last route: the activation is channel-last and U is prepacked as
+/// Resolve the route: the activation is NHWC and U is prepacked as
 /// B panels (PackedWinoWeightLast).
 Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDesc> inputs,
                              std::span<const TensorDesc> outputs, int num_threads,
@@ -404,7 +404,7 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const Tens
     // re-uses it; an oc chunk reads a disjoint slice of the same bytes. So the
     // block axis is the only one that costs weight traffic, and blocks exist
     // for the pool and the arena, not for the GEMM: take the fewest that fill
-    // it. Measured at 1 thread on channel-last f32, whole-plane against the old
+    // it. Measured at 1 thread on NHWC f32, whole-plane against the old
     // ~12-tile block: 28x28 512->512 1.10x, 28x28 256 1.15x, 56x56 256 flat.
     const int64_t NB = (in.dims[0] > 0) ? in.dims[0] : 1;
     const int64_t nt = std::max<int64_t>(num_threads, 1);

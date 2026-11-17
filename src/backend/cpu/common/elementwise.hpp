@@ -12,7 +12,7 @@
 /// op dispatch switch.
 ///
 /// Two rules the helpers encode:
-///  - A channel-last "row" is one whole spatial line — W pixels × C channels —
+///  - An NHWC "row" is one whole spatial line — W pixels × C channels —
 ///    so last_dim is shape(1) * shape(rank-1), not W.
 ///  - The fused quantized paths require input and output to share one
 ///    granularity (PerTensor or PerToken); the tile drivers assert it.
@@ -55,7 +55,7 @@ inline void run_parallel(const ComputeContext& ctx, int64_t count, const Paralle
 
 /// Row-major view of a pitch-aware tensor, with input/output row strides.
 struct RowGeometry {
-    int64_t last_dim;   ///< elements per row (channel-last includes all C)
+    int64_t last_dim;   ///< elements per row (NHWC includes all C)
     int64_t num_rows;   ///< number of logical rows
     int64_t in_stride;  ///< input row stride (elements)
     int64_t out_stride; ///< output row stride (elements)

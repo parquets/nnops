@@ -1390,7 +1390,7 @@ NNOPS_TEST(validation_rejects) {
         auto op = Lstm::create(bad);
         NNOPS_EXPECT_EQ(op->validate(make(5), gout), Status::unsupported);
     }
-    // Channel-last is not a layout this kernel reads.
+    // NHWC is not a layout this kernel reads.
     {
         LstmAttributes last;
         last.hidden_size = 5;

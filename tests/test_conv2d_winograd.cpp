@@ -1,16 +1,16 @@
 /// @file test_conv2d_winograd.cpp
-/// @brief Unit tests for the channel-last Winograd Conv2D path (k3s1),
+/// @brief Unit tests for the Winograd Conv2D path (k3s1),
 ///        F(2×2,3×3) and F(4×4,3×3).
 ///
 /// The weight transform is checked against a naive scalar reference written
 /// longhand from each order's definition; the F(4,3) input and output
-/// transforms are checked on channel-last planes. The order policy is pinned at
+/// transforms are checked on NHWC planes. The order policy is pinned at
 /// its fences: winograd_applicable's admission and wino_pick_order's F(2,3) /
 /// F(4,3) decision.
 ///
 /// The end-to-end Winograd-vs-reference cases live in
-/// test_conv2d_channel_last, where the activation, the HWIO filter and the
-/// prepacked U are all channel-last.
+/// test_conv2d, where the activation, the HWIO filter and the prepacked U are
+/// all NHWC.
 ///
 /// Winograd and direct convolution are algebraically equal but not bit-identical
 /// (the transform reorders the sums and, at f16, adds a rounding step), so those
@@ -173,7 +173,7 @@ NNOPS_TEST(wino_weight_transform_plane_strides) {
 }
 
 // ============================================================
-// F(4,3) transforms (channel-last route)
+// F(4,3) transforms
 // ============================================================
 
 NNOPS_TEST(wino43_weight_transform_matches_naive) {
@@ -201,7 +201,7 @@ NNOPS_TEST(wino43_weight_transform_matches_naive) {
 }
 
 NNOPS_TEST(wino43_input_transform_matches_naive) {
-    // A 12x12 channel-last plane holds four 4x4 tiles in a row and three tile rows; the
+    // A 12x12 NHWC plane holds four 4x4 tiles in a row and three tile rows; the
     // window of the corner tile reads four rows and columns of zeros.
     constexpr int IH = 12, IW = 12, IC = 8;
     constexpr int64_t kVPlane = 8;  // one tile per position
@@ -291,7 +291,7 @@ NNOPS_TEST(wino_applicable_thresholds) {
     NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 6, 14));   // too short
     NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 14, 6));   // too narrow
 
-    // The channel-last plane floor is 7x7: it flattens its tiles and keeps
+    // The plane floor is 7x7: it flattens its tiles and keeps
     // winning down to one tile row.
     NNOPS_EXPECT_TRUE(winograd_applicable(a, 64, 7, 7));
     NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 6, 7));
@@ -322,7 +322,7 @@ NNOPS_TEST(wino_pick_order_fences) {
     // f16 keeps F(2,3) at every width and plane.
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56) ==
                       WinoOrder::F23);
-    // The channel-last floor moves with the team: a 14x14 plane is one
+    // The floor moves with the team: a 14x14 plane is one
     // whole-plane block on a small pool (1.47x of F(2,3) at 1 thread on
     // 256->256), and past four workers that block stops filling the pool
     // (0.60x at 20).

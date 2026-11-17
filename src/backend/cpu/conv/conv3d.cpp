@@ -1,5 +1,5 @@
 /// @file conv3d.cpp
-/// @brief CPU Conv3D (NDHWC, f32/f16) — channel-last im2col → GEMM, with the
+/// @brief CPU Conv3D (NDHWC, f32/f16) — im2col → GEMM, with the
 ///        scalar gather as the fallback.
 ///
 /// Forward convolution is the easy direction for a col matrix: the gathered
@@ -11,7 +11,7 @@
 ///   C = [pixels × OC/G],
 ///
 /// and what is left is the epilogue pass that writes the tile out. A tap of a
-/// channel-last activation is a contiguous IC/G-channel run, so the gather is
+/// NDHWC activation is a contiguous IC/G-channel run, so the gather is
 /// one vector copy per tap; the GEMM's C rows are pixels and its columns are
 /// output channels, which is exactly the destination's own order.
 ///
@@ -32,7 +32,7 @@
 /// output-driven gather, which is correct for every shape.
 ///
 /// The weight stays [OC, IC/G, KD, KH, KW]; both the input and the output are
-/// stored channel-last ([N, D, H, W, C] in memory, logical dims
+/// stored NDHWC ([N, D, H, W, C] in memory, logical dims
 /// [N, C, D, H, W]).
 
 #include "nnops/ops/conv3d.hpp"

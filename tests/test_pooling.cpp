@@ -1,8 +1,8 @@
-/// Unit tests for Pooling — channel-last.
+/// Unit tests for Pooling on NHWC/NDHWC planes.
 ///
-/// The channel-first scalar reference holds the truth; the channel-last run is
-/// converted back to channel-first for the comparison. The quantization lane is
-/// the channel, so a quantized plane is channel-last as well.
+/// The scalar reference, written in dense order, holds the truth; the run is
+/// converted back to that order for the comparison. The quantization lane is
+/// the channel, so a quantized plane is stored channels-innermost as well.
 ///
 /// Window walks: the kernels, the reference and the tests share one convention —
 /// taps are spaced by the dilation and only the leading pad exists explicitly, the
@@ -25,7 +25,7 @@
 
 using namespace nnops;
 
-// Forward declare the reference pooling kernel (channel-first scalar, ground truth).
+// Forward declare the reference pooling kernel (scalar, dense order, ground truth).
 namespace nnops::backend::cpu::reference {
     void pooling_ref(const PoolingAttributes& attrs,
                      TensorView& output,
@@ -35,8 +35,8 @@ namespace nnops::backend::cpu::reference {
 }
 
 // ============================================================
-// Quantized pooling (s8/u8, PerTensor) — channel-last only: the kernel lanes the
-// channel, where a channel-first plane lanes output width
+// Quantized pooling (s8/u8, PerTensor): the kernel lanes the channel, which is
+// the innermost axis of the stored plane
 // ============================================================
 
 static QuantParams make_per_tensor_q(float scale, int32_t zp) {
@@ -48,9 +48,9 @@ static QuantParams make_per_tensor_q(float scale, int32_t zp) {
 }
 
 // ============================================================
-// Channel-last pooling — the lane is the channel, so a plane is
-// stored [N][H][W][C]. Each case keeps a copy in both orders and compares the
-// channel-last result, converted back, against the channel-first reference.
+// Pooling — the lane is the channel, so a plane is stored [N][H][W][C]. Each
+// case keeps a copy in both orders and compares the result, converted back,
+// against the scalar reference.
 // ============================================================
 
 /// Product of the spatial dims of a [N, C, (D,) H, W] shape.
@@ -92,7 +92,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& shape,
 
     auto op = Pooling::create(attrs, Backend::CPU);
 
-    // ---- Reference, in the channel-first order ----------------------------------
+    // ---- Reference, in dense order ----------------------------------------------
     const TensorDesc ref_in[] = {in_channel_first.desc()};
     auto ref_descs = op->getOutputTensorDesc(ref_in);
     const int64_t outS  = pool_spatial_elems(ref_descs[0].dims);
@@ -107,7 +107,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& shape,
         backend::cpu::reference::pooling_ref(attrs, ref, r, ctx, nullptr);
     }
 
-    // ---- The same values, in the channel-last order ----------------------
+    // ---- The same values, in NHWC order ----------------------------------
     const auto in_cl_f = test::to_channel_last<float>(in_vec, N, C, inS);
     std::vector<T> in_cl(in_cl_f.size());
     for (size_t i = 0; i < in_cl.size(); ++i) { in_cl[i] = to_T(in_cl_f[i]); }
@@ -127,7 +127,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& shape,
     const TensorView ins[] = {in_v};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out_v, ins)));
 
-    // ---- Back to the channel-first order for the comparison ----------------------
+    // ---- Back to dense order for the comparison ---------------------------------
     const auto got = test::to_channel_first<T>(out_buf, N, C, outS);
     for (int64_t i = 0; i < out_n; ++i) {
         NNOPS_EXPECT_NEAR(as_f(got[static_cast<size_t>(i)]),
@@ -135,7 +135,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& shape,
     }
 }
 
-NNOPS_TEST(pooling_channel_last_max_padding) {
+NNOPS_TEST(pooling_max_padding) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {1, 3, 3};
@@ -144,7 +144,7 @@ NNOPS_TEST(pooling_channel_last_max_padding) {
     test_channel_last_vs_ref<float>({1, 8, 10, 10}, attrs, 1e-4f);
 }
 
-NNOPS_TEST(pooling_channel_last_max_stride2_odd_width) {
+NNOPS_TEST(pooling_max_stride2_odd_width) {
     // Odd width and a short channel block (C=5) at once: the 16-lane chunk
     // runs with five live lanes.
     PoolingAttributes attrs;
@@ -155,7 +155,7 @@ NNOPS_TEST(pooling_channel_last_max_stride2_odd_width) {
     test_channel_last_vs_ref<float>({2, 5, 13, 15}, attrs, 1e-4f);
 }
 
-NNOPS_TEST(pooling_channel_last_avg_padding) {
+NNOPS_TEST(pooling_avg_padding) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.kernel_shape = {1, 3, 3};
@@ -164,7 +164,7 @@ NNOPS_TEST(pooling_channel_last_avg_padding) {
     test_channel_last_vs_ref<float>({1, 16, 9, 9}, attrs, 1e-4f);
 }
 
-NNOPS_TEST(pooling_channel_last_avg_exclude_pad) {
+NNOPS_TEST(pooling_avg_exclude_pad) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.exclude_pad  = true;
@@ -174,7 +174,7 @@ NNOPS_TEST(pooling_channel_last_avg_exclude_pad) {
     test_channel_last_vs_ref<float>({1, 3, 7, 7}, attrs, 1e-4f);
 }
 
-NNOPS_TEST(pooling_channel_last_add_to) {
+NNOPS_TEST(pooling_add_to) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.add_to       = true;
@@ -183,7 +183,7 @@ NNOPS_TEST(pooling_channel_last_add_to) {
     test_channel_last_vs_ref<float>({1, 8, 8, 8}, attrs, 1e-4f);
 }
 
-NNOPS_TEST(pooling_channel_last_f16) {
+NNOPS_TEST(pooling_f16) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.kernel_shape = {1, 2, 2};
@@ -191,7 +191,7 @@ NNOPS_TEST(pooling_channel_last_f16) {
     test_channel_last_vs_ref<backend::cpu::half>({1, 8, 8, 8}, attrs, 5e-3f);
 }
 
-NNOPS_TEST(pooling_channel_last_global) {
+NNOPS_TEST(pooling_global) {
     // The whole-plane form: one pixel out per image, so with few rows the
     // split has nothing but the channel axis.
     PoolingAttributes attrs;
@@ -204,7 +204,7 @@ NNOPS_TEST(pooling_channel_last_global) {
     test_channel_last_vs_ref<float>({2, 11, 9, 13}, mx, 1e-4f);
 }
 
-NNOPS_TEST(pooling_channel_last_3d) {
+NNOPS_TEST(pooling_3d) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {2, 2, 2};
@@ -212,7 +212,7 @@ NNOPS_TEST(pooling_channel_last_3d) {
     test_channel_last_vs_ref<float>({1, 4, 6, 8, 8}, attrs, 1e-4f);
 }
 
-NNOPS_TEST(pooling_channel_last_3d_avg_padding) {
+NNOPS_TEST(pooling_3d_avg_padding) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.kernel_shape = {2, 2, 2};
@@ -221,7 +221,7 @@ NNOPS_TEST(pooling_channel_last_3d_avg_padding) {
     test_channel_last_vs_ref<float>({1, 5, 4, 5, 6}, attrs, 1e-4f);
 }
 
-NNOPS_TEST(pooling_channel_last_2d_dilation) {
+NNOPS_TEST(pooling_2d_dilation) {
     // C = 5 ends on a short block, and the dilated window keeps the row-group
     // walk's bounds checks busy on the clipped side windows.
     PoolingAttributes attrs;
@@ -242,7 +242,7 @@ NNOPS_TEST(pooling_channel_last_2d_dilation) {
     test_channel_last_vs_ref<backend::cpu::half>({1, 16, 8, 8}, attrs, 5e-3f);
 }
 
-NNOPS_TEST(pooling_channel_last_3d_dilation) {
+NNOPS_TEST(pooling_3d_dilation) {
     PoolingAttributes attrs;
     attrs.type         = PoolingType::Average;
     attrs.kernel_shape = {2, 2, 2};
@@ -250,7 +250,7 @@ NNOPS_TEST(pooling_channel_last_3d_dilation) {
     test_channel_last_vs_ref<float>({1, 6, 5, 6, 7}, attrs, 1e-4f);
 }
 
-// ---- Quantized, channel-last -------------------------------------------
+// ---- Quantized ---------------------------------------------------------
 
 template <typename InT, typename OutT>
 static void pooling_q_channel_last_test(const std::vector<int64_t>& shape,
@@ -282,7 +282,7 @@ static void pooling_q_channel_last_test(const std::vector<int64_t>& shape,
 
     auto op = Pooling::create(attrs, Backend::CPU);
 
-    // ---- Reference (channel-first, ground truth) ----
+    // ---- Reference (dense order, ground truth) ----
     const TensorDesc ref_in[] = {in_channel_first.desc()};
     auto ref_desc = op->getOutputTensorDesc(ref_in)[0];
     const int64_t outS = pool_spatial_elems(ref_desc.dims);
@@ -296,7 +296,7 @@ static void pooling_q_channel_last_test(const std::vector<int64_t>& shape,
         backend::cpu::reference::pooling_ref(attrs, ref_out, ins, ctx, nullptr);
     }
 
-    // ---- Channel-last run --------------------------------------------------
+    // ---- The run under test ------------------------------------------------
     auto in_cl = test::to_channel_last<InT>(in_data, N, C, inS);
     const TensorLayout cl = (shape.size() == 5) ? TensorLayout::NDHWC
                                                 : TensorLayout::NHWC;
@@ -325,7 +325,7 @@ static void pooling_q_channel_last_test(const std::vector<int64_t>& shape,
     }
 }
 
-NNOPS_TEST(pooling_q_channel_last_max_fast_path) {
+NNOPS_TEST(pooling_q_max_fast_path) {
     // Matching scale/zero_point and dtype: the raw-integer max, on full blocks.
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
@@ -336,7 +336,7 @@ NNOPS_TEST(pooling_q_channel_last_max_fast_path) {
         make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
 }
 
-NNOPS_TEST(pooling_q_channel_last_max_short_block) {
+NNOPS_TEST(pooling_q_max_short_block) {
     // C=5: the block is five lanes, short of the eight-lane fast path, so it
     // dequantizes.
     PoolingAttributes attrs;
@@ -347,7 +347,7 @@ NNOPS_TEST(pooling_q_channel_last_max_short_block) {
         make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
 }
 
-NNOPS_TEST(pooling_q_channel_last_max_scale_change) {
+NNOPS_TEST(pooling_q_max_scale_change) {
     // Differing scale and zero_point: the max cannot run on the raw integers,
     // so it dequantizes, compares, and requantizes.
     PoolingAttributes attrs;
@@ -358,7 +358,7 @@ NNOPS_TEST(pooling_q_channel_last_max_scale_change) {
         make_per_tensor_q(2.0f, 0), make_per_tensor_q(1.0f, 128));
 }
 
-NNOPS_TEST(pooling_q_channel_last_u8_to_s8) {
+NNOPS_TEST(pooling_q_u8_to_s8) {
     // Mixed dtype (u8 -> s8) takes the same float path.
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
@@ -368,7 +368,7 @@ NNOPS_TEST(pooling_q_channel_last_u8_to_s8) {
         make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
 }
 
-NNOPS_TEST(pooling_q_channel_last_avg_exclude_pad) {
+NNOPS_TEST(pooling_q_avg_exclude_pad) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.exclude_pad  = true;
@@ -379,7 +379,7 @@ NNOPS_TEST(pooling_q_channel_last_avg_exclude_pad) {
         make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
 }
 
-NNOPS_TEST(pooling_q_channel_last_avg_reqantize) {
+NNOPS_TEST(pooling_q_avg_reqantize) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.kernel_shape = {1, 3, 3};
@@ -389,9 +389,9 @@ NNOPS_TEST(pooling_q_channel_last_avg_reqantize) {
         make_per_tensor_q(2.0f, 0), make_per_tensor_q(1.0f, 128));
 }
 
-NNOPS_TEST(pooling_q_channel_last_global) {
+NNOPS_TEST(pooling_q_global) {
     // Quantized global takes the window walk with the window spelled out; the
-    // Channel-last driver then runs it a row group at a time.
+    // driver then runs it a row group at a time.
     const auto qp = make_per_tensor_q(1.0f, 0);
     PoolingAttributes attrs;
     attrs.type   = PoolingType::Average;
@@ -406,10 +406,10 @@ NNOPS_TEST(pooling_q_channel_last_global) {
 // ============================================================
 // Adaptive pooling — the window of output index o spans
 // [floor(o·I/O), ceil((o+1)·I/O)) on each axis, so a size whose I % O != 0 has
-// no fixed kernel/stride form. The channel-first reference walks the same bounds.
+// no fixed kernel/stride form. The scalar reference walks the same bounds.
 // ============================================================
 
-NNOPS_TEST(pooling_adaptive_channel_last) {
+NNOPS_TEST(pooling_adaptive) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.output_size = {0, 3, 4};
@@ -420,14 +420,14 @@ NNOPS_TEST(pooling_adaptive_channel_last) {
     test_channel_last_vs_ref<float>({2, 11, 7, 13}, mx, 1e-4f);
 }
 
-NNOPS_TEST(pooling_adaptive_channel_last_3d) {
+NNOPS_TEST(pooling_adaptive_3d) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
     attrs.output_size = {2, 2, 3};
     test_channel_last_vs_ref<float>({1, 4, 5, 6, 7}, attrs, 1e-4f);
 }
 
-NNOPS_TEST(pooling_adaptive_channel_last_f16) {
+NNOPS_TEST(pooling_adaptive_f16) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.output_size = {0, 3, 3};

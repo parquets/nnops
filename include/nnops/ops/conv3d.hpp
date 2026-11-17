@@ -1,10 +1,10 @@
 #pragma once
 /// @file conv3d.hpp
-/// @brief 3D convolution, channel-last (NDHWC).
+/// @brief 3D convolution over NDHWC activations.
 ///
 /// Input [N, IC, ID, IH, IW] stored NDHWC, weight [OC, IC/G, KD, KH, KW]
 /// (ONNX-style, also when grouped), output [N, OC, OD, OH, OW] stored NDHWC,
-/// optional bias [OC]. Grouped and dilated; channel-last only.
+/// optional bias [OC]. Grouped and dilated.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

@@ -1,8 +1,8 @@
 /// @file test_depthwise_conv.cpp
-/// @brief DepthwiseConv tests — channel-last.
+/// @brief DepthwiseConv tests on NHWC activations.
 ///
-/// The same values in both orders — channel-first plus the raw channel-first
-/// filter for the reference, channel-last plus TensorFlow's [KD][KH][KW][C]
+/// The same values in both orders — dense plus the raw [C, 1, ...] filter for
+/// the reference, NHWC plus TensorFlow's [KD][KH][KW][C]
 /// filter for the kernel. The route reads the filter as the graph holds it, so
 /// the only plumbing is the transpose between the orders. A call covers 8
 /// channels, or 16 (two vectors) where the 3x3 kernel can take both halves —
@@ -64,7 +64,7 @@ static QuantParams make_per_channel(const std::vector<float>& scales,
 }
 
 // ============================================================
-// Channel-last depthwise conv — channel-last activation, HWCM filter
+// Depthwise conv — NHWC activation, HWCM filter
 // ============================================================
 
 /// Taps of a depthwise filter, whose shape is [C, 1, (KD,) KH, KW].
@@ -126,7 +126,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
 
     auto op = DepthwiseConv::create(attrs, Backend::CPU);
 
-    // ---- Reference, in the channel-first order ----------------------------------
+    // ---- Reference, in dense order ----------------------------------------------
     const TensorDesc ref_in[] = {in_channel_first.desc(), w_channel_first.desc(), b_channel_first.desc()};
     auto ref_descs = op->getOutputTensorDesc(
         std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
@@ -148,7 +148,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
             attrs, ref, std::span<const TensorView>(r, has_bias ? 3 : 2), ctx, nullptr);
     }
 
-    // ---- The same values, in the channel-last order ----------------------
+    // ---- The same values, in NHWC order ----------------------------------
     const auto in_cl_f = test::to_channel_last<float>(in_vec, N, C, inS);
     const auto w_cl_f  = test::depthwise_to_hwcm<float>(w_vec, C, taps);
     std::vector<T> in_cl(in_cl_f.size());
@@ -198,7 +198,7 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
     if (has_bias) { ins.push_back(b_v); }
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out_v, ins)));
 
-    // ---- Back to the channel-first order for the comparison ---------------------
+    // ---- Back to dense order for the comparison ---------------------------------
     const auto got = test::to_channel_first<T>(out_buf, N, C, outS);
     for (int64_t i = 0; i < out_n; ++i) {
         NNOPS_EXPECT_NEAR(as_f(got[static_cast<size_t>(i)]),
@@ -206,50 +206,50 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
     }
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_basic) {
+NNOPS_TEST(dwconv_vs_ref_basic) {
     test_channel_last_vs_ref<float>({2, 8, 16, 16}, {8, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}},
         false, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_partial_block) {
+NNOPS_TEST(dwconv_vs_ref_partial_block) {
     // C=5: an 8-lane call with three lanes masked; OH=7 leaves a three-row group.
     test_channel_last_vs_ref<float>({1, 5, 9, 11}, {5, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}},
         false, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_stride2_padding) {
+NNOPS_TEST(dwconv_vs_ref_stride2_padding) {
     test_channel_last_vs_ref<float>({1, 6, 14, 13}, {6, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}},
         false, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_dilation) {
+NNOPS_TEST(dwconv_vs_ref_dilation) {
     test_channel_last_vs_ref<float>({1, 4, 10, 10}, {4, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 2, 2}, {0, 0, 0}},
         false, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_bias) {
+NNOPS_TEST(dwconv_vs_ref_bias) {
     test_channel_last_vs_ref<float>({2, 8, 8, 8}, {8, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         true, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_add_to) {
+NNOPS_TEST(dwconv_vs_ref_add_to) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     attrs.add_to = true;
     test_channel_last_vs_ref<float>({1, 3, 8, 8}, {3, 1, 3, 3}, attrs, false, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_relu) {
+NNOPS_TEST(dwconv_vs_ref_relu) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     attrs.epilogue.type = EpilogueActivateType::Relu;
     test_channel_last_vs_ref<float>({1, 5, 6, 11}, {5, 1, 3, 3}, attrs, false, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_pre_act) {
+NNOPS_TEST(dwconv_vs_ref_pre_act) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     attrs.add_to = true;
     attrs.residual_pre_activation = true;
@@ -257,7 +257,7 @@ NNOPS_TEST(dwconv_channel_last_vs_ref_pre_act) {
     test_channel_last_vs_ref<float>({1, 5, 6, 11}, {5, 1, 3, 3}, attrs, false, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_pre_act_wide) {
+NNOPS_TEST(dwconv_vs_ref_pre_act_wide) {
     // C=17: the two-vector 3x3 kernel followed by the one-lane tail, both
     // reading their own destination before the epilogue.
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
@@ -267,7 +267,7 @@ NNOPS_TEST(dwconv_channel_last_vs_ref_pre_act_wide) {
     test_channel_last_vs_ref<float>({1, 17, 7, 7}, {17, 1, 3, 3}, attrs, true, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_pre_act_generic) {
+NNOPS_TEST(dwconv_vs_ref_pre_act_generic) {
     // A 1x1 filter keeps the 1x1 shape off the 3x3 kernels and on the generic
     // row kernel.
     DepthwiseConvAttributes attrs{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}};
@@ -277,7 +277,7 @@ NNOPS_TEST(dwconv_channel_last_vs_ref_pre_act_generic) {
     test_channel_last_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1}, attrs, false, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_f16_pre_act) {
+NNOPS_TEST(dwconv_vs_ref_f16_pre_act) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     attrs.add_to = true;
     attrs.residual_pre_activation = true;
@@ -286,13 +286,13 @@ NNOPS_TEST(dwconv_channel_last_vs_ref_f16_pre_act) {
         attrs, false, 5e-3f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_1x1_stride2) {
+NNOPS_TEST(dwconv_vs_ref_1x1_stride2) {
     test_channel_last_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1},
         DepthwiseConvAttributes{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}},
         false, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_multi_block) {
+NNOPS_TEST(dwconv_vs_ref_multi_block) {
     // C=17: one full sixteen-wide block plus a one-lane block; the plane is
     // small enough that the filter axis splits across tasks.
     test_channel_last_vs_ref<float>({1, 17, 7, 7}, {17, 1, 3, 3},
@@ -300,13 +300,13 @@ NNOPS_TEST(dwconv_channel_last_vs_ref_multi_block) {
         true, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_f16) {
+NNOPS_TEST(dwconv_vs_ref_f16) {
     test_channel_last_vs_ref<backend::cpu::half>({1, 8, 10, 10}, {8, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         false, 5e-3f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_f16_wide) {
+NNOPS_TEST(dwconv_vs_ref_f16_wide) {
     // The two-vector 3x3 kernel is generic over T; half is a different
     // `v_load`/`v_fmadd`, so it gets its own wide case.
     test_channel_last_vs_ref<backend::cpu::half>({1, 32, 10, 10}, {32, 1, 3, 3},
@@ -314,7 +314,7 @@ NNOPS_TEST(dwconv_channel_last_vs_ref_f16_wide) {
         true, 5e-3f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_wide_stride2) {
+NNOPS_TEST(dwconv_vs_ref_wide_stride2) {
     // C=16 is exactly one sixteen-wide block: the two-vector 3x3 kernel's
     // stride-2 instantiation, whose row table reads R*2+2 input rows instead of
     // R+2 — a different index set from the stride-1 cases above.
@@ -323,7 +323,7 @@ NNOPS_TEST(dwconv_channel_last_vs_ref_wide_stride2) {
         true, 1e-4f);
 }
 
-NNOPS_TEST(dwconv_channel_last_vs_ref_wide_block) {
+NNOPS_TEST(dwconv_vs_ref_wide_block) {
     // C=48: three full sixteen-wide blocks, each handed to the two-vector 3x3
     // kernel at its own width. Passing the *remaining* channel count instead
     // routes the full blocks through the generic path — the same values, so
@@ -339,10 +339,10 @@ NNOPS_TEST(dwconv_ndhwc_vs_ref_3d) {
         true, 1e-4f);
 }
 
-// ---- Quantized, channel-last: same task grid, HWCM weight ----------------
+// ---- Quantized: same task grid, HWCM weight ------------------------------
 
 template <typename InT, typename OutT>
-static void dwconv_q_channel_last_test(const std::vector<int64_t>& in_shape,
+static void dwconv_q_test(const std::vector<int64_t>& in_shape,
                                const std::vector<int64_t>& w_shape,
                                const DepthwiseConvAttributes& attrs,
                                const QuantParams& in_qp,
@@ -398,7 +398,7 @@ static void dwconv_q_channel_last_test(const std::vector<int64_t>& in_shape,
 
     auto op = DepthwiseConv::create(attrs, Backend::CPU);
 
-    // ---- Reference, in the channel-first order ----------------------------------
+    // ---- Reference, in dense order ----------------------------------------------
     const TensorDesc ref_in[] = {in_channel_first.desc(), w_channel_first.desc(), b_channel_first.desc()};
     auto ref_descs = op->getOutputTensorDesc(
         std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
@@ -423,7 +423,7 @@ static void dwconv_q_channel_last_test(const std::vector<int64_t>& in_shape,
             ctx, nullptr);
     }
 
-    // ---- Channel-last: channel-last activation, HWCM filter -----------------------
+    // ---- The run: NHWC activation, HWCM filter ------------------------------------
     auto in_cl = test::to_channel_last<InT>(in_data, N, C, inS);
     auto w_cl  = test::depthwise_to_hwcm<InT>(w_data, C, taps);
 
@@ -472,25 +472,25 @@ static void dwconv_q_channel_last_test(const std::vector<int64_t>& in_shape,
     }
 }
 
-NNOPS_TEST(dwconv_q_channel_last_s8_to_s8) {
+NNOPS_TEST(dwconv_q_s8_to_s8) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
     std::vector<float> wscales(8, 1.0f);
     std::vector<int32_t> wzps(8, 0);
-    dwconv_q_channel_last_test<int8_t, int8_t>({1, 8, 8, 8}, {8, 1, 3, 3}, attrs,
+    dwconv_q_test<int8_t, int8_t>({1, 8, 8, 8}, {8, 1, 3, 3}, attrs,
         make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
         make_per_tensor(1.0f, 0), false);
 }
 
-NNOPS_TEST(dwconv_q_channel_last_u8_to_u8_partial_bias) {
+NNOPS_TEST(dwconv_q_u8_to_u8_partial_bias) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     std::vector<float> wscales(5, 1.0f);
     std::vector<int32_t> wzps(5, 0);
-    dwconv_q_channel_last_test<uint8_t, uint8_t>({1, 5, 6, 6}, {5, 1, 3, 3}, attrs,
+    dwconv_q_test<uint8_t, uint8_t>({1, 5, 6, 6}, {5, 1, 3, 3}, attrs,
         make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
         make_per_tensor(1.0f, 128), true);
 }
 
-NNOPS_TEST(dwconv_q_channel_last_s8_pre_act) {
+NNOPS_TEST(dwconv_q_s8_pre_act) {
     // The quantized route dequantizes the destination into the sum, so the
     // clamp sees the residual on the correct side of the output quantizer.
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
@@ -499,12 +499,12 @@ NNOPS_TEST(dwconv_q_channel_last_s8_pre_act) {
     attrs.epilogue.type = EpilogueActivateType::Relu;
     std::vector<float> wscales(8, 1.0f);
     std::vector<int32_t> wzps(8, 0);
-    dwconv_q_channel_last_test<int8_t, int8_t>({1, 8, 8, 8}, {8, 1, 3, 3}, attrs,
+    dwconv_q_test<int8_t, int8_t>({1, 8, 8, 8}, {8, 1, 3, 3}, attrs,
         make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
         make_per_tensor(1.0f, 0), true);
 }
 
-NNOPS_TEST(dwconv_q_channel_last_u8_pre_act_clamp) {
+NNOPS_TEST(dwconv_q_u8_pre_act_clamp) {
     // u8 with a non-zero zero point and a clamp: the residual arrives as a
     // quantized value and must be dequantized around that zero point.
     DepthwiseConvAttributes attrs{{1, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
@@ -514,17 +514,17 @@ NNOPS_TEST(dwconv_q_channel_last_u8_pre_act_clamp) {
     attrs.epilogue.max_clip = 0.75f;
     std::vector<float> wscales(5, 1.0f);
     std::vector<int32_t> wzps(5, 0);
-    dwconv_q_channel_last_test<uint8_t, uint8_t>({1, 5, 6, 6}, {5, 1, 2, 2}, attrs,
+    dwconv_q_test<uint8_t, uint8_t>({1, 5, 6, 6}, {5, 1, 2, 2}, attrs,
         make_per_tensor(1.0f, 128), make_per_channel(wscales, wzps),
         make_per_tensor(1.0f, 128), true);
 }
 
-NNOPS_TEST(dwconv_q_channel_last_multi_block_s8) {
+NNOPS_TEST(dwconv_q_multi_block_s8) {
     // C=17: two full vectors, a one-lane tail, and a split channel axis.
     DepthwiseConvAttributes attrs{{1, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
     std::vector<float> wscales(17, 1.0f);
     std::vector<int32_t> wzps(17, 0);
-    dwconv_q_channel_last_test<int8_t, int8_t>({1, 17, 5, 5}, {17, 1, 2, 2}, attrs,
+    dwconv_q_test<int8_t, int8_t>({1, 17, 5, 5}, {17, 1, 2, 2}, attrs,
         make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
         make_per_tensor(1.0f, 0), false);
 }
@@ -632,7 +632,7 @@ static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
     }
 }
 
-NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last) {
+NNOPS_TEST(conv2d_group_eq_channels_depthwise) {
     // Padding, bias and a relu epilogue: the pieces the depthwise route has to
     // carry across, not just the multiply-add. Also an NHWC activation and an
     // HWIO [KH, KW, 1, C] filter.
@@ -641,7 +641,7 @@ NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last) {
     conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true);
 }
 
-NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last_pre_act) {
+NNOPS_TEST(conv2d_group_eq_channels_depthwise_pre_act) {
     // The reroute forwards the flag: a Conv2D with group == in_channels must
     // not silently apply its shortcut after the activation.
     DepthwiseConvAttributes dw{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
@@ -651,7 +651,7 @@ NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last_pre_act) {
     conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true);
 }
 
-NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last_add_to) {
+NNOPS_TEST(conv2d_group_eq_channels_depthwise_add_to) {
     // C=17 leaves a one-lane tail past two full vectors, and the filter is
     // smaller than its padding-free plane, so the output is not the input's size.
     DepthwiseConvAttributes dw{{1, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};

@@ -13,7 +13,7 @@
 /// The sweep exists because validate() admits bf16 wherever it admits f16
 /// (dtype_in), so an op whose kernel never learned bf16 would either assert or
 /// silently take an f16 path. MatMul has its own numeric suite in test_matmul;
-/// this file covers the rest of the operator surface, including the channel-last
+/// this file covers the rest of the operator surface, including the NHWC
 /// Conv2D/conv1d/depthwise/transpose variants, conv3d, the normalization
 /// and softmax kernels, embedding, pooling, the elementwise set and the
 /// movement ops.
@@ -629,7 +629,7 @@ void run_misc_ops()
                    2e-2f);
     }
     {
-        // Resize is channel-last: [N, H, W, C] in, [N, OH, OW, C] out.
+        // Resize takes NHWC: [N, H, W, C] in, [N, OH, OW, C] out.
         for (auto mode : {ResizeMode::Nearest, ResizeMode::Linear}) {
             ResizeAttributes a;
             a.mode = mode;

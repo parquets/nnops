@@ -1,5 +1,5 @@
 /// @file bench_depthwise.cpp
-/// @brief Depthwise conv throughput, channel-last.
+/// @brief Depthwise conv throughput.
 ///
 /// The channel lane vectorizes: one load feeds 16 channels at one output
 /// position, four output rows are unrolled, and each tap broadcasts one weight
@@ -186,12 +186,12 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
 
 }  // namespace
 
-NNOPS_BENCH(depthwise_channel_last) {
+NNOPS_BENCH(depthwise) {
     const std::vector<int> threads = bench_threads();
     const int iters = 20;
     const int rounds = 5;
 
-    std::printf("depthwise conv channel-last (lane=channel)\n");
+    std::printf("depthwise conv (lane=channel)\n");
     std::printf("  pool=%s  threads=", test::bench_pool_name());
     for (size_t i = 0; i < threads.size(); ++i) {
         std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");

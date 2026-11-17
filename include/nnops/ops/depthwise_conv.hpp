@@ -1,6 +1,6 @@
 #pragma once
 /// @file depthwise_conv.hpp
-/// @brief DepthwiseConv operator — per-channel 2D/3D convolution, channel-last.
+/// @brief DepthwiseConv operator — per-channel 2D/3D convolution on NHWC/NDHWC.
 ///
 /// One filter per input channel and no cross-channel mixing — the first half of
 /// a depthwise-separable convolution. The output has the input's channel count

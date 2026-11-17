@@ -1,6 +1,6 @@
 /// @file pooling.cu
 /// @brief CUDA implementation of 2D/3D spatial pooling — Max and Average — on a
-///        channel-last tensor.
+///        NHWC/NDHWC tensor.
 ///
 /// The lane spans channels: a thread owns one 16 B vector of a pixel (four f32
 /// or eight f16) and the window walk becomes one 128-bit load a tap. Adjacent
@@ -13,7 +13,7 @@
 /// rows share K-1 of their input rows, so ROWS+K-1 loads feed ROWS output rows,
 /// and each load contributes to up to K of them.
 ///
-/// Global pooling is a separate pair. A channel-last image reduces across
+/// Global pooling is a separate pair. An NHWC image reduces across
 /// pixels with one thread per channel vector, and the pixel range is split
 /// across blockDim.y so one image can fill the machine: the lanes of a warp
 /// still hold one pixel's channel vectors, which keeps the loads coalesced
@@ -43,7 +43,7 @@ struct PoolGeom {
     int64_t SD, SH, SW;
     int64_t DD, DH, DW;
     int64_t PD, PH, PW;
-    // Channel-last image/pixel/row strides
+    // NHWC image/pixel/row strides
     int64_t in_d_stride, in_row_stride;
     int64_t out_d_stride, out_row_stride;
     int64_t in_pix_stride, out_pix_stride;
@@ -53,7 +53,7 @@ struct PoolGeom {
 };
 
 // ============================================================
-// Channel-last — the lane spans channels
+// The vector kernel — the lane spans channels
 // ============================================================
 
 /// One output vector per thread, its position carried by the block axes: x is

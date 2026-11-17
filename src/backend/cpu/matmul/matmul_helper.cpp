@@ -27,7 +27,7 @@
 /// per-panel correction block is read at the call's kc (see matmul_packed_b_geom).
 ///
 /// tile_mma_direct's bias seeds the accumulator instead of reading C: `bias` is
-/// one value per output row, `col_bias` one per output column (channel-last
+/// one value per output row, `col_bias` one per output column (NHWC
 /// Conv2D, where a row is a pixel). Either one builds the tile, so it belongs on
 /// the first k-block only.
 

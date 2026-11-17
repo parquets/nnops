@@ -1,6 +1,6 @@
 #pragma once
 /// @file conv2d.hpp
-/// @brief 2D convolution — channel-last.
+/// @brief 2D convolution over NHWC activations.
 ///
 /// Input [N, IC, IH, IW] stored NHWC, weight HWIO [KH, KW, IC/G, OC] — there the
 /// tensor's *shape* is the filter itself — output [N, OC, OH, OW], bias [OC]. The
@@ -28,10 +28,10 @@
 /// algorithm != ImplicitGemm (the off switch), k3s1, at least 32 input channels
 /// per group, and a 7x7 plane floor. The transforms cost a fixed amount per tile
 /// per channel, so the 2.25x multiply saving needs wide K to pay for them (a
-/// wash at 8 channels, ~1.2x at 32, 1.5-1.6x at 128-256). Channel-last has no
-/// deinterleaving load, no strided column store and no 8-lane tile packing (its
-/// tiles are flattened, so a 7x7 plane's 16 tiles are exactly 16), and beats the
-/// channel-last implicit GEMM at every IC >= 32 shape down to 7x7: 0.50-0.59x of
+/// wash at 8 channels, ~1.2x at 32, 1.5-1.6x at 128-256). The spatial pose has
+/// no deinterleaving load, no strided column store and no 8-lane tile packing
+/// (its tiles are flattened, so a 7x7 plane's 16 tiles are exactly 16), and
+/// beats the implicit GEMM at every IC >= 32 shape down to 7x7: 0.50-0.59x of
 /// its time at 1 thread, and 2.2 ms of ResNet-18's 21.3 ms (7x7, 512->512) once
 /// the floor lets it in.
 

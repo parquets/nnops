@@ -11,7 +11,7 @@
 ///  - block-packed dtypes (q4_1) have no per-element size — data_type_size()
 ///    is 0 and strides step in 20-byte blocks — so every row/stride computation
 ///    goes through data_type_row_bytes() / data_type_stride_unit();
-///  - channel-last keeps C inside the row, so a row is one
+///  - NHWC/NDHWC keep C inside the row, so a row is one
 ///    spatial line: W pixels × C channels.
 ///
 /// The default layout is Dense: the logical dims are the memory order, with no
@@ -19,7 +19,7 @@
 /// default; a TensorView built with an explicit pitch accepts any value >= the
 /// minimum.
 ///   Dense uint8,        W=70:    pitch = 96  (70 rounded up to a multiple of 32)
-///   Channel-last uint8, W*C=56:  pitch = 64  (56 rounded up to a multiple of 32)
+///   NHWC uint8,         W*C=56:  pitch = 64  (56 rounded up to a multiple of 32)
 
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/tensor_layout.hpp"
@@ -248,7 +248,7 @@ public:
     /// pitch, so it may exceed shape[rank-1].
     int64_t stride_elems(int64_t dim) const noexcept {
         NNOPS_ASSERT(dim >= 0 && dim < rank_);
-        // Channel-last stores [N][spatial…][C]: C (dim 1) is the innermost
+        // A spatial layout stores [N][spatial…][C]: C (dim 1) is the innermost
         // axis, a spatial step moves a whole C block. A step in H is one row
         // pitch, so a pitched view's outer strides account for the padding.
         if (is_channel_last(layout_)) {
@@ -284,8 +284,8 @@ public:
 
     // ---- Layout-aware accessors ----
 
-    /// Channels per contiguously-stored block: channel-first keeps each channel as
-    /// its own block (C), channel-last packs all of C into every pixel (1
+    /// Channels per contiguously-stored block: a dense tensor keeps each channel
+    /// as its own block (C), NHWC/NDHWC packs all of C into every pixel (one
     /// channel block per spatial position).
     int64_t num_channel_blocks() const noexcept {
         if (rank_ < 2) {
@@ -307,7 +307,7 @@ public:
         return s;
     }
 
-    /// Flat row count: N × channel blocks × inner spatial dims (channel-last
+    /// Flat row count: N × channel blocks × inner spatial dims (NHWC/NDHWC
     /// has no channel axis in the count).
     int64_t total_rows() const noexcept {
         if (rank_ < 1) {

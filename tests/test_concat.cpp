@@ -1,9 +1,9 @@
 /// @file test_concat.cpp
-/// @brief Unit tests for Concat (CPU), channel-first and channel-last.
+/// @brief Unit tests for Concat (CPU) on dense and NHWC tensors.
 ///
-/// The channel-last cases are a convert → concat → convert-back roundtrip
-/// compared against concat_ref on the channel-first inputs; the C-axis ones exercise
-/// the interleaved-channel axis merge.
+/// The NHWC cases are a convert → concat → convert-back roundtrip compared
+/// against concat_ref on the dense inputs; the C-axis ones exercise the
+/// interleaved-channel axis merge.
 
 #include "nnops/ops/concat.hpp"
 #include "common/test_harness.hpp"
@@ -29,7 +29,7 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-/// Convert → concat → convert-back, compared against the channel-first reference.
+/// Convert → concat → convert-back, compared against the dense-order reference.
 void test_channel_last_concat(const std::vector<std::vector<int64_t>>& in_shapes,
                                int64_t axis,
                                DataType dtype = DataType::f32)
@@ -51,7 +51,7 @@ void test_channel_last_concat(const std::vector<std::vector<int64_t>>& in_shapes
         in_channel_firsts[static_cast<size_t>(i)] = tv;
     }
 
-    // Golden: concat_ref on the channel-first inputs.
+    // Golden: concat_ref on the dense-order inputs.
     ConcatAttributes attrs;
     attrs.axis = axis;
 
@@ -75,7 +75,7 @@ void test_channel_last_concat(const std::vector<std::vector<int64_t>>& in_shapes
         backend::cpu::reference::concat_ref(attrs, out_ref, ref_ins, ctx, nullptr);
     }
 
-    // Channel-last path: convert each input, concat, convert back.
+    // NHWC path: convert each input, concat, convert back.
     std::vector<std::vector<float>> cl_bufs(N);
     std::vector<TensorView> in_cls(N);
     for (int64_t i = 0; i < N; ++i) {
@@ -461,66 +461,66 @@ NNOPS_TEST(concat_op_type) {
 }
 
 // ============================================================
-// Channel-last layout tests
+// Layout tests
 // ============================================================
 
-NNOPS_TEST(concat_channel_last_axis0) {
-    // Concat on N axis with channel-last: [2, 3, 4, 4] + [1, 3, 4, 4] -> [3, 3, 4, 4]
+NNOPS_TEST(concat_nhwc_axis0) {
+    // Concat on N axis, NHWC: [2, 3, 4, 4] + [1, 3, 4, 4] -> [3, 3, 4, 4]
     test_channel_last_concat({{2, 3, 4, 4}, {1, 3, 4, 4}}, 0);
 }
 
-NNOPS_TEST(concat_channel_last_axis1_c3_c5) {
+NNOPS_TEST(concat_nhwc_axis1_c3_c5) {
     // Concat on C axis: 3ch + 5ch → 8ch (single channel block)
     test_channel_last_concat({{1, 3, 4, 4}, {1, 5, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_channel_last_axis1_c7_c5) {
+NNOPS_TEST(concat_nhwc_axis1_c7_c5) {
     // C axis: 7ch + 5ch → 12ch 
     test_channel_last_concat({{1, 7, 4, 4}, {1, 5, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_channel_last_axis1_c10_c6) {
+NNOPS_TEST(concat_nhwc_axis1_c10_c6) {
     // C axis: 10ch + 6ch → 16ch 
     test_channel_last_concat({{1, 10, 4, 4}, {1, 6, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_channel_last_axis1_c2_c3_c3) {
+NNOPS_TEST(concat_nhwc_axis1_c2_c3_c3) {
     // Three inputs on C axis: 2ch + 3ch + 3ch → 8ch
     test_channel_last_concat({{1, 2, 4, 4}, {1, 3, 4, 4}, {1, 3, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_channel_last_axis1_c1_c1) {
+NNOPS_TEST(concat_nhwc_axis1_c1_c1) {
     // Small C: 1 + 1 → 2 
     test_channel_last_concat({{1, 1, 8, 8}, {1, 1, 8, 8}}, 1);
 }
 
-NNOPS_TEST(concat_channel_last_axis1_multibatch) {
+NNOPS_TEST(concat_nhwc_axis1_multibatch) {
     // Multi-batch C-axis concat: N=2
     test_channel_last_concat({{2, 5, 4, 4}, {2, 3, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_channel_last_axis2_H) {
-    // Concat on H axis with channel-last: [1, 3, 4, 4] + [1, 3, 6, 4] -> [1, 3, 10, 4]
+NNOPS_TEST(concat_nhwc_axis2_H) {
+    // Concat on H axis, NHWC: [1, 3, 4, 4] + [1, 3, 6, 4] -> [1, 3, 10, 4]
     test_channel_last_concat({{1, 3, 4, 4}, {1, 3, 6, 4}}, 2);
 }
 
-NNOPS_TEST(concat_channel_last_axis3_W) {
-    // Concat on W axis with channel-last: [1, 3, 4, 6] + [1, 3, 4, 4] -> [1, 3, 4, 10]
+NNOPS_TEST(concat_nhwc_axis3_W) {
+    // Concat on W axis, NHWC: [1, 3, 4, 6] + [1, 3, 4, 4] -> [1, 3, 4, 10]
     test_channel_last_concat({{1, 3, 4, 6}, {1, 3, 4, 4}}, 3);
 }
 
-NNOPS_TEST(concat_channel_last_axis2_H_multi_c8) {
+NNOPS_TEST(concat_nhwc_axis2_H_multi_c8) {
     // H-axis concat with multiple channel planes (C=10)
     test_channel_last_concat({{1, 10, 4, 4}, {1, 10, 6, 4}}, 2);
 }
 
-NNOPS_TEST(concat_channel_last_axis0_multi_c8) {
+NNOPS_TEST(concat_nhwc_axis0_multi_c8) {
     // N-axis concat with multiple channel planes
     test_channel_last_concat({{2, 10, 4, 4}, {1, 10, 4, 4}}, 0);
 }
 
 // ============================================================
-// 3D channel-last layout tests (channel-last 3D)
+// 3D layout tests (NDHWC)
 // ============================================================
 
 NNOPS_TEST(concat_ndhwc_axis1_C) {

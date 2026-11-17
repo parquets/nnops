@@ -1,9 +1,9 @@
 #pragma once
 /// @file conv2d_implicit_gemm.h
-/// @brief Conv2D as implicit GEMM, channel-last.
+/// @brief Conv2D as implicit GEMM over NHWC activations.
 ///
 /// Conv2D over an im2col matrix is a GEMM with the operands laid out for the
-/// channel-last activation:
+/// NHWC activation:
 ///
 ///     M = pixels, N = oc block, K = karea × ic block, tap-major
 ///     A = the activation tile (the input row itself for a 1x1)
@@ -126,10 +126,10 @@ inline int64_t gemm_set_elems(int64_t panels_per_oc, int64_t kdim, int64_t nr_ma
     return panels_per_oc * gemm_panel_slot(kdim, nr_max, esz, quant, bf16);
 }
 
-/// Geometry of the channel-last prepacked filter (PackedHWIO): the blob is
+/// Geometry of the prepacked filter (PackedHWIO): the blob is
 /// [group][oc block][k block][panel][k][nr], panels of `nr` output channels.
 /// The two outer axes are the reader's own loop nest — the driver walks oc block
-/// → pixel pass → k block → panel ([conv2d_implicit_gemm.cpp], the channel-last
+/// → pixel pass → k block → panel ([conv2d_implicit_gemm.cpp], the
 /// task) — so one oc block's whole filter is one contiguous run taken in order,
 /// and a cold filter streams once instead of in `panels_oc`-strided slices.
 /// The trailing k block packs a shorter k, hence a shorter panel stride.
@@ -179,8 +179,8 @@ struct ConvPackedWeightLast {
     }
 };
 
-/// Resolve the channel-last prepacked geometry; it is also the channel-last
-/// plan's block sizes (the plan reads icn_block/ocn_block from here), so the
+/// Resolve the prepacked geometry; it is also the im2col plan's block sizes
+/// (the plan reads icn_block/ocn_block from here), so the
 /// panels it sizes and the panels prepackWeights builds cannot disagree.
 ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs, int64_t ic_per_group,
                                              int64_t oc_per_group, DataType weight_dtype);
@@ -228,7 +228,7 @@ inline Conv2DGemmScratch gemm_scratch_layout(const Conv2DGemmPlan& p, int64_t es
 }
 
 /// Resolve the plan (block sizes, parallel decomposition, workspace bytes) from
-/// the descriptors. The channel-last route needs the HWIO filter or its
+/// the descriptors. The im2col route needs the HWIO filter or its
 /// prepacked blob. A zeroed plan — `icn_block == 0`, not workspace_size — is the
 /// unsupported-dtype answer, which the kernel turns into Status::unsupported.
 /// Supported: f32/f16 on every tensor, or the int8 route — an s8 weight, a

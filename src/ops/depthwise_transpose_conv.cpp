@@ -2,13 +2,12 @@
 /// @brief DepthwiseTransposeConv2D operator dispatch — descriptor checks and
 ///        backend binding.
 ///
-/// One filter per channel, read raw: a channel-first activation takes the
-/// [C, 1, KH, KW] filter, a channel-last one the HWCM [KH][KW][C] form whose
-/// every tap is a contiguous run of C channels. There is no prepack either way
-/// — the storage order already is the access pattern the kernel wants. A
-/// channel-last activation also takes the [C, 1, KH, KW] filter, because that
-/// is what a grouped TransposeConv2D hands over when its group count meets its
-/// channel count; the entry repacks it to the per-tap order.
+/// One filter per channel, read raw: the HWCM [KH][KW][C] form, whose every tap
+/// is a contiguous run of C channels. There is no prepack — the storage order is
+/// already the access pattern the kernel wants. A caller may also hand the
+/// [C, 1, KH, KW] filter, because that is what a grouped TransposeConv2D passes
+/// over when its group count meets its channel count; the entry repacks it to
+/// the per-tap order.
 
 #include "nnops/ops/depthwise_transpose_conv.hpp"
 #include "nnops/detail/assert.hpp"

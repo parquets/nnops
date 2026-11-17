@@ -211,8 +211,8 @@ inline v_f16x8 v_load_stride2_odd(const half* p) {
     return v_load_stride2_odd_f16x8(reinterpret_cast<const uint16_t*>(p));
 }
 
-// bf16 has no native deinterleave load; the stride-2 gathers widen scalar-wise.
-// Only the stride-2 channel-first pooling path takes them.
+// bf16 has no native deinterleave load; the gated combine's even/odd picks
+// widen scalar-wise.
 inline v_f32x8x2_t v_deinterleave(const bfloat16* p) {
     float even[8], odd[8];
     for (int i = 0; i < 8; ++i) {

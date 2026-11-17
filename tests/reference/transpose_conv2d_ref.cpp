@@ -1,16 +1,16 @@
 /// @file transpose_conv2d_ref.cpp
-/// @brief channel-first scalar reference — used as correctness baseline for tests.
+/// @brief Dense-order scalar reference — used as correctness baseline for tests.
 ///
 /// Implements the scatter-add (input-driven) approach from ncnn Deconvolution:
 /// each input pixel, scaled by kernel weights, is accumulated into the
 /// appropriate output region.
 ///
-/// This kernel operates on channel-first tensors. It serves as the golden
-/// reference for verifying the channel-last SIMD implementation.
+/// This kernel operates on dense-order tensors. It serves as the golden
+/// reference for verifying the SIMD implementation.
 ///
-/// Weight layout: channel-first [IC, OC/G, KH, KW].
-/// Input:  channel-first [N, IC, IH, IW]
-/// Output: channel-first [N, OC, OH, OW]
+/// Weight layout: [IC, OC/G, KH, KW].
+/// Input:  [N, IC, IH, IW]
+/// Output: [N, OC, OH, OW]
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/core/parallel_for.hpp"

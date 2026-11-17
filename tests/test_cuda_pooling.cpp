@@ -9,7 +9,7 @@
 /// and both routes read the identical views, so nothing in the comparison
 /// depends on a layout conversion.
 ///
-/// The cases cover the channel-last vector lane and its scalar tail (C = 4/8
+/// The cases cover the channel-vector lane and its scalar tail (C = 4/8
 /// exactly, then 5 and 17, which leave one or nine channels for the scalar
 /// launch), plus the 3D forms, the flat fallback and global pooling.
 ///
@@ -50,7 +50,7 @@ void run_case(const PoolCase& c, const char* what)
     PoolingAttributes attrs = c.attrs;
     attrs.add_to = c.add_to;
 
-    // Channel-last views stay dense: their strides never consult the pitch.
+    // NHWC views stay dense: their strides never consult the pitch.
     HostTensor in = make_host_random(c.shape, c.dtype, false, 13, -1.0f, 1.0f,
                                      c.layout);
 
@@ -99,10 +99,10 @@ PoolingAttributes window(PoolingType type, int64_t k, int64_t stride = 1,
 }  // namespace
 
 // ============================================================
-// Channel-last
+// NHWC
 // ============================================================
 
-NNOPS_TEST(cuda_pooling_channel_last_vector_lane) {
+NNOPS_TEST(cuda_pooling_vector_lane) {
     // C = 4 (f32) and 8 (f16) divide the 16 B vector exactly; 5 and 17 leave a
     // scalar tail, both a short one and one longer than a vector.
     for (int64_t C : {4, 5, 8, 17}) {
@@ -111,35 +111,35 @@ NNOPS_TEST(cuda_pooling_channel_last_vector_lane) {
             c.shape = {2, C, 9, 11};
             c.layout = TensorLayout::NHWC;
             c.attrs = window(type, 3, 2, 1);
-            run_case(c, "cuda_pooling_channel_last_vector_lane");
+            run_case(c, "cuda_pooling_vector_lane");
         }
     }
 }
 
-NNOPS_TEST(cuda_pooling_channel_last_average_exclude_pad) {
+NNOPS_TEST(cuda_pooling_average_exclude_pad) {
     PoolCase c;
     c.shape = {1, 16, 8, 10};
     c.layout = TensorLayout::NHWC;
     c.attrs = window(PoolingType::Average, 3, 2, 1);
     c.attrs.exclude_pad = true;
-    run_case(c, "cuda_pooling_channel_last_average_exclude_pad");
+    run_case(c, "cuda_pooling_average_exclude_pad");
     c.add_to = true;
-    run_case(c, "cuda_pooling_channel_last_average_exclude_pad");
+    run_case(c, "cuda_pooling_average_exclude_pad");
 }
 
-NNOPS_TEST(cuda_pooling_channel_last_f16) {
+NNOPS_TEST(cuda_pooling_f16) {
     PoolCase c;
     c.shape = {1, 8, 7, 7};
     c.dtype = DataType::f16;
     c.layout = TensorLayout::NHWC;
     c.attrs = window(PoolingType::Max, 2, 2);
-    run_case(c, "cuda_pooling_channel_last_f16");
+    run_case(c, "cuda_pooling_f16");
     c.attrs = window(PoolingType::Average, 3, 1, 1);
-    run_case(c, "cuda_pooling_channel_last_f16");
+    run_case(c, "cuda_pooling_f16");
 }
 
-NNOPS_TEST(cuda_pooling_channel_last_rows) {
-    // Unit stride and a square kernel: the channel-last kernel that walks two
+NNOPS_TEST(cuda_pooling_rows) {
+    // Unit stride and a square kernel: the kernel that walks two
     // output rows per thread. The max window pads, so its last row is short;
     // the exclude_pad average divides by a count that changes at the border.
     for (DataType dt : {DataType::f32, DataType::f16}) {
@@ -148,10 +148,10 @@ NNOPS_TEST(cuda_pooling_channel_last_rows) {
         c.dtype = dt;
         c.layout = TensorLayout::NHWC;
         c.attrs = window(PoolingType::Max, 3, 1, 1);
-        run_case(c, "cuda_pooling_channel_last_rows");
+        run_case(c, "cuda_pooling_rows");
         c.attrs = window(PoolingType::Average, 2, 1, 1);
         c.attrs.exclude_pad = true;
-        run_case(c, "cuda_pooling_channel_last_rows");
+        run_case(c, "cuda_pooling_rows");
     }
     // A 3D unit-stride window takes the same walk with a depth loop.
     PoolCase d;
@@ -159,31 +159,31 @@ NNOPS_TEST(cuda_pooling_channel_last_rows) {
     d.layout = TensorLayout::NDHWC;
     d.attrs = window(PoolingType::Average, 3, 1, 1);
     d.attrs.exclude_pad = true;
-    run_case(d, "cuda_pooling_channel_last_rows");
+    run_case(d, "cuda_pooling_rows");
 }
 
-NNOPS_TEST(cuda_pooling_last_flat_fallback) {
+NNOPS_TEST(cuda_pooling_flat_fallback) {
     // (image, depth, row) past blockIdx.z's range, on a window that is neither
-    // square nor of the walkable sizes: the channel-last flat script.
+    // square nor of the walkable sizes: the flat script.
     PoolCase c;
     c.shape = {1, 8, 300, 250, 2};
     c.layout = TensorLayout::NDHWC;
     c.attrs = window(PoolingType::Max, 1, 1, 0);
-    run_case(c, "cuda_pooling_last_flat_fallback");
+    run_case(c, "cuda_pooling_flat_fallback");
 }
 
-NNOPS_TEST(cuda_pooling_channel_last_3d) {
+NNOPS_TEST(cuda_pooling_3d) {
     PoolCase c;
     c.shape = {1, 8, 3, 5, 6};
     c.layout = TensorLayout::NDHWC;
     c.attrs = window(PoolingType::Max, 2, 2);
-    run_case(c, "cuda_pooling_channel_last_3d");
+    run_case(c, "cuda_pooling_3d");
     c.attrs = window(PoolingType::Average, 2, 1, 1);
     c.attrs.exclude_pad = true;
-    run_case(c, "cuda_pooling_channel_last_3d");
+    run_case(c, "cuda_pooling_3d");
 }
 
-NNOPS_TEST(cuda_pooling_global_channel_last) {
+NNOPS_TEST(cuda_pooling_global_nhwc) {
     for (int64_t C : {8, 5, 17}) {
         for (PoolingType type : {PoolingType::Max, PoolingType::Average}) {
             PoolCase c;
@@ -191,7 +191,7 @@ NNOPS_TEST(cuda_pooling_global_channel_last) {
             c.layout = TensorLayout::NHWC;
             c.attrs.global = true;
             c.attrs.type = type;
-            run_case(c, "cuda_pooling_global_channel_last");
+            run_case(c, "cuda_pooling_global_nhwc");
         }
     }
     PoolCase d;
@@ -200,7 +200,7 @@ NNOPS_TEST(cuda_pooling_global_channel_last) {
     d.attrs.global = true;
     d.attrs.type = PoolingType::Average;
     d.add_to = true;
-    run_case(d, "cuda_pooling_global_channel_last");
+    run_case(d, "cuda_pooling_global_nhwc");
 }
 
 #endif  // NNOPS_HAS_CUDA

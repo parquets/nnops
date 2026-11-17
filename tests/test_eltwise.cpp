@@ -730,8 +730,8 @@ NNOPS_TEST(eltwise_quant_per_tensor_add_u8) {
 
 // ============================================================
 // NumPy broadcasting — the inputs' shapes are right-aligned and a size-1 axis
-// (or a missing axis) repeats. The channel-first and channel-last paths share the
-// odometer, so the layout only changes the strides.
+// (or a missing axis) repeats. The dense and NHWC paths share the odometer,
+// so the layout only changes the strides.
 // ============================================================
 
 NNOPS_TEST(eltwise_broadcast_scalar) {
@@ -860,8 +860,8 @@ NNOPS_TEST(eltwise_broadcast_add_to) {
     }
 }
 
-NNOPS_TEST(eltwise_broadcast_channel_last_per_channel) {
-    // [N,C,H,W] logical in channel-last storage, times a [1,C,1,1] per-channel scale.
+NNOPS_TEST(eltwise_broadcast_per_channel) {
+    // [N,C,H,W] logical in NHWC storage, times a [1,C,1,1] per-channel scale.
     constexpr int64_t N = 2, C = 3, H = 5, W = 4;
     auto [a_vec, a_channel_first] = test::make_random_tensor({N, C, H, W}, -2.0f, 2.0f);
     auto [s_vec, s] = test::make_random_tensor({1, C, 1, 1}, -2.0f, 2.0f);

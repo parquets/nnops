@@ -11,8 +11,8 @@
 ///
 /// The oracle is the CPU backend running the same attributes on the same input
 /// values — the contract is identical, so a difference is a CUDA bug. Rows are
-/// built with make_packed (a 32 B pitch) for channel-first tensors so the padded-stride
-/// path is the one under test; channel-last tensors must be dense, because their
+/// built with make_packed (a 32 B pitch) for dense tensors so the padded-stride
+/// path is the one under test; NHWC tensors must be dense, because their
 /// strides never consult the pitch.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
@@ -253,7 +253,7 @@ struct HostTensor {
 };
 
 /// Random host tensor over `shape`. `padded` gives it the 32 B row pitch the
-/// operators see in a graph; channel-last views must stay dense because their
+/// operators see in a graph; NHWC views must stay dense because their
 /// strides ignore the pitch.
 inline HostTensor make_host_random(std::span<const int64_t> shape, DataType dt,
                                    bool padded, uint64_t seed,
@@ -531,7 +531,7 @@ inline HostTensor bf16_rounded_host(const HostTensor& src)
 }
 
 /// The same values in bf16 storage. A pitched source keeps the 32 B row rule
-/// for the new width; a channel-last one stays dense.
+/// for the new width; an NHWC one stays dense.
 inline HostTensor to_bf16_host(const HostTensor& src, bool padded)
 {
     const TensorView& s = src.view;

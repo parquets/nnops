@@ -1,7 +1,7 @@
 /// @file multi_head_attention.cpp
 /// @brief MultiHeadAttention operator dispatch.
 ///
-/// Q, K, V [, mask] in f32 or f16, channel-first, merged [B, S, H*D] or explicit
+/// Q, K, V [, mask] in f32 or f16, dense rows, merged [B, S, H*D] or explicit
 /// [B, H, S, D]. The optional mask is positional and may still arrive as an
 /// empty view (absent, not malformed). Everything below the attribute copy is
 /// the shared CPU attention core.

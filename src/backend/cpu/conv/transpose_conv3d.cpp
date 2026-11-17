@@ -21,7 +21,7 @@
 /// operand views cannot describe: a pitched volume or a kernel taller than the
 /// per-row tap list.
 ///
-/// The weight stays channel-first [IC, OC/G, KD, KH, KW].
+/// The weight stays [IC, OC/G, KD, KH, KW].
 
 #include "nnops/ops/transpose_conv3d.hpp"
 #include "backend/cpu/conv/tconv_cl.h"
@@ -59,13 +59,13 @@ struct Geom3 {
 };
 
 // =========================================================================
-//  Channel-last (NDHWC)
+//  NDHWC
 // =========================================================================
 //
-// The 2-D channel-last col GEMM one axis deeper:
+// The 2-D NHWC col GEMM one axis deeper:
 // A is the volume as [ID·IH·IW] × [IC/G] voxels (a voxel's channels are
 // contiguous), B is the filter as [IC/G] × [KD·KH·KW·nc] taps, and the scatter
-// adds whole oc vectors out of the pixel-major col. It is the 2-D channel-last
+// adds whole oc vectors out of the pixel-major col. It is the 2-D NHWC
 // structure (transpose_conv2d.cpp) one axis deeper — see that file for why the
 // col beats the pixel kernel once the filter stops staying resident.
 //
@@ -73,7 +73,7 @@ struct Geom3 {
 // channel the vector axis, so the "col" is the input volume itself and each tap
 // is one weighted vector add per voxel.
 
-/// Channel-last through a col matrix — the 2-D route one axis deeper, and what
+/// NDHWC through a col matrix — the 2-D route one axis deeper, and what
 /// MNN's NC4HW4 deconvolution does: one GEMM per (batch, group) does the channel
 /// reduction for the whole volume, and a depth/height tap list plus a
 /// stride-residue scatter fold the col back. The chunk skeleton is tconv_cl.h's;
@@ -122,7 +122,7 @@ bool tconv3d_channel_last_gemm(const Geom3& gm, TensorView& output,
         });
 }
 
-/// Depthwise channel-last: one channel per group means group g's input channel
+/// Depthwise: one channel per group means group g's input channel
 /// is output channel g, so the vector axis is the channel itself and an output
 /// voxel accumulates the whole C-wide tap vector at once, the "col" being the
 /// input volume. The skeleton — the repack to [KD·KH·KW][C], the row scratch,

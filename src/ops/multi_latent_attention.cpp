@@ -1,7 +1,7 @@
 /// @file multi_latent_attention.cpp
 /// @brief MultiLatentAttention operator dispatch.
 ///
-/// Absorbed: Q and the packed latent KV [, mask], f32 or f16, channel-first,
+/// Absorbed: Q and the packed latent KV [, mask], f32 or f16, dense rows,
 /// merged [B, S, H*D] or explicit [B, H, S, D]. D = kv_lora_rank +
 /// qk_rope_head_dim on both inputs; the value is the leading v_head_dim
 /// channels of each latent row, so there is no third input. Non-absorbed

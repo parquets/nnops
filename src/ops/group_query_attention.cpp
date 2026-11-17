@@ -1,7 +1,7 @@
 /// @file group_query_attention.cpp
 /// @brief GroupQueryAttention operator dispatch.
 ///
-/// Q, K, V [, mask] in f32 or f16, channel-first, merged [B, S, H*D] or explicit
+/// Q, K, V [, mask] in f32 or f16, dense rows, merged [B, S, H*D] or explicit
 /// [B, H, S, D]. K and V carry kv_num_heads heads, so their rows are
 /// H_kv*D wide; query head h reads kv head h / (H / H_kv). Everything below
 /// the attribute copy is the shared CPU attention core.

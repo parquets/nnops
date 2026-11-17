@@ -1,9 +1,9 @@
 /// @file test_conv3d.cpp
-/// @brief Conv3D correctness tests — channel-last (NDHWC), f32 and f16.
+/// @brief Conv3D correctness tests — NDHWC, f32 and f16.
 ///
 /// Two kinds of case: hand-computed small shapes that pin exact output values,
 /// and random cases against reference::conv3d_channel_first_ref
-/// (tests/reference). The golden is dense channel-first, so each case converts
+/// (tests/reference). The golden is dense, so each case converts
 /// its activation to NDHWC for the operator and converts the operator's output
 /// back for the comparison. The pitched cases give the output or the filter a
 /// row stride wider than its row, which is what selects the staged write pass
@@ -30,7 +30,7 @@
 
 using namespace nnops;
 
-// Defined in tests/reference/; the dense channel-first scalar golden.
+// Defined in tests/reference/; the dense-order scalar golden.
 namespace nnops::backend::cpu::reference {
     void conv3d_channel_first_ref(const Conv3DAttributes& attrs,
                                   TensorView& output,

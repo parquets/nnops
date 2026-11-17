@@ -9,7 +9,7 @@
 /// produce identical bytes, not merely close ones — and that covers f16 and the
 /// integer dtypes without a widening pass.
 ///
-/// Inputs are channel-first and, where the operator accepts them, pitched: a
+/// Inputs are dense and, where the operator accepts them, pitched: a
 /// padded row is the case a stride-folded walk gets wrong, so several cases hand
 /// the kernels a 32 B pitch on the source.
 ///

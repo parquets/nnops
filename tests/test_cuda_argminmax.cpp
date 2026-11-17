@@ -11,14 +11,14 @@
 /// warp-a-row kernel, so a lone 1D tensor, a logits-shaped [N, V] and an axis
 /// longer than a warp are covered; any other axis takes the thread-per-output
 /// kernel, whose inner length is what decides the coalescing. The padded input
-/// covers the pitch model and the channel-last cases cover the strides the
+/// covers the pitch model and the NHWC cases cover the strides the
 /// reduction reads through, both of them with a batch above one so the outer
 /// step is exercised rather than only the first image.
 ///
 /// Ties and NaNs are built by hand: random data has neither, and both are the
 /// places where a GPU reduction tree drifts from a sequential walk.
 ///
-/// The walk reads strides, so a channel-last view and a pitched row are the same
+/// The walk reads strides, so an NHWC view and a pitched row are the same
 /// two groups with different terms: both get a group of their own here, and the
 /// CPU route for each is pinned by tests/test_argminmax.cpp against a written-out
 /// oracle rather than against the same strides read back.
@@ -73,7 +73,7 @@ struct ArgCase {
 /// The index tensors are s64, which the shared float comparison does not widen,
 /// so they are compared as integers. Both sides are dense, so the memory order is
 /// the comparison: the point of the test is that the two backends agree on where
-/// every index goes, and a padded or channel-last output would only hide that.
+/// every index goes, and a padded or NHWC output would only hide that.
 void expect_index_same(const HostTensor& got, const HostTensor& want, const char* what)
 {
     const int64_t n = got.view.numel();
@@ -271,30 +271,30 @@ NNOPS_TEST(cuda_argmax_padded) {
 }
 
 // ============================================================
-// Channel-last: the dims after the axis are interleaved
+// NHWC: the dims after the axis are interleaved
 // ============================================================
 
-NNOPS_TEST(cuda_argmax_channel_last) {
+NNOPS_TEST(cuda_argmax_nhwc) {
     {
         ArgCase c;   // the channel is the axis, the spatial tail is interleaved
         c.shape = {4, 16, 8, 8};
         c.axis = 1;
         c.layout = TensorLayout::NHWC;
-        run_case(c, "cuda_argmax_channel_last");
+        run_case(c, "cuda_argmax_nhwc");
     }
     {
         ArgCase c;   // a spatial axis: the channel sits inside the inner group
         c.shape = {2, 8, 12, 10};
         c.axis = 2;
         c.layout = TensorLayout::NHWC;
-        run_case(c, "cuda_argmax_channel_last");
+        run_case(c, "cuda_argmax_nhwc");
     }
     {
         ArgCase c;   // the batch axis: a single outer position, a wide tail
         c.shape = {4, 6, 5};
         c.axis = 0;
         c.layout = TensorLayout::NHWC;
-        run_case(c, "cuda_argmax_channel_last");
+        run_case(c, "cuda_argmax_nhwc");
     }
     {
         ArgCase c;   // keepdims, ArgMin, f16
@@ -305,7 +305,7 @@ NNOPS_TEST(cuda_argmax_channel_last) {
         c.use_argmin = true;
         c.dtype = DataType::f16;
         c.layout = TensorLayout::NHWC;
-        run_case(c, "cuda_argmax_channel_last");
+        run_case(c, "cuda_argmax_nhwc");
     }
 }
 

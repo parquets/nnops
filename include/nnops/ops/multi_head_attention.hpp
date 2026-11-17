@@ -7,7 +7,7 @@
 /// Q/K/V arrive as [B, S, H·D] (reshaped internally to [B, H, S, D]) or already
 /// as [B, H, S, D]; inputs[0..2] = Q, K, V and inputs[3] = optional additive
 /// mask, flat [Sq, Sk] shared by every batch and head or a per-head bias
-/// [B, H, Sq, Sk]. scale = 0 means 1/sqrt(head_dim). Channel-first layouts only.
+/// [B, H, Sq, Sk]. scale = 0 means 1/sqrt(head_dim).
 ///
 /// Chunked input: inputs[4] and inputs[5] are an optional past K and past V —
 /// the same layout as K/V, with Sk_past rows instead of Sk_new. The key run

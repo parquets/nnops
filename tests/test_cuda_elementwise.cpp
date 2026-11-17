@@ -12,7 +12,7 @@
 /// makes the row bases alternate off the 16 B bound, so half of them take the
 /// scalar fallback; an f16 row of 37 with a 32 B pitch keeps the bases aligned
 /// and exercises the tail instead. A 20 k-element row is past the shared-memory
-/// budget, so softmax re-reads it from global memory. Softmax is channel-last.
+/// budget, so softmax re-reads it from global memory. Softmax runs on NHWC.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
@@ -65,7 +65,7 @@ void run_softmax(std::vector<int64_t> shape, int64_t axis, DataType dt,
     attrs.log_softmax = log_softmax;
     attrs.temperature = temperature;
 
-    // Channel-last views must stay dense: their strides never consult the pitch.
+    // NHWC views must stay dense: their strides never consult the pitch.
     const bool pad = padded && !is_channel_last(layout);
     HostTensor in = make_host_random(shape, dt, pad, 19, -4.0f, 4.0f, layout);
     const HostTensor ins[] = {in};
@@ -105,10 +105,10 @@ NNOPS_TEST(cuda_activation_f16_and_add_to) {
                    TensorLayout::NHWC, false, "cuda_activation_leaky_f16");
     run_activation(ActivationType::Silu, {8, 1024}, DataType::f16, true, TensorLayout::NHWC,
                    true, "cuda_activation_silu_add_to");
-    // Channel-last rows are one spatial line of W·C, which is the last dim the
+    // NHWC rows are one spatial line of W·C, which is the last dim the
     // kernel is handed.
     run_activation(ActivationType::Relu, {2, 8, 7, 5}, DataType::f32, false,
-                   TensorLayout::NHWC, false, "cuda_activation_channel_last");
+                   TensorLayout::NHWC, false, "cuda_activation");
 }
 
 NNOPS_TEST(cuda_softmax_contiguous) {
@@ -130,10 +130,10 @@ NNOPS_TEST(cuda_softmax_contiguous) {
                 "cuda_softmax_log_20000", kF32Abs, kF32Rel);
 }
 
-NNOPS_TEST(cuda_softmax_channel_last_and_f16) {
-    // Channel-last with the axis on C: the groups are the layout's own rows.
+NNOPS_TEST(cuda_softmax_and_f16) {
+    // NHWC with the axis on C: the groups are the layout's own rows.
     run_softmax({1, 8, 16, 16}, 1, DataType::f32, false, TensorLayout::NHWC,
-                false, "cuda_softmax_channel_last", kF32Abs, kF32Rel);
+                false, "cuda_softmax", kF32Abs, kF32Rel);
     run_softmax({128, 1024}, -1, DataType::f16, true, TensorLayout::NHWC, false,
                 "cuda_softmax_f16", kF16Abs, kF16Rel);
     run_softmax({64, 37}, -1, DataType::f16, true, TensorLayout::NHWC, true,

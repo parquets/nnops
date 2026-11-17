@@ -2,10 +2,10 @@
 /// @file tensor_layout.hpp
 /// @brief TensorLayout enum for describing data arrangement in memory.
 ///
-/// Activations are channel-last (NHWC/NDHWC) or dense (Dense). Channel-last
-/// keeps the logical [N, C, ...] dims in the descriptor; only the physical
-/// order changes, so the "row" of the pitch model is one spatial line — (n, h)
-/// over all W pixels and all C channels — and the channel axis is contiguous.
+/// Spatial activations are NHWC/NDHWC or dense (Dense). A spatial layout keeps
+/// the logical [N, C, ...] dims in the descriptor; only the physical order
+/// changes, so the "row" of the pitch model is one spatial line — (n, h) over
+/// all W pixels and all C channels — and the channel axis is contiguous.
 /// A [W][C] row is one contiguous block, with pitch =
 /// align_up(W * C * elem_size, 32) (see TensorDesc::row_pitch()); a TensorView
 /// built with an explicit pitch may use any larger value.
@@ -23,28 +23,28 @@ namespace nnops {
 
 /// Memory layout of tensor data.
 enum class TensorLayout : uint8_t {
-    // ---- channel-last, 2D / 3D ----
+    // ---- spatial activations, 2D / 3D ----
     NHWC      = 2,  ///< logical [N, C, H, W], stored [N, H, W, C]
     NDHWC     = 3,  ///< logical [N, C, D, H, W], stored [N, D, H, W, C]
 
-    // ---- Channel-last conv weight ----
-    HWIO      = 5,  ///< [KH][KW][IC/G][OC] — TF filter order for channel-last
+    // ---- Spatial conv weight ----
+    HWIO      = 5,  ///< [KH][KW][IC/G][OC] — TF filter order for spatial
                     ///< activations: the shape *is* H×W×I×O, OC contiguous.
 
-    // ---- Winograd-transformed weight, channel-last ----
-    PackedWinoWeightLast = 6,  ///< the U for a channel-last activation, as the
+    // ---- Winograd-transformed weight, spatial ----
+    PackedWinoWeightLast = 6,  ///< the U for a spatial activation, as the
                                ///< GEMM's B panels [16][⌈IC/G ÷ KC⌉][G·⌈OC/G ÷ nr⌉][ldd],
                                ///< each [KC][nr] k-major, OC zero-padded to panels;
                                ///< KC divides IC/G, nr is the arch's panel width.
                                ///< Opaque outside the Winograd kernel.
 
-    // ---- Channel-last depthwise weight ----
+    // ---- Spatial depthwise weight ----
     HWCM = 7,  ///< [KH][KW][C] (3D: [KD][KH][KW][C]) — TF depthwise filter with
                ///< multiplier 1 (OC == IC); one tap's 8 channels load as a vector.
 
     // ---- Prepacked conv weight (Conv2D::prepackWeights, im2col route) ----
     //
-    // PackedHWIO — channel-last (HWIO) filter: the filter is the B operand (one
+    // PackedHWIO — the HWIO filter: the filter is the B operand (one
     // k-major panel of nr OC per k block). Opaque outside the im2col kernel: the
     // descriptor's shape is [OC, ⌈elements / OC⌉] so shape inference still reads
     // the output-channel count; panel geometry is resolved from the attributes
@@ -85,17 +85,17 @@ enum class TensorLayout : uint8_t {
     Dense = 12,
 };
 
-/// True for the channel-last layouts, NHWC and NDHWC.
+/// True for the spatial layouts, NHWC and NDHWC.
 constexpr bool is_channel_last(TensorLayout layout) noexcept {
     return layout == TensorLayout::NHWC || layout == TensorLayout::NDHWC;
 }
 
-/// True for HWIO, the channel-last conv weight order.
+/// True for HWIO, the conv weight order of a spatial activation.
 constexpr bool is_channel_last_weight(TensorLayout layout) noexcept {
     return layout == TensorLayout::HWIO;
 }
 
-/// True for HWCM, the channel-last depthwise filter.
+/// True for HWCM, the depthwise filter with the channel innermost.
 constexpr bool is_depthwise_weight_last(TensorLayout layout) noexcept {
     return layout == TensorLayout::HWCM;
 }
@@ -131,7 +131,7 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
 
 /// Categories of layout support for an operator.
 ///
-///   ChannelLastOnly  — channel-last activations (plus weight tags)
+///   ChannelLastOnly  — NHWC/NDHWC activations (plus weight tags)
 ///   DenseOnly        — dense row-major only
 ///   Any              — layout-agnostic: the data is walked as flat rows, so
 ///                      neither family is interpreted

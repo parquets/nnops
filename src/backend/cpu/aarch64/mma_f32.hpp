@@ -22,8 +22,8 @@
 /// tile needs no per-row guards; only the tail's store loop stops at `mr`.
 ///
 /// Bias seed: 1 is per-row (`bias[r]`) -- a dense row is an output channel;
-/// 2 is per-column (`bias + n + off`) -- the channel-last shape, where rows are
-/// pixels and the bias lands on the panel's lanes. Seeding each row's three panel vectors costs a few loads, where
+/// 2 is per-column (`bias + n + off`) -- the NHWC shape, where rows are pixels
+/// and the bias lands on the panel's lanes. Seeding each row's three panel vectors costs a few loads, where
 /// priming the tile first would cost a full output write and read-back. Seed 2
 /// loads a whole 12-lane panel even on a short tail, since `n` is its start.
 /// The mr1 kernels ignore `mr` and `ldc`, and the packed-B one `lda` too.

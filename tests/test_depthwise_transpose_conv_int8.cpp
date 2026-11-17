@@ -1,6 +1,6 @@
 /// @file test_depthwise_transpose_conv_int8.cpp
 /// @brief Bit-exactness tests for the quantized CPU DepthwiseTransposeConv2D
-///        channel-last route.
+///        route.
 ///
 /// Route matrix: activation u8 / s8 / f16 / f32 (per-tensor QuantParams) ×
 /// weight s8 (per-channel QuantParams) → f32 / f16 / s8 / u8 output, across
@@ -12,10 +12,10 @@
 /// sides share the dequant/requant expression. The fp-activation cases use a
 /// power-of-two activation scale, which makes x·(1/scale) exact.
 ///
-/// The kernel runs on channel-last storage (the activation as [N][H][W][C], the
-/// filter as HWCM [KH][KW][C]) and the reference on the same values in
-/// channel-first order, converting the result back before the comparison: the
-/// layouts are a permutation, so the bits must survive it.
+/// The kernel runs on NHWC storage (the activation as [N][H][W][C], the filter
+/// as HWCM [KH][KW][C]) and the reference on the same values in dense order,
+/// converting the result back before the comparison: the layouts are a
+/// permutation, so the bits must survive it.
 ///
 /// Threading is part of the contract: the same case must give identical bits at
 /// 2/4/8 threads, since an output row's pixels belong to exactly one task.
@@ -142,8 +142,8 @@ struct Case {
     uint64_t seed = 1;
 };
 
-/// Owns a case's channel-first buffers and the views over them — views last, so
-/// a resize dangles. A channel-last case permutes these on the way in and out.
+/// Owns a case's dense-order buffers and the views over them — views last, so a
+/// resize dangles. A case permutes these on the way in and out.
 struct Fixture {
     Case c;
     std::vector<uint8_t> act;         // activation storage [N][C][IH][IW]
@@ -327,8 +327,8 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     Fixture f(c);
     auto op = DepthwiseTransposeConv2D::create(f.attrs, Backend::CPU);
 
-    // The channel-first descriptor carries the logical output geometry either
-    // way; a channel-last call only changes the storage order.
+    // The dense descriptor carries the logical output geometry either way; the
+    // call only changes the storage order.
     const std::vector<TensorDesc> cf_ins = f.descs();
     const auto cf_outs = op->getOutputTensorDesc(cf_ins);
     const int64_t N  = cf_outs[0].dims[0];
@@ -349,7 +349,7 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
         return r;
     }
 
-    // ---- channel-last: permute the activation in, the output back ----
+    // ---- permute the activation in, the output back ----
     const int64_t IH = c.ishape[2], IW = c.ishape[3];
     std::vector<uint8_t> act_cl =
         to_cl(f.act, elem_size(c.act), N, C, IH, IW);
@@ -440,7 +440,7 @@ void expect_matches_ref(const Case& c, const ComputeContext& ctx = {}, int idx =
     }
 }
 
-/// Every case runs channel-last.
+/// Every case compares against the dense-order reference.
 void expect_matches_ref_both(Case c, int idx) {
     expect_matches_ref(c, {}, idx);
 }
@@ -626,7 +626,7 @@ NNOPS_TEST(dwt_i8_matches_ref_int_out) {
 // ============================================================
 
 NNOPS_TEST(dwt_i8_threaded_matches_serial) {
-    // The channel-last route splits a row into strips when the row grid cannot
+    // The route splits a row into strips when the row grid cannot
     // fill the pool; the serial and pooled runs must land on the same bytes.
     struct ThreadCase { Case c; };
     std::vector<ThreadCase> cases;

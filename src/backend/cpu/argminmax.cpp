@@ -5,8 +5,8 @@
 /// Uses scalar reduction (argminmax is inherently sequential along the axis).
 ///
 /// The walk is described by strides alone — an outer group, the axis, an inner
-/// group — so the layout never enters the loop: a padded row, a channel-last
-/// view and a dense planar tensor all reduce to the same two groups.
+/// group — so the layout never enters the loop: a padded row, an NHWC
+/// view and a dense tensor all reduce to the same two groups.
 
 #include "nnops/ops/argminmax.hpp"
 #include "nnops/detail/simd/simd.hpp"

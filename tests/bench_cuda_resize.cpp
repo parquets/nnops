@@ -1,5 +1,5 @@
 /// @file bench_cuda_resize.cpp
-/// @brief CUDA resize throughput, channel-last.
+/// @brief CUDA resize throughput.
 ///
 /// Resize performs no MACs, so the second column is not a FLOP rate: it is the
 /// bandwidth a call moves at, counting the output it writes and the input image
@@ -110,7 +110,7 @@ double run_rsz(const RszBenchCase& c, const char* label)
         (c.elems(c.n, c.c, c.od, c.oh, c.ow) + c.elems(c.n, c.c, c.id, c.ih, c.iw)) * esz;
     const double gbps = ms > 0.0 ? bytes / (ms * 1e6) : 0.0;
     std::printf("  %-18s %-46s %9.4f ms %9.2f GB/s\n", label,
-                rsz_geometry(c, "channel_last").c_str(), ms, gbps);
+                rsz_geometry(c, "nhwc").c_str(), ms, gbps);
     return gbps;
 }
 
@@ -162,14 +162,14 @@ void run_table(DataType dt, const char* label)
 
 }  // namespace
 
-NNOPS_BENCH(cuda_resize_channel_last) {
-    print_cuda_header("CUDA Resize channel-last (f32)");
+NNOPS_BENCH(cuda_resize_f32) {
+    print_cuda_header("CUDA Resize (f32)");
     run_table(DataType::f32, "f32");
 }
 
 NNOPS_BENCH(cuda_resize_f16) {
-    print_cuda_header("CUDA Resize f16 (channel-last)");
-    run_table(DataType::f16, "f16 channel_last");
+    print_cuda_header("CUDA Resize (f16)");
+    run_table(DataType::f16, "f16");
 }
 
 #endif  // NNOPS_HAS_CUDA

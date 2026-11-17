@@ -10,7 +10,7 @@
 /// strides are the 1D ones and a sub-view that starts mid-row still addresses
 /// right.
 ///
-/// The channel-last form works through the same call because a rank-3 view
+/// The NHWC form works through the same call because a rank-3 view
 /// keeps its logical dims [N, C, L] whatever the layout says; [N, L, C] in
 /// memory lifts to [N, H=1, W=L, C].
 ///
@@ -37,7 +37,7 @@ inline TensorView lift_wide(const TensorView& v)
                       v.layout(), v.quant_params());
 }
 
-/// A channel-last conv filter (rank 3) → its 2D order:
+/// An NHWC conv filter (rank 3) → its 2D order:
 /// HWIO [K, IC/G, OC] → [1, K, IC/G, OC].
 ///
 /// The rank-3 row is IC/G·OC, which is not the rank-4 row (K·OC), so the lifted

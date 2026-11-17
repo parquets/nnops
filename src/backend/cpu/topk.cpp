@@ -4,7 +4,7 @@
 /// Supports both f32 and f16 via templated implementation.
 /// Uses scalar selection (top-k is inherently sequential along the axis).
 ///
-/// Supports the channel-first layouts, 2D and 3D. Not for packed layouts. The
+/// Supports dense and spatial 2D/3D layouts. Not for packed layouts. The
 /// input is read through its own strides, so a padded pitch is the same walk
 /// with a different offset group (see axis_walk.hpp); the outputs are dense,
 /// which is what their descriptors specify.

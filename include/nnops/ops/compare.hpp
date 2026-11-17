@@ -7,7 +7,7 @@
 /// (f32/f16/s32/s64); a NaN compares equal to nothing and greater/less to
 /// nothing, so a NaN input yields 0 for every relation. Logical takes one
 /// operand (Not) or two, treats a nonzero byte as true, and accepts s8/u8/s32/
-/// s64. Channel-first.
+/// s64.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

@@ -1,5 +1,5 @@
 /// @file resize.cu
-/// @brief CUDA Resize — nearest / linear / bicubic, channel-last.
+/// @brief CUDA Resize — nearest / linear / bicubic, on NHWC/NDHWC tensors.
 ///
 /// The CPU route builds per-axis coordinate tables once per call and walks them.
 /// A launch cannot: the tables live in device memory behind their own allocation
@@ -146,7 +146,7 @@ template <class T> __device__ inline void rsz_store(T* dst, float v, bool add_to
 }
 
 // ============================================================
-// Channel-last — lanes on the channel vector
+// The vector kernel — lanes on the channel vector
 // ============================================================
 
 /// One 16 B channel lane of one output pixel per thread. threadIdx.x walks the
@@ -323,8 +323,8 @@ __global__ void resize_last_vec_kernel(const T* __restrict__ in, T* __restrict__
     }
 }
 
-/// Channel-last with the channels walked inside one thread: the fallback for a
-/// channel count that is not a 16 B multiple (an RGB image) or too narrow to fill
+/// The scalar fallback, channels walked inside one thread: for a channel count
+/// that is not a 16 B multiple (an RGB image) or too narrow to fill
 /// a warp's worth of vectors.
 template <class T, int Mode, bool ThreeD>
 __global__ void resize_last_scalar_kernel(const T* __restrict__ in, T* __restrict__ out,

@@ -9,7 +9,7 @@
 ///
 /// Pads ride as an attribute, not an input: getOutputTensorDesc() reads
 /// descriptors only, so a pads *tensor* could not size the output. A graph
-/// front-end resolves a constant pads input into the attribute. Channel-first order.
+/// front-end resolves a constant pads input into the attribute. Logical order.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

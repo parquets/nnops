@@ -10,7 +10,7 @@
 /// Cases cover the shapes the kernel branches on: the vector lane's exact fit
 /// (C = 4 f32 / 8 f16), a short and a long scalar tail (C = 5 and 17), strided
 /// windows, dilation, the bias seed, the epilogue, add_to's ordering, the 3D
-/// forms, and f16 throughout. Channel-last tensors stay dense because their
+/// forms, and f16 throughout. NHWC tensors stay dense because their
 /// strides never consult the pitch.
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
@@ -124,10 +124,10 @@ void run_case(const DwCase& c, const char* what)
 }  // namespace
 
 // ============================================================
-// Channel-last
+// NHWC
 // ============================================================
 
-NNOPS_TEST(cuda_dwconv_last_vector_lane) {
+NNOPS_TEST(cuda_dwconv_vector_lane) {
     // C = 4 (f32) and 8 (f16) divide the 16 B vector exactly; 5 and 17 leave a
     // scalar tail, both a short one and one longer than a vector.
     for (int64_t C : {4, 5, 8, 17}) {
@@ -136,18 +136,18 @@ NNOPS_TEST(cuda_dwconv_last_vector_lane) {
             DwCase c;
             c.in_shape = {2, C, 9, 11};
             c.dtype = dt;
-            run_case(c, "cuda_dwconv_last_vector_lane");
+            run_case(c, "cuda_dwconv_vector_lane");
         }
     }
 }
 
-NNOPS_TEST(cuda_dwconv_last_window) {
+NNOPS_TEST(cuda_dwconv_window) {
     DwCase c;
     c.in_shape = {1, 16, 14, 13};
     c.stride = {1, 2, 2};
     c.padding = {0, 1, 1};
     c.bias = true;
-    run_case(c, "cuda_dwconv_last_window");
+    run_case(c, "cuda_dwconv_window");
 
     c.in_shape = {1, 8, 10, 10};
     c.stride = {1, 1, 1};
@@ -155,35 +155,35 @@ NNOPS_TEST(cuda_dwconv_last_window) {
     c.padding = {0, 0, 0};
     c.epilogue.type = EpilogueActivateType::HardSwish;
     c.add_to = true;
-    run_case(c, "cuda_dwconv_last_window");
+    run_case(c, "cuda_dwconv_window");
 }
 
-NNOPS_TEST(cuda_dwconv_last_f16) {
+NNOPS_TEST(cuda_dwconv_f16) {
     DwCase c;
     c.in_shape = {1, 8, 7, 7};
     c.dtype = DataType::f16;
     c.kernel = {1, 1, 1};
     c.stride = {1, 2, 2};
-    run_case(c, "cuda_dwconv_last_f16");
+    run_case(c, "cuda_dwconv_f16");
     c.kernel = {1, 3, 3};
     c.stride = {1, 1, 1};
     c.padding = {0, 1, 1};
     c.epilogue.type = EpilogueActivateType::Gelu;
     c.bias = true;
-    run_case(c, "cuda_dwconv_last_f16");
+    run_case(c, "cuda_dwconv_f16");
 }
 
-NNOPS_TEST(cuda_dwconv_last_3d) {
+NNOPS_TEST(cuda_dwconv_3d) {
     DwCase c;
     c.in_shape = {1, 8, 3, 5, 6};
     c.kernel = {2, 2, 2};
     c.stride = {1, 1, 1};
-    run_case(c, "cuda_dwconv_last_3d");
+    run_case(c, "cuda_dwconv_3d");
     c.kernel = {3, 3, 3};
     c.padding = {1, 1, 1};
     c.bias = true;
     c.add_to = true;
-    run_case(c, "cuda_dwconv_last_3d");
+    run_case(c, "cuda_dwconv_3d");
 }
 
 #endif  // NNOPS_HAS_CUDA

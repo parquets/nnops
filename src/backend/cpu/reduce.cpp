@@ -1,7 +1,7 @@
 /// @file reduce.cpp
 /// @brief SIMD-optimized CPU implementation of the Reduce operator.
 ///
-/// f32 and f16; channel-first and channel-last layouts; one axis or many.
+/// f32 and f16; dense and spatial layouts; one axis or many.
 /// The reduction is driven by the logical axes; stride_elems() turns them into
 /// physical offsets, so the same axis means the same thing in either layout.
 ///
@@ -14,7 +14,7 @@
 ///   1. axis==rank-1            -> kernel::reduce_process_contiguous_row
 ///   2. inner-contiguous        -> kernel::reduce_process_inner_contiguous_block
 ///   3. general                 -> scalar strided walk over (outer x inner)
-/// Channel-last: axis==1 (C) is the contiguous case and runs one row reduction
+/// Spatial: axis==1 (C) is the contiguous case and runs one row reduction
 /// per spatial position; every other axis walks the strided reduce axis.
 ///
 /// Multi-axis dispatch:
@@ -95,7 +95,7 @@ void reduce_channel_last(const ReduceAttributes& attrs, TensorView& output, cons
     T* y_ptr = output.ptr<T>();
     const float inv_D = 1.0f / static_cast<float>(D);
 
-    // axis==1 is C: contiguous in every channel-last tensor.
+    // axis==1 is C: contiguous in every spatial tensor.
     if (axis == 1) {
         const auto process_pos = [&](int64_t s) {
             const int64_t in_off = decompose_flat_offset(s, input, 0, rank - 1, /*skip_dim=*/1);
@@ -520,7 +520,8 @@ void reduce_copy(TensorView& output, const TensorView& input, const ComputeConte
     }
 
     // total_rows()/numel() gives the logical elements in one physical row for
-    // every layout: W planar, C*W channel-last, the packed block width packed.
+    // every layout: the dense row is W, the spatial row C*W, and a packed row
+    // is the block width.
     const int64_t rows = input.total_rows();
     if (rows <= 0) {
         return;
@@ -536,7 +537,7 @@ void reduce_copy(TensorView& output, const TensorView& input, const ComputeConte
     });
 }
 
-/// The single-axis dispatch, unchanged: channel-last, last axis, inner
+/// The single-axis dispatch, unchanged: spatial, last axis, inner
 /// contiguous, general.
 template <typename T>
 void reduce_single_axis(const ReduceAttributes& attrs, TensorView& output, const TensorView& input,

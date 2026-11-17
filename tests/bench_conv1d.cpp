@@ -248,7 +248,7 @@ struct ConvShape {
 };
 
 /// Audio front ends and sequence backbones, then the awkward geometries — all
-/// channel-last.
+/// on NHWC storage.
 const std::vector<ConvShape>& conv_sweep() {
     static const std::vector<ConvShape> s = {
         {"cl wav2vec fe c2  1x512x3199 -> 512 k3 s2",  1, 512,  3199, 512,  3, 2, 1, 1},

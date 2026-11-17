@@ -1,7 +1,7 @@
 #pragma once
 /// @file depthwise_transpose_conv.hpp
 /// @brief DepthwiseTransposeConv2D — per-channel transposed 2D convolution, the
-///        backward of DepthwiseConv, on a channel-last tensor.
+///        backward of DepthwiseConv, on an NHWC/NDHWC tensor.
 ///
 /// One filter per channel and no cross-channel mixing, so the output has the
 /// input's channel count. The input is [N, C, IH, IW] stored NHWC; the weight

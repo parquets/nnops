@@ -5,10 +5,10 @@
 /// f32 and f16 share one templated implementation per type, over the SIMD row
 /// kernels in simd_kernel/simd_norm.hpp. LayerNorm / RMSNorm / L2Norm run the
 /// vectorized row path when the normalized axes are the physically contiguous
-/// tail (channel-first axis == rank-1) and otherwise walk precomputed offsets, so a
-/// logical axis means the same thing in channel-first and channel-last layouts.
+/// tail (dense axis == rank-1) and otherwise walk precomputed offsets, so a
+/// logical axis means the same thing in dense and spatial layouts.
 /// BatchNorm walks rows and applies the per-channel factors pixel by pixel in
-/// Channel-last; GroupNorm reduces one (sample, group) at a time.
+/// NHWC/NDHWC; GroupNorm reduces one (sample, group) at a time.
 ///
 /// s8/u8 input is supported for LayerNorm / RMSNorm / L2Norm over the trailing
 /// axis: each integer row is dequantized to f32 by the arch quant.hpp per-row
@@ -162,7 +162,7 @@ inline NormDims compute_norm_dims(const TensorView& X, int64_t raw_axis)
         norm_size *= X.shape(i);
     }
 
-    // Only channel-first's trailing axis is one physically contiguous run.
+    // Only a dense tensor's trailing axis is one physically contiguous run.
     const bool contiguous_tail = (axis == rank - 1) && !is_channel_last(X.layout());
     return {axis, num_rows, norm_size, contiguous_tail};
 }

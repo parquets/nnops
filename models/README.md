@@ -86,21 +86,21 @@ anything structural.
 
 ## Layout notes
 
-The runners stay in channel-first, which is what PyTorch records, so nothing is
-converted on the way in:
+The artifacts record PyTorch's NCHW order. The runners convert the input to NHWC
+once per forward (`model::to_channel_last`) and run the graph there; each
+checkpoint is reordered back to NCHW for comparison.
 
 - **Global average pooling** is the pooling operator's `global` mode
   (`attrs.global`, the `AdaptiveAvgPool2d(1)` / `GlobalAveragePool` form): the
   window is the whole plane and every spatial axis of the output is 1, so the
   kernel scans each channel plane instead of walking a window.
 
-Pooling and depthwise convolution take channel-first directly, so `max_pool()` and
-`depthwise_conv()` in `common/net_ops.hpp` hand them the tensor (and, for the
-depthwise stage, the exported `[C, 1, 3, 3]` weight) with no repacking.
+Pooling takes NHWC directly, so `max_pool()` in `common/net_ops.hpp` hands the
+tensor through. The depthwise stage needs the exported `[C, 1, 3, 3]` weight in
+HWCM [KH, KW, C], which `depthwise_conv()` reorders once at load time.
 
 Convolutions take the Winograd route where `winograd_applicable` says it pays —
-3×3, stride 1, at least 32 input channels and a 14×14 input, or 7×7 for the
-channel-last layout — with the weight
+3×3, stride 1, at least 32 input channels and a 7×7 plane — with the weight
 transformed (`common/net_ops.hpp`'s `winograd_weight`) and cached on first use;
 everything else stays on im2col. Both runners do one untimed pass first, so the
 weight transform and the first-touch allocation costs are paid before the clock

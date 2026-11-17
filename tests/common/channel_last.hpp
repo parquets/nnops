@@ -1,13 +1,13 @@
 #pragma once
 /// @file channel_last.hpp
-/// @brief Channel-first ↔ channel-last and OIHW ↔ HWIO bridges for the
-///        channel-last Conv2D tests and benchmarks.
+/// @brief Dense ↔ NHWC and OIHW ↔ HWIO bridges for the Conv2D tests and
+///        benchmarks.
 ///
-/// The channel-last routes take their activations stored [N][H][W][C] and their
-/// weights stored [KH][KW][IC/G][OC] — TensorFlow's filter order, referred to
-/// here as HWIO (TensorLayout::HWIO) — while every reference implementation in
-/// this directory reads the channel-first orders. The tests therefore keep one copy in
-/// each order and move between them with these helpers; the benches use them to
+/// The operators take activations stored [N][H][W][C] and weights stored
+/// [KH][KW][IC/G][OC] — TensorFlow's filter order, referred to here as HWIO
+/// (TensorLayout::HWIO) — while every reference implementation in this
+/// directory reads dense order. The tests therefore keep one copy in each
+/// order and move between them with these helpers; the benches use them to
 /// prepare the inputs once, outside the timed region.
 ///
 /// All conversions are plain element copies — cheap against a convolution — so
@@ -18,7 +18,7 @@
 
 namespace nnops::test {
 
-/// Channel-first [N][C][H][W] → channel-last [N][H][W][C].
+/// Dense [N][C][H][W] → NHWC [N][H][W][C].
 template <class T>
 std::vector<T> channel_first_to_channel_last(std::span<const T> src,
                             int64_t N, int64_t C, int64_t H, int64_t W)
@@ -35,7 +35,7 @@ std::vector<T> channel_first_to_channel_last(std::span<const T> src,
     return dst;
 }
 
-/// Channel-last [N][H][W][C] → channel-first [N][C][H][W].
+/// NHWC [N][H][W][C] → dense [N][C][H][W].
 template <class T>
 std::vector<T> channel_last_to_channel_first(std::span<const T> src,
                             int64_t N, int64_t C, int64_t H, int64_t W)
@@ -52,8 +52,8 @@ std::vector<T> channel_last_to_channel_first(std::span<const T> src,
     return dst;
 }
 
-/// [N][C][S] → [N][S][C] over a flat spatial extent @p S; the 2D and 3D
-/// Channel-last layouts alike, since only the element order matters.
+/// [N][C][S] → [N][S][C] over a flat spatial extent @p S; 2D and 3D alike,
+/// since only the element order matters.
 template <class T>
 std::vector<T> to_channel_last(std::span<const T> src,
                                int64_t N, int64_t C, int64_t S)

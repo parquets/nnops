@@ -1,11 +1,11 @@
 /// @file pooling.cpp
-/// @brief Pooling operator dispatch — channel-first or channel-last I/O, direct
-///        pass-through (output layout follows the input's).
+/// @brief Pooling operator dispatch — NHWC/NDHWC I/O, direct pass-through
+///        (output layout follows the input's).
 ///
 /// Attribute semantics live in pooling.hpp. What this file adds is auto_pad:
 /// SAME_UPPER / SAME_LOWER / VALID are resolved here into explicit leading
-/// padding, because the kernels only see a resolved pad. Channel-first input is
-/// f32/f16; quantized pooling is channel-last only (the lane is the channel).
+/// padding, because the kernels only see a resolved pad. f32/f16 and the
+/// quantized s8/u8 pairs (whose lane is the channel).
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"

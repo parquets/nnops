@@ -692,7 +692,7 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, bf
 //         a copy. `direct` only: a packed A always pairs with panels.
 //
 // `bias` (one value per M row) or `col_bias` (one per N column, for the
-// channel-last Conv2D whose rows are pixels and a row seed has nothing to hold)
+// NHWC Conv2D whose rows are pixels and a row seed has nothing to hold)
 // seeds the accumulator instead of reading C, so the tile is *built*: pass it
 // on the first k-block only, or a later one re-seeds and drops the partial sum.
 // Either implies the overwrite path (`zero_mode` is ignored). `col_bias` is read
@@ -778,7 +778,7 @@ void tile_mma_pack_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t*
                       bool zero_mode);
 
 // A row-major through `lda` (int8 elements; kc must be a multiple of 4, the
-// panel's group size). Conv2D's channel-last route gathers its activations into
+// panel's group size). Conv2D's im2col route gathers its activations into
 // A, so there is no panel to pack.
 void tile_mma_direct_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t* a, int lda,
                         const int8_t* packed_b, int ldb, int32_t clamp_min, int32_t clamp_max,

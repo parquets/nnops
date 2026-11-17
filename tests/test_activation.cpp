@@ -430,14 +430,14 @@ NNOPS_TEST(activation_quick_gelu) {
 // PRelu — the slope is a second input, one per logical channel (dim 1)
 // ============================================================
 
-NNOPS_TEST(activation_prelu_channel_last) {
+NNOPS_TEST(activation_prelu_nhwc) {
     constexpr int64_t N = 2, C = 5, H = 4, W = 6;
     auto [in_vec, in_channel_first] = test::make_random_tensor({N, C, H, W}, -4.0f, 4.0f);
     float slope_data[C];
     for (int64_t c = 0; c < C; ++c) { slope_data[c] = 0.1f * (c + 1); }
 
     auto cl = test::to_channel_last<float>(in_vec, N, C, H * W);
-    // Logical shape stays [N, C, H, W]; the channel-last tag changes only the storage.
+    // Logical shape stays [N, C, H, W]; the NHWC tag changes only the storage.
     const int64_t in_shape[] = {N, C, H, W};
     TensorView input(in_shape, DataType::f32, cl.data(), TensorLayout::NHWC);
 

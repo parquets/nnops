@@ -137,9 +137,10 @@ void Linear::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
     const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));
 
     if (outputs[0].is_empty()) {
-        // Query: [N, ⌈elems / N⌉] pitched at the row length — not channel-packed,
-        // so the default alignment would not describe it. A weight with no packed
-        // form answers empty rather than failing, since a graph engine asks
+        // Query: [N, ⌈elems / N⌉] pitched at the row length — not aligned to the
+        // 32 B default, so the default alignment would not describe it. A weight
+        // with no packed form answers empty rather than failing, since a graph
+        // engine asks
         // unconditionally.
         if (d.rank <= 0) {
             return;
