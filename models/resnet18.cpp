@@ -39,7 +39,7 @@ using model::ModelCheck;
 using nnops::TensorView;
 
 /// BatchNorm at @p prefix: scale, shift and the two running statistics.
-Buf norm(const ModelArtifact& m, const std::string& prefix, const TensorView& x)
+Buf norm(ModelArtifact& m, const std::string& prefix, const TensorView& x)
 {
     return model::batch_norm(x, model::batch_norm_params(m, prefix));
 }
@@ -47,7 +47,7 @@ Buf norm(const ModelArtifact& m, const std::string& prefix, const TensorView& x)
 /// conv -> BN -> @p act, as one operator call when fusion is on. Every conv in
 /// this network is followed by that pair, so this is the whole fusion: the BN
 /// folds into the weight and @p act becomes the conv's epilogue.
-Buf conv_bn(const ModelArtifact& m, const TensorView& x,
+Buf conv_bn(ModelArtifact& m, const TensorView& x,
             const std::string& conv, const std::string& bn,
             nnops::EpilogueActivateType act,
             int64_t kernel, int64_t stride, int64_t pad,
@@ -55,12 +55,12 @@ Buf conv_bn(const ModelArtifact& m, const TensorView& x,
             bool residual_pre_act = false)
 {
     if (model::fuse_enabled()) {
-        return model::conv2d_bn_act(x, m.at(conv + ".weight"),
+        return model::conv2d_bn_act(x, m.compute(conv + ".weight"),
                                     model::batch_norm_params(m, bn), act,
                                     kernel, stride, pad, 1, residual,
                                     residual_pre_act);
     }
-    Buf y = model::conv2d(x, m.at(conv + ".weight"), kernel, stride, pad);
+    Buf y = model::conv2d(x, m.compute(conv + ".weight"), kernel, stride, pad);
     y = norm(m, bn, y.view);
     switch (act) {
     case nnops::EpilogueActivateType::None: return y;
@@ -71,7 +71,7 @@ Buf conv_bn(const ModelArtifact& m, const TensorView& x,
 
 /// One BasicBlock. @p downsample selects the 1x1-conv shortcut, which is what
 /// PyTorch builds when the block changes the channel count or resolution.
-Buf basic_block(const ModelArtifact& m, const std::string& prefix,
+Buf basic_block(ModelArtifact& m, const std::string& prefix,
                 const TensorView& x, int64_t stride, bool downsample)
 {
     Buf y = conv_bn(m, x, prefix + ".conv1", prefix + ".bn1",
@@ -112,7 +112,7 @@ Buf basic_block(const ModelArtifact& m, const std::string& prefix,
 
 /// Run the network and compare every recorded checkpoint. Each row of the
 /// profile table is one checkpoint, timed without the comparison itself.
-int forward(const ModelArtifact& m, ModelCheck& check, const TensorView& input)
+int forward(ModelArtifact& m, ModelCheck& check, const TensorView& input)
 {
     // Stem: conv1 -> bn1 -> relu. Fused, that is one call and its output is the
     // checkpoint after the relu, so the three-intermediate comparison collapses
@@ -126,7 +126,7 @@ int forward(const ModelArtifact& m, ModelCheck& check, const TensorView& input)
         model::compare_checkpoint(check, "relu", act.view, m.at("ref.relu"));
     } else {
         act = model::layer("conv1", [&] {
-            return model::conv2d(input, m.at("conv1.weight"), 7, 2, 3);
+            return model::conv2d(input, m.compute("conv1.weight"), 7, 2, 3);
         });
         model::compare_checkpoint(check, "conv1", act.view, m.at("ref.conv1"));
 
@@ -162,7 +162,7 @@ int forward(const ModelArtifact& m, ModelCheck& check, const TensorView& input)
 
     Buf logits = model::layer("logits", [&] {
         return model::linear(model::flatten_to_2d(pooled.view),
-                             m.at("fc.weight"), m.at("fc.bias"));
+                             m.compute("fc.weight"), m.compute("fc.bias"));
     });
     model::compare_checkpoint(check, "logits", logits.view, m.at("ref.logits"));
     return 0;
@@ -175,13 +175,19 @@ int main(int argc, char** argv)
     std::string dir = NNOPS_MODEL_DATA_DIR "/resnet18";
     double atol = 1e-3;
     double rtol = 1e-3;
+    bool f16 = false;
+    bool tol_set = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (std::strcmp(a, "--atol") == 0 && i + 1 < argc) {
             atol = std::atof(argv[++i]);
+            tol_set = true;
         } else if (std::strcmp(a, "--rtol") == 0 && i + 1 < argc) {
             rtol = std::atof(argv[++i]);
+            tol_set = true;
+        } else if (std::strcmp(a, "--f16") == 0) {
+            f16 = true;
         } else if (a[0] != '-') {
             dir = a;
         }
@@ -202,13 +208,27 @@ int main(int argc, char** argv)
                      "(unset NNOPS_MODEL_FUSE)\n");
         return 2;
     }
+    if (f16) {
+        // The artifact stays f32 — its ref.* tensors are the PyTorch
+        // checkpoints — and the graph consumes converted mirrors.
+        artifact.set_compute_dtype(nnops::DataType::f16);
+        if (!tol_set) {
+            // f16 rounds every layer's output; the f32 1e-3 would fail on the
+            // first checkpoint. Every Winograd layer but the 512-channel stage
+            // runs F(4,3) here (the 512-channel U is 18.9 MB and loses the L3
+            // fence), and their wider error is what sets this bound: measured
+            // max |d| 1.3e-1 and max_rel 2.7e-2 at layer1.1.
+            atol = 1.5e-1;
+            rtol = 3e-2;
+        }
+    }
     Buf cl_input;
-    TensorView input = artifact.at("input");
+    TensorView input = artifact.compute("input");
     cl_input = model::to_channel_last(input);
     input = cl_input.view;
 
-    std::printf("resnet18: %zu tensors from %s (conv+bn+relu folded, NHWC)\n",
-                artifact.count(), dir.c_str());
+    std::printf("resnet18: %zu tensors from %s (conv+bn+relu folded, NHWC%s)\n",
+                artifact.count(), dir.c_str(), f16 ? ", f16" : "");
     // The untimed pass is the model-load step: it prepacks the Winograd weights
     // (and first-touches every buffer) and it is the pass that checks every
     // checkpoint, so the number below is the steady state with no comparison in

@@ -11,8 +11,10 @@
 /// All tensors are f32 today; the dtype column exists so the format can grow
 /// without a version bump.
 
+#include "nnops/core/data_type.hpp"
 #include "nnops/core/status.hpp"
 #include "nnops/core/tensor_view.hpp"
+#include "nnops/detail/half.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -226,11 +228,48 @@ public:
         return it->second;
     }
 
+    /// The dtype the graph runs in. The artifact itself stays f32 — its
+    /// `ref.*` tensors are the PyTorch checkpoints and must be compared at full
+    /// precision — so only the tensors the graph consumes go through
+    /// compute(), which hands back a mirror in this dtype.
+    void set_compute_dtype(nnops::DataType dt) { compute_dtype_ = dt; }
+    nnops::DataType compute_dtype() const { return compute_dtype_; }
+
+    /// The tensor named @p name in the compute dtype: @p name itself for f32,
+    /// or a converted mirror for f16. Mirrors are made once and cached, because
+    /// the weight transforms key their caches on the view's address and the
+    /// graph asks for the same weight on every forward pass.
+    ///
+    /// The mirror is a `std::map` node's own vector: node-based maps keep an
+    /// element's storage where it is across insertions, so a view handed out
+    /// earlier stays valid.
+    nnops::TensorView compute(const std::string& name)
+    {
+        const nnops::TensorView src = at(name);
+        if (compute_dtype_ == nnops::DataType::f32) { return src; }
+        auto it = mirrors_.find(name);
+        if (it == mirrors_.end()) {
+            std::vector<nnops::backend::cpu::half> buf(
+                static_cast<size_t>(src.numel()));
+            const float* p = src.ptr<float>();
+            for (int64_t i = 0; i < src.numel(); ++i) {
+                buf[static_cast<size_t>(i)] =
+                    static_cast<nnops::backend::cpu::half>(p[i]);
+            }
+            it = mirrors_.emplace(name, std::move(buf)).first;
+        }
+        return nnops::TensorView(src.shape_span(), nnops::DataType::f16,
+                                 it->second.data(), src.layout(),
+                                 src.quant_params());
+    }
+
     size_t count() const { return tensors_.size(); }
 
 private:
     std::vector<float> data_;
     std::map<std::string, nnops::TensorView> tensors_;
+    nnops::DataType compute_dtype_ = nnops::DataType::f32;
+    std::map<std::string, std::vector<nnops::backend::cpu::half>> mirrors_;
 };
 
 }  // namespace model

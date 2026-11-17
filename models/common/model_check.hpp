@@ -136,18 +136,34 @@ public:
             rows_.push_back(row);
             return;
         }
-        if (actual.data_type() != nnops::DataType::f32) {
+        const nnops::DataType dt = actual.data_type();
+        if (dt != nnops::DataType::f32 && dt != nnops::DataType::f16) {
             row.shape_ok = false;
             if (verbose_) {
-                std::printf("  %-24s DTYPE: only f32 is compared\n", name.c_str());
+                std::printf("  %-24s DTYPE: only f32/f16 are compared\n",
+                            name.c_str());
             }
             rows_.push_back(row);
             return;
         }
 
-        const auto* a = actual.ptr<float>();
-        const auto* e = expected.ptr<float>();
+        // The reference is always f32 (it is the PyTorch checkpoint). An f16
+        // activation is widened once for the sweep; the comparison itself stays
+        // f32 so a verdict cannot come from its own rounding.
         const int64_t n = actual.numel();
+        std::vector<float> widened;
+        const float* a = nullptr;
+        if (dt == nnops::DataType::f16) {
+            const auto* h = actual.ptr<nnops::backend::cpu::half>();
+            widened.resize(static_cast<size_t>(n));
+            for (int64_t i = 0; i < n; ++i) {
+                widened[static_cast<size_t>(i)] = static_cast<float>(h[i]);
+            }
+            a = widened.data();
+        } else {
+            a = actual.ptr<float>();
+        }
+        const auto* e = expected.ptr<float>();
         const auto atol = static_cast<float>(atol_);
         const auto rtol = static_cast<float>(rtol_);
         const detail::Diff d = detail::sweep(a, e, n, atol, rtol);

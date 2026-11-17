@@ -176,6 +176,28 @@ Buf run(const char* what, Op& op, std::span<const TensorView> inputs,
 
 namespace detail {
 
+/// One element read as f32 whatever the tensor stores. The load-time weight
+/// transforms are the only loops here, so the branch costs nothing.
+inline float load_elem(const TensorView& t, int64_t i) noexcept
+{
+    if (t.data_type() == DataType::f16) {
+        return static_cast<float>(t.ptr<nnops::backend::cpu::half>()[i]);
+    }
+    return t.ptr<float>()[i];
+}
+
+/// The inverse: write an element in the tensor's own dtype. The fold computes
+/// in f32 and narrows here, so an f16 weight is rounded once, not per tap.
+inline void store_elem(TensorView& t, int64_t i, float v) noexcept
+{
+    if (t.data_type() == DataType::f16) {
+        t.ptr<nnops::backend::cpu::half>()[i] =
+            static_cast<nnops::backend::cpu::half>(v);
+    } else {
+        t.ptr<float>()[i] = v;
+    }
+}
+
 /// A filter reordered into the order an NHWC activation reads.
 struct WeightCopy {
     std::vector<int64_t> shape;  ///< the source's, to catch a reused address
@@ -231,14 +253,15 @@ inline const TensorView& hwio_weight(const TensorView& w)
 
     // Writes are the contiguous run, reads are a column of the source: one
     // output channel's K values are ICG·KH·KW apart.
-    const float* src = w.ptr<float>();
-    float* dst = buf.ptr();
     const int64_t taps = KH * KW;
     for (int64_t t = 0; t < taps; ++t) {
         for (int64_t i = 0; i < ICG; ++i) {
-            const float* s = src + i * taps + t;
-            float* o = dst + (t * ICG + i) * OC;
-            for (int64_t c = 0; c < OC; ++c) { o[c] = s[c * ICG * taps]; }
+            const int64_t s = i * taps + t;
+            const int64_t o = (t * ICG + i) * OC;
+            for (int64_t c = 0; c < OC; ++c) {
+                detail::store_elem(buf.view, o + c,
+                                   detail::load_elem(w, s + c * ICG * taps));
+            }
         }
     }
     return detail::store_copy(cache, w, std::move(buf));
@@ -263,12 +286,11 @@ inline const TensorView& hwcm_weight(const TensorView& w)
     d.dims[0] = KH; d.dims[1] = KW; d.dims[2] = C;
     Buf buf = alloc(d);
 
-    const float* src = w.ptr<float>();
-    float* dst = buf.ptr();
     const int64_t taps = KH * KW;
     for (int64_t t = 0; t < taps; ++t) {
         for (int64_t c = 0; c < C; ++c) {
-            dst[t * C + c] = src[c * taps + t];
+            detail::store_elem(buf.view, t * C + c,
+                               detail::load_elem(w, c * taps + t));
         }
     }
     return detail::store_copy(cache, w, std::move(buf));
@@ -602,13 +624,22 @@ inline bool fuse_enabled()
 
 namespace detail {
 
-/// A 1-D f32 buffer over @p values — the folded bias, and nothing else so far.
-inline Buf make_vector(std::vector<float> values)
+/// A 1-D buffer over @p values — the folded bias, and nothing else so far. The
+/// values are f32 (the fold computes there); @p dt is the buffer's own dtype,
+/// so an f16 graph gets an f16 bias and rounds once.
+inline Buf make_vector(std::vector<float> values, DataType dt = DataType::f32)
 {
     Buf b;
-    b.data = std::move(values);
-    const int64_t shape[] = {static_cast<int64_t>(b.data.size())};
-    b.view = TensorView(shape, DataType::f32, b.data.data());
+    const int64_t n = static_cast<int64_t>(values.size());
+    const size_t bytes = static_cast<size_t>(n) *
+                         (dt == DataType::f16 ? sizeof(nnops::backend::cpu::half)
+                                              : sizeof(float));
+    b.data.assign((bytes + sizeof(float) - 1) / sizeof(float), 0.0f);
+    const int64_t shape[] = {n};
+    b.view = TensorView(shape, dt, b.data.data());
+    for (int64_t i = 0; i < n; ++i) {
+        store_elem(b.view, i, values[static_cast<size_t>(i)]);
+    }
     return b;
 }
 
@@ -650,18 +681,19 @@ inline const Folded& folded(const TensorView& w, const BatchNormParams& bn)
 
     Folded f;
     f.weight = alloc(w.desc());
-    const int64_t per = static_cast<int64_t>(f.weight.data.size()) / oc;
+    // Elements, not the buffer's float words: an f16 filter stores two elements
+    // per word, so `data.size() / oc` would halve the stride.
+    const int64_t per = w.numel() / oc;
     std::vector<float> bias(static_cast<size_t>(oc));
-    const float* src = w.ptr<float>();
-    float* dst = f.weight.ptr();
     for (int64_t o = 0; o < oc; ++o) {
         const float s = gamma[o] / std::sqrt(var[o] + bn.eps);
         for (int64_t i = 0; i < per; ++i) {
-            dst[o * per + i] = src[o * per + i] * s;
+            store_elem(f.weight.view, o * per + i,
+                       load_elem(w, o * per + i) * s);
         }
         bias[static_cast<size_t>(o)] = beta[o] - mean[o] * s;
     }
-    f.bias = make_vector(std::move(bias));
+    f.bias = make_vector(std::move(bias), w.data_type());
     f.shape.assign(w.rank(), 0);
     for (int64_t d = 0; d < w.rank(); ++d) { f.shape[static_cast<size_t>(d)] = w.shape(d); }
     for (int i = 0; i < 4; ++i) { f.bn_key[i] = bn_key[i]; }
@@ -815,14 +847,13 @@ inline Buf to_channel_last(const TensorView& x)
     d.dims[0] = N; d.dims[1] = C; d.dims[2] = H; d.dims[3] = W;
     Buf out = alloc(d);
 
-    const float* src = x.ptr<float>();
-    float* dst = out.ptr();
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t c = 0; c < C; ++c) {
-            const float* s = src + (n * C + c) * H * W;
+            const int64_t s = (n * C + c) * H * W;
             for (int64_t h = 0; h < H; ++h) {
                 for (int64_t w = 0; w < W; ++w) {
-                    dst[((n * H + h) * W + w) * C + c] = s[h * W + w];
+                    detail::store_elem(out.view, ((n * H + h) * W + w) * C + c,
+                                       detail::load_elem(x, s + h * W + w));
                 }
             }
         }
@@ -845,14 +876,13 @@ inline Buf channel_first_copy_of(const TensorView& x)
     d.dims[0] = N; d.dims[1] = C; d.dims[2] = H; d.dims[3] = W;
     Buf out = alloc(d);
 
-    const float* src = x.ptr<float>();
-    float* dst = out.ptr();
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t c = 0; c < C; ++c) {
-            float* o = dst + (n * C + c) * H * W;
+            const int64_t o = (n * C + c) * H * W;
             for (int64_t h = 0; h < H; ++h) {
                 for (int64_t w = 0; w < W; ++w) {
-                    o[h * W + w] = src[((n * H + h) * W + w) * C + c];
+                    detail::store_elem(out.view, o + h * W + w,
+                                       detail::load_elem(x, ((n * H + h) * W + w) * C + c));
                 }
             }
         }

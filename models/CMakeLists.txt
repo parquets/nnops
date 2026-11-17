@@ -21,4 +21,9 @@ foreach(src ${MODEL_SOURCES})
         NNOPS_MODEL_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
     add_test(NAME model_${name} COMMAND model_${name})
     set_tests_properties(model_${name} PROPERTIES SKIP_RETURN_CODE 77)
+    # The same graph with f16 activations and weights. The artifact stays f32
+    # (its ref.* tensors are the PyTorch checkpoints); the runner converts the
+    # tensors the graph consumes and uses the f16 tolerance it defaults to.
+    add_test(NAME model_${name}_f16 COMMAND model_${name} --f16)
+    set_tests_properties(model_${name}_f16 PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()

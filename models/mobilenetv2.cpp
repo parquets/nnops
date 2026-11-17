@@ -41,7 +41,7 @@ using model::ModelArtifact;
 using model::ModelCheck;
 using nnops::TensorView;
 
-Buf norm(const ModelArtifact& m, const std::string& prefix, const TensorView& x)
+Buf norm(ModelArtifact& m, const std::string& prefix, const TensorView& x)
 {
     return model::batch_norm(x, model::batch_norm_params(m, prefix));
 }
@@ -49,17 +49,17 @@ Buf norm(const ModelArtifact& m, const std::string& prefix, const TensorView& x)
 /// conv -> BN -> relu6, as one operator call when fusion is on: the BN folds
 /// into the weight and a bias, and the relu6 becomes the conv's epilogue. With
 /// None the same path is conv -> BN only (the projection stages).
-Buf conv_bn(const ModelArtifact& m, const TensorView& x, const std::string& conv,
+Buf conv_bn(ModelArtifact& m, const TensorView& x, const std::string& conv,
             const std::string& bn, nnops::EpilogueActivateType act,
             int64_t kernel, int64_t stride, int64_t pad,
             const TensorView* residual = nullptr)
 {
     if (model::fuse_enabled()) {
-        return model::conv2d_bn_act(x, m.at(conv + ".weight"),
+        return model::conv2d_bn_act(x, m.compute(conv + ".weight"),
                                     model::batch_norm_params(m, bn), act,
                                     kernel, stride, pad, 1, residual);
     }
-    Buf y = model::conv2d(x, m.at(conv + ".weight"), kernel, stride, pad);
+    Buf y = model::conv2d(x, m.compute(conv + ".weight"), kernel, stride, pad);
     y = norm(m, bn, y.view);
     switch (act) {
     case nnops::EpilogueActivateType::None:  return y;
@@ -70,23 +70,23 @@ Buf conv_bn(const ModelArtifact& m, const TensorView& x, const std::string& conv
 
 /// depthwise -> BN -> relu6, fused the same way. The filter is [C, 1, KH, KW]
 /// and the BN is per channel, which is the filter's own axis.
-Buf dw_bn_relu6(const ModelArtifact& m, const TensorView& x, const std::string& dw,
+Buf dw_bn_relu6(ModelArtifact& m, const TensorView& x, const std::string& dw,
                 const std::string& bn, int64_t kernel, int64_t stride, int64_t pad)
 {
     if (model::fuse_enabled()) {
-        return model::depthwise_bn_act(x, m.at(dw),
+        return model::depthwise_bn_act(x, m.compute(dw),
                                        model::batch_norm_params(m, bn),
                                        nnops::EpilogueActivateType::Relu6,
                                        kernel, stride, pad);
     }
-    Buf y = model::depthwise_conv(x, m.at(dw), kernel, stride, pad);
+    Buf y = model::depthwise_conv(x, m.compute(dw), kernel, stride, pad);
     y = norm(m, bn, y.view);
     return model::relu6(y.view);
 }
 
 /// One InvertedResidual. @p t is the expansion ratio (the expand stage is
 /// omitted when it is 1) and @p out_c the projection width.
-Buf inverted_residual(const ModelArtifact& m, const std::string& prefix,
+Buf inverted_residual(ModelArtifact& m, const std::string& prefix,
                       const TensorView& x, int64_t out_c, int64_t t,
                       int64_t stride, bool residual)
 {
@@ -131,7 +131,7 @@ constexpr BlockSpec kSetting[] = {
 
 /// Each row of the profile table is one checkpoint (a whole inverted-residual
 /// block for features.1..17), timed without the comparison itself.
-int forward(const ModelArtifact& m, ModelCheck& check, const TensorView& input)
+int forward(ModelArtifact& m, ModelCheck& check, const TensorView& input)
 {
     Buf act = model::layer("features.0", [&] {
         return conv_bn(m, input, "features.0.0", "features.0.1",
@@ -168,8 +168,8 @@ int forward(const ModelArtifact& m, ModelCheck& check, const TensorView& input)
     });
     Buf logits = model::layer("logits", [&] {
         return model::linear(model::flatten_to_2d(pooled.view),
-                             m.at("classifier.1.weight"),
-                             m.at("classifier.1.bias"));
+                             m.compute("classifier.1.weight"),
+                             m.compute("classifier.1.bias"));
     });
     model::compare_checkpoint(check, "logits", logits.view, m.at("ref.logits"));
     return 0;
@@ -182,13 +182,19 @@ int main(int argc, char** argv)
     std::string dir = NNOPS_MODEL_DATA_DIR "/mobilenetv2";
     double atol = 1e-3;
     double rtol = 1e-3;
+    bool f16 = false;
+    bool tol_set = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (std::strcmp(a, "--atol") == 0 && i + 1 < argc) {
             atol = std::atof(argv[++i]);
+            tol_set = true;
         } else if (std::strcmp(a, "--rtol") == 0 && i + 1 < argc) {
             rtol = std::atof(argv[++i]);
+            tol_set = true;
+        } else if (std::strcmp(a, "--f16") == 0) {
+            f16 = true;
         } else if (a[0] != '-') {
             dir = a;
         }
@@ -209,13 +215,27 @@ int main(int argc, char** argv)
                      "(unset NNOPS_MODEL_FUSE)\n");
         return 2;
     }
+    if (f16) {
+        // The artifact stays f32 — its ref.* tensors are the PyTorch
+        // checkpoints — and the graph consumes converted mirrors.
+        artifact.set_compute_dtype(nnops::DataType::f16);
+        if (!tol_set) {
+            // f16 rounds every layer's output; the f32 1e-3 would fail on the
+            // first checkpoint. Measured on the cached artifact: max |d| 4.7e-1
+            // (a residual cancellation landing on a near-zero element) and
+            // max_rel 4.8e-2 at features.18, so the absolute bound is what the
+            // near-zero tail needs and the relative bound is the real one.
+            atol = 5e-1;
+            rtol = 5e-2;
+        }
+    }
     Buf cl_input;
-    TensorView input = artifact.at("input");
+    TensorView input = artifact.compute("input");
     cl_input = model::to_channel_last(input);
     input = cl_input.view;
 
-    std::printf("mobilenetv2: %zu tensors from %s (conv+bn+relu6 folded, NHWC)\n",
-                artifact.count(), dir.c_str());
+    std::printf("mobilenetv2: %zu tensors from %s (conv+bn+relu6 folded, NHWC%s)\n",
+                artifact.count(), dir.c_str(), f16 ? ", f16" : "");
     // The untimed pass is the model-load step: it prepacks any Winograd weights
     // (and first-touches every buffer) and it is the pass that checks every
     // checkpoint, so the number below is the steady state with no comparison in

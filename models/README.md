@@ -49,7 +49,15 @@ or through CTest (`ctest -R model_`). Both are registered as tests and return
 **77** when the artifact is missing, which CTest reports as skipped, so a
 checkout without the exported data still has a green test run.
 
-Arguments: `model_resnet18 [artifact-dir] [--atol X] [--rtol Y]`.
+Arguments: `model_resnet18 [artifact-dir] [--atol X] [--rtol Y] [--f16]`.
+
+`--f16` runs the graph with f16 activations and weights: the artifact stays f32
+(its `ref.*` tensors are the PyTorch checkpoints) and the runner converts the
+tensors the graph consumes, so the comparison still measures f16 against the
+full-precision reference. It also swaps in a wider default tolerance, because
+f16 rounds at every layer and the stack accumulates it — pass `--atol/--rtol`
+to tighten or loosen it. Both dtypes are registered with CTest
+(`model_resnet18`, `model_resnet18_f16`).
 
 After the checkpoint table each runner prints a profile of the timed pass
 (`common/model_prof.hpp`): wall clock **per layer** (the checkpoint names, so a
