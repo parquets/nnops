@@ -31,6 +31,7 @@
 #include "nnops/core/quant_params.hpp"
 #include "nnops/detail/q4_1.hpp"
 #include "nnops/detail/half.hpp"
+#include "detail/bench_knobs.hpp" // disable_sme — pin the prepacked comparison
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
@@ -809,6 +810,16 @@ void check_prepacked_weight(const PrepackShape& c, uint64_t seed,
 }  // anonymous namespace
 
 NNOPS_TEST(linear_prepacked_weight) {
+    // Same reason as matmul_prepacked_b: the bit-exact cases compare the packed
+    // and raw weight through one kernel, so SME (a separate engine, and one that
+    // declines a prepacked B) is pinned off here.
+    const int sme_prev =
+        nnops::detail::disable_sme.exchange(1, std::memory_order_relaxed);
+    struct SmeRestore {
+        int prev;
+        ~SmeRestore() { nnops::detail::disable_sme.store(prev, std::memory_order_relaxed); }
+    } sme_restore{sme_prev};
+
     // Shapes for the pack's seams: partial n panel, K not a k-block multiple,
     // N below one panel, deep K.
     struct Row { PrepackShape s; bool bitwise; };

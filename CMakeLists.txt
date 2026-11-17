@@ -13,6 +13,27 @@ option(NNOPS_BUILD_CUDA       "Build CUDA backend"         OFF)
 option(NNOPS_BUILD_VULKAN     "Build Vulkan backend"       OFF)
 option(NNOPS_BUILD_METAL      "Build Metal backend (Apple only)" OFF)
 option(NNOPS_OPENMP           "Build the OpenMP CpuBackend adapter" OFF)
+# AArch64 SME kernels (matmul's outer-product route). Compiled with
+# -march=armv8.2-a+sme2 for one translation unit only; the runtime checks
+# FEAT_SME and a 64-byte SVL before anything calls in, so a build that carries
+# them still runs on a CPU without SME.
+option(NNOPS_ENABLE_SME       "Build the AArch64 SME GEMM kernels" ON)
+
+if(NNOPS_ENABLE_SME AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64)|(arm64)|(ARM64)")
+    message(STATUS "NNOPS_ENABLE_SME: SME is AArch64-only; disabling")
+    set(NNOPS_ENABLE_SME OFF)
+endif()
+if(NNOPS_ENABLE_SME AND NOT MSVC)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-march=armv8.2-a+sme2" NNOPS_HAS_SME_FLAG)
+    if(NOT NNOPS_HAS_SME_FLAG)
+        message(STATUS "NNOPS_ENABLE_SME: the compiler rejects -march=armv8.2-a+sme2; disabling")
+        set(NNOPS_ENABLE_SME OFF)
+    endif()
+elseif(NNOPS_ENABLE_SME)
+    message(STATUS "NNOPS_ENABLE_SME: no SME support on MSVC; disabling")
+    set(NNOPS_ENABLE_SME OFF)
+endif()
 
 if(NNOPS_BUILD_METAL)
     if(NOT APPLE)

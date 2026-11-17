@@ -43,4 +43,9 @@ inline std::atomic<int> cuda_ptx_i8{0};
 /// scan runs once, so set this before the first CpuFeatures::get().
 inline std::atomic<int> disable_i8mm{0};
 
+/// CPU SME: 1 hides the SME GEMM route so the NEON routes are taken. Unlike the
+/// feature scan this is read on every availability query, so a bench or a test
+/// can flip it between calls to compare the two engines on one binary.
+inline std::atomic<int> disable_sme{0};
+
 }  // namespace nnops::detail

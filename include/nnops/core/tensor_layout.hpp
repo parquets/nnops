@@ -64,6 +64,15 @@ enum class TensorLayout : uint8_t {
     // [N, ⌈elements / N⌉], N first so shape inference reads the output's last dim.
     PackedB = 10,
 
+    // ---- Prepacked matmul RHS, AArch64 SME (f32) ----
+    //
+    // The same idea as PackedB, in the layout the ZA kernels want: 64 contiguous
+    // output columns per k, `[⌈N/64⌉][K][64]`, tail columns zero-filled. Packed
+    // once at load time, it needs no per-call RHS pack. Small M reads it too —
+    // inside one 64-column block the blob is a plain [K][64] row-major matrix,
+    // which is exactly what the GEMV wants (ldb = 64, one call per block).
+    PackedBSme = 11,
+
     // ---- Prepacked recurrent weights (Rnn / Gru / Lstm ::prepackWeights) ----
     //
     // Everything the step loop would otherwise rebuild on every call, for every
@@ -112,7 +121,7 @@ constexpr bool is_packed_conv_weight(TensorLayout layout) noexcept {
 
 /// True for the prepacked matmul RHS; opaque, addressed by matmul_packed_b_geom.
 constexpr bool is_packed_matmul_b(TensorLayout layout) noexcept {
-    return layout == TensorLayout::PackedB;
+    return layout == TensorLayout::PackedB || layout == TensorLayout::PackedBSme;
 }
 
 /// True for the recurrent family's prepacked weights; opaque, self-describing.

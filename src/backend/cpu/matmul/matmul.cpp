@@ -1239,8 +1239,8 @@ Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
 /// The float family: a dense f32/f16 product, with B the same type or a Q4_1
 /// block stream that decodes to it in the RHS pack. On aarch64 bf16 joins
 /// both: a dense bf16 product, or a Q4_1 B decoded into the BFMMLA layout.
-/// Two routes here never build a plan — the fused Q4_1 decode and the
-/// small-product sweep.
+/// Three routes here never build a plan — the fused Q4_1 decode, the
+/// small-product sweep, and (on aarch64) the SME tiles.
 Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
                           std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
@@ -1280,6 +1280,16 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
     // Past those, only f32/f16 have a fused kernel, plus a block-packed B, whose
     // blocks decode to A's type in the RHS pack.
     if (!float_a || (!same_type && !block_b)) {
+        return Status::unsupported;
+    }
+
+    // SME runs the whole product on its own tiles and pack layouts, before the
+    // plan exists; it declines every case whose geometry it cannot fill.
+    if (matmul_sme(attrs, output, inputs, ctx)) {
+        return Status::ok;
+    }
+    // An SME-layout blob has no other reader: the panel route would misread it.
+    if (b.layout() == TensorLayout::PackedBSme) {
         return Status::unsupported;
     }
 

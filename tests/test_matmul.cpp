@@ -53,6 +53,8 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/core/quant_params.hpp"
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan — to pin the pack_a route
+#include "backend/cpu/aarch64/sme_gemm.hpp"     // available() — the SME route's own gate
+#include "detail/bench_knobs.hpp"               // disable_sme — the SME / generic A/B pin
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
@@ -61,6 +63,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <thread>
@@ -83,6 +86,21 @@ float cast_from(T v) {
     if constexpr (std::is_same_v<T, float>) { return v; }
     else { return backend::cpu::half_to_float(v); }
 }
+
+/// Scope-pin the CPU SME route: off forces the generic tiled engine, on restores
+/// the hardware verdict. A no-op on a build or CPU without the SME kernels,
+/// where the route declines either way.
+struct SmePin {
+    explicit SmePin(bool on)
+        : previous(detail::disable_sme.load(std::memory_order_relaxed))
+    {
+        detail::disable_sme.store(on ? 0 : 1, std::memory_order_relaxed);
+    }
+    ~SmePin() { detail::disable_sme.store(previous, std::memory_order_relaxed); }
+    SmePin(const SmePin&) = delete;
+    SmePin& operator=(const SmePin&) = delete;
+    int previous;
+};
 
 }  // namespace
 
@@ -2933,8 +2951,8 @@ TensorView prepack_b(MatMul& op, TensorView b, std::vector<T>& blob) {
     q = oq[0];
     // Rank 2 separates a blob from "no packed form", which carries no storage.
     NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
-    NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
-                    static_cast<int>(TensorLayout::PackedB));
+    NNOPS_EXPECT_TRUE(q.layout() == TensorLayout::PackedB ||
+                      q.layout() == TensorLayout::PackedBSme);
     NNOPS_EXPECT_TRUE(q.desc().numel() >= b.numel());
 
     blob.assign(static_cast<size_t>(q.desc().numel()), T{});
@@ -2948,8 +2966,95 @@ TensorView prepack_b(MatMul& op, TensorView b, std::vector<T>& blob) {
 
 }  // namespace
 
+NNOPS_TEST(matmul_sme_matches_reference) {
+    namespace cpu = nnops::backend::cpu;
+    if (!cpu::sme::available()) {
+        std::printf("  (no SME kernels on this build or CPU; skipped)\n");
+        return;
+    }
+
+    // Shapes that fill the 16-row / 16-column faces, plus tails on both axes and
+    // a K that is not a multiple of anything. Every transpose pose, because the
+    // SME packers read A and B through a transpose flag of their own.
+    struct Case {
+        int64_t M, N, K;
+        bool ta, tb;
+    };
+    const Case cases[] = {
+        {64, 64, 64, false, false},
+        {64, 96, 256, false, false},  // a layer shape
+        {64, 96, 256, true, false},   // A stored K×M
+        {64, 96, 256, false, true},   // B stored N×K
+        {64, 96, 256, true, true},
+        {33, 70, 129, false, false},  // row, column and K tails
+        {17, 16, 1, false, false},    // one K
+        {128, 320, 512, false, false},
+    };
+
+    const auto run = [&](auto dtype_tag) {
+        using T = decltype(dtype_tag);
+        const DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        // Two f32 summations of the same products differ only in the order the
+        // k-blocks and the ZA rows were added; sqrt(K) roundings at K = 512 land
+        // a little above 1e-5, so the bound is 1e-4 relative.
+        const float tol = std::is_same_v<T, float> ? 1e-4f : kF16AccumTol;
+
+        for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+            const Case& c = cases[ci];
+            const int64_t ashape[] = {c.ta ? c.K : c.M, c.ta ? c.M : c.K};
+            const int64_t bshape[] = {c.tb ? c.N : c.K, c.tb ? c.K : c.N};
+
+            std::vector<T> av(static_cast<size_t>(c.M * c.K));
+            std::vector<T> bv(static_cast<size_t>(c.K * c.N));
+            nnops::test::XorShift128 rng(900 + 10 * static_cast<uint64_t>(ci));
+            for (auto& e : av) { e = cast_to<T>(rng.next_float()); }
+            for (auto& e : bv) { e = cast_to<T>(rng.next_float()); }
+
+            TensorView a(ashape, dt, av.data());
+            TensorView b(bshape, dt, bv.data());
+
+            MatMulAttributes attrs;
+            attrs.transpose_a = c.ta;
+            attrs.transpose_b = c.tb;
+            auto op = MatMul::create(attrs, Backend::CPU);
+
+            const TensorDesc descs[] = {a.desc(), b.desc()};
+            const auto od = op->getOutputTensorDesc(descs);
+            std::vector<T> want(static_cast<size_t>(od[0].numel()));
+            std::vector<T> got(static_cast<size_t>(od[0].numel()));
+            auto wo = nnops::test::make_channel_first(od[0], want.data());
+            auto go = nnops::test::make_channel_first(od[0], got.data());
+
+            const TensorView ins[] = {a, b};
+            {
+                const SmePin pin(/*on=*/false);
+                NNOPS_EXPECT_EQ(op->compute(wo, ins, {}, nullptr), Status::ok);
+            }
+            {
+                const SmePin pin(/*on=*/true);
+                NNOPS_EXPECT_EQ(op->compute(go, ins, {}, nullptr), Status::ok);
+            }
+
+            for (size_t i = 0; i < want.size(); ++i) {
+                const float e = cast_from<T>(want[i]);
+                NNOPS_EXPECT_NEAR(cast_from<T>(got[i]), e, tol * std::max(1.0f, std::abs(e)));
+            }
+        }
+    };
+
+    run(float{});
+    run(half{});
+}
+
 NNOPS_TEST(matmul_prepacked_b) {
     namespace cpu = nnops::backend::cpu;
+
+    // The packing claims bit-exactness against the same product's raw route, so
+    // both arms have to be the same kernel. SME is a different engine with its
+    // own summation order and declines a prepacked B anyway; pin the test to the
+    // generic tiled route, whose numbers SME's are checked against separately
+    // (matmul_sme_matches_reference).
+    const SmePin sme_off(/*on=*/false);
 
     struct Case {
         int64_t B, M, K, N;
@@ -3039,12 +3144,74 @@ NNOPS_TEST(matmul_prepacked_b) {
     run(half{});
 }
 
+NNOPS_TEST(matmul_prepacked_b_sme) {
+    namespace cpu = nnops::backend::cpu;
+    if (!cpu::sme::available()) {
+        std::printf("  (no SME kernels; skipped)\n");
+        return;
+    }
+    // The weight on an SME machine is packed once into the ZA kernels' blocked
+    // layout — f32 [K][64], f16 [ceil(K/2)][128] — and both engines read it: the
+    // SME route for M past the small gate, the GEMV (f16 through a vld2
+    // de-interleave) below it. This compares the blob against raw B in both
+    // regimes and both dtypes.
+    const int64_t N = 96, K = 200;
+    const auto run = [&](auto dtype_tag) {
+        using T = decltype(dtype_tag);
+        const DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        const float tol = std::is_same_v<T, float> ? 1e-4f : kF16AccumTol;
+
+        nnops::test::XorShift128 rng(77);
+        std::vector<T> av(static_cast<size_t>(K * 200));
+        std::vector<T> bv(static_cast<size_t>(K * N));
+        for (auto& e : av) { e = cast_to<T>(rng.next_float()); }
+        for (auto& e : bv) { e = cast_to<T>(rng.next_float()); }
+
+        const int64_t bshape[] = {K, N};
+        TensorView b(bshape, dt, bv.data());
+        auto op = MatMul::create(MatMulAttributes{}, Backend::CPU);
+
+        std::vector<T> blob;
+        TensorView packed = prepack_b(*op, b, blob);
+        NNOPS_EXPECT_EQ(static_cast<int>(packed.layout()),
+                        static_cast<int>(TensorLayout::PackedBSme));
+
+        for (int64_t M : {int64_t(1), int64_t(5), int64_t(16), int64_t(64)}) {
+            const int64_t ashape[] = {M, K};
+            TensorView a(ashape, dt, av.data());
+            const TensorDesc descs[] = {a.desc(), b.desc()};
+            const auto od = op->getOutputTensorDesc(descs);
+            std::vector<T> raw_out(static_cast<size_t>(od[0].numel()));
+            std::vector<T> pk_out(static_cast<size_t>(od[0].numel()));
+            auto ro = nnops::test::make_channel_first(od[0], raw_out.data());
+            auto po = nnops::test::make_channel_first(od[0], pk_out.data());
+
+            const TensorView rins[] = {a, b};
+            const TensorView pins[] = {a, packed};
+            NNOPS_EXPECT_EQ(op->compute(ro, rins, {}, nullptr), Status::ok);
+            NNOPS_EXPECT_EQ(op->compute(po, pins, {}, nullptr), Status::ok);
+            for (size_t i = 0; i < raw_out.size(); ++i) {
+                const float want = cast_from<T>(raw_out[i]);
+                NNOPS_EXPECT_NEAR(cast_from<T>(pk_out[i]), want,
+                                  tol * std::max(1.0f, std::abs(want)));
+            }
+        }
+    };
+    run(float{});
+    run(half{});
+}
+
 NNOPS_TEST(matmul_prepacked_b_n_tails) {
     // N in and around the 1-row kernel's two-panel rung. That kernel reads two
     // packed panels per call, so 16 takes the 16-wide remainder, 17 the paired
     // loop plus a single panel, 32 two pairs and 33 a pair plus a tail. K = 37
     // leaves a tail inside every panel too. M = 5 falls off the rung and must
     // still see one panel per call.
+    //
+    // The blob only exists off an SME machine — prepackWeights declines it
+    // there and leaves B raw — so this test, which is about the panel contract,
+    // pins the non-SME answer.
+    const SmePin sme_off(/*on=*/false);
     const int64_t Ns[] = {1, 15, 16, 17, 31, 32, 33, 40, 47, 48, 64, 65};
     const int64_t Ms[] = {1, 4, 5};
     const int64_t K = 37;
@@ -3225,6 +3392,8 @@ NNOPS_TEST(matmul_prepacked_b_int8_rejects_u8_activation) {
 }
 
 NNOPS_TEST(matmul_prepacked_b_contract_errors) {
+    // Same reason as matmul_prepacked_b_n_tails: the blob is the non-SME answer.
+    const SmePin sme_off(/*on=*/false);
     const int64_t bshape[] = {37, 19};
     auto [bv, b] = test::make_random_tensor({37, 19}, -1.0f, 1.0f, 61);
 

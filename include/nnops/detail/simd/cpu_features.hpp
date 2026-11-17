@@ -58,6 +58,8 @@ enum class CpuIsa : uint32_t {
     NEON_DOT   = 1 << 18,  ///< ARMv8.2 dot-product
     NEON_BF16  = 1 << 19,  ///< Armv8.6 bfloat16 (BFMMLA, BFCVT), FEAT_BF16
     NEON_I8MM  = 1 << 20,  ///< Armv8.6 int8 matrix multiply (SMMLA), FEAT_I8MM
+    SME        = 1 << 21,  ///< Armv9 Scalable Matrix Extension (MOPA/ZA)
+    SME2       = 1 << 22,  ///< SME2 (four ZA tiles, multi-vector MOPA)
 };
 
 /// Runtime CPU feature detector (process-wide singleton).
@@ -94,6 +96,10 @@ public:
     /// efficiency classes are reported.
     int fast_core_count() const { return fast_cores_; }
 
+    /// SME streaming vector length in bytes, when the platform publishes it.
+    /// 0 means unknown: the kernel has to ask the hardware in streaming mode.
+    size_t sme_svl_bytes() const { return sme_svl_; }
+
 private:
     CpuFeatures() { detect(); }
     void detect();
@@ -103,6 +109,7 @@ private:
     size_t l2_cache_size_ = 262144;  // 256KB default (Haswell baseline)
     size_t l2_shared_cache_size_ = 0;  // 0 = no separate value known
     int fast_cores_ = 0;             // 0 = no efficiency classes reported
+    size_t sme_svl_ = 0;             // 0 = unknown
 };
 
 inline bool cpu_has_sse4_1()  { return CpuFeatures::get().has(CpuIsa::SSE4_1); }
@@ -115,6 +122,12 @@ inline bool cpu_has_neon()    { return CpuFeatures::get().has(CpuIsa::NEON); }
 inline bool cpu_has_bf16()    { return CpuFeatures::get().has(CpuIsa::NEON_BF16); }
 /// FEAT_I8MM: the SMMLA int8 matrix-multiply instruction is available.
 inline bool cpu_has_i8mm()    { return CpuFeatures::get().has(CpuIsa::NEON_I8MM); }
+/// FEAT_SME: the Scalable Matrix Extension (ZA state, MOPA) is available.
+inline bool cpu_has_sme()     { return CpuFeatures::get().has(CpuIsa::SME); }
+/// FEAT_SME2: four ZA tiles and the multi-vector SME2 forms are available.
+inline bool cpu_has_sme2()    { return CpuFeatures::get().has(CpuIsa::SME2); }
+/// SME streaming vector length in bytes, or 0 when the OS does not say.
+inline size_t cpu_sme_svl()   { return CpuFeatures::get().sme_svl_bytes(); }
 
 } // namespace simd
 } // namespace nnops

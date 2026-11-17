@@ -12,7 +12,9 @@
 ///                                GEMM_FAST_PATH_THRESHOLD MACs, and the direct
 ///                                GEMV at M <= GEMV_M_MAX;
 ///   - matmul_qblock_fused.cpp  — the fused Q4_1 decode route (x86_64 and
-///                                aarch64; M <= 16 trans, 8 copy by default).
+///                                aarch64; M <= 16 trans, 8 copy by default);
+///   - matmul_sme.cpp           — the whole product on AArch64 SME's ZA tiles,
+///                                with its own pack layouts and its own kc.
 ///
 /// Neither packs, blocks nor splits: each sweeps the product in one pass and
 /// never touches the routes. What they do share with the driver is here — the
@@ -143,6 +145,13 @@ struct BatchWalk {
 /// not one of those (wrong dtypes, or large enough that the plan should run).
 bool matmul_small_fp(const MatMulAttributes& attrs, TensorView& output,
                      std::span<const TensorView> inputs, const ComputeContext& ctx);
+
+/// Dense f32/f16 through the AArch64 SME kernels: its own pack layouts, its own
+/// kc, no plan. False when the CPU (or build) has no SME, the operands are not
+/// a same-type dense fp pair, alpha is not 1, or a face is narrower than one ZA
+/// tile — the generic routes then take it.
+bool matmul_sme(const MatMulAttributes& attrs, TensorView& output,
+                std::span<const TensorView> inputs, const ComputeContext& ctx);
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 /// Whole product through the fused Q4_1 kernels; false if not applicable.

@@ -14,6 +14,7 @@ set(TEST_SOURCES
     test_pooling.cpp
     test_linear.cpp
     test_pack_mma.cpp
+    test_sme_gemm.cpp
     test_multi_head_attention.cpp
     test_group_query_attention.cpp
     test_multi_latent_attention.cpp

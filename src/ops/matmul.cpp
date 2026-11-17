@@ -24,6 +24,7 @@
 
 #include "backend/cpu/matmul/matmul.h"
 #include "backend/cpu/matmul/matmul_helper.h"
+#include "backend/cpu/aarch64/sme_gemm.hpp" // sme::available — the prepack layout decision
 
 #include <vector>
 
@@ -104,6 +105,10 @@ void MatMul::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
     const auto& raw = inputs[0];
     NNOPS_ASSERT(raw.rank() >= 2);
 
+    // Which layout, if any, is decided here, once, at load time: a dense f32
+    // weight on an SME machine is packed into the ZA kernels' own blocked form
+    // (matmul_packed_b_desc), which both the SME route and the small-M GEMV can
+    // read — so no per-call RHS pack and no second format.
     const TensorDesc d = backend::cpu::matmul_packed_b_desc(raw.desc(), attrs_.transpose_b);
     std::vector<int64_t> shape(d.dims.begin(), d.dims.begin() + d.rank);
     const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));

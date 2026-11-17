@@ -67,6 +67,8 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/q4_1.hpp"         // q4_1_block, float_to_half, half_to_bits
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
+#include "backend/cpu/aarch64/sme_gemm.hpp"     // cpu::sme::available — the SME A/B gate
+#include "detail/bench_knobs.hpp"               // disable_sme — the A/B pin
 #include "backend/cpu/simd_kernel/simd_quant.hpp"  // quant_kernel::quantization (the dq quantize pass)
 #include "common/bench_harness.hpp"
 #include "common/cpu_pool.hpp"
@@ -565,6 +567,101 @@ void bench_route_ab(const char* tag, const char* la, const char* lb,
     const double ma = median(va), mb = median(vb);
     std::printf("    median:   %s=%7.1f  %s=%7.1f   %s/%s=%.3f\n",
                 la, ma, lb, mb, la, lb, ma / mb);
+}
+
+/// SME route vs the generic tiled engine, same binary, interleaved round by
+/// round (the host drifts, so a block-ordered pair would read as a regression).
+/// One op object serves both arms, so the route is the only difference. A case
+/// the SME route declines — M or N below one ZA face, alpha, a prepacked B —
+/// shows up as a ratio of 1.000, which is itself the answer.
+template <typename T>
+void bench_sme_ab(const char* tag, int64_t M, int64_t K, int64_t N, int rounds = 4,
+                  int iters = 20) {
+    if (!cpu::sme::available()) {
+        std::printf("  SME A/B %s skipped: no SME kernels on this build or CPU\n", tag);
+        return;
+    }
+    RouteAB<T> r(M, K, N, /*transpose_a=*/false, 1);
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    auto timed = [&](bool sme_on) {
+        detail::disable_sme.store(sme_on ? 0 : 1, std::memory_order_relaxed);
+        return r.time(iters);
+    };
+
+    std::printf("  SME A/B %s  %lldx%lldx%lld  1T  rounds=%d iters=%d\n", tag,
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), rounds, iters);
+    std::vector<double> off, on;
+    for (int r_i = 0; r_i < rounds; ++r_i) {
+        off.push_back(timed(false));
+        on.push_back(timed(true));
+        std::printf("    round %d:  generic=%7.1f  sme=%7.1f   sme/generic=%.3f\n", r_i,
+                    off.back(), on.back(), on.back() / off.back());
+    }
+    detail::disable_sme.store(0, std::memory_order_relaxed);
+    std::printf("    median:   generic=%7.1f  sme=%7.1f   sme/generic=%.3f\n", median(off),
+                median(on), median(on) / median(off));
+}
+
+/// Prepacked weight vs the per-call RHS pack, through the public MatMul. The
+/// blob is what prepackWeights emits on an SME machine; both arms are the same
+/// kernel, so the difference is exactly the B pack it saves.
+template <typename T>
+void bench_sme_prepack(const char* tag, int64_t M, int64_t K, int64_t N, int rounds = 4,
+                       int iters = 20) {
+    if (!cpu::sme::available()) {
+        std::printf("  SME prepack A/B %s skipped\n", tag);
+        return;
+    }
+    RouteAB<T> r(M, K, N, /*transpose_a=*/false, 1);
+    // Two-step prepack (query, allocate, fill) — the caller owns the buffer.
+    const TensorView bq[] = {r.b};
+    TensorView q;
+    TensorView oq[] = {q};
+    r.op->prepackWeights(bq, oq);
+    q = oq[0];
+    if (q.rank() != 2) {
+        std::printf("  SME prepack A/B %s: no packed form for this dtype\n", tag);
+        return;
+    }
+    std::vector<T> blob(static_cast<size_t>(q.desc().numel()), T{});
+    TensorView fill(q.shape_span(), q.data_type(), blob.data(), q.pitch(), q.layout(),
+                    r.b.quant_params());
+    TensorView oq2[] = {fill};
+    r.op->prepackWeights(bq, oq2);
+    TensorView packed = oq2[0];
+    const bool is_sme_blob = packed.layout() == TensorLayout::PackedBSme;
+    const TensorView packed_ins[] = {r.a, packed};
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    auto gflops = [&](const TensorView* ins) {
+        for (int i = 0; i < 2; ++i) { r.op->compute(r.out, {ins, ins + 2}, {}, nullptr); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) { r.op->compute(r.out, {ins, ins + 2}, {}, nullptr); }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        return 2.0 * M * N * K * iters /
+               (std::chrono::duration<double, std::milli>(t1 - t0).count() * 1e6);
+    };
+
+    std::printf("  SME prepack A/B %s  %lldx%lldx%lld  blob=%s\n", tag,
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), is_sme_blob ? "sme" : "none");
+    std::vector<double> raw, pk;
+    for (int i = 0; i < rounds; ++i) {
+        raw.push_back(gflops(r.ins));
+        pk.push_back(gflops(packed_ins));
+        std::printf("    round %d:  pack-per-call=%7.1f  prepacked=%7.1f   %.3fx\n", i,
+                    raw.back(), pk.back(), pk.back() / raw.back());
+    }
+    std::printf("    median:   pack-per-call=%7.1f  prepacked=%7.1f   %.3fx\n", median(raw),
+                median(pk), median(pk) / median(raw));
 }
 
 #ifdef NNOPS_ARCH_AARCH64
@@ -2902,6 +2999,36 @@ NNOPS_BENCH(matmul_alpha_ab) {
     bench_alpha_ab<float>("f32", 128, 4096, 4096, true, 6, 4);
     bench_alpha_ab<half>("f16", 1, 4096, 4096, false, 6, 30);
     bench_alpha_ab<half>("f16", 128, 4096, 4096, false, 6, 4);
+}
+
+NNOPS_BENCH(matmul_sme_ab) {
+    // Square and layer-shaped products, a prefill (small M, wide N) and a
+    // decode (M = 1, which the SME route declines). f32 and f16.
+    // M sweep at a fixed 1024x1024 face: where the SME route stops paying.
+    bench_sme_ab<float>("f32", 8, 1024, 1024, 4, 30);
+    bench_sme_ab<float>("f32", 16, 1024, 1024, 4, 30);
+    bench_sme_ab<float>("f32", 32, 1024, 1024, 4, 30);
+    bench_sme_ab<float>("f32", 64, 1024, 1024, 4, 20);
+    bench_sme_ab<half>("f16", 16, 1024, 1024, 4, 30);
+    bench_sme_ab<half>("f16", 32, 1024, 1024, 4, 30);
+    bench_sme_ab<half>("f16", 64, 1024, 1024, 4, 20);
+    bench_sme_ab<float>("f32", 512, 512, 512, 4, 40);
+    bench_sme_ab<float>("f32", 1024, 512, 1024, 4, 12);
+    bench_sme_ab<float>("f32", 1024, 1024, 1024, 4, 12);
+    bench_sme_ab<float>("f32", 128, 4096, 4096, 4, 4);
+    bench_sme_ab<float>("f32", 1, 4096, 4096, 4, 30);
+    bench_sme_ab<half>("f16", 512, 512, 512, 4, 40);
+    bench_sme_ab<half>("f16", 1024, 1024, 1024, 4, 12);
+    bench_sme_ab<half>("f16", 128, 4096, 4096, 4, 4);
+    bench_sme_ab<half>("f16", 1, 4096, 4096, 4, 30);
+}
+
+NNOPS_BENCH(matmul_sme_prepack_ab) {
+    bench_sme_prepack<float>("f32", 128, 4096, 4096, 4, 4);   // prefill
+    bench_sme_prepack<float>("f32", 1024, 1024, 1024, 4, 12); // square
+    bench_sme_prepack<float>("f32", 1024, 512, 1024, 4, 12);  // layer shape
+    bench_sme_prepack<half>("f16", 128, 4096, 4096, 4, 4);
+    bench_sme_prepack<half>("f16", 1024, 1024, 1024, 4, 12);
 }
 
 NNOPS_BENCH(matmul_bias_ab) {

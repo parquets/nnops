@@ -299,6 +299,20 @@ void CpuFeatures::detect()
     if (hwcap2 & HWCAP2_I8MM) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_I8MM);
     }
+// FEAT_SME / FEAT_SME2: HWCAP2 bits 23 and 37. SME2 arrived after most of the
+// headers in the field, so both are spelled numerically.
+#ifndef HWCAP2_SME
+#define HWCAP2_SME (1L << 23)
+#endif
+#ifndef HWCAP2_SME2
+#define HWCAP2_SME2 (1L << 37)
+#endif
+    if (hwcap2 & HWCAP2_SME) {
+        features_ |= static_cast<uint32_t>(CpuIsa::SME);
+        if (hwcap2 & HWCAP2_SME2) {
+            features_ |= static_cast<uint32_t>(CpuIsa::SME2);
+        }
+    }
 
 #elif defined(_WIN32)
     // NEON (ASIMD) is always available. 43 is
@@ -329,6 +343,29 @@ void CpuFeatures::detect()
         if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &has_i8mm, &len, nullptr, 0) == 0 &&
             has_i8mm != 0) {
             features_ |= static_cast<uint32_t>(CpuIsa::NEON_I8MM);
+        }
+    }
+    {
+        int32_t has_sme = 0;
+        size_t len = sizeof(has_sme);
+        if (sysctlbyname("hw.optional.arm.FEAT_SME", &has_sme, &len, nullptr, 0) == 0 &&
+            has_sme != 0) {
+            features_ |= static_cast<uint32_t>(CpuIsa::SME);
+            int32_t has_sme2 = 0;
+            len = sizeof(has_sme2);
+            if (sysctlbyname("hw.optional.arm.FEAT_SME2", &has_sme2, &len, nullptr, 0) == 0 &&
+                has_sme2 != 0) {
+                features_ |= static_cast<uint32_t>(CpuIsa::SME2);
+            }
+            // The maximum streaming vector length, in bytes. The kernel packs
+            // for SVL 64 (16 f32 lanes); a part that reports another width
+            // keeps the SME path off until the kernel is written for it.
+            int32_t svl = 0;
+            len = sizeof(svl);
+            if (sysctlbyname("hw.optional.arm.sme_max_svl_b", &svl, &len, nullptr, 0) == 0 &&
+                svl > 0) {
+                sme_svl_ = static_cast<size_t>(svl);
+            }
         }
     }
 #endif

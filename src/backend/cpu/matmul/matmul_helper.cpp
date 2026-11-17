@@ -40,6 +40,7 @@
 #include "nnops/detail/q4_1.hpp"
 #include "nnops/detail/simd.hpp"
 #include "backend/cpu/simd_kernel/simd_quant.hpp"
+#include "backend/cpu/aarch64/sme_gemm.hpp"
 
 #ifdef NNOPS_ARCH_X86_64
 using namespace nnops::backend::cpu::x86_64;
@@ -721,6 +722,23 @@ MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcep
     return g;
 }
 
+MatMulPackedB matmul_packed_b_sme_geom(int64_t N, int64_t K, DataType dtype) noexcept
+{
+    MatMulPackedB g;
+    if (N <= 0 || K <= 0 || (dtype != DataType::f32 && dtype != DataType::f16) ||
+        !sme::available()) {
+        return g;
+    }
+    // One slot per 64-column block, contiguous, the layout the kernels read in
+    // place: f32 [K][64], f16 [ceil(K/2)][128] with each column's K pair
+    // adjacent. A small-M reader de-interleaves the f16 slot with vld2.
+    g.nr = sme::kNB;
+    g.ldd = dtype == DataType::f16 ? ((K + 1) / 2) * (2 * sme::kNB) : K * sme::kNB;
+    g.np = (N + g.nr - 1) / g.nr;
+    g.total = g.np * g.ldd;
+    return g;
+}
+
 namespace {
 
 /// N and K of a raw B, in the order @p transpose_b describes.
@@ -748,14 +766,20 @@ TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b)
 
     int64_t N = 0, K = 0;
     raw_b_extent(raw, transpose_b, N, K);
-    const MatMulPackedB g = matmul_packed_b_geom(N, K, raw.dtype);
+    // On an SME machine a dense f32 weight is packed into the ZA kernels' own
+    // layout: those run the product as soon as M is past the small routes, and
+    // a NEON panel blob would be unreadable there. Decided once, at load time.
+    const bool sme_blob =
+        (raw.dtype == DataType::f32 || raw.dtype == DataType::f16) && sme::available();
+    const MatMulPackedB g =
+        sme_blob ? matmul_packed_b_sme_geom(N, K, raw.dtype) : matmul_packed_b_geom(N, K, raw.dtype);
     if (!g.ok()) {
         return d;
     }
 
     d.rank = 2;
     d.dtype = raw.dtype;
-    d.layout = TensorLayout::PackedB;
+    d.layout = sme_blob ? TensorLayout::PackedBSme : TensorLayout::PackedB;
     d.dims.resize(2);
     d.dims[0] = N;
     d.dims[1] = packed_b_numel(g, N) / N;
@@ -769,7 +793,9 @@ bool matmul_packed_b_matches(const TensorDesc& packed, int64_t K) noexcept
         return false;
     }
     const int64_t N = packed.dims[0];
-    const MatMulPackedB g = matmul_packed_b_geom(N, K, packed.dtype);
+    const MatMulPackedB g = packed.layout == TensorLayout::PackedBSme ?
+                                matmul_packed_b_sme_geom(N, K, packed.dtype) :
+                                matmul_packed_b_geom(N, K, packed.dtype);
     return g.ok() && packed.numel() == packed_b_numel(g, N);
 }
 
@@ -780,6 +806,16 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed, bool transp
     const bool trans = transpose_b;
     const int64_t N = trans ? raw.shape(raw.rank() - 2) : raw.shape(raw.rank() - 1);
     const int64_t K = trans ? raw.shape(raw.rank() - 1) : raw.shape(raw.rank() - 2);
+    if (packed.layout() == TensorLayout::PackedBSme) {
+        if (dt == DataType::f16) {
+            sme::pack_b_f16(static_cast<int>(N), static_cast<int>(K), packed.ptr<half>(),
+                            raw.ptr<half>(), raw.row_stride_elems(), trans);
+        } else {
+            sme::pack_b_f32(static_cast<int>(N), static_cast<int>(K), packed.ptr<float>(),
+                            raw.ptr<float>(), raw.row_stride_elems(), trans);
+        }
+        return;
+    }
     const MatMulPackedB g = matmul_packed_b_geom(N, K, dt);
     NNOPS_ASSERT(g.ok() && "matmul_packed_b_pack: no packed form for this B");
     NNOPS_ASSERT(packed.numel() == packed_b_numel(g, N) &&
