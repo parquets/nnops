@@ -434,7 +434,7 @@ void run_conv()
         a.kernel_size = {2, 2, 2};
         check_case("conv3d",
                    [a] { return Conv3D::create(a, Backend::CPU); },
-                   {{{1, 2, 5, 5, 5}}, {{3, 2, 2, 2, 2}}}, 5e-2f);
+                   {{{1, 2, 5, 5, 5}, TensorLayout::NDHWC}, {{3, 2, 2, 2, 2}}}, 5e-2f);
     }
 }
 

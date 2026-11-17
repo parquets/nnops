@@ -193,8 +193,8 @@ NNOPS_TEST(cast_large_float_paths) {
     for (int64_t i = 0; i < n; ++i) {
         // The eight-lane narrowing must round exactly where the scalar
         // conversion does, including the f16 subnormal range.
-        if (halves[static_cast<size_t>(i)].bits !=
-            cpu::float_to_half(src[static_cast<size_t>(i)]).bits) {
+        if (cpu::half_to_bits(halves[static_cast<size_t>(i)]) !=
+            cpu::half_to_bits(cpu::float_to_half(src[static_cast<size_t>(i)]))) {
             ++bad;
         }
         if (back[static_cast<size_t>(i)] != cpu::half_to_float(halves[static_cast<size_t>(i)])) {
@@ -208,7 +208,10 @@ NNOPS_TEST(cast_large_float_paths) {
     auto copy16 = run_cast<cpu::half>(DataType::f16, DataType::f16, halves.data(), n);
     for (int64_t i = 0; i < n; ++i) {
         if (copy32[static_cast<size_t>(i)] != src[static_cast<size_t>(i)]) { ++bad; }
-        if (copy16[static_cast<size_t>(i)].bits != halves[static_cast<size_t>(i)].bits) { ++bad; }
+        if (cpu::half_to_bits(copy16[static_cast<size_t>(i)]) !=
+            cpu::half_to_bits(halves[static_cast<size_t>(i)])) {
+            ++bad;
+        }
     }
 
     std::vector<int8_t>  s8(static_cast<size_t>(n));
