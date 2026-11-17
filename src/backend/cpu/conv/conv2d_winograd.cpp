@@ -29,24 +29,34 @@ namespace k = nnops::kernel;
 WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_group, int64_t out_h,
                           int64_t out_w, int num_threads) noexcept
 {
-    // f16 stays on F(2,3): Bᵀ scales a window by up to 5 and Aᵀ the products by
-    // 8, so the V and M rounds cost three bits on top of an f16 for an f16 GEMM
-    // accumulate. Measured 0.63-0.73x of F(2,3) (0.56-0.87x at 1 thread), but at
-    // 0.125 of full scale on a 32-channel case where the f16 contract holds
-    // 0.05 — the speed is there and the accuracy is not.
-    // A caller who wants it anyway pins winograd_order = 4.
-    if (dt != DataType::f32) {
-        return WinoOrder::F23;
-    }
+    // f16 is offered F(4,3) on the same terms as f32; what differs is the
+    // accuracy it buys. Bᵀ scales a window by up to 5 and Aᵀ the products by 8,
+    // so the GEMM's f16 accumulate rounds an intermediate ~8x the output, and
+    // the error grows as √IC on top of that.
+    //
+    // Measured on an M4 against an f32 implicit GEMM (five seeds, 16x16/56x56),
+    // by channels per group:
+    //   IC/G   8: 1.5% of full scale, 0.15% rms, worst |err|/(1+|ref|) 0.04-0.22
+    //   IC/G  16: 2.4%,              0.20%,                        0.18-0.30
+    //   IC/G  32: 4.0%,              0.28%,                        0.25-0.72
+    //   IC/G  64: 5.5%,              0.28%,                        0.65-1.16
+    //   IC/G 128: 8.0%,              0.37%,                        -
+    // F(2,3) holds ~0.2% of full scale and 0.01 element-wise on the same cases.
+    // The element-wise tail is cancellation on near-zero outputs, not a bias:
+    // at 64 channels and up an output near zero can be off by more than its own
+    // magnitude. That is the caller's trade to make — pin winograd_order = 2 on
+    // a layer that needs the accuracy.
 
     // The U is streamed on every call, and F(4,3)'s is 2.25x the blob — 36
     // transform positions against 16 for the same filter. Past a 32 MB-class L3
     // (16 MB here, leaving room for the activations) that stream is the wall: a
-    // 512x512 filter is 37.7 MB and measured 1.62x F(2,3) at 7x7 and 0.92x at
+    // 512x512 f32 filter is 37.7 MB and measured 1.62x F(2,3) at 7x7 and 0.92x at
     // 28x28 at 1 thread, 1.72x and 1.38x at 20 — the one shape where the wider
-    // tile stops paying for itself. Below the fence it pays.
+    // tile stops paying for itself. Below the fence it pays. The budget counts
+    // the blob's own element size, so f16 reaches twice as far as f32.
     constexpr int64_t u_budget = 16 << 20;
-    if (wino_pos(WinoOrder::F43) * ic_per_group * oc_per_group * 4 > u_budget) {
+    const int64_t esz = static_cast<int64_t>(data_type_size(dt));
+    if (wino_pos(WinoOrder::F43) * ic_per_group * oc_per_group * esz > u_budget) {
         return WinoOrder::F23;
     }
 

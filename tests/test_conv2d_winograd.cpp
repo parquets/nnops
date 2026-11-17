@@ -319,7 +319,20 @@ NNOPS_TEST(wino_applicable_thresholds) {
 NNOPS_TEST(wino_pick_order_fences) {
     using nnops::backend::cpu::WinoOrder;
     using nnops::backend::cpu::wino_pick_order;
-    // f16 keeps F(2,3) at every width and plane.
+    // f16 picks on the same rules as f32: F(4,3) from the plane floor up, with
+    // no channel fence (the wider error is documented, not gated) ...
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 32, 32, 56, 56) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 64, 64, 56, 56) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 128, 128, 56, 56) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 256, 256, 14, 14, 4) ==
+                      WinoOrder::F43);
+    // ... and F(2,3) below the plane floor, or where the U stream no longer
+    // fits (36 * 512 * 512 * 2 B = 18.9 MB; 256 channels is 4.7 MB and wins).
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 64, 64, 7, 7) ==
+                      WinoOrder::F23);
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56) ==
                       WinoOrder::F23);
     // The floor moves with the team: a 14x14 plane is one

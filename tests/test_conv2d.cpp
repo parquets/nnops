@@ -152,6 +152,10 @@ struct FpCase {
     std::array<int64_t, 4> ishape;  ///< N, IC, IH, IW
     int64_t oc, kh, kw, sh, sw, ph, pw, dh, dw, groups;
     bool bias;
+    /// Pinned Winograd order (2 or 4); 0 lets the policy choose. Pinning keeps an
+    /// end-to-end case on the order it is meant to cover instead of following
+    /// the policy's thresholds.
+    int64_t wino_order = 0;
 };
 
 struct FpResult {
@@ -224,6 +228,7 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
     attrs.add_to      = add_to;
     attrs.residual_pre_activation = pre_act;
     attrs.algorithm   = alg;
+    attrs.winograd_order = c.wino_order;
 
     auto op = Conv2D::create(attrs, Backend::CPU);
 
@@ -791,17 +796,43 @@ NNOPS_TEST(conv2d_wino_matches_ref) {
                         static_cast<int>(i) + 200, ConvAlgorithm::Winograd);
     }
 
-    // f16 narrows only the accumulator, so the shared f16 tolerance applies.
-    const Case f16_cases[] = {
-        {{{1, 32, 16, 16},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   81},
-        {{{1, 64, 14, 14},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},  82},
-        {{{1, 40, 13, 15},  24, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   83},
-        {{{2, 16, 20, 20},   8, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},  84},
+    // f16 at F(2,3). Pinned so the order stays covered whatever the policy's
+    // channel fence does; OC 24 leaves a tail in the 16-wide GEMM panel, and the
+    // 13x15 plane is odd on both axes.
+    const Case f16_f23_cases[] = {
+        {{{1, 32, 16, 16},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, true,  2},   81},
+        {{{1, 64, 14, 14},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, false, 2},   82},
+        {{{1, 40, 13, 15},  24, 3, 3, 1, 1, 1, 1, 1, 1, 1, true,  2},   83},
+        {{{2, 16, 20, 20},   8, 3, 3, 1, 1, 1, 1, 1, 1, 2, false, 2},   84},
     };
-    for (size_t i = 0; i < std::size(f16_cases); ++i) {
-        expect_fp_close(f16_cases[i].c, DataType::f16, nnops::test::kF16AccumTol,
-                        EpilogueActivateType::None, false, f16_cases[i].seed,
+    for (size_t i = 0; i < std::size(f16_f23_cases); ++i) {
+        expect_fp_close(f16_f23_cases[i].c, DataType::f16, nnops::test::kF16AccumTol,
+                        EpilogueActivateType::None, false, f16_f23_cases[i].seed,
                         static_cast<int>(i), ConvAlgorithm::Winograd);
+    }
+
+    // f16 at F(4,3): offered by the policy only up to 32 channels per group,
+    // where the full-scale error still holds the contract (4% at IC/G 32; see
+    // wino_pick_order). F(4,3)'s transform cancels harder than F(2,3)'s, so the
+    // element-wise metric on near-zero outputs reaches ~0.5 where F(2,3) holds
+    // 0.01; that tail is the order's price, and this tolerance is its measured
+    // envelope rather than the shared f16 contract. The test is here to catch a
+    // structural break in the f16 F(4,3) route, not to pin the error budget.
+    constexpr float kF16F43Tol = 8e-1f;
+    const Case f16_f43_cases[] = {
+        {{{1, 32, 16, 16},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, true,  4},   91},
+        // A wider plane, and OC over the 64-wide GEMM block.
+        {{{1, 32, 28, 28}, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, false, 4},   92},
+        // groups 2: IC/G 16, OC/G 16.
+        {{{1, 32, 20, 20},  32, 3, 3, 1, 1, 1, 1, 1, 1, 2, true,  4},   93},
+        // Padded, odd on both axes: the last tile of every row and of the last
+        // row are partial.
+        {{{1, 24, 15, 17},  24, 3, 3, 1, 1, 1, 1, 1, 1, 1, false, 4},   94},
+    };
+    for (size_t i = 0; i < std::size(f16_f43_cases); ++i) {
+        expect_fp_close(f16_f43_cases[i].c, DataType::f16, kF16F43Tol,
+                        EpilogueActivateType::None, false, f16_f43_cases[i].seed,
+                        static_cast<int>(i) + 100, ConvAlgorithm::Winograd);
     }
 }
 

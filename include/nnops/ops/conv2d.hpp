@@ -123,9 +123,13 @@ struct Conv2DAttributes {
     /// Winograd transform order as the output tile side: 2 pins F(2,3), 4 pins
     /// F(4,3), 0 (the default) lets wino_pick_order() choose — F(4,3) from a
     /// 28x28 plane up at any team size, subject to the U still fitting the
-    /// last-level cache. Pin 4 to take it anywhere. Any other value is refused
-    /// at prepack. It only selects which U prepackWeights() builds; compute()
-    /// reads the order back off the blob, so the two cannot disagree.
+    /// last-level cache. f16 picks between the two on the same rules; note that
+    /// its GEMM accumulates in f16 and F(4,3) amplifies that rounding ~8x, so
+    /// the error grows with the channel count (4% of full scale at 32 channels
+    /// per group, 8% at 128). Pin 2 on a layer that needs the accuracy, or 4 to
+    /// take F(4,3) past the fences. Any other value is refused at prepack. It
+    /// only selects which U prepackWeights() builds; compute() reads the order
+    /// back off the blob, so the two cannot disagree.
     int64_t winograd_order = 0;
 };
 

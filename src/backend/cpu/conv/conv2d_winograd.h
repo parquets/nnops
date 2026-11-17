@@ -144,6 +144,11 @@ WinoU wino_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
 /// decides: F(4,3) from 28x28 up, at any team size, subject to the U still
 /// fitting the last-level cache.
 ///
+/// f16 gets the same choice; its GEMM accumulates in f16, and F(4,3)'s Aᵀ/Bᵀ
+/// amplify that rounding ~8x with the error growing as √IC (measured: 4% of full
+/// scale at 32 channels per group, 8% at 128). The order is still picked by the
+/// shape and cost fences; a caller that cannot take the wider error pins 2.
+///
 /// @p num_threads is the *worker* count (CpuBackend::thread_slot_count, not the
 /// item grid) — the grid an over-subscribed pool hands out says nothing about
 /// how many cores the transforms run on.
