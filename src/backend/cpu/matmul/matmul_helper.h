@@ -807,6 +807,13 @@ void xor0x80_i8(int8_t* p, int nbytes);
 // and the plan pins kc to one segment. `seg` is that length; the float blobs
 // leave it 0, their panels already span the whole K. Last segment sits at a
 // whole panel slot too: a caller never has to read its shorter pitch.
+//
+// That segmented int8 blob is what the planned and dequantizing routes read. On
+// an SME machine an s8 weight prepacked for an integral destination instead
+// takes `TensorLayout::PackedBSme`, the ZA kernel's `[⌈N/64⌉][⌈K/4⌉][256]`:
+// raw B, no correction block, whole K. It accepts s8 and u8 activations alike;
+// an fp destination decodes it once to a dense matrix
+// (matmul_packed_b_sme_i8_unpack) for the dequantizing route.
 
 struct MatMulPackedB {
     int64_t nr = 0;    ///< panel width (the arch's uniform RHS width)
@@ -828,7 +835,20 @@ MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcep
 /// is what shape inference reads (Linear's output width, MatMul's N under
 /// transpose_b). Rank 0 for a B with no packed form; @p transpose_b says @p raw
 /// is ordered [N, K] (Linear's weight, MatMul's transposed B) or [K, N].
-TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b);
+///
+/// On an SME machine a dense f32/f16 weight takes the ZA kernels' whole-K blob
+/// (`TensorLayout::PackedBSme`). An s8 weight does too, but only when
+/// @p sme_int8 is set — the prepack cannot see the activation, and an fp
+/// activation's quantizing route reads the segmented panel blob instead. The
+/// ops pass their `output_dtype`'s integrality here; a caller that supplies the
+/// weight for an fp-output compute leaves it false.
+TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b, bool sme_int8 = false);
+
+/// Decode an SME-layout s8 blob back to a dense [K][N] row-major matrix. Only
+/// the fp-output routes need it: they read the segmented panel blob, so a
+/// weight prepacked for an integral output is decoded once rather than misread.
+void matmul_packed_b_sme_i8_unpack(const TensorView& packed, int64_t K, int8_t* dst,
+                                   const ComputeContext& ctx);
 
 /// True when @p packed is a coherent blob for a product K deep — its numel is
 /// the geometry's. That single check is what catches a blob packed against a

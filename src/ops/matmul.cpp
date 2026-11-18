@@ -11,9 +11,11 @@
 /// not f32/f16/s8, or an empty extent -- is an answer rather than a failure),
 /// then the same call fills the caller's buffer. A float blob holds the whole K,
 /// which is what makes it independent of the per-call plan -- and why alpha,
-/// which otherwise rides the RHS pack, must be 1. The int8 blob is cut into
-/// segments (its panel correction block is read at the call's kc), so the plan
-/// pins kc to one segment instead, and only an s8 activation can read it. A
+/// which otherwise rides the RHS pack, must be 1. The segmented int8 blob has
+/// its panel correction block read at the call's kc, so the plan pins kc to one
+/// segment instead, and only an s8 activation can read it. On an SME machine an
+/// s8 weight prepacked for an integral output takes the ZA blob instead: raw B,
+/// whole K, s8 and u8 activations both, and an fp output decodes it once. A
 /// packed B carries N but no K: validate() takes K from A, and the backend's
 /// numel check catches a blob packed against another K.
 
@@ -24,7 +26,6 @@
 
 #include "backend/cpu/matmul/matmul.h"
 #include "backend/cpu/matmul/matmul_helper.h"
-#include "backend/cpu/aarch64/sme_gemm.hpp" // sme::available — the prepack layout decision
 
 #include <vector>
 
@@ -109,7 +110,13 @@ void MatMul::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
     // weight on an SME machine is packed into the ZA kernels' own blocked form
     // (matmul_packed_b_desc), which both the SME route and the small-M GEMV can
     // read — so no per-call RHS pack and no second format.
-    const TensorDesc d = backend::cpu::matmul_packed_b_desc(raw.desc(), attrs_.transpose_b);
+    // An integral output says the weight will feed the integer route; an fp
+    // output keeps the segmented blob the dequantizing route reads.
+    const DataType odt = attrs_.output_dtype;
+    const bool sme_i8 =
+        odt == DataType::s32 || odt == DataType::s8 || odt == DataType::u8;
+    const TensorDesc d =
+        backend::cpu::matmul_packed_b_desc(raw.desc(), attrs_.transpose_b, sme_i8);
     std::vector<int64_t> shape(d.dims.begin(), d.dims.begin() + d.rank);
     const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));
 

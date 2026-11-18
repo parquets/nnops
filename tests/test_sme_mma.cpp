@@ -1,5 +1,5 @@
-/// @file test_sme_gemm.cpp
-/// @brief The SME GEMM micro-kernels against a scalar reference.
+/// @file test_sme_mma.cpp
+/// @brief The SME MMA micro-kernels against a scalar reference.
 ///
 /// The kernels take the packed layouts directly, so the test packs with the
 /// same packers the engine uses and checks every path: overwrite / accumulate /
@@ -7,8 +7,13 @@
 /// tails. On a machine without SME the test reports and passes without calling
 /// in.
 
-#include "backend/cpu/aarch64/sme_gemm.hpp"
-#include "nnops/detail/simd/cpu_features.hpp"
+#include "backend/cpu/aarch64/mma_f16_sme.hpp"
+#include "backend/cpu/aarch64/mma_f32_sme.hpp"
+#include "backend/cpu/aarch64/mma_i8_sme.hpp"
+#include "backend/cpu/aarch64/mma_sme.hpp"
+#include "backend/cpu/aarch64/pack_f16_sme.hpp"
+#include "backend/cpu/aarch64/pack_f32_sme.hpp"
+#include "backend/cpu/aarch64/pack_i8_sme.hpp"
 
 #include "common/test_harness.hpp"
 
@@ -18,9 +23,12 @@
 #include <cstdio>
 #include <vector>
 
+#if defined(NNOPS_ARCH_SME)
+
 using namespace nnops;
 using nnops::backend::cpu::half;
-using nnops::backend::cpu::sme::available;
+using namespace nnops::backend::cpu::aarch64;
+using nnops::backend::cpu::aarch64::available_sme;
 
 namespace {
 
@@ -65,16 +73,16 @@ void run_f32(int mc, int nc, int kc)
 {
     const auto a = make_a(mc, kc, static_cast<uint32_t>(mc * 7 + mc + kc));
     const auto b = make_b(nc, kc, static_cast<uint32_t>(nc * 3 + kc));
-    std::vector<float> pa(backend::cpu::sme::packed_a_elems_f32(mc, kc));
-    std::vector<float> pb(backend::cpu::sme::packed_b_elems_f32(nc, kc));
-    backend::cpu::sme::pack_a_f32(mc, kc, pa.data(), a.data(), kc);
-    backend::cpu::sme::pack_b_f32(nc, kc, pb.data(), b.data(), nc);
+    std::vector<float> pa(packed_a_elems_f32_sme(mc, kc));
+    std::vector<float> pb(packed_b_elems_f32_sme(nc, kc));
+    pack_a_f32_sme(mc, kc, pa.data(), a.data(), kc);
+    pack_b_f32_sme(nc, kc, pb.data(), b.data(), nc);
 
     std::vector<float> c(static_cast<size_t>(mc) * nc);
 
     // Overwrite, no clamp.
     std::fill(c.begin(), c.end(), 123.0f);
-    backend::cpu::sme::gemm_f32(mc, nc, kc, c.data(), nc, pa.data(), pb.data(),
+    mma_f32_sme(mc, nc, kc, c.data(), nc, pa.data(), pb.data(),
                                 /*zero_mode=*/true, -1e30f, 1e30f, nullptr);
     for (int m = 0; m < mc; ++m) {
         for (int n = 0; n < nc; ++n) {
@@ -91,7 +99,7 @@ void run_f32(int mc, int nc, int kc)
         v = static_cast<float>(st >> 8) / 16777216.0f;
     }
     std::vector<float> base = c2;
-    backend::cpu::sme::gemm_f32(mc, nc, kc, c2.data(), nc, pa.data(), pb.data(),
+    mma_f32_sme(mc, nc, kc, c2.data(), nc, pa.data(), pb.data(),
                                 /*zero_mode=*/false, -1e30f, 1e30f, nullptr);
     for (int m = 0; m < mc; ++m) {
         for (int n = 0; n < nc; ++n) {
@@ -104,7 +112,7 @@ void run_f32(int mc, int nc, int kc)
     std::vector<float> bias(static_cast<size_t>(nc));
     for (int n = 0; n < nc; ++n) { bias[static_cast<size_t>(n)] = 0.01f * static_cast<float>(n); }
     std::fill(c.begin(), c.end(), -777.0f);
-    backend::cpu::sme::gemm_f32(mc, nc, kc, c.data(), nc, pa.data(), pb.data(),
+    mma_f32_sme(mc, nc, kc, c.data(), nc, pa.data(), pb.data(),
                                 /*zero_mode=*/true, -0.5f, 0.5f, bias.data());
     for (int m = 0; m < mc; ++m) {
         for (int n = 0; n < nc; ++n) {
@@ -128,12 +136,12 @@ void run_f16(int mc, int nc, int kc)
     for (size_t i = 0; i < a.size(); ++i) { af[i] = static_cast<float>(a[i]); }
     for (size_t i = 0; i < b.size(); ++i) { bf[i] = static_cast<float>(b[i]); }
 
-    std::vector<half> pa(backend::cpu::sme::packed_a_elems_f16(mc, kc));
-    std::vector<half> pb(backend::cpu::sme::packed_b_elems_f16(nc, kc));
-    backend::cpu::sme::pack_a_f16(mc, kc, pa.data(), a.data(), kc);
-    backend::cpu::sme::pack_b_f16(nc, kc, pb.data(), b.data(), nc);
+    std::vector<half> pa(packed_a_elems_f16_sme(mc, kc));
+    std::vector<half> pb(packed_b_elems_f16_sme(nc, kc));
+    pack_a_f16_sme(mc, kc, pa.data(), a.data(), kc);
+    pack_b_f16_sme(nc, kc, pb.data(), b.data(), nc);
     std::vector<half> c(static_cast<size_t>(mc) * nc);
-    backend::cpu::sme::gemm_f16(mc, nc, kc, c.data(), nc, pa.data(), pb.data(),
+    mma_f16_sme(mc, nc, kc, c.data(), nc, pa.data(), pb.data(),
                                 /*zero_mode=*/true, -1e30f, 1e30f, nullptr);
     for (int m = 0; m < mc; ++m) {
         for (int n = 0; n < nc; ++n) {
@@ -155,13 +163,13 @@ void run_i8(int mc, int nc, int kc)
     for (auto& v : a) { st = st * 1664525u + 1013904223u; v = static_cast<int8_t>((st >> 16) % 251 - 125); }
     for (auto& v : b) { st = st * 1664525u + 1013904223u; v = static_cast<int8_t>((st >> 16) % 251 - 125); }
 
-    std::vector<int8_t> pa(backend::cpu::sme::packed_a_elems_i8(mc, kc));
-    std::vector<int8_t> pb(backend::cpu::sme::packed_b_elems_i8(nc, kc));
-    backend::cpu::sme::pack_a_i8(mc, kc, pa.data(), a.data(), kc, false, false);
-    backend::cpu::sme::pack_b_i8(nc, kc, pb.data(), b.data(), nc, false);
+    std::vector<int8_t> pa(packed_a_elems_i8_sme(mc, kc));
+    std::vector<int8_t> pb(packed_b_elems_i8_sme(nc, kc));
+    pack_a_i8_sme(mc, kc, pa.data(), a.data(), kc, false, false);
+    pack_b_i8_sme(nc, kc, pb.data(), b.data(), nc, false);
 
     std::vector<int32_t> c(static_cast<size_t>(mc) * nc);
-    backend::cpu::sme::gemm_i8(mc, nc, kc, c.data(), nc, pa.data(), pb.data(),
+    mma_i8_sme(mc, nc, kc, c.data(), nc, pa.data(), pb.data(),
                                /*zero_mode=*/true, INT32_MIN, INT32_MAX);
     for (int m = 0; m < mc; ++m) {
         for (int n = 0; n < nc; ++n) {
@@ -177,8 +185,8 @@ void run_i8(int mc, int nc, int kc)
 
 } // namespace
 
-NNOPS_TEST(sme_gemm_matches_reference) {
-    if (!available()) {
+NNOPS_TEST(sme_mma_matches_reference) {
+    if (!available_sme()) {
         std::printf("  (no SME on this build or CPU; skipped)\n");
         return;
     }
@@ -195,3 +203,5 @@ NNOPS_TEST(sme_gemm_matches_reference) {
     run_f16(40, 70, 17); // odd kc pads the last K pair
     run_f16(1, 13, 5);
 }
+
+#endif // NNOPS_ARCH_SME

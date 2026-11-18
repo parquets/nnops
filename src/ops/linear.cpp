@@ -131,8 +131,13 @@ void Linear::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
     const auto& weight = inputs[0];
     NNOPS_ASSERT(weight.rank() == 2);
 
+    // An integral output says the weight will feed the integer route; an fp
+    // output keeps the segmented blob the dequantizing route reads.
+    const DataType odt = attrs_.output_dtype;
+    const bool sme_i8 =
+        odt == DataType::s32 || odt == DataType::s8 || odt == DataType::u8;
     const TensorDesc d = backend::cpu::matmul_packed_b_desc(weight.desc(),
-                                                            /*transpose_b=*/true);
+                                                            /*transpose_b=*/true, sme_i8);
     std::vector<int64_t> shape(d.dims.begin(), d.dims.begin() + d.rank);
     const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));
 

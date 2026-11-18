@@ -87,13 +87,15 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/compare.cpp
 
     # CPU tiled matmul kernel (NKM loop with pack + MMA), plus the routes that
-    # bypass the plan (small naive / GEMV, fused Q4_1, AArch64 SME). matmul_helper
-    # is the shared pack/MMA layer that conv2d and attention also drive.
+    # bypass the plan (small naive / GEMV, fused Q4_1, AArch64 SME for fp and
+    # int8). matmul_helper is the shared pack/MMA layer that conv2d and
+    # attention also drive.
     backend/cpu/matmul/matmul.cpp
     backend/cpu/matmul/matmul_helper.cpp
     backend/cpu/matmul/matmul_small.cpp
     backend/cpu/matmul/matmul_qblock_fused.cpp
     backend/cpu/matmul/matmul_sme.cpp
+    backend/cpu/matmul/matmul_sme_i8.cpp
 
     # Linear is the MatMul GEMM with a transposed weight, a per-column bias and
     # an fp output for quantized operands; it drives matmul.cpp above. MoE is
@@ -143,19 +145,13 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/cumsum.cpp
 )
 
-if(NNOPS_ENABLE_SME)
-    # The one translation unit built for SME; everything else stays baseline and
-    # reaches it through sme::available().
-    list(APPEND NNOPS_CPU_SOURCES backend/cpu/aarch64/sme_gemm.cpp)
-endif()
-
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})
 target_include_directories(nnops_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(NNOPS_ENABLE_SME)
+    # The kernels are header-only and carry their own target("+sme2") attribute,
+    # so the library stays baseline AArch64 and only the emitted bodies use SME.
     target_compile_definitions(nnops_cpu PUBLIC NNOPS_ARCH_SME=1)
-    set_source_files_properties(backend/cpu/aarch64/sme_gemm.cpp PROPERTIES
-        COMPILE_OPTIONS "-march=armv8.2-a+sme2;-O2")
 endif()
 
 # ---- CUDA backend (optional) ----

@@ -1173,16 +1173,25 @@ Status matmul_int8_tiled(const MatMulAttributes& attrs, TensorView& output,
 
 /// A prepacked RHS (MatMul/Linear ::prepackWeights) is a float-panel blob —
 /// same dtype as A, f32 or f16, alpha 1 (alpha rode the per-call RHS pack, and
-/// a load-time blob has no slot for it) — or an int8 one. The int8 blob is
-/// s8-only and alpha-free: its panel correction block is the +128 A shift, which
-/// neither a u8 activation nor a fused fp one would reproduce. Its numel is the
-/// one thing that can be wrong — a blob packed against another K — so it is
-/// checked rather than trusted.
+/// a load-time blob has no slot for it) — or an int8 one. The segmented int8
+/// blob is s8-only and alpha-free: its panel correction block is the +128 A
+/// shift, which neither a u8 activation nor a fused fp one would reproduce. The
+/// SME int8 blob is raw B in the ZA layout, so it takes u8 too; an fp activation
+/// decodes it to a dense matrix for the dequantizing route. Its numel is the one
+/// thing that can be wrong — a blob packed against another K — so it is checked
+/// rather than trusted.
 Status check_packed_b(const MatMulAttributes& attrs, const TensorView& a, const TensorView& b)
 {
     const DataType dt_a = a.data_type();
-    const bool int8_blob = dt_a == DataType::s8 && b.data_type() == DataType::s8;
-    if (!int8_blob) {
+    if (b.data_type() == DataType::s8) {
+        const bool sme_blob = b.layout() == TensorLayout::PackedBSme;
+        const bool fp_a = dt_a == DataType::f32 || dt_a == DataType::f16;
+        const bool int_a = dt_a == DataType::s8 || dt_a == DataType::u8;
+        // s8 is the only A the segmented panels' folded shift reproduces.
+        if (!(dt_a == DataType::s8 || (sme_blob && (int_a || fp_a)))) {
+            return Status::unsupported;
+        }
+    } else {
         const bool float_blob =
             dt_a == b.data_type() && (dt_a == DataType::f32 || dt_a == DataType::f16 ||
                                       (nnops::detail::bf16_cpu_enabled && dt_a == DataType::bf16));
@@ -1226,13 +1235,41 @@ Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
                              std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
+    const auto& b = inputs[1];
     const DataType dt_a = a.data_type();
+    if (b.layout() == TensorLayout::PackedBSme) {
+        // The SME integer route owns integral destinations, and every shape when
+        // B is prepacked. The fp-output routes read the segmented panel blob, so
+        // an fp destination decodes the SME blob once — the combination only
+        // arises when a weight prepacked for an integral output is dequantized.
+        if (matmul_sme_i8(attrs, output, inputs, ctx)) {
+            return Status::ok;
+        }
+        const int64_t N = b.shape(0);
+        const int64_t K = matmul_dims(attrs, a, b).K;
+        PoolArray<int8_t> dense_buf(static_cast<size_t>(K) * static_cast<size_t>(N));
+        matmul_packed_b_sme_i8_unpack(b, K, dense_buf.data(), ctx);
+        const int64_t shape[] = {K, N};
+        const TensorView dense(shape, DataType::s8, dense_buf.data(), TensorLayout::Dense,
+                               b.quant_params());
+        MatMulAttributes attrs_n = attrs;
+        attrs_n.transpose_b = false;
+        const TensorView ins[] = {a, dense};
+        if (dt_a == DataType::f32 || dt_a == DataType::f16) {
+            return matmul_dq_from_fp(attrs_n, output, ins, ctx);
+        }
+        const auto plan = make_plan(attrs_n, a, dense, ctx);
+        return matmul_int8_tiled(attrs_n, output, ins, ctx, plan);
+    }
     // fp activations: quantize (in the pack, or into A_q), then dequantize out.
     if (dt_a == DataType::f32 || dt_a == DataType::f16) {
         return matmul_dq_from_fp(attrs, output, inputs, ctx);
     }
+    if (matmul_sme_i8(attrs, output, inputs, ctx)) {
+        return Status::ok;
+    }
     // Integer activations: the destination dtype picks the output pass.
-    const auto plan = make_plan(attrs, a, inputs[1], ctx);
+    const auto plan = make_plan(attrs, a, b, ctx);
     return matmul_int8_tiled(attrs, output, inputs, ctx, plan);
 }
 

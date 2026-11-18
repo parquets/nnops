@@ -64,13 +64,16 @@ enum class TensorLayout : uint8_t {
     // [N, ⌈elements / N⌉], N first so shape inference reads the output's last dim.
     PackedB = 10,
 
-    // ---- Prepacked matmul RHS, AArch64 SME (f32) ----
+    // ---- Prepacked matmul RHS, AArch64 SME (f32 / f16 / s8) ----
     //
     // The same idea as PackedB, in the layout the ZA kernels want: 64 contiguous
-    // output columns per k, `[⌈N/64⌉][K][64]`, tail columns zero-filled. Packed
-    // once at load time, it needs no per-call RHS pack. Small M reads it too —
-    // inside one 64-column block the blob is a plain [K][64] row-major matrix,
-    // which is exactly what the GEMV wants (ldb = 64, one call per block).
+    // output columns per k, `[⌈N/64⌉][K][64]` for f32 (`[⌈N/64⌉][⌈K/2⌉][128]`
+    // for f16's interleaved K pairs, `[⌈N/64⌉][⌈K/4⌉][256]` for s8's four-K
+    // groups), tail columns zero-filled. Packed once at load time, it needs no
+    // per-call RHS pack. Small M reads the fp forms too — inside one 64-column
+    // block the f32 blob is a plain [K][64] row-major matrix, which is exactly
+    // what the GEMV wants (ldb = 64, one call per block). The s8 blob is only
+    // produced for an integral destination (see MatMul::prepackWeights).
     PackedBSme = 11,
 
     // ---- Prepacked recurrent weights (Rnn / Gru / Lstm ::prepackWeights) ----

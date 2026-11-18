@@ -40,7 +40,12 @@
 #include "nnops/detail/q4_1.hpp"
 #include "nnops/detail/simd.hpp"
 #include "backend/cpu/simd_kernel/simd_quant.hpp"
-#include "backend/cpu/aarch64/sme_gemm.hpp"
+#include "backend/cpu/aarch64/mma_sme.hpp"
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/pack_f16_sme.hpp"
+#include "backend/cpu/aarch64/pack_f32_sme.hpp"
+#include "backend/cpu/aarch64/pack_i8_sme.hpp"
+#endif
 
 #ifdef NNOPS_ARCH_X86_64
 using namespace nnops::backend::cpu::x86_64;
@@ -725,15 +730,23 @@ MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcep
 MatMulPackedB matmul_packed_b_sme_geom(int64_t N, int64_t K, DataType dtype) noexcept
 {
     MatMulPackedB g;
-    if (N <= 0 || K <= 0 || (dtype != DataType::f32 && dtype != DataType::f16) ||
-        !sme::available()) {
+    if (N <= 0 || K <= 0 ||
+        (dtype != DataType::f32 && dtype != DataType::f16 && dtype != DataType::s8) ||
+        !aarch64::available_sme()) {
         return g;
     }
     // One slot per 64-column block, contiguous, the layout the kernels read in
     // place: f32 [K][64], f16 [ceil(K/2)][128] with each column's K pair
-    // adjacent. A small-M reader de-interleaves the f16 slot with vld2.
-    g.nr = sme::kNB;
-    g.ldd = dtype == DataType::f16 ? ((K + 1) / 2) * (2 * sme::kNB) : K * sme::kNB;
+    // adjacent, s8 [ceil(K/4)][256] with each column's four K values adjacent.
+    // A small-M reader de-interleaves the f16 slot with vld2.
+    g.nr = aarch64::sme_nr_max;
+    if (dtype == DataType::f16) {
+        g.ldd = ((K + 1) / 2) * (2 * aarch64::sme_nr_max);
+    } else if (dtype == DataType::s8) {
+        g.ldd = ((K + 3) / 4) * (4 * aarch64::sme_nr_max);
+    } else {
+        g.ldd = K * aarch64::sme_nr_max;
+    }
     g.np = (N + g.nr - 1) / g.nr;
     g.total = g.np * g.ldd;
     return g;
@@ -757,7 +770,7 @@ inline int64_t packed_b_numel(const MatMulPackedB& g, int64_t N) noexcept
 
 } // namespace
 
-TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b)
+TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b, bool sme_int8)
 {
     TensorDesc d;
     if (raw.rank < 2) {
@@ -766,13 +779,16 @@ TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b)
 
     int64_t N = 0, K = 0;
     raw_b_extent(raw, transpose_b, N, K);
-    // On an SME machine a dense f32 weight is packed into the ZA kernels' own
-    // layout: those run the product as soon as M is past the small routes, and
-    // a NEON panel blob would be unreadable there. Decided once, at load time.
-    const bool sme_blob =
-        (raw.dtype == DataType::f32 || raw.dtype == DataType::f16) && sme::available();
-    const MatMulPackedB g =
-        sme_blob ? matmul_packed_b_sme_geom(N, K, raw.dtype) : matmul_packed_b_geom(N, K, raw.dtype);
+    // On an SME machine a dense f32/f16 weight is packed into the ZA kernels'
+    // own layout: those run the product as soon as M is past the small routes,
+    // and a NEON panel blob would be unreadable there. Decided once, at load
+    // time. An s8 weight joins only when the caller asked for an integral
+    // output: an fp output keeps the segmented blob its quantizing route reads.
+    const bool sme_fp = raw.dtype == DataType::f32 || raw.dtype == DataType::f16;
+    const bool sme_i8 = raw.dtype == DataType::s8 && sme_int8;
+    const bool sme_blob = (sme_fp || sme_i8) && aarch64::available_sme();
+    const MatMulPackedB g = sme_blob ? matmul_packed_b_sme_geom(N, K, raw.dtype) :
+                                       matmul_packed_b_geom(N, K, raw.dtype);
     if (!g.ok()) {
         return d;
     }
@@ -807,13 +823,18 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed, bool transp
     const int64_t N = trans ? raw.shape(raw.rank() - 2) : raw.shape(raw.rank() - 1);
     const int64_t K = trans ? raw.shape(raw.rank() - 1) : raw.shape(raw.rank() - 2);
     if (packed.layout() == TensorLayout::PackedBSme) {
+#if defined(NNOPS_ARCH_SME)
         if (dt == DataType::f16) {
-            sme::pack_b_f16(static_cast<int>(N), static_cast<int>(K), packed.ptr<half>(),
-                            raw.ptr<half>(), raw.row_stride_elems(), trans);
+            pack_b_f16_sme(static_cast<int>(N), static_cast<int>(K), packed.ptr<half>(),
+                           raw.ptr<half>(), raw.row_stride_elems(), trans);
+        } else if (dt == DataType::s8) {
+            pack_b_i8_sme(static_cast<int>(N), static_cast<int>(K), packed.ptr<int8_t>(),
+                          raw.ptr<int8_t>(), raw.row_stride_elems(), trans);
         } else {
-            sme::pack_b_f32(static_cast<int>(N), static_cast<int>(K), packed.ptr<float>(),
-                            raw.ptr<float>(), raw.row_stride_elems(), trans);
+            pack_b_f32_sme(static_cast<int>(N), static_cast<int>(K), packed.ptr<float>(),
+                           raw.ptr<float>(), raw.row_stride_elems(), trans);
         }
+#endif
         return;
     }
     const MatMulPackedB g = matmul_packed_b_geom(N, K, dt);
@@ -881,6 +902,34 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed, bool transp
                 tile_pack_rhs(trans, w, kc, dst, ldd, src, lds_i, 1.0f);
             }
 #endif
+        }
+    });
+}
+
+void matmul_packed_b_sme_i8_unpack(const TensorView& packed, int64_t K, int8_t* dst,
+                                   const ComputeContext& ctx)
+{
+    const int64_t N = packed.shape(0);
+    const int64_t kg = (K + 3) / 4;
+    const int64_t nr = aarch64::sme_nr_max;
+    const int64_t za = aarch64::sme_za_n;
+    const int8_t* const blob = packed.ptr<int8_t>();
+    const int64_t n_blocks = (N + nr - 1) / nr;
+    ctx.cpu.run(0, n_blocks, [&](int64_t nb) {
+        const int64_t n0 = nb * nr;
+        const int64_t cols = std::min(nr, N - n0);
+        const int8_t* const blk = blob + nb * kg * (4 * nr);
+        for (int64_t g = 0; g < kg; ++g) {
+            const int8_t* const grp = blk + g * (4 * nr);
+            for (int64_t j = 0; j < cols; ++j) {
+                const int8_t* const cell = grp + (j / za) * (4 * za) + (j % za) * 4;
+                for (int p = 0; p < 4; ++p) {
+                    const int64_t k = 4 * g + p;
+                    if (k < K) {
+                        dst[k * N + n0 + j] = cell[p];
+                    }
+                }
+            }
         }
     });
 }

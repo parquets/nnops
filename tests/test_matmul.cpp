@@ -53,7 +53,7 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/core/quant_params.hpp"
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan — to pin the pack_a route
-#include "backend/cpu/aarch64/sme_gemm.hpp"     // available() — the SME route's own gate
+#include "backend/cpu/aarch64/mma_sme.hpp"      // available_sme — the SME route's own gate
 #include "detail/bench_knobs.hpp"               // disable_sme — the SME / generic A/B pin
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
@@ -2968,7 +2968,7 @@ TensorView prepack_b(MatMul& op, TensorView b, std::vector<T>& blob) {
 
 NNOPS_TEST(matmul_sme_matches_reference) {
     namespace cpu = nnops::backend::cpu;
-    if (!cpu::sme::available()) {
+    if (!cpu::aarch64::available_sme()) {
         std::printf("  (no SME kernels on this build or CPU; skipped)\n");
         return;
     }
@@ -3044,6 +3044,309 @@ NNOPS_TEST(matmul_sme_matches_reference) {
 
     run(float{});
     run(half{});
+}
+
+NNOPS_TEST(matmul_sme_i8_matches_reference) {
+    // The SME integer route against the planned one on the same operands, plus
+    // an exact int32 reference for the raw destination: zero-point
+    // compensation, an integer bias, Relu and requantizing all have to land on
+    // the same bytes. Every case runs the generic route with SME pinned off, so
+    // the comparison is SME-on vs SME-off, not SME vs a second copy of itself.
+    namespace cpu = nnops::backend::cpu;
+    if (!cpu::aarch64::available_sme()) {
+        std::printf("  (no SME kernels on this build or CPU; skipped)\n");
+        return;
+    }
+
+    struct Case {
+        int64_t M, N, K;
+        bool ta, tb, u8a, asym, bias, relu;
+        DataType odt;
+        /// Per-tensor A zero point override; INT32_MIN keeps the default
+        /// (128 for u8, 0 for s8). Conv2D's u8 activation uses e.g. 173.
+        int32_t azp = INT32_MIN;
+    };
+    const Case cases[] = {
+        {64, 64, 64, false, false, false, false, false, false, DataType::s32},
+        {64, 96, 256, false, false, false, false, false, false, DataType::s32},
+        {64, 96, 256, true, false, false, false, false, false, DataType::s32},
+        {64, 96, 256, false, true, false, false, false, false, DataType::s32},
+        {33, 70, 129, false, false, false, true, false, false, DataType::s32},
+        {33, 70, 129, false, false, true, false, false, false, DataType::s32},
+        {33, 70, 129, false, false, true, true, false, false, DataType::s32},
+        {33, 70, 129, false, false, false, true, true, false, DataType::s32},
+        {33, 70, 129, false, false, false, true, true, true, DataType::s32},
+        {17, 16, 1, false, false, false, false, false, false, DataType::s32},
+        {128, 320, 512, false, false, false, false, false, false, DataType::s32},
+        // Conv2D's u8 plane: a per-tensor zero point that is not 128, so the
+        // plane shift does not cancel and the column sums are live.
+        {81, 54, 4, false, false, true, false, false, false, DataType::s32, 173},
+        {64, 96, 256, false, false, true, false, false, false, DataType::s32, 173},
+        {64, 96, 257, false, false, false, true, false, false, DataType::s8},
+        {64, 96, 257, false, false, true, true, true, false, DataType::u8},
+        {16, 16, 17, false, false, false, false, false, false, DataType::s8},
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+        const Case& c = cases[ci];
+        const int64_t a_rows = c.ta ? c.K : c.M;
+        const int64_t a_cols = c.ta ? c.M : c.K;
+        const int64_t b_rows = c.tb ? c.N : c.K;
+        const int64_t b_cols = c.tb ? c.K : c.N;
+        const int64_t ashape[] = {a_rows, a_cols};
+        const int64_t bshape[] = {b_rows, b_cols};
+
+        nnops::test::XorShift128 rng(4242 + static_cast<uint64_t>(ci));
+        std::vector<uint8_t> av(static_cast<size_t>(a_rows * a_cols));
+        std::vector<uint8_t> bv(static_cast<size_t>(b_rows * b_cols));
+        for (auto& e : av) { e = static_cast<uint8_t>(rng.next_u64() & 0xffu); }
+        for (auto& e : bv) { e = static_cast<uint8_t>(rng.next_u64() & 0xffu); }
+
+        const int32_t azp0 =
+            c.azp != INT32_MIN ? c.azp : (c.u8a ? 128 : 0);
+        std::vector<float> a_s(static_cast<size_t>(c.M), 0.01f);
+        std::vector<float> b_s(static_cast<size_t>(c.N), 0.004f);
+        std::vector<int32_t> a_zp(static_cast<size_t>(c.M), azp0);
+        std::vector<int32_t> b_zp(static_cast<size_t>(c.N), 0);
+        QuantParams qa = bias_per_tensor(0.01f, azp0);
+        QuantParams qb = bias_per_tensor(0.004f, 0);
+        if (c.asym) {
+            for (int64_t i = 0; i < c.M; ++i) {
+                a_s[static_cast<size_t>(i)] = 0.01f + 0.002f * static_cast<float>(i % 9);
+                a_zp[static_cast<size_t>(i)] =
+                    (c.u8a ? 120 : -3) + static_cast<int32_t>(i % 9);
+            }
+            for (int64_t i = 0; i < c.N; ++i) {
+                b_s[static_cast<size_t>(i)] = 0.004f + 0.001f * static_cast<float>(i % 5);
+                b_zp[static_cast<size_t>(i)] = static_cast<int32_t>(i % 5) - 2;
+            }
+            qa.granularity = QuantGranularity::PerToken;
+            qa.scale_data = a_s.data();
+            qa.zero_point_data = a_zp.data();
+            qa.num_scales = c.M;
+            qb.granularity = QuantGranularity::PerChannel;
+            qb.scale_data = b_s.data();
+            qb.zero_point_data = b_zp.data();
+            qb.num_scales = c.N;
+        }
+
+        const DataType adt = c.u8a ? DataType::u8 : DataType::s8;
+        TensorView a(ashape, adt, av.data(), TensorLayout::Dense, qa);
+        TensorView b(bshape, DataType::s8, bv.data(), TensorLayout::Dense, qb);
+
+        std::vector<int32_t> biasv(static_cast<size_t>(c.N));
+        nnops::test::XorShift128 brng(99 + static_cast<uint64_t>(ci));
+        for (auto& v : biasv) {
+            v = static_cast<int32_t>(brng.next_u64() % 41) - 20;
+        }
+        const int64_t bshape_bias[] = {c.N};
+        TensorView bias(bshape_bias, DataType::s32, biasv.data());
+
+        MatMulAttributes attrs;
+        attrs.transpose_a = c.ta;
+        attrs.transpose_b = c.tb;
+        attrs.output_dtype = c.odt;
+        if (c.relu) { attrs.epilogue.type = EpilogueActivateType::Relu; }
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        TensorDesc ins_descs[3];
+        ins_descs[0] = a.desc();
+        ins_descs[1] = b.desc();
+        const size_t n_in = c.bias ? 3 : 2;
+        if (c.bias) { ins_descs[2] = bias.desc(); }
+        const auto od = op->getOutputTensorDesc(
+            std::span<const TensorDesc>(ins_descs, n_in))[0];
+        const auto oshape = std::span<const int64_t>(od.dims.data(),
+                                                     static_cast<size_t>(od.rank));
+        const size_t out_bytes =
+            static_cast<size_t>(od.numel()) * data_type_size(od.dtype);
+        std::vector<std::byte> gen_buf(out_bytes);
+        std::vector<std::byte> sme_buf(out_bytes);
+
+        QuantParams qo = bias_per_tensor(2.0f, c.odt == DataType::u8 ? 128 : -7);
+        TensorView gen(oshape, od.dtype, gen_buf.data(), TensorLayout::Dense, qo);
+        TensorView sme(oshape, od.dtype, sme_buf.data(), TensorLayout::Dense, qo);
+
+        TensorView ins[3] = {a, b, bias};
+        const std::span<const TensorView> ins_span(ins, n_in);
+        {
+            const SmePin pin(/*on=*/false);
+            NNOPS_EXPECT_EQ(op->compute(gen, ins_span, {}, nullptr), Status::ok);
+        }
+        {
+            const SmePin pin(/*on=*/true);
+            NNOPS_EXPECT_EQ(op->compute(sme, ins_span, {}, nullptr), Status::ok);
+        }
+        NNOPS_EXPECT_TRUE(std::memcmp(gen_buf.data(), sme_buf.data(), out_bytes) == 0);
+
+        if (c.odt != DataType::s32) {
+            continue;
+        }
+        // Exact reference: MatMulInteger's (a − zp_a)·(b − zp_b), then the
+        // integer bias and Relu the output pass applies.
+        const int32_t* gen32 = reinterpret_cast<const int32_t*>(gen_buf.data());
+        for (int64_t m = 0; m < c.M; ++m) {
+            for (int64_t n = 0; n < c.N; ++n) {
+                int64_t acc = 0;
+                for (int64_t k = 0; k < c.K; ++k) {
+                    const int64_t ai = c.ta ? k * a_cols + m : m * a_cols + k;
+                    const int64_t bi = c.tb ? n * b_cols + k : k * b_cols + n;
+                    const int32_t aval =
+                        c.u8a ? static_cast<int32_t>(av[static_cast<size_t>(ai)]) :
+                                static_cast<int32_t>(static_cast<int8_t>(
+                                    av[static_cast<size_t>(ai)]));
+                    const int32_t bval =
+                        static_cast<int32_t>(static_cast<int8_t>(bv[static_cast<size_t>(bi)]));
+                    const int32_t za = c.asym ? a_zp[static_cast<size_t>(m)] : azp0;
+                    const int32_t zb = c.asym ? b_zp[static_cast<size_t>(n)] : 0;
+                    acc += static_cast<int64_t>(aval - za) * (bval - zb);
+                }
+                if (c.bias) { acc += biasv[static_cast<size_t>(n)]; }
+                if (c.relu && acc < 0) { acc = 0; }
+                NNOPS_EXPECT_EQ(static_cast<int64_t>(
+                                    gen32[m * c.N + n]),
+                                acc);
+            }
+        }
+    }
+}
+
+NNOPS_TEST(matmul_sme_i8_prepacked) {
+    // The SME s8 blob against the same product's per-call pack. Integral
+    // destinations are what make the prepack choose this layout; both operand
+    // polarities and both output kinds are covered, with a K tail.
+    namespace cpu = nnops::backend::cpu;
+    if (!cpu::aarch64::available_sme()) {
+        std::printf("  (no SME kernels on this build or CPU; skipped)\n");
+        return;
+    }
+
+    struct Case {
+        int64_t M, N, K;
+        bool tb, u8a;
+        DataType odt;
+    };
+    const Case cases[] = {
+        {64, 96, 257, false, false, DataType::s32},
+        {64, 96, 257, true, false, DataType::s32},
+        {64, 96, 257, false, true, DataType::s32},
+        {33, 70, 129, false, false, DataType::s32},
+        {64, 96, 257, false, false, DataType::s8},
+        {64, 96, 257, false, true, DataType::u8},
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+        const Case& c = cases[ci];
+        const int64_t ashape[] = {c.M, c.K};
+        const int64_t bshape[] = {c.tb ? c.N : c.K, c.tb ? c.K : c.N};
+
+        nnops::test::XorShift128 rng(5150 + static_cast<uint64_t>(ci));
+        std::vector<uint8_t> av(static_cast<size_t>(c.M * c.K));
+        std::vector<uint8_t> bv(static_cast<size_t>(c.K * c.N));
+        for (auto& e : av) { e = static_cast<uint8_t>(rng.next_u64() & 0xffu); }
+        for (auto& e : bv) { e = static_cast<uint8_t>(rng.next_u64() & 0xffu); }
+
+        const DataType adt = c.u8a ? DataType::u8 : DataType::s8;
+        const int32_t azp = c.u8a ? 128 : 0;
+        TensorView a(ashape, adt, av.data(), TensorLayout::Dense,
+                     bias_per_tensor(0.01f, azp));
+        TensorView b(bshape, DataType::s8, bv.data(), TensorLayout::Dense,
+                     bias_per_tensor(0.004f, 0));
+
+        MatMulAttributes attrs;
+        attrs.transpose_b = c.tb;
+        attrs.output_dtype = c.odt;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc descs[] = {a.desc(), b.desc()};
+        const auto od = op->getOutputTensorDesc(descs)[0];
+        const auto oshape = std::span<const int64_t>(od.dims.data(),
+                                                     static_cast<size_t>(od.rank));
+        const size_t out_bytes =
+            static_cast<size_t>(od.numel()) * data_type_size(od.dtype);
+        std::vector<std::byte> raw_buf(out_bytes);
+        std::vector<std::byte> pk_buf(out_bytes);
+        QuantParams qo = bias_per_tensor(2.0f, c.odt == DataType::u8 ? 128 : -7);
+        TensorView raw(oshape, od.dtype, raw_buf.data(), TensorLayout::Dense, qo);
+        TensorView pk(oshape, od.dtype, pk_buf.data(), TensorLayout::Dense, qo);
+
+        const TensorView ins[] = {a, b};
+        NNOPS_EXPECT_EQ(op->compute(raw, ins, {}, nullptr), Status::ok);
+
+        std::vector<int8_t> blob;
+        TensorView packed = prepack_b(*op, b, blob);
+        NNOPS_EXPECT_EQ(static_cast<int>(packed.layout()),
+                        static_cast<int>(TensorLayout::PackedBSme));
+
+        const TensorView pins[] = {a, packed};
+        NNOPS_EXPECT_EQ(op->compute(pk, pins, {}, nullptr), Status::ok);
+        NNOPS_EXPECT_TRUE(std::memcmp(raw_buf.data(), pk_buf.data(), out_bytes) == 0);
+    }
+}
+
+NNOPS_TEST(matmul_sme_i8_blob_fp_output) {
+    // A weight prepacked for an integral output is still readable when the call
+    // dequantizes: the SME blob is raw B in the ZA order, so it is decoded to a
+    // dense matrix once. Both the integer-A and the fp-A dequantizing routes
+    // are covered.
+    namespace cpu = nnops::backend::cpu;
+    if (!cpu::aarch64::available_sme()) {
+        std::printf("  (no SME kernels on this build or CPU; skipped)\n");
+        return;
+    }
+
+    const int64_t M = 32, N = 48, K = 128;
+    const int64_t ashape[] = {M, K};
+    const int64_t bshape[] = {K, N};
+
+    nnops::test::XorShift128 rng(8080);
+    std::vector<uint8_t> av(static_cast<size_t>(M * K));
+    std::vector<uint8_t> bv(static_cast<size_t>(K * N));
+    for (auto& e : av) { e = static_cast<uint8_t>(rng.next_u64() & 0xffu); }
+    for (auto& e : bv) { e = static_cast<uint8_t>(rng.next_u64() & 0xffu); }
+
+    TensorView b(bshape, DataType::s8, bv.data(), TensorLayout::Dense, bias_per_tensor(0.004f, 0));
+
+    // An integral-output op is what makes the prepack choose the SME layout.
+    auto prepack_op = MatMul::create(MatMulAttributes{}, Backend::CPU);
+    std::vector<int8_t> blob;
+    TensorView packed = prepack_b(*prepack_op, b, blob);
+    NNOPS_EXPECT_EQ(static_cast<int>(packed.layout()),
+                    static_cast<int>(TensorLayout::PackedBSme));
+
+    const auto run_dq = [&](const TensorView& b_view, const TensorView& a) {
+        MatMulAttributes attrs;
+        attrs.output_dtype = DataType::f32;
+        auto op = MatMul::create(attrs, Backend::CPU);
+        const TensorDesc descs[] = {a.desc(), b_view.desc()};
+        const auto od = op->getOutputTensorDesc(descs)[0];
+        const auto oshape = std::span<const int64_t>(od.dims.data(),
+                                                     static_cast<size_t>(od.rank));
+        std::vector<float> out(static_cast<size_t>(od.numel()));
+        TensorView o(oshape, DataType::f32, out.data());
+        const TensorView ins[] = {a, b_view};
+        NNOPS_EXPECT_EQ(op->compute(o, ins, {}, nullptr), Status::ok);
+        return out;
+    };
+
+    // Integer A: s8 × s8 with an fp destination.
+    TensorView a8(ashape, DataType::s8, av.data(), TensorLayout::Dense,
+                  bias_per_tensor(0.01f, 0));
+    const auto raw8 = run_dq(b, a8);
+    const auto pk8 = run_dq(packed, a8);
+    NNOPS_EXPECT_TRUE(raw8 == pk8);
+
+    // fp A carrying its offline parameters: the fused dq route quantizes on the
+    // fly, and the blob is decoded before it.
+    std::vector<float> af(static_cast<size_t>(M * K));
+    for (size_t i = 0; i < af.size(); ++i) {
+        af[i] = static_cast<float>(static_cast<int8_t>(av[i])) * 0.01f;
+    }
+    QuantParams qa = bias_per_tensor(0.01f, 0);
+    TensorView af32(ashape, DataType::f32, af.data(), TensorLayout::Dense, qa);
+    const auto rawf = run_dq(b, af32);
+    const auto pkf = run_dq(packed, af32);
+    NNOPS_EXPECT_TRUE(rawf == pkf);
 }
 
 NNOPS_TEST(matmul_prepacked_b) {
@@ -3146,7 +3449,7 @@ NNOPS_TEST(matmul_prepacked_b) {
 
 NNOPS_TEST(matmul_prepacked_b_sme) {
     namespace cpu = nnops::backend::cpu;
-    if (!cpu::sme::available()) {
+    if (!cpu::aarch64::available_sme()) {
         std::printf("  (no SME kernels; skipped)\n");
         return;
     }
@@ -3369,8 +3672,11 @@ NNOPS_TEST(matmul_prepacked_b_int8) {
 }
 
 NNOPS_TEST(matmul_prepacked_b_int8_rejects_u8_activation) {
-    // The blob's panels are written with the s8 activation shift folded in, so
-    // only an s8 A may read them — a u8 A is refused, not silently mis-read.
+    // The segmented blob's panels are written with the s8 activation shift
+    // folded in, so only an s8 A may read them — a u8 A is refused, not
+    // silently mis-read. Pin SME off: the SME blob is raw B and takes u8 (see
+    // matmul_sme_i8_prepacked).
+    const SmePin sme_off(/*on=*/false);
     const int64_t ashape[] = {4, 32};
     const int64_t bshape[] = {32, 16};
     std::vector<uint8_t> av(static_cast<size_t>(4 * 32), 7);

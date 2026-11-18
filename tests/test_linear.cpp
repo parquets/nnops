@@ -32,6 +32,7 @@
 #include "nnops/detail/q4_1.hpp"
 #include "nnops/detail/half.hpp"
 #include "detail/bench_knobs.hpp" // disable_sme — pin the prepacked comparison
+#include "backend/cpu/aarch64/mma_sme.hpp" // available_sme — the blob layout fork
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
@@ -934,8 +935,10 @@ void check_prepacked_s8(int64_t M, int64_t K, int64_t N, bool asym,
     op->prepackWeights(wq_in, oq);
     q = oq[0];
     NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
-    NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
-                    static_cast<int>(TensorLayout::PackedB));
+    // The segmented panels on a non-SME path; the ZA blob when SME is on and
+    // the destination is integral.
+    NNOPS_EXPECT_TRUE(q.layout() == TensorLayout::PackedB ||
+                      q.layout() == TensorLayout::PackedBSme);
     NNOPS_EXPECT_EQ(q.shape(0), N);
     NNOPS_EXPECT_TRUE(q.desc().numel() >= N * K);
 
@@ -958,14 +961,33 @@ NNOPS_TEST(linear_prepacked_weight_int8) {
     // 33: one short segment. 1031: three k segments (512, 512, 7) — a final
     // segment shorter than a dot group. 512/1024: whole segments. The asym rows
     // are the ones whose output pass needs the B column sums.
-    check_prepacked_s8(  7,   33, 19, false, DataType::f32, 900);
-    check_prepacked_s8(  6, 1031, 21, false, DataType::f32, 910);
-    check_prepacked_s8(  6,   40, 13, true,  DataType::f32, 920);
-    check_prepacked_s8(  9, 1024, 17, true,  DataType::f32, 930);
-    check_prepacked_s8(  5,  512, 40, false, DataType::s32, 940);
-    // One row and two: the narrow-M kernels read the blob too.
-    check_prepacked_s8(  1, 4096, 37, false, DataType::f32, 950);
-    check_prepacked_s8(  2,  777, 21, true,  DataType::f32, 960);
+    //
+    // Each blob layout gets its own arm: SME off keeps the segmented panels
+    // (with their per-panel correction block), SME on gives the ZA blob for the
+    // integral destinations and the segmented one for the fp outputs.
+    const auto run_cases = [] {
+        check_prepacked_s8(  7,   33, 19, false, DataType::f32, 900);
+        check_prepacked_s8(  6, 1031, 21, false, DataType::f32, 910);
+        check_prepacked_s8(  6,   40, 13, true,  DataType::f32, 920);
+        check_prepacked_s8(  9, 1024, 17, true,  DataType::f32, 930);
+        check_prepacked_s8(  5,  512, 40, false, DataType::s32, 940);
+        // One row and two: the narrow-M kernels read the blob too.
+        check_prepacked_s8(  1, 4096, 37, false, DataType::f32, 950);
+        check_prepacked_s8(  2,  777, 21, true,  DataType::f32, 960);
+    };
+    struct Restore {
+        int prev;
+        ~Restore() { nnops::detail::disable_sme.store(prev, std::memory_order_relaxed); }
+    };
+    const bool sme = nnops::backend::cpu::aarch64::available_sme();
+    {
+        const Restore r{nnops::detail::disable_sme.exchange(1, std::memory_order_relaxed)};
+        run_cases();
+    }
+    if (sme) {
+        const Restore r{nnops::detail::disable_sme.exchange(0, std::memory_order_relaxed)};
+        run_cases();
+    }
 }
 
 NNOPS_TEST(linear_prepacked_weight_quantized_has_no_blob) {

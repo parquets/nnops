@@ -67,7 +67,7 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/q4_1.hpp"         // q4_1_block, float_to_half, half_to_bits
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
-#include "backend/cpu/aarch64/sme_gemm.hpp"     // cpu::sme::available — the SME A/B gate
+#include "backend/cpu/aarch64/mma_sme.hpp"      // cpu::aarch64::available_sme — the SME A/B gate
 #include "detail/bench_knobs.hpp"               // disable_sme — the A/B pin
 #include "backend/cpu/simd_kernel/simd_quant.hpp"  // quant_kernel::quantization (the dq quantize pass)
 #include "common/bench_harness.hpp"
@@ -577,7 +577,7 @@ void bench_route_ab(const char* tag, const char* la, const char* lb,
 template <typename T>
 void bench_sme_ab(const char* tag, int64_t M, int64_t K, int64_t N, int rounds = 4,
                   int iters = 20) {
-    if (!cpu::sme::available()) {
+    if (!cpu::aarch64::available_sme()) {
         std::printf("  SME A/B %s skipped: no SME kernels on this build or CPU\n", tag);
         return;
     }
@@ -613,7 +613,7 @@ void bench_sme_ab(const char* tag, int64_t M, int64_t K, int64_t N, int rounds =
 template <typename T>
 void bench_sme_prepack(const char* tag, int64_t M, int64_t K, int64_t N, int rounds = 4,
                        int iters = 20) {
-    if (!cpu::sme::available()) {
+    if (!cpu::aarch64::available_sme()) {
         std::printf("  SME prepack A/B %s skipped\n", tag);
         return;
     }

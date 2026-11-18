@@ -8,7 +8,7 @@
 /// far above the NEON plan's 128, as long as the B slab fits) instead of
 /// borrowing the plan, and why it owns
 /// its pack layouts — [m/16][k][16] for A, [n/64][k][64] for B, K-pair
-/// interleaved for f16 (see sme_gemm.hpp).
+/// interleaved for f16 (see mma_sme.hpp and pack_*_sme.hpp).
 ///
 /// The route is deliberately separate from the plan-driven skeleton: the tiles,
 /// the pack geometry and the thread split all differ, and the two share only
@@ -24,7 +24,11 @@
 
 #if defined(NNOPS_ARCH_SME)
 
-#include "backend/cpu/aarch64/sme_gemm.hpp"
+#include "backend/cpu/aarch64/mma_f16_sme.hpp"
+#include "backend/cpu/aarch64/mma_f32_sme.hpp"
+#include "backend/cpu/aarch64/mma_sme.hpp"
+#include "backend/cpu/aarch64/pack_f16_sme.hpp"
+#include "backend/cpu/aarch64/pack_f32_sme.hpp"
 #include "backend/cpu/common/memory_pool.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
 #include "nnops/detail/half.hpp"
@@ -34,6 +38,9 @@
 #include <type_traits>
 
 namespace nnops::backend::cpu {
+
+using namespace aarch64;
+
 namespace {
 
 constexpr int kSmeRows = 16;  // rows in one ZA tile
@@ -64,40 +71,40 @@ template <typename T> constexpr int sme_kc() noexcept
 template <typename T> struct SmeOp;
 
 template <> struct SmeOp<float> {
-    static int64_t packed_a(int mc, int kc) { return sme::packed_a_elems_f32(mc, kc); }
-    static int64_t packed_b(int nc, int kc) { return sme::packed_b_elems_f32(nc, kc); }
+    static int64_t packed_a(int mc, int kc) { return packed_a_elems_f32_sme(mc, kc); }
+    static int64_t packed_b(int nc, int kc) { return packed_b_elems_f32_sme(nc, kc); }
     static void pack_a(int mc, int kc, float* d, const float* s, int64_t ld, bool trans)
     {
-        sme::pack_a_f32(mc, kc, d, s, ld, trans);
+        pack_a_f32_sme(mc, kc, d, s, ld, trans);
     }
     static void pack_b(int nc, int kc, float* d, const float* s, int64_t ld, bool trans)
     {
-        sme::pack_b_f32(nc, kc, d, s, ld, trans);
+        pack_b_f32_sme(nc, kc, d, s, ld, trans);
     }
-    static void gemm(int mc, int nc, int kc, float* c, int ldc, const float* a, const float* b,
+    static void mma(int mc, int nc, int kc, float* c, int ldc, const float* a, const float* b,
                      bool zero_mode, float lo, float hi, const float* col_bias,
                      int64_t b_block_stride)
     {
-        sme::gemm_f32(mc, nc, kc, c, ldc, a, b, zero_mode, lo, hi, col_bias, b_block_stride);
+        mma_f32_sme(mc, nc, kc, c, ldc, a, b, zero_mode, lo, hi, col_bias, b_block_stride);
     }
 };
 
 template <> struct SmeOp<half> {
-    static int64_t packed_a(int mc, int kc) { return sme::packed_a_elems_f16(mc, kc); }
-    static int64_t packed_b(int nc, int kc) { return sme::packed_b_elems_f16(nc, kc); }
+    static int64_t packed_a(int mc, int kc) { return packed_a_elems_f16_sme(mc, kc); }
+    static int64_t packed_b(int nc, int kc) { return packed_b_elems_f16_sme(nc, kc); }
     static void pack_a(int mc, int kc, half* d, const half* s, int64_t ld, bool trans)
     {
-        sme::pack_a_f16(mc, kc, d, s, ld, trans);
+        pack_a_f16_sme(mc, kc, d, s, ld, trans);
     }
     static void pack_b(int nc, int kc, half* d, const half* s, int64_t ld, bool trans)
     {
-        sme::pack_b_f16(nc, kc, d, s, ld, trans);
+        pack_b_f16_sme(nc, kc, d, s, ld, trans);
     }
-    static void gemm(int mc, int nc, int kc, half* c, int ldc, const half* a, const half* b,
+    static void mma(int mc, int nc, int kc, half* c, int ldc, const half* a, const half* b,
                      bool zero_mode, float lo, float hi, const half* col_bias,
                      int64_t b_block_stride)
     {
-        sme::gemm_f16(mc, nc, kc, c, ldc, a, b, zero_mode, lo, hi, col_bias, b_block_stride);
+        mma_f16_sme(mc, nc, kc, c, ldc, a, b, zero_mode, lo, hi, col_bias, b_block_stride);
     }
 };
 
@@ -115,9 +122,9 @@ void sme_block(const MatMulAttributes& attrs, T* c_base, int ldc, const T* a, in
     // A prepacked blob is [ceil(N/64)][K][64]: one k's 64 columns contiguous and
     // blocks K*64 apart, so a k block is just an offset into it.
     const int64_t blob_stride = std::is_same_v<T, float> ?
-                                    static_cast<int64_t>(K) * sme::kNB :
-                                    static_cast<int64_t>((K + 1) / 2) * (2 * sme::kNB);
-    const int64_t blob_block0 = static_cast<int64_t>(n0 / sme::kNB) * blob_stride;
+                                    static_cast<int64_t>(K) * sme_nr_max :
+                                    static_cast<int64_t>((K + 1) / 2) * (2 * sme_nr_max);
+    const int64_t blob_block0 = static_cast<int64_t>(n0 / sme_nr_max) * blob_stride;
 
     for (int k = 0; k < K; k += kc_block) {
         const int kc = std::min(kc_block, K - k);
@@ -156,8 +163,8 @@ void sme_block(const MatMulAttributes& attrs, T* c_base, int ldc, const T* a, in
                        lda, attrs.transpose_a);
 
             const auto [lo, hi] = kblock_clamp(attrs, last_k);
-            Op::gemm(mc, nw, kc, c_tile, ldc, pack_a.data(),
-                     prepacked != nullptr ? prepacked + blob_block0 + static_cast<int64_t>(k) * sme::kNB
+            Op::mma(mc, nw, kc, c_tile, ldc, pack_a.data(),
+                     prepacked != nullptr ? prepacked + blob_block0 + static_cast<int64_t>(k) * sme_nr_max
                                           : pack_b.data(),
                      /*zero_mode=*/k == 0 && beta == 0.0f, lo, hi,
                      seed ? bias + n0 : nullptr, prepacked != nullptr ? blob_stride : 0);
@@ -190,11 +197,11 @@ void matmul_sme_run(const MatMulAttributes& attrs, TensorView& output,
 
     // One worker per 64-column block at most, and never wider than the cap that
     // keeps a B slab small.
-    const int64_t n_blocks_total = (N + sme::kNB - 1) / sme::kNB;
+    const int64_t n_blocks_total = (N + sme_nr_max - 1) / sme_nr_max;
     const int workers = static_cast<int>(
         std::max<int64_t>(1, std::min<int64_t>(ctx.cpu.thread_count(), n_blocks_total)));
     int nw = std::min(kSmeNMax, (N + workers - 1) / workers);
-    nw = ((nw + sme::kNB - 1) / sme::kNB) * sme::kNB;
+    nw = ((nw + sme_nr_max - 1) / sme_nr_max) * sme_nr_max;
     const int blocks = (N + nw - 1) / nw;
 
     const BatchWalk batch(a, b);
@@ -213,7 +220,7 @@ void matmul_sme_run(const MatMulAttributes& attrs, TensorView& output,
 bool matmul_sme(const MatMulAttributes& attrs, TensorView& output,
                 std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    if (!sme::available() || inputs.size() < 2) {
+    if (!available_sme() || inputs.size() < 2) {
         return false;
     }
     const auto& a = inputs[0];

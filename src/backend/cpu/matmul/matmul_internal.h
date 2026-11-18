@@ -13,8 +13,10 @@
 ///                                GEMV at M <= GEMV_M_MAX;
 ///   - matmul_qblock_fused.cpp  — the fused Q4_1 decode route (x86_64 and
 ///                                aarch64; M <= 16 trans, 8 copy by default);
-///   - matmul_sme.cpp           — the whole product on AArch64 SME's ZA tiles,
-///                                with its own pack layouts and its own kc.
+///   - matmul_sme.cpp           — the whole fp product on AArch64 SME's ZA
+///                                tiles, with its own pack layouts and kc;
+///   - matmul_sme_i8.cpp        — the same for the int8 SMOPA kernel, including
+///                                s8/u8 requantizing and the prepacked blob.
 ///
 /// Neither packs, blocks nor splits: each sweeps the product in one pass and
 /// never touches the routes. What they do share with the driver is here — the
@@ -152,6 +154,13 @@ bool matmul_small_fp(const MatMulAttributes& attrs, TensorView& output,
 /// tile — the generic routes then take it.
 bool matmul_sme(const MatMulAttributes& attrs, TensorView& output,
                 std::span<const TensorView> inputs, const ComputeContext& ctx);
+
+/// Integer MatMul (s8/u8 A × s8 B) through the AArch64 SME SMOPA kernels: its
+/// own pack layouts and k-block, no plan. False when the CPU (or build) has no
+/// SME, the operands are not an integer pair, the destination is not integral,
+/// or a raw (unprepacked) shape is one the planned route should keep.
+bool matmul_sme_i8(const MatMulAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx);
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 /// Whole product through the fused Q4_1 kernels; false if not applicable.
