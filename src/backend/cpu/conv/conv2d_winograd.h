@@ -121,6 +121,9 @@ constexpr int64_t wino_alpha(WinoOrder o) noexcept { return wino_tile(o) + 2; }
 /// columns are computed and dropped.
 struct WinoU {
     WinoOrder order = WinoOrder::F23; ///< which transform produced these panels
+    bool za = false;                  ///< panels are the ZA B blocks (32 columns,
+                                      ///< f16 K pairs interleaved), not the NEON
+                                      ///< nr_max panels
     int64_t pos = 0;                  ///< transform positions = wino_pos(order)
     int64_t nr = 0;                   ///< panel width: the arch's nr_max for the dtype
     int64_t kc = 0;                   ///< k-block length: the largest divisor of IC/G that is
@@ -190,7 +193,8 @@ struct Conv2DWinogradPlan {
     int64_t v_p_stride = 0; ///< elements between transform positions
     int64_t v_size = 0;     ///< pos · v_p_stride
     int64_t m_size = 0;     ///< pos · tile_block · ocn_block
-    int64_t slot_size = 0;  ///< V + M, rounded to 16
+    int64_t a_size = 0;     ///< tile_block · icn_block, the ZA path's packed A
+    int64_t slot_size = 0;  ///< V + M + A, rounded to 16
     size_t workspace_size = 0;
 };
 

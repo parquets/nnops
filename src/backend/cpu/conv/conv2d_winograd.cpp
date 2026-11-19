@@ -8,6 +8,9 @@
 
 #include "conv2d_winograd.h"
 #include "backend/cpu/matmul/matmul_helper.h"        // tile_mma_direct / tile_pack_rhs
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"       // available_sme, the ZA panel width
+#endif
 #include "backend/cpu/simd_kernel/simd_winograd.hpp" // the F(2,3) and F(4,3) transforms
 #include "backend/cpu/common/memory_pool.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -90,13 +93,25 @@ WinoU wino_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
     // IC/G exactly, so the panels need no zero-padded k tail; the ceiling is the
     // same f16 accumulate budget MatMul uses (KC_CAP_F16), with f32 allowed to
     // run twice as wide because its accumulator is exact enough for it.
-    const int64_t nr = (dt == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32;
+    // On an SME machine the panels are the ZA B blocks: 32 columns, K-major,
+    // with the f16 K pairs interleaved. The transform GEMMs then run through
+    // tile_mma_pack_sme like every other product, instead of the NEON direct
+    // kernel that was 87% of this route's time.
+#if defined(NNOPS_ARCH_SME)
+    const bool za = aarch64::available_sme();
+#else
+    const bool za = false;
+#endif
+    // 32: the ZA B block's width (the f16 form interleaves its K pairs).
+    constexpr int64_t kZaPanelN = 32;
+    const int64_t nr = za ? kZaPanelN : (dt == DataType::f16 ? NR_MAX_F16 : NR_MAX_F32);
     const int64_t cap = (dt == DataType::f16) ? 128 : 256;
     int64_t kc = std::min(ic_per_group, cap);
     while (ic_per_group % kc != 0) {
         --kc;
     }
 
+    u.za = za;
     u.nr = nr;
     u.kc = kc;
     u.nb = ic_per_group / kc;
@@ -215,6 +230,8 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
         T* scratch = static_cast<T*>(workspace) + slot * plan.slot_size;
         T* v_all = scratch;
         T* m_all = v_all + plan.v_size;
+        T* const a_packed = m_all + plan.m_size;
+        (void)a_packed;
 
         const T* task_in = in_ptr + n * in_n_stride + g * ic_per_group;
         T* task_out = out_ptr + n * out_n_stride + g * oc_per_group;
@@ -262,10 +279,28 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
                 const T* b_base = u_ptr + (kb * ug.jbg + g * ug.jb + ocn0 / ug.nr) * ug.ldd;
                 const T* a_base = v_all + kb * kc;
                 for (int p = 0; p < kpos; ++p) {
+                    T* const m_p = m_all + p * m_p_stride;
+                    const T* const v_p = a_base + p * v_p_stride;
+                    const T* const u_p = b_base + p * ug.plane;
+#if defined(NNOPS_ARCH_SME)
+                    if (ug.za) {
+                        // The same product on the ZA tiles: pack this
+                        // position's V slab into the kernel's A layout, then
+                        // one tiled pass over (tiles, oc block, ic).
+                        tile_pack_lhs_sme(false, static_cast<int>(ntl), static_cast<int>(kc),
+                                          a_packed, v_p, static_cast<int>(v_lda));
+                        tile_mma_pack_sme(
+                            static_cast<int>(ntl), static_cast<int>(ocnc),
+                            static_cast<int>(kc), m_p, static_cast<int>(m_oc_stride), a_packed,
+                            u_p, ug.ldd, -std::numeric_limits<float>::infinity(),
+                            std::numeric_limits<float>::infinity(), /*zero_mode=*/kb == 0,
+                            /*col_bias=*/nullptr);
+                        continue;
+                    }
+#endif
                     tile_mma_direct(static_cast<int>(ntl), static_cast<int>(ocnc),
-                                    static_cast<int>(kc), m_all + p * m_p_stride,
-                                    static_cast<int>(m_oc_stride), a_base + p * v_p_stride,
-                                    static_cast<int>(v_lda), b_base + p * ug.plane, /*ldb=*/-1,
+                                    static_cast<int>(kc), m_p, static_cast<int>(m_oc_stride),
+                                    v_p, static_cast<int>(v_lda), u_p, /*ldb=*/-1,
                                     /*stage=*/nullptr, -std::numeric_limits<float>::infinity(),
                                     std::numeric_limits<float>::infinity(),
                                     /*zero_mode=*/kb == 0);
@@ -458,10 +493,16 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const Tens
     plan.v_p_stride = plan.tile_block * plan.v_lda + 8;
     plan.v_size = ug.pos * plan.v_p_stride;
     plan.m_size = ug.pos * plan.tile_block * plan.m_oc_stride;
+    // The ZA route packs one position's A at a time, so one tile block of
+    // kc-wide rows is all it ever holds.
+    // The packed A is [ceil(tiles/32)][k][32], not dense: a whole 32-row block
+    // exists even when the tile block is shorter.
+    constexpr int64_t kZaRows = 32; // the kernel's A block: two 16-row faces
+    plan.a_size = ug.za ? ((plan.tile_block + kZaRows - 1) / kZaRows) * kZaRows * ug.kc : 0;
 
     // Round the slot to 16 elements so every slot base keeps the transform's
     // 32-byte f16 stores aligned.
-    plan.slot_size = ((plan.v_size + plan.m_size) + 15) / 16 * 16;
+    plan.slot_size = ((plan.v_size + plan.m_size + plan.a_size) + 15) / 16 * 16;
     // The slot count follows the *workers*, not the reported thread count: an
     // over-subscribed grid would otherwise multiply the arena for nothing.
     const int64_t avail = (num_slots > 0) ? num_slots : nt;

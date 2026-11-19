@@ -998,8 +998,11 @@ NNOPS_TEST(conv2d_wino_plan_and_auto) {
     const backend::cpu::WinoU ug =
         backend::cpu::wino_u(32, 32, 1, DataType::f32);
     // The U is laid out in the arch's MMA panels, so both the panel width and
-    // the panel count it implies follow NR_MAX_F32 (16 on x86, 12 on aarch64).
-    const int64_t nr_max = backend::cpu::NR_MAX_F32;
+    // the panel count it implies follow the engine: the ZA 32-column B blocks
+    // where the tiles are available, the NEON NR_MAX_F32 panels otherwise.
+    const int64_t nr_max = backend::cpu::aarch64::available_sme() ?
+                               backend::cpu::aarch64::sme_fp_nr :
+                               backend::cpu::NR_MAX_F32;
     const int64_t jb = (32 + nr_max - 1) / nr_max;
     NNOPS_EXPECT_EQ(ug.nr, nr_max);
     NNOPS_EXPECT_EQ(ug.kc, int64_t{32});   // one k-block: 32 divides 32

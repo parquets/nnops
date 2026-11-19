@@ -130,7 +130,13 @@ void wino_pack_weight_hwio(const TensorView& weight, TensorView& u_out,
             } else {
                 nnops::kernel::winograd43_weight_transform(gt, 3, uu, 6, 1);
             }
-            T* dst = u + (kb * ug.jbg + j) * ug.ldd + k * ug.nr + col;
+            // The ZA f16 panel interleaves a column's K pair: k and k+1 of one
+            // column sit at col*2 and col*2+1 of the same K-pair row.
+            int64_t lane = k * ug.nr + col;
+            if (ug.za && std::is_same_v<T, backend::cpu::half>) {
+                lane = (k / 2) * (2 * ug.nr) + col * 2 + (k & 1);
+            }
+            T* dst = u + (kb * ug.jbg + j) * ug.ldd + lane;
             for (int64_t p = 0; p < ug.pos; ++p) {
                 dst[p * ug.plane] = uu[p];
             }
