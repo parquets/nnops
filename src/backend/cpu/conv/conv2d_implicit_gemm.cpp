@@ -147,6 +147,10 @@ constexpr int64_t kOcnBlock = 128; ///< output-channel tile (the GEMM's N)
 /// 144 into 80 + 64 cost the int8 expand layer a quarter of its time.
 constexpr int64_t kOcnSingleCap = 192;
 constexpr int64_t kMBlock = 24; ///< pixel tile (the GEMM's M): 4 × mr_max(6)
+/// The widest pixel tile any route picks: the int8 SME route takes 16 * sme_mr
+/// (256) rows. Stack buffers indexed by the tile are fixed at this width so the
+/// file still compiles with the SME kernels switched off.
+constexpr int64_t kMaxMBlock = 256;
 /// Pixels a task needs before it is worth splitting the plane again: two M
 /// blocks, i.e. one full tile plus a second to hide its prologue.
 constexpr int64_t kTaskMinPixels = 2 * kMBlock;
@@ -1795,10 +1799,10 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                             // The per-pixel sums the compensation reads: over the
                             // whole K, of the *true* activation values (the gather's
                             // shift comes back out), recomputed rather than buffered.
-                            int32_t ra_tile[16 * aarch64::sme_mr];
+                            int32_t ra_tile[kMaxMBlock];
                             const int32_t* ra_ptr = nullptr;
                             if (comp) {
-                                NNOPS_ASSERT(mc <= 16 * aarch64::sme_mr);
+                                NNOPS_ASSERT(mc <= kMaxMBlock);
                                 if (direct_a) {
                                     // The pixel is its own patch, its channels one
                                     // contiguous run: a row sum of the bytes the MMA
@@ -2028,6 +2032,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     const bool sme_i8_route = quant &&
                               (sme_blob || (!prepacked && aarch64::available_sme() &&
                                             oc_per_group >= aarch64::sme_nr_max));
+    static_assert(16 * aarch64::sme_mr <= kMaxMBlock, "kMaxMBlock must cover the int8 tile");
     plan.m_block = sme_route ? 2 * aarch64::sme_mr : (sme_i8_route ? 16 * aarch64::sme_mr : kMBlock);
 #else
     plan.m_block = kMBlock;
