@@ -668,6 +668,8 @@ NNOPS_TEST(conv2d_prepack_query) {
     q = wo[0];
 
     NNOPS_EXPECT_TRUE(q.rank() > 0);
+    // 16 output channels is under the ZA route's gate, so the query answers
+    // with the panel blob the NEON route reads.
     NNOPS_EXPECT_EQ(q.layout(), TensorLayout::PackedHWIO);
     NNOPS_EXPECT_TRUE(is_packed_conv_weight(q.layout()));
     // [OC, ⌈elements / OC⌉]: shape inference reads OC off axis 0, and numel()
@@ -1220,6 +1222,8 @@ NNOPS_TEST(conv2d_plan_blocks) {
                                c.wshape[0] >= 32;
         NNOPS_EXPECT_EQ(plan.m_block, sme_route ? int64_t{32} : int64_t{24});
         NNOPS_EXPECT_TRUE(plan.icn_block >= 1 && plan.icn_block <= c.wshape[1]);
+        // A raw filter's plan geometry is the NEON panel set even when the ZA
+        // route runs, so the oc tile is not rounded to 32 here.
         NNOPS_EXPECT_EQ(plan.ocn_block, std::min<int64_t>(128, c.wshape[0]));
         // 1x1: A is the input row, no gather buffer and no tap-major staging.
         if (c.wshape[2] == 1) {

@@ -2000,9 +2000,16 @@ ConvPackedWeight conv_packed_weight(const Conv2DAttributes& attrs, int64_t ic_pe
     // consulted (no input shape), and a padded 1x1 gathers with the same wide K.
     const bool unit_1x1 = karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1;
     g.nr = quant ? NR_MAX_I8 : nr_max_dt(weight_dtype);
+    // At least 32 input channels per k block: with a raw filter this geometry
+    // is also the plan the ZA route packs its per-call B slab against, and a
+    // shorter block (16 channels of a 3x3 is 144) leaves the tile's K loop too
+    // short to amortise the per-call store and setup — 1050 GFLOPS at 144
+    // against 1560 at 576.
+    constexpr int64_t kSmeIcMin = 32;
     g.icn_block =
         unit_1x1 ? ic_per_group :
-                   std::min<int64_t>(impl::get_ic_block(karea, ic_per_group),
+                   std::min<int64_t>(std::max<int64_t>(
+                                         impl::get_ic_block(karea, ic_per_group), kSmeIcMin),
                                      ic_per_group);
     // Balance the oc blocks rather than taking kOcnBlock and leaving a sliver:
     // 144 is 80 + 64, not 128 + 16 (an eighth-full block paying every per-block
@@ -2060,9 +2067,15 @@ ConvPackedWeight conv_packed_weight_sme(const Conv2DAttributes& attrs, int64_t i
     constexpr int64_t kSmeBlockN = 32;
     g.sme = true;
     g.nr = kSmeBlockN;
+    // The ZA tiles cover 32x32, so a short ic block leaves the kernel's K loop
+    // (kdim = icn * karea groups of four) too short to amortise the per-call
+    // store and setup: 16 channels of a 3x3 is 144, and the tile ran at
+    // 1050 GFLOPS against 1560 at 576.
+    constexpr int64_t kSmeIcMin = 32;
     g.icn_block =
         unit_1x1 ? ic_per_group :
-                   std::min<int64_t>(impl::get_ic_block(karea, ic_per_group),
+                   std::min<int64_t>(std::max<int64_t>(
+                                         impl::get_ic_block(karea, ic_per_group), kSmeIcMin),
                                      ic_per_group);
     // The task N tile is a whole number of 32-column ZA blocks.
     const int64_t oc_tile = std::min<int64_t>(oc_per_group, impl::kOcnBlock);
