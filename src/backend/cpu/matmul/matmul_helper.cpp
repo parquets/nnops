@@ -1164,6 +1164,26 @@ void tile_mma_pack_i8_sme(int mc, int nc, int kc, int32_t* c, int ldc, const int
     aarch64::mma_i8_sme(mc, nc, kc, c, ldc, packed_a, b, zero_mode, clamp_min, clamp_max,
                         block_stride > 0 ? block_stride : 0);
 }
+
+void tile_mma_pack_i8_sme_epi(int mc, int nc, int kc, float* out, int64_t ldm,
+                              const int8_t* packed_a, const int8_t* b, int64_t block_stride,
+                              const float* s_b, float s_b_scalar, float s_a,
+                              const float* col_bias, float lo, float hi)
+{
+    aarch64::mma_i8_sme_epi<float>(mc, nc, kc, out, ldm, packed_a, b,
+                                   block_stride > 0 ? block_stride : 0, s_b, s_b_scalar, s_a,
+                                   col_bias, lo, hi);
+}
+
+void tile_mma_pack_i8_sme_epi(int mc, int nc, int kc, half* out, int64_t ldm,
+                              const int8_t* packed_a, const int8_t* b, int64_t block_stride,
+                              const float* s_b, float s_b_scalar, float s_a,
+                              const float* col_bias, float lo, float hi)
+{
+    aarch64::mma_i8_sme_epi<half>(mc, nc, kc, out, ldm, packed_a, b,
+                                  block_stride > 0 ? block_stride : 0, s_b, s_b_scalar, s_a,
+                                  col_bias, lo, hi);
+}
 #endif
 
 void xor0x80_i8(int8_t* p, int nbytes)

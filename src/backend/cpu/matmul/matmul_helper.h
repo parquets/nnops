@@ -813,6 +813,18 @@ void tile_pack_rhs_i8_sme(bool trans, int nc, int kc, int8_t* dst, const int8_t*
 void tile_mma_pack_i8_sme(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t* packed_a,
                           const int8_t* b, int64_t block_stride, int32_t clamp_min,
                           int32_t clamp_max, bool zero_mode);
+// The same tile with the dequantizing store fused in: no int32 accumulator
+// reaches memory. `s_b` (or `s_b_scalar`) is the per-column weight scale, `s_a`
+// the per-tensor activation one, and lo/hi are the clip bounds with the
+// activation already composed into them.
+void tile_mma_pack_i8_sme_epi(int mc, int nc, int kc, float* out, int64_t ldm,
+                              const int8_t* packed_a, const int8_t* b, int64_t block_stride,
+                              const float* s_b, float s_b_scalar, float s_a,
+                              const float* col_bias, float lo, float hi);
+void tile_mma_pack_i8_sme_epi(int mc, int nc, int kc, half* out, int64_t ldm,
+                              const int8_t* packed_a, const int8_t* b, int64_t block_stride,
+                              const float* s_b, float s_b_scalar, float s_a,
+                              const float* col_bias, float lo, float hi);
 #endif
 
 // XOR every byte of a packed-A panel with 0x80 (s8 → u8 for VNNI).

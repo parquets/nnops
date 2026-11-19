@@ -1449,6 +1449,30 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
         [[maybe_unused]] const TOut* const bias_g = b_ptr ? b_ptr + g * oc_per_group : nullptr;
         [[maybe_unused]] const int32_t* const ibias_g = b_i32 ? b_i32 + g * oc_per_group : nullptr;
 
+        // The dequantizing store folds the whole epilogue into the kernel's
+        // write-back. It needs the plain dequant shape — no per-row or per-column
+        // compensation, a clamp-only activation, no residual — and one k block
+        // per tile, so every tile starts from a zeroed ZA.
+#if defined(NNOPS_ARCH_SME)
+        const bool epi_fused = use_sme && !kIntOut && !comp && !col_term &&
+                               plan.orig_size == 0 && icn_block >= ic_per_group &&
+                               attrs.epilogue.quant == EpilogueQuantType::None &&
+                               (attrs.epilogue.type == EpilogueActivateType::None ||
+                                attrs.epilogue.type == EpilogueActivateType::Relu ||
+                                attrs.epilogue.type == EpilogueActivateType::Relu6);
+#else
+        constexpr bool epi_fused = false;
+#endif
+        // Relu and Relu6 compose into the clip bounds: clamp∘clamp is a clamp.
+        float epi_lo = attrs.epilogue.min_clip;
+        float epi_hi = attrs.epilogue.max_clip;
+        if (attrs.epilogue.type == EpilogueActivateType::Relu) {
+            epi_lo = std::max(epi_lo, 0.0f);
+        } else if (attrs.epilogue.type == EpilogueActivateType::Relu6) {
+            epi_lo = std::max(epi_lo, 0.0f);
+            epi_hi = std::min(epi_hi, 6.0f);
+        }
+
         const int64_t r0 = chunk * OH / oh_chunks;
         const int64_t r1 = (chunk + 1) * OH / oh_chunks;
         // Over *panels*, like the fp route: a task starts where a panel does.
@@ -1475,6 +1499,26 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
             const int64_t oc_end = block_end(ocn);
             const int64_t ocnc = std::min(ocn_block, oc_end - ocn);
 
+            // The epilogue's per-column weight scale and bias, indexed like
+            // `ip.s_b` / `ip.col_bias` below.
+            [[maybe_unused]] const float* const sb_ptr =
+                qw.scale_data ? qw.scale_data + g * oc_per_group + ocn : nullptr;
+            // The fused store takes the bias in the float domain; a half bias
+            // (which the dequantizing pass widens per element) widens once here.
+            [[maybe_unused]] float bias_f[kOcnBlock];
+            [[maybe_unused]] const float* col_bias_f = nullptr;
+#if defined(NNOPS_ARCH_SME)
+            if (epi_fused && bias_g != nullptr) {
+                if constexpr (std::is_same_v<TOut, float>) {
+                    col_bias_f = bias_g + ocn;
+                } else {
+                    for (int64_t j = 0; j < ocnc; ++j) {
+                        bias_f[j] = static_cast<float>(bias_g[ocn + j]);
+                    }
+                    col_bias_f = bias_f;
+                }
+            }
+#endif
             for (int64_t pr = r0; pr < r1; pr += ph_block) {
                 const int64_t pr1 = std::min(r1, pr + ph_block);
                 const int64_t p_first = pr * OW;
@@ -1550,6 +1594,12 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                         {
                             const uint8_t* const in_row = in_g + oh * in_row_stride;
 
+                            // The dequantizing store needs nothing compensated per
+                            // row or per column, a clamp-only activation, one k block
+                            // per tile (so every tile starts from a zeroed ZA) and the
+                            // fp output the epilogue would have written.
+                            bool epi_done = false;
+
                             // The SME route gathers straight into the packed A
                             // panel (one ZA row per pixel), which needs signed
                             // bytes in whole k groups — a u8 source comes in
@@ -1607,11 +1657,28 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                                     tile_pack_lhs_i8_sme(false, mc, kdim4, sme_a.data(), a, lda,
                                                          a_biased);
                                 }
-                                tile_mma_pack_i8_sme(
-                                    mc, static_cast<int>(ocnc), kdim4, acc_tile,
-                                    static_cast<int>(ocn_block), sme_a.data(), b_panel,
-                                    /*block_stride=*/sme_slot_max, INT32_MIN, INT32_MAX,
-                                    /*zero_mode=*/icn == 0);
+                                if constexpr (!kIntOut) {
+                                    if (epi_fused) {
+                                        // The dequantizing store: the epilogue is
+                                        // the kernel's write-back, so no int32 tile
+                                        // exists.
+                                        TOut* const fdst =
+                                            out_g + oh * out_row_stride + ow0 * OC + ocn;
+                                        tile_mma_pack_i8_sme_epi(
+                                            mc, static_cast<int>(ocnc), kdim4, fdst,
+                                            static_cast<int64_t>(OC), sme_a.data(), b_panel,
+                                            /*block_stride=*/sme_slot_max, sb_ptr, qw.scale, s_x,
+                                            col_bias_f, epi_lo, epi_hi);
+                                        epi_done = true;
+                                    }
+                                }
+                                if (!epi_done) {
+                                    tile_mma_pack_i8_sme(
+                                        mc, static_cast<int>(ocnc), kdim4, acc_tile,
+                                        static_cast<int>(ocn_block), sme_a.data(), b_panel,
+                                        /*block_stride=*/sme_slot_max, INT32_MIN, INT32_MAX,
+                                        /*zero_mode=*/icn == 0);
+                                }
                                 mma_sme = true;
                             }
 #endif
@@ -1742,8 +1809,11 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                                 ip.col_bias = bias_g ? bias_g + ocn : nullptr;
                                 ip.out = dst;
                                 ip.ldc_out = static_cast<int>(OC);
-                                dq_epilogue_tile<TOut>(ip, acc_tile, static_cast<int>(ocn_block), 0,
-                                                       0, mc, ocnc);
+                                if (!epi_done) {
+                                    dq_epilogue_tile<TOut>(ip, acc_tile,
+                                                           static_cast<int>(ocn_block), 0, 0, mc,
+                                                           ocnc);
+                                }
                             }
                         }
                     }

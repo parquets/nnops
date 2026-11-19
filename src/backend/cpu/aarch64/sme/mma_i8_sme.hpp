@@ -188,6 +188,166 @@ inline void mma_i8_sme(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t
     }
 }
 
+// The epilogue's three steps, as macros: SVE intrinsics inside a helper would
+// need their own streaming attribute, which this compiler refuses to take on a
+// definition here (same reason the MOPA loops are macros).
+#define NNOPS_I8_EPI_SCALE(pg_, n_, out_)                                                 \
+    const svfloat32_t out_ =                                                             \
+        svmul_f32_x(pg_, vsa, s_b ? svld1_f32(pg_, s_b + (n_)) : svdup_n_f32(s_b_scalar))
+
+// One column group of one row: the scale product, the optional bias, the clip,
+// and the store. The arithmetic is the dequantizing pass's, lane for lane, so
+// the two agree bit for bit.
+#define NNOPS_I8_EPI_LANE(v_, sc_, bi_, pg_, cnt_, dst_)                                  \
+    do {                                                                                  \
+        svfloat32_t nno_f = svmul_f32_x(pg_, svcvt_f32_s32_x(pg_, (v_)), (sc_));           \
+        if (col_bias != nullptr) {                                                        \
+            nno_f = svadd_f32_x(pg_, nno_f, (bi_));                                       \
+        }                                                                                 \
+        nno_f = svmin_f32_x(pg_, svmax_f32_x(pg_, nno_f, vlo), vhi);                      \
+        if constexpr (std::is_same_v<TOut, half>) {                                       \
+            svst1_f16(svwhilelt_b16(0, (cnt_)), reinterpret_cast<float16_t*>(dst_),       \
+                      svcvt_f16_x(pg_, nno_f));                                           \
+        } else {                                                                          \
+            svst1_f32(pg_, (dst_), nno_f);                                                \
+        }                                                                                 \
+    } while (0)
+
+// A whole row: four column groups, live0..live3 of them populated.
+#define NNOPS_I8_EPI_ROW(g0_, g1_, g2_, g3_, idx_, row_)                                  \
+    do {                                                                                  \
+        NNOPS_I8_EPI_LANE(svget4_s32(g0_, idx_), sc0, bi0, s0, live0, (row_));            \
+        if (live1) {                                                                      \
+            NNOPS_I8_EPI_LANE(svget4_s32(g1_, idx_), sc1, bi1, s1, live1,                 \
+                              (row_) + sme_za_n);                                         \
+        }                                                                                 \
+        if (live2) {                                                                      \
+            NNOPS_I8_EPI_LANE(svget4_s32(g2_, idx_), sc2, bi2, s2, live2,                 \
+                              (row_) + 2 * sme_za_n);                                     \
+        }                                                                                 \
+        if (live3) {                                                                      \
+            NNOPS_I8_EPI_LANE(svget4_s32(g3_, idx_), sc3, bi3, s3, live3,                 \
+                              (row_) + 3 * sme_za_n);                                     \
+        }                                                                                 \
+    } while (0)
+
+/// The requantizing store: the same accumulation as mma_i8_sme, but the tile is
+/// dequantized and written out as it leaves ZA, so the int32 accumulator never
+/// reaches memory (XNNPACK's KleidiAI kernels are shaped the same way).
+///
+///     out[m,n] = clip((float)acc * (s_a * s_b[n]) + bias[n], lo, hi)
+///
+/// The clip bounds carry the activation too — a Relu or Relu6 composes into
+/// them — and the caller only takes this path when nothing is compensated per
+/// row or per column and the whole K is one block, so every tile starts from a
+/// zeroed ZA.
+template <class TOut>
+__arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
+inline void mma_i8_sme_epi(int mc, int nc, int kc, TOut* out, int64_t ldm, const int8_t* a,
+                           const int8_t* b, int64_t b_block_stride, const float* s_b,
+                           float s_b_scalar, float s_a, const float* col_bias, float lo,
+                           float hi) noexcept
+{
+    const int m_tiles = (mc + sme_mr - 1) / sme_mr;
+    const int n_blocks = (nc + sme_nr_max - 1) / sme_nr_max;
+    const int k_groups = (kc + 3) / 4;
+    const svfloat32_t vlo = svdup_n_f32(lo);
+    const svfloat32_t vhi = svdup_n_f32(hi);
+    const svfloat32_t vsa = svdup_n_f32(s_a);
+
+    for (int nb = 0; nb < n_blocks; ++nb) {
+        const int n0 = nb * sme_nr_max;
+        const bool t1 = n0 + sme_za_n < nc;
+        const bool t2 = n0 + 2 * sme_za_n < nc;
+        const bool t3 = n0 + 3 * sme_za_n < nc;
+        const int live0 = std::min(sme_za_n, nc - n0);
+        const int live1 = t1 ? std::min(sme_za_n, nc - n0 - sme_za_n) : 0;
+        const int live2 = t2 ? std::min(sme_za_n, nc - n0 - 2 * sme_za_n) : 0;
+        const int live3 = t3 ? std::min(sme_za_n, nc - n0 - 3 * sme_za_n) : 0;
+        const svbool_t pn0 = svwhilelt_b8(0, 4 * live0);
+        const svbool_t pn1 = t1 ? svwhilelt_b8(0, 4 * live1) : svpfalse_b();
+        const svbool_t pn2 = t2 ? svwhilelt_b8(0, 4 * live2) : svpfalse_b();
+        const svbool_t pn3 = t3 ? svwhilelt_b8(0, 4 * live3) : svpfalse_b();
+        const svbool_t s0 = svwhilelt_b32(0, live0);
+        const svbool_t s1 = t1 ? svwhilelt_b32(0, live1) : svpfalse_b();
+        const svbool_t s2 = t2 ? svwhilelt_b32(0, live2) : svpfalse_b();
+        const svbool_t s3 = t3 ? svwhilelt_b32(0, live3) : svpfalse_b();
+        const int8_t* bp =
+            b + static_cast<int64_t>(nb) * (b_block_stride != 0 ?
+                                                b_block_stride :
+                                                static_cast<int64_t>(k_groups) * (4 * sme_nr_max));
+        // The scale product and the bias are per output column: one load per
+        // 64-column block, not one per row.
+        const int c1 = n0 + sme_za_n;
+        const int c2 = n0 + 2 * sme_za_n;
+        const int c3 = n0 + 3 * sme_za_n;
+        NNOPS_I8_EPI_SCALE(s0, n0, sc0);
+        NNOPS_I8_EPI_SCALE(s1, c1, sc1);
+        NNOPS_I8_EPI_SCALE(s2, c2, sc2);
+        NNOPS_I8_EPI_SCALE(s3, c3, sc3);
+        const svfloat32_t bi0 = col_bias ? svld1_f32(s0, col_bias + n0) : svdup_n_f32(0.0f);
+        const svfloat32_t bi1 =
+            (col_bias && t1) ? svld1_f32(s1, col_bias + c1) : svdup_n_f32(0.0f);
+        const svfloat32_t bi2 =
+            (col_bias && t2) ? svld1_f32(s2, col_bias + c2) : svdup_n_f32(0.0f);
+        const svfloat32_t bi3 =
+            (col_bias && t3) ? svld1_f32(s3, col_bias + c3) : svdup_n_f32(0.0f);
+
+        for (int m0 = 0; m0 < m_tiles; ++m0) {
+            const int mlive = std::min(sme_mr, mc - m0 * sme_mr);
+            const svbool_t pm = svwhilelt_b8(0, 4 * mlive);
+            const int8_t* ap = a + static_cast<int64_t>(m0) * k_groups * 64;
+
+            svzero_za();
+            const int8_t* brow = bp;
+            for (int g = 0; g < k_groups; ++g, brow += 4 * sme_nr_max) {
+                const svint8_t av = svld1_s8(pm, ap + static_cast<int64_t>(g) * 64);
+                svmopa_za32_s8_m(0, pm, pn0, av, svld1_s8(pn0, brow));
+                svmopa_za32_s8_m(1, pm, pn1, av, svld1_s8(pn1, brow + sme_za_n * 4));
+                svmopa_za32_s8_m(2, pm, pn2, av, svld1_s8(pn2, brow + 2 * sme_za_n * 4));
+                svmopa_za32_s8_m(3, pm, pn3, av, svld1_s8(pn3, brow + 3 * sme_za_n * 4));
+            }
+
+            TOut* const obase = out + static_cast<int64_t>(m0 * sme_mr) * ldm + n0;
+            int i = 0;
+            for (; i + 4 <= mlive; i += 4) {
+                const svint32x4_t g0 = svread_hor_za32_s32_vg4(0, static_cast<uint32_t>(i));
+                const svint32x4_t g1 = svread_hor_za32_s32_vg4(1, static_cast<uint32_t>(i));
+                const svint32x4_t g2 = svread_hor_za32_s32_vg4(2, static_cast<uint32_t>(i));
+                const svint32x4_t g3 = svread_hor_za32_s32_vg4(3, static_cast<uint32_t>(i));
+                TOut* const r0 = obase + static_cast<int64_t>(i) * ldm;
+                const int64_t l = ldm;
+                NNOPS_I8_EPI_ROW(g0, g1, g2, g3, 0, r0);
+                NNOPS_I8_EPI_ROW(g0, g1, g2, g3, 1, r0 + l);
+                NNOPS_I8_EPI_ROW(g0, g1, g2, g3, 2, r0 + 2 * l);
+                NNOPS_I8_EPI_ROW(g0, g1, g2, g3, 3, r0 + 3 * l);
+            }
+            for (; i < mlive; ++i) {
+                const svbool_t pg = svptrue_b32();
+                TOut* const row = obase + static_cast<int64_t>(i) * ldm;
+                NNOPS_I8_EPI_LANE(svread_hor_za32_s32_m(svundef_s32(), pg, 0, i), sc0, bi0, s0,
+                                  live0, row);
+                if (live1) {
+                    NNOPS_I8_EPI_LANE(svread_hor_za32_s32_m(svundef_s32(), pg, 1, i), sc1, bi1,
+                                      s1, live1, row + sme_za_n);
+                }
+                if (live2) {
+                    NNOPS_I8_EPI_LANE(svread_hor_za32_s32_m(svundef_s32(), pg, 2, i), sc2, bi2,
+                                      s2, live2, row + 2 * sme_za_n);
+                }
+                if (live3) {
+                    NNOPS_I8_EPI_LANE(svread_hor_za32_s32_m(svundef_s32(), pg, 3, i), sc3, bi3,
+                                      s3, live3, row + 3 * sme_za_n);
+                }
+            }
+        }
+    }
+}
+
+#undef NNOPS_I8_EPI_ROW
+#undef NNOPS_I8_EPI_LANE
+#undef NNOPS_I8_EPI_SCALE
+
 } // namespace nnops::backend::cpu::aarch64
 
 #endif // NNOPS_ARCH_SME
