@@ -397,48 +397,75 @@ inline void mma_i8_sme_epi(int mc, int nc, int kc, TOut* out, int64_t ldm, const
 // XNNPACK's packed conv ends in an int8 tile, so the store is the comparison
 // that matters there: saturate on the way out and write a quarter of the bytes.
 
-#define NNOPS_I8_EPI8_LANE(v_, sc_, bi_, pg_, cnt_, dst_)                                 \
+// The requantize itself, without the store: float scale, round to nearest ties
+// away, offset, then one SVE2 clamp. Clamping the integer afterwards is the
+// same as clamping the float first — the bounds are integers — and it folds the
+// two float clamps into one instruction whose result is already a byte.
+#define NNOPS_I8_EPI8_Q(v_, sc_, bi_, pg_, out_)                                          \
+    svint32_t out_ = (v_);                                                                \
+    if (col_bias != nullptr) {                                                            \
+        out_ = svadd_s32_x(pg_, out_, (bi_));                                             \
+    }                                                                                     \
+    if (relu) {                                                                           \
+        out_ = svmax_s32_x(pg_, out_, vzero);                                             \
+    }                                                                                     \
+    out_ = svadd_s32_x(                                                                   \
+        pg_,                                                                              \
+        svcvt_s32_f32_x(pg_, svrinta_f32_x(                                               \
+                                 pg_, svmul_f32_x(pg_, svcvt_f32_s32_x(pg_, out_), (sc_)))), \
+        vzp);                                                                             \
+    out_ = svclamp_s32(out_, vkmin, vkmax)
+
+// Two column groups of one row, clamped, packed by taking the low byte of each
+// lane — `uzp1` on the byte view gathers 32 of them in one instruction.
+#define NNOPS_I8_EPI8_STORE2(q0_, q1_, dst_)                                              \
     do {                                                                                  \
-        svint32_t nno_v = (v_);                                                           \
-        if (col_bias != nullptr) {                                                        \
-            nno_v = svadd_s32_x(pg_, nno_v, (bi_));                                       \
-        }                                                                                 \
-        if (relu) {                                                                       \
-            nno_v = svmax_s32_x(pg_, nno_v, vzero);                                       \
-        }                                                                                 \
-        svfloat32_t nno_g = svmul_f32_x(pg_, svcvt_f32_s32_x(pg_, nno_v), (sc_));         \
-        nno_g = svmin_f32_x(pg_, svmax_f32_x(pg_, nno_g, vfmin), vfmax);                  \
-        /* FRINTA + FCVT is FCVTAS: nearest, ties away from zero, as the row pass. */      \
-        const svint32_t nno_q =                                                           \
-            svadd_s32_x(pg_, svcvt_s32_f32_x(pg_, svrinta_f32_x(pg_, nno_g)), vzp);       \
-        /* The narrows leave their elements in the even lanes; uzp1 packs them. */        \
-        const svint16_t nno_h0 = svqxtnb_s32(nno_q);                                      \
-        const svint16_t nno_h = svuzp1_s16(nno_h0, nno_h0);                               \
         if constexpr (std::is_same_v<TOut, uint8_t>) {                                    \
-            const svuint8_t nno_b0 = svqxtunb_s16(nno_h);                                 \
-            svst1_u8(svwhilelt_b8(0, (cnt_)), reinterpret_cast<uint8_t*>(dst_),           \
-                     svuzp1_u8(nno_b0, nno_b0));                                          \
+            svst1_u8(svwhilelt_b8(0, 2 * sme_za_n), reinterpret_cast<uint8_t*>(dst_),     \
+                     svuzp1_u8(svreinterpret_u8_s32(q0_), svreinterpret_u8_s32(q1_)));    \
         } else {                                                                          \
-            const svint8_t nno_b0 = svqxtnb_s16(nno_h);                                   \
-            svst1_s8(svwhilelt_b8(0, (cnt_)), reinterpret_cast<int8_t*>(dst_),            \
-                     svuzp1_s8(nno_b0, nno_b0));                                          \
+            svst1_s8(svwhilelt_b8(0, 2 * sme_za_n), reinterpret_cast<int8_t*>(dst_),      \
+                     svuzp1_s8(svreinterpret_s8_s32(q0_), svreinterpret_s8_s32(q1_)));    \
         }                                                                                 \
     } while (0)
 
+// One group on its own, for the partial blocks.
+#define NNOPS_I8_EPI8_STORE1(q_, pg_, cnt_, dst_)                                         \
+    do {                                                                                  \
+        if constexpr (std::is_same_v<TOut, uint8_t>) {                                    \
+            svst1_u8(svwhilelt_b8(0, (cnt_)), reinterpret_cast<uint8_t*>(dst_),           \
+                     svuzp1_u8(svreinterpret_u8_s32(q_), svreinterpret_u8_s32(q_)));      \
+        } else {                                                                          \
+            svst1_s8(svwhilelt_b8(0, (cnt_)), reinterpret_cast<int8_t*>(dst_),            \
+                     svuzp1_s8(svreinterpret_s8_s32(q_), svreinterpret_s8_s32(q_)));      \
+        }                                                                                 \
+    } while (0)
+
+// A whole row: four column groups, 32 bytes per store on the full blocks.
 #define NNOPS_I8_EPI8_ROW(g0_, g1_, g2_, g3_, idx_, row_)                                 \
     do {                                                                                  \
-        NNOPS_I8_EPI8_LANE(svget4_s32(g0_, idx_), sc0, bi0, s0, live0, (row_));           \
-        if (live1) {                                                                      \
-            NNOPS_I8_EPI8_LANE(svget4_s32(g1_, idx_), sc1, bi1, s1, live1,                \
-                               (row_) + sme_za_n);                                        \
-        }                                                                                 \
-        if (live2) {                                                                      \
-            NNOPS_I8_EPI8_LANE(svget4_s32(g2_, idx_), sc2, bi2, s2, live2,                \
-                               (row_) + 2 * sme_za_n);                                    \
-        }                                                                                 \
-        if (live3) {                                                                      \
-            NNOPS_I8_EPI8_LANE(svget4_s32(g3_, idx_), sc3, bi3, s3, live3,                \
-                               (row_) + 3 * sme_za_n);                                    \
+        if (full) {                                                                       \
+            NNOPS_I8_EPI8_Q(svget4_s32(g0_, idx_), sc0, bi0, s0, nno_q0);                 \
+            NNOPS_I8_EPI8_Q(svget4_s32(g1_, idx_), sc1, bi1, s1, nno_q1);                 \
+            NNOPS_I8_EPI8_STORE2(nno_q0, nno_q1, (row_));                                 \
+            NNOPS_I8_EPI8_Q(svget4_s32(g2_, idx_), sc2, bi2, s2, nno_q2);                 \
+            NNOPS_I8_EPI8_Q(svget4_s32(g3_, idx_), sc3, bi3, s3, nno_q3);                 \
+            NNOPS_I8_EPI8_STORE2(nno_q2, nno_q3, (row_) + 2 * sme_za_n);                  \
+        } else {                                                                          \
+            NNOPS_I8_EPI8_Q(svget4_s32(g0_, idx_), sc0, bi0, s0, nno_q0);                 \
+            NNOPS_I8_EPI8_STORE1(nno_q0, s0, live0, (row_));                              \
+            if (live1) {                                                                  \
+                NNOPS_I8_EPI8_Q(svget4_s32(g1_, idx_), sc1, bi1, s1, nno_q1);             \
+                NNOPS_I8_EPI8_STORE1(nno_q1, s1, live1, (row_) + sme_za_n);               \
+            }                                                                             \
+            if (live2) {                                                                  \
+                NNOPS_I8_EPI8_Q(svget4_s32(g2_, idx_), sc2, bi2, s2, nno_q2);             \
+                NNOPS_I8_EPI8_STORE1(nno_q2, s2, live2, (row_) + 2 * sme_za_n);           \
+            }                                                                             \
+            if (live3) {                                                                  \
+                NNOPS_I8_EPI8_Q(svget4_s32(g3_, idx_), sc3, bi3, s3, nno_q3);             \
+                NNOPS_I8_EPI8_STORE1(nno_q3, s3, live3, (row_) + 3 * sme_za_n);           \
+            }                                                                             \
         }                                                                                 \
     } while (0)
 
@@ -456,9 +483,10 @@ inline void mma_i8_sme_epi_i8(int mc, int nc, int kc, TOut* out, int64_t ldm, co
                               int32_t zp_out, bool relu) noexcept
 {
     constexpr bool kU8 = std::is_same_v<TOut, uint8_t>;
-    const float zpf = static_cast<float>(zp_out);
-    const svfloat32_t vfmin = svdup_n_f32((kU8 ? 0.0f : -128.0f) - zpf);
-    const svfloat32_t vfmax = svdup_n_f32((kU8 ? 255.0f : 127.0f) - zpf);
+    // The destination's integer range, clamped after the zero point instead of
+    // before the rounding — the same result, one instruction.
+    const svint32_t vkmin = svdup_n_s32(kU8 ? 0 : -128);
+    const svint32_t vkmax = svdup_n_s32(kU8 ? 255 : 127);
     const svfloat32_t vrowk = svdup_n_f32(row_k);
     const svint32_t vzp = svdup_n_s32(zp_out);
     const svint32_t vzero = svdup_n_s32(0);
@@ -483,6 +511,8 @@ inline void mma_i8_sme_epi_i8(int mc, int nc, int kc, TOut* out, int64_t ldm, co
         const svbool_t s1 = t1 ? svwhilelt_b32(0, live1) : svpfalse_b();
         const svbool_t s2 = t2 ? svwhilelt_b32(0, live2) : svpfalse_b();
         const svbool_t s3 = t3 ? svwhilelt_b32(0, live3) : svpfalse_b();
+        const bool full = live0 == sme_za_n && live1 == sme_za_n && live2 == sme_za_n &&
+                          live3 == sme_za_n;
         const int8_t* bp =
             b + static_cast<int64_t>(nb) * (b_block_stride != 0 ?
                                                 b_block_stride :
@@ -538,19 +568,23 @@ inline void mma_i8_sme_epi_i8(int mc, int nc, int kc, TOut* out, int64_t ldm, co
             for (; i < mlive; ++i) {
                 const svbool_t pg = svptrue_b32();
                 TOut* const row = obase + static_cast<int64_t>(i) * ldm;
-                NNOPS_I8_EPI8_LANE(svread_hor_za32_s32_m(svundef_s32(), pg, 0, i), sc0, bi0, s0,
-                                   live0, row);
+                NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg, 0, i), sc0, bi0, s0,
+                                nno_q0);
+                NNOPS_I8_EPI8_STORE1(nno_q0, s0, live0, row);
                 if (live1) {
-                    NNOPS_I8_EPI8_LANE(svread_hor_za32_s32_m(svundef_s32(), pg, 1, i), sc1, bi1,
-                                       s1, live1, row + sme_za_n);
+                    NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg, 1, i), sc1, bi1,
+                                    s1, nno_q1);
+                    NNOPS_I8_EPI8_STORE1(nno_q1, s1, live1, row + sme_za_n);
                 }
                 if (live2) {
-                    NNOPS_I8_EPI8_LANE(svread_hor_za32_s32_m(svundef_s32(), pg, 2, i), sc2, bi2,
-                                       s2, live2, row + 2 * sme_za_n);
+                    NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg, 2, i), sc2, bi2,
+                                    s2, nno_q2);
+                    NNOPS_I8_EPI8_STORE1(nno_q2, s2, live2, row + 2 * sme_za_n);
                 }
                 if (live3) {
-                    NNOPS_I8_EPI8_LANE(svread_hor_za32_s32_m(svundef_s32(), pg, 3, i), sc3, bi3,
-                                       s3, live3, row + 3 * sme_za_n);
+                    NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg, 3, i), sc3, bi3,
+                                    s3, nno_q3);
+                    NNOPS_I8_EPI8_STORE1(nno_q3, s3, live3, row + 3 * sme_za_n);
                 }
             }
         }
@@ -558,7 +592,9 @@ inline void mma_i8_sme_epi_i8(int mc, int nc, int kc, TOut* out, int64_t ldm, co
 }
 
 #undef NNOPS_I8_EPI8_ROW
-#undef NNOPS_I8_EPI8_LANE
+#undef NNOPS_I8_EPI8_STORE1
+#undef NNOPS_I8_EPI8_STORE2
+#undef NNOPS_I8_EPI8_Q
 
 #undef NNOPS_I8_EPI_ROW
 #undef NNOPS_I8_EPI_LANE
