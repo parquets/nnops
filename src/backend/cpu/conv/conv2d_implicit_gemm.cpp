@@ -2019,16 +2019,15 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     const bool sme_route = !quant &&
                            (sme_blob || (!prepacked && aarch64::available_sme() &&
                                          oc_per_group >= aarch64::sme_fp_nr));
-    // The int8 route's SMOPA tile is the same two 16-row faces, and a 24-pixel
-    // kMBlock leaves the second face half dead on every tile (a 24-row tile
-    // and a 32-row one cost the same). Narrow rows keep 24: below 16 output
-    // pixels a tile straddles rows on almost every step and the gather's
-    // row-merge no longer pays.
+    // The int8 route's A tile is 128 pixels whatever the row width. Width was
+    // once the gate here, on the theory that a narrow row cannot fill the tile;
+    // measured, the opposite holds — the tile is what the kernel wants, and a
+    // 24-pixel one (the NEON kMBlock) re-walks the whole packed B every 24
+    // pixels. 28x28 128->128 ran 128 us against 104 us at 128 pixels.
     const bool sme_i8_route = quant &&
                               (sme_blob || (!prepacked && aarch64::available_sme() &&
                                             oc_per_group >= aarch64::sme_nr_max));
-    const bool sme_i8_wide = sme_i8_route && out.dims[3] >= 2 * aarch64::sme_mr;
-    plan.m_block = sme_route ? 2 * aarch64::sme_mr : (sme_i8_wide ? 8 * aarch64::sme_mr : kMBlock);
+    plan.m_block = sme_route ? 2 * aarch64::sme_mr : (sme_i8_route ? 8 * aarch64::sme_mr : kMBlock);
 #else
     plan.m_block = kMBlock;
 #endif
