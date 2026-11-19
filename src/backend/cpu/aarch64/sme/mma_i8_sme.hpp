@@ -112,6 +112,7 @@ inline void mma_i8_sme(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t
         const svbool_t s3 = t3 ? svwhilelt_b32(0, live3) : svpfalse_b();
         const bool full = live0 == sme_za_n && live1 == sme_za_n && live2 == sme_za_n &&
                           live3 == sme_za_n;
+        const bool half4 = !full && live0 == sme_za_n && live1 == sme_za_n;
         const int8_t* bp =
             b + static_cast<int64_t>(nb) * (b_block_stride != 0 ?
                                                 b_block_stride :
@@ -235,7 +236,11 @@ inline void mma_i8_sme(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t
 #define NNOPS_I8_EPI_ROW(g0_, g1_, g2_, g3_, idx_, row_)                                  \
     do {                                                                                  \
         if constexpr (std::is_same_v<TOut, float>) {                                       \
-            if (full) {                                                                    \
+            if (half4) {                                                                   \
+                NNOPS_I8_EPI_VAL(svget4_s32(g0_, idx_), sc0, bi0, s0, nno_e0);             \
+                NNOPS_I8_EPI_VAL(svget4_s32(g1_, idx_), sc1, bi1, s1, nno_e1);             \
+                svst1_f32_x2(svptrue_c32(), (row_), svcreate2_f32(nno_e0, nno_e1));        \
+            } else if (full) {                                                             \
                 NNOPS_I8_EPI_VAL(svget4_s32(g0_, idx_), sc0, bi0, s0, nno_e0);             \
                 NNOPS_I8_EPI_VAL(svget4_s32(g1_, idx_), sc1, bi1, s1, nno_e1);             \
                 svst1_f32_x2(svptrue_c32(), (row_), svcreate2_f32(nno_e0, nno_e1));        \
@@ -321,6 +326,7 @@ inline void mma_i8_sme_epi(int mc, int nc, int kc, TOut* out, int64_t ldm, const
         const svbool_t s3 = t3 ? svwhilelt_b32(0, live3) : svpfalse_b();
         const bool full = live0 == sme_za_n && live1 == sme_za_n && live2 == sme_za_n &&
                           live3 == sme_za_n;
+        const bool half4 = !full && live0 == sme_za_n && live1 == sme_za_n;
         const int8_t* bp =
             b + static_cast<int64_t>(nb) * (b_block_stride != 0 ?
                                                 b_block_stride :
@@ -514,6 +520,7 @@ inline void mma_i8_sme_epi_i8(int mc, int nc, int kc, TOut* out, int64_t ldm, co
         const svbool_t s3 = t3 ? svwhilelt_b32(0, live3) : svpfalse_b();
         const bool full = live0 == sme_za_n && live1 == sme_za_n && live2 == sme_za_n &&
                           live3 == sme_za_n;
+        const bool half4 = !full && live0 == sme_za_n && live1 == sme_za_n;
         const int8_t* bp =
             b + static_cast<int64_t>(nb) * (b_block_stride != 0 ?
                                                 b_block_stride :
