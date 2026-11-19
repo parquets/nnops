@@ -448,30 +448,47 @@ inline void mma_i8_sme_epi(int mc, int nc, int kc, TOut* out, int64_t ldm, const
         }                                                                                 \
     } while (0)
 
-// A whole row: four column groups, 32 bytes per store on the full blocks.
-#define NNOPS_I8_EPI8_ROW(g0_, g1_, g2_, g3_, idx_, row_)                                 \
+// One row of one m half: two column groups from two ZA tiles that differ in n,
+// 32 bytes per store on the full blocks.
+#define NNOPS_I8_EPI8_ROW2(ga_, gb_, idx_, row_)                                          \
     do {                                                                                  \
         if (full) {                                                                       \
-            NNOPS_I8_EPI8_Q(svget4_s32(g0_, idx_), sc0, bi0, s0, nno_q0);                 \
-            NNOPS_I8_EPI8_Q(svget4_s32(g1_, idx_), sc1, bi1, s1, nno_q1);                 \
+            NNOPS_I8_EPI8_Q(svget4_s32(ga_, idx_), sc0, bi0, s0, nno_q0);                 \
+            NNOPS_I8_EPI8_Q(svget4_s32(gb_, idx_), sc1, bi1, s1, nno_q1);                 \
             NNOPS_I8_EPI8_STORE2(nno_q0, nno_q1, (row_));                                 \
-            NNOPS_I8_EPI8_Q(svget4_s32(g2_, idx_), sc2, bi2, s2, nno_q2);                 \
-            NNOPS_I8_EPI8_Q(svget4_s32(g3_, idx_), sc3, bi3, s3, nno_q3);                 \
-            NNOPS_I8_EPI8_STORE2(nno_q2, nno_q3, (row_) + 2 * sme_za_n);                  \
         } else {                                                                          \
-            NNOPS_I8_EPI8_Q(svget4_s32(g0_, idx_), sc0, bi0, s0, nno_q0);                 \
-            NNOPS_I8_EPI8_STORE1(nno_q0, s0, live0, (row_));                              \
+            NNOPS_I8_EPI8_Q(svget4_s32(ga_, idx_), sc0, bi0, s0, nno_q2);                 \
+            NNOPS_I8_EPI8_STORE1(nno_q2, s0, live0, (row_));                              \
             if (live1) {                                                                  \
-                NNOPS_I8_EPI8_Q(svget4_s32(g1_, idx_), sc1, bi1, s1, nno_q1);             \
-                NNOPS_I8_EPI8_STORE1(nno_q1, s1, live1, (row_) + sme_za_n);               \
+                NNOPS_I8_EPI8_Q(svget4_s32(gb_, idx_), sc1, bi1, s1, nno_q3);             \
+                NNOPS_I8_EPI8_STORE1(nno_q3, s1, live1, (row_) + sme_za_n);               \
             }                                                                             \
-            if (live2) {                                                                  \
-                NNOPS_I8_EPI8_Q(svget4_s32(g2_, idx_), sc2, bi2, s2, nno_q2);             \
-                NNOPS_I8_EPI8_STORE1(nno_q2, s2, live2, (row_) + 2 * sme_za_n);           \
-            }                                                                             \
-            if (live3) {                                                                  \
-                NNOPS_I8_EPI8_Q(svget4_s32(g3_, idx_), sc3, bi3, s3, nno_q3);             \
-                NNOPS_I8_EPI8_STORE1(nno_q3, s3, live3, (row_) + 3 * sme_za_n);           \
+        }                                                                                 \
+    } while (0)
+
+// `nlive` pixel rows out of one m half's two ZA tiles, four at a time.
+#define NNOPS_I8_EPI8_HALF(za_a_, za_b_, first_, nlive_, base_)                           \
+    do {                                                                                  \
+        int i_ = 0;                                                                       \
+        for (; i_ + 4 <= (nlive_); i_ += 4) {                                             \
+            const svint32x4_t ga_ = svread_hor_za32_s32_vg4(za_a_, (uint32_t)i_);         \
+            const svint32x4_t gb_ = svread_hor_za32_s32_vg4(za_b_, (uint32_t)i_);         \
+            TOut* const r_ = (base_) + static_cast<int64_t>((first_) + i_) * ldm;         \
+            NNOPS_I8_EPI8_ROW2(ga_, gb_, 0, r_);                                          \
+            NNOPS_I8_EPI8_ROW2(ga_, gb_, 1, r_ + ldm);                                    \
+            NNOPS_I8_EPI8_ROW2(ga_, gb_, 2, r_ + 2 * ldm);                                \
+            NNOPS_I8_EPI8_ROW2(ga_, gb_, 3, r_ + 3 * ldm);                                \
+        }                                                                                 \
+        for (; i_ < (nlive_); ++i_) {                                                     \
+            const svbool_t pg_ = svptrue_b32();                                           \
+            TOut* const r_ = (base_) + static_cast<int64_t>((first_) + i_) * ldm;         \
+            NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg_, za_a_, i_), sc0,    \
+                            bi0, s0, nno_q0);                                             \
+            NNOPS_I8_EPI8_STORE1(nno_q0, s0, live0, r_);                                  \
+            if (live1) {                                                                  \
+                NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg_, za_b_, i_),     \
+                                sc1, bi1, s1, nno_q1);                                    \
+                NNOPS_I8_EPI8_STORE1(nno_q1, s1, live1, r_ + sme_za_n);                   \
             }                                                                             \
         }                                                                                 \
     } while (0)
@@ -490,6 +507,11 @@ inline void mma_i8_sme_epi_i8(int mc, int nc, int kc, TOut* out, int64_t ldm, co
                               int32_t zp_out, bool relu) noexcept
 {
     constexpr bool kU8 = std::is_same_v<TOut, uint8_t>;
+    // A 32x32 output block: four ZA tiles as a 2x2 grid, two m halves by two n
+    // halves. Same instruction count per MAC as the 16x64 face, but the packed
+    // B is walked once per 32 rows instead of once per 16.
+    constexpr int kBlockM = 2 * sme_mr;
+    constexpr int kBlockN = 2 * sme_za_n;
     // The destination's integer range, clamped after the zero point instead of
     // before the rounding — the same result, one instruction.
     const svint32_t vkmin = svdup_n_s32(kU8 ? 0 : -128);
@@ -497,109 +519,77 @@ inline void mma_i8_sme_epi_i8(int mc, int nc, int kc, TOut* out, int64_t ldm, co
     const svfloat32_t vrowk = svdup_n_f32(row_k);
     const svint32_t vzp = svdup_n_s32(zp_out);
     const svint32_t vzero = svdup_n_s32(0);
-    const int m_tiles = (mc + sme_mr - 1) / sme_mr;
-    const int n_blocks = (nc + sme_nr_max - 1) / sme_nr_max;
+    const int m_blocks = (mc + kBlockM - 1) / kBlockM;
+    const int n_blocks = (nc + kBlockN - 1) / kBlockN;
     const int k_groups = (kc + 3) / 4;
 
     for (int nb = 0; nb < n_blocks; ++nb) {
-        const int n0 = nb * sme_nr_max;
+        const int n0 = nb * kBlockN;
         const bool t1 = n0 + sme_za_n < nc;
-        const bool t2 = n0 + 2 * sme_za_n < nc;
-        const bool t3 = n0 + 3 * sme_za_n < nc;
         const int live0 = std::min(sme_za_n, nc - n0);
         const int live1 = t1 ? std::min(sme_za_n, nc - n0 - sme_za_n) : 0;
-        const int live2 = t2 ? std::min(sme_za_n, nc - n0 - 2 * sme_za_n) : 0;
-        const int live3 = t3 ? std::min(sme_za_n, nc - n0 - 3 * sme_za_n) : 0;
         const svbool_t pn0 = svwhilelt_b8(0, 4 * live0);
         const svbool_t pn1 = t1 ? svwhilelt_b8(0, 4 * live1) : svpfalse_b();
-        const svbool_t pn2 = t2 ? svwhilelt_b8(0, 4 * live2) : svpfalse_b();
-        const svbool_t pn3 = t3 ? svwhilelt_b8(0, 4 * live3) : svpfalse_b();
         const svbool_t s0 = svwhilelt_b32(0, live0);
         const svbool_t s1 = t1 ? svwhilelt_b32(0, live1) : svpfalse_b();
-        const svbool_t s2 = t2 ? svwhilelt_b32(0, live2) : svpfalse_b();
-        const svbool_t s3 = t3 ? svwhilelt_b32(0, live3) : svpfalse_b();
-        const bool full = live0 == sme_za_n && live1 == sme_za_n && live2 == sme_za_n &&
-                          live3 == sme_za_n;
-        const bool half4 = !full && live0 == sme_za_n && live1 == sme_za_n;
-        const int8_t* bp =
-            b + static_cast<int64_t>(nb) * (b_block_stride != 0 ?
-                                                b_block_stride :
-                                                static_cast<int64_t>(k_groups) * (4 * sme_nr_max));
+        const bool full = live0 == sme_za_n && live1 == sme_za_n;
+        const int64_t b_blk =
+            static_cast<int64_t>(n0 / sme_nr_max) *
+                (b_block_stride != 0 ? b_block_stride :
+                                       static_cast<int64_t>(k_groups) * (4 * sme_nr_max)) +
+            static_cast<int64_t>(n0 % sme_nr_max) / sme_za_n * 64;
+        const int8_t* const bp = b + b_blk;
         const int c1 = n0 + sme_za_n;
-        const int c2 = n0 + 2 * sme_za_n;
-        const int c3 = n0 + 3 * sme_za_n;
         const svfloat32_t sc0 = svmul_f32_x(s0, vrowk,
                                             s_b ? svld1_f32(s0, s_b + n0) : svdup_n_f32(s_b_scalar));
         const svfloat32_t sc1 =
             svmul_f32_x(s1, vrowk, s_b ? svld1_f32(s1, s_b + c1) : svdup_n_f32(s_b_scalar));
-        const svfloat32_t sc2 =
-            svmul_f32_x(s2, vrowk, s_b ? svld1_f32(s2, s_b + c2) : svdup_n_f32(s_b_scalar));
-        const svfloat32_t sc3 =
-            svmul_f32_x(s3, vrowk, s_b ? svld1_f32(s3, s_b + c3) : svdup_n_f32(s_b_scalar));
         const svint32_t bi0 = col_bias ? svld1_s32(s0, col_bias + n0) : svdup_n_s32(0);
-        const svint32_t bi1 =
-            (col_bias && t1) ? svld1_s32(s1, col_bias + c1) : svdup_n_s32(0);
-        const svint32_t bi2 =
-            (col_bias && t2) ? svld1_s32(s2, col_bias + c2) : svdup_n_s32(0);
-        const svint32_t bi3 =
-            (col_bias && t3) ? svld1_s32(s3, col_bias + c3) : svdup_n_s32(0);
+        const svint32_t bi1 = (col_bias && t1) ? svld1_s32(s1, col_bias + c1) : svdup_n_s32(0);
 
-        for (int m0 = 0; m0 < m_tiles; ++m0) {
-            const int mlive = std::min(sme_mr, mc - m0 * sme_mr);
-            const svbool_t pm = svwhilelt_b8(0, 4 * mlive);
-            const int8_t* ap = a + static_cast<int64_t>(m0) * k_groups * 64;
+        for (int m0 = 0; m0 < m_blocks; ++m0) {
+            const int mbase = m0 * kBlockM;
+            const int mlive0 = std::min(sme_mr, mc - mbase);
+            const int mlive1 = std::max(0, std::min(sme_mr, mc - mbase - sme_mr));
+            const svbool_t pm0 = svwhilelt_b8(0, 4 * mlive0);
+            const int8_t* const ap = a + static_cast<int64_t>(2 * m0) * k_groups * 64;
 
             svzero_za();
             const int8_t* brow = bp;
-            for (int g = 0; g < k_groups; ++g, brow += 4 * sme_nr_max) {
-                const svint8_t av = svld1_s8(pm, ap + static_cast<int64_t>(g) * 64);
-                svmopa_za32_s8_m(0, pm, pn0, av, svld1_s8(pn0, brow));
-                svmopa_za32_s8_m(1, pm, pn1, av, svld1_s8(pn1, brow + sme_za_n * 4));
-                svmopa_za32_s8_m(2, pm, pn2, av, svld1_s8(pn2, brow + 2 * sme_za_n * 4));
-                svmopa_za32_s8_m(3, pm, pn3, av, svld1_s8(pn3, brow + 3 * sme_za_n * 4));
+            const int8_t* ap1 = ap + static_cast<int64_t>(k_groups) * 64;
+            if (mlive1 != 0) {
+                const svbool_t pm1 = svwhilelt_b8(0, 4 * mlive1);
+                for (int g = 0; g < k_groups; ++g, brow += 4 * sme_nr_max) {
+                    const svint8_t a0 = svld1_s8(pm0, ap + static_cast<int64_t>(g) * 64);
+                    const svint8_t a1 = svld1_s8(pm1, ap1 + static_cast<int64_t>(g) * 64);
+                    const svint8_t b0 = svld1_s8(pn0, brow);
+                    const svint8_t b1 = svld1_s8(pn1, brow + sme_za_n * 4);
+                    svmopa_za32_s8_m(0, pm0, pn0, a0, b0);
+                    svmopa_za32_s8_m(1, pm0, pn1, a0, b1);
+                    svmopa_za32_s8_m(2, pm1, pn0, a1, b0);
+                    svmopa_za32_s8_m(3, pm1, pn1, a1, b1);
+                }
+            } else {
+                for (int g = 0; g < k_groups; ++g, brow += 4 * sme_nr_max) {
+                    const svint8_t a0 = svld1_s8(pm0, ap + static_cast<int64_t>(g) * 64);
+                    const svint8_t b0 = svld1_s8(pn0, brow);
+                    const svint8_t b1 = svld1_s8(pn1, brow + sme_za_n * 4);
+                    svmopa_za32_s8_m(0, pm0, pn0, a0, b0);
+                    svmopa_za32_s8_m(1, pm0, pn1, a0, b1);
+                }
             }
 
-            TOut* const obase = out + static_cast<int64_t>(m0 * sme_mr) * ldm + n0;
-            int i = 0;
-            for (; i + 4 <= mlive; i += 4) {
-                const svint32x4_t g0 = svread_hor_za32_s32_vg4(0, static_cast<uint32_t>(i));
-                const svint32x4_t g1 = svread_hor_za32_s32_vg4(1, static_cast<uint32_t>(i));
-                const svint32x4_t g2 = svread_hor_za32_s32_vg4(2, static_cast<uint32_t>(i));
-                const svint32x4_t g3 = svread_hor_za32_s32_vg4(3, static_cast<uint32_t>(i));
-                TOut* const r0 = obase + static_cast<int64_t>(i) * ldm;
-                const int64_t l = ldm;
-                NNOPS_I8_EPI8_ROW(g0, g1, g2, g3, 0, r0);
-                NNOPS_I8_EPI8_ROW(g0, g1, g2, g3, 1, r0 + l);
-                NNOPS_I8_EPI8_ROW(g0, g1, g2, g3, 2, r0 + 2 * l);
-                NNOPS_I8_EPI8_ROW(g0, g1, g2, g3, 3, r0 + 3 * l);
-            }
-            for (; i < mlive; ++i) {
-                const svbool_t pg = svptrue_b32();
-                TOut* const row = obase + static_cast<int64_t>(i) * ldm;
-                NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg, 0, i), sc0, bi0, s0,
-                                nno_q0);
-                NNOPS_I8_EPI8_STORE1(nno_q0, s0, live0, row);
-                if (live1) {
-                    NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg, 1, i), sc1, bi1,
-                                    s1, nno_q1);
-                    NNOPS_I8_EPI8_STORE1(nno_q1, s1, live1, row + sme_za_n);
-                }
-                if (live2) {
-                    NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg, 2, i), sc2, bi2,
-                                    s2, nno_q2);
-                    NNOPS_I8_EPI8_STORE1(nno_q2, s2, live2, row + 2 * sme_za_n);
-                }
-                if (live3) {
-                    NNOPS_I8_EPI8_Q(svread_hor_za32_s32_m(svundef_s32(), pg, 3, i), sc3, bi3,
-                                    s3, nno_q3);
-                    NNOPS_I8_EPI8_STORE1(nno_q3, s3, live3, row + 3 * sme_za_n);
-                }
+            TOut* const obase = out + static_cast<int64_t>(mbase) * ldm + n0;
+            NNOPS_I8_EPI8_HALF(0, 1, 0, mlive0, obase);
+            if (mlive1 != 0) {
+                NNOPS_I8_EPI8_HALF(2, 3, sme_mr, mlive1, obase);
             }
         }
     }
 }
 
-#undef NNOPS_I8_EPI8_ROW
+#undef NNOPS_I8_EPI8_HALF
+#undef NNOPS_I8_EPI8_ROW2
 #undef NNOPS_I8_EPI8_STORE1
 #undef NNOPS_I8_EPI8_STORE2
 #undef NNOPS_I8_EPI8_Q
