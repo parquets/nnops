@@ -1083,6 +1083,7 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
 
     // HWIO: the output channel is the last axis; a prepacked blob leads with it.
     const bool prepacked = is_packed_conv_weight(weight.layout());
+    const bool sme_blob = weight.layout() == TensorLayout::PackedHWIOSme;
     const int64_t OC = prepacked ? weight.shape(0) : weight.shape(3);
 
     const int64_t OH = output.shape(2);
@@ -1093,17 +1094,13 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
     const int64_t ic_per_group = IC / G;
     const int64_t oc_per_group = OC / G;
 
-    // The int8 SMOPA route is implemented but stays off: on MobileNetV2 its
-    // per-tile scalar A pack and 64-column blocks lose to the NEON panels at
-    // every width (about 2x on the 3x3 256/512 layers). The tiled MatMul route
-    // still serves the int8 GEMMs the transpose-conv path issues.
-#if defined(NNOPS_ARCH_SME)
     // The SMOPA tiles are 16 rows x 64 columns: one pass is four 16-column
-    // groups, so the filter has to fill them. A caller's packed blob is the
-    // NEON panels and has no reader here — the ZA route builds its own shared
-    // prepack from the raw filter.
-    const bool use_sme = !prepacked && aarch64::available_sme() &&
-                         oc_per_group >= aarch64::sme_nr_max;
+    // groups, so the filter has to fill them. A caller's NEON panel blob has no
+    // reader here; the ZA blob does, at the same 64-column width, so a
+    // prepacked filter skips the per-call shared prepack entirely.
+#if defined(NNOPS_ARCH_SME)
+    const bool use_sme = sme_blob || (!prepacked && aarch64::available_sme() &&
+                                      oc_per_group >= aarch64::sme_nr_max);
 #else
     constexpr bool use_sme = false;
 #endif
@@ -1135,8 +1132,10 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
 
     // Same geometry prepackWeights used (see the float kernel).
     const ConvPackedWeight pg =
-        conv_packed_weight(attrs, ic_per_group, oc_per_group, weight.data_type());
-    NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block && pg.nr == NR_MAX_I8);
+        sme_blob ? conv_packed_weight_sme(attrs, ic_per_group, oc_per_group, weight.data_type()) :
+                   conv_packed_weight(attrs, ic_per_group, oc_per_group, weight.data_type());
+    NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block &&
+                 pg.nr == NR_MAX_I8);
     constexpr int64_t nr_max = NR_MAX_I8;
 
     // ---- quantization parameters -----------------------------------------
@@ -1249,7 +1248,12 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
     int64_t sme_region_bytes = 0;
     int64_t sme_slot_max = 0;
     int64_t sme_num_ic_blocks = 0;
-    if (use_sme) {
+    if (use_sme && sme_blob) {
+        // The blob holds one region per (group, ic block, 64-column block),
+        // whole-K: nothing to pack here.
+        sme_num_ic_blocks = (ic_per_group + icn_block - 1) / icn_block;
+        sme_slot_max = pg.sme_region;
+    } else if (use_sme) {
         const int64_t nr = aarch64::sme_nr_max;
         sme_num_ic_blocks = (ic_per_group + icn_block - 1) / icn_block;
         sme_start_prefix.assign(static_cast<size_t>(oc_chunks) + 1, 0);
@@ -1364,9 +1368,14 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
         const int64_t r0 = chunk * OH / oh_chunks;
         const int64_t r1 = (chunk + 1) * OH / oh_chunks;
         // Over *panels*, like the fp route: a task starts where a panel does.
-        const int64_t oc_lo = oc_chunk * pg.panels_oc / oc_chunks * nr_max;
-        const int64_t oc_hi =
-            std::min((oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
+        // A ZA blob's blocks are the filter's own 64-column ones, not the NEON
+        // panels the split is measured in; its plan keeps the group whole.
+        const int64_t oc_lo =
+            sme_blob ? 0 : oc_chunk * pg.panels_oc / oc_chunks * nr_max;
+        const int64_t oc_hi = sme_blob ?
+                                  oc_per_group :
+                                  std::min((oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max,
+                                           oc_per_group);
 
         // Same flat-pixel rule as the fp route; pointwise also needs the input
         // dense, since it reads A straight out of the row.
@@ -1409,16 +1418,28 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                     bool b_sme = false;
 #if defined(NNOPS_ARCH_SME)
                     if (use_sme) {
-                        const int64_t oc_lo_chunk =
-                            oc_chunk * pg.panels_oc / oc_chunks * nr_max;
-                        const int64_t starts_before =
-                            sme_start_prefix[static_cast<size_t>(oc_chunk)];
-                        const int64_t si_local = (ocn - oc_lo_chunk) / ocn_block;
-                        const int64_t slice =
-                            (g * sme_total_starts + starts_before + si_local) *
-                                sme_num_ic_blocks +
-                            icn / icn_block;
-                        b_panel = sme_b_shared.data() + slice * sme_region_bytes;
+                        if (sme_blob) {
+                            // The caller's blob: one whole-K region per (group,
+                            // ic block, 64-column block), read in place.
+                            const int64_t kd4 = align4(pg.kdim_max);
+                            (void)kd4;
+                            const int64_t slice =
+                                (g * sme_num_ic_blocks + icn / icn_block) *
+                                    pg.num_oc_blocks +
+                                ocn / aarch64::sme_nr_max;
+                            b_panel = w_ptr + slice * pg.sme_region;
+                        } else {
+                            const int64_t oc_lo_chunk =
+                                oc_chunk * pg.panels_oc / oc_chunks * nr_max;
+                            const int64_t starts_before =
+                                sme_start_prefix[static_cast<size_t>(oc_chunk)];
+                            const int64_t si_local = (ocn - oc_lo_chunk) / ocn_block;
+                            const int64_t slice =
+                                (g * sme_total_starts + starts_before + si_local) *
+                                    sme_num_ic_blocks +
+                                icn / icn_block;
+                            b_panel = sme_b_shared.data() + slice * sme_region_bytes;
+                        }
                         b_sme = true;
                     }
 #endif
@@ -2170,28 +2191,34 @@ ConvPackedWeight conv_packed_weight_sme(const Conv2DAttributes& attrs, int64_t i
                                         int64_t oc_per_group, DataType weight_dtype)
 {
     ConvPackedWeight g;
+    const bool q8 = weight_dtype == DataType::s8;
     if (ic_per_group <= 0 || oc_per_group <= 0 || attrs.groups <= 0 ||
-        (weight_dtype != DataType::f32 && weight_dtype != DataType::f16)) {
+        (!q8 && weight_dtype != DataType::f32 && weight_dtype != DataType::f16)) {
         return g;
     }
 
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
     const bool unit_1x1 = karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1;
-    // The float ZA kernel's n tile: 2 * 16 columns. A constant here so this
-    // geometry stays buildable without the SME headers.
-    constexpr int64_t kSmeBlockN = 32;
+    // The ZA n tile: 32 columns for the float 2x2 face pair, 64 for the int8
+    // SMOPA kernel's four 16-column groups. Constants here so this geometry
+    // stays buildable without the SME headers.
+    constexpr int64_t kSmeBlockN_f32 = 32;
+    constexpr int64_t kSmeBlockN_i8 = 64;
     g.sme = true;
-    g.nr = kSmeBlockN;
+    g.nr = q8 ? kSmeBlockN_i8 : kSmeBlockN_f32;
     // The ZA tiles cover 32x32, so a short ic block leaves the kernel's K loop
     // (kdim = icn * karea groups of four) too short to amortise the per-call
     // store and setup: 16 channels of a 3x3 is 144, and the tile ran at
     // 1050 GFLOPS against 1560 at 576.
     constexpr int64_t kSmeIcMin = 32;
+    // int8 keeps the panel ladder's block: its K loop is the same four-K group,
+    // and the SMOPA tile already reads its A through the ZA pack.
     g.icn_block =
         unit_1x1 ? ic_per_group :
-                   std::min<int64_t>(std::max<int64_t>(
-                                         impl::get_ic_block(karea, ic_per_group), kSmeIcMin),
-                                     ic_per_group);
+        std::min<int64_t>(q8 ? impl::get_ic_block(karea, ic_per_group) :
+                               std::max<int64_t>(
+                                   impl::get_ic_block(karea, ic_per_group), kSmeIcMin),
+                          ic_per_group);
     // The task N tile is a whole number of 32-column ZA blocks.
     const int64_t oc_tile = std::min<int64_t>(oc_per_group, impl::kOcnBlock);
     g.ocn_block = ((oc_tile + g.nr - 1) / g.nr) * g.nr;
@@ -2250,9 +2277,12 @@ TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs, const TensorDe
     // The ZA tiles only repay their blob when the oc block fills four 64-column
     // blocks; below that the NEON panels are the better packed form.
 #if defined(NNOPS_ARCH_SME)
-    const int64_t sme_oc_min = aarch64::sme_fp_nr;
-    const bool sme_blob = (weight.dtype == DataType::f32 || weight.dtype == DataType::f16) &&
-                          (OC / G) >= sme_oc_min && aarch64::available_sme();
+    // The ZA routes' own widths: the float 2x2 tile is 32 columns wide, the
+    // int8 SMOPA tile 64.
+    const bool sme_fp = (weight.dtype == DataType::f32 || weight.dtype == DataType::f16) &&
+                        (OC / G) >= aarch64::sme_fp_nr;
+    const bool sme_q8 = weight.dtype == DataType::s8 && (OC / G) >= aarch64::sme_nr_max;
+    const bool sme_blob = (sme_fp || sme_q8) && aarch64::available_sme();
 #else
     const bool sme_blob = false;
 #endif
@@ -2415,8 +2445,13 @@ void pack_weight_sme(const TensorView& weight, TensorView& packed, const ConvPac
                                    g.sme_region;
                 const T* const bsrc = w_group + ocn + icn * w_ic;
                 if (karea == 1) {
-                    tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out, bsrc,
-                                      static_cast<int>(w_ic));
+                    if constexpr (std::is_same_v<T, int8_t>) {
+                        tile_pack_rhs_i8_sme(false, static_cast<int>(np), kdim, out, bsrc,
+                                             static_cast<int>(w_ic));
+                    } else {
+                        tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out, bsrc,
+                                          static_cast<int>(w_ic));
+                    }
                 } else {
                     for (int t = 0; t < karea; ++t) {
                         for (int64_t i = 0; i < icnc; ++i) {
@@ -2426,8 +2461,13 @@ void pack_weight_sme(const TensorView& weight, TensorView& packed, const ConvPac
                                         static_cast<size_t>(np) * sizeof(T));
                         }
                     }
-                    tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out, stage.data(),
-                                      static_cast<int>(nr));
+                    if constexpr (std::is_same_v<T, int8_t>) {
+                        tile_pack_rhs_i8_sme(false, static_cast<int>(np), kdim, out,
+                                             stage.data(), static_cast<int>(nr));
+                    } else {
+                        tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out, stage.data(),
+                                          static_cast<int>(nr));
+                    }
                 }
             }
         }
@@ -2476,9 +2516,11 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs, const TensorView& we
         NNOPS_ASSERT(g.sme && packed.numel() >= g.total);
         if (dtype == DataType::f32) {
             pack_weight_sme<float>(weight, packed, g, ICG, OCG, G, ctx);
-        } else {
-            NNOPS_ASSERT(dtype == DataType::f16);
+        } else if (dtype == DataType::f16) {
             pack_weight_sme<half>(weight, packed, g, ICG, OCG, G, ctx);
+        } else {
+            NNOPS_ASSERT(dtype == DataType::s8);
+            pack_weight_sme<int8_t>(weight, packed, g, ICG, OCG, G, ctx);
         }
         return;
 #else

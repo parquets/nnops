@@ -1474,8 +1474,11 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
         TensorView oq[] = {q};
         op->prepackWeights(wq, oq);
         q = oq[0];
-        if (q.layout() != TensorLayout::PackedHWIO) {
-            return "a quantized HWIO filter did not query PackedHWIO";
+        // The ZA route takes a wide enough filter into its own blob; the rest
+        // keeps the NEON panels. Both are valid answers for this filter.
+        if (q.layout() != TensorLayout::PackedHWIO &&
+            q.layout() != TensorLayout::PackedHWIOSme) {
+            return "a quantized HWIO filter did not query a packed conv layout";
         }
         std::vector<int8_t> blob(q.storage_bytes());
         TensorView pv(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
