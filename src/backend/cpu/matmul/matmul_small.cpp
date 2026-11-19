@@ -109,7 +109,7 @@ void gemv_blocked_f16(int K, const half* a, int lda, const half* b_blk, half* c,
         }
         for (int p = 0; p < pairs; ++p) {
             const float16_t* row =
-                reinterpret_cast<const float16_t*>(b_blk + static_cast<int64_t>(p) * 128 + 2 * j0);
+                reinterpret_cast<const float16_t*>(b_blk + static_cast<int64_t>(p) * 64 + 2 * j0);
             float av0[M], av1[M];
             for (int m = 0; m < M; ++m) {
                 av0[m] = static_cast<float>(a[static_cast<int64_t>(m) * lda + 2 * p]);
@@ -179,9 +179,9 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
     // B's size picks the traversal, which decides how wide a slice is worth one
     // call (see arch::gemv_slice).
     const int span = arch::gemv_slice<T>(Mi, N, K);
-    // The SME blob: one [K][64] block per 64 output columns, blocks K*64 apart.
+    // The SME blob: one [K][32] block per 32 output columns, blocks K*32 apart.
     const bool blocked_b = b.layout() == TensorLayout::PackedBSme;
-    const int block_w = 64;
+    const int block_w = 32;
     const int blocks = blocked_b ? (Ni + block_w - 1) / block_w : (Ni + span - 1) / span;
 
     const T* a_base = a.ptr<T>();
@@ -275,9 +275,9 @@ void matmul_naive_small(const MatMulAttributes& attrs, TensorView& output,
 
     const T* a_base = a.ptr<T>();
     T* c_base = output.ptr<T>();
-    // The SME blob: one [K][64] block per 64 output columns, blocks K*64 apart.
+    // The SME blob: one [K][32] block per 32 output columns, blocks K*32 apart.
     const bool blocked_b = b.layout() == TensorLayout::PackedBSme;
-    const int block_w = 64;
+    const int block_w = 32;
     const T* b_base = b.ptr<T>();
 
     const BatchWalk batch(a, b);

@@ -67,7 +67,7 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/q4_1.hpp"         // q4_1_block, float_to_half, half_to_bits
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
-#include "backend/cpu/aarch64/mma_sme.hpp"      // cpu::aarch64::available_sme — the SME A/B gate
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"      // cpu::aarch64::available_sme — the SME A/B gate
 #include "detail/bench_knobs.hpp"               // disable_sme — the A/B pin
 #include "backend/cpu/simd_kernel/simd_quant.hpp"  // quant_kernel::quantization (the dq quantize pass)
 #include "common/bench_harness.hpp"
@@ -3029,6 +3029,19 @@ NNOPS_BENCH(matmul_sme_prepack_ab) {
     bench_sme_prepack<float>("f32", 1024, 512, 1024, 4, 12);  // layer shape
     bench_sme_prepack<half>("f16", 128, 4096, 4096, 4, 4);
     bench_sme_prepack<half>("f16", 1024, 1024, 1024, 4, 12);
+
+    // The shapes XNNPACK's FC benchmark publishes, for a like-for-like
+    // comparison (its weights are prepacked at setup too).
+    for (const auto& s : std::array<std::array<int64_t, 3>, 7>{
+             {{512, 512, 512}, {512, 1024, 512}, {256, 1024, 512}, {128, 1024, 512},
+              {64, 1024, 512}, {16, 1024, 512}, {128, 4096, 512}}}) {
+        // A few hundred ms per timing window: the small shapes need many
+        // iterations before the caches and the clock settle.
+        const int iters = static_cast<int>(std::clamp<int64_t>(
+            2000000000LL / (2 * s[0] * s[1] * s[2]), 20, 500));
+        bench_sme_prepack<float>("f32", s[0], s[1], s[2], 3, iters);
+        bench_sme_prepack<half>("f16", s[0], s[1], s[2], 3, iters);
+    }
 }
 
 NNOPS_BENCH(matmul_bias_ab) {

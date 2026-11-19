@@ -53,7 +53,7 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/core/quant_params.hpp"
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan — to pin the pack_a route
-#include "backend/cpu/aarch64/mma_sme.hpp"      // available_sme — the SME route's own gate
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"      // available_sme — the SME route's own gate
 #include "detail/bench_knobs.hpp"               // disable_sme — the SME / generic A/B pin
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"

@@ -126,7 +126,8 @@ inline int64_t gemm_set_elems(int64_t panels_per_oc, int64_t kdim, int64_t nr_ma
     return panels_per_oc * gemm_panel_slot(kdim, nr_max, esz, quant, bf16);
 }
 
-/// Geometry of the prepacked filter (PackedHWIO): the blob is
+/// Geometry of the prepacked filter (PackedHWIO, and the SME variant's own
+/// fields): the blob is
 /// [group][oc block][k block][panel][k][nr], panels of `nr` output channels.
 /// The two outer axes are the reader's own loop nest — the driver walks oc block
 /// → pixel pass → k block → panel ([conv2d_implicit_gemm.cpp], the
@@ -148,6 +149,14 @@ struct ConvPackedWeight {
     int64_t group_elems = 0;  ///< one group's panels
     int64_t sums_off = 0;     ///< element offset of the sums table
     int64_t total = 0;        ///< all groups' panels, then the sums table
+
+    // The SME variant (PackedHWIOSme): per (group, ic block, 64-column oc
+    // block) one whole-K ZA B block, `sme_region` elements each; `nr` is 64 and
+    // the NEON panel fields above are unused.
+    bool sme = false;
+    int64_t num_oc_blocks = 0; ///< ⌈oc_per_group / 64⌉
+    int64_t num_ic_blocks = 0; ///< ⌈ic_per_group / icn_block⌉
+    int64_t sme_region = 0;    ///< elements of one 64-column block at kdim_max
 
     // A quantized blob carries Σ_k weight[oc, k] per output channel — the
     // epilogue's R_b, which the raw path re-derives from the filter on every
@@ -184,6 +193,12 @@ struct ConvPackedWeight {
 /// panels it sizes and the panels prepackWeights builds cannot disagree.
 ConvPackedWeight conv_packed_weight(const Conv2DAttributes& attrs, int64_t ic_per_group,
                                              int64_t oc_per_group, DataType weight_dtype);
+
+/// The ZA-tile geometry of the same filter (PackedHWIOSme): nr 64, the same
+/// icn_block as the NEON blob, one whole-K block per 64 output channels and ic
+/// block. Only fp filters take it.
+ConvPackedWeight conv_packed_weight_sme(const Conv2DAttributes& attrs, int64_t ic_per_group,
+                                        int64_t oc_per_group, DataType weight_dtype);
 
 /// The blob @p weight prepacks into — the query half of the two-step prepack,
 /// what Conv2D::prepackWeights returns. Shape [OC, ⌈elems / OC⌉] with an

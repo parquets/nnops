@@ -32,7 +32,7 @@
 #include "nnops/detail/q4_1.hpp"
 #include "nnops/detail/half.hpp"
 #include "detail/bench_knobs.hpp" // disable_sme — pin the prepacked comparison
-#include "backend/cpu/aarch64/mma_sme.hpp" // available_sme — the blob layout fork
+#include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme — the blob layout fork
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"

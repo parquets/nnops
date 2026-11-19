@@ -32,6 +32,15 @@
 ///  * An fp activation is quantized into a compact plane once per call, never
 ///    inside the gather: the gather repeats once per oc block, and only the
 ///    materialized plane lets a 1x1 conv take the pointwise route.
+///  * On AArch64 SME a raw f32/f16/s8 filter with a wide oc block (four
+///    64-column ZA tiles) takes the MOPA kernels: B is packed once per call into
+///    the ZA layout, per (group, task oc start, ic block) — the task starts need
+///    not be 64-aligned — and each pixel tile's A is packed into [m/16][k][16].
+///    Below that width the per-tile A pack and the half-empty 64-column blocks
+///    lose to the NEON panels, so the route stays there. A caller's PackedHWIO
+///    blob is the NEON layout and stays there too; its SME form
+///    (PackedHWIOSme) is produced by prepackWeights for the same wide-OC fp
+///    filters, so the packed path needs no per-call B pack either.
 ///
 /// Plan heuristics, measured at one thread unless stated (this host, 6P+8E):
 ///
@@ -55,6 +64,9 @@
 
 #include "conv2d_implicit_gemm.h"
 #include "backend/cpu/matmul/matmul_helper.h"           // uniform pack/MMA + panel strides
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"              // available_sme + SME tile geometry
+#endif
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"    // epilogue / dequant epilogues
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"      // tiled im2col gathers
 #include "backend/cpu/simd_kernel/simd_int8_reduce.hpp" // int8_row_sum / int8_col_sum_slab
@@ -272,8 +284,17 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
     const int64_t in_row_stride = input.row_stride_elems();
 
     // HWIO: the output channel is the last axis; a prepacked blob leads with it.
+    const bool sme_blob = weight.layout() == TensorLayout::PackedHWIOSme;
     const bool prepacked = is_packed_conv_weight(weight.layout());
     const int64_t OC = prepacked ? weight.shape(0) : weight.shape(3);
+
+    // The ZA tiles read raw HWIO filters in their own layout, and their own
+    // prepacked form directly. A PackedHWIO blob is the NEON panels and has no
+    // reader here, so that case stays on the panel route.
+#if defined(NNOPS_ARCH_SME)
+    constexpr bool sme_dtype = std::is_same_v<T, float> || std::is_same_v<T, half>;
+    constexpr DataType sme_be_dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+#endif
 
     const int64_t OH = output.shape(2);
     const int64_t OW = output.shape(3);
@@ -282,6 +303,22 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
     const int64_t G = attrs.groups;
     const int64_t ic_per_group = IC / G;
     const int64_t oc_per_group = OC / G;
+
+#if defined(NNOPS_ARCH_SME)
+    // Only wide-OC blocks fill four 64-column ZA tiles; below that the per-tile
+    // A pack and the half-empty B blocks lose to the NEON panels. A caller's
+    // prepacked HWIO blob is the NEON layout and stays there too.
+    // 128 output channels fill four 32-column tiles: enough for a pointwise
+    // filter, whose A unpack is shared across every oc block. A k-tap filter
+    // repacks A per (oc block, k block), so it needs the wider 64-column gate
+    // — and a narrow row's partial last tile wastes the 32-row kernel.
+    const int64_t sme_oc_min = aarch64::sme_fp_nr;
+    const bool use_sme =
+        sme_dtype && (sme_blob || (!prepacked && aarch64::available_sme() &&
+                                   oc_per_group >= sme_oc_min));
+#else
+    constexpr bool use_sme = false;
+#endif
 
     const int KH = static_cast<int>(attrs.kernel_size[0]);
     const int KW = static_cast<int>(attrs.kernel_size[1]);
@@ -418,9 +455,14 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
 
     // ---- block geometry ----------------------------------------------------
     // Same function prepackWeights built the blob with; it must never disagree.
-    const ConvPackedWeight pg =
-        conv_packed_weight(attrs, ic_per_group, oc_per_group, weight.data_type());
-    NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block && pg.nr == nr_max);
+    const ConvPackedWeight pg = sme_blob ?
+                                    conv_packed_weight_sme(attrs, ic_per_group, oc_per_group,
+                                                           weight.data_type()) :
+                                    conv_packed_weight(attrs, ic_per_group, oc_per_group,
+                                                       weight.data_type());
+    if (!sme_blob) {
+        NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block && pg.nr == nr_max);
+    }
     const int64_t num_ic_blocks = pg.nfull_ic + (pg.tail_ic ? 1 : 0);
     const int64_t kdim_max = pg.kdim_max;
 
@@ -433,11 +475,13 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
     // The panels every task reads in place: the caller's blob, or this call's
     // prepack in the arena (null when the weight did not fit — each task then
     // packs its own into its slot).
-    const T* const panels = prepacked ? w_ptr : (shared ? shared_ptr : nullptr);
+    const T* const panels =
+        (!use_sme && (prepacked || shared)) ? (prepacked ? w_ptr : shared_ptr) : nullptr;
 
     // ---- the shared weight prepack (once per call) -------------------------
-    // The same entry prepackWeights uses, only the destination differs.
-    if (shared) {
+    // The same entry prepackWeights uses, only the destination differs. The SME
+    // route packs its own B layout per task, so the NEON prepack is skipped.
+    if (shared && !use_sme) {
         const int64_t cols = (plan.shared_elems + OC - 1) / OC;
         const int64_t shape[] = {OC, cols};
         TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(), shared_ptr,
@@ -461,6 +505,94 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
         std::memcpy(bias_pad.data(), b_ptr, static_cast<size_t>(OC) * sizeof(T));
     }
 
+#if defined(NNOPS_ARCH_SME)
+    // ---- the shared SME filter prepack (once per call) ----------------------
+    // One SME-layout copy per (group, task oc start, ic block), so the task
+    // grid reads it in place instead of re-packing its slice per oh chunk. The
+    // start list is the tasks' own oc tiling — `ocn_block` need not be a
+    // 64-column multiple, so a per-chunk layout could not be addressed. Blocks
+    // inside a region are `sme_slot_max` apart and the kernel is told that
+    // stride.
+    std::vector<int64_t> sme_start_prefix;
+    PoolArray<T> sme_b_shared;
+    PoolArray<T> sme_stage_shared;
+    int64_t sme_total_starts = 0;
+    int64_t sme_region_elems = 0;
+    int64_t sme_slot_max = 0;
+    int64_t sme_num_ic_blocks = 0;
+    if constexpr (sme_dtype) {
+        if (use_sme && !sme_blob) {
+            const int64_t nr = aarch64::sme_fp_nr;
+            sme_num_ic_blocks = (ic_per_group + icn_block - 1) / icn_block;
+            sme_start_prefix.assign(static_cast<size_t>(oc_chunks) + 1, 0);
+            for (int64_t c = 0; c < oc_chunks; ++c) {
+                const int64_t lo = c * pg.panels_oc / oc_chunks * nr_max;
+                const int64_t hi =
+                    std::min((c + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
+                const int64_t starts = (hi - lo + ocn_block - 1) / ocn_block;
+                sme_start_prefix[static_cast<size_t>(c) + 1] =
+                    sme_start_prefix[static_cast<size_t>(c)] + starts;
+            }
+            sme_total_starts = sme_start_prefix[static_cast<size_t>(oc_chunks)];
+            sme_slot_max = sme_b_panel_stride(sme_be_dt, kdim_max);
+            const int64_t max_blocks = (ocn_block + nr - 1) / nr;
+            sme_region_elems = max_blocks * sme_slot_max;
+            const int64_t slices = G * sme_total_starts * sme_num_ic_blocks;
+            sme_b_shared.reset(static_cast<size_t>(slices * sme_region_elems));
+            if (karea > 1) {
+                sme_stage_shared.reset(static_cast<size_t>(kdim_max * nr));
+            }
+            for (int64_t g = 0; g < G; ++g) {
+                const T* const w_group = w_ptr + g * oc_per_group;
+                for (int64_t c = 0; c < oc_chunks; ++c) {
+                    const int64_t oc_lo = c * pg.panels_oc / oc_chunks * nr_max;
+                    const int64_t oc_hi =
+                        std::min((c + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
+                    int64_t si = 0;
+                    for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block, ++si) {
+                        const int64_t ocnc = std::min(ocn_block, oc_hi - ocn);
+                        for (int64_t ib = 0; ib < sme_num_ic_blocks; ++ib) {
+                            const int64_t icn0 = ib * icn_block;
+                            const int64_t icnc = std::min(icn_block, ic_per_group - icn0);
+                            const int64_t kdim = icnc * karea;
+                            T* const dst =
+                                sme_b_shared.data() +
+                                ((g * sme_total_starts + sme_start_prefix[static_cast<size_t>(c)] +
+                                  si) *
+                                     sme_num_ic_blocks +
+                                 ib) *
+                                    sme_region_elems;
+                            for (int64_t p0 = 0; p0 < ocnc; p0 += nr) {
+                                const int64_t np = std::min(nr, ocnc - p0);
+                                const T* const bsrc =
+                                    w_group + ocn + p0 + icn0 * w_ic_stride;
+                                T* const out = dst + (p0 / nr) * sme_slot_max;
+                                if (karea == 1) {
+                                    tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out,
+                                                      bsrc, static_cast<int>(w_ic_stride));
+                                } else {
+                                    for (int t = 0; t < karea; ++t) {
+                                        for (int64_t i = 0; i < icnc; ++i) {
+                                            std::memcpy(
+                                                sme_stage_shared.data() +
+                                                    (static_cast<int64_t>(t) * icnc + i) * nr,
+                                                bsrc + t * w_tap_stride + i * w_ic_stride,
+                                                static_cast<size_t>(np) * sizeof(T));
+                                        }
+                                    }
+                                    tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out,
+                                                      sme_stage_shared.data(),
+                                                      static_cast<int>(nr));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     const auto run_task = [&](int64_t t) {
         const int64_t ng = t / chunks_per_ng;
         const int64_t rem = t % chunks_per_ng;
@@ -478,6 +610,19 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
         T* const stage = reinterpret_cast<T*>(slot_ptr + sc.off_stage);
         T* const pack_buf = reinterpret_cast<T*>(slot_ptr + sc.off_pack);
 
+        // The SME route's per-task A slab; B is the shared prepack above.
+#if defined(NNOPS_ARCH_SME)
+        PoolArray<T> sme_a;
+        if constexpr (sme_dtype) {
+            if (use_sme) {
+                constexpr int64_t kSmeARows = 2 * aarch64::sme_mr;
+                const int64_t a_blocks = (m_block + kSmeARows - 1) / kSmeARows;
+                sme_a.reset(static_cast<size_t>(
+                    a_blocks * sme_a_panel_stride(sme_be_dt, kdim_max)));
+            }
+        }
+#endif
+
         T* const out_g = out_ptr + n * ob_step + g * oc_per_group;
         const T* const in_g = in_ptr + n * ib_step + g * ic_per_group;
         const T* const w_g = w_ptr + g * oc_per_group;
@@ -489,9 +634,14 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
         // [p·nr, (p+1)·nr) of its k column, so a task starts where a panel does.
         const int64_t r0 = chunk * OH / oh_chunks;
         const int64_t r1 = (chunk + 1) * OH / oh_chunks;
-        const int64_t oc_lo = oc_chunk * pg.panels_oc / oc_chunks * nr_max;
+        // An SME blob keeps the whole group on the filter axis (its plan sets
+        // oc_chunks 1): starts and the 64-column blocks then agree.
+        const int64_t oc_lo =
+            sme_blob ? 0 : oc_chunk * pg.panels_oc / oc_chunks * nr_max;
         const int64_t oc_hi =
-            std::min((oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
+            sme_blob ? oc_per_group :
+                       std::min((oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max,
+                                oc_per_group);
 
         // Dense rows make a pixel tile one contiguous run, so it may cross a row
         // boundary — which keeps a narrow plane's tiles at the full M instead of
@@ -537,23 +687,61 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
 
                     const T* b_panel;
                     int b_ld = 0;
-                    if (panels) {
-                        // The blob's own walk: this oc block's k block, in place —
-                        // no pack, however many chunks the oc axis took.
-                        b_panel = panels + pg.offset(g, icn / icn_block, ocn);
-                    } else if (karea == 1) {
-                        // A 1x1 filter is [ic][oc] with oc contiguous — a panel's k
-                        // rows already, `w_ic_stride` apart — so read it in place and
-                        // let the stage take the partial last panel only.
-                        b_panel = w_g + ocn + icn * w_ic_stride;
-                        b_ld = static_cast<int>(w_ic_stride);
-                    } else {
-                        pack_block<T>(
-                            pack_buf,
-                            gemm_panel_slot(kdim, nr_max, esz, false, std::is_same_v<T, bfloat16>),
-                            stage, w_g + ocn + icn * w_ic_stride, w_ic_stride, w_tap_stride, ocnc,
-                            icnc, karea, nr_max, kdim);
-                        b_panel = pack_buf;
+                    bool b_sme = false;
+                    int64_t sme_stride = 0;
+#if defined(NNOPS_ARCH_SME)
+                    if constexpr (sme_dtype) {
+                        if (use_sme) {
+                            if (sme_blob) {
+                                // The prepacked blob's block for (group, ic
+                                // block, 64-column oc block); consecutive oc
+                                // blocks are one region apart.
+                                const int64_t slice =
+                                    (g * pg.num_ic_blocks + icn / icn_block) *
+                                    pg.num_oc_blocks + ocn / pg.nr;
+                                b_panel = w_ptr + slice * pg.sme_region;
+                                sme_stride = pg.sme_region;
+                            } else {
+                                // The shared prepack's slice for this task's
+                                // (group, oc start, ic block); its first block
+                                // is the task's own `ocn`.
+                                const int64_t oc_lo_chunk =
+                                    oc_chunk * pg.panels_oc / oc_chunks * nr_max;
+                                const int64_t starts_before =
+                                    sme_start_prefix[static_cast<size_t>(oc_chunk)];
+                                const int64_t si_local = (ocn - oc_lo_chunk) / ocn_block;
+                                const int64_t slice =
+                                    (g * sme_total_starts + starts_before + si_local) *
+                                        sme_num_ic_blocks +
+                                    icn / icn_block;
+                                b_panel = sme_b_shared.data() + slice * sme_region_elems;
+                                sme_stride = sme_slot_max;
+                            }
+                            b_sme = true;
+                        }
+                    }
+#endif
+                    if (!b_sme) {
+                        if (panels) {
+                            // The blob's own walk: this oc block's k block, in
+                            // place — no pack, however many chunks the oc axis took.
+                            b_panel = panels + pg.offset(g, icn / icn_block, ocn);
+                        } else if (karea == 1) {
+                            // A 1x1 filter is [ic][oc] with oc contiguous — a
+                            // panel's k rows already, `w_ic_stride` apart — so read
+                            // it in place and let the stage take the partial last
+                            // panel only.
+                            b_panel = w_g + ocn + icn * w_ic_stride;
+                            b_ld = static_cast<int>(w_ic_stride);
+                        } else {
+                            pack_block<T>(
+                                pack_buf,
+                                gemm_panel_slot(kdim, nr_max, esz, false,
+                                                std::is_same_v<T, bfloat16>),
+                                stage, w_g + ocn + icn * w_ic_stride, w_ic_stride, w_tap_stride,
+                                ocnc, icnc, karea, nr_max, kdim);
+                            b_panel = pack_buf;
+                        }
                     }
 
                     const bool clamp_here = is_last_icn && epi_folded;
@@ -611,11 +799,28 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
                         // would double the tile's traffic for one addend.
                         // A 1x1 filter reads in place; everything else arrives as
                         // panels, the blob's or this call's.
-                        tile_mma_direct(
-                            mc, static_cast<int>(ocnc), kdim, tile, static_cast<int>(OC), a, lda,
-                            b_panel, b_ld != 0 ? b_ld : -1, stage, c_lo, c_hi,
-                            /*zero_mode=*/icn == 0 && !attrs.add_to && !bias_seed, nullptr,
-                            (icn == 0 && bias_seed) ? bias_col + ocn : nullptr);
+                        bool mma_sme = false;
+#if defined(NNOPS_ARCH_SME)
+                        if constexpr (sme_dtype) {
+                            if (use_sme) {
+                                tile_pack_lhs_sme(false, mc, kdim, sme_a.data(), a, lda);
+                                tile_mma_pack_sme(
+                                    mc, static_cast<int>(ocnc), kdim, tile,
+                                    static_cast<int>(OC), sme_a.data(), b_panel, sme_stride,
+                                    c_lo, c_hi,
+                                    /*zero_mode=*/icn == 0 && !attrs.add_to && !bias_seed,
+                                    (icn == 0 && bias_seed) ? bias_col + ocn : nullptr);
+                                mma_sme = true;
+                            }
+                        }
+#endif
+                        if (!mma_sme) {
+                            tile_mma_direct(
+                                mc, static_cast<int>(ocnc), kdim, tile, static_cast<int>(OC), a,
+                                lda, b_panel, b_ld != 0 ? b_ld : -1, stage, c_lo, c_hi,
+                                /*zero_mode=*/icn == 0 && !attrs.add_to && !bias_seed, nullptr,
+                                (icn == 0 && bias_seed) ? bias_col + ocn : nullptr);
+                        }
 
                         if (is_last_icn && need_epi) {
                             epilogue_inplace<T>(mc, static_cast<int>(ocnc), tile,
@@ -782,6 +987,12 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
     const int64_t ic_per_group = IC / G;
     const int64_t oc_per_group = OC / G;
 
+    // The int8 SMOPA route is implemented but stays off: on MobileNetV2 its
+    // per-tile scalar A pack and 64-column blocks lose to the NEON panels at
+    // every width (about 2x on the 3x3 256/512 layers). The tiled MatMul route
+    // still serves the int8 GEMMs the transpose-conv path issues.
+    constexpr bool use_sme = false;
+
     const int KH = static_cast<int>(attrs.kernel_size[0]);
     const int KW = static_cast<int>(attrs.kernel_size[1]);
     const int SH = static_cast<int>(attrs.stride[0]);
@@ -872,12 +1083,14 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
     const bool shared = plan.shared_elems > 0;
     // The panels every task reads in place: the caller's blob, or this call's
     // own copy (null when the weight did not fit — each task packs its slot).
-    const int8_t* const panels = prepacked ? w_ptr : (shared ? shared_ptr : nullptr);
+    const int8_t* const panels =
+        (!use_sme && (prepacked || shared)) ? (prepacked ? w_ptr : shared_ptr) : nullptr;
 
     // ---- the shared weight prepack (once per call) -------------------------
     // Through the entry prepackWeights uses, so the addressing is one code path.
-    // It runs before the sums are read back below.
-    if (shared) {
+    // It runs before the sums are read back below. The SME route packs its own
+    // B layout per task, so this NEON copy is skipped there.
+    if (shared && !use_sme) {
         const int64_t cols = (plan.shared_elems + OC - 1) / OC;
         const int64_t shape[] = {OC, cols};
         TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(), shared_ptr, cols,
@@ -909,6 +1122,89 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
         }
     }
 
+#if defined(NNOPS_ARCH_SME)
+    // ---- the shared SME filter prepack (once per call) ----------------------
+    // Per (group, task oc start, ic block), the same layout the fp route uses.
+    // `ocn_block` need not be a 64-column multiple, so the region is cut at the
+    // tasks' own oc steps rather than at chunk boundaries.
+    std::vector<int64_t> sme_start_prefix;
+    PoolArray<int8_t> sme_b_shared;
+    PoolArray<int8_t> sme_stage_shared;
+    int64_t sme_total_starts = 0;
+    int64_t sme_region_bytes = 0;
+    int64_t sme_slot_max = 0;
+    int64_t sme_num_ic_blocks = 0;
+    if (use_sme) {
+        const int64_t nr = aarch64::sme_nr_max;
+        sme_num_ic_blocks = (ic_per_group + icn_block - 1) / icn_block;
+        sme_start_prefix.assign(static_cast<size_t>(oc_chunks) + 1, 0);
+        for (int64_t c = 0; c < oc_chunks; ++c) {
+            const int64_t lo = c * pg.panels_oc / oc_chunks * nr_max;
+            const int64_t hi =
+                std::min((c + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
+            const int64_t starts = (hi - lo + ocn_block - 1) / ocn_block;
+            sme_start_prefix[static_cast<size_t>(c) + 1] =
+                sme_start_prefix[static_cast<size_t>(c)] + starts;
+        }
+        sme_total_starts = sme_start_prefix[static_cast<size_t>(oc_chunks)];
+        sme_slot_max = sme_b_panel_stride(DataType::s8, kdim_max);
+        const int64_t max_blocks = (ocn_block + nr - 1) / nr;
+        sme_region_bytes = max_blocks * sme_slot_max;
+        const int64_t slices = G * sme_total_starts * sme_num_ic_blocks;
+        sme_b_shared.reset(static_cast<size_t>(slices * sme_region_bytes));
+        if (karea > 1) {
+            sme_stage_shared.reset(static_cast<size_t>(kdim_max * nr));
+        }
+        for (int64_t g = 0; g < G; ++g) {
+            const int8_t* const w_group = w_ptr + g * oc_per_group;
+            for (int64_t c = 0; c < oc_chunks; ++c) {
+                const int64_t oc_lo = c * pg.panels_oc / oc_chunks * nr_max;
+                const int64_t oc_hi =
+                    std::min((c + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
+                int64_t si = 0;
+                for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block, ++si) {
+                    const int64_t ocnc = std::min(ocn_block, oc_hi - ocn);
+                    for (int64_t ib = 0; ib < sme_num_ic_blocks; ++ib) {
+                        const int64_t icn0 = ib * icn_block;
+                        const int64_t icnc = std::min(icn_block, ic_per_group - icn0);
+                        const int64_t kdim = icnc * karea;
+                        int8_t* const dst =
+                            sme_b_shared.data() +
+                            ((g * sme_total_starts + sme_start_prefix[static_cast<size_t>(c)] +
+                              si) *
+                                 sme_num_ic_blocks +
+                             ib) *
+                                sme_region_bytes;
+                        for (int64_t p0 = 0; p0 < ocnc; p0 += nr) {
+                            const int64_t np = std::min(nr, ocnc - p0);
+                            const int8_t* const bsrc =
+                                w_group + ocn + p0 + icn0 * w_ic_stride;
+                            int8_t* const out = dst + (p0 / nr) * sme_slot_max;
+                            if (karea == 1) {
+                                tile_pack_rhs_i8_sme(false, static_cast<int>(np), kdim, out,
+                                                     bsrc, static_cast<int>(w_ic_stride));
+                            } else {
+                                for (int t = 0; t < karea; ++t) {
+                                    for (int64_t i = 0; i < icnc; ++i) {
+                                        std::memcpy(
+                                            sme_stage_shared.data() +
+                                                (static_cast<int64_t>(t) * icnc + i) * nr,
+                                            bsrc + t * w_tap_stride + i * w_ic_stride,
+                                            static_cast<size_t>(np));
+                                    }
+                                }
+                                tile_pack_rhs_i8_sme(false, static_cast<int>(np), kdim, out,
+                                                     sme_stage_shared.data(),
+                                                     static_cast<int>(nr));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     const int64_t NG = N * G;
     const int64_t chunks_per_ng = oh_chunks * oc_chunks;
     const int64_t total = NG * chunks_per_ng;
@@ -932,6 +1228,17 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
         int8_t* const pack_buf = reinterpret_cast<int8_t*>(slot_ptr + sc.off_pack);
         int32_t* const acc_buf = reinterpret_cast<int32_t*>(
             base + sc.off_acc + slot * plan.acc_size * static_cast<int64_t>(sizeof(int32_t)));
+
+        // The SME route's per-task A slab; B is the shared prepack.
+#if defined(NNOPS_ARCH_SME)
+        PoolArray<int8_t> sme_a;
+        if (use_sme) {
+            const int64_t kd4 = align4(kdim_max);
+            const int64_t a_blocks = (m_block + aarch64::sme_mr - 1) / aarch64::sme_mr;
+            sme_a.reset(static_cast<size_t>(
+                a_blocks * sme_a_panel_stride(DataType::s8, kd4)));
+        }
+#endif
 
         TOut* const out_g = out_ptr + n * ob_step + g * oc_per_group;
         const uint8_t* const in_g = in_base + n * ib_step + g * ic_per_group;
@@ -984,13 +1291,32 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                     const bool direct_a = plan.pointwise && (kdim == kdim4);
 
                     const int8_t* b_panel;
-                    if (panels) {
-                        b_panel = panels + pg.offset(g, icn / icn_block, ocn);
-                    } else {
-                        pack_block_i8(pack_buf, gemm_panel_slot(kdim, nr_max, 1, true), stage,
-                                      w_g + ocn + icn * w_ic_stride, w_ic_stride, w_tap_stride,
-                                      ocnc, icnc, karea, nr_max, kdim, a_biased);
-                        b_panel = pack_buf;
+                    bool b_sme = false;
+#if defined(NNOPS_ARCH_SME)
+                    if (use_sme) {
+                        const int64_t oc_lo_chunk =
+                            oc_chunk * pg.panels_oc / oc_chunks * nr_max;
+                        const int64_t starts_before =
+                            sme_start_prefix[static_cast<size_t>(oc_chunk)];
+                        const int64_t si_local = (ocn - oc_lo_chunk) / ocn_block;
+                        const int64_t slice =
+                            (g * sme_total_starts + starts_before + si_local) *
+                                sme_num_ic_blocks +
+                            icn / icn_block;
+                        b_panel = sme_b_shared.data() + slice * sme_region_bytes;
+                        b_sme = true;
+                    }
+#endif
+                    if (!b_sme) {
+                        if (panels) {
+                            b_panel = panels + pg.offset(g, icn / icn_block, ocn);
+                        } else {
+                            pack_block_i8(pack_buf, gemm_panel_slot(kdim, nr_max, 1, true),
+                                          stage, w_g + ocn + icn * w_ic_stride, w_ic_stride,
+                                          w_tap_stride, ocnc, icnc, karea, nr_max, kdim,
+                                          a_biased);
+                            b_panel = pack_buf;
+                        }
                     }
 
                     // `mc` lives outside the loop: it is the step, and the body's
@@ -1030,13 +1356,28 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                             // The first K block stores instead of accumulating, so the
                             // tile needs no zero fill — a whole-tile write that only
                             // existed to be read back is skipped.
-                            const int64_t ldd_a = geom_ldd_i8_a(kdim4);
-                            tile_pack_lhs_i8(false, mc, kdim4, a_pack, static_cast<int>(ldd_a), a,
-                                             lda, a_biased);
-                            tile_mma_pack_i8(mc, static_cast<int>(ocnc), kdim4, acc_tile,
-                                             static_cast<int>(ocn_block), a_pack, b_panel,
-                                             /*ldb=*/0, INT32_MIN, INT32_MAX,
-                                             /*zero_mode=*/icn == 0);
+                            bool mma_sme = false;
+#if defined(NNOPS_ARCH_SME)
+                            if (use_sme) {
+                                tile_pack_lhs_i8_sme(false, mc, kdim4, sme_a.data(), a, lda,
+                                                     a_biased);
+                                tile_mma_pack_i8_sme(
+                                    mc, static_cast<int>(ocnc), kdim4, acc_tile,
+                                    static_cast<int>(ocn_block), sme_a.data(), b_panel,
+                                    /*block_stride=*/sme_slot_max, INT32_MIN, INT32_MAX,
+                                    /*zero_mode=*/icn == 0);
+                                mma_sme = true;
+                            }
+#endif
+                            if (!mma_sme) {
+                                const int64_t ldd_a = geom_ldd_i8_a(kdim4);
+                                tile_pack_lhs_i8(false, mc, kdim4, a_pack,
+                                                 static_cast<int>(ldd_a), a, lda, a_biased);
+                                tile_mma_pack_i8(mc, static_cast<int>(ocnc), kdim4, acc_tile,
+                                                 static_cast<int>(ocn_block), a_pack, b_panel,
+                                                 /*ldb=*/0, INT32_MIN, INT32_MAX,
+                                                 /*zero_mode=*/icn == 0);
+                            }
 
                             if (!is_last_icn) {
                                 continue;
@@ -1226,7 +1567,8 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     // The weight is TensorFlow's [KH, KW, IC/G, OC]; anything else
     // is not this route's — except the prepacked blob, whose shape leads with OC
     // (see conv_packed_weight_desc).
-    const bool prepacked = wt.layout == TensorLayout::PackedHWIO;
+    const bool sme_blob = wt.layout == TensorLayout::PackedHWIOSme;
+    const bool prepacked = is_packed_conv_weight(wt.layout);
     if (!is_channel_last_weight(wt.layout) && !prepacked) {
         return plan;
     }
@@ -1248,12 +1590,24 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     // The block sizes are the prepacked filter's geometry: conv_packed_weight
     // resolves them from the attributes and the filter's dims alone, and a plan
     // choosing again would size panels the blob does not hold.
-    const ConvPackedWeight pg =
-        conv_packed_weight(attrs, ic_per_group, oc_per_group, wt.dtype);
+    const ConvPackedWeight pg = sme_blob ?
+                                    conv_packed_weight_sme(attrs, ic_per_group, oc_per_group,
+                                                           wt.dtype) :
+                                    conv_packed_weight(attrs, ic_per_group, oc_per_group, wt.dtype);
     plan.icn_block = pg.icn_block;
     plan.ocn_block = pg.ocn_block;
     const int64_t nr_for_split = pg.nr;
+#if defined(NNOPS_ARCH_SME)
+    // The SME route's tile is two 16-row ZA faces: 32 pixels. A 24-row kMBlock
+    // would leave a quarter of every tile's rows dead and take the masked
+    // fallback instead of the pair load.
+    const bool sme_route = !quant &&
+                           (sme_blob || (!prepacked && aarch64::available_sme() &&
+                                         oc_per_group >= aarch64::sme_fp_nr));
+    plan.m_block = sme_route ? 2 * aarch64::sme_mr : kMBlock;
+#else
     plan.m_block = kMBlock;
+#endif
     plan.oh_chunks = 1;
     plan.oc_chunks = 1;
 
@@ -1273,7 +1627,9 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     plan.oh_chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1,
                                          std::min(std::max<int64_t>(OH, 1), max_row_chunks));
     const int64_t plane_tasks = NG * plan.oh_chunks;
-    if (2 * plane_tasks < nt) {
+    // An SME blob's OC blocks are 64-aligned; its tasks keep one whole group on
+    // the filter axis rather than starting mid-block.
+    if (!sme_blob && 2 * plane_tasks < nt) {
         // The filter split divides N, so its granularity is a panel (`nr`): two
         // panels per chunk is the smallest split that fills a micro-kernel tile.
         // Splitting 96 oc seven ways leaves 14 live lanes of a 16-wide panel.
@@ -1688,6 +2044,41 @@ ConvPackedWeight conv_packed_weight(const Conv2DAttributes& attrs, int64_t ic_pe
     return g;
 }
 
+ConvPackedWeight conv_packed_weight_sme(const Conv2DAttributes& attrs, int64_t ic_per_group,
+                                        int64_t oc_per_group, DataType weight_dtype)
+{
+    ConvPackedWeight g;
+    if (ic_per_group <= 0 || oc_per_group <= 0 || attrs.groups <= 0 ||
+        (weight_dtype != DataType::f32 && weight_dtype != DataType::f16)) {
+        return g;
+    }
+
+    const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
+    const bool unit_1x1 = karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1;
+    // The float ZA kernel's n tile: 2 * 16 columns. A constant here so this
+    // geometry stays buildable without the SME headers.
+    constexpr int64_t kSmeBlockN = 32;
+    g.sme = true;
+    g.nr = kSmeBlockN;
+    g.icn_block =
+        unit_1x1 ? ic_per_group :
+                   std::min<int64_t>(impl::get_ic_block(karea, ic_per_group),
+                                     ic_per_group);
+    // The task N tile is a whole number of 32-column ZA blocks.
+    const int64_t oc_tile = std::min<int64_t>(oc_per_group, impl::kOcnBlock);
+    g.ocn_block = ((oc_tile + g.nr - 1) / g.nr) * g.nr;
+    g.kdim_max = g.icn_block * karea;
+    g.nfull_ic = ic_per_group / g.icn_block;
+    g.tail_ic = ic_per_group - g.nfull_ic * g.icn_block;
+    g.num_ic_blocks = g.nfull_ic + (g.tail_ic ? 1 : 0);
+    g.num_oc_blocks = (oc_per_group + g.nr - 1) / g.nr;
+    g.sme_region = sme_b_panel_stride(weight_dtype, g.kdim_max);
+    g.slot_full = g.sme_region;
+    g.panels_oc = g.num_oc_blocks;
+    g.total = attrs.groups * g.num_ic_blocks * g.num_oc_blocks * g.sme_region;
+    return g;
+}
+
 
 namespace {
 
@@ -1728,8 +2119,21 @@ TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs, const TensorDe
         return TensorDesc{};
     }
 
-    const ConvPackedWeight g = conv_packed_weight(attrs, ICG, OC / G, weight.dtype);
-    return packed_weight_desc(OC / G, G, g.total, weight.dtype, TensorLayout::PackedHWIO);
+    // The ZA tiles only repay their blob when the oc block fills four 64-column
+    // blocks; below that the NEON panels are the better packed form.
+#if defined(NNOPS_ARCH_SME)
+    const int64_t sme_oc_min = aarch64::sme_fp_nr;
+    const bool sme_blob = (weight.dtype == DataType::f32 || weight.dtype == DataType::f16) &&
+                          (OC / G) >= sme_oc_min && aarch64::available_sme();
+#else
+    const bool sme_blob = false;
+#endif
+    const ConvPackedWeight g = sme_blob ?
+                                   conv_packed_weight_sme(attrs, ICG, OC / G, weight.dtype) :
+                                   conv_packed_weight(attrs, ICG, OC / G, weight.dtype);
+    return packed_weight_desc(OC / G, G, g.total, weight.dtype,
+                              sme_blob ? TensorLayout::PackedHWIOSme :
+                                         TensorLayout::PackedHWIO);
 }
 
 namespace {
@@ -1850,6 +2254,59 @@ void pack_weight_i8(const TensorView& weight, TensorView& packed,
     });
 }
 
+#if defined(NNOPS_ARCH_SME)
+/// The ZA blob (PackedHWIOSme): one whole-K 64-column block per (group, ic
+/// block, oc block), so compute() reads it with no per-call pack. The block
+/// stride is the kdim_max slot; the last k block packs shorter but stays in it.
+template <class T>
+void pack_weight_sme(const TensorView& weight, TensorView& packed, const ConvPackedWeight& g,
+                     int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
+                     const ComputeContext& ctx)
+{
+    (void)ctx;
+    const int64_t karea = g.kdim_max / g.icn_block;
+    const int64_t OC = weight.shape(3);
+    const int64_t w_ic = OC;
+    const int64_t w_tap = ic_per_group * w_ic;
+    const T* const w = weight.ptr<T>();
+    T* const blob = packed.ptr<T>();
+    const int64_t nr = g.nr;
+    PoolArray<T> stage(karea > 1 ? static_cast<size_t>(g.kdim_max * nr) : 0);
+
+    for (int64_t gg = 0; gg < groups; ++gg) {
+        const T* const w_group = w + gg * oc_per_group;
+        for (int64_t ib = 0; ib < g.num_ic_blocks; ++ib) {
+            const int64_t icn = ib * g.icn_block;
+            const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
+            const int64_t kdim = icnc * karea;
+            for (int64_t ob = 0; ob < g.num_oc_blocks; ++ob) {
+                const int64_t ocn = ob * nr;
+                const int64_t np = std::min(nr, oc_per_group - ocn);
+                T* const out = blob +
+                               ((gg * g.num_ic_blocks + ib) * g.num_oc_blocks + ob) *
+                                   g.sme_region;
+                const T* const bsrc = w_group + ocn + icn * w_ic;
+                if (karea == 1) {
+                    tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out, bsrc,
+                                      static_cast<int>(w_ic));
+                } else {
+                    for (int t = 0; t < karea; ++t) {
+                        for (int64_t i = 0; i < icnc; ++i) {
+                            std::memcpy(stage.data() +
+                                            (static_cast<int64_t>(t) * icnc + i) * nr,
+                                        bsrc + t * w_tap + i * w_ic,
+                                        static_cast<size_t>(np) * sizeof(T));
+                        }
+                    }
+                    tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out, stage.data(),
+                                      static_cast<int>(nr));
+                }
+            }
+        }
+    }
+}
+#endif
+
 /// Σ_k weight[oc, k] per output channel over a group's whole K — the table the
 /// int8 epilogue compensates with. Written from the *raw* HWIO filter.
 void write_weight_sums(const int8_t* w, int64_t OC, int64_t ic_per_group, int64_t karea,
@@ -1884,6 +2341,23 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs, const TensorView& we
     const int64_t OCG = OC / G;
     const DataType dtype = weight.data_type();
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
+
+    if (packed.layout() == TensorLayout::PackedHWIOSme) {
+#if defined(NNOPS_ARCH_SME)
+        const ConvPackedWeight g = conv_packed_weight_sme(attrs, ICG, OCG, dtype);
+        NNOPS_ASSERT(g.sme && packed.numel() >= g.total);
+        if (dtype == DataType::f32) {
+            pack_weight_sme<float>(weight, packed, g, ICG, OCG, G, ctx);
+        } else {
+            NNOPS_ASSERT(dtype == DataType::f16);
+            pack_weight_sme<half>(weight, packed, g, ICG, OCG, G, ctx);
+        }
+        return;
+#else
+        NNOPS_ASSERT(!"conv_packed_weight_pack: SME blob on a non-SME build");
+        return;
+#endif
+    }
 
     // No zero-fill here: the panel packers mask-load a short panel and zero-fill
     // the lanes past its width, so every byte a consumer reads is written.

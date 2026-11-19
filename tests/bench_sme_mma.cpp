@@ -13,10 +13,15 @@
 
 #if defined(NNOPS_ARCH_SME)
 
-#include "backend/cpu/aarch64/mma_i8_sme.hpp"
-#include "backend/cpu/aarch64/mma_sme.hpp"
-#include "backend/cpu/aarch64/pack_i8_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_f16_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_f32_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_i8_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_f16_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_f32_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_i8_sme.hpp"
 #include "detail/bench_knobs.hpp"
+#include "nnops/detail/half.hpp"
 #include "nnops/ops/matmul.hpp"
 
 #include <algorithm>
@@ -24,11 +29,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 namespace {
 
 using namespace nnops;
+using nnops::backend::cpu::half;
 using namespace nnops::backend::cpu::aarch64;
 
 /// Deterministic fill; the values only need to be varied, not meaningful.
@@ -99,6 +106,70 @@ void bench_sme_i8(const char* tag, int M, int N, int K, int rounds = 5, int iter
                     r, kern.back(), packed.back(), kern.back() / packed.back());
     }
     std::printf("    median:   kernel=%7.1f  pack+kernel=%7.1f  GOPS   kernel/packed=%.2f\n",
+                median(kern), median(packed), median(kern) / median(packed));
+}
+
+/// f32/f16 kernel-only: packed operands, one k-block, 2*M*N*K. The route-level
+/// number (bench_matmul matmul_sme_ab) adds the per-call packs and the plan.
+template <typename T>
+void bench_sme_fp(const char* tag, int M, int N, int K, int rounds = 5, int iters = 100)
+{
+    if (!available_sme()) {
+        std::printf("  SME %s skipped: no SME kernels on this build or CPU\n", tag);
+        return;
+    }
+    std::vector<T> a(static_cast<size_t>(M) * K);
+    std::vector<T> b(static_cast<size_t>(K) * N);
+    uint32_t st = 0x5EED5EEDu;
+    for (auto& x : a) {
+        st = st * 1664525u + 1013904223u;
+        x = static_cast<T>((static_cast<float>(st >> 8) / 16777216.0f - 0.5f) * 2.0f);
+    }
+    for (auto& x : b) {
+        st = st * 1664525u + 1013904223u;
+        x = static_cast<T>((static_cast<float>(st >> 8) / 16777216.0f - 0.5f) * 2.0f);
+    }
+    const size_t pa_n = static_cast<size_t>(std::is_same_v<T, float> ?
+                                                packed_a_elems_f32_sme(M, K) :
+                                                packed_a_elems_f16_sme(M, K));
+    const size_t pb_n = static_cast<size_t>(std::is_same_v<T, float> ?
+                                                packed_b_elems_f32_sme(N, K) :
+                                                packed_b_elems_f16_sme(N, K));
+    std::vector<T> pa(pa_n), pb(pb_n);
+    std::vector<T> c(static_cast<size_t>(M) * N);
+    const int64_t ops = 2 * static_cast<int64_t>(M) * N * K;
+    auto kernel = [&] {
+        if constexpr (std::is_same_v<T, float>) {
+            mma_f32_sme(M, N, K, c.data(), N, pa.data(), pb.data(), false, -1e30f, 1e30f,
+                        nullptr, 0);
+        } else {
+            mma_f16_sme(M, N, K, c.data(), N, pa.data(), pb.data(), false, -1e30f, 1e30f,
+                        nullptr, 0);
+        }
+    };
+    auto pack_and_kernel = [&] {
+        if constexpr (std::is_same_v<T, float>) {
+            pack_a_f32_sme(M, K, pa.data(), a.data(), K, false);
+            pack_b_f32_sme(N, K, pb.data(), b.data(), N, false);
+        } else {
+            pack_a_f16_sme(M, K, pa.data(), a.data(), K, false);
+            pack_b_f16_sme(N, K, pb.data(), b.data(), N, false);
+        }
+        kernel();
+    };
+    for (int i = 0; i < 5; ++i) { pack_and_kernel(); }
+    for (int i = 0; i < 20; ++i) { kernel(); }
+
+    std::printf("  SME %s  %dx%dx%d  1T  rounds=%d iters=%d  (2*M*N*K)\n", tag, M, N, K,
+                rounds, iters);
+    std::vector<double> kern, packed;
+    for (int r = 0; r < rounds; ++r) {
+        kern.push_back(time_gops(ops, iters, kernel));
+        packed.push_back(time_gops(ops, iters, pack_and_kernel));
+        std::printf("    round %d:  kernel=%8.1f  pack+kernel=%8.1f  GOPS   k/p=%.2f\n", r,
+                    kern.back(), packed.back(), kern.back() / packed.back());
+    }
+    std::printf("    median:   kernel=%8.1f  pack+kernel=%8.1f  GOPS   k/p=%.2f\n",
                 median(kern), median(packed), median(kern) / median(packed));
 }
 
@@ -210,6 +281,13 @@ NNOPS_BENCH(sme_i8_kernel) {
     bench_sme_i8("kc1024", 384, 768, 1024);
     bench_sme_i8("kc2048", 384, 768, 2048);
     bench_sme_i8("square", 1024, 1024, 1024);
+}
+
+NNOPS_BENCH(sme_fp_kernel) {
+    bench_sme_fp<float>("f32 512", 512, 512, 512);
+    bench_sme_fp<float>("f32 1024", 1024, 1024, 1024);
+    bench_sme_fp<half>("f16 512", 512, 512, 512);
+    bench_sme_fp<half>("f16 1024", 1024, 1024, 1024);
 }
 
 NNOPS_BENCH(sme_i8_route) {

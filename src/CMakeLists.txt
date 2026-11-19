@@ -94,8 +94,6 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/matmul/matmul_helper.cpp
     backend/cpu/matmul/matmul_small.cpp
     backend/cpu/matmul/matmul_qblock_fused.cpp
-    backend/cpu/matmul/matmul_sme.cpp
-    backend/cpu/matmul/matmul_sme_i8.cpp
 
     # Linear is the MatMul GEMM with a transposed weight, a per-column bias and
     # an fp output for quantized operands; it drives matmul.cpp above. MoE is

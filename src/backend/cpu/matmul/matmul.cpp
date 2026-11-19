@@ -38,6 +38,9 @@
 #include "backend/cpu/simd_kernel/simd_int8_reduce.hpp"
 #include "backend/cpu/simd_kernel/simd_quant.hpp"
 #include "backend/cpu/common/memory_pool.hpp" // internal scratch-memory pool
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme — the ZA route gate
+#endif
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"
 
@@ -385,6 +388,111 @@ template <class TOut, class AIn = int8_t> struct DqRoute : I8Route {
     }
 };
 
+#if defined(NNOPS_ARCH_SME)
+// =========================================================================
+//  SME route variants — the same skeleton, the ZA tiles' pack layouts
+// =========================================================================
+//
+// Everything but the packs, the MMA and the B blob's walk comes from FpRoute /
+// I8Route: the batch walk, beta and bias, the fp epilogue, and the int8
+// zero-point compensation / requantize are all the planned route's. A is always
+// packed, so there is no direct-A arm.
+
+/// One float ZA B block: 32 columns (the 2x2 tile). The prepacked blob is
+/// walked in these units.
+constexpr int kSmeFpPanelN = 32;
+/// The int8 SMOPA kernel's block: 64 columns.
+constexpr int kSmeI8PanelN = 64;
+
+template <class T> struct SmeFpRoute : FpRoute<T> {
+    using B = typename FpRoute<T>::B;
+
+    static constexpr bool has_direct_a = false;
+
+    static int ldd_b(int kc)
+    {
+        return static_cast<int>(sme_b_panel_stride(
+            std::is_same_v<T, float> ? DataType::f32 : DataType::f16, kc));
+    }
+    static int ldd_a(int kc)
+    {
+        return static_cast<int>(sme_a_panel_stride(
+            std::is_same_v<T, float> ? DataType::f32 : DataType::f16, kc));
+    }
+
+    static constexpr int b_panel_w() { return kSmeFpPanelN; }
+    static constexpr int64_t ldb_packed = 0;
+
+    static std::pair<const T*, int64_t> prepacked_addr(const PackedBView& pb, int64_t panel0,
+                                                       int k)
+    {
+        const DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        return {static_cast<const T*>(pb.base) + panel0 * pb.ldd + sme_b_k_offset(dt, k),
+                pb.ldd};
+    }
+
+    static void pack_a(bool trans, int mc, int kc, T* dst, int /*ldd*/, const T* src, int lds,
+                       bool /*a_biased*/, const NoEpilogueParams* /*ip*/, int /*m*/)
+    {
+        tile_pack_lhs_sme(trans, mc, kc, dst, src, lds);
+    }
+
+    static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc, int n_start,
+                       int nc, T* dst, int /*ldd*/, bool /*a_biased*/)
+    {
+        NNOPS_ASSERT(!b.blocked());
+        const T* base = static_cast<const T*>(b.ptr);
+        const T* src = attrs.transpose_b ? base + n_start * b.ldb + k
+                                         : base + k * b.ldb + n_start;
+        tile_pack_rhs_sme(attrs.transpose_b, nc, kc, dst, src, b.ldb);
+    }
+
+    static void mma_pack(int mc, int nc, int kc, T* c, int ldc, const T* pa, const T* pb,
+                         float lo, float hi, bool zero_mode, int64_t ldb = 0,
+                         const T* col_bias = nullptr)
+    {
+        tile_mma_pack_sme(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi, zero_mode, col_bias);
+    }
+};
+
+struct SmeI8Route : I8Route {
+    static int ldd_b(int kc) { return static_cast<int>(sme_b_panel_stride(DataType::s8, kc)); }
+    static int ldd_a(int kc) { return static_cast<int>(sme_a_panel_stride(DataType::s8, kc)); }
+
+    static constexpr int b_panel_w() { return kSmeI8PanelN; }
+    static constexpr int64_t ldb_packed = 0;
+
+    static std::pair<const int8_t*, int64_t> prepacked_addr(const PackedBView& pb,
+                                                            int64_t panel0, int k)
+    {
+        return {static_cast<const int8_t*>(pb.base) + panel0 * pb.ldd +
+                    sme_b_k_offset(DataType::s8, k),
+                pb.ldd};
+    }
+
+    static void pack_a(bool trans, int mc, int kc, Elem* dst, int /*ldd*/, const AElem* src,
+                       int lds, bool a_biased, const EpilogueParams* /*ip*/, int /*m*/)
+    {
+        tile_pack_lhs_i8_sme(trans, mc, kc, dst, src, lds, a_biased);
+    }
+
+    static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc, int n_start,
+                       int nc, Elem* dst, int /*ldd*/, bool /*a_biased*/)
+    {
+        const Elem* src = attrs.transpose_b ? b.ptr + n_start * b.ldb + k
+                                            : b.ptr + k * b.ldb + n_start;
+        tile_pack_rhs_i8_sme(attrs.transpose_b, nc, kc, dst, src, b.ldb);
+    }
+
+    static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc, const Elem* pa, const Elem* pb,
+                         Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = 0,
+                         const Elem* /*col_bias*/ = nullptr)
+    {
+        tile_mma_pack_i8_sme(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi, zero_mode);
+    }
+};
+#endif  // NNOPS_ARCH_SME
+
 // =========================================================================
 //  Tile-block kernels
 // =========================================================================
@@ -679,7 +787,10 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs, TensorView& output,
 
     PackedBView prepacked;
     if (is_packed_matmul_b(b.layout())) {
-        const MatMulPackedB bg = matmul_packed_b_geom(N, K, b.data_type());
+        // The SME blob is a different walk: 64-column blocks over the whole K.
+        const MatMulPackedB bg = b.layout() == TensorLayout::PackedBSme ?
+                                     matmul_packed_b_sme_geom(N, K, b.data_type()) :
+                                     matmul_packed_b_geom(N, K, b.data_type());
         prepacked = {b.ptr<void>(), bg.ldd, bg.np, bg.seg};
     }
 
@@ -1237,14 +1348,37 @@ Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
     const auto& a = inputs[0];
     const auto& b = inputs[1];
     const DataType dt_a = a.data_type();
-    if (b.layout() == TensorLayout::PackedBSme) {
-        // The SME integer route owns integral destinations, and every shape when
-        // B is prepacked. The fp-output routes read the segmented panel blob, so
-        // an fp destination decodes the SME blob once — the combination only
-        // arises when a weight prepacked for an integral output is dequantized.
-        if (matmul_sme_i8(attrs, output, inputs, ctx)) {
-            return Status::ok;
+#if defined(NNOPS_ARCH_SME)
+    // The integer pair on the ZA tiles, integral destinations only. A raw B
+    // keeps the small-shape gate; a prepacked blob has no other reader. The
+    // fp-output and fp-A cases stay on the planned engine below, with an SME
+    // blob decoded first.
+    const DataType odt = output.data_type();
+    const bool sme_blob = b.layout() == TensorLayout::PackedBSme;
+    if ((dt_a == DataType::s8 || dt_a == DataType::u8) && b.data_type() == DataType::s8 &&
+        (odt == DataType::s32 || odt == DataType::s8 || odt == DataType::u8) &&
+        !attrs.residual_pre_activation && aarch64::available_sme() &&
+        (!is_packed_matmul_b(b.layout()) || sme_blob)) {
+        const auto [M, N, K] = matmul_dims(attrs, a, b);
+        // A raw B needs four full 64-column ZA blocks and enough K to repay the
+        // per-call packing; a prepacked blob already holds B, so the shape gate
+        // does not apply. The small-K transpose-conv GEMMs measured ~20-35%
+        // behind the planned route at K < 256 (and N < 256 for the same reason).
+        const bool wide =
+            sme_blob || (M > 4 && N >= 4 * aarch64::sme_nr_max && K >= 256);
+        if (wide && K > 0) {
+            const MatMulPlan plan =
+                get_matmul_plan_sme(attrs, a.desc(), b.desc(), ctx.cpu.worker_count(),
+                                    ctx.cpu.thread_slot_count() > 0);
+            if (plan.mc > 0) {
+                return run_route<SmeI8Route>(attrs, output, inputs, ctx, plan);
+            }
         }
+    }
+#endif
+    if (b.layout() == TensorLayout::PackedBSme) {
+        // An fp destination decodes the SME blob once — the combination only
+        // arises when a weight prepacked for an integral output is dequantized.
         const int64_t N = b.shape(0);
         const int64_t K = matmul_dims(attrs, a, b).K;
         PoolArray<int8_t> dense_buf(static_cast<size_t>(K) * static_cast<size_t>(N));
@@ -1265,9 +1399,6 @@ Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
     if (dt_a == DataType::f32 || dt_a == DataType::f16) {
         return matmul_dq_from_fp(attrs, output, inputs, ctx);
     }
-    if (matmul_sme_i8(attrs, output, inputs, ctx)) {
-        return Status::ok;
-    }
     // Integer activations: the destination dtype picks the output pass.
     const auto plan = make_plan(attrs, a, b, ctx);
     return matmul_int8_tiled(attrs, output, inputs, ctx, plan);
@@ -1276,8 +1407,9 @@ Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
 /// The float family: a dense f32/f16 product, with B the same type or a Q4_1
 /// block stream that decodes to it in the RHS pack. On aarch64 bf16 joins
 /// both: a dense bf16 product, or a Q4_1 B decoded into the BFMMLA layout.
-/// Three routes here never build a plan — the fused Q4_1 decode, the
-/// small-product sweep, and (on aarch64) the SME tiles.
+/// Two routes here never build a plan — the fused Q4_1 decode and the
+/// small-product sweep. The AArch64 SME tiles are a third route body, on the
+/// same planned skeleton (SmeFpRoute), with a plan of their own geometry.
 Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
                           std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
@@ -1320,11 +1452,28 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
         return Status::unsupported;
     }
 
-    // SME runs the whole product on its own tiles and pack layouts, before the
-    // plan exists; it declines every case whose geometry it cannot fill.
-    if (matmul_sme(attrs, output, inputs, ctx)) {
-        return Status::ok;
+#if defined(NNOPS_ARCH_SME)
+    // Dense f32/f16 on the ZA tiles, before the plan. The route packs A, so a
+    // transposed A is fine; alpha rides the generic RHS pack, which this route
+    // does not have. A raw B keeps the small-shape gate, but a prepacked blob
+    // has no other reader.
+    const bool sme_blob = b.layout() == TensorLayout::PackedBSme;
+    if ((dt_a == DataType::f32 || dt_a == DataType::f16) && same_type && !block_b &&
+        attrs.alpha == 1.0f && aarch64::available_sme() &&
+        (!is_packed_matmul_b(b.layout()) || sme_blob)) {
+        const auto [M, N, K] = matmul_dims(attrs, a, b);
+        if ((sme_blob || (M > 4 && N >= 16)) && K > 0) {
+            const MatMulPlan plan =
+                get_matmul_plan_sme(attrs, a.desc(), b.desc(), ctx.cpu.worker_count(),
+                                    ctx.cpu.thread_slot_count() > 0);
+            if (plan.mc > 0) {
+                return dt_a == DataType::f32 ?
+                           run_route<SmeFpRoute<float>>(attrs, output, inputs, ctx, plan) :
+                           run_route<SmeFpRoute<half>>(attrs, output, inputs, ctx, plan);
+            }
+        }
     }
+#endif
     // An SME-layout blob has no other reader: the panel route would misread it.
     if (b.layout() == TensorLayout::PackedBSme) {
         return Status::unsupported;

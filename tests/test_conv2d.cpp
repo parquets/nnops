@@ -28,7 +28,9 @@
 #include "nnops/detail/half.hpp"
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"
 #include "backend/cpu/conv/conv2d_winograd.h"
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"      // available_sme — the SME blob test
 #include "backend/cpu/matmul/matmul_helper.h"   // NR_MAX_F32 — the U's panel width
+#include "detail/bench_knobs.hpp"               // disable_sme — packed vs raw is one engine
 #include "common/cpu_pool.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
@@ -197,7 +199,8 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
                      bool add_to = false, uint64_t seed = 900,
                      ConvAlgorithm alg = ConvAlgorithm::Auto,
                      bool packed_filter = false,
-                     bool pre_act = false)
+                     bool pre_act = false,
+                     bool allow_sme = false)
 {
     const int64_t N = c.ishape[0], IC = c.ishape[1];
     const int64_t IH = c.ishape[2], IW = c.ishape[3];
@@ -264,6 +267,23 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
             ? test::channel_first_to_channel_last<float>(res_channel_first, N, OC, OH, OW) : std::vector<float>{};
 
         auto check = [&](auto tag) -> FpResult {
+            // The packed/raw pair is compared bit for bit, so both arms must
+            // run the same engine: pin the planned route for that comparison.
+            const bool pin_sme_off =
+                packed_filter && !allow_sme && alg != ConvAlgorithm::Winograd;
+            const int sme_prev =
+                pin_sme_off ? nnops::detail::disable_sme.exchange(1, std::memory_order_relaxed) : 0;
+            struct SmeRestore {
+                bool active;
+                int prev;
+                ~SmeRestore()
+                {
+                    if (active) {
+                        nnops::detail::disable_sme.store(prev, std::memory_order_relaxed);
+                    }
+                }
+            } sme_restore{pin_sme_off, sme_prev};
+
             using T = decltype(tag);
             constexpr DataType dtt = dtype_tag<T>::value;
             auto to_T = [](float v) -> T {
@@ -286,6 +306,11 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
             TensorView u_v;
             if (alg == ConvAlgorithm::Winograd || packed_filter) {
                 u_v = prepack_filter<T>(w_v, *op, u_buf);
+                // The wide fp cases are the ones the SME prepack serves; the
+                // narrow ones stay on PackedHWIO.
+                if (allow_sme && packed_filter && alg != ConvAlgorithm::Winograd) {
+                    NNOPS_EXPECT_EQ(u_v.layout(), TensorLayout::PackedHWIOSme);
+                }
             }
 
             std::vector<TensorView> ins = {in_v};
@@ -309,7 +334,7 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
             const std::vector<T> out_seed = out_buf;
             op->compute(out_v, ins, {}, nullptr);
 
-            if (packed_filter && alg != ConvAlgorithm::Winograd) {
+            if (packed_filter && !allow_sme && alg != ConvAlgorithm::Winograd) {
                 std::vector<T> raw_buf = out_seed;
                 TensorView raw_v(std::span<const int64_t>(osh, 4), dtt,
                                  raw_buf.data(), TensorLayout::NHWC);
@@ -340,10 +365,11 @@ void expect_fp_close(const FpCase& c, DataType dt, float tol,
                      EpilogueActivateType ep = EpilogueActivateType::None,
                      bool add_to = false, uint64_t seed = 900, int idx = -1,
                      ConvAlgorithm alg = ConvAlgorithm::Auto,
-                     bool packed_filter = false, bool pre_act = false)
+                     bool packed_filter = false, bool pre_act = false,
+                     bool allow_sme = false)
 {
     const FpResult r = run_fp_case(c, dt, ep, add_to, seed, alg, packed_filter,
-                                   pre_act);
+                                   pre_act, allow_sme);
     if (r.worst > tol) {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
@@ -729,6 +755,41 @@ NNOPS_TEST(conv2d_fp_prepacked_filter) {
                         EpilogueActivateType::None, false, 750 + i,
                         static_cast<int>(i) + 100, ConvAlgorithm::ImplicitGemm,
                         /*packed_filter=*/true);
+    }
+}
+
+NNOPS_TEST(conv2d_fp_prepacked_filter_sme) {
+    // The wide-OC fp filters prepack into the ZA B layout and run the SME
+    // route; explicit ImplicitGemm keeps a k3s1 filter out of the Winograd U.
+    namespace cpu = nnops::backend::cpu;
+    if (!cpu::aarch64::available_sme()) {
+        std::printf("  (no SME kernels on this build or CPU; skipped)\n");
+        return;
+    }
+
+    const FpCase cases[] = {
+        {{1, 16, 14, 14}, 320, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+        {{1, 48, 10, 10}, 256, 3, 3, 1, 1, 0, 0, 1, 1, 1, false},
+        {{1, 128, 8, 8},  320, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
+        {{1, 64, 14, 14}, 512, 3, 3, 2, 2, 1, 1, 1, 1, 1, false},
+    };
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        expect_fp_close(cases[i], DataType::f32, 2e-4f, EpilogueActivateType::None,
+                        false, 800 + i, static_cast<int>(i),
+                        ConvAlgorithm::ImplicitGemm, /*packed_filter=*/true,
+                        /*pre_act=*/false, /*allow_sme=*/true);
+    }
+
+    const FpCase f16_cases[] = {
+        {{1, 16, 14, 14}, 320, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+        {{1, 128, 8, 8},  320, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
+    };
+    for (size_t i = 0; i < std::size(f16_cases); ++i) {
+        expect_fp_close(f16_cases[i], DataType::f16, nnops::test::kF16AccumTol,
+                        EpilogueActivateType::None, false, 850 + i,
+                        static_cast<int>(i) + 100, ConvAlgorithm::ImplicitGemm,
+                        /*packed_filter=*/true, /*pre_act=*/false,
+                        /*allow_sme=*/true);
     }
 }
 
@@ -1153,7 +1214,11 @@ NNOPS_TEST(conv2d_plan_blocks) {
         const auto plan = get_conv2d_implicit_gemm_plan(attrs, ins, outs, /*num_threads=*/1, false);
 
         NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
-        NNOPS_EXPECT_EQ(plan.m_block, int64_t{24});
+        // The float SME route works in 32-row ZA tiles; its gate is 32 output
+        // channels per group.
+        const bool sme_route = nnops::backend::cpu::aarch64::available_sme() &&
+                               c.wshape[0] >= 32;
+        NNOPS_EXPECT_EQ(plan.m_block, sme_route ? int64_t{32} : int64_t{24});
         NNOPS_EXPECT_TRUE(plan.icn_block >= 1 && plan.icn_block <= c.wshape[1]);
         NNOPS_EXPECT_EQ(plan.ocn_block, std::min<int64_t>(128, c.wshape[0]));
         // 1x1: A is the input row, no gather buffer and no tap-major staging.

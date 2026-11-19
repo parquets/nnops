@@ -687,12 +687,17 @@ struct AbPacked {
         const TensorView wi2[] = {w_v};
         TensorView wo2[] = {p_v};
         op->prepackWeights(wi2, wo2);
+        has_packed = q.rank() == 2;
     }
 
     void run_raw(const ComputeContext& ctx) {
         const TensorView ins[] = {in_v, w_v, b_v};
         op->compute(std::span<TensorView>(&out_v, 1), ins, ctx, nullptr);
     }
+    /// A narrow 3x3..7x7 filter has no packed form by design — the direct route
+    /// convolves the raw filter — so the caller must not read a packed timing.
+    bool has_packed = false;
+
     void run_packed(const ComputeContext& ctx) {
         const TensorView ins[] = {in_v, p_v, b_v};
         op->compute(std::span<TensorView>(&out_v, 1), ins, ctx, nullptr);
@@ -740,6 +745,8 @@ struct AbPackedI8 : AbI8 {
         const TensorView ins[] = {*in, *w, b_v};
         p_op->compute(std::span<TensorView>(out, 1), ins, ctx, nullptr);
     }
+    bool has_packed = true;   // the s8 blob has no narrow-filter exception
+
     void run_packed(const ComputeContext& ctx) {
         const TensorView ins[] = {*in, p_v, b_v};
         p_op->compute(std::span<TensorView>(out, 1), ins, ctx, nullptr);
@@ -767,10 +774,22 @@ void run_filter_table(const char* title,
         for (const auto& c : shapes) {
             if (c.dw) { continue; }   // a depthwise layer is a different operator
             Layer l(c);
+            // No packed form: the caller keeps the raw filter, so both columns
+            // are the raw time.
+            const bool pk = l.has_packed;
             const AbResult r = measure_ab(nt,
                 [&](const ComputeContext& x) { l.run_raw(x); },
-                [&](const ComputeContext& x) { l.run_packed(x); },
+                [&](const ComputeContext& x) { pk ? l.run_packed(x) : l.run_raw(x); },
                 iters, rounds);
+            if (!pk) {
+                std::printf("    %-34s %8.3f %8.1f | %8s %8s | %8s | %s\n", c.name,
+                            r.a_ms, l.work / r.a_ms / 1e6, "= raw", "= raw", "-",
+                            "no packed form");
+                tot_raw += r.a_ms;
+                tot_packed += r.a_ms;
+                ++ties;
+                continue;
+            }
             const double ratio = r.b_ms / r.a_ms;
             const bool real = std::abs(r.a_ms - r.b_ms) / r.a_ms * 100.0 > r.null_pct;
             const char* verdict = !real ? "tie (noise)"

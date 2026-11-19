@@ -55,9 +55,14 @@ inline constexpr int sme_mr = 16;
 /// Columns in one ZA tile, i.e. the N extent one MOPA updates.
 inline constexpr int sme_za_n = 16;
 
-/// Columns of B in one blocked pass — the four ZA tiles; also the pack's block
-/// width.
+/// Columns of B in one blocked pass — the four ZA tiles; also the int8 pack's
+/// block width (the SMOPA kernel is 16x64).
 inline constexpr int sme_nr_max = 4 * sme_za_n;
+
+/// Columns of B in one float pass: the 2x2 ZA tile's width. The float pack uses
+/// it as the block width too, so a tile's B stream is contiguous; at 64 the
+/// kernel read half of every 256-byte K row and lost about half the throughput.
+inline constexpr int sme_fp_nr = 2 * sme_za_n;
 
 #if defined(NNOPS_ARCH_SME)
 

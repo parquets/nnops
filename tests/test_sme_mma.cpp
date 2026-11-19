@@ -7,13 +7,13 @@
 /// tails. On a machine without SME the test reports and passes without calling
 /// in.
 
-#include "backend/cpu/aarch64/mma_f16_sme.hpp"
-#include "backend/cpu/aarch64/mma_f32_sme.hpp"
-#include "backend/cpu/aarch64/mma_i8_sme.hpp"
-#include "backend/cpu/aarch64/mma_sme.hpp"
-#include "backend/cpu/aarch64/pack_f16_sme.hpp"
-#include "backend/cpu/aarch64/pack_f32_sme.hpp"
-#include "backend/cpu/aarch64/pack_i8_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_f16_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_f32_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_i8_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_f16_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_f32_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_i8_sme.hpp"
 
 #include "common/test_harness.hpp"
 

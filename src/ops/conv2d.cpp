@@ -3,7 +3,8 @@
 ///        the two prepacked weight products.
 ///
 /// validate() makes the filter order pair with the activation: an NHWC
-/// activation takes HWIO, PackedHWIO or PackedWinoWeightLast. compute() forces
+/// activation takes HWIO, PackedHWIO, PackedHWIOSme or PackedWinoWeightLast.
+/// compute() forces
 /// the implicit-GEMM kernel for three cases whatever the algorithm says — a
 /// quantized (s8) filter, a prepacked im2col filter, and a raw filter — and
 /// under Auto picks Winograd only when handed U, since a raw filter has no U to
@@ -20,7 +21,8 @@
 /// prepackWeights() produces one of two things: the Winograd U —
 /// [pos][nb][G·jb][ldd] B panels, pos being 16 (F(2,3)) or 36 (F(4,3)) — when
 /// asked for Winograd (under Auto, only for a non-quantized k3s1 filter), and
-/// the im2col route's PackedHWIO otherwise. Both are built once at load time so
+/// the im2col route's PackedHWIO (or PackedHWIOSme on an SME machine)
+/// otherwise. Both are built once at load time so
 /// compute() reads them in place instead of repacking per call.
 
 #include "nnops/ops/conv2d.hpp"
@@ -186,7 +188,8 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
     const TensorLayout wl = inputs[1].layout;
     NNOPS_TRY(detail::require(is_channel_last_weight(wl) ||
                               wl == TensorLayout::PackedWinoWeightLast ||
-                              wl == TensorLayout::PackedHWIO));
+                              wl == TensorLayout::PackedHWIO ||
+                              wl == TensorLayout::PackedHWIOSme));
 
     // A pre-activation residual is implemented by every fp CPU route (both
     // layouts, the depthwise reroute and Winograd) and the reference. Refusing

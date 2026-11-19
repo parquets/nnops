@@ -40,11 +40,14 @@
 #include "nnops/detail/q4_1.hpp"
 #include "nnops/detail/simd.hpp"
 #include "backend/cpu/simd_kernel/simd_quant.hpp"
-#include "backend/cpu/aarch64/mma_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"
 #if defined(NNOPS_ARCH_SME)
-#include "backend/cpu/aarch64/pack_f16_sme.hpp"
-#include "backend/cpu/aarch64/pack_f32_sme.hpp"
-#include "backend/cpu/aarch64/pack_i8_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_f16_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_f32_sme.hpp"
+#include "backend/cpu/aarch64/sme/mma_i8_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_f16_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_f32_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_i8_sme.hpp"
 #endif
 
 #ifdef NNOPS_ARCH_X86_64
@@ -735,21 +738,65 @@ MatMulPackedB matmul_packed_b_sme_geom(int64_t N, int64_t K, DataType dtype) noe
         !aarch64::available_sme()) {
         return g;
     }
-    // One slot per 64-column block, contiguous, the layout the kernels read in
-    // place: f32 [K][64], f16 [ceil(K/2)][128] with each column's K pair
-    // adjacent, s8 [ceil(K/4)][256] with each column's four K values adjacent.
-    // A small-M reader de-interleaves the f16 slot with vld2.
-    g.nr = aarch64::sme_nr_max;
+    // One slot per n tile, contiguous, the layout the kernels read in place:
+    // f32 [K][32], f16 [ceil(K/2)][64] with each column's K pair adjacent, and
+    // s8 [ceil(K/4)][256] with each column's four K values adjacent. The float
+    // slots are the 2x2 ZA tile's 32 columns, so a tile's stream is sequential;
+    // at 64 the kernel read half of every K row.
+    g.nr = dtype == DataType::s8 ? aarch64::sme_nr_max : aarch64::sme_fp_nr;
     if (dtype == DataType::f16) {
-        g.ldd = ((K + 1) / 2) * (2 * aarch64::sme_nr_max);
+        g.ldd = ((K + 1) / 2) * (2 * g.nr);
     } else if (dtype == DataType::s8) {
-        g.ldd = ((K + 3) / 4) * (4 * aarch64::sme_nr_max);
+        g.ldd = ((K + 3) / 4) * (4 * g.nr);
     } else {
-        g.ldd = K * aarch64::sme_nr_max;
+        g.ldd = K * g.nr;
     }
     g.np = (N + g.nr - 1) / g.nr;
     g.total = g.np * g.ldd;
     return g;
+}
+
+int64_t sme_b_panel_stride(DataType dtype, int64_t kc) noexcept
+{
+    const int64_t nr = dtype == DataType::s8 ? aarch64::sme_nr_max : aarch64::sme_fp_nr;
+    if (dtype == DataType::f32) {
+        return kc * nr;
+    }
+    if (dtype == DataType::f16) {
+        return ((kc + 1) / 2) * (2 * nr);
+    }
+    return ((kc + 3) / 4) * (4 * nr);
+}
+
+int64_t sme_a_panel_stride(DataType dtype, int64_t kc) noexcept
+{
+    // fp A blocks are the kernel's 32-row (2x2 ZA) tile so its two vectors are
+    // one pair load; int8 keeps the 16-row SMOPA block.
+    const int64_t mr = 2 * aarch64::sme_mr;
+    if (dtype == DataType::f32) {
+        return kc * mr;
+    }
+    if (dtype == DataType::f16) {
+        return ((kc + 1) / 2) * (2 * mr);
+    }
+    return ((kc + 3) / 4) * (4 * aarch64::sme_mr);
+}
+
+int64_t sme_b_k_offset(DataType dtype, int64_t k) noexcept
+{
+    const int64_t nr = dtype == DataType::s8 ? aarch64::sme_nr_max : aarch64::sme_fp_nr;
+    if (dtype == DataType::f32) {
+        return k * nr;
+    }
+    if (dtype == DataType::f16) {
+        return (k / 2) * (2 * nr);
+    }
+    return (k / 4) * (4 * nr);
+}
+
+int64_t sme_kc_for(DataType dtype) noexcept
+{
+    return dtype == DataType::f32 ? 1024 : 2048;
 }
 
 namespace {
@@ -938,8 +985,35 @@ void matmul_packed_b_i8_col_sums(const TensorView& packed, int64_t K, int32_t* r
                                  const ComputeContext& ctx)
 {
     const int64_t N = packed.shape(0);
+    NNOPS_ASSERT(r_b != nullptr);
+
+    if (packed.layout() == TensorLayout::PackedBSme) {
+        // [n/64][k/4][256]: column j's four K values are contiguous at its
+        // lane slot, panels of 16 columns 64 bytes apart.
+        const int64_t nr = aarch64::sme_nr_max;
+        const int64_t za = aarch64::sme_za_n;
+        const int64_t kg = (K + 3) / 4;
+        const int8_t* const blob = packed.ptr<int8_t>();
+        const int64_t n_blocks = (N + nr - 1) / nr;
+        ctx.cpu.run(0, n_blocks, [&](int64_t nb) {
+            const int64_t n0 = nb * nr;
+            const int64_t cols = std::min(nr, N - n0);
+            const int8_t* const blk = blob + nb * kg * (4 * nr);
+            for (int64_t j = 0; j < cols; ++j) {
+                const int8_t* const cell0 = blk + (j / za) * (4 * za) + (j % za) * 4;
+                int32_t s = 0;
+                for (int64_t g = 0; g < kg; ++g) {
+                    const int8_t* const cell = cell0 + g * (4 * nr);
+                    s += cell[0] + cell[1] + cell[2] + cell[3];
+                }
+                r_b[n0 + j] = s;
+            }
+        });
+        return;
+    }
+
     const MatMulPackedB g = matmul_packed_b_geom(N, K, DataType::s8);
-    NNOPS_ASSERT(g.ok() && r_b != nullptr);
+    NNOPS_ASSERT(g.ok());
 
     // The panel is [k group][nr][group] bytes: four on SDOT (x86 too), eight on
     // i8mm. Column c of a group is that many contiguous bytes at c*group. A
@@ -1032,6 +1106,64 @@ constexpr PackI8WideFn pack_i8_rhs_copy = pack_copy_n16_dp4a_i8;
 #elif defined(NNOPS_ARCH_AARCH64)
 constexpr PackI8WideFn pack_i8_rhs_trans = pack_trans_n12_dp4a_i8;
 constexpr PackI8WideFn pack_i8_rhs_copy = pack_copy_n12_dp4a_i8;
+#endif
+
+#if defined(NNOPS_ARCH_SME)
+void tile_pack_lhs_sme(bool trans, int mc, int kc, float* dst, const float* src, int lds) noexcept
+{
+    aarch64::pack_a_f32_sme(mc, kc, dst, src, lds, trans);
+}
+
+void tile_pack_lhs_sme(bool trans, int mc, int kc, half* dst, const half* src, int lds) noexcept
+{
+    aarch64::pack_a_f16_sme(mc, kc, dst, src, lds, trans);
+}
+
+void tile_pack_rhs_sme(bool trans, int nc, int kc, float* dst, const float* src, int lds) noexcept
+{
+    aarch64::pack_b_f32_sme(nc, kc, dst, src, lds, trans);
+}
+
+void tile_pack_rhs_sme(bool trans, int nc, int kc, half* dst, const half* src, int lds) noexcept
+{
+    aarch64::pack_b_f16_sme(nc, kc, dst, src, lds, trans);
+}
+
+void tile_mma_pack_sme(int mc, int nc, int kc, float* c, int ldc, const float* packed_a,
+                       const float* b, int64_t block_stride, float clamp_min, float clamp_max,
+                       bool zero_mode, const float* col_bias)
+{
+    aarch64::mma_f32_sme(mc, nc, kc, c, ldc, packed_a, b, zero_mode, clamp_min, clamp_max,
+                         col_bias, block_stride > 0 ? block_stride : 0);
+}
+
+void tile_mma_pack_sme(int mc, int nc, int kc, half* c, int ldc, const half* packed_a,
+                       const half* b, int64_t block_stride, float clamp_min, float clamp_max,
+                       bool zero_mode, const half* col_bias)
+{
+    aarch64::mma_f16_sme(mc, nc, kc, c, ldc, packed_a, b, zero_mode, clamp_min, clamp_max,
+                         col_bias, block_stride > 0 ? block_stride : 0);
+}
+
+void tile_pack_lhs_i8_sme(bool trans, int mc, int kc, int8_t* dst, const int8_t* src,
+                          int lds, bool a_biased) noexcept
+{
+    aarch64::pack_a_i8_sme(mc, kc, dst, src, lds, trans, a_biased);
+}
+
+void tile_pack_rhs_i8_sme(bool trans, int nc, int kc, int8_t* dst, const int8_t* src,
+                          int lds) noexcept
+{
+    aarch64::pack_b_i8_sme(nc, kc, dst, src, lds, trans);
+}
+
+void tile_mma_pack_i8_sme(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t* packed_a,
+                          const int8_t* b, int64_t block_stride, int32_t clamp_min,
+                          int32_t clamp_max, bool zero_mode)
+{
+    aarch64::mma_i8_sme(mc, nc, kc, c, ldc, packed_a, b, zero_mode, clamp_min, clamp_max,
+                        block_stride > 0 ? block_stride : 0);
+}
 #endif
 
 void xor0x80_i8(int8_t* p, int nbytes)
@@ -1473,5 +1605,101 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs, const TensorDesc& a_de
 
     return plan;
 }
+
+#if defined(NNOPS_ARCH_SME)
+MatMulPlan get_matmul_plan_sme(const MatMulAttributes& attrs, const TensorDesc& a_desc,
+                               const TensorDesc& b_desc, int num_threads, bool use_thread_slots)
+{
+    MatMulPlan plan{};
+
+    const DataType dt_a = a_desc.dtype;
+    const DataType dt_b = b_desc.dtype;
+    const bool i8_pair = is_int8_matmul(dt_a, dt_b);
+    const bool fp_pair =
+        (dt_a == DataType::f32 || dt_a == DataType::f16) && dt_b == dt_a;
+    if ((!i8_pair && !fp_pair) || a_desc.rank < 2 || b_desc.rank < 2) {
+        return plan;
+    }
+
+    const bool packed_b = is_packed_matmul_b(b_desc.layout);
+    // Only the ZA blob is readable here; a NEON panel blob is another route's.
+    if (packed_b && b_desc.layout != TensorLayout::PackedBSme) {
+        return plan;
+    }
+    // A block-quantised B has no SME kernel.
+    if (!packed_b && is_block_packed_dtype(dt_b)) {
+        return plan;
+    }
+
+    const int64_t a_rank = a_desc.rank;
+    const int64_t b_rank = b_desc.rank;
+    const int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 1)] :
+                                          a_desc.dims[static_cast<size_t>(a_rank - 2)];
+    const int64_t N = packed_b ? b_desc.dims[0] :
+                      attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)] :
+                                          b_desc.dims[static_cast<size_t>(b_rank - 1)];
+    const int64_t K = packed_b ?
+                          (attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 2)] :
+                                               a_desc.dims[static_cast<size_t>(a_rank - 1)]) :
+                          (attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)] :
+                                               b_desc.dims[static_cast<size_t>(b_rank - 2)]);
+    if (M <= 0 || N <= 0 || K <= 0) {
+        return plan;
+    }
+
+    const int64_t elem = static_cast<int64_t>(data_type_size(dt_a));
+    const int64_t kc = sme_kc_for(dt_a);
+    // The kernel's n-tile loop reloads B for every m-block, so a small mc is
+    // paid in B traffic: 64 columns x kc of B per block. 256 rows keeps the
+    // packed A slab at mc*kc elements (1-2 MB) while amortising B 4x better.
+    const int64_t mc = 64;
+    const int64_t nr = i8_pair ? aarch64::sme_nr_max : aarch64::sme_fp_nr;
+    num_threads = std::max(num_threads, 1);
+
+    // One N block per worker, rounded to the 64-column grid and capped so a
+    // worker's B slab stays small; the driver splits N over the pool.
+    const int64_t n_total_blocks = (N + nr - 1) / nr;
+    const int64_t workers =
+        std::max<int64_t>(1, std::min<int64_t>(num_threads, n_total_blocks));
+    int64_t nc = std::min<int64_t>(1024, (N + workers - 1) / workers);
+    nc = std::max<int64_t>(nr, ((nc + nr - 1) / nr) * nr);
+
+    const int64_t np_slice = (nc + nr - 1) / nr;
+    const int64_t num_n_blocks = (N + nc - 1) / nc;
+
+    plan.mc = mc;
+    plan.nc = nc;
+    plan.kc = kc;
+    plan.split_n = true;
+    plan.pack_a = true;
+    plan.ldd_b = sme_b_panel_stride(dt_b, kc);
+    plan.ldd_a = sme_a_panel_stride(dt_a, kc);
+    plan.np_a = i8_pair ? (mc + aarch64::sme_mr - 1) / aarch64::sme_mr :
+                          (mc + 2 * aarch64::sme_mr - 1) / (2 * aarch64::sme_mr);
+
+    if (packed_b) {
+        plan.num_slots = 0;
+        plan.np_slice = 0;
+        plan.workspace_size = 0;
+    } else {
+        plan.num_slots = num_n_blocks;
+        plan.np_slice = np_slice;
+        plan.workspace_size = plan.num_slots * np_slice * plan.ldd_b * elem;
+    }
+
+    plan.pack_a_offset = plan.workspace_size;
+    const int64_t nt = std::max<int64_t>(num_threads, 1);
+    if (nt <= 1) {
+        plan.num_slots_a = 1;
+    } else if (use_thread_slots && nt < num_n_blocks) {
+        plan.num_slots_a = nt;
+    } else {
+        plan.num_slots_a = num_n_blocks;
+    }
+    plan.workspace_size =
+        plan.pack_a_offset + plan.num_slots_a * plan.np_a * plan.ldd_a * elem;
+    return plan;
+}
+#endif
 
 } // namespace nnops::backend::cpu

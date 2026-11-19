@@ -784,6 +784,37 @@ void tile_mma_direct_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_
                         const int8_t* packed_b, int ldb, int32_t clamp_min, int32_t clamp_max,
                         bool zero_mode);
 
+#if defined(NNOPS_ARCH_SME)
+// ---- SME tiles -----------------------------------------------------------
+//
+// The same two axes as the NEON API, with the ZA kernels' layouts: A is
+// [m/16][k][16] (f16 K pairs interleaved), B [n/64][k][64] (f16 pairs, int8
+// fours). A is always packed. `block_stride` is the distance between B's
+// 64-column blocks: 0 for the layout the per-call pack writes, a whole-K blob's
+// stride otherwise. The MMA signatures mirror `tile_mma_pack`, but the SME pack
+// functions own their layout, so `ldd` is not needed on the pack side.
+void tile_pack_lhs_sme(bool trans, int mc, int kc, float* dst, const float* src,
+                       int lds) noexcept;
+void tile_pack_lhs_sme(bool trans, int mc, int kc, half* dst, const half* src, int lds) noexcept;
+void tile_pack_rhs_sme(bool trans, int nc, int kc, float* dst, const float* src,
+                       int lds) noexcept;
+void tile_pack_rhs_sme(bool trans, int nc, int kc, half* dst, const half* src, int lds) noexcept;
+void tile_mma_pack_sme(int mc, int nc, int kc, float* c, int ldc, const float* packed_a,
+                       const float* b, int64_t block_stride, float clamp_min, float clamp_max,
+                       bool zero_mode, const float* col_bias = nullptr);
+void tile_mma_pack_sme(int mc, int nc, int kc, half* c, int ldc, const half* packed_a,
+                       const half* b, int64_t block_stride, float clamp_min, float clamp_max,
+                       bool zero_mode, const half* col_bias = nullptr);
+
+void tile_pack_lhs_i8_sme(bool trans, int mc, int kc, int8_t* dst, const int8_t* src, int lds,
+                          bool a_biased) noexcept;
+void tile_pack_rhs_i8_sme(bool trans, int nc, int kc, int8_t* dst, const int8_t* src,
+                          int lds) noexcept;
+void tile_mma_pack_i8_sme(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t* packed_a,
+                          const int8_t* b, int64_t block_stride, int32_t clamp_min,
+                          int32_t clamp_max, bool zero_mode);
+#endif
+
 // XOR every byte of a packed-A panel with 0x80 (s8 → u8 for VNNI).
 void xor0x80_i8(int8_t* p, int nbytes);
 
@@ -829,6 +860,24 @@ struct MatMulPackedB {
 /// dtype with no packed RHS route (anything but f32, f16 and s8), and for a
 /// non-positive extent.
 MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcept;
+
+/// The SME blob's geometry: the ZA kernels' [⌈N/64⌉] blocks, `ldd` the stride
+/// between them over the whole K (f32 K·64, f16 ⌈K/2⌉·128, s8 ⌈K/4⌉·256).
+/// Empty when the build/CPU has no SME; the layout is still decoded on the
+/// fp-output fallback, so the declaration is arch-neutral.
+MatMulPackedB matmul_packed_b_sme_geom(int64_t N, int64_t K, DataType dtype) noexcept;
+
+/// SME tile geometry: one A block is 16 rows, one B block 64 columns, and the
+/// k-grouping is the pack's (f16 pairs, int8 fours). `*_panel_stride` is one
+/// 64-column B block / 16-row A block; `b_k_offset` the element offset of
+/// k-block start @p k inside it. Scalar arithmetic, so the declarations stay
+/// arch-neutral: the conv prepack resolves its blob geometry on every build
+/// (an SME blob is only produced when available_sme() holds).
+int64_t sme_b_panel_stride(DataType dtype, int64_t kc) noexcept;
+int64_t sme_a_panel_stride(DataType dtype, int64_t kc) noexcept;
+int64_t sme_b_k_offset(DataType dtype, int64_t k) noexcept;
+/// K per SME k-block: f32 1024, f16/int8 2048.
+int64_t sme_kc_for(DataType dtype) noexcept;
 
 /// The descriptor the blob is allocated from — the query half of the two-step
 /// prepack. Shape [N, ⌈elements / N⌉], like the conv blobs: N leads because it
@@ -899,6 +948,17 @@ struct MatMulPlan {
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs, const TensorDesc& a_desc,
                            const TensorDesc& b_desc, int num_threads = 1,
                            bool use_thread_slots = false);
+
+#if defined(NNOPS_ARCH_SME)
+/// The same plan for the SME tiles: mc 64, nc in 64-column blocks (up to 1024,
+/// enough to fill the pool), kc per dtype, A always packed. The packed-A region
+/// is ceil(mc/16) blocks — the ZA kernel's own row geometry, not the NEON MR
+/// ladder — and B's stride is the 64-column block. An all-zero plan means the
+/// operand pair is not one the SME tiles serve (non-f32/f16/i8, or a Q4_1 B).
+MatMulPlan get_matmul_plan_sme(const MatMulAttributes& attrs, const TensorDesc& a_desc,
+                               const TensorDesc& b_desc, int num_threads = 1,
+                               bool use_thread_slots = false);
+#endif
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 /// Diagnostic cap on the fused block-quant small-M route

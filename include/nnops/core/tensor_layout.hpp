@@ -51,6 +51,12 @@ enum class TensorLayout : uint8_t {
     // and the filter's dims, never indexed by hand.
     PackedHWIO = 9,
 
+    // PackedHWIOSme — the same filter for the AArch64 SME tiles: per group,
+    // ic block and 64-column oc block, the ZA B layout ([oc block][k][64] with
+    // f16 K pairs interleaved), whole-K so compute() needs no per-call B pack.
+    // Opaque, like PackedHWIO; only the im2col route reads it.
+    PackedHWIOSme = 13,
+
     // ---- Prepacked matmul RHS (MatMul / Linear ::prepackWeights) ----
     //
     // The GEMM's B operand, packed over its *whole* K once at load time instead of
@@ -119,7 +125,12 @@ constexpr bool is_wino_weight(TensorLayout layout) noexcept {
 
 /// True for the prepacked im2col conv filter; an opaque blob.
 constexpr bool is_packed_conv_weight(TensorLayout layout) noexcept {
-    return layout == TensorLayout::PackedHWIO;
+    return layout == TensorLayout::PackedHWIO || layout == TensorLayout::PackedHWIOSme;
+}
+
+/// True for the AArch64 SME filter blob (the ZA tiles' B layout).
+constexpr bool is_sme_conv_weight(TensorLayout layout) noexcept {
+    return layout == TensorLayout::PackedHWIOSme;
 }
 
 /// True for the prepacked matmul RHS; opaque, addressed by matmul_packed_b_geom.
