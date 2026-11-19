@@ -355,7 +355,7 @@ inline void tile_im2col_pack_i8_sme(int8_t* dst, const int8_t* in, int64_t in_ro
 {
     constexpr int kRows = aarch64::sme_mr;      // 16 pixels: one A panel
     constexpr int kChanMax = 64;                // bytes one ZA tile row spans
-    constexpr int kMaxPix = 2 * aarch64::sme_mr; // one tile's pixels
+    constexpr int kMaxPix = 16 * aarch64::sme_mr; // one tile's pixels
     const int64_t groups = static_cast<int64_t>(karea) * icnc / 4;
     int8_t fill_row[kChanMax];
     // Per pixel: the patch's top-left corner. A tap is then two adds and two
@@ -1791,10 +1791,10 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                             // The per-pixel sums the compensation reads: over the
                             // whole K, of the *true* activation values (the gather's
                             // shift comes back out), recomputed rather than buffered.
-                            int32_t ra_tile[64];
+                            int32_t ra_tile[16 * aarch64::sme_mr];
                             const int32_t* ra_ptr = nullptr;
                             if (comp) {
-                                NNOPS_ASSERT(mc <= 64);
+                                NNOPS_ASSERT(mc <= 16 * aarch64::sme_mr);
                                 if (direct_a) {
                                     // The pixel is its own patch, its channels one
                                     // contiguous run: a row sum of the bytes the MMA
@@ -2024,7 +2024,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
                               (sme_blob || (!prepacked && aarch64::available_sme() &&
                                             oc_per_group >= aarch64::sme_nr_max));
     const bool sme_i8_wide = sme_i8_route && out.dims[3] >= 2 * aarch64::sme_mr;
-    plan.m_block = (sme_route || sme_i8_wide) ? 2 * aarch64::sme_mr : kMBlock;
+    plan.m_block = sme_route ? 2 * aarch64::sme_mr : (sme_i8_wide ? 8 * aarch64::sme_mr : kMBlock);
 #else
     plan.m_block = kMBlock;
 #endif
