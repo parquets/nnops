@@ -377,6 +377,23 @@ inline void tile_im2col_pack_i8_sme(int8_t* dst, const int8_t* in, int64_t in_ro
         }
     }
 
+    // A tile whose every pixel's whole patch lies inside the input is the common
+    // case, and there a tap is one add per pixel off a base computed once —
+    // no range tests, no multiplies. The bulk of this function's cost was that
+    // addressing, not the ZA moves themselves.
+    int64_t base0[kMaxPix];
+    bool interior = true;
+    {
+        const int64_t hspan = static_cast<int64_t>(KH - 1) * DH;
+        const int64_t wspan = static_cast<int64_t>(KW - 1) * DW;
+        for (int i = 0; i < mc; ++i) {
+            interior = interior && ih0[i] >= 0 && ih0[i] + hspan < IH && iw0[i] >= 0 &&
+                       iw0[i] + wspan < IW;
+            base0[i] = static_cast<int64_t>(ih0[i]) * in_row_stride +
+                       static_cast<int64_t>(iw0[i]) * ic_stride;
+        }
+    }
+
     for (int t = 0; t < karea; ++t) {
         const int kh = t / KW;
         const int kw = t - kh * KW;
@@ -384,33 +401,67 @@ inline void tile_im2col_pack_i8_sme(int8_t* dst, const int8_t* in, int64_t in_ro
         const int tcol = kw * DW;
         int64_t base[kMaxPix];
         bool live[kMaxPix];
-        for (int i = 0; i < mc; ++i) {
-            const int ih = ih0[i] + trow;
-            const int iw = iw0[i] + tcol;
-            live[i] = ih >= 0 && ih < IH && iw >= 0 && iw < IW;
-            base[i] = live[i] ? static_cast<int64_t>(ih) * in_row_stride +
-                                    static_cast<int64_t>(iw) * ic_stride :
-                                0;
+        if (interior) {
+            const int64_t shift = static_cast<int64_t>(trow) * in_row_stride +
+                                  static_cast<int64_t>(tcol) * ic_stride;
+            for (int i = 0; i < mc; ++i) {
+                base[i] = base0[i] + shift;
+            }
+        } else {
+            for (int i = 0; i < mc; ++i) {
+                const int ih = ih0[i] + trow;
+                const int iw = iw0[i] + tcol;
+                live[i] = ih >= 0 && ih < IH && iw >= 0 && iw < IW;
+                base[i] = live[i] ? static_cast<int64_t>(ih) * in_row_stride +
+                                        static_cast<int64_t>(iw) * ic_stride :
+                                    0;
+            }
         }
         for (int c0 = 0; c0 < icnc; c0 += kChanMax) {
             const int words = std::min(kChanMax, icnc - c0) / 4;
             const svbool_t pc = svwhilelt_b32(0, words);
             for (int pstart = 0; pstart < mc; pstart += kRows) {
                 const int n = std::min(kRows, mc - pstart);
-                for (int i = 0; i < n; ++i) {
-                    const int8_t* const src = live[pstart + i] ?
-                                                  in + base[pstart + i] + c0 :
-                                                  fill_row;
-                    svld1_hor_za32(0, static_cast<uint32_t>(i), pc,
-                                   reinterpret_cast<const uint32_t*>(src));
+                if (interior && n == kRows) {
+                    // Constant row indices: the ZA slice folds into the
+                    // instruction instead of a register, and the whole panel
+                    // pipelines. Worth 10-25% of this function.
+#pragma unroll
+                    for (int i = 0; i < kRows; ++i) {
+                        svld1_hor_za32(
+                            0, static_cast<uint32_t>(i), pc,
+                            reinterpret_cast<const uint32_t*>(in + base[pstart + i] + c0));
+                    }
+                } else if (interior) {
+                    for (int i = 0; i < n; ++i) {
+                        svld1_hor_za32(
+                            0, static_cast<uint32_t>(i), pc,
+                            reinterpret_cast<const uint32_t*>(in + base[pstart + i] + c0));
+                    }
+                } else {
+                    for (int i = 0; i < n; ++i) {
+                        const int8_t* const src = live[pstart + i] ?
+                                                      in + base[pstart + i] + c0 :
+                                                      fill_row;
+                        svld1_hor_za32(0, static_cast<uint32_t>(i), pc,
+                                       reinterpret_cast<const uint32_t*>(src));
+                    }
                 }
                 const svbool_t pr = svwhilelt_b32(0, n);
                 auto* const dw = reinterpret_cast<int32_t*>(dst);
                 const int64_t blk = static_cast<int64_t>(pstart / kRows) * groups;
-                for (int j = 0; j < words; ++j) {
-                    svst1_ver_za32(0, static_cast<uint32_t>(j), pr,
-                                   dw + (blk + static_cast<int64_t>(t) * icnc / 4 + c0 / 4 + j) *
-                                            aarch64::sme_mr);
+                const int64_t bjat = blk + static_cast<int64_t>(t) * icnc / 4 + c0 / 4;
+                if (words == kRows) {
+#pragma unroll
+                    for (int j = 0; j < kRows; ++j) {
+                        svst1_ver_za32(0, static_cast<uint32_t>(j), pr,
+                                       dw + (bjat + j) * aarch64::sme_mr);
+                    }
+                } else {
+                    for (int j = 0; j < words; ++j) {
+                        svst1_ver_za32(0, static_cast<uint32_t>(j), pr,
+                                       dw + (bjat + j) * aarch64::sme_mr);
+                    }
                 }
             }
         }
@@ -1463,6 +1514,29 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
 #else
         constexpr bool epi_fused = false;
 #endif
+        // The 8-bit requantizing store: same preconditions, but the destination
+        // is quantized, so the epilogue's requantize rides the write-back too.
+#if defined(NNOPS_ARCH_SME)
+        const bool epi_i8 = use_sme && kIntOut && !comp && !col_term &&
+                            plan.orig_size == 0 && icn_block >= ic_per_group &&
+                            (attrs.epilogue.quant != EpilogueQuantType::Requantize ||
+                             attrs.epilogue.quant_param_count == 0) &&
+                            (attrs.epilogue.type == EpilogueActivateType::None ||
+                             attrs.epilogue.type == EpilogueActivateType::Relu);
+#else
+        constexpr bool epi_i8 = false;
+#endif
+        // The requantize scale: s_a / s_out, and the destination's zero point —
+        // what int8_epilogue_row_quant forms per row when nothing overrides it.
+        const float out_scale = (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                                 attrs.epilogue.quant_param_count > 0)
+                                    ? epilogue_quant_scale(attrs.epilogue, 0)
+                                    : quant_scale_at(qc, 0);
+        const int32_t out_zp = (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                                attrs.epilogue.quant_param_count > 0)
+                                   ? epilogue_quant_zero(attrs.epilogue, 0)
+                                   : quant_zp_at(qc, 0);
+
         // Relu and Relu6 compose into the clip bounds: clamp∘clamp is a clamp.
         float epi_lo = attrs.epilogue.min_clip;
         float epi_hi = attrs.epilogue.max_clip;
@@ -1657,8 +1731,20 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                                     tile_pack_lhs_i8_sme(false, mc, kdim4, sme_a.data(), a, lda,
                                                          a_biased);
                                 }
-                                if constexpr (!kIntOut) {
-                                    if (epi_fused) {
+                                if constexpr (kIntOut) {
+                                    if (epi_i8) {
+                                        TOut* const fdst =
+                                            out_g + oh * out_row_stride + ow0 * OC + ocn;
+                                        tile_mma_pack_i8_sme_epi_i8(
+                                            mc, static_cast<int>(ocnc), kdim4, fdst,
+                                            static_cast<int64_t>(OC), sme_a.data(), b_panel,
+                                            /*block_stride=*/sme_slot_max, sb_ptr, qw.scale,
+                                            s_x / out_scale,
+                                            ibias_g ? ibias_g + ocn : nullptr, out_zp,
+                                            attrs.epilogue.type == EpilogueActivateType::Relu);
+                                        epi_done = true;
+                                    }
+                                } else if (epi_fused) {
                                         // The dequantizing store: the epilogue is
                                         // the kernel's write-back, so no int32 tile
                                         // exists.
@@ -1670,7 +1756,6 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                                             /*block_stride=*/sme_slot_max, sb_ptr, qw.scale, s_x,
                                             col_bias_f, epi_lo, epi_hi);
                                         epi_done = true;
-                                    }
                                 }
                                 if (!epi_done) {
                                     tile_mma_pack_i8_sme(
@@ -1780,8 +1865,11 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                                     ip.out = dst;
                                 }
                                 ip.ldc_out = static_cast<int>(OC);
-                                int8_epilogue_tile(ip, acc_tile, static_cast<int>(ocn_block), 0, 0,
-                                                   mc, ocnc);
+                                if (!epi_done) {
+                                    int8_epilogue_tile(ip, acc_tile,
+                                                       static_cast<int>(ocn_block), 0, 0, mc,
+                                                       ocnc);
+                                }
                             } else {
                                 DqEpilogueParams<TOut> ip{};
                                 ip.r_a = ra_ptr;

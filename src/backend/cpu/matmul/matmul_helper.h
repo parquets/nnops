@@ -825,6 +825,16 @@ void tile_mma_pack_i8_sme_epi(int mc, int nc, int kc, half* out, int64_t ldm,
                               const int8_t* packed_a, const int8_t* b, int64_t block_stride,
                               const float* s_b, float s_b_scalar, float s_a,
                               const float* col_bias, float lo, float hi);
+// The same tile requantized to 8 bits: row_k is s_a / s_out, col_bias the int32
+// per-column bias, and relu folds in as a floor of zero before the requant.
+void tile_mma_pack_i8_sme_epi_i8(int mc, int nc, int kc, int8_t* out, int64_t ldm,
+                                 const int8_t* packed_a, const int8_t* b, int64_t block_stride,
+                                 const float* s_b, float s_b_scalar, float row_k,
+                                 const int32_t* col_bias, int32_t zp_out, bool relu);
+void tile_mma_pack_i8_sme_epi_i8(int mc, int nc, int kc, uint8_t* out, int64_t ldm,
+                                 const int8_t* packed_a, const int8_t* b, int64_t block_stride,
+                                 const float* s_b, float s_b_scalar, float row_k,
+                                 const int32_t* col_bias, int32_t zp_out, bool relu);
 #endif
 
 // XOR every byte of a packed-A panel with 0x80 (s8 → u8 for VNNI).
