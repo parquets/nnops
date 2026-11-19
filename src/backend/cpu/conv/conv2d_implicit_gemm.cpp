@@ -264,6 +264,84 @@ void stem_conv_plane(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in, const T*
     });
 }
 
+// ---- the fused im2col + A pack (SME) ---------------------------------------
+
+#if defined(NNOPS_ARCH_SME)
+/// The im2col gather written straight into the ZA A layout. A ZA row is one
+/// pixel's channel run (NHWC, so it is contiguous) and the K columns come out
+/// of the tile vertically, so the gather and the transpose are one pass
+/// instead of a dense write, a ZA re-read and a second write.
+///
+/// f32 holds one K per lane. f16 packs a channel's K pair into one word, which
+/// needs an even channel count so a pair never straddles a tap — the caller
+/// checks that and falls back to the dense gather plus pack_a_f16_sme.
+template <class T>
+__arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
+inline void tile_im2col_pack_sme(T* dst, const T* in, int64_t in_row_stride, int64_t ic_stride,
+                                 int64_t p0, int OW, int mc, int IH, int IW, int KH, int KW,
+                                 int SH, int SW, int DH, int DW, int PH, int PW, int icnc,
+                                 int karea) noexcept
+{
+    constexpr bool f32 = std::is_same_v<T, float>;
+    constexpr int kRows = 2 * aarch64::sme_mr; // 32 pixels: one A block
+    constexpr int kChanStep = f32 ? 16 : 32;   // channels one ZA tile row spans
+    const svfloat32_t vzero = svdup_n_f32(0.0f);
+    int64_t base[kRows];
+    bool live[kRows];
+
+    for (int t = 0; t < karea; ++t) {
+        const int kh = t / KW;
+        const int kw = t - kh * KW;
+        for (int i = 0; i < mc; ++i) {
+            const int64_t p = p0 + i;
+            const int64_t oh = p / OW;
+            const int64_t ow = p - oh * OW;
+            const int64_t ih = oh * SH - PH + static_cast<int64_t>(kh) * DH;
+            const int64_t iw = ow * SW - PW + static_cast<int64_t>(kw) * DW;
+            live[i] = ih >= 0 && ih < IH && iw >= 0 && iw < IW;
+            base[i] = live[i] ? ih * in_row_stride + iw * ic_stride : 0;
+        }
+        for (int c0 = 0; c0 < icnc; c0 += kChanStep) {
+            const int lanes = f32 ? std::min(16, icnc - c0) :
+                                    std::min(16, (icnc - c0) / 2);
+            const svbool_t pc = svwhilelt_b32(0, lanes);
+            const int k0 = t * icnc + c0;
+            for (int pstart = 0; pstart < mc; pstart += aarch64::sme_mr) {
+                const int n = std::min(aarch64::sme_mr, mc - pstart);
+                for (int i = 0; i < n; ++i) {
+                    if (live[pstart + i]) {
+                        if constexpr (f32) {
+                            svld1_hor_za32(0, static_cast<uint32_t>(i), pc,
+                                           in + base[pstart + i] + c0);
+                        } else {
+                            svld1_hor_za32(0, static_cast<uint32_t>(i), pc,
+                                           reinterpret_cast<const uint32_t*>(in) +
+                                               (base[pstart + i] + c0) / 2);
+                        }
+                    } else {
+                        svwrite_hor_za32_f32_m(0, static_cast<uint32_t>(i), pc, vzero);
+                    }
+                }
+                const svbool_t pr = svwhilelt_b32(0, n);
+                if constexpr (f32) {
+                    for (int j = 0; j < lanes; ++j) {
+                        svst1_ver_za32(0, static_cast<uint32_t>(j), pr,
+                                       dst + static_cast<int64_t>(k0 + j) * kRows + pstart);
+                    }
+                } else {
+                    auto* const dw = reinterpret_cast<uint32_t*>(dst);
+                    for (int j = 0; j < lanes; ++j) {
+                        svst1_ver_za32(0, static_cast<uint32_t>(j), pr,
+                                       dw + static_cast<int64_t>(k0 / 2 + j) * kRows +
+                                           pstart);
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
+
 // ---- main kernel ----------------------------------------------------------
 
 template <class T>
@@ -756,19 +834,45 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
 
                         const T* a;
                         int lda;
+                        // The ZA route's gather writes the packed A layout
+                        // directly, so it needs no separate transpose pass.
+                        bool a_packed = false;
                         if (plan.pointwise) {
                             // The pixel is its own patch: A is the input run itself
                             // (contiguous across a row boundary only when flat).
                             a = in_g + oh * in_row_stride + ow0 * IC + icn;
                             lda = static_cast<int>(IC);
                         } else {
-                            tiled_im2col<T>(a_buf, kdim, in_g + icn, in_row_stride, IC,
+                            bool fused = false;
+#if defined(NNOPS_ARCH_SME)
+                            if constexpr (sme_dtype) {
+                                // f16 pairs two K values in a word: an odd
+                                // channel run would put a pair across two taps.
+                                fused = use_sme && (IC % 2 == 0) &&
+                                        (in_row_stride % 2 == 0) &&
+                                        (!std::is_same_v<T, half> || (icnc % 2) == 0);
+                            }
+#endif
+                            if (fused) {
+#if defined(NNOPS_ARCH_SME)
+                                tile_im2col_pack_sme<T>(
+                                    sme_a.data(), in_g + icn, in_row_stride, IC, p,
+                                    static_cast<int>(OW), mc, static_cast<int>(IH),
+                                    static_cast<int>(IW), KH, KW, SH, SW, DH, DW, PH, PW,
+                                    static_cast<int>(icnc), karea);
+                                a = sme_a.data();
+                                lda = kdim;
+                                a_packed = true;
+#endif
+                            } else {
+                                tiled_im2col<T>(a_buf, kdim, in_g + icn, in_row_stride, IC,
                                                          T{}, p, static_cast<int>(OW), flat, mc,
                                                          static_cast<int>(IH), static_cast<int>(IW),
                                                          KH, KW, SH, SW, DH, DW, PH, PW,
                                                          static_cast<int>(icnc), karea);
-                            a = a_buf;
-                            lda = kdim;
+                                a = a_buf;
+                                lda = kdim;
+                            }
                         }
 
                         T* const tile = out_g + oh * out_row_stride + ow0 * OC + ocn;
@@ -803,7 +907,9 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
 #if defined(NNOPS_ARCH_SME)
                         if constexpr (sme_dtype) {
                             if (use_sme) {
-                                tile_pack_lhs_sme(false, mc, kdim, sme_a.data(), a, lda);
+                                if (!a_packed) {
+                                    tile_pack_lhs_sme(false, mc, kdim, sme_a.data(), a, lda);
+                                }
                                 tile_mma_pack_sme(
                                     mc, static_cast<int>(ocnc), kdim, tile,
                                     static_cast<int>(OC), sme_a.data(), b_panel, sme_stride,
