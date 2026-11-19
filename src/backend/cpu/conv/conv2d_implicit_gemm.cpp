@@ -340,6 +340,82 @@ inline void tile_im2col_pack_sme(T* dst, const T* in, int64_t in_row_stride, int
         }
     }
 }
+
+/// The quantized twin: a ZA row is one pixel's channel run (four channels a
+/// word), so a tap's 64-byte run per pixel is one `ld1_hor_za32` into that
+/// pixel's row, and the K groups come out of the tile vertically into
+/// [m/16][k/4][64]. The gather and the A pack are one pass, as in the float
+/// form — the source must already be signed (@p xr applied upstream) and four
+/// bytes wide per k group, and pixels outside the input read @p fill.
+__arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
+inline void tile_im2col_pack_i8_sme(int8_t* dst, const int8_t* in, int64_t in_row_stride,
+                                    int64_t ic_stride, int8_t fill, int64_t p0, int OW, int mc,
+                                    int IH, int IW, int KH, int KW, int SH, int SW, int DH,
+                                    int DW, int PH, int PW, int icnc, int karea) noexcept
+{
+    constexpr int kRows = aarch64::sme_mr;      // 16 pixels: one A panel
+    constexpr int kChanMax = 64;                // bytes one ZA tile row spans
+    constexpr int kMaxPix = 2 * aarch64::sme_mr; // one tile's pixels
+    const int64_t groups = static_cast<int64_t>(karea) * icnc / 4;
+    int8_t fill_row[kChanMax];
+    // Per pixel: the patch's top-left corner. A tap is then two adds and two
+    // range tests, not a divide, per pixel.
+    int32_t ih0[kMaxPix];
+    int32_t iw0[kMaxPix];
+    std::memset(fill_row, static_cast<int>(static_cast<uint8_t>(fill)), sizeof(fill_row));
+
+    {
+        int64_t oh = p0 / OW;
+        int64_t ow = p0 - oh * OW;
+        for (int i = 0; i < mc; ++i, ++ow) {
+            if (ow == OW) {
+                ow = 0;
+                ++oh;
+            }
+            ih0[i] = static_cast<int32_t>(oh * SH - PH);
+            iw0[i] = static_cast<int32_t>(ow * SW - PW);
+        }
+    }
+
+    for (int t = 0; t < karea; ++t) {
+        const int kh = t / KW;
+        const int kw = t - kh * KW;
+        const int trow = kh * DH;
+        const int tcol = kw * DW;
+        int64_t base[kMaxPix];
+        bool live[kMaxPix];
+        for (int i = 0; i < mc; ++i) {
+            const int ih = ih0[i] + trow;
+            const int iw = iw0[i] + tcol;
+            live[i] = ih >= 0 && ih < IH && iw >= 0 && iw < IW;
+            base[i] = live[i] ? static_cast<int64_t>(ih) * in_row_stride +
+                                    static_cast<int64_t>(iw) * ic_stride :
+                                0;
+        }
+        for (int c0 = 0; c0 < icnc; c0 += kChanMax) {
+            const int words = std::min(kChanMax, icnc - c0) / 4;
+            const svbool_t pc = svwhilelt_b32(0, words);
+            for (int pstart = 0; pstart < mc; pstart += kRows) {
+                const int n = std::min(kRows, mc - pstart);
+                for (int i = 0; i < n; ++i) {
+                    const int8_t* const src = live[pstart + i] ?
+                                                  in + base[pstart + i] + c0 :
+                                                  fill_row;
+                    svld1_hor_za32(0, static_cast<uint32_t>(i), pc,
+                                   reinterpret_cast<const uint32_t*>(src));
+                }
+                const svbool_t pr = svwhilelt_b32(0, n);
+                auto* const dw = reinterpret_cast<int32_t*>(dst);
+                const int64_t blk = static_cast<int64_t>(pstart / kRows) * groups;
+                for (int j = 0; j < words; ++j) {
+                    svst1_ver_za32(0, static_cast<uint32_t>(j), pr,
+                                   dw + (blk + static_cast<int64_t>(t) * icnc / 4 + c0 / 4 + j) *
+                                            aarch64::sme_mr);
+                }
+            }
+        }
+    }
+}
 #endif
 
 // ---- main kernel ----------------------------------------------------------
@@ -1004,7 +1080,15 @@ void materialize_plane(const TensorView& in, int8_t* dst, float scale, int32_t z
             int8_t* d = dst + e;
             const TAct* p = src + row * rs + off;
             if constexpr (kPreQuant) {
-                for (int64_t j = 0; j < len; ++j) {
+                int64_t j = 0;
+#if defined(__ARM_NEON)
+                const uint8x16_t m = vdupq_n_u8(0x80);
+                for (; j + 16 <= len; j += 16) {
+                    vst1q_u8(reinterpret_cast<uint8_t*>(d + j),
+                             veorq_u8(vld1q_u8(reinterpret_cast<const uint8_t*>(p + j)), m));
+                }
+#endif
+                for (; j < len; ++j) {
                     d[j] = static_cast<int8_t>(static_cast<uint8_t>(p[j]) ^ 0x80u);
                 }
             } else {
@@ -1466,12 +1550,26 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                         {
                             const uint8_t* const in_row = in_g + oh * in_row_stride;
 
+                            // The SME route gathers straight into the packed A
+                            // panel (one ZA row per pixel), which needs signed
+                            // bytes in whole k groups — a u8 source comes in
+                            // shifted through the materialized plane.
+                            bool fused_pack = false;
+#if defined(NNOPS_ARCH_SME)
+                            fused_pack = use_sme && !direct_a && xr == 0 && (icnc % 4) == 0 &&
+                                         (IC % 4) == 0 && (in_row_stride % 4) == 0 &&
+                                         (reinterpret_cast<uintptr_t>(in_g + icn) % 4) == 0;
+#endif
+
                             const int8_t* a;
                             int lda;
                             if (direct_a) {
                                 // The pixel is its own patch: A is the input run.
                                 a = reinterpret_cast<const int8_t*>(in_row + ow0 * IC + icn);
                                 lda = static_cast<int>(IC);
+                            } else if (fused_pack) {
+                                a = nullptr;
+                                lda = 0;
                             } else {
                                 tiled_im2col_i8(
                                     a_buf, kdim4, in_g + icn, in_row_stride, IC, xr,
@@ -1495,8 +1593,20 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                             bool mma_sme = false;
 #if defined(NNOPS_ARCH_SME)
                             if (use_sme) {
-                                tile_pack_lhs_i8_sme(false, mc, kdim4, sme_a.data(), a, lda,
-                                                     a_biased);
+                                if (fused_pack) {
+                                    tile_im2col_pack_i8_sme(
+                                        sme_a.data(),
+                                        reinterpret_cast<const int8_t*>(in_g + icn),
+                                        in_row_stride, IC,
+                                        static_cast<int8_t>(static_cast<uint8_t>(
+                                            (plane ? zp_x + d : zp_x) ^ xr)),
+                                        p, static_cast<int>(OW), mc, static_cast<int>(IH),
+                                        static_cast<int>(IW), KH, KW, SH, SW, DH, DW, PH, PW,
+                                        static_cast<int>(icnc), karea);
+                                } else {
+                                    tile_pack_lhs_i8_sme(false, mc, kdim4, sme_a.data(), a, lda,
+                                                         a_biased);
+                                }
                                 tile_mma_pack_i8_sme(
                                     mc, static_cast<int>(ocnc), kdim4, acc_tile,
                                     static_cast<int>(ocn_block), sme_a.data(), b_panel,
@@ -1740,7 +1850,16 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     const bool sme_route = !quant &&
                            (sme_blob || (!prepacked && aarch64::available_sme() &&
                                          oc_per_group >= aarch64::sme_fp_nr));
-    plan.m_block = sme_route ? 2 * aarch64::sme_mr : kMBlock;
+    // The int8 route's SMOPA tile is the same two 16-row faces, and a 24-pixel
+    // kMBlock leaves the second face half dead on every tile (a 24-row tile
+    // and a 32-row one cost the same). Narrow rows keep 24: below 16 output
+    // pixels a tile straddles rows on almost every step and the gather's
+    // row-merge no longer pays.
+    const bool sme_i8_route = quant &&
+                              (sme_blob || (!prepacked && aarch64::available_sme() &&
+                                            oc_per_group >= aarch64::sme_nr_max));
+    const bool sme_i8_wide = sme_i8_route && out.dims[3] >= 2 * aarch64::sme_mr;
+    plan.m_block = (sme_route || sme_i8_wide) ? 2 * aarch64::sme_mr : kMBlock;
 #else
     plan.m_block = kMBlock;
 #endif
@@ -1841,10 +1960,18 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     // The int32 accumulator is a per-slot tile set shaped like the residual.
     plan.acc_size = quant ? pass_tiles * plan.ocn_block : 0;
     // An fp activation is materialized into a compact s8 NHWC plane once per
-    // call. A pre-quantized u8 one is materialized too
-    // when it takes the pointwise route, whose in-row A read cannot shift bytes.
+    // call. A pre-quantized u8 one is materialized too when it takes the
+    // pointwise route (whose in-row A read cannot shift bytes) or the SME one,
+    // whose gather packs A straight out of ZA rows and so cannot shift either.
+#if defined(NNOPS_ARCH_SME)
+    const bool sme_i8_plane = !prepacked && aarch64::available_sme() &&
+                              oc_per_group >= aarch64::sme_nr_max;
+#else
+    constexpr bool sme_i8_plane = false;
+#endif
     const bool fp_act = (dt == DataType::f32 || dt == DataType::f16);
-    plan.quant_size = (quant && (fp_act || (dt == DataType::u8 && plan.pointwise))) ?
+    plan.quant_size = (quant && (fp_act || (dt == DataType::u8 &&
+                                            (plan.pointwise || sme_blob || sme_i8_plane)))) ?
                           N * in.dims[2] * in.dims[3] * IC :
                           0;
 
@@ -2211,14 +2338,15 @@ ConvPackedWeight conv_packed_weight_sme(const Conv2DAttributes& attrs, int64_t i
     // store and setup: 16 channels of a 3x3 is 144, and the tile ran at
     // 1050 GFLOPS against 1560 at 576.
     constexpr int64_t kSmeIcMin = 32;
-    // int8 keeps the panel ladder's block: its K loop is the same four-K group,
-    // and the SMOPA tile already reads its A through the ZA pack.
+    // int8 runs the group's whole K in one pass: the SMOPA tile wants a long K
+    // loop, and every k block is another gather, another A pack and another
+    // read-modify-write of the whole accumulator tile set.
     g.icn_block =
-        unit_1x1 ? ic_per_group :
-        std::min<int64_t>(q8 ? impl::get_ic_block(karea, ic_per_group) :
-                               std::max<int64_t>(
-                                   impl::get_ic_block(karea, ic_per_group), kSmeIcMin),
-                          ic_per_group);
+        (unit_1x1 || q8) ?
+            ic_per_group :
+            std::min<int64_t>(
+                std::max<int64_t>(impl::get_ic_block(karea, ic_per_group), kSmeIcMin),
+                ic_per_group);
     // The task N tile is a whole number of 32-column ZA blocks.
     const int64_t oc_tile = std::min<int64_t>(oc_per_group, impl::kOcnBlock);
     g.ocn_block = ((oc_tile + g.nr - 1) / g.nr) * g.nr;
