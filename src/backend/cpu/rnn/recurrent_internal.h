@@ -22,6 +22,9 @@
 #include "backend/cpu/common/memory_pool.hpp"
 #include "backend/cpu/matmul/matmul.h"
 #include "backend/cpu/matmul/matmul_helper.h"
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"
+#endif
 #include "backend/cpu/simd_kernel/activation_kernels.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -148,11 +151,50 @@ inline int64_t packed_b_numel(int64_t n, int64_t total) noexcept
     return ((total + n - 1) / n) * n;
 }
 
-template <typename T> TensorView packed_view(int64_t n, int64_t total, T* data) noexcept
+template <typename T>
+TensorView packed_view(int64_t n, int64_t total, T* data,
+                       TensorLayout layout = TensorLayout::PackedB) noexcept
 {
     int64_t shape[2] = {n, packed_b_numel(n, total) / n};
     return TensorView(std::span<const int64_t>(shape, 2), dtype_of<T>(), data,
-                      shape[1] * static_cast<int64_t>(sizeof(T)));
+                      shape[1] * static_cast<int64_t>(sizeof(T)), layout);
+}
+
+/// The projection weight's packed geometry. The ZA B blocks when the tiles are
+/// available: the input projection is a plain GEMM over a chunk of timesteps,
+/// which is exactly what those kernels are for. R stays on the NEON panels —
+/// its product is one timestep's batch rows, too short for a 16-row tile.
+inline MatMulPackedB w_pack_geom(int64_t cols, int64_t input, DataType dt) noexcept
+{
+#if defined(NNOPS_ARCH_SME)
+    const MatMulPackedB g = matmul_packed_b_sme_geom(cols, input, dt);
+    if (g.ok()) {
+        return g;
+    }
+#endif
+    return matmul_packed_b_geom(cols, input, dt);
+}
+
+/// True when @p g is the ZA geometry (the panel width is the tile's).
+inline bool w_pack_is_za(const MatMulPackedB& g) noexcept
+{
+#if defined(NNOPS_ARCH_SME)
+    return g.ok() && g.nr == aarch64::sme_fp_nr;
+#else
+    (void)g;
+    return false;
+#endif
+}
+
+/// The same question for a caller that only kept the panel width.
+inline bool w_nr_is_za(int64_t nr) noexcept
+{
+#if defined(NNOPS_ARCH_SME)
+    return nr == aarch64::sme_fp_nr;
+#else
+    (void)nr;
+    return false;
+#endif
 }
 
 // =========================================================================

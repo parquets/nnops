@@ -418,9 +418,11 @@ void pack_fp_weights(const Run<T>& run, int64_t d, Arena& arena, const ComputeCo
     {
         int64_t sh[2] = {plan.total_cols, run.I};
         TensorView rv(std::span<const int64_t>(sh, 2), run.p.dtype, raw, run.I * esz);
-        TensorView pv =
-            packed_view(plan.total_cols, plan.wgeo.total,
-                        arena.take<T>(packed_b_numel(plan.total_cols, plan.wgeo.total)));
+        TensorView pv = packed_view(plan.total_cols, plan.wgeo.total,
+                                    arena.take<T>(packed_b_numel(plan.total_cols,
+                                                                 plan.wgeo.total)),
+                                    w_pack_is_za(plan.wgeo) ? TensorLayout::PackedBSme :
+                                                              TensorLayout::PackedB);
         matmul_packed_b_pack(rv, pv, /*transpose_b=*/true, ctx);
         dw.w = pv.ptr<T>();
     }

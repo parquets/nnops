@@ -334,6 +334,17 @@ NNOPS_BENCH(lstm_f32_wide) {
     bench_case({"lstm f32 T16 B2 I256 H256", RecurrentMode::Lstm, 16, 2, 256, 256});
 }
 
+NNOPS_BENCH(lstm_f32_projection) {
+    // A long chunk over wide layers: the input projection is a real GEMM
+    // (chunk x 4H x I) and the place the ZA tiles can pay for themselves.
+    bench_case({"lstm f32 T64 B4 I1024 H1024", RecurrentMode::Lstm, 64, 4, 1024, 1024});
+}
+
+NNOPS_BENCH(lstm_f16_projection) {
+    bench_case({"lstm f16 T64 B4 I1024 H1024", RecurrentMode::Lstm, 64, 4, 1024, 1024,
+                RnnDirection::Forward, /*f16=*/true});
+}
+
 NNOPS_BENCH(lstm_f32_bidirectional) {
     bench_case({"lstm f32 bidir T32 B2 I128 H128", RecurrentMode::Lstm, 32, 2, 128, 128,
                 RnnDirection::Bidirectional});

@@ -122,7 +122,7 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
     }
 
     if (!plan.q8) {
-        plan.wgeo = matmul_packed_b_geom(plan.total_cols, p.input, p.dtype);
+        plan.wgeo = w_pack_geom(plan.total_cols, p.input, p.dtype);
         if (!plan.wgeo.ok()) {
             return Status::invalid_argument;
         }

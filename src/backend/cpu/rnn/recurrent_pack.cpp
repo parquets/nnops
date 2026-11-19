@@ -54,7 +54,7 @@ PackedWeightOffsets packed_weight_offsets(const RecurrentPackedHeader& h) noexce
     // A panel region is np·ldd, which is k rounded up to nr — not k, so the
     // geometry call, not the raw extent, is what sizes it.
     const DataType dt = static_cast<DataType>(h.dtype);
-    const MatMulPackedB wg = matmul_packed_b_geom(h.total_cols, h.input, dt);
+    const MatMulPackedB wg = w_pack_geom(h.total_cols, h.input, dt);
     o.w = take(packed_b_numel(h.total_cols, wg.total));
     for (int64_t ph = 0; ph < h.nphases; ++ph) {
         const MatMulPackedB rg = matmul_packed_b_geom(h.phase_cols[ph], h.hidden, dt);
@@ -123,8 +123,10 @@ void pack_direction(const RecurrentParams& p, const RecurrentPackedHeader& h, co
         int64_t sh[2] = {h.total_cols, I};
         TensorView rv(std::span<const int64_t>(sh, 2), dt, raw,
                       I * static_cast<int64_t>(sizeof(T)));
-        const MatMulPackedB wg = matmul_packed_b_geom(h.total_cols, I, dt);
-        TensorView pv = packed_view(h.total_cols, wg.total, reinterpret_cast<T*>(base + o.w));
+        const MatMulPackedB wg = w_pack_geom(h.total_cols, I, dt);
+        TensorView pv = packed_view(h.total_cols, wg.total, reinterpret_cast<T*>(base + o.w),
+                                    w_pack_is_za(wg) ? TensorLayout::PackedBSme :
+                                                       TensorLayout::PackedB);
         matmul_packed_b_pack(rv, pv, /*transpose_b=*/true, ctx);
     }
 

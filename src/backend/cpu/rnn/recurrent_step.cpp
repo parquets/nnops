@@ -382,6 +382,13 @@ void project_chunk(const T* x, int64_t x_ld, T* c, int64_t ldc, const T* packed_
         mc -= 8;
     }
     const int64_t m_blocks = (rows + mc - 1) / mc;
+#if defined(NNOPS_ARCH_SME)
+    // The ZA geometry: W prepacked in 32-column blocks, so the projection runs
+    // through the tiled kernel with one packed A block per (m block, k block).
+    const bool za = w_nr_is_za(w_nr);
+#else
+    constexpr bool za = false;
+#endif
 
     auto body = [&](int64_t task) {
         const int64_t m0 = (task / n_blocks) * mc;
@@ -395,9 +402,37 @@ void project_chunk(const T* x, int64_t x_ld, T* c, int64_t ldc, const T* packed_
         T* c_tile = c + m0 * ldc + n0;
         const T* a = x + m0 * x_ld;
         const T* b_panel = packed_w + (n0 / w_nr) * w_ldd;
+#if defined(NNOPS_ARCH_SME)
+        PoolArray<T> a_packed;  // the ZA path's packed A, per (m block, k block)
+        if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
+            if (za) {
+                constexpr int64_t kZaRows = 2 * aarch64::sme_mr;
+                a_packed.reset(static_cast<size_t>(((mcnt + kZaRows - 1) / kZaRows) *
+                                                   kZaRows * kc));
+            }
+        }
+#endif
 
         for (int64_t k = 0; k < input; k += kc) {
             const int64_t kcnt = std::min<int64_t>(kc, input - k);
+#if defined(NNOPS_ARCH_SME)
+            if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
+                if (za) {
+                    // Whole-K blob: this k block starts `sme_b_k_offset` into
+                    // the panel, and the kernel strides 32 columns at a time.
+                    const DataType dt =
+                        std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+                    tile_pack_lhs_sme(false, static_cast<int>(mcnt), static_cast<int>(kcnt),
+                                      a_packed.data(), a + k, static_cast<int>(x_ld));
+                    tile_mma_pack_sme(static_cast<int>(mcnt), static_cast<int>(ncnt),
+                                      static_cast<int>(kcnt), c_tile, static_cast<int>(ldc),
+                                      a_packed.data(), b_panel + sme_b_k_offset(dt, k), w_ldd,
+                                      -INFINITY, INFINITY, /*zero_mode=*/k == 0,
+                                      /*col_bias=*/nullptr);
+                    continue;
+                }
+            }
+#endif
             tile_mma_direct(static_cast<int>(mcnt), static_cast<int>(ncnt), static_cast<int>(kcnt),
                             c_tile, static_cast<int>(ldc), a + k, static_cast<int>(x_ld),
                             b_panel + k * w_nr, -w_ldd, /*stage=*/nullptr, -INFINITY, INFINITY,
