@@ -460,10 +460,7 @@ inline void tile_im2col_pack_i8_sme(int8_t* dst, const int8_t* in, int64_t in_ro
                 if (n == kRows) {
                     for (; j + 4 <= words; j += 4) {
                         const svint32x4_t g = svread_ver_za32_s32_vg4(0, static_cast<uint32_t>(j));
-                        svst1_s32_x2(svptrue_c32(), dw + (bjat + j) * aarch64::sme_mr,
-                                     svcreate2_s32(svget4_s32(g, 0), svget4_s32(g, 1)));
-                        svst1_s32_x2(svptrue_c32(), dw + (bjat + j + 2) * aarch64::sme_mr,
-                                     svcreate2_s32(svget4_s32(g, 2), svget4_s32(g, 3)));
+                        svst1_s32_x4(svptrue_c32(), dw + (bjat + j) * aarch64::sme_mr, g);
                     }
                 }
                 for (; j < words; ++j) {
@@ -1571,6 +1568,9 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
         const bool flat =
             out_row_stride == OW * OC && (!plan.pointwise || in_row_stride == IW * IC);
 
+#if defined(NNOPS_ARCH_SME)
+        [[maybe_unused]] std::vector<float> bias_f;
+#endif
         // Same block-end clamp and step as the fp route: the blob holds one oc
         // block at a time and the kernel walks its panels at `slot` apart.
         const auto block_end = [&](int64_t ocn) {
@@ -1586,17 +1586,21 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                 qw.scale_data ? qw.scale_data + g * oc_per_group + ocn : nullptr;
             // The fused store takes the bias in the float domain; a half bias
             // (which the dequantizing pass widens per element) widens once here.
-            [[maybe_unused]] float bias_f[kOcnBlock];
             [[maybe_unused]] const float* col_bias_f = nullptr;
 #if defined(NNOPS_ARCH_SME)
             if (epi_fused && bias_g != nullptr) {
                 if constexpr (std::is_same_v<TOut, float>) {
                     col_bias_f = bias_g + ocn;
                 } else {
+                    // Sized by the tile, not by kOcnBlock: the int8 route's N
+                    // tile is the whole group width.
+                    if (bias_f.size() < static_cast<size_t>(ocnc)) {
+                        bias_f.resize(static_cast<size_t>(ocnc));
+                    }
                     for (int64_t j = 0; j < ocnc; ++j) {
                         bias_f[j] = static_cast<float>(bias_g[ocn + j]);
                     }
-                    col_bias_f = bias_f;
+                    col_bias_f = bias_f.data();
                 }
             }
 #endif
@@ -2512,8 +2516,11 @@ ConvPackedWeight conv_packed_weight_sme(const Conv2DAttributes& attrs, int64_t i
             std::min<int64_t>(
                 std::max<int64_t>(impl::get_ic_block(karea, ic_per_group), kSmeIcMin),
                 ic_per_group);
-    // The task N tile is a whole number of 32-column ZA blocks.
-    const int64_t oc_tile = std::min<int64_t>(oc_per_group, impl::kOcnBlock);
+    // The task N tile is a whole number of 32-column ZA blocks. The int8 route
+    // takes the group's whole width: its A panel is gathered once per task and
+    // every extra oc block re-gathers the same tile, so a 512-channel group
+    // packed as four 128-column blocks paid for the im2col four times.
+    const int64_t oc_tile = q8 ? oc_per_group : std::min<int64_t>(oc_per_group, impl::kOcnBlock);
     g.ocn_block = ((oc_tile + g.nr - 1) / g.nr) * g.nr;
     g.kdim_max = g.icn_block * karea;
     g.nfull_ic = ic_per_group / g.icn_block;
