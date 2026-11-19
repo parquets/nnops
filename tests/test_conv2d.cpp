@@ -1591,6 +1591,72 @@ NNOPS_TEST(conv2d_i8_hand_exact) {
     }
 }
 
+NNOPS_TEST(conv2d_i8_mixed_float_refused) {
+    // A quantized filter quantizes its activation per call and requantizes into
+    // the same float, so a floating-point activation and output are one type.
+    // getOutputTensorDesc answers an fp activation with the activation's dtype
+    // whatever output_dtype says; a view asking for the other float type is
+    // refused rather than converted.
+    const int64_t IC = 4, IH = 6, OC = 8;
+    const int64_t ishape[] = {1, IC, IH, IH};   // NCHW dims, NHWC layout
+    const int64_t wshape[] = {3, 3, IC, OC};    // HWIO
+    const int64_t oshape[] = {1, OC, IH - 2, IH - 2};
+
+    std::vector<float> act_f32(static_cast<size_t>(IC) * IH * IH, 0.25f);
+    std::vector<half> act_f16(act_f32.size(), float_to_half(0.25f));
+    std::vector<uint8_t> act_u8(act_f32.size(), 128);
+    std::vector<int8_t> wt(3 * 3 * IC * OC, 3);
+    std::vector<float> ws(static_cast<size_t>(OC), 0.01f);
+    std::vector<int32_t> wz(static_cast<size_t>(OC), 0);
+    const size_t out_n = static_cast<size_t>(OC) * (IH - 2) * (IH - 2);
+    std::vector<float> out_f32(out_n, 0.f);
+    std::vector<half> out_f16(out_n, float_to_half(0.f));
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {1, 1};
+    attrs.padding = {0, 0};
+    auto op = Conv2D::create(attrs, Backend::CPU);
+
+    TensorView wv(wshape, DataType::s8, wt.data(), TensorLayout::HWIO,
+                  per_channel(ws.data(), wz.data(), OC));
+    auto input = [&](DataType dt) {
+        switch (dt) {
+        case DataType::f32:
+            return TensorView(ishape, DataType::f32, act_f32.data(), TensorLayout::NHWC);
+        case DataType::f16:
+            return TensorView(ishape, DataType::f16, act_f16.data(), TensorLayout::NHWC);
+        default:
+            return TensorView(ishape, DataType::u8, act_u8.data(), TensorLayout::NHWC,
+                              per_tensor(1.f / 255, 128));
+        }
+    };
+    auto run = [&](DataType in_dt, DataType out_dt) {
+        const TensorView ins[] = {input(in_dt), wv};
+        TensorView out = out_dt == DataType::f16
+                             ? TensorView(oshape, DataType::f16, out_f16.data(),
+                                          TensorLayout::NHWC)
+                             : TensorView(oshape, DataType::f32, out_f32.data(),
+                                          TensorLayout::NHWC);
+        return op->compute(out, ins, {}, nullptr);
+    };
+
+    // The matching pairs, and an integer activation with either fp output.
+    NNOPS_EXPECT_EQ(run(DataType::f32, DataType::f32), Status::ok);
+    NNOPS_EXPECT_EQ(run(DataType::f16, DataType::f16), Status::ok);
+    NNOPS_EXPECT_EQ(run(DataType::u8, DataType::f32), Status::ok);
+    NNOPS_EXPECT_EQ(run(DataType::u8, DataType::f16), Status::ok);
+
+    // The mixed ones are not routed, not converted.
+    NNOPS_EXPECT_EQ(run(DataType::f16, DataType::f32), Status::unsupported);
+    NNOPS_EXPECT_EQ(run(DataType::f32, DataType::f16), Status::unsupported);
+
+    // The descriptor already answers with the activation's dtype, which is why
+    // the mixed pair only shows up when a caller hands over its own view.
+    const TensorDesc f16_descs[] = {input(DataType::f16).desc(), wv.desc()};
+    NNOPS_EXPECT_EQ(op->getOutputTensorDesc(f16_descs)[0].dtype, DataType::f16);
+}
+
 NNOPS_TEST(conv2d_i8_matches_ref_all_routes) {
     std::vector<QCase> cases;
     auto add = [&](QCase c) { cases.push_back(c); };
@@ -1627,7 +1693,9 @@ NNOPS_TEST(conv2d_i8_matches_ref_all_routes) {
     { QCase c; c.ishape = {1, 4, 8, 8}; c.wshape = {8, 4, 3, 3}; c.kh = c.kw = 3;
       c.act = DataType::f16; c.out = DataType::f16; c.act_q = DataType::u8;
       c.zp_x = 117; add(c); }
-    // ---- f16 activation → f32 output -------------------------------------
+    // ---- an fp activation ignores output_dtype: asking for f32 here still
+    //      resolves to f16, so this case runs f16 → f16 (the mixed pair itself
+    //      is refused; see conv2d_i8_mixed_float_refused) ------------------
     { QCase c; c.ishape = {1, 3, 6, 6}; c.wshape = {4, 3, 3, 3}; c.kh = c.kw = 3;
       c.act = DataType::f16; c.out = DataType::f32; c.act_q = DataType::s8; add(c); }
     // ---- 1x1 pointwise, pre-quantized u8 (the materialized plane) --------

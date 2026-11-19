@@ -102,8 +102,11 @@ struct Conv2DAttributes {
     /// Quantized-route output dtype.
     ///   f32 (default) / f16: dequantize the int32 accumulate. With an fp
     ///                        activation the output follows the activation's
-    ///                        dtype and this value is ignored; with a
-    ///                        pre-quantized (u8/s8) activation it is honoured.
+    ///                        dtype and this value is ignored — the two must be
+    ///                        one float type, so an f16 activation against an
+    ///                        f32 output (or the reverse) is unsupported, not
+    ///                        converted. With a pre-quantized (u8/s8) activation
+    ///                        this value is honoured.
     ///   s8 / u8:             requantize with the output's QuantParams (scale
     ///                        s_w·s_x/out_scale, round half away from zero,
     ///                        clamped to the storage range; the product is f32).

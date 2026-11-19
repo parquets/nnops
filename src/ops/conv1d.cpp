@@ -61,8 +61,22 @@ Status Conv1D::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_rank(inputs[1].rank, 3, 3));
 
     // A raw HWIO filter only: the packed and Winograd forms describe a 2D kernel.
-    return detail::require(is_channel_last(inputs[0].layout) &&
-                           is_channel_last_weight(inputs[1].layout));
+    NNOPS_TRY(detail::require(is_channel_last(inputs[0].layout) &&
+                              is_channel_last_weight(inputs[1].layout)));
+
+    // Same rule as Conv2D: a quantized filter's floating-point activation and
+    // output are one type, since the route quantizes the activation per call
+    // and requantizes into that same float.
+    if (is_quantized_conv1d(inputs[1].dtype) && !outputs.empty()) {
+        const DataType act = inputs[0].dtype;
+        const DataType odt = outputs[0].dtype;
+        const bool fp_act = act == DataType::f32 || act == DataType::f16;
+        const bool fp_out = odt == DataType::f32 || odt == DataType::f16;
+        if (fp_act && fp_out && odt != act) {
+            return Status::unsupported;
+        }
+    }
+    return Status::ok;
 }
 
 Status Conv1D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

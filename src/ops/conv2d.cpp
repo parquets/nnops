@@ -197,6 +197,22 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
                               wl == TensorLayout::PackedHWIO ||
                               wl == TensorLayout::PackedHWIOSme));
 
+    // A quantized filter quantizes its activation per call and requantizes into
+    // the same float, so a floating-point activation and output are one type:
+    // there is no f16-in/f32-out (or f32-in/f16-out) route to fall back on.
+    // getOutputTensorDesc already reports the activation's dtype for such a
+    // call, so this refuses the view that asks for the other one instead of
+    // converting it silently.
+    if (is_quantized_conv2d(inputs[1].dtype) && !outputs.empty()) {
+        const DataType act = inputs[0].dtype;
+        const DataType odt = outputs[0].dtype;
+        const bool fp_act = act == DataType::f32 || act == DataType::f16;
+        const bool fp_out = odt == DataType::f32 || odt == DataType::f16;
+        if (fp_act && fp_out && odt != act) {
+            return Status::unsupported;
+        }
+    }
+
     // A pre-activation residual is implemented by every fp CPU route (both
     // layouts, the depthwise reroute and Winograd) and the reference. Refusing
     // the other routes beats silently applying the residual on the wrong side
