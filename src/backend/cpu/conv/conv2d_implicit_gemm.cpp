@@ -1097,7 +1097,16 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
     // per-tile scalar A pack and 64-column blocks lose to the NEON panels at
     // every width (about 2x on the 3x3 256/512 layers). The tiled MatMul route
     // still serves the int8 GEMMs the transpose-conv path issues.
+#if defined(NNOPS_ARCH_SME)
+    // The SMOPA tiles are 16 rows x 64 columns: one pass is four 16-column
+    // groups, so the filter has to fill them. A caller's packed blob is the
+    // NEON panels and has no reader here — the ZA route builds its own shared
+    // prepack from the raw filter.
+    const bool use_sme = !prepacked && aarch64::available_sme() &&
+                         oc_per_group >= aarch64::sme_nr_max;
+#else
     constexpr bool use_sme = false;
+#endif
 
     const int KH = static_cast<int>(attrs.kernel_size[0]);
     const int KW = static_cast<int>(attrs.kernel_size[1]);
