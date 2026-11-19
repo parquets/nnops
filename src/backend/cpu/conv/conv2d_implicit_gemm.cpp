@@ -2443,8 +2443,12 @@ ConvPackedWeight conv_packed_weight(const Conv2DAttributes& attrs, int64_t ic_pe
     // short to amortise the per-call store and setup — 1050 GFLOPS at 144
     // against 1560 at 576.
     constexpr int64_t kSmeIcMin = 32;
+    // The quantized route takes the group's whole K as well. Its side of the
+    // trade is the gather: the nine-tap addressing is per pixel and per tap, so
+    // a 32-channel block pays it once per block -- eight times for a 256-channel
+    // 3x3. Whole-K measured 15% off all six ResNet18 shapes.
     g.icn_block =
-        unit_1x1 ? ic_per_group :
+        (unit_1x1 || quant) ? ic_per_group :
                    std::min<int64_t>(std::max<int64_t>(
                                          impl::get_ic_block(karea, ic_per_group), kSmeIcMin),
                                      ic_per_group);
