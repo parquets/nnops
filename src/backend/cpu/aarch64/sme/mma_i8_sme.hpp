@@ -206,10 +206,11 @@ inline void mma_i8_sme(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t
     if (col_bias != nullptr) {                                                            \
         out_ = svadd_f32_x(pg_, out_, (bi_));                                             \
     }                                                                                     \
-    if (clip_lo) {                                                                            \
+    if (clip_lo && clip_hi) {                                                                 \
+        out_ = svclamp_f32(out_, vlo, vhi);                                                   \
+    } else if (clip_lo) {                                                                     \
         out_ = svmax_f32_x(pg_, out_, vlo);                                                   \
-    }                                                                                         \
-    if (clip_hi) {                                                                            \
+    } else if (clip_hi) {                                                                     \
         out_ = svmin_f32_x(pg_, out_, vhi);                                                   \
     }
 
