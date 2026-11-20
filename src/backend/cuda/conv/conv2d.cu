@@ -299,6 +299,14 @@ __device__ inline Elem* conv_out_addr(const ConvParams& p, int64_t base, int pix
            int64_t(n) * p.out_c;
 }
 
+/// The same address when the caller already decoded the pixel: an epilogue
+/// walking several channels of one output pixel pays the division once.
+template <class Elem>
+__device__ inline Elem* conv_row_addr(const ConvParams& p, int64_t row_base, int n)
+{
+    return static_cast<Elem*>(p.output) + row_base + int64_t(n) * p.out_c;
+}
+
 /// Post-accumulation store, including the residual an add_to conv adds after
 /// the activation.
 template <class Elem>
@@ -1176,6 +1184,12 @@ void conv_gemm_i8_kernel(ConvParams p)
                 if (m >= M) {
                     continue;
                 }
+                // One pixel, several channels: the decode is paid here rather
+                // than in every store's address.
+                const int oh = m / p.ow;
+                const int ow = m - oh * p.ow;
+                const int64_t row_base =
+                    out_base + int64_t(oh) * p.out_h + int64_t(ow) * p.out_w;
 #pragma unroll
                 for (int cc = 0; cc < 2; ++cc) {
                     const int n = gn + cc;
@@ -1204,10 +1218,10 @@ void conv_gemm_i8_kernel(ConvParams p)
                         const float s_w = p.sc_w != nullptr ? p.sc_w[gi + n] : p.sc_w_scalar;
                         const float row_k = s_w / p.out_scale;
                         if (kind == I8OutKind::S8) {
-                            *conv_out_addr<int8_t>(p, out_base, m, n) = detail::i8_requant<int8_t>(
+                            *conv_row_addr<int8_t>(p, row_base, n) = detail::i8_requant<int8_t>(
                                 v, row_k, p.sc_x, float(p.out_zp));
                         } else {
-                            *conv_out_addr<uint8_t>(p, out_base, m, n) = detail::i8_requant<uint8_t>(
+                            *conv_row_addr<uint8_t>(p, row_base, n) = detail::i8_requant<uint8_t>(
                                 v, row_k, p.sc_x, float(p.out_zp));
                         }
                         break;
@@ -1228,9 +1242,9 @@ void conv_gemm_i8_kernel(ConvParams p)
                         f = fminf(fmaxf(f, p.min_clip), p.max_clip);
                         f = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, f);
                         if (kind == I8OutKind::F32) {
-                            *conv_out_addr<float>(p, out_base, m, n) = f;
+                            *conv_row_addr<float>(p, row_base, n) = f;
                         } else {
-                            *conv_out_addr<__half>(p, out_base, m, n) = __float2half(f);
+                            *conv_row_addr<__half>(p, row_base, n) = __float2half(f);
                         }
                         break;
                     }
