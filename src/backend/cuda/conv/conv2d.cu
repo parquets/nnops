@@ -1079,28 +1079,38 @@ inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
 /// third stage still leaves three blocks a SM and 24 warps.
 using ConvShapeI8 = I8TileShape<32, 16, 2, 4, 64, 3, 3>;
 
+/// The same tile with 128 channels a CTA, for a group that has them. The A fill
+/// is the int8 kernel's dominant cost and its total traffic is M*N*BK/BN, so
+/// doubling BN halves it; the warp keeps a square-ish 32x32 fragment, which also
+/// takes the A `ldmatrix` from one m16n8k32 operand set (LDSM:IMMA 1:1) to two.
+using ConvShapeI8Wide = I8TileShape<32, 32, 2, 4, 64, 3, 2>;
+
 /// The epilogue staging tile's row pitch, in bytes: the smallest pitch at least
 /// `BN * esz` that is 80 mod 128. Four banks a row (80 bytes is 20 words) is
 /// what the staging pass needs -- eight consecutive rows then land on eight
 /// distinct banks -- and the copy-out reads 16 B at a time, where the pitch
 /// only has to be a multiple of 16.
+template <class S>
 constexpr int conv_i8_stage_pitch(int esz)
 {
-    const int need = ConvShapeI8::BN * esz;
+    const int need = S::BN * esz;
     return need + (80 - need % 128 + 128) % 128;
 }
 
-static_assert(ConvShapeI8::BM * conv_i8_stage_pitch(4) <= ConvShapeI8::kSmemBytes,
+static_assert(ConvShapeI8::BM * conv_i8_stage_pitch<ConvShapeI8>(4) <= ConvShapeI8::kSmemBytes,
+              "the staging tile has to fit the pipeline's shared memory");
+static_assert(ConvShapeI8Wide::BM * conv_i8_stage_pitch<ConvShapeI8Wide>(4) <=
+                  ConvShapeI8Wide::kSmemBytes,
               "the staging tile has to fit the pipeline's shared memory");
 
 /// Either k-major s8 panel, as the gather's (row, col, stage) indexer. The base
 /// already carries the stage; rows are `LD` bytes apart.
-template <class Elem>
+template <class S, class Elem>
 struct ConvI8Panel {
     Elem* base;
     __device__ __forceinline__ Elem& operator()(int row, int col, int) const
     {
-        return base[row * ConvShapeI8::LD + col];
+        return base[row * S::LD + col];
     }
 };
 
@@ -1377,11 +1387,10 @@ __global__ void conv_i8_pack_kernel(ConvI8PackParams q)
     }
 }
 
-template <class AElem>
-__global__ __launch_bounds__(ConvShapeI8::threads, ConvShapeI8::MinBlocks)
+template <class S, class AElem>
+__global__ __launch_bounds__(S::threads, S::MinBlocks)
 void conv_gemm_i8_kernel(ConvParams p)
 {
-    using S = ConvShapeI8;
     using BElem = int8_t;
     constexpr int BM = S::BM;
     constexpr int BN = S::BN;
@@ -1436,8 +1445,15 @@ void conv_gemm_i8_kernel(ConvParams p)
     // can cross a tap. It cannot when icg is a multiple of the run, which the
     // tail check below is what makes sufficient.
     constexpr int kBFillK = BK / (S::threads / BN);
-    static_assert(kBFillK == 16, "the filter gather writes one 16 B vector");
+    constexpr int kNVec = kBFillK / 16;
+    static_assert(kBFillK % 16 == 0, "the filter gather writes whole 16 B vectors");
+    // A packed-filter panel is kConvI8PackBN rows of the format's own stride, so
+    // a tile wider than the blob reads one panel per block of channels.
+    constexpr int kNPanels = BN / kConvI8PackBN;
+    constexpr int kPanelBytes = kConvI8PackBN * kConvI8PackLD;
+    static_assert(BN % kConvI8PackBN == 0, "a tile has to read whole blob panels");
     const bool w_tap_aligned = (p.icg % kBFillK) == 0;
+    ConvTapWalk w_walk;
 
     auto fill = [&](int kt, int stage) {
         if (kt >= k_tiles) {
@@ -1454,12 +1470,12 @@ void conv_gemm_i8_kernel(ConvParams p)
         int8_t* const sA = sAbase + stage * S::kABytes;
         int8_t* const sB = sBbase + stage * S::kBBytes;
         if (p.fill_vec) {
-            conv_fill_a_vec_i8<AElem, BK>(p, ConvI8Panel<AElem>{reinterpret_cast<AElem*>(sA)},
+            conv_fill_a_vec_i8<AElem, BK>(p, ConvI8Panel<S, AElem>{reinterpret_cast<AElem*>(sA)},
                                           stage, in, rows, k0, tap_walk, ra_vec, add);
         } else {
             const int32_t s =
                 conv_fill_a_i8<AElem, S::threads, BM, BK>(
-                    p, ConvI8Panel<AElem>{reinterpret_cast<AElem*>(sA)}, stage, in, m0, k0);
+                    p, ConvI8Panel<S, AElem>{reinterpret_cast<AElem*>(sA)}, stage, in, m0, k0);
             if (add) {
                 ra_single += s;
             }
@@ -1488,25 +1504,37 @@ void conv_gemm_i8_kernel(ConvParams p)
             if (p.w_panel != nullptr) {
                 // The blob already holds this panel row for row: no predicate
                 // (its tails are zeroed), no odometer, one asynchronous copy.
-                const int8_t* const src = static_cast<const int8_t*>(p.w_panel) +
-                                          ((int64_t(g) * k_tiles + kt) * p.w_nblk + blockIdx.y) *
-                                              S::kBBytes +
-                                          row * LD + col0;
-                cp_async_ca_16B(d, src);
+                // A blob panel is kConvI8PackBN rows, so a tile wider than that
+                // reads one panel per block of channels; a block past the last
+                // panel is left alone, and the epilogue skips those channels.
+                const int half = row / kConvI8PackBN;
+                const int64_t pan = int64_t(blockIdx.y) * kNPanels + half;
+                if (pan < p.w_nblk) {
+                    const int8_t* const src = static_cast<const int8_t*>(p.w_panel) +
+                                              ((int64_t(g) * k_tiles + kt) * p.w_nblk + pan) *
+                                                  kPanelBytes +
+                                              (row - half * kConvI8PackBN) * LD + col0;
+#pragma unroll
+                    for (int c = 0; c < kNVec; ++c) {
+                        cp_async_ca_16B(d + c * 16, src + c * 16);
+                    }
+                }
             } else if (n_ok && k + kBFillK <= K && w_tap_aligned) {
                 // Inside one tap the run is a fixed `w_ic` stride, so the
                 // odometer the fallback steps is not needed at all.
-                const int tap = k / p.icg;
-                const int kh = tap / p.kw;
-                const int32_t off = int32_t(k - tap * p.icg) * w_ic + kh * w_kh +
-                                    int32_t(tap - kh * p.kw) * w_kw;
-                uint4 v;
-                int8_t* const vb = reinterpret_cast<int8_t*>(&v);
+                conv_tap_seek(p, w_walk, k);
+                const int32_t off0 = w_walk.ic * w_ic + w_walk.kh * w_kh + w_walk.kw * w_kw;
 #pragma unroll
-                for (int j = 0; j < kBFillK; ++j) {
-                    vb[j] = row_w[off + j * w_ic];
+                for (int c = 0; c < kNVec; ++c) {
+                    uint4 v;
+                    int8_t* const vb = reinterpret_cast<int8_t*>(&v);
+                    const int32_t off = off0 + c * 16 * w_ic;
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        vb[j] = row_w[off + j * w_ic];
+                    }
+                    *reinterpret_cast<uint4*>(d + c * 16) = v;
                 }
-                *reinterpret_cast<uint4*>(d) = v;
             } else {
                 const int32_t icg = int32_t(p.icg), kw_end = int32_t(p.kw);
                 int kk = k;
@@ -1590,7 +1618,7 @@ void conv_gemm_i8_kernel(ConvParams p)
     // memory instead (dead behind the barrier above) and copied out as whole
     // 16 B vectors, which is a sector's worth of one pixel's row.
     const int esz = kind == I8OutKind::F32 ? 4 : (kind == I8OutKind::F16 ? 2 : 1);
-    const int pitch = conv_i8_stage_pitch(esz);
+    const int pitch = conv_i8_stage_pitch<S>(esz);
     unsigned char* const sC = conv_smem;
 
     // C: lane l holds (m = l/4, n = 2*(l%4)), plus the +1 column and the +8 row.
@@ -1730,9 +1758,23 @@ void conv_gemm_i8_kernel(ConvParams p)
 
 template <class AElem> void launch_conv_i8(ConvParams& p, cudaStream_t stream)
 {
+    // A group narrower than the wide tile would waste half its MMA work, so the
+    // 64-channel shape keeps the layers that have exactly that.
+    if (p.ocg >= ConvShapeI8Wide::BN) {
+        using S = ConvShapeI8Wide;
+        constexpr int smem = S::kSmemBytes;
+        auto kernel = conv_gemm_i8_kernel<S, AElem>;
+        static const cudaError_t cfg =
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        (void)cfg;
+        dim3 grid(unsigned((p.oh * p.ow + S::BM - 1) / S::BM),
+                  unsigned((p.ocg + S::BN - 1) / S::BN), unsigned(p.batch * p.groups));
+        kernel<<<grid, S::threads, smem, stream>>>(p);
+        return;
+    }
     using S = ConvShapeI8;
     constexpr int smem = S::kSmemBytes;
-    auto kernel = conv_gemm_i8_kernel<AElem>;
+    auto kernel = conv_gemm_i8_kernel<S, AElem>;
     static const cudaError_t cfg =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
