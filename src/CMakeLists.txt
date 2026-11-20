@@ -86,11 +86,14 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/where.cpp
     backend/cpu/compare.cpp
 
-    # CPU tiled matmul kernel (NKM loop with pack + MMA), plus the routes that
-    # bypass the plan (small naive / GEMV, fused Q4_1, AArch64 SME for fp and
-    # int8). matmul_helper is the shared pack/MMA layer that conv2d and
+    # CPU tiled matmul kernel (NKM loop with pack + MMA), split one file per
+    # arithmetic family — the float routes with the classifier, the quantized
+    # routes — plus the routes that bypass the plan (small naive / GEMV, fused
+    # Q4_1). matmul_helper is the shared pack/MMA layer that conv2d and
     # attention also drive.
     backend/cpu/matmul/matmul.cpp
+    backend/cpu/matmul/i8matmul.cpp
+    backend/cpu/matmul/i8matmul_helper.cpp
     backend/cpu/matmul/matmul_helper.cpp
     backend/cpu/matmul/matmul_small.cpp
     backend/cpu/matmul/matmul_qblock_fused.cpp
@@ -102,18 +105,24 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/matmul/linear.cpp
     backend/cpu/matmul/moe.cpp
 
-    # CPU convolution kernels: the implicit-GEMM route (NHWC, fp and quantized,
-    # one file since they share a plan, a scratch layout and a driver), the
-    # Winograd F(2x2,3x3) route, the depthwise kernel and pooling (which sweeps
-    # the same windows the two above do, and shares their channel-lane /
-    # width-lane split).
+    # CPU convolution kernels: the implicit-GEMM route (NHWC) split one file per
+    # arithmetic family — the float route with the plan, scratch layout and
+    # driver both families share, and the quantized route with the s8 panels'
+    # prepack — then the Winograd F(2x2,3x3) route, the depthwise kernel and
+    # pooling (which sweeps the same windows the two above do, and shares their
+    # channel-lane / width-lane split).
     backend/cpu/conv/conv2d_implicit_gemm.cpp
+    backend/cpu/conv/i8conv2d_implicit_gemm.cpp
     backend/cpu/conv/conv2d_winograd.cpp
     backend/cpu/conv/depthwise_conv.cpp
+    backend/cpu/conv/i8depthwise_conv.cpp
     backend/cpu/conv/depthwise_transpose_conv.cpp
+    backend/cpu/conv/i8depthwise_transpose_conv.cpp
     backend/cpu/conv/transpose_conv2d.cpp
+    backend/cpu/conv/i8transpose_conv2d.cpp
     backend/cpu/conv/transpose_conv3d.cpp
     backend/cpu/conv/pooling.cpp
+    backend/cpu/conv/i8pooling.cpp
     backend/cpu/conv/conv3d.cpp
 
     # Conv1D is the 2D GEMM kernel on a rank-4 lift (conv1d_common.h), so this

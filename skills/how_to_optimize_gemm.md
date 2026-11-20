@@ -1,8 +1,15 @@
 # How to Optimize GEMM — Design Notes for the Tiled MatMul Backend
 
 A record of the optimization decisions, constraints, and trade-offs that shaped the
-tiled GEMM implementation in [src/backend/cpu/matmul/matmul.cpp](../src/backend/cpu/matmul/matmul.cpp)
-and the shared pack/MMA helpers in [src/backend/cpu/matmul/matmul_helper.h](../src/backend/cpu/matmul/matmul_helper.h).
+tiled GEMM implementation. The plan-driven skeleton is one body for every route and
+lives in [matmul_tile_impl.h](../src/backend/cpu/matmul/matmul_tile_impl.h); the
+float routes (and the classifier) are in [matmul.cpp](../src/backend/cpu/matmul/matmul.cpp),
+the quantized routes in [i8matmul.cpp](../src/backend/cpu/matmul/i8matmul.cpp),
+and the shared pack/MMA helpers in
+[matmul_helper.h](../src/backend/cpu/matmul/matmul_helper.h),
+[matmul_helper.cpp](../src/backend/cpu/matmul/matmul_helper.cpp) (float, plus the
+geometry and plan every dtype shares) and
+[i8matmul_helper.cpp](../src/backend/cpu/matmul/i8matmul_helper.cpp) (int8).
 The two routes that bypass the plan — the small-GEMM / GEMV paths (rules 3 and 4
 below) and the fused Q4_1 decode — are self-contained and live beside it in
 [matmul_small.cpp](../src/backend/cpu/matmul/matmul_small.cpp) and

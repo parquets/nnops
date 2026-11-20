@@ -921,6 +921,10 @@ TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b, bool sm
 void matmul_packed_b_sme_i8_unpack(const TensorView& packed, int64_t K, int8_t* dst,
                                    const ComputeContext& ctx);
 
+/// Pack a dense s8 B into the SME layout — the int8 half of
+/// matmul_packed_b_pack, which owns the float branch.
+void matmul_packed_b_sme_i8_pack(const TensorView& raw, TensorView& packed, bool transpose_b);
+
 /// True when @p packed is a coherent blob for a product K deep — its numel is
 /// the geometry's. That single check is what catches a blob packed against a
 /// different K, which is otherwise indistinguishable from a correct one.
