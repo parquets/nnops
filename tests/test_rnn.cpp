@@ -744,6 +744,104 @@ NNOPS_TEST(single_step_geometries) {
     }
 }
 
+NNOPS_TEST(recurrent_shape_sweep) {
+    // Boundary shapes for the tiling the driver forks on: H % 8, B on both
+    // sides of a row tile, I % 8, and an H past the 128-wide k cap. Time stays
+    // short because the reference costs T·B·G·H·(I+H).
+    struct S {
+        int64_t T, B, I, H;
+    };
+    const S shapes[] = {
+        {1, 1, 1, 1},     // every axis degenerate
+        {1, 4, 17, 7},    // I past two vectors, H below one
+        {2, 9, 1, 16},    // B past a row tile, one input channel
+        {3, 17, 33, 24},  // B and I on tails, H a full 3 x 8
+        {4, 2, 64, 32},   // I and H whole multiples
+        {5, 3, 7, 64},    // a narrow input under a wide hidden
+        {2, 8, 8, 130},   // H past the f32 k cap
+    };
+    for (const S& s : shapes) {
+        RnnAttributes a;
+        a.hidden_size = s.H;
+        Geo g;
+        g.T = s.T;
+        g.B = s.B;
+        g.I = s.I;
+        g.H = s.H;
+        g.bias = (s.B % 2) != 0;
+        g.h0 = true;
+        try {
+            check_rnn<float>(g, a, kF32Tol);
+        } catch (const std::exception& e) {
+            throw std::runtime_error("rnn T=" + std::to_string(s.T) + " B=" +
+                                     std::to_string(s.B) + " I=" + std::to_string(s.I) +
+                                     " H=" + std::to_string(s.H) + ": " + e.what());
+        }
+    }
+
+    // LSTM and GRU have a different gate count and carry an extra state; one
+    // boundary shape each, including the single-row rung and a k-cap split.
+    {
+        LstmAttributes a;
+        a.hidden_size = 9;
+        Geo g;
+        g.T = 2; g.B = 17; g.I = 5; g.H = 9;
+        g.h0 = true; g.c0 = true;
+        check_lstm<float>(g, a, kF32Tol);
+    }
+    {
+        GruAttributes a;
+        a.hidden_size = 33;
+        a.linear_before_reset = true;
+        Geo g;
+        g.T = 3; g.B = 1; g.I = 17; g.H = 33;
+        g.h0 = true;
+        check_gru<float>(g, a, kF32Tol);
+    }
+    {
+        LstmAttributes a;
+        a.hidden_size = 130;
+        Geo g;
+        g.T = 2; g.B = 5; g.I = 7; g.H = 130;
+        g.h0 = true; g.c0 = true;
+        check_lstm<float>(g, a, 2e-3f);
+    }
+
+    // The half-precision gate buffer on the same boundaries. H = 7 gives the
+    // plan kc = 8 (the f16 pair rounding), so I at 6, 9 and 33 cover one, two
+    // and five input-projection k blocks on an even start; 31/32 put the tail
+    // one short of and exactly on the block.
+    for (int64_t I : {int64_t{6}, int64_t{9}, int64_t{17}, int64_t{31},
+                      int64_t{32}, int64_t{33}}) {
+        RnnAttributes a;
+        a.hidden_size = 7;
+        Geo g;
+        g.T = 2; g.B = 5; g.I = I; g.H = 7;
+        g.h0 = true;
+        try {
+            check_rnn<half>(g, a, test::kF16AccumTol);
+        } catch (const std::exception& e) {
+            throw std::runtime_error("f16 rnn I=" + std::to_string(I) + ": " + e.what());
+        }
+    }
+    {
+        GruAttributes a;
+        a.hidden_size = 17;
+        Geo g;
+        g.T = 2; g.B = 3; g.I = 33; g.H = 17;
+        g.h0 = true;
+        check_gru<half>(g, a, test::kF16AccumTol);
+    }
+    {
+        LstmAttributes a;
+        a.hidden_size = 9;
+        Geo g;
+        g.T = 2; g.B = 3; g.I = 33; g.H = 9;
+        g.h0 = true; g.c0 = true;
+        check_lstm<half>(g, a, test::kF16AccumTol);
+    }
+}
+
 // =========================================================================
 //  W8A8 — s8 weights, per-row scale, dynamically quantized activations
 // =========================================================================
