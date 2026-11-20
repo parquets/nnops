@@ -477,605 +477,708 @@ inline void tile_im2col_pack_i8_sme(int8_t* dst, const int8_t* in, int64_t in_ro
 }
 #endif
 
-// ---- main kernel ----------------------------------------------------------
+// ---- the per-call context -------------------------------------------------
+//
+// Everything the task grid reads, resolved once per call. The task and its
+// tile helpers take this by reference; the alternative — a lambda capturing
+// forty locals — is what made this kernel one function of six hundred lines.
 
-template <class T>
-void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
-                              std::span<const TensorView> inputs, const ComputeContext& ctx,
-                              const Conv2DGemmPlan& plan, void* workspace)
+/// The once-per-call SME B prepack: one ZA-layout copy per (group, task oc
+/// start, ic block), so a task reads its filter in place. `start_prefix` maps
+/// an oc chunk to its first start; blocks inside a region are `slot_max`
+/// elements apart.
+template <class T> struct SmeFpShared {
+    std::vector<int64_t> start_prefix;
+    PoolArray<T> b;
+    PoolArray<T> stage;
+    int64_t total_starts = 0;
+    int64_t region_elems = 0;
+    int64_t slot_max = 0;
+    int64_t num_ic_blocks = 0;
+};
+
+template <class T> struct FpConvCtx {
+    static constexpr int64_t nr_max = nr_max_flt<T>();
+
+    const Conv2DAttributes* attrs = nullptr;
+    const ComputeContext* ctx = nullptr;
+    const T* in_ptr = nullptr;
+    const T* w_ptr = nullptr;
+    const T* b_ptr = nullptr;
+    T* out_ptr = nullptr;
+    bool has_bias = false;
+
+    int64_t N = 0, IC = 0, IH = 0, IW = 0, OC = 0, OH = 0, OW = 0;
+    int64_t in_row_stride = 0, out_row_stride = 0;
+    int64_t G = 0, ic_per_group = 0, oc_per_group = 0;
+    int KH = 0, KW = 0, SH = 0, SW = 0, DH = 0, DW = 0, PH = 0, PW = 0, karea = 0;
+
+    int64_t icn_block = 0, ocn_block = 0, oh_chunks = 0, ph_block = 0, oc_chunks = 0;
+    int m_block = 0;
+    int64_t ib_step = 0, ob_step = 0;
+    int64_t w_ic_stride = 0, w_tap_stride = 0;
+    int64_t esz = 0;
+    bool prepacked = false, sme_blob = false, use_sme = false, pointwise = false;
+
+    float clamp_lo = 0.0f, clamp_hi = 0.0f;
+    bool epi_folded = false, epi_pass = false;
+    bool keep_orig = false, seed_bias = false, bias_seed = false, need_epi = false;
+
+    ConvPackedWeight pg;
+    int64_t num_ic_blocks = 0, kdim_max = 0;
+    Conv2DGemmScratch sc;
+    char* base = nullptr;
+    T* shared_ptr = nullptr;
+    bool shared = false;
+    const T* panels = nullptr;
+    int64_t total = 0;
+    bool per_thread = false;
+    PoolArray<T> bias_pad;
+    SmeFpShared<T> sme;
+};
+
+/// The finish decision: what folds into the MMA store and what needs a pass.
+struct FpFinish {
+    float clamp_lo = 0.0f;
+    float clamp_hi = 0.0f;
+    bool epi_folded = false;
+    bool epi_pass = false;
+    bool keep_orig = false;
+    bool seed_bias = false;
+    bool bias_seed = false;
+    bool need_epi = false;
+};
+
+inline FpFinish fp_finish(const Conv2DAttributes& attrs, bool has_bias) noexcept
 {
-    const auto& input = inputs[0];
-    const auto& weight = inputs[1];
-    const bool has_bias = inputs.size() > 2;
-
-    // Channel-last [N, H, W, C]: a "row" is one spatial line and a pixel's
-    // channel vector is contiguous.
-    const int64_t N = input.shape(0);
-    const int64_t IC = input.shape(3);
-    const int64_t IH = input.shape(1);
-    const int64_t IW = input.shape(2);
-    const int64_t in_row_stride = input.row_stride_elems();
-
-    // HWIO: the output channel is the last axis; a prepacked blob leads with it.
-    const bool sme_blob = weight.layout() == TensorLayout::PackedHWIOSme;
-    const bool prepacked = is_packed_conv_weight(weight.layout());
-    const int64_t OC = prepacked ? weight.shape(0) : weight.shape(3);
-
-    // The ZA tiles read raw HWIO filters in their own layout, and their own
-    // prepacked form directly. A PackedHWIO blob is the NEON panels and has no
-    // reader here, so that case stays on the panel route.
-#if defined(NNOPS_ARCH_SME)
-    constexpr bool sme_dtype = std::is_same_v<T, float> || std::is_same_v<T, half>;
-    constexpr DataType sme_be_dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
-#endif
-
-    const int64_t OH = output.shape(1);
-    const int64_t OW = output.shape(2);
-    const int64_t out_row_stride = output.row_stride_elems();
-
-    const int64_t G = attrs.groups;
-    const int64_t ic_per_group = IC / G;
-    const int64_t oc_per_group = OC / G;
-
-#if defined(NNOPS_ARCH_SME)
-    // Only wide-OC blocks fill four 64-column ZA tiles; below that the per-tile
-    // A pack and the half-empty B blocks lose to the NEON panels. A caller's
-    // prepacked HWIO blob is the NEON layout and stays there too.
-    // 128 output channels fill four 32-column tiles: enough for a pointwise
-    // filter, whose A unpack is shared across every oc block. A k-tap filter
-    // repacks A per (oc block, k block), so it needs the wider 64-column gate
-    // — and a narrow row's partial last tile wastes the 32-row kernel.
-    const int64_t sme_oc_min = aarch64::sme_fp_nr;
-    const bool use_sme =
-        sme_dtype && (sme_blob || (!prepacked && aarch64::available_sme() &&
-                                   oc_per_group >= sme_oc_min));
-#else
-    constexpr bool use_sme = false;
-#endif
-
-    const int KH = static_cast<int>(attrs.kernel_size[0]);
-    const int KW = static_cast<int>(attrs.kernel_size[1]);
-    const int SH = static_cast<int>(attrs.stride[0]);
-    const int SW = static_cast<int>(attrs.stride[1]);
-    const int DH = static_cast<int>(attrs.dilation[0]);
-    const int DW = static_cast<int>(attrs.dilation[1]);
-    const int PH = static_cast<int>(attrs.padding[0]);
-    const int PW = static_cast<int>(attrs.padding[1]);
-    const int karea = KH * KW;
-
-    const int64_t icn_block = plan.icn_block;
-    const int64_t ocn_block = plan.ocn_block;
-    const int m_block = static_cast<int>(plan.m_block);
-    const int64_t oh_chunks = plan.oh_chunks;
-    const int64_t ph_block = plan.ph_block;
-    const int64_t oc_chunks = plan.oc_chunks;
-
-    // A sample is IH rows of the NHWC pitch.
-    const int64_t ib_step = IH * in_row_stride;
-    const int64_t ob_step = OH * out_row_stride;
-
-    // HWIO (TensorFlow's filter): [KH][KW][IC/G][OC]. The output channel is the
-    // contiguous axis, so one (tap, input channel) is an OC-length run and the B
-    // panel is a plain strided copy — no transpose. Dims, not pitch: a weight is
-    // a load-time constant. A prepacked blob is read only through the panel
-    // geometry, so its strides stay 0.
-    //   w_ic_stride = OC (one input channel's row); w_tap_stride = ic_per_group·OC
-    const int64_t w_row = prepacked ? 0 : weight.shape(3); // [oc] run of one (tap, ic)
-    const int64_t w_ic_stride = w_row;                     // [ic] within a tap
-    const int64_t w_tap_stride = prepacked                 // [kh][kw] position
-                                     ?
-                                     0 :
-                                     weight.shape(2) * w_row;
-
-    T* out_ptr = output.ptr<T>();
-    const T* in_ptr = input.ptr<T>();
-    const T* w_ptr = weight.ptr<T>();
-    const T* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
-
-    constexpr int64_t nr_max = nr_max_flt<T>();
-    const int64_t esz = static_cast<int64_t>(sizeof(T));
     constexpr float kInf = std::numeric_limits<float>::infinity();
-
-    // ---- the finish decision ----------------------------------------------
-    // A pure clamp folds into the MMA store. The bias is per *column* here
-    // (rows are pixels), so it seeds the tile instead of the micro-kernel's
-    // per-row seed — leaving the clamp nothing else to do.
-    // A pre-activation residual joins the sum before the clamp, so the clamp
-    // cannot ride the MMA store and the epilogue stays a separate pass.
     const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
 
-    float clamp_lo = -kInf;
-    float clamp_hi = kInf;
-    bool epi_folded = false;
+    FpFinish f;
+    f.clamp_lo = -kInf;
+    f.clamp_hi = kInf;
     if (!attrs.add_to || pre_act) {
         switch (attrs.epilogue.type) {
         case EpilogueActivateType::Relu:
-            clamp_lo = 0.0f;
-            epi_folded = true;
+            f.clamp_lo = 0.0f;
+            f.epi_folded = true;
             break;
         case EpilogueActivateType::Relu6:
-            clamp_lo = 0.0f;
-            clamp_hi = 6.0f;
-            epi_folded = true;
+            f.clamp_lo = 0.0f;
+            f.clamp_hi = 6.0f;
+            f.epi_folded = true;
             break;
         default:
             break;
         }
     }
     const bool epi_active = attrs.epilogue.type != EpilogueActivateType::None;
-    const bool epi_pass = epi_active && !epi_folded;
-
+    f.epi_pass = epi_active && !f.epi_folded;
     // add_to folds the pre-existing output into the accumulator seed when the
     // epilogue is the identity, and the pre-activation order always does; the
     // post-activation order with an activation preserves the original tile and
     // adds it after the epilogue instead.
-    const bool keep_orig = attrs.add_to && epi_pass && !pre_act;
-
+    f.keep_orig = attrs.add_to && f.epi_pass && !pre_act;
     // The bias is per column, so it always seeds the tile; add_to's seed also
     // carries the residual. A seeded tile must never be zeroed by the MMA.
-    const bool seed_bias = attrs.add_to && has_bias;
-    const bool bias_seed = has_bias && !attrs.add_to;
-    const bool need_epi = epi_pass;
+    f.seed_bias = attrs.add_to && has_bias;
+    f.bias_seed = has_bias && !attrs.add_to;
+    f.need_epi = f.epi_pass;
+    return f;
+}
 
-    // ---- the tiny filter ---------------------------------------------------
-    // At most four input channels under a square 3x3/5x5/7x7: no gather, no
-    // panel, no plan — the tap is read where it lies. prepackWeights declines
-    // this shape too, so the filter arrives raw.
+/// The tiny filter: at most four input channels under a square 3x3/5x5/7x7
+/// takes the direct plane kernel — no gather, no panel, no plan. prepackWeights
+/// declines this shape too, so the filter arrives raw. Returns true when the
+/// call was handled.
+template <class T> bool try_stem(const FpConvCtx<T>& c)
+{
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
-        if (G == 1 && !prepacked && ic_per_group <= 4 && oc_per_group % 16 == 0 && KH == KW &&
-            KH >= 3 && KH <= 7 && (KH & 1) && !attrs.add_to && !epi_pass) {
-            const bool clamp = clamp_lo != -kInf || clamp_hi != kInf;
-            const float lo = clamp ? clamp_lo : -kInf;
-            const float hi = clamp ? clamp_hi : kInf;
+        if (c.G == 1 && !c.prepacked && c.ic_per_group <= 4 && c.oc_per_group % 16 == 0 &&
+            c.KH == c.KW && c.KH >= 3 && c.KH <= 7 && (c.KH & 1) && !c.attrs->add_to &&
+            !c.epi_pass) {
+            constexpr float kInf = std::numeric_limits<float>::infinity();
+            const bool clamp = c.clamp_lo != -kInf || c.clamp_hi != kInf;
+            const float lo = clamp ? c.clamp_lo : -kInf;
+            const float hi = clamp ? c.clamp_hi : kInf;
             const auto run = [&](auto kk) {
                 constexpr int K = decltype(kk)::value;
-                switch (ic_per_group) {
+                switch (c.ic_per_group) {
                 case 1:
-                    stem_conv_plane<T, 1, K>(out_ptr, in_ptr, w_ptr, b_ptr, N, IH, IW, OW, OC,
-                                             in_row_stride, out_row_stride, ib_step, ob_step, OH,
-                                             SH, SW, PH, PW, DH, DW, clamp, lo, hi, ctx);
+                    stem_conv_plane<T, 1, K>(c.out_ptr, c.in_ptr, c.w_ptr, c.b_ptr, c.N, c.IH,
+                                             c.IW, c.OW, c.OC, c.in_row_stride, c.out_row_stride,
+                                             c.ib_step, c.ob_step, c.OH, c.SH, c.SW, c.PH, c.PW,
+                                             c.DH, c.DW, clamp, lo, hi, *c.ctx);
                     return;
                 case 2:
-                    stem_conv_plane<T, 2, K>(out_ptr, in_ptr, w_ptr, b_ptr, N, IH, IW, OW, OC,
-                                             in_row_stride, out_row_stride, ib_step, ob_step, OH,
-                                             SH, SW, PH, PW, DH, DW, clamp, lo, hi, ctx);
+                    stem_conv_plane<T, 2, K>(c.out_ptr, c.in_ptr, c.w_ptr, c.b_ptr, c.N, c.IH,
+                                             c.IW, c.OW, c.OC, c.in_row_stride, c.out_row_stride,
+                                             c.ib_step, c.ob_step, c.OH, c.SH, c.SW, c.PH, c.PW,
+                                             c.DH, c.DW, clamp, lo, hi, *c.ctx);
                     return;
                 case 3:
-                    stem_conv_plane<T, 3, K>(out_ptr, in_ptr, w_ptr, b_ptr, N, IH, IW, OW, OC,
-                                             in_row_stride, out_row_stride, ib_step, ob_step, OH,
-                                             SH, SW, PH, PW, DH, DW, clamp, lo, hi, ctx);
+                    stem_conv_plane<T, 3, K>(c.out_ptr, c.in_ptr, c.w_ptr, c.b_ptr, c.N, c.IH,
+                                             c.IW, c.OW, c.OC, c.in_row_stride, c.out_row_stride,
+                                             c.ib_step, c.ob_step, c.OH, c.SH, c.SW, c.PH, c.PW,
+                                             c.DH, c.DW, clamp, lo, hi, *c.ctx);
                     return;
                 default:
-                    stem_conv_plane<T, 4, K>(out_ptr, in_ptr, w_ptr, b_ptr, N, IH, IW, OW, OC,
-                                             in_row_stride, out_row_stride, ib_step, ob_step, OH,
-                                             SH, SW, PH, PW, DH, DW, clamp, lo, hi, ctx);
+                    stem_conv_plane<T, 4, K>(c.out_ptr, c.in_ptr, c.w_ptr, c.b_ptr, c.N, c.IH,
+                                             c.IW, c.OW, c.OC, c.in_row_stride, c.out_row_stride,
+                                             c.ib_step, c.ob_step, c.OH, c.SH, c.SW, c.PH, c.PW,
+                                             c.DH, c.DW, clamp, lo, hi, *c.ctx);
                     return;
                 }
             };
-            switch (KH) {
+            switch (c.KH) {
             case 3:
                 run(std::integral_constant<int, 3>{});
-                return;
+                return true;
             case 5:
                 run(std::integral_constant<int, 5>{});
-                return;
+                return true;
             default:
                 run(std::integral_constant<int, 7>{});
-                return;
+                return true;
             }
         }
+    }
+    return false;
+}
+
+/// The shared SME filter prepack (once per call). Blocks inside a region are
+/// `slot_max` apart, and the start list is the tasks' own oc tiling —
+/// `ocn_block` need not be a 64-column multiple, so a per-chunk layout could
+/// not be addressed.
+template <class T> void pack_sme_filter_shared(FpConvCtx<T>& c, SmeFpShared<T>& s)
+{
+#if defined(NNOPS_ARCH_SME)
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
+        if (!c.use_sme || c.sme_blob) {
+            return;
+        }
+        constexpr DataType be_dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        const int64_t nr = aarch64::sme_fp_nr;
+        s.num_ic_blocks = (c.ic_per_group + c.icn_block - 1) / c.icn_block;
+        s.start_prefix.assign(static_cast<size_t>(c.oc_chunks) + 1, 0);
+        for (int64_t chunk = 0; chunk < c.oc_chunks; ++chunk) {
+            const int64_t lo = chunk * c.pg.panels_oc / c.oc_chunks * FpConvCtx<T>::nr_max;
+            const int64_t hi = std::min((chunk + 1) * c.pg.panels_oc / c.oc_chunks *
+                                            FpConvCtx<T>::nr_max,
+                                        c.oc_per_group);
+            const int64_t starts = (hi - lo + c.ocn_block - 1) / c.ocn_block;
+            s.start_prefix[static_cast<size_t>(chunk) + 1] =
+                s.start_prefix[static_cast<size_t>(chunk)] + starts;
+        }
+        s.total_starts = s.start_prefix[static_cast<size_t>(c.oc_chunks)];
+        s.slot_max = sme_b_panel_stride(be_dt, c.kdim_max);
+        const int64_t max_blocks = (c.ocn_block + nr - 1) / nr;
+        s.region_elems = max_blocks * s.slot_max;
+        const int64_t slices = c.G * s.total_starts * s.num_ic_blocks;
+        s.b.reset(static_cast<size_t>(slices * s.region_elems));
+        if (c.karea > 1) {
+            s.stage.reset(static_cast<size_t>(c.kdim_max * nr));
+        }
+        for (int64_t g = 0; g < c.G; ++g) {
+            const T* const w_group = c.w_ptr + g * c.oc_per_group;
+            for (int64_t chunk = 0; chunk < c.oc_chunks; ++chunk) {
+                const int64_t oc_lo =
+                    chunk * c.pg.panels_oc / c.oc_chunks * FpConvCtx<T>::nr_max;
+                const int64_t oc_hi =
+                    std::min((chunk + 1) * c.pg.panels_oc / c.oc_chunks *
+                                 FpConvCtx<T>::nr_max,
+                             c.oc_per_group);
+                int64_t si = 0;
+                for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += c.ocn_block, ++si) {
+                    const int64_t ocnc = std::min(c.ocn_block, oc_hi - ocn);
+                    for (int64_t ib = 0; ib < s.num_ic_blocks; ++ib) {
+                        const int64_t icn0 = ib * c.icn_block;
+                        const int64_t icnc = std::min(c.icn_block, c.ic_per_group - icn0);
+                        const int64_t kdim = icnc * c.karea;
+                        T* const dst =
+                            s.b.data() +
+                            ((g * s.total_starts + s.start_prefix[static_cast<size_t>(chunk)] +
+                              si) *
+                                 s.num_ic_blocks +
+                             ib) *
+                                s.region_elems;
+                        for (int64_t p0 = 0; p0 < ocnc; p0 += nr) {
+                            const int64_t np = std::min(nr, ocnc - p0);
+                            const T* const bsrc = w_group + ocn + p0 + icn0 * c.w_ic_stride;
+                            T* const out = dst + (p0 / nr) * s.slot_max;
+                            if (c.karea == 1) {
+                                tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out, bsrc,
+                                                  static_cast<int>(c.w_ic_stride));
+                            } else {
+                                for (int t = 0; t < c.karea; ++t) {
+                                    for (int64_t i = 0; i < icnc; ++i) {
+                                        std::memcpy(
+                                            s.stage.data() +
+                                                (static_cast<int64_t>(t) * icnc + i) * nr,
+                                            bsrc + t * c.w_tap_stride + i * c.w_ic_stride,
+                                            static_cast<size_t>(np) * sizeof(T));
+                                    }
+                                }
+                                tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out,
+                                                  s.stage.data(), static_cast<int>(nr));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#else
+    (void)c;
+    (void)s;
+#endif
+}
+
+/// Resolve the context. Returns false when the stem kernel handled the call.
+template <class T>
+bool init_fp_ctx(FpConvCtx<T>& c, const Conv2DAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx,
+                 const Conv2DGemmPlan& plan, void* workspace)
+{
+    const auto& input = inputs[0];
+    const auto& weight = inputs[1];
+    c.attrs = &attrs;
+    c.ctx = &ctx;
+    c.has_bias = inputs.size() > 2;
+
+    // Channel-last [N, H, W, C]: a "row" is one spatial line and a pixel's
+    // channel vector is contiguous.
+    c.N = input.shape(0);
+    c.IC = input.shape(3);
+    c.IH = input.shape(1);
+    c.IW = input.shape(2);
+    c.in_row_stride = input.row_stride_elems();
+
+    // HWIO: the output channel is the last axis; a prepacked blob leads with it.
+    c.sme_blob = weight.layout() == TensorLayout::PackedHWIOSme;
+    c.prepacked = is_packed_conv_weight(weight.layout());
+    c.OC = c.prepacked ? weight.shape(0) : weight.shape(3);
+
+    c.OH = output.shape(1);
+    c.OW = output.shape(2);
+    c.out_row_stride = output.row_stride_elems();
+
+    c.G = attrs.groups;
+    c.ic_per_group = c.IC / c.G;
+    c.oc_per_group = c.OC / c.G;
+
+#if defined(NNOPS_ARCH_SME)
+    // Only wide-OC blocks fill four 64-column ZA tiles; below that the per-tile
+    // A pack and the half-empty B blocks lose to the NEON panels. A caller's
+    // prepacked HWIO blob is the NEON layout and stays there too.
+    constexpr bool sme_dtype = std::is_same_v<T, float> || std::is_same_v<T, half>;
+    c.use_sme = sme_dtype && (c.sme_blob || (!c.prepacked && aarch64::available_sme() &&
+                                             c.oc_per_group >= aarch64::sme_fp_nr));
+#else
+    c.use_sme = false;
+#endif
+
+    c.KH = static_cast<int>(attrs.kernel_size[0]);
+    c.KW = static_cast<int>(attrs.kernel_size[1]);
+    c.SH = static_cast<int>(attrs.stride[0]);
+    c.SW = static_cast<int>(attrs.stride[1]);
+    c.DH = static_cast<int>(attrs.dilation[0]);
+    c.DW = static_cast<int>(attrs.dilation[1]);
+    c.PH = static_cast<int>(attrs.padding[0]);
+    c.PW = static_cast<int>(attrs.padding[1]);
+    c.karea = c.KH * c.KW;
+
+    c.pointwise = plan.pointwise;
+    c.icn_block = plan.icn_block;
+    c.ocn_block = plan.ocn_block;
+    c.m_block = static_cast<int>(plan.m_block);
+    c.oh_chunks = plan.oh_chunks;
+    c.ph_block = plan.ph_block;
+    c.oc_chunks = plan.oc_chunks;
+
+    c.ib_step = c.IH * c.in_row_stride;
+    c.ob_step = c.OH * c.out_row_stride;
+
+    // HWIO (TensorFlow's filter): [KH][KW][IC/G][OC]. The output channel is the
+    // contiguous axis, so one (tap, input channel) is an OC-length run and the B
+    // panel is a plain strided copy — no transpose. Dims, not pitch.
+    c.w_ic_stride = c.prepacked ? 0 : weight.shape(3);
+    c.w_tap_stride = c.prepacked ? 0 : weight.shape(2) * c.w_ic_stride;
+
+    c.out_ptr = output.ptr<T>();
+    c.in_ptr = input.ptr<T>();
+    c.w_ptr = weight.ptr<T>();
+    c.b_ptr = c.has_bias ? inputs[2].ptr<T>() : nullptr;
+    c.esz = static_cast<int64_t>(sizeof(T));
+
+    const FpFinish fin = fp_finish(attrs, c.has_bias);
+    c.clamp_lo = fin.clamp_lo;
+    c.clamp_hi = fin.clamp_hi;
+    c.epi_folded = fin.epi_folded;
+    c.epi_pass = fin.epi_pass;
+    c.keep_orig = fin.keep_orig;
+    c.seed_bias = fin.seed_bias;
+    c.bias_seed = fin.bias_seed;
+    c.need_epi = fin.need_epi;
+
+    if (try_stem<T>(c)) {
+        return false;
     }
 
     // ---- block geometry ----------------------------------------------------
     // Same function prepackWeights built the blob with; it must never disagree.
-    const ConvPackedWeight pg = sme_blob ?
-                                    conv_packed_weight_sme(attrs, ic_per_group, oc_per_group,
-                                                           weight.data_type()) :
-                                    conv_packed_weight(attrs, ic_per_group, oc_per_group,
-                                                       weight.data_type());
-    if (!sme_blob) {
-        NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block && pg.nr == nr_max);
+    c.pg = c.sme_blob ? conv_packed_weight_sme(attrs, c.ic_per_group, c.oc_per_group,
+                                               weight.data_type()) :
+                        conv_packed_weight(attrs, c.ic_per_group, c.oc_per_group,
+                                           weight.data_type());
+    if (!c.sme_blob) {
+        NNOPS_ASSERT(c.pg.icn_block == c.icn_block && c.pg.ocn_block == c.ocn_block &&
+                     c.pg.nr == FpConvCtx<T>::nr_max);
     }
-    const int64_t num_ic_blocks = pg.nfull_ic + (pg.tail_ic ? 1 : 0);
-    const int64_t kdim_max = pg.kdim_max;
+    c.num_ic_blocks = c.pg.nfull_ic + (c.pg.tail_ic ? 1 : 0);
+    c.kdim_max = c.pg.kdim_max;
 
     // ---- scratch -----------------------------------------------------------
-    const Conv2DGemmScratch sc = gemm_scratch_layout(plan, esz);
-    char* const base = static_cast<char*>(workspace);
-    T* const shared_ptr = reinterpret_cast<T*>(base + sc.panel_off);
-    const bool shared = plan.shared_elems > 0;
-
+    c.sc = gemm_scratch_layout(plan, c.esz);
+    c.base = static_cast<char*>(workspace);
+    c.shared_ptr = reinterpret_cast<T*>(c.base + c.sc.panel_off);
+    c.shared = plan.shared_elems > 0;
     // The panels every task reads in place: the caller's blob, or this call's
     // prepack in the arena (null when the weight did not fit — each task then
     // packs its own into its slot).
-    const T* const panels =
-        (!use_sme && (prepacked || shared)) ? (prepacked ? w_ptr : shared_ptr) : nullptr;
+    c.panels =
+        (!c.use_sme && (c.prepacked || c.shared)) ? (c.prepacked ? c.w_ptr : c.shared_ptr) :
+                                                    nullptr;
 
     // ---- the shared weight prepack (once per call) -------------------------
-    // The same entry prepackWeights uses, only the destination differs. The SME
-    // route packs its own B layout per task, so the NEON prepack is skipped.
-    if (shared && !use_sme) {
-        const int64_t cols = (plan.shared_elems + OC - 1) / OC;
-        const int64_t shape[] = {OC, cols};
-        TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(), shared_ptr,
-                        cols * esz, TensorLayout::PackedHWIO);
+    if (c.shared && !c.use_sme) {
+        const int64_t cols = (plan.shared_elems + c.OC - 1) / c.OC;
+        const int64_t shape[] = {c.OC, cols};
+        TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(), c.shared_ptr,
+                        cols * c.esz, TensorLayout::PackedHWIO);
         conv_packed_weight_pack(attrs, weight, blob, ctx);
     }
 
-    const int64_t NG = N * G;
-    const int64_t chunks_per_ng = oh_chunks * oc_chunks;
-    const int64_t total = NG * chunks_per_ng;
-
+    c.total = (c.N * c.G) * (c.oh_chunks * c.oc_chunks);
     const int nslots = ctx.cpu.thread_slot_count();
-    const bool per_thread = nslots > 0 && nslots < total;
+    c.per_thread = nslots > 0 && nslots < c.total;
 
     // The micro-kernel loads a bias panel at a time, so a group's bias must be
     // readable `nr_max` past its last channel. One padded copy covers every
     // group: lanes past a group are only read, and the store drops them.
-    PoolArray<T> bias_pad;
-    if (bias_seed) {
-        bias_pad.assign(static_cast<size_t>(OC + nr_max), T{});
-        std::memcpy(bias_pad.data(), b_ptr, static_cast<size_t>(OC) * sizeof(T));
+    if (c.bias_seed) {
+        c.bias_pad.assign(static_cast<size_t>(c.OC + FpConvCtx<T>::nr_max), T{});
+        std::memcpy(c.bias_pad.data(), c.b_ptr,
+                    static_cast<size_t>(c.OC) * sizeof(T));
     }
 
+    pack_sme_filter_shared(c, c.sme);
+    return true;
+}
+
+/// The B panel a task reads: in place from a blob or a 1x1 filter, or packed
+/// into its slot. The SME form carries a block stride instead of an ld.
+template <class T> struct FpBPanel {
+    const T* ptr = nullptr;
+    int ld = 0;
+    int64_t sme_stride = 0;
+};
+
+template <class T>
+FpBPanel<T> fp_pick_b(const FpConvCtx<T>& c, int64_t g, int64_t icn, int64_t icnc,
+                      int kdim, int64_t oc_chunk, int64_t ocn, int64_t ocnc, T* stage,
+                      T* pack_buf)
+{
+    FpBPanel<T> b;
 #if defined(NNOPS_ARCH_SME)
-    // ---- the shared SME filter prepack (once per call) ----------------------
-    // One SME-layout copy per (group, task oc start, ic block), so the task
-    // grid reads it in place instead of re-packing its slice per oh chunk. The
-    // start list is the tasks' own oc tiling — `ocn_block` need not be a
-    // 64-column multiple, so a per-chunk layout could not be addressed. Blocks
-    // inside a region are `sme_slot_max` apart and the kernel is told that
-    // stride.
-    std::vector<int64_t> sme_start_prefix;
-    PoolArray<T> sme_b_shared;
-    PoolArray<T> sme_stage_shared;
-    int64_t sme_total_starts = 0;
-    int64_t sme_region_elems = 0;
-    int64_t sme_slot_max = 0;
-    int64_t sme_num_ic_blocks = 0;
-    if constexpr (sme_dtype) {
-        if (use_sme && !sme_blob) {
-            const int64_t nr = aarch64::sme_fp_nr;
-            sme_num_ic_blocks = (ic_per_group + icn_block - 1) / icn_block;
-            sme_start_prefix.assign(static_cast<size_t>(oc_chunks) + 1, 0);
-            for (int64_t c = 0; c < oc_chunks; ++c) {
-                const int64_t lo = c * pg.panels_oc / oc_chunks * nr_max;
-                const int64_t hi =
-                    std::min((c + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
-                const int64_t starts = (hi - lo + ocn_block - 1) / ocn_block;
-                sme_start_prefix[static_cast<size_t>(c) + 1] =
-                    sme_start_prefix[static_cast<size_t>(c)] + starts;
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
+        if (c.use_sme) {
+            if (c.sme_blob) {
+                // The prepacked blob's block for (group, ic block, 64-column oc
+                // block); consecutive oc blocks are one region apart.
+                const int64_t slice =
+                    (g * c.pg.num_ic_blocks + icn / c.icn_block) * c.pg.num_oc_blocks +
+                    ocn / c.pg.nr;
+                b.ptr = c.w_ptr + slice * c.pg.sme_region;
+                b.sme_stride = c.pg.sme_region;
+            } else {
+                // The shared prepack's slice for this task's (group, oc start,
+                // ic block); its first block is the task's own `ocn`.
+                const int64_t oc_lo_chunk =
+                    oc_chunk * c.pg.panels_oc / c.oc_chunks * FpConvCtx<T>::nr_max;
+                const int64_t starts_before =
+                    c.sme.start_prefix[static_cast<size_t>(oc_chunk)];
+                const int64_t si_local = (ocn - oc_lo_chunk) / c.ocn_block;
+                const int64_t slice =
+                    (g * c.sme.total_starts + starts_before + si_local) *
+                        c.sme.num_ic_blocks +
+                    icn / c.icn_block;
+                b.ptr = c.sme.b.data() + slice * c.sme.region_elems;
+                b.sme_stride = c.sme.slot_max;
             }
-            sme_total_starts = sme_start_prefix[static_cast<size_t>(oc_chunks)];
-            sme_slot_max = sme_b_panel_stride(sme_be_dt, kdim_max);
-            const int64_t max_blocks = (ocn_block + nr - 1) / nr;
-            sme_region_elems = max_blocks * sme_slot_max;
-            const int64_t slices = G * sme_total_starts * sme_num_ic_blocks;
-            sme_b_shared.reset(static_cast<size_t>(slices * sme_region_elems));
-            if (karea > 1) {
-                sme_stage_shared.reset(static_cast<size_t>(kdim_max * nr));
-            }
-            for (int64_t g = 0; g < G; ++g) {
-                const T* const w_group = w_ptr + g * oc_per_group;
-                for (int64_t c = 0; c < oc_chunks; ++c) {
-                    const int64_t oc_lo = c * pg.panels_oc / oc_chunks * nr_max;
-                    const int64_t oc_hi =
-                        std::min((c + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
-                    int64_t si = 0;
-                    for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block, ++si) {
-                        const int64_t ocnc = std::min(ocn_block, oc_hi - ocn);
-                        for (int64_t ib = 0; ib < sme_num_ic_blocks; ++ib) {
-                            const int64_t icn0 = ib * icn_block;
-                            const int64_t icnc = std::min(icn_block, ic_per_group - icn0);
-                            const int64_t kdim = icnc * karea;
-                            T* const dst =
-                                sme_b_shared.data() +
-                                ((g * sme_total_starts + sme_start_prefix[static_cast<size_t>(c)] +
-                                  si) *
-                                     sme_num_ic_blocks +
-                                 ib) *
-                                    sme_region_elems;
-                            for (int64_t p0 = 0; p0 < ocnc; p0 += nr) {
-                                const int64_t np = std::min(nr, ocnc - p0);
-                                const T* const bsrc =
-                                    w_group + ocn + p0 + icn0 * w_ic_stride;
-                                T* const out = dst + (p0 / nr) * sme_slot_max;
-                                if (karea == 1) {
-                                    tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out,
-                                                      bsrc, static_cast<int>(w_ic_stride));
-                                } else {
-                                    for (int t = 0; t < karea; ++t) {
-                                        for (int64_t i = 0; i < icnc; ++i) {
-                                            std::memcpy(
-                                                sme_stage_shared.data() +
-                                                    (static_cast<int64_t>(t) * icnc + i) * nr,
-                                                bsrc + t * w_tap_stride + i * w_ic_stride,
-                                                static_cast<size_t>(np) * sizeof(T));
-                                        }
-                                    }
-                                    tile_pack_rhs_sme(false, static_cast<int>(np), kdim, out,
-                                                      sme_stage_shared.data(),
-                                                      static_cast<int>(nr));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            return b;
         }
     }
 #endif
+    const T* const w_g = c.w_ptr + g * c.oc_per_group;
+    if (c.panels) {
+        // The blob's own walk: this oc block's k block, in place.
+        b.ptr = c.panels + c.pg.offset(g, icn / c.icn_block, ocn);
+    } else if (c.karea == 1) {
+        // A 1x1 filter is [ic][oc] with oc contiguous — a panel's k rows
+        // already, `w_ic_stride` apart — so read it in place.
+        b.ptr = w_g + ocn + icn * c.w_ic_stride;
+        b.ld = static_cast<int>(c.w_ic_stride);
+    } else {
+        pack_block<T>(pack_buf,
+                      gemm_panel_slot(kdim, FpConvCtx<T>::nr_max, c.esz, false,
+                                      std::is_same_v<T, bfloat16>),
+                      stage, w_g + ocn + icn * c.w_ic_stride, c.w_ic_stride, c.w_tap_stride,
+                      ocnc, icnc, c.karea, FpConvCtx<T>::nr_max, kdim);
+        b.ptr = pack_buf;
+    }
+    return b;
+}
 
-    const auto run_task = [&](int64_t t) {
-        const int64_t ng = t / chunks_per_ng;
-        const int64_t rem = t % chunks_per_ng;
-        // The oc-chunk varies fastest: neighbours in task order then cover
-        // different filter rows, so their weight streams differ.
-        const int64_t chunk = rem / oc_chunks;
-        const int64_t oc_chunk = rem % oc_chunks;
-        const int64_t n = ng / G;
-        const int64_t g = ng % G;
+/// The A tile a pixel tile multiplies: the input run itself (pointwise), the
+/// fused ZA gather on SME, or the dense im2col scratch.
+template <class T> struct FpATile {
+    const T* ptr = nullptr;
+    int lda = 0;
+    bool packed = false;
+};
 
-        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
-        char* const slot_ptr = base + sc.head + slot * sc.slot_stride;
-        T* const a_buf = reinterpret_cast<T*>(slot_ptr + sc.off_a);
-        T* const orig_buf = reinterpret_cast<T*>(slot_ptr + sc.off_orig);
-        T* const stage = reinterpret_cast<T*>(slot_ptr + sc.off_stage);
-        T* const pack_buf = reinterpret_cast<T*>(slot_ptr + sc.off_pack);
-
-        // The SME route's per-task A slab; B is the shared prepack above.
+template <class T>
+FpATile<T> fp_pick_a(const FpConvCtx<T>& c, const T* in_g, int64_t icn, int64_t icnc,
+                     int64_t p, int64_t oh, int64_t ow0, int mc, bool flat, T* a_buf,
+                     T* sme_a)
+{
+    FpATile<T> a;
+    const int kdim = static_cast<int>(icnc * c.karea);
+    if (c.pointwise) {
+        a.ptr = in_g + oh * c.in_row_stride + ow0 * c.IC + icn;
+        a.lda = static_cast<int>(c.IC);
+        return a;
+    }
+    bool fused = false;
 #if defined(NNOPS_ARCH_SME)
-        PoolArray<T> sme_a;
-        if constexpr (sme_dtype) {
-            if (use_sme) {
-                constexpr int64_t kSmeARows = 2 * aarch64::sme_mr;
-                const int64_t a_blocks = (m_block + kSmeARows - 1) / kSmeARows;
-                sme_a.reset(static_cast<size_t>(
-                    a_blocks * sme_a_panel_stride(sme_be_dt, kdim_max)));
-            }
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
+        // f16 pairs two K values in a word: an odd channel run would put a pair
+        // across two taps.
+        fused = c.use_sme && (c.IC % 2 == 0) && (c.in_row_stride % 2 == 0) &&
+                (!std::is_same_v<T, half> || (icnc % 2) == 0);
+    }
+#endif
+    if (fused) {
+#if defined(NNOPS_ARCH_SME)
+        // The ZA route's gather writes the packed A layout directly, so it needs
+        // no separate transpose pass.
+        tile_im2col_pack_sme<T>(sme_a, in_g + icn, c.in_row_stride, c.IC, p,
+                                static_cast<int>(c.OW), mc, static_cast<int>(c.IH),
+                                static_cast<int>(c.IW), c.KH, c.KW, c.SH, c.SW, c.DH, c.DW,
+                                c.PH, c.PW, static_cast<int>(icnc), c.karea);
+        a.ptr = sme_a;
+        a.lda = kdim;
+        a.packed = true;
+#endif
+    } else {
+        tiled_im2col<T>(a_buf, kdim, in_g + icn, c.in_row_stride, c.IC, T{}, p,
+                        static_cast<int>(c.OW), flat, mc, static_cast<int>(c.IH),
+                        static_cast<int>(c.IW), c.KH, c.KW, c.SH, c.SW, c.DH, c.DW, c.PH,
+                        c.PW, static_cast<int>(icnc), c.karea);
+        a.ptr = a_buf;
+        a.lda = kdim;
+    }
+    return a;
+}
+
+/// One pixel tile: seed (add_to), multiply, and finish. The first icn block
+/// builds the tile; later blocks accumulate.
+template <class T>
+void fp_mma_tile(const FpConvCtx<T>& c, int64_t g, int64_t icn, int64_t icnc, bool is_last_icn,
+                 int mc, int64_t ocn, int64_t ocnc, T* tile, T* orig_tile,
+                 const FpATile<T>& a, const FpBPanel<T>& b, T* sme_a, T* stage)
+{
+    const int kdim = static_cast<int>(icnc * c.karea);
+    const int64_t ldc = c.OC;
+    const T* const bias_g = c.b_ptr ? c.b_ptr + g * c.oc_per_group : nullptr;
+    const T* const bias_col =
+        c.bias_seed ? c.bias_pad.data() + g * c.oc_per_group : nullptr;
+
+    if (icn == 0 && c.attrs->add_to) {
+        if (c.keep_orig) {
+            tile_save<T>(orig_tile, tile, static_cast<int>(ldc), mc, static_cast<int>(ocnc));
         }
-#endif
-
-        T* const out_g = out_ptr + n * ob_step + g * oc_per_group;
-        const T* const in_g = in_ptr + n * ib_step + g * ic_per_group;
-        const T* const w_g = w_ptr + g * oc_per_group;
-        const T* const bias_g = b_ptr ? b_ptr + g * oc_per_group : nullptr;
-        const T* const bias_col = bias_seed ? bias_pad.data() + g * oc_per_group : nullptr;
-
-        // This oh-chunk's contiguous row range, and its oc range. The oc split
-        // is over *panels*, not channels: the blob holds panel p as channels
-        // [p·nr, (p+1)·nr) of its k column, so a task starts where a panel does.
-        const int64_t r0 = chunk * OH / oh_chunks;
-        const int64_t r1 = (chunk + 1) * OH / oh_chunks;
-        // An SME blob keeps the whole group on the filter axis (its plan sets
-        // oc_chunks 1): starts and the 64-column blocks then agree.
-        const int64_t oc_lo =
-            sme_blob ? 0 : oc_chunk * pg.panels_oc / oc_chunks * nr_max;
-        const int64_t oc_hi =
-            sme_blob ? oc_per_group :
-                       std::min((oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max,
-                                oc_per_group);
-
-        // Dense rows make a pixel tile one contiguous run, so it may cross a row
-        // boundary — which keeps a narrow plane's tiles at the full M instead of
-        // paying MR-row granularity per row (a 7-pixel row of a 6-row MR block
-        // wastes 40%). Pointwise reads A the same way, so the input must be dense.
-        const bool flat =
-            out_row_stride == OW * OC && (!plan.pointwise || in_row_stride == IW * IC);
-
-        // A task may start mid-block (oc_chunks splits on panels), but the blob
-        // holds one oc block at a time: end the tile where the block does, so its
-        // panels keep the stride the kernel derives from kdim. The step is
-        // therefore the tile's own end — a whole block from a short tile would
-        // skip the rest of that block.
-        const auto block_end = [&](int64_t ocn) {
-            return panels ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block) : oc_hi;
-        };
-        for (int64_t ocn = oc_lo; ocn < oc_hi; ocn = panels ? block_end(ocn) : ocn + ocn_block) {
-            const int64_t oc_end = block_end(ocn);
-            const int64_t ocnc = std::min(ocn_block, oc_end - ocn);
-            // The residual region covers one pass's rows (one oc block live).
-            T* const orig = keep_orig ? orig_buf : nullptr;
-
-            for (int64_t pr = r0; pr < r1; pr += ph_block) {
-                const int64_t pr1 = std::min(r1, pr + ph_block);
-                const int64_t p_first = pr * OW;
-                const int64_t p_last = pr1 * OW;
-                // A pass of 49 pixels is 24 + 24 + 1 and the last tile pays a whole
-                // MR block for one row. Re-split only a *short* tail, and keep the
-                // step a multiple of MR: 24 + 24 + 12 costs the same MR blocks as
-                // three even 16s, where a step of 23 would pay a fourth block for 5.
-                constexpr int64_t mr_step = mr_max_flt<T>();
-                const int64_t p_span = std::max<int64_t>(p_last - p_first, 1);
-                const int64_t p_tail = p_span % m_block;
-                const int64_t p_step =
-                    (flat && p_tail != 0 && p_tail < mr_step && m_block >= 2 * mr_step) ?
-                        (m_block / mr_step - 1) * mr_step :
-                        m_block;
-
-                for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
-                    const int64_t icnc = std::min(icn_block, ic_per_group - icn);
-                    const bool is_last_icn = (icn + icn_block) >= ic_per_group;
-                    const int kdim = static_cast<int>(icnc * karea);
-
-                    const T* b_panel;
-                    int b_ld = 0;
-                    bool b_sme = false;
-                    int64_t sme_stride = 0;
-#if defined(NNOPS_ARCH_SME)
-                    if constexpr (sme_dtype) {
-                        if (use_sme) {
-                            if (sme_blob) {
-                                // The prepacked blob's block for (group, ic
-                                // block, 64-column oc block); consecutive oc
-                                // blocks are one region apart.
-                                const int64_t slice =
-                                    (g * pg.num_ic_blocks + icn / icn_block) *
-                                    pg.num_oc_blocks + ocn / pg.nr;
-                                b_panel = w_ptr + slice * pg.sme_region;
-                                sme_stride = pg.sme_region;
-                            } else {
-                                // The shared prepack's slice for this task's
-                                // (group, oc start, ic block); its first block
-                                // is the task's own `ocn`.
-                                const int64_t oc_lo_chunk =
-                                    oc_chunk * pg.panels_oc / oc_chunks * nr_max;
-                                const int64_t starts_before =
-                                    sme_start_prefix[static_cast<size_t>(oc_chunk)];
-                                const int64_t si_local = (ocn - oc_lo_chunk) / ocn_block;
-                                const int64_t slice =
-                                    (g * sme_total_starts + starts_before + si_local) *
-                                        sme_num_ic_blocks +
-                                    icn / icn_block;
-                                b_panel = sme_b_shared.data() + slice * sme_region_elems;
-                                sme_stride = sme_slot_max;
-                            }
-                            b_sme = true;
-                        }
-                    }
-#endif
-                    if (!b_sme) {
-                        if (panels) {
-                            // The blob's own walk: this oc block's k block, in
-                            // place — no pack, however many chunks the oc axis took.
-                            b_panel = panels + pg.offset(g, icn / icn_block, ocn);
-                        } else if (karea == 1) {
-                            // A 1x1 filter is [ic][oc] with oc contiguous — a
-                            // panel's k rows already, `w_ic_stride` apart — so read
-                            // it in place and let the stage take the partial last
-                            // panel only.
-                            b_panel = w_g + ocn + icn * w_ic_stride;
-                            b_ld = static_cast<int>(w_ic_stride);
-                        } else {
-                            pack_block<T>(
-                                pack_buf,
-                                gemm_panel_slot(kdim, nr_max, esz, false,
-                                                std::is_same_v<T, bfloat16>),
-                                stage, w_g + ocn + icn * w_ic_stride, w_ic_stride, w_tap_stride,
-                                ocnc, icnc, karea, nr_max, kdim);
-                            b_panel = pack_buf;
-                        }
-                    }
-
-                    const bool clamp_here = is_last_icn && epi_folded;
-                    const float c_lo = clamp_here ? clamp_lo : -kInf;
-                    const float c_hi = clamp_here ? clamp_hi : kInf;
-
-                    for (int64_t p = p_first; p < p_last;) {
-                        const int64_t oh = p / OW;
-                        const int64_t ow0 = p - oh * OW;
-                        const int64_t left = flat ? std::min(p_step, p_last - p) : (OW - ow0);
-                        const int mc = static_cast<int>(std::min<int64_t>(m_block, left));
-
-                        const T* a;
-                        int lda;
-                        // The ZA route's gather writes the packed A layout
-                        // directly, so it needs no separate transpose pass.
-                        bool a_packed = false;
-                        if (plan.pointwise) {
-                            // The pixel is its own patch: A is the input run itself
-                            // (contiguous across a row boundary only when flat).
-                            a = in_g + oh * in_row_stride + ow0 * IC + icn;
-                            lda = static_cast<int>(IC);
-                        } else {
-                            bool fused = false;
-#if defined(NNOPS_ARCH_SME)
-                            if constexpr (sme_dtype) {
-                                // f16 pairs two K values in a word: an odd
-                                // channel run would put a pair across two taps.
-                                fused = use_sme && (IC % 2 == 0) &&
-                                        (in_row_stride % 2 == 0) &&
-                                        (!std::is_same_v<T, half> || (icnc % 2) == 0);
-                            }
-#endif
-                            if (fused) {
-#if defined(NNOPS_ARCH_SME)
-                                tile_im2col_pack_sme<T>(
-                                    sme_a.data(), in_g + icn, in_row_stride, IC, p,
-                                    static_cast<int>(OW), mc, static_cast<int>(IH),
-                                    static_cast<int>(IW), KH, KW, SH, SW, DH, DW, PH, PW,
-                                    static_cast<int>(icnc), karea);
-                                a = sme_a.data();
-                                lda = kdim;
-                                a_packed = true;
-#endif
-                            } else {
-                                tiled_im2col<T>(a_buf, kdim, in_g + icn, in_row_stride, IC,
-                                                         T{}, p, static_cast<int>(OW), flat, mc,
-                                                         static_cast<int>(IH), static_cast<int>(IW),
-                                                         KH, KW, SH, SW, DH, DW, PH, PW,
-                                                         static_cast<int>(icnc), karea);
-                                a = a_buf;
-                                lda = kdim;
-                            }
-                        }
-
-                        T* const tile = out_g + oh * out_row_stride + ow0 * OC + ocn;
-                        T* const orig_tile = orig ? orig + (p - p_first) * ocn_block : nullptr;
-
-                        if (icn == 0 && attrs.add_to) {
-                            if (keep_orig) {
-                                tile_save<T>(orig_tile, tile, static_cast<int>(OC), mc,
-                                             static_cast<int>(ocnc));
-                            }
-                            if (seed_bias) {
-                                // The residual stays in the accumulator only on the
-                                // identity-epilogue route; keep_orig saves it and
-                                // the tile is the seed.
-                                tile_seed<T>(tile, static_cast<int>(OC), mc, static_cast<int>(ocnc),
-                                             bias_g + ocn,
-                                             /*add=*/!keep_orig);
-                            } else if (keep_orig) {
-                                // No bias: the tile holds the residual, which the
-                                // epilogue adds back itself.
-                                tile_zero<T>(tile, static_cast<int>(OC), mc,
-                                             static_cast<int>(ocnc));
-                            }
-                        }
-
-                        // Bias only: build the accumulator from it (one panel-lane
-                        // load per n-block) rather than seed the tile, which
-                        // would double the tile's traffic for one addend.
-                        // A 1x1 filter reads in place; everything else arrives as
-                        // panels, the blob's or this call's.
-                        bool mma_sme = false;
-#if defined(NNOPS_ARCH_SME)
-                        if constexpr (sme_dtype) {
-                            if (use_sme) {
-                                if (!a_packed) {
-                                    tile_pack_lhs_sme(false, mc, kdim, sme_a.data(), a, lda);
-                                }
-                                tile_mma_pack_sme(
-                                    mc, static_cast<int>(ocnc), kdim, tile,
-                                    static_cast<int>(OC), sme_a.data(), b_panel, sme_stride,
-                                    c_lo, c_hi,
-                                    /*zero_mode=*/icn == 0 && !attrs.add_to && !bias_seed,
-                                    (icn == 0 && bias_seed) ? bias_col + ocn : nullptr);
-                                mma_sme = true;
-                            }
-                        }
-#endif
-                        if (!mma_sme) {
-                            tile_mma_direct(
-                                mc, static_cast<int>(ocnc), kdim, tile, static_cast<int>(OC), a,
-                                lda, b_panel, b_ld != 0 ? b_ld : -1, stage, c_lo, c_hi,
-                                /*zero_mode=*/icn == 0 && !attrs.add_to && !bias_seed, nullptr,
-                                (icn == 0 && bias_seed) ? bias_col + ocn : nullptr);
-                        }
-
-                        if (is_last_icn && need_epi) {
-                            epilogue_inplace<T>(mc, static_cast<int>(ocnc), tile,
-                                                static_cast<int>(OC), nullptr, attrs.epilogue,
-                                                keep_orig ? orig_tile : nullptr, keep_orig);
-                        }
-                        p += flat ? p_step : mc;
-                    }
-                }
-            }
+        if (c.seed_bias) {
+            // The residual stays in the accumulator only on the identity
+            // epilogue route; keep_orig saves it and the tile is the seed.
+            tile_seed<T>(tile, static_cast<int>(ldc), mc, static_cast<int>(ocnc),
+                         bias_g + ocn, /*add=*/!c.keep_orig);
+        } else if (c.keep_orig) {
+            // No bias: the tile holds the residual, which the epilogue adds
+            // back itself.
+            tile_zero<T>(tile, static_cast<int>(ldc), mc, static_cast<int>(ocnc));
         }
+    }
+
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    const bool clamp_here = is_last_icn && c.epi_folded;
+    const float c_lo = clamp_here ? c.clamp_lo : -kInf;
+    const float c_hi = clamp_here ? c.clamp_hi : kInf;
+    const bool zero_mode = icn == 0 && !c.attrs->add_to && !c.bias_seed;
+
+    bool mma_sme = false;
+#if defined(NNOPS_ARCH_SME)
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
+        if (c.use_sme) {
+            if (!a.packed) {
+                tile_pack_lhs_sme(false, mc, kdim, sme_a, a.ptr, a.lda);
+            }
+            tile_mma_pack_sme(mc, static_cast<int>(ocnc), kdim, tile, static_cast<int>(ldc),
+                              sme_a, b.ptr, b.sme_stride, c_lo, c_hi, zero_mode,
+                              (icn == 0 && c.bias_seed) ? bias_col + ocn : nullptr);
+            mma_sme = true;
+        }
+    }
+#endif
+    if (!mma_sme) {
+        tile_mma_direct(mc, static_cast<int>(ocnc), kdim, tile, static_cast<int>(ldc), a.ptr,
+                        a.lda, b.ptr, b.ld != 0 ? b.ld : -1, stage, c_lo, c_hi, zero_mode,
+                        nullptr,
+                        (icn == 0 && c.bias_seed) ? bias_col + ocn : nullptr);
+    }
+
+    if (is_last_icn && c.need_epi) {
+        epilogue_inplace<T>(mc, static_cast<int>(ocnc), tile, static_cast<int>(ldc), nullptr,
+                            c.attrs->epilogue, c.keep_orig ? orig_tile : nullptr, c.keep_orig);
+    }
+}
+
+/// One task of the (batch, group) × oh-chunk × oc-chunk grid.
+template <class T> void run_fp_task(const FpConvCtx<T>& c, int64_t t)
+{
+    const int64_t chunks_per_ng = c.oh_chunks * c.oc_chunks;
+    const int64_t ng = t / chunks_per_ng;
+    const int64_t rem = t % chunks_per_ng;
+    // The oc-chunk varies fastest: neighbours in task order then cover
+    // different filter rows, so their weight streams differ.
+    const int64_t chunk = rem / c.oc_chunks;
+    const int64_t oc_chunk = rem % c.oc_chunks;
+    const int64_t n = ng / c.G;
+    const int64_t g = ng % c.G;
+
+    const int64_t slot =
+        c.per_thread ? static_cast<int64_t>(c.ctx->cpu.current_thread_id()) : t;
+    char* const slot_ptr = c.base + c.sc.head + slot * c.sc.slot_stride;
+    T* const a_buf = reinterpret_cast<T*>(slot_ptr + c.sc.off_a);
+    T* const orig_buf = reinterpret_cast<T*>(slot_ptr + c.sc.off_orig);
+    T* const stage = reinterpret_cast<T*>(slot_ptr + c.sc.off_stage);
+    T* const pack_buf = reinterpret_cast<T*>(slot_ptr + c.sc.off_pack);
+
+    // The SME route's per-task A slab; B is the shared prepack.
+    PoolArray<T> sme_a;
+#if defined(NNOPS_ARCH_SME)
+    if (c.use_sme) {
+        constexpr int64_t kSmeARows = 2 * aarch64::sme_mr;
+        const int64_t a_blocks = (c.m_block + kSmeARows - 1) / kSmeARows;
+        sme_a.reset(static_cast<size_t>(a_blocks * sme_a_panel_stride(
+                                             std::is_same_v<T, float> ? DataType::f32 :
+                                                                        DataType::f16,
+                                             c.kdim_max)));
+    }
+#endif
+
+    T* const out_g = c.out_ptr + n * c.ob_step + g * c.oc_per_group;
+    const T* const in_g = c.in_ptr + n * c.ib_step + g * c.ic_per_group;
+
+    // This oh-chunk's contiguous row range, and its oc range. The oc split is
+    // over *panels*, not channels: the blob holds panel p as channels
+    // [p·nr, (p+1)·nr) of its k column, so a task starts where a panel does.
+    const int64_t r0 = chunk * c.OH / c.oh_chunks;
+    const int64_t r1 = (chunk + 1) * c.OH / c.oh_chunks;
+    // An SME blob keeps the whole group on the filter axis (its plan sets
+    // oc_chunks 1): starts and the 64-column blocks then agree.
+    const int64_t oc_lo =
+        c.sme_blob ? 0 : oc_chunk * c.pg.panels_oc / c.oc_chunks * FpConvCtx<T>::nr_max;
+    const int64_t oc_hi =
+        c.sme_blob ? c.oc_per_group :
+                     std::min((oc_chunk + 1) * c.pg.panels_oc / c.oc_chunks *
+                                  FpConvCtx<T>::nr_max,
+                              c.oc_per_group);
+
+    // Dense rows make a pixel tile one contiguous run, so it may cross a row
+    // boundary — which keeps a narrow plane's tiles at the full M. Pointwise
+    // reads A the same way, so the input must be dense.
+    const bool flat =
+        c.out_row_stride == c.OW * c.OC && (!c.pointwise || c.in_row_stride == c.IW * c.IC);
+
+    // A task may start mid-block (oc_chunks splits on panels), but the blob
+    // holds one oc block at a time: end the tile where the block does, so its
+    // panels keep the stride the kernel derives from kdim.
+    const auto block_end = [&](int64_t ocn) {
+        return c.panels ? std::min(oc_hi, (ocn / c.ocn_block + 1) * c.ocn_block) : oc_hi;
     };
+    for (int64_t ocn = oc_lo; ocn < oc_hi;
+         ocn = c.panels ? block_end(ocn) : ocn + c.ocn_block) {
+        const int64_t oc_end = block_end(ocn);
+        const int64_t ocnc = std::min(c.ocn_block, oc_end - ocn);
+        T* const orig = c.keep_orig ? orig_buf : nullptr;
 
-    ctx.cpu.run(0, total, run_task);
+        for (int64_t pr = r0; pr < r1; pr += c.ph_block) {
+            const int64_t pr1 = std::min(r1, pr + c.ph_block);
+            const int64_t p_first = pr * c.OW;
+            const int64_t p_last = pr1 * c.OW;
+            // A short tail is re-split, keeping the step a multiple of MR.
+            constexpr int64_t mr_step = mr_max_flt<T>();
+            const int64_t p_span = std::max<int64_t>(p_last - p_first, 1);
+            const int64_t p_tail = p_span % c.m_block;
+            const int64_t p_step =
+                (flat && p_tail != 0 && p_tail < mr_step && c.m_block >= 2 * mr_step) ?
+                    (c.m_block / mr_step - 1) * mr_step :
+                    c.m_block;
+
+            for (int64_t icn = 0; icn < c.ic_per_group; icn += c.icn_block) {
+                const int64_t icnc = std::min(c.icn_block, c.ic_per_group - icn);
+                const bool is_last_icn = (icn + c.icn_block) >= c.ic_per_group;
+                const int kdim = static_cast<int>(icnc * c.karea);
+
+                const FpBPanel<T> b =
+                    fp_pick_b(c, g, icn, icnc, kdim, oc_chunk, ocn, ocnc, stage, pack_buf);
+
+                for (int64_t p = p_first; p < p_last;) {
+                    const int64_t oh = p / c.OW;
+                    const int64_t ow0 = p - oh * c.OW;
+                    const int64_t left =
+                        flat ? std::min(p_step, p_last - p) : (c.OW - ow0);
+                    const int mc = static_cast<int>(std::min<int64_t>(c.m_block, left));
+
+                    const FpATile<T> a = fp_pick_a(c, in_g, icn, icnc, p, oh, ow0, mc, flat,
+                                                  a_buf, sme_a.data());
+                    T* const tile = out_g + oh * c.out_row_stride + ow0 * c.OC + ocn;
+                    T* const orig_tile =
+                        orig ? orig + (p - p_first) * c.ocn_block : nullptr;
+
+                    fp_mma_tile(c, g, icn, icnc, is_last_icn, mc, ocn, ocnc, tile, orig_tile,
+                                a, b, sme_a.data(), stage);
+                    p += flat ? p_step : mc;
+                }
+            }
+        }
+    }
+}
+
+// ---- main kernel ----------------------------------------------------------
+
+template <class T>
+void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx,
+                 const Conv2DGemmPlan& plan, void* workspace)
+{
+    FpConvCtx<T> c;
+    if (!init_fp_ctx(c, attrs, output, inputs, ctx, plan, workspace)) {
+        return;
+    }
+    ctx.cpu.run(0, c.total, [&](int64_t t) { run_fp_task(c, t); });
 }
 
 // ---- the quantized route --------------------------------------------------
@@ -1204,733 +1307,867 @@ inline void pack_block_i8(int8_t* dst, int64_t panel_slot, int8_t* stage, const 
     }
 }
 
-// ---- main kernel ----------------------------------------------------------
+// ---- the per-call context -------------------------------------------------
 
-template <class TAct, class TOut>
-void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
-                                   std::span<const TensorView> inputs, const ComputeContext& ctx,
-                                   const Conv2DGemmPlan& plan, void* workspace)
-{
-    constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
-    constexpr bool kU8 = std::is_same_v<TAct, uint8_t>;
-    constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+/// The once-per-call SME int8 B prepack; see SmeFpShared.
+struct SmeI8Shared {
+    std::vector<int64_t> start_prefix;
+    PoolArray<int8_t> b;
+    PoolArray<int8_t> stage;
+    int64_t total_starts = 0;
+    int64_t region_bytes = 0;
+    int64_t slot_max = 0;
+    int64_t num_ic_blocks = 0;
+};
 
-    const auto& input = inputs[0];
-    const auto& weight = inputs[1];
-    const bool has_bias = inputs.size() > 2;
+template <class TAct, class TOut> struct I8ConvCtx {
+    static constexpr bool kFpAct =
+        !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
+    static constexpr bool kU8 = std::is_same_v<TAct, uint8_t>;
+    static constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+    static constexpr int64_t nr_max = NR_MAX_I8;
 
-    const int64_t N = input.shape(0);
-    const int64_t IC = input.shape(3);
-    const int64_t IH = input.shape(1);
-    const int64_t IW = input.shape(2);
-
-    // HWIO: the output channel is the last axis; a prepacked blob leads with it.
-    const bool prepacked = is_packed_conv_weight(weight.layout());
-    const bool sme_blob = weight.layout() == TensorLayout::PackedHWIOSme;
-    const int64_t OC = prepacked ? weight.shape(0) : weight.shape(3);
-
-    const int64_t OH = output.shape(1);
-    const int64_t OW = output.shape(2);
-    const int64_t out_row_stride = output.row_stride_elems();
-
-    const int64_t G = attrs.groups;
-    const int64_t ic_per_group = IC / G;
-    const int64_t oc_per_group = OC / G;
-
-    // The SMOPA tiles are 16 rows x 64 columns: one pass is four 16-column
-    // groups, so the filter has to fill them. A caller's NEON panel blob has no
-    // reader here; the ZA blob does, at the same 64-column width, so a
-    // prepacked filter skips the per-call shared prepack entirely.
-#if defined(NNOPS_ARCH_SME)
-    const bool use_sme = sme_blob || (!prepacked && aarch64::available_sme() &&
-                                      oc_per_group >= aarch64::sme_nr_max);
-#else
-    constexpr bool use_sme = false;
-#endif
-
-    const int KH = static_cast<int>(attrs.kernel_size[0]);
-    const int KW = static_cast<int>(attrs.kernel_size[1]);
-    const int SH = static_cast<int>(attrs.stride[0]);
-    const int SW = static_cast<int>(attrs.stride[1]);
-    const int DH = static_cast<int>(attrs.dilation[0]);
-    const int DW = static_cast<int>(attrs.dilation[1]);
-    const int PH = static_cast<int>(attrs.padding[0]);
-    const int PW = static_cast<int>(attrs.padding[1]);
-    const int karea = KH * KW;
-    const int64_t k_full = ic_per_group * karea; ///< the epilogue's K
-
-    const int64_t icn_block = plan.icn_block;
-    const int64_t ocn_block = plan.ocn_block;
-    const int m_block = static_cast<int>(plan.m_block);
-    const int64_t oh_chunks = plan.oh_chunks;
-    const int64_t ph_block = plan.ph_block;
-    const int64_t oc_chunks = plan.oc_chunks;
-
-    const int64_t ob_step = OH * out_row_stride;
-
-    // HWIO: dims, not pitch — one (tap, input channel) is one OC-length run.
-    const int64_t w_row = prepacked ? 0 : weight.shape(3);
-    const int64_t w_ic_stride = w_row;
-    const int64_t w_tap_stride = prepacked ? 0 : weight.shape(2) * w_row;
-
-    // Same geometry prepackWeights used (see the float kernel).
-    const ConvPackedWeight pg =
-        sme_blob ? conv_packed_weight_sme(attrs, ic_per_group, oc_per_group, weight.data_type()) :
-                   conv_packed_weight(attrs, ic_per_group, oc_per_group, weight.data_type());
-    NNOPS_ASSERT(pg.icn_block == icn_block && pg.ocn_block == ocn_block &&
-                 pg.nr == NR_MAX_I8);
-    constexpr int64_t nr_max = NR_MAX_I8;
-
-    // ---- quantization parameters -----------------------------------------
-    const QuantParams& qa = input.quant_params();
-    const QuantParams& qw = weight.quant_params();
-
-    const float s_x = quant_scale_at(qa, 0);
-    const int32_t zp_x = quant_zp_at(qa, 0);
-    NNOPS_ASSERT(s_x > 0.0f);
-
-    // `d`: the shift the A bytes carry into the GEMM. Both arches fold out only
-    // the +128 *they* add, so the epilogue must undo `d`. Which applies comes from
-    // the *quantization target* — the activation's own storage type when it
-    // arrives quantized, else `act_quant_dtype`.
-    const bool u8a = kFpAct ? (attrs.act_quant_dtype == DataType::u8) : kU8;
-    const int32_t d = u8a ? -128 : 0;
-
-    // The column term exists when the A-side shift and zero point do not cancel;
-    // the per-pixel term when some weight zero point is non-zero.
-    const bool col_term = (d + zp_x) != 0;
-    const bool comp = any_zp_nonzero(qw, OC);
-
-    // ---- the activation as s8 bytes ---------------------------------------
-    const Conv2DGemmScratch sc = gemm_scratch_layout(plan, 1);
-    char* const base = static_cast<char*>(workspace);
-
-    const bool plane = plan.quant_size > 0;
-    uint8_t xr = u8a ? uint8_t{0x80} : uint8_t{0};
-
+    const Conv2DAttributes* attrs = nullptr;
+    const ComputeContext* ctx = nullptr;
+    const QuantParams* qw = nullptr;
+    const QuantParams* qc = nullptr;
+    const TOut* b_ptr = nullptr;
+    const int32_t* b_i32 = nullptr;
+    TOut* out_ptr = nullptr;
+    const int8_t* w_ptr = nullptr;
     const uint8_t* in_base = nullptr;
     int64_t in_row_stride = 0;
-    if (plane) {
+
+    int64_t N = 0, IC = 0, IH = 0, IW = 0, OC = 0, OH = 0, OW = 0;
+    int64_t out_row_stride = 0;
+    int64_t G = 0, ic_per_group = 0, oc_per_group = 0;
+    int KH = 0, KW = 0, SH = 0, SW = 0, DH = 0, DW = 0, PH = 0, PW = 0, karea = 0;
+    int64_t k_full = 0;
+
+    int64_t icn_block = 0, ocn_block = 0, oh_chunks = 0, ph_block = 0, oc_chunks = 0;
+    int m_block = 0;
+    int64_t ib_step = 0, ob_step = 0;
+    int64_t w_ic_stride = 0, w_tap_stride = 0;
+    bool prepacked = false, sme_blob = false, use_sme = false, pointwise = false;
+
+    float s_x = 0.0f;
+    int32_t zp_x = 0;
+    bool u8a = false;
+    int32_t d = 0;
+    bool col_term = false, comp = false;
+    bool plane = false;
+    uint8_t xr = 0;
+
+    ConvPackedWeight pg;
+    int64_t kdim_max = 0;
+    bool a_biased = false;
+    Conv2DGemmScratch sc;
+    char* base = nullptr;
+    int8_t* shared_ptr = nullptr;
+    bool shared = false;
+    const int8_t* panels = nullptr;
+    PoolArray<int32_t> r_b_all;
+
+    int64_t a_pack_stride = 0; ///< packed-A panels at the front of the A region
+    int64_t acc_size = 0; ///< per-slot int32 accumulator elements
+    int64_t total = 0;
+    bool per_thread = false;
+
+    bool epi_fused = false, epi_i8 = false;
+    float out_scale = 0.0f;
+    int32_t out_zp = 0;
+    float epi_lo = 0.0f, epi_hi = 0.0f;
+
+    SmeI8Shared sme;
+};
+
+/// Materialize the activation as s8 bytes (or point at it directly).
+template <class TAct, class TOut>
+void prepare_i8_input(I8ConvCtx<TAct, TOut>& c, const TensorView& input,
+                      const ComputeContext& ctx)
+{
+    if (c.plane) {
         // s8 bytes, compact: the quantizer (or the pre-quantized copy) carries
         // the shift. The zero point moves into the *byte* domain too — a u8
         // source's `q − 128` is `q + d` — or the quantizer would clamp a
         // u8-range zero against the s8 clamp.
-        int8_t* p = reinterpret_cast<int8_t*>(base + sc.quant_off);
-        materialize_plane<TAct>(input, p, s_x, zp_x + d, ctx);
-        in_base = reinterpret_cast<const uint8_t*>(p);
-        in_row_stride = IW * IC;
-        xr = 0;
+        int8_t* p = reinterpret_cast<int8_t*>(c.base + c.sc.quant_off);
+        materialize_plane<TAct>(input, p, c.s_x, c.zp_x + c.d, ctx);
+        c.in_base = reinterpret_cast<const uint8_t*>(p);
+        c.in_row_stride = c.IW * c.IC;
+        c.xr = 0;
     } else {
-        in_base = reinterpret_cast<const uint8_t*>(input.ptr<TAct>());
-        in_row_stride = input.row_stride_elems();
+        c.in_base = reinterpret_cast<const uint8_t*>(input.ptr<TAct>());
+        c.in_row_stride = input.row_stride_elems();
     }
-    const int64_t ib_step = IH * in_row_stride;
+    c.ib_step = c.IH * c.in_row_stride;
+}
 
-    const int8_t* const w_ptr = weight.ptr<int8_t>();
-    [[maybe_unused]] const TOut* b_ptr = (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
-    [[maybe_unused]] const int32_t* b_i32 =
-        (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
-    TOut* const out_ptr = output.ptr<TOut>();
-    [[maybe_unused]] const QuantParams& qc = output.quant_params();
+/// R_b[oc] = Σ_k weight[oc,k] over the whole K. A packed blob carries it, so
+/// the walk below is only for a filter too large for the arena, and it is
+/// serial because a second pool dispatch costs more than the pass.
+///
+/// In HWIO one output channel's K values are a *strided* column, so the sum
+/// accumulates over the k rows — elementwise across OC, the contiguous axis.
+template <class TAct, class TOut> void compute_i8_r_b(I8ConvCtx<TAct, TOut>& c)
+{
+    if (!c.col_term) {
+        return;
+    }
+    c.r_b_all.assign(static_cast<size_t>(c.OC), 0);
+    if (c.panels) {
+        std::memcpy(c.r_b_all.data(), c.panels + c.pg.sums_off,
+                    static_cast<size_t>(c.OC) * sizeof(int32_t));
+        return;
+    }
+    for (int t = 0; t < c.karea; ++t) {
+        for (int64_t i = 0; i < c.ic_per_group; ++i) {
+            const int8_t* const row = c.w_ptr + t * c.w_tap_stride + i * c.w_ic_stride;
+            for (int64_t oc = 0; oc < c.OC; ++oc) {
+                c.r_b_all[static_cast<size_t>(oc)] += row[oc];
+            }
+        }
+    }
+}
+
+/// The shared SME int8 filter prepack. Per (group, task oc start, ic block),
+/// the same layout the fp route uses; `ocn_block` need not be a 64-column
+/// multiple, so the region is cut at the tasks' own oc steps.
+template <class TAct, class TOut> void pack_i8_sme_filter_shared(I8ConvCtx<TAct, TOut>& c)
+{
+#if defined(NNOPS_ARCH_SME)
+    if (!c.use_sme) {
+        return;
+    }
+    if (c.sme_blob) {
+        // The blob holds one region per (group, ic block, 64-column block),
+        // whole-K: nothing to pack here.
+        c.sme.num_ic_blocks = (c.ic_per_group + c.icn_block - 1) / c.icn_block;
+        c.sme.slot_max = c.pg.sme_region;
+        return;
+    }
+    const int64_t nr = aarch64::sme_nr_max;
+    c.sme.num_ic_blocks = (c.ic_per_group + c.icn_block - 1) / c.icn_block;
+    c.sme.start_prefix.assign(static_cast<size_t>(c.oc_chunks) + 1, 0);
+    for (int64_t chunk = 0; chunk < c.oc_chunks; ++chunk) {
+        const int64_t lo = chunk * c.pg.panels_oc / c.oc_chunks * I8ConvCtx<TAct, TOut>::nr_max;
+        const int64_t hi = std::min((chunk + 1) * c.pg.panels_oc / c.oc_chunks *
+                                        I8ConvCtx<TAct, TOut>::nr_max,
+                                    c.oc_per_group);
+        const int64_t starts = (hi - lo + c.ocn_block - 1) / c.ocn_block;
+        c.sme.start_prefix[static_cast<size_t>(chunk) + 1] =
+            c.sme.start_prefix[static_cast<size_t>(chunk)] + starts;
+    }
+    c.sme.total_starts = c.sme.start_prefix[static_cast<size_t>(c.oc_chunks)];
+    c.sme.slot_max = sme_b_panel_stride(DataType::s8, c.kdim_max);
+    const int64_t max_blocks = (c.ocn_block + nr - 1) / nr;
+    c.sme.region_bytes = max_blocks * c.sme.slot_max;
+    const int64_t slices = c.G * c.sme.total_starts * c.sme.num_ic_blocks;
+    c.sme.b.reset(static_cast<size_t>(slices * c.sme.region_bytes));
+    if (c.karea > 1) {
+        c.sme.stage.reset(static_cast<size_t>(c.kdim_max * nr));
+    }
+    for (int64_t g = 0; g < c.G; ++g) {
+        const int8_t* const w_group = c.w_ptr + g * c.oc_per_group;
+        for (int64_t chunk = 0; chunk < c.oc_chunks; ++chunk) {
+            const int64_t oc_lo =
+                chunk * c.pg.panels_oc / c.oc_chunks * I8ConvCtx<TAct, TOut>::nr_max;
+            const int64_t oc_hi =
+                std::min((chunk + 1) * c.pg.panels_oc / c.oc_chunks *
+                             I8ConvCtx<TAct, TOut>::nr_max,
+                         c.oc_per_group);
+            int64_t si = 0;
+            for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += c.ocn_block, ++si) {
+                const int64_t ocnc = std::min(c.ocn_block, oc_hi - ocn);
+                for (int64_t ib = 0; ib < c.sme.num_ic_blocks; ++ib) {
+                    const int64_t icn0 = ib * c.icn_block;
+                    const int64_t icnc = std::min(c.icn_block, c.ic_per_group - icn0);
+                    const int64_t kdim = icnc * c.karea;
+                    int8_t* const dst =
+                        c.sme.b.data() +
+                        ((g * c.sme.total_starts +
+                          c.sme.start_prefix[static_cast<size_t>(chunk)] + si) *
+                             c.sme.num_ic_blocks +
+                         ib) *
+                            c.sme.region_bytes;
+                    for (int64_t p0 = 0; p0 < ocnc; p0 += nr) {
+                        const int64_t np = std::min(nr, ocnc - p0);
+                        const int8_t* const bsrc = w_group + ocn + p0 + icn0 * c.w_ic_stride;
+                        int8_t* const out = dst + (p0 / nr) * c.sme.slot_max;
+                        if (c.karea == 1) {
+                            tile_pack_rhs_i8_sme(false, static_cast<int>(np), kdim, out, bsrc,
+                                                 static_cast<int>(c.w_ic_stride));
+                        } else {
+                            for (int t = 0; t < c.karea; ++t) {
+                                for (int64_t i = 0; i < icnc; ++i) {
+                                    std::memcpy(
+                                        c.sme.stage.data() +
+                                            (static_cast<int64_t>(t) * icnc + i) * nr,
+                                        bsrc + t * c.w_tap_stride + i * c.w_ic_stride,
+                                        static_cast<size_t>(np));
+                                }
+                            }
+                            tile_pack_rhs_i8_sme(false, static_cast<int>(np), kdim, out,
+                                                 c.sme.stage.data(), static_cast<int>(nr));
+                        }
+                    }
+                }
+            }
+        }
+    }
+#else
+    (void)c;
+#endif
+}
+
+template <class TAct, class TOut>
+void init_i8_ctx(I8ConvCtx<TAct, TOut>& c, const Conv2DAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx,
+                 const Conv2DGemmPlan& plan, void* workspace)
+{
+    const auto& input = inputs[0];
+    const auto& weight = inputs[1];
+    const bool has_bias = inputs.size() > 2;
+    c.attrs = &attrs;
+    c.ctx = &ctx;
+
+    c.N = input.shape(0);
+    c.IC = input.shape(3);
+    c.IH = input.shape(1);
+    c.IW = input.shape(2);
+
+    // HWIO: the output channel is the last axis; a prepacked blob leads with it.
+    c.prepacked = is_packed_conv_weight(weight.layout());
+    c.sme_blob = weight.layout() == TensorLayout::PackedHWIOSme;
+    c.OC = c.prepacked ? weight.shape(0) : weight.shape(3);
+
+    c.OH = output.shape(1);
+    c.OW = output.shape(2);
+    c.out_row_stride = output.row_stride_elems();
+
+    c.G = attrs.groups;
+    c.ic_per_group = c.IC / c.G;
+    c.oc_per_group = c.OC / c.G;
+
+    // The SMOPA tiles are 16 rows x 64 columns: one pass is four 16-column
+    // groups, so the filter has to fill them. A caller's NEON panel blob has no
+    // reader here; the ZA blob does, at the same 64-column width.
+#if defined(NNOPS_ARCH_SME)
+    c.use_sme = c.sme_blob || (!c.prepacked && aarch64::available_sme() &&
+                               c.oc_per_group >= aarch64::sme_nr_max);
+#else
+    c.use_sme = false;
+#endif
+
+    c.KH = static_cast<int>(attrs.kernel_size[0]);
+    c.KW = static_cast<int>(attrs.kernel_size[1]);
+    c.SH = static_cast<int>(attrs.stride[0]);
+    c.SW = static_cast<int>(attrs.stride[1]);
+    c.DH = static_cast<int>(attrs.dilation[0]);
+    c.DW = static_cast<int>(attrs.dilation[1]);
+    c.PH = static_cast<int>(attrs.padding[0]);
+    c.PW = static_cast<int>(attrs.padding[1]);
+    c.karea = c.KH * c.KW;
+    c.k_full = c.ic_per_group * c.karea;
+
+    c.pointwise = plan.pointwise;
+    c.icn_block = plan.icn_block;
+    c.ocn_block = plan.ocn_block;
+    c.m_block = static_cast<int>(plan.m_block);
+    c.oh_chunks = plan.oh_chunks;
+    c.ph_block = plan.ph_block;
+    c.oc_chunks = plan.oc_chunks;
+    c.ob_step = c.OH * c.out_row_stride;
+
+    // HWIO: dims, not pitch — one (tap, input channel) is one OC-length run.
+    c.w_ic_stride = c.prepacked ? 0 : weight.shape(3);
+    c.w_tap_stride = c.prepacked ? 0 : weight.shape(2) * c.w_ic_stride;
+
+    // Same geometry prepackWeights used (see the float kernel).
+    c.pg = c.sme_blob ? conv_packed_weight_sme(attrs, c.ic_per_group, c.oc_per_group,
+                                               weight.data_type()) :
+                        conv_packed_weight(attrs, c.ic_per_group, c.oc_per_group,
+                                           weight.data_type());
+    NNOPS_ASSERT(c.pg.icn_block == c.icn_block && c.pg.ocn_block == c.ocn_block &&
+                 c.pg.nr == NR_MAX_I8);
+    c.kdim_max = c.pg.kdim_max;
+    c.a_biased = arch::mma_i8_folds_a_bias;
+
+    // ---- quantization parameters -----------------------------------------
+    const QuantParams& qa = input.quant_params();
+    c.qw = &weight.quant_params();
+    c.qc = &output.quant_params();
+    c.s_x = quant_scale_at(qa, 0);
+    c.zp_x = quant_zp_at(qa, 0);
+    NNOPS_ASSERT(c.s_x > 0.0f);
+
+    // `d`: the shift the A bytes carry into the GEMM. Both arches fold out only
+    // the +128 *they* add, so the epilogue must undo `d`. Which applies comes
+    // from the *quantization target* — the activation's own storage type when
+    // it arrives quantized, else `act_quant_dtype`.
+    c.u8a = I8ConvCtx<TAct, TOut>::kFpAct ? (attrs.act_quant_dtype == DataType::u8) :
+                                            I8ConvCtx<TAct, TOut>::kU8;
+    c.d = c.u8a ? -128 : 0;
+    // The column term exists when the A-side shift and zero point do not
+    // cancel; the per-pixel term when some weight zero point is non-zero.
+    c.col_term = (c.d + c.zp_x) != 0;
+    c.comp = any_zp_nonzero(*c.qw, c.OC);
+
+    // ---- the activation as s8 bytes ---------------------------------------
+    c.sc = gemm_scratch_layout(plan, 1);
+    c.base = static_cast<char*>(workspace);
+    c.plane = plan.quant_size > 0;
+    c.xr = c.u8a ? uint8_t{0x80} : uint8_t{0};
+
+    c.w_ptr = weight.ptr<int8_t>();
+    c.b_ptr = (has_bias && !I8ConvCtx<TAct, TOut>::kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
+    c.b_i32 = (has_bias && I8ConvCtx<TAct, TOut>::kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
+    c.out_ptr = output.ptr<TOut>();
 
     // ---- block geometry ----------------------------------------------------
-    const int64_t kdim_max = pg.kdim_max;
-    const bool a_biased = arch::mma_i8_folds_a_bias;
-    int8_t* const shared_ptr = reinterpret_cast<int8_t*>(base + sc.panel_off);
-    const bool shared = plan.shared_elems > 0;
+    c.shared_ptr = reinterpret_cast<int8_t*>(c.base + c.sc.panel_off);
+    c.shared = plan.shared_elems > 0;
     // The panels every task reads in place: the caller's blob, or this call's
     // own copy (null when the weight did not fit — each task packs its slot).
-    const int8_t* const panels =
-        (!use_sme && (prepacked || shared)) ? (prepacked ? w_ptr : shared_ptr) : nullptr;
+    c.panels = (!c.use_sme && (c.prepacked || c.shared)) ?
+                   (c.prepacked ? c.w_ptr : c.shared_ptr) :
+                   nullptr;
 
     // ---- the shared weight prepack (once per call) -------------------------
     // Through the entry prepackWeights uses, so the addressing is one code path.
     // It runs before the sums are read back below. The SME route packs its own
     // B layout per task, so this NEON copy is skipped there.
-    if (shared && !use_sme) {
-        const int64_t cols = (plan.shared_elems + OC - 1) / OC;
-        const int64_t shape[] = {OC, cols};
-        TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(), shared_ptr, cols,
-                        TensorLayout::PackedHWIO);
+    if (c.shared && !c.use_sme) {
+        const int64_t cols = (plan.shared_elems + c.OC - 1) / c.OC;
+        const int64_t shape[] = {c.OC, cols};
+        TensorView blob(std::span<const int64_t>(shape, 2), weight.data_type(), c.shared_ptr,
+                        cols, TensorLayout::PackedHWIO);
         conv_packed_weight_pack(attrs, weight, blob, ctx);
     }
 
-    // R_b[oc] = Σ_k weight[oc,k] over the whole K. A packed blob carries it, so
-    // the walk below is only for a filter too large for the arena, and it is
-    // serial because a second pool dispatch costs more than the pass.
-    //
-    // In HWIO one output channel's K values are a *strided* column, so the sum
-    // accumulates over the k rows — elementwise across OC, the contiguous axis.
-    PoolArray<int32_t> r_b_all;
-    if (col_term) {
-        r_b_all.assign(static_cast<size_t>(OC), 0);
-        if (panels) {
-            std::memcpy(r_b_all.data(), panels + pg.sums_off,
-                        static_cast<size_t>(OC) * sizeof(int32_t));
-        } else {
-            for (int t = 0; t < karea; ++t) {
-                for (int64_t i = 0; i < ic_per_group; ++i) {
-                    const int8_t* const row = w_ptr + t * w_tap_stride + i * w_ic_stride;
-                    for (int64_t oc = 0; oc < OC; ++oc) {
-                        r_b_all[static_cast<size_t>(oc)] += row[oc];
-                    }
-                }
-            }
-        }
-    }
+    compute_i8_r_b(c);
+    pack_i8_sme_filter_shared(c);
+    prepare_i8_input(c, input, ctx);
 
-#if defined(NNOPS_ARCH_SME)
-    // ---- the shared SME filter prepack (once per call) ----------------------
-    // Per (group, task oc start, ic block), the same layout the fp route uses.
-    // `ocn_block` need not be a 64-column multiple, so the region is cut at the
-    // tasks' own oc steps rather than at chunk boundaries.
-    std::vector<int64_t> sme_start_prefix;
-    PoolArray<int8_t> sme_b_shared;
-    PoolArray<int8_t> sme_stage_shared;
-    int64_t sme_total_starts = 0;
-    int64_t sme_region_bytes = 0;
-    int64_t sme_slot_max = 0;
-    int64_t sme_num_ic_blocks = 0;
-    if (use_sme && sme_blob) {
-        // The blob holds one region per (group, ic block, 64-column block),
-        // whole-K: nothing to pack here.
-        sme_num_ic_blocks = (ic_per_group + icn_block - 1) / icn_block;
-        sme_slot_max = pg.sme_region;
-    } else if (use_sme) {
-        const int64_t nr = aarch64::sme_nr_max;
-        sme_num_ic_blocks = (ic_per_group + icn_block - 1) / icn_block;
-        sme_start_prefix.assign(static_cast<size_t>(oc_chunks) + 1, 0);
-        for (int64_t c = 0; c < oc_chunks; ++c) {
-            const int64_t lo = c * pg.panels_oc / oc_chunks * nr_max;
-            const int64_t hi =
-                std::min((c + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
-            const int64_t starts = (hi - lo + ocn_block - 1) / ocn_block;
-            sme_start_prefix[static_cast<size_t>(c) + 1] =
-                sme_start_prefix[static_cast<size_t>(c)] + starts;
-        }
-        sme_total_starts = sme_start_prefix[static_cast<size_t>(oc_chunks)];
-        sme_slot_max = sme_b_panel_stride(DataType::s8, kdim_max);
-        const int64_t max_blocks = (ocn_block + nr - 1) / nr;
-        sme_region_bytes = max_blocks * sme_slot_max;
-        const int64_t slices = G * sme_total_starts * sme_num_ic_blocks;
-        sme_b_shared.reset(static_cast<size_t>(slices * sme_region_bytes));
-        if (karea > 1) {
-            sme_stage_shared.reset(static_cast<size_t>(kdim_max * nr));
-        }
-        for (int64_t g = 0; g < G; ++g) {
-            const int8_t* const w_group = w_ptr + g * oc_per_group;
-            for (int64_t c = 0; c < oc_chunks; ++c) {
-                const int64_t oc_lo = c * pg.panels_oc / oc_chunks * nr_max;
-                const int64_t oc_hi =
-                    std::min((c + 1) * pg.panels_oc / oc_chunks * nr_max, oc_per_group);
-                int64_t si = 0;
-                for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block, ++si) {
-                    const int64_t ocnc = std::min(ocn_block, oc_hi - ocn);
-                    for (int64_t ib = 0; ib < sme_num_ic_blocks; ++ib) {
-                        const int64_t icn0 = ib * icn_block;
-                        const int64_t icnc = std::min(icn_block, ic_per_group - icn0);
-                        const int64_t kdim = icnc * karea;
-                        int8_t* const dst =
-                            sme_b_shared.data() +
-                            ((g * sme_total_starts + sme_start_prefix[static_cast<size_t>(c)] +
-                              si) *
-                                 sme_num_ic_blocks +
-                             ib) *
-                                sme_region_bytes;
-                        for (int64_t p0 = 0; p0 < ocnc; p0 += nr) {
-                            const int64_t np = std::min(nr, ocnc - p0);
-                            const int8_t* const bsrc =
-                                w_group + ocn + p0 + icn0 * w_ic_stride;
-                            int8_t* const out = dst + (p0 / nr) * sme_slot_max;
-                            if (karea == 1) {
-                                tile_pack_rhs_i8_sme(false, static_cast<int>(np), kdim, out,
-                                                     bsrc, static_cast<int>(w_ic_stride));
-                            } else {
-                                for (int t = 0; t < karea; ++t) {
-                                    for (int64_t i = 0; i < icnc; ++i) {
-                                        std::memcpy(
-                                            sme_stage_shared.data() +
-                                                (static_cast<int64_t>(t) * icnc + i) * nr,
-                                            bsrc + t * w_tap_stride + i * w_ic_stride,
-                                            static_cast<size_t>(np));
-                                    }
-                                }
-                                tile_pack_rhs_i8_sme(false, static_cast<int>(np), kdim, out,
-                                                     sme_stage_shared.data(),
-                                                     static_cast<int>(nr));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-#endif
-
-    const int64_t NG = N * G;
-    const int64_t chunks_per_ng = oh_chunks * oc_chunks;
-    const int64_t total = NG * chunks_per_ng;
-
+    c.a_pack_stride = plan.a_pack_stride;
+    c.acc_size = plan.acc_size;
+    c.total = (c.N * c.G) * (c.oh_chunks * c.oc_chunks);
     const int nslots = ctx.cpu.thread_slot_count();
-    const bool per_thread = nslots > 0 && nslots < total;
+    c.per_thread = nslots > 0 && nslots < c.total;
 
-    const auto run_task = [&](int64_t t) {
-        const int64_t ng = t / chunks_per_ng;
-        const int64_t rem = t % chunks_per_ng;
-        const int64_t chunk = rem / oc_chunks;
-        const int64_t oc_chunk = rem % oc_chunks;
-        const int64_t n = ng / G;
-        const int64_t g = ng % G;
-
-        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
-        char* const slot_ptr = base + sc.head + slot * sc.slot_stride;
-        int8_t* const a_pack = reinterpret_cast<int8_t*>(slot_ptr + sc.off_a);
-        int8_t* const a_buf = a_pack + plan.a_pack_stride;
-        int8_t* const stage = reinterpret_cast<int8_t*>(slot_ptr + sc.off_stage);
-        int8_t* const pack_buf = reinterpret_cast<int8_t*>(slot_ptr + sc.off_pack);
-        int32_t* const acc_buf = reinterpret_cast<int32_t*>(
-            base + sc.off_acc + slot * plan.acc_size * static_cast<int64_t>(sizeof(int32_t)));
-
-        // The SME route's per-task A slab; B is the shared prepack.
+    // ---- the epilogue route -------------------------------------------------
+    // The dequantizing store folds the whole epilogue into the kernel's
+    // write-back. It needs the plain dequant shape — no per-row or per-column
+    // compensation, a clamp-only activation, no residual — and one k block per
+    // tile, so every tile starts from a zeroed ZA.
 #if defined(NNOPS_ARCH_SME)
-        PoolArray<int8_t> sme_a;
-        if (use_sme) {
-            const int64_t kd4 = align4(kdim_max);
-            const int64_t a_blocks = (m_block + aarch64::sme_mr - 1) / aarch64::sme_mr;
-            sme_a.reset(static_cast<size_t>(
-                a_blocks * sme_a_panel_stride(DataType::s8, kd4)));
-        }
-#endif
-
-        TOut* const out_g = out_ptr + n * ob_step + g * oc_per_group;
-        const uint8_t* const in_g = in_base + n * ib_step + g * ic_per_group;
-        const int8_t* const w_g = w_ptr + g * oc_per_group;
-        [[maybe_unused]] const TOut* const bias_g = b_ptr ? b_ptr + g * oc_per_group : nullptr;
-        [[maybe_unused]] const int32_t* const ibias_g = b_i32 ? b_i32 + g * oc_per_group : nullptr;
-
-        // The dequantizing store folds the whole epilogue into the kernel's
-        // write-back. It needs the plain dequant shape — no per-row or per-column
-        // compensation, a clamp-only activation, no residual — and one k block
-        // per tile, so every tile starts from a zeroed ZA.
-#if defined(NNOPS_ARCH_SME)
-        const bool epi_fused = use_sme && !kIntOut && !comp && !col_term &&
-                               plan.orig_size == 0 && icn_block >= ic_per_group &&
-                               attrs.epilogue.quant == EpilogueQuantType::None &&
-                               (attrs.epilogue.type == EpilogueActivateType::None ||
-                                attrs.epilogue.type == EpilogueActivateType::Relu ||
-                                attrs.epilogue.type == EpilogueActivateType::Relu6);
+    c.epi_fused = c.use_sme && !I8ConvCtx<TAct, TOut>::kIntOut && !c.comp && !c.col_term &&
+                  plan.orig_size == 0 && c.icn_block >= c.ic_per_group &&
+                  attrs.epilogue.quant == EpilogueQuantType::None &&
+                  (attrs.epilogue.type == EpilogueActivateType::None ||
+                   attrs.epilogue.type == EpilogueActivateType::Relu ||
+                   attrs.epilogue.type == EpilogueActivateType::Relu6);
+    // The 8-bit requantizing store: same preconditions, but the destination is
+    // quantized, so the epilogue's requantize rides the write-back too.
+    c.epi_i8 = c.use_sme && I8ConvCtx<TAct, TOut>::kIntOut && !c.comp && !c.col_term &&
+               plan.orig_size == 0 && c.icn_block >= c.ic_per_group &&
+               (attrs.epilogue.quant != EpilogueQuantType::Requantize ||
+                attrs.epilogue.quant_param_count == 0) &&
+               (attrs.epilogue.type == EpilogueActivateType::None ||
+                attrs.epilogue.type == EpilogueActivateType::Relu);
 #else
-        constexpr bool epi_fused = false;
+    c.epi_fused = false;
+    c.epi_i8 = false;
 #endif
-        // The 8-bit requantizing store: same preconditions, but the destination
-        // is quantized, so the epilogue's requantize rides the write-back too.
-#if defined(NNOPS_ARCH_SME)
-        const bool epi_i8 = use_sme && kIntOut && !comp && !col_term &&
-                            plan.orig_size == 0 && icn_block >= ic_per_group &&
-                            (attrs.epilogue.quant != EpilogueQuantType::Requantize ||
-                             attrs.epilogue.quant_param_count == 0) &&
-                            (attrs.epilogue.type == EpilogueActivateType::None ||
-                             attrs.epilogue.type == EpilogueActivateType::Relu);
-#else
-        constexpr bool epi_i8 = false;
-#endif
-        // The requantize scale: s_a / s_out, and the destination's zero point —
-        // what int8_epilogue_row_quant forms per row when nothing overrides it.
-        const float out_scale = (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
-                                 attrs.epilogue.quant_param_count > 0)
-                                    ? epilogue_quant_scale(attrs.epilogue, 0)
-                                    : quant_scale_at(qc, 0);
-        const int32_t out_zp = (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
-                                attrs.epilogue.quant_param_count > 0)
-                                   ? epilogue_quant_zero(attrs.epilogue, 0)
-                                   : quant_zp_at(qc, 0);
+    // The requantize scale: s_a / s_out, and the destination's zero point —
+    // what int8_epilogue_row_quant forms per row when nothing overrides it.
+    c.out_scale = (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                   attrs.epilogue.quant_param_count > 0) ?
+                      epilogue_quant_scale(attrs.epilogue, 0) :
+                      quant_scale_at(*c.qc, 0);
+    c.out_zp = (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                attrs.epilogue.quant_param_count > 0) ?
+                   epilogue_quant_zero(attrs.epilogue, 0) :
+                   quant_zp_at(*c.qc, 0);
 
-        // Relu and Relu6 compose into the clip bounds: clamp∘clamp is a clamp.
-        float epi_lo = attrs.epilogue.min_clip;
-        float epi_hi = attrs.epilogue.max_clip;
-        if (attrs.epilogue.type == EpilogueActivateType::Relu) {
-            epi_lo = std::max(epi_lo, 0.0f);
-        } else if (attrs.epilogue.type == EpilogueActivateType::Relu6) {
-            epi_lo = std::max(epi_lo, 0.0f);
-            epi_hi = std::min(epi_hi, 6.0f);
+    // Relu and Relu6 compose into the clip bounds: clamp∘clamp is a clamp.
+    c.epi_lo = attrs.epilogue.min_clip;
+    c.epi_hi = attrs.epilogue.max_clip;
+    if (attrs.epilogue.type == EpilogueActivateType::Relu) {
+        c.epi_lo = std::max(c.epi_lo, 0.0f);
+    } else if (attrs.epilogue.type == EpilogueActivateType::Relu6) {
+        c.epi_lo = std::max(c.epi_lo, 0.0f);
+        c.epi_hi = std::min(c.epi_hi, 6.0f);
+    }
+}
+
+/// The B panel a task reads: in place from a blob, or packed into its slot.
+template <class TAct, class TOut>
+const int8_t* pick_i8_b(const I8ConvCtx<TAct, TOut>& c, int64_t g, int64_t icn, int64_t ocn,
+                        int64_t ocnc, int64_t icnc, int kdim, int64_t oc_chunk,
+                        int8_t* stage, int8_t* pack_buf)
+{
+#if defined(NNOPS_ARCH_SME)
+    if (c.use_sme) {
+        if (c.sme_blob) {
+            // The caller's blob: one whole-K region per (group, ic block,
+            // 64-column block), read in place.
+            const int64_t slice = (g * c.sme.num_ic_blocks + icn / c.icn_block) *
+                                      c.pg.num_oc_blocks +
+                                  ocn / aarch64::sme_nr_max;
+            return c.w_ptr + slice * c.pg.sme_region;
         }
-
-        const int64_t r0 = chunk * OH / oh_chunks;
-        const int64_t r1 = (chunk + 1) * OH / oh_chunks;
-        // Over *panels*, like the fp route: a task starts where a panel does.
-        // A ZA blob's blocks are the filter's own 64-column ones, not the NEON
-        // panels the split is measured in; its plan keeps the group whole.
-        const int64_t oc_lo =
-            sme_blob ? 0 : oc_chunk * pg.panels_oc / oc_chunks * nr_max;
-        const int64_t oc_hi = sme_blob ?
-                                  oc_per_group :
-                                  std::min((oc_chunk + 1) * pg.panels_oc / oc_chunks * nr_max,
-                                           oc_per_group);
-
-        // Same flat-pixel rule as the fp route; pointwise also needs the input
-        // dense, since it reads A straight out of the row.
-        const bool flat =
-            out_row_stride == OW * OC && (!plan.pointwise || in_row_stride == IW * IC);
-
-#if defined(NNOPS_ARCH_SME)
-        [[maybe_unused]] std::vector<float> bias_f;
+        const int64_t oc_lo_chunk =
+            oc_chunk * c.pg.panels_oc / c.oc_chunks * I8ConvCtx<TAct, TOut>::nr_max;
+        const int64_t starts_before = c.sme.start_prefix[static_cast<size_t>(oc_chunk)];
+        const int64_t si_local = (ocn - oc_lo_chunk) / c.ocn_block;
+        const int64_t slice = (g * c.sme.total_starts + starts_before + si_local) *
+                                  c.sme.num_ic_blocks +
+                              icn / c.icn_block;
+        return c.sme.b.data() + slice * c.sme.region_bytes;
+    }
 #endif
-        // Same block-end clamp and step as the fp route: the blob holds one oc
-        // block at a time and the kernel walks its panels at `slot` apart.
-        const auto block_end = [&](int64_t ocn) {
-            return panels ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block) : oc_hi;
-        };
-        for (int64_t ocn = oc_lo; ocn < oc_hi; ocn = panels ? block_end(ocn) : ocn + ocn_block) {
-            const int64_t oc_end = block_end(ocn);
-            const int64_t ocnc = std::min(ocn_block, oc_end - ocn);
+    const int8_t* const w_g = c.w_ptr + g * c.oc_per_group;
+    if (c.panels) {
+        return c.panels + c.pg.offset(g, icn / c.icn_block, ocn);
+    }
+    pack_block_i8(pack_buf,
+                  gemm_panel_slot(kdim, I8ConvCtx<TAct, TOut>::nr_max, 1, true), stage,
+                  w_g + ocn + icn * c.w_ic_stride, c.w_ic_stride, c.w_tap_stride, ocnc, icnc,
+                  c.karea, I8ConvCtx<TAct, TOut>::nr_max, kdim, c.a_biased);
+    return pack_buf;
+}
 
-            // The epilogue's per-column weight scale and bias, indexed like
-            // `ip.s_b` / `ip.col_bias` below.
-            [[maybe_unused]] const float* const sb_ptr =
-                qw.scale_data ? qw.scale_data + g * oc_per_group + ocn : nullptr;
-            // The fused store takes the bias in the float domain; a half bias
-            // (which the dequantizing pass widens per element) widens once here.
-            [[maybe_unused]] const float* col_bias_f = nullptr;
+/// The A tile a pixel tile multiplies: the input run itself (pointwise), the
+/// fused ZA gather on SME, or the dense int8 im2col scratch.
+struct I8ATile {
+    const int8_t* ptr = nullptr;
+    int lda = 0;
+    bool packed = false;
+    bool direct = false;
+};
+
+template <class TAct, class TOut>
+I8ATile pick_i8_a(const I8ConvCtx<TAct, TOut>& c, const uint8_t* in_g, const uint8_t* in_row,
+                  int64_t icn, int64_t icnc, int64_t p, int64_t ow0, int mc, bool flat,
+                  int kdim, int kdim4, int8_t* a_buf, int8_t* sme_a)
+{
+    I8ATile a;
+    // Pointwise reads the pixels straight out of the row, which needs a whole
+    // number of 4-byte k groups; else the gather zero-fills.
+    a.direct = c.pointwise && (kdim == kdim4);
+    if (a.direct) {
+        // The pixel is its own patch: A is the input run.
+        a.ptr = reinterpret_cast<const int8_t*>(in_row + ow0 * c.IC + icn);
+        a.lda = static_cast<int>(c.IC);
+        return a;
+    }
+
+    bool fused_pack = false;
 #if defined(NNOPS_ARCH_SME)
-            if (epi_fused && bias_g != nullptr) {
-                if constexpr (std::is_same_v<TOut, float>) {
-                    col_bias_f = bias_g + ocn;
-                } else {
-                    // Sized by the tile, not by kOcnBlock: the int8 route's N
-                    // tile is the whole group width.
-                    if (bias_f.size() < static_cast<size_t>(ocnc)) {
-                        bias_f.resize(static_cast<size_t>(ocnc));
-                    }
-                    for (int64_t j = 0; j < ocnc; ++j) {
-                        bias_f[j] = static_cast<float>(bias_g[ocn + j]);
-                    }
-                    col_bias_f = bias_f.data();
-                }
+    // The SME route gathers straight into the packed A panel (one ZA row per
+    // pixel), which needs signed bytes in whole k groups — a u8 source comes in
+    // shifted through the materialized plane.
+    fused_pack = c.use_sme && c.xr == 0 && (icnc % 4) == 0 && (c.IC % 4) == 0 &&
+                 (c.in_row_stride % 4) == 0 &&
+                 (reinterpret_cast<uintptr_t>(in_g + icn) % 4) == 0;
+#endif
+    if (fused_pack) {
+#if defined(NNOPS_ARCH_SME)
+        tile_im2col_pack_i8_sme(
+            sme_a, reinterpret_cast<const int8_t*>(in_g + icn), c.in_row_stride, c.IC,
+            static_cast<int8_t>(static_cast<uint8_t>((c.plane ? c.zp_x + c.d : c.zp_x)) ^
+                                c.xr),
+            p, static_cast<int>(c.OW), mc, static_cast<int>(c.IH), static_cast<int>(c.IW),
+            c.KH, c.KW, c.SH, c.SW, c.DH, c.DW, c.PH, c.PW, static_cast<int>(icnc), c.karea);
+        a.ptr = sme_a;
+        a.lda = kdim4;
+        a.packed = true;
+#endif
+    } else {
+        tiled_im2col_i8(a_buf, kdim4, in_g + icn, c.in_row_stride, c.IC, c.xr,
+                        static_cast<uint8_t>(c.plane ? c.zp_x + c.d : c.zp_x), p,
+                        static_cast<int>(c.OW), flat, mc, static_cast<int>(c.IH),
+                        static_cast<int>(c.IW), c.KH, c.KW, c.SH, c.SW, c.DH, c.DW, c.PH,
+                        c.PW, static_cast<int>(icnc), c.karea, kdim, kdim4);
+        a.ptr = a_buf;
+        a.lda = kdim4;
+    }
+    return a;
+}
+
+/// Multiply one pixel tile. Returns true when a fused store already wrote the
+/// destination (no int32 tile was materialized).
+template <class TAct, class TOut>
+bool i8_mma(const I8ConvCtx<TAct, TOut>& c, int64_t g, int64_t icn, int mc, int64_t ocn,
+            int64_t ocnc, int kdim4, int32_t* acc_tile, int8_t* a_pack, const I8ATile& a,
+            const int8_t* b_panel, int8_t* sme_a, TOut* fdst, const float* sb_ptr,
+            const float* col_bias_f)
+{
+#if defined(NNOPS_ARCH_SME)
+    if (c.use_sme) {
+        if (!a.packed) {
+            tile_pack_lhs_i8_sme(false, mc, kdim4, sme_a, a.ptr, a.lda, c.a_biased);
+        }
+        if constexpr (I8ConvCtx<TAct, TOut>::kIntOut) {
+            if (c.epi_i8) {
+                tile_mma_pack_i8_sme_epi_i8(
+                    mc, static_cast<int>(ocnc), kdim4, fdst, static_cast<int64_t>(c.OC),
+                    sme_a, b_panel, c.sme.slot_max, sb_ptr, c.qw->scale, c.s_x / c.out_scale,
+                    c.b_i32 ? c.b_i32 + g * c.oc_per_group + ocn : nullptr, c.out_zp,
+                    c.attrs->epilogue.type == EpilogueActivateType::Relu);
+                return true;
             }
+        } else if (c.epi_fused) {
+            // The dequantizing store: the epilogue is the kernel's write-back,
+            // so no int32 tile exists.
+            tile_mma_pack_i8_sme_epi(mc, static_cast<int>(ocnc), kdim4, fdst,
+                                     static_cast<int64_t>(c.OC), sme_a, b_panel,
+                                     c.sme.slot_max, sb_ptr, c.qw->scale, c.s_x, col_bias_f,
+                                     c.epi_lo, c.epi_hi);
+            return true;
+        }
+        tile_mma_pack_i8_sme(mc, static_cast<int>(ocnc), kdim4, acc_tile,
+                             static_cast<int>(c.ocn_block), sme_a, b_panel, c.sme.slot_max,
+                             INT32_MIN, INT32_MAX, /*zero_mode=*/icn == 0);
+        return false;
+    }
 #endif
-            for (int64_t pr = r0; pr < r1; pr += ph_block) {
-                const int64_t pr1 = std::min(r1, pr + ph_block);
-                const int64_t p_first = pr * OW;
-                const int64_t p_last = pr1 * OW;
-                // Re-split a tail shorter than MR evenly, keeping the step a
-                // multiple of MR so the re-split costs no extra block.
-                constexpr int64_t mr_step = MR_MAX_I8;
-                const int64_t p_span = std::max<int64_t>(p_last - p_first, 1);
-                const int64_t p_tail = p_span % m_block;
-                const int64_t p_step =
-                    (flat && p_tail != 0 && p_tail < mr_step && m_block >= 2 * mr_step) ?
-                        (m_block / mr_step - 1) * mr_step :
-                        m_block;
+    const int64_t ldd_a = geom_ldd_i8_a(kdim4);
+    tile_pack_lhs_i8(false, mc, kdim4, a_pack, static_cast<int>(ldd_a), a.ptr, a.lda,
+                     c.a_biased);
+    tile_mma_pack_i8(mc, static_cast<int>(ocnc), kdim4, acc_tile,
+                     static_cast<int>(c.ocn_block), a_pack, b_panel, /*ldb=*/0, INT32_MIN,
+                     INT32_MAX, /*zero_mode=*/icn == 0);
+    return false;
+}
 
-                for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
-                    const int64_t icnc = std::min(icn_block, ic_per_group - icn);
-                    const bool is_last_icn = (icn + icn_block) >= ic_per_group;
-                    const int kdim = static_cast<int>(icnc * karea);
-                    const int kdim4 = static_cast<int>(align4(kdim));
-                    // Pointwise reads the pixels straight out of the row, which needs
-                    // a whole number of 4-byte k groups; else the gather zero-fills.
-                    const bool direct_a = plan.pointwise && (kdim == kdim4);
-
-                    const int8_t* b_panel;
-                    bool b_sme = false;
-#if defined(NNOPS_ARCH_SME)
-                    if (use_sme) {
-                        if (sme_blob) {
-                            // The caller's blob: one whole-K region per (group,
-                            // ic block, 64-column block), read in place.
-                            const int64_t kd4 = align4(pg.kdim_max);
-                            (void)kd4;
-                            const int64_t slice =
-                                (g * sme_num_ic_blocks + icn / icn_block) *
-                                    pg.num_oc_blocks +
-                                ocn / aarch64::sme_nr_max;
-                            b_panel = w_ptr + slice * pg.sme_region;
-                        } else {
-                            const int64_t oc_lo_chunk =
-                                oc_chunk * pg.panels_oc / oc_chunks * nr_max;
-                            const int64_t starts_before =
-                                sme_start_prefix[static_cast<size_t>(oc_chunk)];
-                            const int64_t si_local = (ocn - oc_lo_chunk) / ocn_block;
-                            const int64_t slice =
-                                (g * sme_total_starts + starts_before + si_local) *
-                                    sme_num_ic_blocks +
-                                icn / icn_block;
-                            b_panel = sme_b_shared.data() + slice * sme_region_bytes;
-                        }
-                        b_sme = true;
-                    }
-#endif
-                    if (!b_sme) {
-                        if (panels) {
-                            b_panel = panels + pg.offset(g, icn / icn_block, ocn);
-                        } else {
-                            pack_block_i8(pack_buf, gemm_panel_slot(kdim, nr_max, 1, true),
-                                          stage, w_g + ocn + icn * w_ic_stride, w_ic_stride,
-                                          w_tap_stride, ocnc, icnc, karea, nr_max, kdim,
-                                          a_biased);
-                            b_panel = pack_buf;
-                        }
-                    }
-
-                    // `mc` lives outside the loop: it is the step, and the body's
-                    // early exits still have to advance it.
-                    int mc = 0;
-                    for (int64_t p = p_first; p < p_last; p += flat ? p_step : mc) {
-                        const int64_t oh = p / OW;
-                        const int64_t ow0 = p - oh * OW;
-                        const int64_t left = flat ? std::min(p_step, p_last - p) : (OW - ow0);
-                        mc = static_cast<int>(std::min<int64_t>(m_block, left));
-                        {
-                            const uint8_t* const in_row = in_g + oh * in_row_stride;
-
-                            // The dequantizing store needs nothing compensated per
-                            // row or per column, a clamp-only activation, one k block
-                            // per tile (so every tile starts from a zeroed ZA) and the
-                            // fp output the epilogue would have written.
-                            bool epi_done = false;
-
-                            // The SME route gathers straight into the packed A
-                            // panel (one ZA row per pixel), which needs signed
-                            // bytes in whole k groups — a u8 source comes in
-                            // shifted through the materialized plane.
-                            bool fused_pack = false;
-#if defined(NNOPS_ARCH_SME)
-                            fused_pack = use_sme && !direct_a && xr == 0 && (icnc % 4) == 0 &&
-                                         (IC % 4) == 0 && (in_row_stride % 4) == 0 &&
-                                         (reinterpret_cast<uintptr_t>(in_g + icn) % 4) == 0;
-#endif
-
-                            const int8_t* a;
-                            int lda;
-                            if (direct_a) {
-                                // The pixel is its own patch: A is the input run.
-                                a = reinterpret_cast<const int8_t*>(in_row + ow0 * IC + icn);
-                                lda = static_cast<int>(IC);
-                            } else if (fused_pack) {
-                                a = nullptr;
-                                lda = 0;
-                            } else {
-                                tiled_im2col_i8(
-                                    a_buf, kdim4, in_g + icn, in_row_stride, IC, xr,
-                                    static_cast<uint8_t>(plane ? zp_x + d : zp_x), p,
-                                    static_cast<int>(OW), flat, mc, static_cast<int>(IH),
-                                    static_cast<int>(IW), KH, KW, SH, SW, DH, DW, PH, PW,
-                                    static_cast<int>(icnc), karea, kdim, kdim4);
-                                a = a_buf;
-                                lda = kdim4;
-                            }
-
-                            int32_t* const acc_tile = acc_buf + (p - p_first) * ocn_block;
-
-                            // The MMA wants A packed (group-major, MR rows of 4 bytes
-                            // per k group): its direct-A variant costs ~2.7x the uops
-                            // broadcasting each group out of a row-major row.
-                            //
-                            // The first K block stores instead of accumulating, so the
-                            // tile needs no zero fill — a whole-tile write that only
-                            // existed to be read back is skipped.
-                            bool mma_sme = false;
-#if defined(NNOPS_ARCH_SME)
-                            if (use_sme) {
-                                if (fused_pack) {
-                                    tile_im2col_pack_i8_sme(
-                                        sme_a.data(),
-                                        reinterpret_cast<const int8_t*>(in_g + icn),
-                                        in_row_stride, IC,
-                                        static_cast<int8_t>(static_cast<uint8_t>(
-                                            (plane ? zp_x + d : zp_x) ^ xr)),
-                                        p, static_cast<int>(OW), mc, static_cast<int>(IH),
-                                        static_cast<int>(IW), KH, KW, SH, SW, DH, DW, PH, PW,
-                                        static_cast<int>(icnc), karea);
-                                } else {
-                                    tile_pack_lhs_i8_sme(false, mc, kdim4, sme_a.data(), a, lda,
-                                                         a_biased);
-                                }
-                                if constexpr (kIntOut) {
-                                    if (epi_i8) {
-                                        TOut* const fdst =
-                                            out_g + oh * out_row_stride + ow0 * OC + ocn;
-                                        tile_mma_pack_i8_sme_epi_i8(
-                                            mc, static_cast<int>(ocnc), kdim4, fdst,
-                                            static_cast<int64_t>(OC), sme_a.data(), b_panel,
-                                            /*block_stride=*/sme_slot_max, sb_ptr, qw.scale,
-                                            s_x / out_scale,
-                                            ibias_g ? ibias_g + ocn : nullptr, out_zp,
-                                            attrs.epilogue.type == EpilogueActivateType::Relu);
-                                        epi_done = true;
-                                    }
-                                } else if (epi_fused) {
-                                        // The dequantizing store: the epilogue is
-                                        // the kernel's write-back, so no int32 tile
-                                        // exists.
-                                        TOut* const fdst =
-                                            out_g + oh * out_row_stride + ow0 * OC + ocn;
-                                        tile_mma_pack_i8_sme_epi(
-                                            mc, static_cast<int>(ocnc), kdim4, fdst,
-                                            static_cast<int64_t>(OC), sme_a.data(), b_panel,
-                                            /*block_stride=*/sme_slot_max, sb_ptr, qw.scale, s_x,
-                                            col_bias_f, epi_lo, epi_hi);
-                                        epi_done = true;
-                                }
-                                if (!epi_done) {
-                                    tile_mma_pack_i8_sme(
-                                        mc, static_cast<int>(ocnc), kdim4, acc_tile,
-                                        static_cast<int>(ocn_block), sme_a.data(), b_panel,
-                                        /*block_stride=*/sme_slot_max, INT32_MIN, INT32_MAX,
-                                        /*zero_mode=*/icn == 0);
-                                }
-                                mma_sme = true;
-                            }
-#endif
-                            if (!mma_sme) {
-                                const int64_t ldd_a = geom_ldd_i8_a(kdim4);
-                                tile_pack_lhs_i8(false, mc, kdim4, a_pack,
-                                                 static_cast<int>(ldd_a), a, lda, a_biased);
-                                tile_mma_pack_i8(mc, static_cast<int>(ocnc), kdim4, acc_tile,
-                                                 static_cast<int>(ocn_block), a_pack, b_panel,
-                                                 /*ldb=*/0, INT32_MIN, INT32_MAX,
-                                                 /*zero_mode=*/icn == 0);
-                            }
-
-                            if (!is_last_icn) {
-                                continue;
-                            }
-
-                            // The per-pixel sums the compensation reads: over the
-                            // whole K, of the *true* activation values (the gather's
-                            // shift comes back out), recomputed rather than buffered.
-                            int32_t ra_tile[kMaxMBlock];
-                            const int32_t* ra_ptr = nullptr;
-                            if (comp) {
-                                NNOPS_ASSERT(mc <= kMaxMBlock);
-                                if (direct_a) {
-                                    // The pixel is its own patch, its channels one
-                                    // contiguous run: a row sum of the bytes the MMA
-                                    // reads — no gather, no A tile.
-                                    for (int m = 0; m < mc; ++m) {
-                                        ra_tile[m] = k::int8_row_sum<int8_t>(
-                                            reinterpret_cast<const int8_t*>(in_row) +
-                                                static_cast<int64_t>(ow0 + m) * IC,
-                                            static_cast<int>(ic_per_group));
-                                    }
-                                } else {
-                                    for (int m = 0; m < mc; ++m) {
-                                        ra_tile[m] = 0;
-                                    }
-                                    for (int64_t icn2 = 0; icn2 < ic_per_group; icn2 += icn_block) {
-                                        const int64_t icnc2 =
-                                            std::min(icn_block, ic_per_group - icn2);
-                                        const int kd2 = static_cast<int>(icnc2 * karea);
-                                        const int kd24 = static_cast<int>(align4(kd2));
-                                        tiled_im2col_i8(
-                                            a_buf, kd24, in_g + icn2, in_row_stride, IC, xr,
-                                            static_cast<uint8_t>(plane ? zp_x + d : zp_x), p,
-                                            static_cast<int>(OW), flat, mc, static_cast<int>(IH),
-                                            static_cast<int>(IW), KH, KW, SH, SW, DH, DW, PH, PW,
-                                            static_cast<int>(icnc2), karea, kd2, kd24);
-                                        for (int m = 0; m < mc; ++m) {
-                                            ra_tile[m] += k::int8_row_sum<int8_t>(
-                                                a_buf + static_cast<int64_t>(m) * kd24, kd2);
-                                        }
-                                    }
-                                }
-                                const int32_t shift_total = d * static_cast<int32_t>(k_full);
-                                for (int m = 0; m < mc; ++m) {
-                                    ra_tile[m] -= shift_total;
-                                }
-                                ra_ptr = ra_tile;
-                            }
-
-                            TOut* const dst = out_g + oh * out_row_stride + ow0 * OC + ocn;
-                            if constexpr (kIntOut) {
-                                Int8EpilogueParams ip{};
-                                ip.r_a = ra_ptr;
-                                ip.s_a = nullptr; // per-tensor activation
-                                ip.zp_a = nullptr;
-                                ip.r_b =
-                                    col_term ? r_b_all.data() + g * oc_per_group + ocn : nullptr;
-                                ip.s_b = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn :
-                                                         nullptr;
-                                ip.zp_b = qw.zero_point_data ?
-                                              qw.zero_point_data + g * oc_per_group + ocn :
-                                              nullptr;
-                                ip.s_a_scalar = s_x;
-                                ip.s_b_scalar = qw.scale;
-                                ip.zp_a_scalar = zp_x;
-                                ip.zp_b_scalar = qw.zero_point;
-                                ip.a_bias_offset = d;
-                                ip.k = static_cast<int32_t>(k_full);
-                                ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
-                                ip.compensate = comp;
-                                ip.col_term = col_term;
-                                ip.out_scale = quant_scale_at(qc, 0);
-                                ip.zp_out = quant_zp_at(qc, 0);
-                                if (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
-                                    attrs.epilogue.quant_param_count > 0) {
-                                    ip.row_out_scales = attrs.epilogue.quant_scales;
-                                    ip.row_out_zps = attrs.epilogue.quant_zero_points;
-                                    ip.out_scale = epilogue_quant_scale(attrs.epilogue, 0);
-                                    ip.zp_out = epilogue_quant_zero(attrs.epilogue, 0);
-                                }
-                                ip.bias = nullptr; // the bias is per column
-                                ip.col_bias = ibias_g ? ibias_g + ocn : nullptr;
-                                if constexpr (std::is_same_v<TOut, uint8_t>) {
-                                    ip.out_u8 = dst;
-                                } else {
-                                    ip.out = dst;
-                                }
-                                ip.ldc_out = static_cast<int>(OC);
-                                if (!epi_done) {
-                                    int8_epilogue_tile(ip, acc_tile,
-                                                       static_cast<int>(ocn_block), 0, 0, mc,
-                                                       ocnc);
-                                }
-                            } else {
-                                DqEpilogueParams<TOut> ip{};
-                                ip.r_a = ra_ptr;
-                                ip.s_a = nullptr;
-                                ip.zp_a = nullptr;
-                                ip.r_b =
-                                    col_term ? r_b_all.data() + g * oc_per_group + ocn : nullptr;
-                                ip.s_b = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn :
-                                                         nullptr;
-                                ip.zp_b = qw.zero_point_data ?
-                                              qw.zero_point_data + g * oc_per_group + ocn :
-                                              nullptr;
-                                ip.row_off = nullptr;
-                                ip.s_a_scalar = s_x;
-                                ip.s_b_scalar = qw.scale;
-                                ip.zp_a_scalar = zp_x;
-                                ip.zp_b_scalar = qw.zero_point;
-                                ip.a_bias_offset = d;
-                                ip.k = static_cast<int32_t>(k_full);
-                                ip.compensate = comp;
-                                ip.col_term = col_term;
-                                ip.act_u8 = u8a;
-                                ip.ep = &attrs.epilogue;
-                                ip.bias = nullptr;
-                                ip.col_bias = bias_g ? bias_g + ocn : nullptr;
-                                ip.out = dst;
-                                ip.ldc_out = static_cast<int>(OC);
-                                if (!epi_done) {
-                                    dq_epilogue_tile<TOut>(ip, acc_tile,
-                                                           static_cast<int>(ocn_block), 0, 0, mc,
-                                                           ocnc);
-                                }
-                            }
-                        }
-                    }
-                }
+/// The per-pixel sums the compensation reads: over the whole K, of the *true*
+/// activation values (the gather's shift comes back out), recomputed rather
+/// than buffered. Returns nullptr when no compensation is needed.
+template <class TAct, class TOut>
+const int32_t* compute_i8_ra(const I8ConvCtx<TAct, TOut>& c, const uint8_t* in_g,
+                             const uint8_t* in_row, int64_t ow0, int64_t p, int mc, bool flat,
+                             bool direct_a, int8_t* a_buf, int32_t* ra_tile)
+{
+    if (!c.comp) {
+        return nullptr;
+    }
+    if (direct_a) {
+        // The pixel is its own patch, its channels one contiguous run: a row
+        // sum of the bytes the MMA reads — no gather, no A tile.
+        for (int m = 0; m < mc; ++m) {
+            ra_tile[m] = k::int8_row_sum<int8_t>(
+                reinterpret_cast<const int8_t*>(in_row) +
+                    static_cast<int64_t>(ow0 + m) * c.IC,
+                static_cast<int>(c.ic_per_group));
+        }
+    } else {
+        for (int m = 0; m < mc; ++m) {
+            ra_tile[m] = 0;
+        }
+        for (int64_t icn2 = 0; icn2 < c.ic_per_group; icn2 += c.icn_block) {
+            const int64_t icnc2 = std::min(c.icn_block, c.ic_per_group - icn2);
+            const int kd2 = static_cast<int>(icnc2 * c.karea);
+            const int kd24 = static_cast<int>(align4(kd2));
+            tiled_im2col_i8(a_buf, kd24, in_g + icn2, c.in_row_stride, c.IC, c.xr,
+                            static_cast<uint8_t>(c.plane ? c.zp_x + c.d : c.zp_x), p,
+                            static_cast<int>(c.OW), flat, mc, static_cast<int>(c.IH),
+                            static_cast<int>(c.IW), c.KH, c.KW, c.SH, c.SW, c.DH, c.DW, c.PH,
+                            c.PW, static_cast<int>(icnc2), c.karea, kd2, kd24);
+            for (int m = 0; m < mc; ++m) {
+                ra_tile[m] +=
+                    k::int8_row_sum<int8_t>(a_buf + static_cast<int64_t>(m) * kd24, kd2);
             }
         }
+    }
+    const int32_t shift_total = c.d * static_cast<int32_t>(c.k_full);
+    for (int m = 0; m < mc; ++m) {
+        ra_tile[m] -= shift_total;
+    }
+    return ra_tile;
+}
+
+/// Compensate and dequantize (or requantize) one accumulator tile.
+template <class TAct, class TOut>
+void i8_epilogue(const I8ConvCtx<TAct, TOut>& c, int64_t g, int64_t ocn, int64_t ocnc,
+                 int mc, int32_t* acc_tile, const int32_t* ra_ptr, TOut* dst,
+                 const TOut* bias_g, const int32_t* ibias_g, bool epi_done)
+{
+    if (epi_done) {
+        return;
+    }
+    const int64_t off = g * c.oc_per_group + ocn;
+    const float* const s_b = c.qw->scale_data ? c.qw->scale_data + off : nullptr;
+    const int32_t* const zp_b =
+        c.qw->zero_point_data ? c.qw->zero_point_data + off : nullptr;
+    const int32_t* const r_b = c.col_term ? c.r_b_all.data() + off : nullptr;
+
+    if constexpr (I8ConvCtx<TAct, TOut>::kIntOut) {
+        Int8EpilogueParams ip{};
+        ip.r_a = ra_ptr;
+        ip.s_a = nullptr; // per-tensor activation
+        ip.zp_a = nullptr;
+        ip.r_b = r_b;
+        ip.s_b = s_b;
+        ip.zp_b = zp_b;
+        ip.s_a_scalar = c.s_x;
+        ip.s_b_scalar = c.qw->scale;
+        ip.zp_a_scalar = c.zp_x;
+        ip.zp_b_scalar = c.qw->zero_point;
+        ip.a_bias_offset = c.d;
+        ip.k = static_cast<int32_t>(c.k_full);
+        ip.relu = c.attrs->epilogue.type == EpilogueActivateType::Relu;
+        ip.compensate = c.comp;
+        ip.col_term = c.col_term;
+        ip.out_scale = quant_scale_at(*c.qc, 0);
+        ip.zp_out = quant_zp_at(*c.qc, 0);
+        if (c.attrs->epilogue.quant == EpilogueQuantType::Requantize &&
+            c.attrs->epilogue.quant_param_count > 0) {
+            ip.row_out_scales = c.attrs->epilogue.quant_scales;
+            ip.row_out_zps = c.attrs->epilogue.quant_zero_points;
+            ip.out_scale = epilogue_quant_scale(c.attrs->epilogue, 0);
+            ip.zp_out = epilogue_quant_zero(c.attrs->epilogue, 0);
+        }
+        ip.bias = nullptr; // the bias is per column
+        ip.col_bias = ibias_g ? ibias_g + ocn : nullptr;
+        if constexpr (std::is_same_v<TOut, uint8_t>) {
+            ip.out_u8 = dst;
+        } else {
+            ip.out = dst;
+        }
+        ip.ldc_out = static_cast<int>(c.OC);
+        int8_epilogue_tile(ip, acc_tile, static_cast<int>(c.ocn_block), 0, 0, mc,
+                           static_cast<int>(ocnc));
+    } else {
+        DqEpilogueParams<TOut> ip{};
+        ip.r_a = ra_ptr;
+        ip.s_a = nullptr;
+        ip.zp_a = nullptr;
+        ip.r_b = r_b;
+        ip.s_b = s_b;
+        ip.zp_b = zp_b;
+        ip.row_off = nullptr;
+        ip.s_a_scalar = c.s_x;
+        ip.s_b_scalar = c.qw->scale;
+        ip.zp_a_scalar = c.zp_x;
+        ip.zp_b_scalar = c.qw->zero_point;
+        ip.a_bias_offset = c.d;
+        ip.k = static_cast<int32_t>(c.k_full);
+        ip.compensate = c.comp;
+        ip.col_term = c.col_term;
+        ip.act_u8 = c.u8a;
+        ip.ep = &c.attrs->epilogue;
+        ip.bias = nullptr;
+        ip.col_bias = bias_g ? bias_g + ocn : nullptr;
+        ip.out = dst;
+        ip.ldc_out = static_cast<int>(c.OC);
+        dq_epilogue_tile<TOut>(ip, acc_tile, static_cast<int>(c.ocn_block), 0, 0, mc,
+                               static_cast<int>(ocnc));
+    }
+}
+
+/// One task of the (batch, group) × oh-chunk × oc-chunk grid.
+template <class TAct, class TOut> void run_i8_task(const I8ConvCtx<TAct, TOut>& c, int64_t t)
+{
+    const int64_t chunks_per_ng = c.oh_chunks * c.oc_chunks;
+    const int64_t ng = t / chunks_per_ng;
+    const int64_t rem = t % chunks_per_ng;
+    const int64_t chunk = rem / c.oc_chunks;
+    const int64_t oc_chunk = rem % c.oc_chunks;
+    const int64_t n = ng / c.G;
+    const int64_t g = ng % c.G;
+
+    const int64_t slot =
+        c.per_thread ? static_cast<int64_t>(c.ctx->cpu.current_thread_id()) : t;
+    char* const slot_ptr = c.base + c.sc.head + slot * c.sc.slot_stride;
+    int8_t* const a_pack = reinterpret_cast<int8_t*>(slot_ptr + c.sc.off_a);
+    int8_t* const a_buf = a_pack + c.a_pack_stride;
+    int8_t* const stage = reinterpret_cast<int8_t*>(slot_ptr + c.sc.off_stage);
+    int8_t* const pack_buf = reinterpret_cast<int8_t*>(slot_ptr + c.sc.off_pack);
+    int32_t* const acc_buf = reinterpret_cast<int32_t*>(
+        c.base + c.sc.off_acc + slot * c.acc_size * static_cast<int64_t>(sizeof(int32_t)));
+
+    // The SME route's per-task A slab; B is the shared prepack.
+    PoolArray<int8_t> sme_a;
+#if defined(NNOPS_ARCH_SME)
+    if (c.use_sme) {
+        const int64_t kd4 = align4(c.kdim_max);
+        const int64_t a_blocks = (c.m_block + aarch64::sme_mr - 1) / aarch64::sme_mr;
+        sme_a.reset(static_cast<size_t>(a_blocks * sme_a_panel_stride(DataType::s8, kd4)));
+    }
+#endif
+
+    TOut* const out_g = c.out_ptr + n * c.ob_step + g * c.oc_per_group;
+    const uint8_t* const in_g = c.in_base + n * c.ib_step + g * c.ic_per_group;
+    const TOut* const bias_g = c.b_ptr ? c.b_ptr + g * c.oc_per_group : nullptr;
+    const int32_t* const ibias_g = c.b_i32 ? c.b_i32 + g * c.oc_per_group : nullptr;
+
+    const int64_t r0 = chunk * c.OH / c.oh_chunks;
+    const int64_t r1 = (chunk + 1) * c.OH / c.oh_chunks;
+    // Over *panels*, like the fp route: a task starts where a panel does. A ZA
+    // blob's blocks are the filter's own 64-column ones, not the NEON panels
+    // the split is measured in; its plan keeps the group whole.
+    const int64_t oc_lo =
+        c.sme_blob ? 0 : oc_chunk * c.pg.panels_oc / c.oc_chunks * I8ConvCtx<TAct, TOut>::nr_max;
+    const int64_t oc_hi =
+        c.sme_blob ? c.oc_per_group :
+                     std::min((oc_chunk + 1) * c.pg.panels_oc / c.oc_chunks *
+                                  I8ConvCtx<TAct, TOut>::nr_max,
+                              c.oc_per_group);
+
+    // Same flat-pixel rule as the fp route; pointwise also needs the input
+    // dense, since it reads A straight out of the row.
+    const bool flat =
+        c.out_row_stride == c.OW * c.OC && (!c.pointwise || c.in_row_stride == c.IW * c.IC);
+
+    [[maybe_unused]] std::vector<float> bias_f;
+    // Same block-end clamp and step as the fp route: the blob holds one oc
+    // block at a time and the kernel walks its panels at `slot` apart.
+    const auto block_end = [&](int64_t ocn) {
+        return c.panels ? std::min(oc_hi, (ocn / c.ocn_block + 1) * c.ocn_block) : oc_hi;
     };
+    for (int64_t ocn = oc_lo; ocn < oc_hi;
+         ocn = c.panels ? block_end(ocn) : ocn + c.ocn_block) {
+        const int64_t oc_end = block_end(ocn);
+        const int64_t ocnc = std::min(c.ocn_block, oc_end - ocn);
 
-    ctx.cpu.run(0, total, run_task);
+        // The epilogue's per-column weight scale and bias, indexed like
+        // `ip.s_b` / `ip.col_bias` in i8_epilogue.
+        const float* const sb_ptr =
+            c.qw->scale_data ? c.qw->scale_data + g * c.oc_per_group + ocn : nullptr;
+        // The fused store takes the bias in the float domain; a half bias
+        // (which the dequantizing pass widens per element) widens once here.
+        const float* col_bias_f = nullptr;
+#if defined(NNOPS_ARCH_SME)
+        if (c.epi_fused && bias_g != nullptr) {
+            if constexpr (std::is_same_v<TOut, float>) {
+                col_bias_f = bias_g + ocn;
+            } else {
+                // Sized by the tile, not by kOcnBlock: the int8 route's N tile
+                // is the whole group width.
+                if (bias_f.size() < static_cast<size_t>(ocnc)) {
+                    bias_f.resize(static_cast<size_t>(ocnc));
+                }
+                for (int64_t j = 0; j < ocnc; ++j) {
+                    bias_f[j] = static_cast<float>(bias_g[ocn + j]);
+                }
+                col_bias_f = bias_f.data();
+            }
+        }
+#endif
+
+        for (int64_t pr = r0; pr < r1; pr += c.ph_block) {
+            const int64_t pr1 = std::min(r1, pr + c.ph_block);
+            const int64_t p_first = pr * c.OW;
+            const int64_t p_last = pr1 * c.OW;
+            // Re-split a tail shorter than MR evenly, keeping the step a
+            // multiple of MR so the re-split costs no extra block.
+            constexpr int64_t mr_step = MR_MAX_I8;
+            const int64_t p_span = std::max<int64_t>(p_last - p_first, 1);
+            const int64_t p_tail = p_span % c.m_block;
+            const int64_t p_step =
+                (flat && p_tail != 0 && p_tail < mr_step && c.m_block >= 2 * mr_step) ?
+                    (c.m_block / mr_step - 1) * mr_step :
+                    c.m_block;
+
+            for (int64_t icn = 0; icn < c.ic_per_group; icn += c.icn_block) {
+                const int64_t icnc = std::min(c.icn_block, c.ic_per_group - icn);
+                const bool is_last_icn = (icn + c.icn_block) >= c.ic_per_group;
+                const int kdim = static_cast<int>(icnc * c.karea);
+                const int kdim4 = static_cast<int>(align4(kdim));
+                const bool direct_a = c.pointwise && (kdim == kdim4);
+
+                const int8_t* const b_panel =
+                    pick_i8_b(c, g, icn, ocn, ocnc, icnc, kdim, oc_chunk, stage, pack_buf);
+
+                // `mc` lives outside the loop: it is the step, and the body's
+                // early exits still have to advance it.
+                int mc = 0;
+                for (int64_t p = p_first; p < p_last; p += flat ? p_step : mc) {
+                    const int64_t oh = p / c.OW;
+                    const int64_t ow0 = p - oh * c.OW;
+                    const int64_t left = flat ? std::min(p_step, p_last - p) : (c.OW - ow0);
+                    mc = static_cast<int>(std::min<int64_t>(c.m_block, left));
+                    const uint8_t* const in_row = in_g + oh * c.in_row_stride;
+
+                    const I8ATile a =
+                        pick_i8_a(c, in_g, in_row, icn, icnc, p, ow0, mc, flat, kdim, kdim4,
+                                  a_buf, sme_a.data());
+                    int32_t* const acc_tile = acc_buf + (p - p_first) * c.ocn_block;
+                    TOut* const dst = out_g + oh * c.out_row_stride + ow0 * c.OC + ocn;
+
+                    const bool epi_done =
+                        i8_mma(c, g, icn, mc, ocn, ocnc, kdim4, acc_tile, a_pack, a, b_panel,
+                               sme_a.data(), dst, sb_ptr, col_bias_f);
+                    if (!is_last_icn) {
+                        continue;
+                    }
+
+                    int32_t ra_tile[kMaxMBlock];
+                    const int32_t* const ra_ptr =
+                        compute_i8_ra(c, in_g, in_row, ow0, p, mc, flat, direct_a, a_buf,
+                                      ra_tile);
+                    i8_epilogue(c, g, ocn, ocnc, mc, acc_tile, ra_ptr, dst, bias_g, ibias_g,
+                                epi_done);
+                }
+            }
+        }
+    }
+}
+
+// ---- main kernel ----------------------------------------------------------
+
+template <class TAct, class TOut>
+void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
+                      std::span<const TensorView> inputs, const ComputeContext& ctx,
+                      const Conv2DGemmPlan& plan, void* workspace)
+{
+    I8ConvCtx<TAct, TOut> c;
+    init_i8_ctx(c, attrs, output, inputs, ctx, plan, workspace);
+    ctx.cpu.run(0, c.total, [&](int64_t t) { run_i8_task(c, t); });
 }
 
 // =========================================================================
 //  Plan
 // =========================================================================
+
+/// The dtype ladder this route admits; false leaves the caller's plan zeroed
+/// (the unsupported answer).
+bool conv_plan_dtypes_ok(const Conv2DAttributes& attrs, std::span<const TensorDesc> inputs,
+                         std::span<const TensorDesc> outputs, bool quant) noexcept
+{
+    const DataType dt = inputs[0].dtype;
+    const DataType wt_dt = inputs[1].dtype;
+    const DataType out_dt = outputs[0].dtype;
+    if (quant) {
+        // Activation: pre-quantized (u8/s8), or fp (quantized per call).
+        if (dt != DataType::u8 && dt != DataType::s8 && dt != DataType::f32 &&
+            dt != DataType::f16) {
+            return false;
+        }
+        const bool int_out = out_dt == DataType::s8 || out_dt == DataType::u8;
+        if (!int_out && out_dt != DataType::f32 && out_dt != DataType::f16) {
+            return false;
+        }
+        if (!int_out && (dt == DataType::f32 || dt == DataType::f16) && out_dt != dt) {
+            return false;
+        }
+        const DataType bias_dt = int_out ? DataType::s32 : out_dt;
+        if (inputs.size() > 2 && inputs[2].dtype != bias_dt) {
+            return false;
+        }
+        // Only the reference implements add_to's fold on the quantized route.
+        return !attrs.add_to;
+    }
+    if (!is_fp_activation_dtype(dt)) {
+        return false;
+    }
+    if (wt_dt != dt || out_dt != dt) {
+        return false;
+    }
+    return inputs.size() <= 2 || inputs[2].dtype == dt;
+}
 
 Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDesc> inputs,
                          std::span<const TensorDesc> outputs, int num_threads,
@@ -1947,38 +2184,8 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
 
     const DataType dt = in.dtype;
     const bool quant = is_quantized_conv2d(wt.dtype);
-
-    if (quant) {
-        // Activation: pre-quantized (u8/s8), or fp (quantized per call).
-        if (dt != DataType::u8 && dt != DataType::s8 && dt != DataType::f32 &&
-            dt != DataType::f16) {
-            return plan;
-        }
-        const bool int_out = out.dtype == DataType::s8 || out.dtype == DataType::u8;
-        if (!int_out && out.dtype != DataType::f32 && out.dtype != DataType::f16) {
-            return plan;
-        }
-        if (!int_out && (dt == DataType::f32 || dt == DataType::f16) && out.dtype != dt) {
-            return plan;
-        }
-        const DataType bias_dt = int_out ? DataType::s32 : out.dtype;
-        if (inputs.size() > 2 && inputs[2].dtype != bias_dt) {
-            return plan;
-        }
-        // Only the reference implements add_to's fold on the quantized route.
-        if (attrs.add_to) {
-            return plan;
-        }
-    } else {
-        if (!is_fp_activation_dtype(dt)) {
-            return plan;
-        }
-        if (wt.dtype != dt || out.dtype != dt) {
-            return plan;
-        }
-        if (inputs.size() > 2 && inputs[2].dtype != dt) {
-            return plan;
-        }
+    if (!conv_plan_dtypes_ok(attrs, inputs, outputs, quant)) {
+        return plan;
     }
 
     const int64_t N = in.dims[0];
