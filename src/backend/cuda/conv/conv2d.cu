@@ -1249,6 +1249,12 @@ void conv_gemm_i8_kernel(ConvParams p)
     int ra_kt = -1;
 
     const int k_tiles = (K + BK - 1) / BK;
+    // The filter gather's bytes per thread per k tile, and whether such a run
+    // can cross a tap. It cannot when icg is a multiple of the run, which the
+    // tail check below is what makes sufficient.
+    constexpr int kBFillK = BK / (S::threads / BN);
+    static_assert(kBFillK == 16, "the filter gather writes one 16 B vector");
+    const bool w_tap_aligned = (p.icg % kBFillK) == 0;
 
     auto fill = [&](int kt, int stage) {
         if (kt >= k_tiles) {
@@ -1276,38 +1282,59 @@ void conv_gemm_i8_kernel(ConvParams p)
             }
         }
         // The filter is HWIO with the channel innermost, so its k axis is not
-        // contiguous and B is gathered byte-wise into a k-major panel. A thread
-        // owns one weight row and a run of consecutive k inside the tile, so
-        // the (ic, kh, kw) odometer is decoded once and then stepped: the two
-        // runtime divisions that used to be paid per byte cost one row.
+        // contiguous in memory and B is gathered byte-wise into a k-major panel.
+        // The loads are the same either way; the store is what the tile pays
+        // for. Thirty-two lanes storing one byte each sit on thirty-two rows at
+        // a 16 B stride, which reaches two of the eight bank quads: 4 wavefronts
+        // a byte, so the sixteen a thread owns cost sixty-four where one 16 B
+        // vector costs four. ncu on 448x448x64: 12.4M of the kernel's 16.9M
+        // store wavefronts were conflicts, against 79,799 on all the ldmatrix
+        // reads together.
         {
-            constexpr int kPer = BK / (S::threads / BN);
             const int row = tid % BN;
-            const int col0 = (tid / BN) * kPer;
+            const int col0 = (tid / BN) * kBFillK;
             const int n = n0 + row;
             const int8_t* const row_w = W + int64_t(n) * p.w_n;
-            const int32_t w_ic = int32_t(p.w_ic), w_kh = int32_t(p.w_kh), w_kw = int32_t(p.w_kw);
-            const int32_t icg = int32_t(p.icg), kw_end = int32_t(p.kw);
-            int k = k0 + col0;
-            const int32_t tap0 = k / icg;
-            int32_t ic = k - tap0 * icg;
-            int32_t kh = tap0 / kw_end;
-            int32_t kw = tap0 - kh * kw_end;
-            int32_t off = ic * w_ic + kh * w_kh + kw * w_kw;
+            int8_t* const d = sB + row * LD + col0;
+            const int k = k0 + col0;
             const bool n_ok = n < N;
+            const int32_t w_ic = int32_t(p.w_ic), w_kh = int32_t(p.w_kh), w_kw = int32_t(p.w_kw);
+            if (n_ok && k + kBFillK <= K && w_tap_aligned) {
+                // Inside one tap the run is a fixed `w_ic` stride, so the
+                // odometer the fallback steps is not needed at all.
+                const int tap = k / p.icg;
+                const int kh = tap / p.kw;
+                const int32_t off = int32_t(k - tap * p.icg) * w_ic + kh * w_kh +
+                                    int32_t(tap - kh * p.kw) * w_kw;
+                uint4 v;
+                int8_t* const vb = reinterpret_cast<int8_t*>(&v);
+#pragma unroll
+                for (int j = 0; j < kBFillK; ++j) {
+                    vb[j] = row_w[off + j * w_ic];
+                }
+                *reinterpret_cast<uint4*>(d) = v;
+            } else {
+                const int32_t icg = int32_t(p.icg), kw_end = int32_t(p.kw);
+                int kk = k;
+                const int32_t tap0 = kk / icg;
+                int32_t ic = kk - tap0 * icg;
+                int32_t kh = tap0 / kw_end;
+                int32_t kw = tap0 - kh * kw_end;
+                int32_t off = ic * w_ic + kh * w_kh + kw * w_kw;
 #pragma unroll 4
-            for (int j = 0; j < kPer; ++j) {
-                sB[row * LD + col0 + j] = (n_ok && k < K) ? row_w[off] : BElem(0);
-                ++k;
-                off += w_ic;
-                if (++ic == icg) {
-                    ic = 0;
-                    off -= icg * w_ic;
-                    off += w_kw;
-                    if (++kw == kw_end) {
-                        kw = 0;
-                        off -= kw_end * w_kw;
-                        off += w_kh;
+                for (int j = 0; j < kBFillK; ++j) {
+                    d[j] = (n_ok && kk < K) ? row_w[off] : BElem(0);
+                    ++kk;
+                    off += w_ic;
+                    if (++ic == icg) {
+                        ic = 0;
+                        off -= icg * w_ic;
+                        off += w_kw;
+                        if (++kw == kw_end) {
+                            kw = 0;
+                            off -= kw_end * w_kw;
+                            off += w_kh;
+                        }
                     }
                 }
             }
