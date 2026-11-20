@@ -864,10 +864,11 @@ inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
 // int8 tensor-core kernel
 // ============================================================
 
-/// The int8 tile: 64 pixels by 64 channels, 64 bytes of k, three stages. The s8
-/// panels are half the fp16 footprint, so a third stage still leaves four blocks
-/// a SM.
-using ConvShapeI8 = I8TileShape<32, 32, 2, 2, 64, 3>;
+/// The int8 tile: 64 pixels by 64 channels, 64 bytes of k, three stages, and the
+/// same eight-warp split as the f16 tile's [[ConvShapeH]] (32x16 per warp) rather
+/// than four warps of 32x32. The s8 panels are half the fp16 footprint, so a
+/// third stage still leaves three blocks a SM and 24 warps.
+using ConvShapeI8 = I8TileShape<32, 16, 2, 4, 64, 3, 3>;
 
 /// Either k-major s8 panel, as the gather's (row, col, stage) indexer. The base
 /// already carries the stage; rows are `LD` bytes apart.
