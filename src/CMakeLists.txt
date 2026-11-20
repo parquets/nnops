@@ -191,6 +191,8 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/matmul/matmul.cu
         backend/cuda/matmul/linear.cu
         backend/cuda/matmul/matmul_f16.cu
+        backend/cuda/matmul/matmul_f16_tail.cu
+        backend/cuda/matmul/matmul_bf16.cu
         backend/cuda/matmul/matmul_f32.cu
         backend/cuda/matmul/matmul_i8_ptx.cu
         backend/cuda/conv/conv2d.cu

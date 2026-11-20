@@ -55,6 +55,12 @@ struct F16Call {
     int vec = 1;
 };
 
+/// Launch one element type's tile menu: the f16 and bf16 kernels are compiled in
+/// separate translation units so the instantiations build in parallel.
+bool f16_tile_half_lo(const F16Call& call, int tile, cudaStream_t stream);
+bool f16_tile_half_hi(const F16Call& call, int tile, cudaStream_t stream);
+bool f16_tile_bf16(const F16Call& call, int tile, cudaStream_t stream);
+
 /// Launch the hand-written kernel; false when the call is outside its pose.
 /// `force` skips the grid-fill gate: a shallow product runs on this tile too,
 /// at whatever rate it gets.
