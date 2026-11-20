@@ -154,6 +154,25 @@ struct ConvRows {
     int ok[kMax] = {};
 };
 
+/// The A tile row a thread feeds, given its place in the k-group walk.
+///
+/// A 16 B store from an eight-lane group has to land on eight distinct bank
+/// quads. With four k-groups (the int8 vector is 16 B) one group spans two
+/// rows, and two adjacent rows start 5 quads apart, so the second row's run of
+/// four overlaps the first's by one: an LD of 80 bytes costs 2x the
+/// wavefronts. Rows four apart are 20 quads apart, i.e. 4 mod 8, which puts the
+/// two runs on disjoint quads. Swapping bits 0 and 2 of the row does that
+/// (0,1,2,3 -> 0,4,2,6) without moving a lane off its four-lane load run.
+/// Sixteen k-groups (f32) and eight (f16) never needed it.
+template <int Groups>
+__device__ inline int conv_fill_row(int p)
+{
+    if constexpr (Groups == 4) {
+        p = (p & ~5) | ((p & 4) >> 2) | ((p & 1) << 2);
+    }
+    return p;
+}
+
 template <class Elem, int Threads, int bM, int bK>
 __device__ inline ConvRows conv_rows(const ConvParams& p, int pixel0)
 {
@@ -163,7 +182,7 @@ __device__ inline ConvRows conv_rows(const ConvParams& p, int pixel0)
     static_assert(bM % step == 0 && bM / step <= ConvRows::kMax,
                   "the row walk has to fit ConvRows");
     const int M = p.oh * p.ow;
-    const int row0 = int(threadIdx.x) / groups;
+    const int base = int(threadIdx.x) / groups;
 
     ConvRows r;
     r.count = bM / step;
@@ -172,7 +191,7 @@ __device__ inline ConvRows conv_rows(const ConvParams& p, int pixel0)
         if (i >= r.count) {
             break;
         }
-        const int row = row0 + i * step;
+        const int row = conv_fill_row<groups>(base + i * step);
         const int pixel = pixel0 + row;
         const int oh = pixel / p.ow;
         const int ow = pixel - oh * p.ow;
@@ -1060,6 +1079,20 @@ inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
 /// third stage still leaves three blocks a SM and 24 warps.
 using ConvShapeI8 = I8TileShape<32, 16, 2, 4, 64, 3, 3>;
 
+/// The epilogue staging tile's row pitch, in bytes: the smallest pitch at least
+/// `BN * esz` that is 80 mod 128. Four banks a row (80 bytes is 20 words) is
+/// what the staging pass needs -- eight consecutive rows then land on eight
+/// distinct banks -- and the copy-out reads 16 B at a time, where the pitch
+/// only has to be a multiple of 16.
+constexpr int conv_i8_stage_pitch(int esz)
+{
+    const int need = ConvShapeI8::BN * esz;
+    return need + (80 - need % 128 + 128) % 128;
+}
+
+static_assert(ConvShapeI8::BM * conv_i8_stage_pitch(4) <= ConvShapeI8::kSmemBytes,
+              "the staging tile has to fit the pipeline's shared memory");
+
 /// Either k-major s8 panel, as the gather's (row, col, stage) indexer. The base
 /// already carries the stage; rows are `LD` bytes apart.
 template <class Elem>
@@ -1542,6 +1575,16 @@ void conv_gemm_i8_kernel(ConvParams p)
                                 static_cast<const __half*>(p.bias) + gi :
                                 nullptr;
 
+    // A lane's fragment carries the cc pair of one pixel's channel run, so a
+    // direct store moves four useful bytes per sector it touches -- eight rows
+    // an instruction. ncu on 448x448x64 read 3.21M store sectors for a tile
+    // whose bytes need 0.40M. The tile is staged in the pipeline's shared
+    // memory instead (dead behind the barrier above) and copied out as whole
+    // 16 B vectors, which is a sector's worth of one pixel's row.
+    const int esz = kind == I8OutKind::F32 ? 4 : (kind == I8OutKind::F16 ? 2 : 1);
+    const int pitch = conv_i8_stage_pitch(esz);
+    unsigned char* const sC = conv_smem;
+
     // C: lane l holds (m = l/4, n = 2*(l%4)), plus the +1 column and the +8 row.
     const int cm = lane / 4;
     const int cn = 2 * (lane % 4);
@@ -1551,18 +1594,14 @@ void conv_gemm_i8_kernel(ConvParams p)
 #pragma unroll
         for (int j = 0; j < S::NA; ++j) {
             const int gn = n0 + warp_n * S::WN + j * 8 + cn;
+            const int cs = warp_n * S::WN + j * 8 + cn;
 #pragma unroll
             for (int rr = 0; rr < 2; ++rr) {
                 const int m = gm + rr * 8;
                 if (m >= M) {
                     continue;
                 }
-                // One pixel, several channels: the decode is paid here rather
-                // than in every store's address.
-                const int oh = m / p.ow;
-                const int ow = m - oh * p.ow;
-                const int64_t row_base =
-                    out_base + int64_t(oh) * p.out_h + int64_t(ow) * p.out_w;
+                unsigned char* const srow = sC + (m - m0) * pitch;
 #pragma unroll
                 for (int cc = 0; cc < 2; ++cc) {
                     const int n = gn + cc;
@@ -1591,10 +1630,10 @@ void conv_gemm_i8_kernel(ConvParams p)
                         const float s_w = p.sc_w != nullptr ? p.sc_w[gi + n] : p.sc_w_scalar;
                         const float row_k = s_w / p.out_scale;
                         if (kind == I8OutKind::S8) {
-                            *conv_row_addr<int8_t>(p, row_base, n) = detail::i8_requant<int8_t>(
+                            reinterpret_cast<int8_t*>(srow)[cs + cc] = detail::i8_requant<int8_t>(
                                 v, row_k, p.sc_x, float(p.out_zp));
                         } else {
-                            *conv_row_addr<uint8_t>(p, row_base, n) = detail::i8_requant<uint8_t>(
+                            reinterpret_cast<uint8_t*>(srow)[cs + cc] = detail::i8_requant<uint8_t>(
                                 v, row_k, p.sc_x, float(p.out_zp));
                         }
                         break;
@@ -1615,14 +1654,67 @@ void conv_gemm_i8_kernel(ConvParams p)
                         f = fminf(fmaxf(f, p.min_clip), p.max_clip);
                         f = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, f);
                         if (kind == I8OutKind::F32) {
-                            *conv_row_addr<float>(p, row_base, n) = f;
+                            reinterpret_cast<float*>(srow)[cs + cc] = f;
                         } else {
-                            *conv_row_addr<__half>(p, row_base, n) = __float2half(f);
+                            reinterpret_cast<__half*>(srow)[cs + cc] = __float2half(f);
                         }
                         break;
                     }
                     }
                 }
+            }
+        }
+    }
+    __syncthreads();
+
+    // ---- copy-out --------------------------------------------------------
+    // Phase two moves bytes: the staged tile already holds the destination's
+    // bytes, row-major by channel. The widest run a row allows is the unit: 16
+    // elements of s8 need the pixel pitch to be a multiple of 16, and a channel
+    // count like 24 drops to a 4 B unit instead of falling all the way back.
+    const auto fits = [&](int u) {
+        return p.out_c == 1 && (p.out_w % u) == 0 && (p.out_h % u) == 0;
+    };
+    const int unit = fits(16 / esz) ? 16 / esz : (fits(4 / esz) ? 4 / esz : 1);
+    const int chunks = S::BN / unit;
+    const int width = unit * esz;
+    unsigned char* const dst = static_cast<unsigned char*>(p.output);
+    for (int v = tid; v < S::BM * chunks; v += S::threads) {
+        const int row = v / chunks;
+        const int ch = (v - row * chunks) * unit;
+        const int m = m0 + row;
+        if (m >= M || n0 + ch >= N) {
+            continue;
+        }
+        const int oh = m / p.ow;
+        const int ow = m - oh * p.ow;
+        const int64_t px = out_base + int64_t(oh) * p.out_h + int64_t(ow) * p.out_w;
+        const unsigned char* const src = sC + row * pitch + ch * esz;
+        unsigned char* const d = dst + (px + n0 + ch) * esz;
+        const uintptr_t a = reinterpret_cast<uintptr_t>(d);
+        const bool vec = n0 + ch + unit <= N &&
+                         (width < 4 || (a & (width == 16 ? 15u : 3u)) == 0);
+        if (vec) {
+            if (width == 16) {
+                *reinterpret_cast<uint4*>(d) = *reinterpret_cast<const uint4*>(src);
+            } else if (width == 4) {
+                *reinterpret_cast<uint32_t*>(d) = *reinterpret_cast<const uint32_t*>(src);
+            } else {
+                for (int b = 0; b < width; ++b) {
+                    d[b] = src[b];
+                }
+            }
+            continue;
+        }
+        for (int c = 0; c < unit; ++c) {
+            const int n = n0 + ch + c;
+            if (n >= N) {
+                break;
+            }
+            const unsigned char* const s = src + c * esz;
+            unsigned char* const o = dst + (px + int64_t(n) * p.out_c) * esz;
+            for (int b = 0; b < esz; ++b) {
+                o[b] = s[b];
             }
         }
     }
