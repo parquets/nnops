@@ -279,6 +279,14 @@ NNOPS_TEST(cuda_conv2d_i8) {
 
         // Depthwise-shaped groups (IC/G = OC/G = 1) stay on the quantized GEMM.
         {1, 16, 8, 8, 16, 3, 3, 1, 1, 1, 1, 1, 1, 16, DataType::s8, DataType::u8, true, true, 131, true},
+
+        // s8 -> s8 (symmetric quantization) beyond the first cases' 8x8 tile:
+        // 128 channels a CTA is the wide tile, OC = 24 misses the 16 B copy-out
+        // unit and falls to the 4 B one, and the grouped one splits ICG to 16.
+        {1, 128, 16, 16, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::s8, true, false, 301, true, 0, true},
+        {1, 32, 32, 32, 24, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::s8, true, true, 303, true, -6, false},
+        {1, 32, 16, 16, 32, 3, 3, 1, 1, 1, 1, 1, 1, 2, DataType::s8, DataType::s8, true, false, 305, true, 0, false},
+        {1, 64, 56, 56, 128, 1, 1, 1, 1, 1, 1, 0, 0, 1, DataType::s8, DataType::s8, true, false, 307, true, 0, true},
     };
 
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {

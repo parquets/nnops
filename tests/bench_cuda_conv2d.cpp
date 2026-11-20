@@ -206,7 +206,7 @@ std::vector<ConvBenchCase> wide_layers()
 /// activation parameters and per-channel weight ones, into an s8 destination.
 /// The same layer set as the fp tables, so the rows are comparable.
 double run_conv_i8(const ConvBenchCase& c, const char* label, bool packed = false,
-                   bool print = true)
+                   bool print = true, DataType adt = DataType::u8)
 {
     Conv2DAttributes attrs;
     attrs.kernel_size = {c.kh, c.kw};
@@ -234,7 +234,7 @@ double run_conv_i8(const ConvBenchCase& c, const char* label, bool packed = fals
 
     QuantParams qa;
     qa.scale = 0.0078125f;
-    qa.zero_point = 128;
+    qa.zero_point = adt == DataType::u8 ? 128 : 0;
     QuantParams qw;
     qw.granularity = QuantGranularity::PerChannel;
     qw.scale_data = w_s.data();
@@ -256,7 +256,7 @@ double run_conv_i8(const ConvBenchCase& c, const char* label, bool packed = fals
     const std::vector<int64_t> ashape = {c.n, c.ih, c.iw, c.ic};
     const std::vector<int64_t> wshape = {c.kh, c.kw, icg, c.oc};
 
-    TensorView av = view(ashape, DataType::u8, a.data(), alay, qa);
+    TensorView av = view(ashape, adt, a.data(), alay, qa);
     TensorView wv = view(wshape, DataType::s8, w.data(), wlay, qw);
     const TensorDesc descs[] = {av.desc(), wv.desc()};
     auto op_cpu = Conv2D::create(attrs, Backend::CPU);
@@ -358,6 +358,22 @@ NNOPS_BENCH(cuda_conv2d_i8_packed) {
             }
         }
         std::printf("  %-8s %-34s raw %8.0f packed %8.0f GFLOPS  %.2fx\n", "i8",
+                    conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[1] / best[0]);
+    }
+}
+
+NNOPS_BENCH(cuda_conv2d_i8_s8) {
+    print_cuda_header("CUDA Conv2D int8, packed filter: u8 (zp 128) vs s8 (zp 0) activation");
+    for (ConvBenchCase c : wide_layers()) {
+        double best[2] = {0.0, 0.0};
+        for (int rep = 0; rep < 3; ++rep) {
+            for (int arm = 0; arm < 2; ++arm) {
+                best[arm] = std::max(best[arm], run_conv_i8(c, "i8", true, false,
+                                                           arm == 1 ? DataType::s8
+                                                                    : DataType::u8));
+            }
+        }
+        std::printf("  %-8s %-34s u8 %8.0f s8 %8.0f GFLOPS  s8/u8 %.3f\n", "i8",
                     conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[1] / best[0]);
     }
 }
