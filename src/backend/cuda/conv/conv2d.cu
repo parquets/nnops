@@ -1100,20 +1100,20 @@ void conv_gemm_i8_kernel(ConvParams p)
             int32_t ic = k - tap0 * icg;
             int32_t kh = tap0 / kw_end;
             int32_t kw = tap0 - kh * kw_end;
-            int64_t off = int64_t(ic) * w_ic + int64_t(kh) * w_kh + int64_t(kw) * w_kw;
+            int32_t off = ic * w_ic + kh * w_kh + kw * w_kw;
             const bool n_ok = n < N;
-#pragma unroll
+#pragma unroll 4
             for (int j = 0; j < kPer; ++j) {
                 sB[row * LD + col0 + j] = (n_ok && k < K) ? row_w[off] : BElem(0);
                 ++k;
                 off += w_ic;
                 if (++ic == icg) {
                     ic = 0;
-                    off -= int64_t(icg) * w_ic;
+                    off -= icg * w_ic;
                     off += w_kw;
                     if (++kw == kw_end) {
                         kw = 0;
-                        off -= int64_t(kw_end) * w_kw;
+                        off -= kw_end * w_kw;
                         off += w_kh;
                     }
                 }
