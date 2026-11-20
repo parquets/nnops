@@ -169,6 +169,29 @@ std::vector<ConvBenchCase> cnn_layers()
     return v;
 }
 
+/// The same stack on planes large enough that the pixel axis alone fills the
+/// machine several times over. The CNN set above is one image at a time, so
+/// most of its rows are under one wave of the 64-pixel tile and price latency,
+/// not the tile: 56x56x64 is 49 blocks against 114 resident. These rows answer
+/// what the kernel does when the grid is not the excuse.
+std::vector<ConvBenchCase> wide_layers()
+{
+    std::vector<ConvBenchCase> v;
+    ConvBenchCase c;
+
+    c.ic = c.oc = 64; c.ih = c.iw = 224;            v.push_back(c); // 3x3
+    c.ic = c.oc = 64; c.ih = c.iw = 112;            v.push_back(c);
+    c.ic = 128; c.oc = 128; c.ih = c.iw = 112;      v.push_back(c);
+    c.ic = 256; c.oc = 256; c.ih = c.iw = 56;       v.push_back(c);
+
+    c = ConvBenchCase{}; c.ic = 64; c.oc = 256; c.ih = c.iw = 112;
+    c.kh = c.kw = 1; c.ph = c.pw = 0;               v.push_back(c); // pointwise
+    c = ConvBenchCase{}; c.ic = 64; c.oc = 128; c.ih = c.iw = 224;
+    c.sh = c.sw = 2; c.ph = c.pw = 0;               v.push_back(c); // stride 2
+
+    return v;
+}
+
 /// int8: a pre-quantized u8 activation against an s8 filter, per-tensor
 /// activation parameters and per-channel weight ones, into an s8 destination.
 /// The same layer set as the fp tables, so the rows are comparable.
@@ -264,6 +287,19 @@ void run_table(DataType dt, const char* label)
     }
 }
 
+/// The wide-plane set, all three dtypes back to back so the rows stay
+/// comparable: the same geometry is one row each for f32, f16 and int8.
+void run_table_wide()
+{
+    for (ConvBenchCase c : wide_layers()) {
+        run_conv_i8(c, "i8");
+        c.dtype = DataType::f32;
+        run_conv(c, "f32");
+        c.dtype = DataType::f16;
+        run_conv(c, "f16");
+    }
+}
+
 }  // namespace
 
 NNOPS_BENCH(cuda_conv2d) {
@@ -279,6 +315,11 @@ NNOPS_BENCH(cuda_conv2d_i8) {
 NNOPS_BENCH(cuda_conv2d_f16) {
     print_cuda_header("CUDA Conv2D f16 (tensor core)");
     run_table(DataType::f16, "f16");
+}
+
+NNOPS_BENCH(cuda_conv2d_wide) {
+    print_cuda_header("CUDA Conv2D wide planes (all dtypes)");
+    run_table_wide();
 }
 
 NNOPS_BENCH(cuda_conv2d_shapes) {

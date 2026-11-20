@@ -323,31 +323,35 @@ __device__ inline void conv_store(const ConvParams& p, int64_t base, int pixel, 
 // f16 tensor-core kernel
 // ============================================================
 
-/// The f16/bf16 conv tile: 64 pixels by 64 channels, 64 halves of k, two stages.
+/// The f16/bf16 conv tile: 64 pixels by 64 channels, 64 halves of k, two stages,
+/// eight warps each holding a 32x16 strip.
 ///
-/// Every axis was swept on the CNN layer set (2026-11-11), and the tile is 32 KB
-/// because that is what fits three blocks a SM where three stages fit two: the
-/// deeper pipeline only wins on the one 56x56 plane whose grid already hides the
-/// gather, and loses by up to 1.7x on the stem and the 1x1s, where the extra
-/// resident block is the whole margin (sum over the layer set 1.58 -> 1.20 ms).
+/// The output tile and the k depth were swept on the CNN layer set in 2026-11-11
+/// and have not moved: 32 KB is what fits three blocks a SM, and a deeper k panel
+/// or a wider n tile each cost more residency than they return.
 ///
-/// A wider n tile is the tempting lever — every block re-gathers its own n slice
-/// of the activation, so bN halves the total A traffic — and it loses anyway:
-/// 1.1-6.9x on every layer whose OC/G does not cover the tile, because the
-/// filter then falls back to its scalar gather, and no better than noise on the
-/// ones where it does, because the wider tile halves the block count of planes
-/// that were already too short to fill the machine. Wider m tiles and deeper k
-/// panels lose the same way, on resident blocks.
-using ConvShapeH = F16TileShape<32, 32, 2, 2, 64, 2, 1, false, 1>;
+/// What did move (2026-11-20, on the hardware counters) is how many warps sit in
+/// that tile. Four warps of 32x32 put 12 on an SM — 25% occupancy, 2.6 active
+/// warps a scheduler, and the counters named it: 72% of cycles had no eligible
+/// warp, the tensor pipe was 5.6% active, and per warp *every* MMA carried 11
+/// non-MMA instructions. Splitting the same 64x64 of output eight ways instead —
+/// 32x16 per warp, four atoms of A and two of B, 16 accumulator registers — uses
+/// 80 registers and 32 KB, so three blocks still fit, and the SM then holds 24
+/// warps. Stalls move from "waiting on latency" to "waiting on the integer
+/// pipes", which is the better side of that trade: the wide-plane set goes
+/// 0.940 -> 0.865 ms and the CNN layer set 0.450 -> 0.402 ms, with the small
+/// planes up most (7x7x512 k1 -34%, the 224 7x7 stem -22%). The one loss is the
+/// deepest k the set has, 56x56x256 k3, at +6%, because 36 k tiles already hid
+/// the latency the extra warps are there to hide.
+using ConvShapeH = F16TileShape<32, 16, 2, 4, 64, 2, 1, false, 3>;
 
 /// The gather's (row, col, stage) indexer over the k-major swizzled panel.
 template <class S, class Elem> using ConvHPanel = conv::KMajorPanel<S, Elem>;
 
-template <class Elem>
-__global__ __launch_bounds__(ConvShapeH::threads, ConvShapeH::MinBlocks)
+template <class Elem, class S>
+__global__ __launch_bounds__(S::threads, S::MinBlocks)
 void conv_gemm_h_kernel(ConvParams p)
 {
-    using S = ConvShapeH;
     constexpr int BM = S::BM;
     constexpr int BN = S::BN;
     constexpr int BK = S::BK;
@@ -814,7 +818,7 @@ template <class Elem> void launch_conv_h(ConvParams& p, cudaStream_t stream)
 {
     using S = ConvShapeH;
     constexpr int smem = S::kSmemBytes;
-    auto kernel = conv_gemm_h_kernel<Elem>;
+    auto kernel = conv_gemm_h_kernel<Elem, S>;
     static const cudaError_t cfg =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
