@@ -22,7 +22,10 @@
 #include "common/cpu_pool.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cmath>
+#include <cstdio>
 #include <span>
 #include <thread>
 #include <vector>
@@ -37,6 +40,11 @@ namespace nnops::backend::cpu::reference {
                                   std::span<const TensorView> inputs,
                                   const ComputeContext& ctx,
                                   void* workspace);
+    void conv3d_int8_ref(const Conv3DAttributes& attrs,
+                         TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx,
+                         void* workspace);
 }
 
 /// Space @p v's logical rows back to back — what the comparison reads, so a
@@ -534,5 +542,306 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
         const TensorView ins[] = {in_view, w_view};
         NNOPS_EXPECT_EQ(op->compute(outs, ins, ctx), Status::ok);
         NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-5f, 1e-5f));
+    }
+}
+
+// ============================================================
+// Quantized route — s8 filter, u8/s8/f32/f16 activation
+// ============================================================
+
+namespace {
+
+using qhalf = nnops::backend::cpu::half;
+using nnops::backend::cpu::half_to_float;
+using nnops::backend::cpu::float_to_half;
+
+inline float q_as_float(float v) { return v; }
+inline float q_as_float(qhalf v) { return half_to_float(v); }
+inline float q_as_float(int8_t v) { return static_cast<float>(v); }
+inline float q_as_float(uint8_t v) { return static_cast<float>(v); }
+
+inline size_t q_elem_size(DataType dt) { return static_cast<size_t>(data_type_size(dt)); }
+
+inline QuantParams q_per_tensor(float scale, int32_t zp)
+{
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerTensor;
+    qp.scale = scale;
+    qp.zero_point = zp;
+    return qp;
+}
+
+inline QuantParams q_per_channel(const float* scale, const int32_t* zp, int64_t n)
+{
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerChannel;
+    qp.scale_data = scale;
+    qp.zero_point_data = zp;
+    qp.num_scales = n;
+    return qp;
+}
+
+/// float → s8/u8 storage, with the arithmetic the quantizers use.
+inline int32_t q_quant(float x, float inv_scale, int32_t zp, bool u8)
+{
+    const int32_t qmin = u8 ? 0 : -128;
+    const int32_t qmax = u8 ? 255 : 127;
+    const float v = std::fmaf(x, inv_scale, static_cast<float>(zp));
+    int32_t q = static_cast<int32_t>(std::nearbyintf(v));
+    return std::min(std::max(q, qmin), qmax);
+}
+
+struct QCase3 {
+    int64_t n = 1, id = 4, ih = 6, iw = 6, ic = 8;
+    int64_t oc = 8, icg = 8;
+    std::array<int64_t, 3> k = {3, 3, 3};
+    std::array<int64_t, 3> s = {1, 1, 1};
+    std::array<int64_t, 3> d = {1, 1, 1};
+    std::array<int64_t, 3> p = {1, 1, 1};
+    int64_t groups = 1;
+    DataType act = DataType::u8;
+    DataType out = DataType::u8;
+    DataType act_q = DataType::s8;
+    bool bias = false;
+    bool asym_w = false;
+    float s_x = 0.0078125f; // 1/128 — exact in binary
+    int32_t zp_x = 0;
+    float s_out = 0.03125f;
+    int32_t zp_out = 0;
+    EpilogueActivateType ep = EpilogueActivateType::None;
+    uint64_t seed = 1;
+};
+
+/// Run one quantized case through the kernel and the NDHWC reference on the
+/// same stored values; an integer destination must agree bit for bit, an fp one
+/// within a small relative tolerance.
+std::string run_q_case(const QCase3& c, const ComputeContext& ctx = {})
+{
+    const int64_t in_n = c.n * c.id * c.ih * c.iw * c.ic;
+    const int64_t icg = c.icg;
+    const int64_t OC = c.oc;
+    const bool is_u8 = c.act == DataType::u8;
+    const bool int_out = c.out == DataType::s8 || c.out == DataType::u8;
+
+    // Activation, NDHWC storage directly — both arms read the same order.
+    const size_t aesz = q_elem_size(c.act);
+    std::vector<uint8_t> act_buf(static_cast<size_t>(in_n) * aesz);
+    {
+        test::XorShift128 rng(c.seed);
+        const float inv = 1.0f / c.s_x;
+        for (int64_t i = 0; i < in_n; ++i) {
+            const float v = rng.next_float(-1.0f, 1.0f);
+            if (c.act == DataType::f32) {
+                reinterpret_cast<float*>(act_buf.data())[i] = v;
+            } else if (c.act == DataType::f16) {
+                reinterpret_cast<qhalf*>(act_buf.data())[i] = float_to_half(v);
+            } else if (is_u8) {
+                act_buf[static_cast<size_t>(i)] =
+                    static_cast<uint8_t>(q_quant(v, inv, c.zp_x, true));
+            } else {
+                reinterpret_cast<int8_t*>(act_buf.data())[i] =
+                    static_cast<int8_t>(q_quant(v, inv, c.zp_x, false));
+            }
+        }
+    }
+
+    // Filter [OC][IC/G][KD][KH][KW].
+    const int64_t wn = OC * icg * c.k[0] * c.k[1] * c.k[2];
+    std::vector<int8_t> w_buf(static_cast<size_t>(wn));
+    {
+        test::XorShift128 rng(c.seed + 1);
+        for (auto& v : w_buf) {
+            v = static_cast<int8_t>(q_quant(rng.next_float(-1.0f, 1.0f), 127.0f, 0, false));
+        }
+    }
+
+    std::vector<float> w_s(static_cast<size_t>(OC));
+    std::vector<int32_t> w_zp(static_cast<size_t>(OC));
+    for (int64_t oc = 0; oc < OC; ++oc) {
+        w_s[static_cast<size_t>(oc)] = 0.01f * static_cast<float>(1 + oc % 5);
+        w_zp[static_cast<size_t>(oc)] =
+            c.asym_w ? static_cast<int32_t>(-40 + (oc * 7) % 60) : 0;
+    }
+
+    std::vector<uint8_t> bias_buf;
+    if (c.bias) {
+        bias_buf.resize(static_cast<size_t>(OC) * (int_out ? sizeof(int32_t) : q_elem_size(c.out)));
+        test::XorShift128 rng(c.seed + 2);
+        for (int64_t oc = 0; oc < OC; ++oc) {
+            if (int_out) {
+                reinterpret_cast<int32_t*>(bias_buf.data())[oc] =
+                    static_cast<int32_t>(rng.next_float(-1500.0f, 1500.0f));
+            } else if (c.out == DataType::f16) {
+                reinterpret_cast<qhalf*>(bias_buf.data())[oc] =
+                    float_to_half(rng.next_float(-0.5f, 0.5f));
+            } else {
+                reinterpret_cast<float*>(bias_buf.data())[oc] = rng.next_float(-0.5f, 0.5f);
+            }
+        }
+    }
+
+    const QuantParams qa = q_per_tensor(c.s_x, c.zp_x);
+    const QuantParams qw = q_per_channel(w_s.data(), w_zp.data(), OC);
+    const QuantParams qo = int_out ? q_per_tensor(c.s_out, c.zp_out) : QuantParams{};
+
+    Conv3DAttributes attrs;
+    attrs.kernel_size = c.k;
+    attrs.stride = c.s;
+    attrs.dilation = c.d;
+    attrs.padding = c.p;
+    attrs.groups = c.groups;
+    attrs.epilogue.type = c.ep;
+    attrs.output_dtype = c.out;
+    attrs.act_quant_dtype = c.act_q;
+
+    auto op = Conv3D::create(attrs, Backend::CPU);
+
+    const int64_t ish[] = {c.n, c.id, c.ih, c.iw, c.ic};
+    const int64_t wsh[] = {OC, icg, c.k[0], c.k[1], c.k[2]};
+    const int64_t bsh[] = {OC};
+    TensorView in(ish, c.act, act_buf.data(), TensorLayout::NDHWC, qa);
+    TensorView wt(wsh, DataType::s8, w_buf.data(), TensorLayout::Dense, qw);
+    const DataType bdt = int_out ? DataType::s32 : c.out;
+    TensorView bv(bsh, bdt, bias_buf.empty() ? nullptr : bias_buf.data());
+
+    std::vector<TensorView> ins = {in, wt};
+    if (c.bias) {
+        ins.push_back(bv);
+    }
+    std::vector<TensorDesc> descs;
+    for (const auto& v : ins) {
+        descs.push_back(v.desc());
+    }
+    const auto od = op->getOutputTensorDesc(descs);
+    const DataType odt = od[0].dtype;
+    const int64_t out_n = od[0].numel();
+
+    std::vector<uint8_t> ref_buf(od[0].nbytes(), 0);
+    {
+        TensorView ref_out(std::span<const int64_t>(od[0].dims.data(), 5), odt, ref_buf.data(),
+                           TensorLayout::NDHWC, qo);
+        nnops::backend::cpu::reference::conv3d_int8_ref(attrs, ref_out, ins, ctx, nullptr);
+    }
+
+    std::vector<uint8_t> op_buf(od[0].nbytes(), 0);
+    {
+        TensorView op_out(std::span<const int64_t>(od[0].dims.data(), 5), odt, op_buf.data(),
+                          TensorLayout::NDHWC, qo);
+        TensorView outs[] = {op_out};
+        const Status st = op->compute(outs, std::span<const TensorView>(ins), ctx, nullptr);
+        if (!is_ok(st)) {
+            return std::string("kernel returned ") + to_string(st);
+        }
+    }
+
+    auto compare = [&](auto tag) -> std::string {
+        using T = decltype(tag);
+        const T* got = reinterpret_cast<const T*>(op_buf.data());
+        const T* want = reinterpret_cast<const T*>(ref_buf.data());
+        int64_t nbad = 0, first = -1;
+        for (int64_t i = 0; i < out_n; ++i) {
+            const float a = q_as_float(got[i]);
+            const float b = q_as_float(want[i]);
+            const bool same = int_out ? (a == b)
+                                      : (std::abs(a - b) <= 1e-5f * std::max(1.0f, std::abs(b)));
+            if (!same) {
+                if (first < 0) {
+                    first = i;
+                }
+                ++nbad;
+            }
+        }
+        if (nbad == 0) {
+            return {};
+        }
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "%lld of %lld elements differ (first at %lld: kernel %.9g, ref %.9g)",
+                      static_cast<long long>(nbad), static_cast<long long>(out_n),
+                      static_cast<long long>(first), double(q_as_float(got[first])),
+                      double(q_as_float(want[first])));
+        return msg;
+    };
+
+    if (odt == DataType::f32) {
+        return compare(float{});
+    }
+    if (odt == DataType::f16) {
+        return compare(qhalf{});
+    }
+    if (odt == DataType::s8) {
+        return compare(int8_t{});
+    }
+    return compare(uint8_t{});
+}
+
+} // namespace
+
+
+NNOPS_TEST(conv3d_int8_threaded_matches_serial) {
+    QCase3 c;
+    c.n = 2;
+    c.id = 4;
+    c.ih = 8;
+    c.iw = 8;
+    c.ic = 16;
+    c.icg = 16;
+    c.oc = 16;
+    c.groups = 1;
+    c.bias = true;
+    c.ep = EpilogueActivateType::Relu;
+
+    const std::string serial = run_q_case(c, ComputeContext{});
+    if (!serial.empty()) {
+        throw std::runtime_error("conv3d int8 serial: " + serial);
+    }
+    for (int nt : {2, 4}) {
+        SimplePool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const std::string diff = run_q_case(c, ctx);
+        if (!diff.empty()) {
+            throw std::runtime_error("conv3d int8 threaded (" + std::to_string(nt) + "T): " +
+                                     diff);
+        }
+    }
+}
+
+NNOPS_TEST(conv3d_int8_refusals) {
+    std::vector<uint8_t> a(1 * 2 * 2 * 2 * 4, 0);
+    std::vector<int8_t> w(4 * 4 * 1 * 1 * 1, 1);
+    std::vector<uint8_t> o(1 * 2 * 2 * 2 * 4, 0);
+
+    const int64_t ish[] = {1, 2, 2, 2, 4};
+    const int64_t wsh[] = {4, 4, 1, 1, 1};
+    TensorView in(ish, DataType::u8, a.data(), TensorLayout::NDHWC);
+    TensorView wt(wsh, DataType::s8, w.data(), TensorLayout::Dense);
+
+    // add_to has no residual stage on the integer path.
+    {
+        Conv3DAttributes attrs;
+        attrs.kernel_size = {1, 1, 1};
+        attrs.add_to = true;
+        auto op = Conv3D::create(attrs, Backend::CPU);
+        TensorView out(ish, DataType::u8, o.data(), TensorLayout::NDHWC);
+        TensorView outs[] = {out};
+        const TensorView ins[] = {in, wt};
+        NNOPS_EXPECT_EQ(op->compute(outs, ins, ComputeContext{}, nullptr), Status::unsupported);
+    }
+
+    // An fp activation needs its quantization parameters.
+    {
+        std::vector<float> af(static_cast<size_t>(1 * 2 * 2 * 2 * 4), 0.5f);
+        std::vector<float> of(static_cast<size_t>(1 * 2 * 2 * 2 * 4), 0.0f);
+        TensorView in_fp(ish, DataType::f32, af.data(), TensorLayout::NDHWC);
+        Conv3DAttributes attrs;
+        attrs.kernel_size = {1, 1, 1};
+        attrs.output_dtype = DataType::f32;
+        auto op = Conv3D::create(attrs, Backend::CPU);
+        TensorView out(ish, DataType::f32, of.data(), TensorLayout::NDHWC);
+        TensorView outs[] = {out};
+        const TensorView ins[] = {in_fp, wt};
+        NNOPS_EXPECT_EQ(op->compute(outs, ins, ComputeContext{}, nullptr),
+                        Status::invalid_argument);
     }
 }

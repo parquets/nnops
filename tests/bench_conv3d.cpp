@@ -230,6 +230,72 @@ void run_one(const Case& c, int nt, int rounds)
                 op_t, ref_t, flops / (op_t * 1e6), ref_t / op_t, null_pct_med);
 }
 
+/// The quantized route on the same shapes: u8 activation, s8 weight, u8 out.
+void run_one_i8(const Case& c, int nt, int rounds)
+{
+    const int64_t N = c.in_shape[0];
+    const int64_t OC = c.w_shape[0];
+    const int64_t IC_per_G = c.w_shape[1];
+    const int64_t IC = c.in_shape[1];
+    const int64_t karea = c.attrs.kernel_size[0] * c.attrs.kernel_size[1] *
+                          c.attrs.kernel_size[2];
+
+    // NDHWC activation, as stored.
+    const int64_t in_n = N * c.in_shape[2] * c.in_shape[3] * c.in_shape[4] * IC;
+    std::vector<uint8_t> act(static_cast<size_t>(in_n));
+    {
+        test::XorShift128 rng(11);
+        for (auto& v : act) { v = static_cast<uint8_t>(rng.next_u64() & 0xFFu); }
+    }
+    std::vector<int8_t> w(static_cast<size_t>(OC * IC_per_G * karea));
+    {
+        test::XorShift128 rng(12);
+        for (auto& v : w) { v = static_cast<int8_t>(int32_t(rng.next_u64() % 255) - 127); }
+    }
+    std::vector<float> w_s(static_cast<size_t>(OC), 0.01f);
+    QuantParams qa;
+    qa.scale = 0.0078125f;
+    QuantParams qw;
+    qw.granularity = QuantGranularity::PerChannel;
+    qw.scale_data = w_s.data();
+    qw.num_scales = OC;
+
+    Conv3DAttributes attrs = c.attrs;
+    attrs.output_dtype = DataType::u8;
+
+    const int64_t in_dims[] = {c.in_shape[0], c.in_shape[2], c.in_shape[3], c.in_shape[4],
+                               c.in_shape[1]};
+    const int64_t w_dims[] = {OC, IC_per_G, c.attrs.kernel_size[0], c.attrs.kernel_size[1],
+                              c.attrs.kernel_size[2]};
+    TensorView in(std::span<const int64_t>(in_dims, 5), DataType::u8, act.data(),
+                  TensorLayout::NDHWC, qa);
+    TensorView wt(std::span<const int64_t>(w_dims, 5), DataType::s8, w.data());
+    auto op = Conv3D::create(attrs, Backend::CPU);
+    const TensorDesc d[] = {in.desc(), wt.desc()};
+    const auto descs = op->getOutputTensorDesc(d);
+    std::vector<uint8_t> out_buf(descs[0].nbytes(), 0);
+    TensorView out(descs[0].dims, DataType::u8, out_buf.data(), TensorLayout::NDHWC);
+
+    BenchPool pool(nt);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+    const TensorView ins[] = {in, wt};
+    TensorView outs[] = {out};
+    auto arm = [&]() { op->compute(outs, ins, use_ctx); };
+    arm();
+
+    std::vector<double> ms;
+    for (int r = 0; r < rounds; ++r) { ms.push_back(time_ms(arm, 20)); }
+    const double t = median_of(ms);
+
+    const int64_t OD = descs[0].dims[1], OH = descs[0].dims[2], OW = descs[0].dims[3];
+    const double gops = 2.0 * static_cast<double>(N) * static_cast<double>(OC) *
+                        static_cast<double>(IC_per_G) *
+                        static_cast<double>(OD * OH * OW) * static_cast<double>(karea) / 1e9;
+    std::printf("    %-36s | %8.3f %9.1f\n", c.name, t, gops / (t * 1e-3));
+}
+
 }  // namespace
 
 NNOPS_BENCH(conv3d) {
@@ -244,4 +310,16 @@ NNOPS_BENCH(conv3d) {
     std::printf("    %-36s | %8s %9s | %7s | %6s %6s\n",
                 "case", "op ms", "ref ms", "op GF", "vs ref", "null");
     for (const auto& c : cases) { run_one(c, nth, 3); }
+}
+
+NNOPS_BENCH(conv3d_i8) {
+    const auto cases = make_cases();
+    int nth = 1;
+    if (const char* env = std::getenv("NNOPS_BENCH_THREADS")) {
+        nth = std::atoi(env);
+        if (nth <= 0) { nth = 1; }
+    }
+    std::printf("\n=== Conv3D int8 (u8 x s8 -> u8), %dT ===\n", nth);
+    std::printf("    %-36s | %8s %9s\n", "case", "op ms", "GOPS");
+    for (const auto& c : cases) { run_one_i8(c, nth, 3); }
 }

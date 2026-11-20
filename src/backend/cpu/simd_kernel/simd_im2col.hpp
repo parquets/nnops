@@ -12,6 +12,7 @@
 ///    zero point as `pad`, and the k tail zeroed to kdim4 for the direct-A MMA.
 ///  - Conv3D: one row per output voxel, [roi_volume][icnc*karea3d]. Each tap is
 ///    again one contiguous channel run; a padded tap fills its run with `pad`.
+///    tiled_im2col_3d_i8 is the byte twin the quantized route runs.
 ///
 /// Address arguments are element strides, not bytes. The 2D gather takes the
 /// input row stride and the channel step; the 3D gather takes the pixel, row
@@ -98,6 +99,54 @@ inline void tiled_im2col_3d(
                             const T* src = in + id * in_d_stride + ih * in_row_stride +
                                            iw * in_pix_stride;
                             copy(k, src);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The quantized 3-D gather: bytes in, bytes out, the zero point as `pad`.
+/// One tap is still one contiguous channel run, so a live tap is one byte copy
+/// and a padded tap one byte fill. The fp gather above cannot serve int8 — its
+/// vector fill converts through f32 — and the 2-D route keeps its own byte
+/// gather for the same reason (tiled_im2col_i8).
+template <class T>
+inline void tiled_im2col_3d_i8(T* NNOPS_RESTRICT a, int lda, const T* NNOPS_RESTRICT in,
+                               int64_t in_pix_stride, int64_t in_d_stride, int64_t in_row_stride,
+                               int icnc, int od0, int oh0, int rd, int rh, int rw, int in_d,
+                               int in_h, int in_w, int kernel_d, int kernel_h, int kernel_w,
+                               int stride_d, int stride_h, int stride_w, int dilate_d,
+                               int dilate_h, int dilate_w, int pad_d, int pad_h, int pad_w,
+                               T pad) noexcept
+{
+    static_assert(sizeof(T) == 1, "quantized storage is one byte");
+    const unsigned char pv = static_cast<unsigned char>(pad);
+    for (int od = 0; od < rd; ++od) {
+        const int id0 = (od0 + od) * stride_d - pad_d;
+        for (int oh = 0; oh < rh; ++oh) {
+            const int ih0 = (oh0 + oh) * stride_h - pad_h;
+            T* pix = a + static_cast<int64_t>(od * rh + oh) * rw * lda;
+            for (int ow = 0; ow < rw; ++ow) {
+                const int iw0 = ow * stride_w - pad_w;
+                T* dst = pix + static_cast<int64_t>(ow) * lda;
+                for (int kd = 0; kd < kernel_d; ++kd) {
+                    const int id = id0 + kd * dilate_d;
+                    for (int kh = 0; kh < kernel_h; ++kh) {
+                        const int ih = ih0 + kh * dilate_h;
+                        for (int kw = 0; kw < kernel_w; ++kw) {
+                            T* k = dst + ((kd * kernel_h + kh) * kernel_w + kw) * icnc;
+                            const int iw = iw0 + kw * dilate_w;
+                            if (id < 0 || id >= in_d || ih < 0 || ih >= in_h || iw < 0 ||
+                                iw >= in_w) {
+                                std::memset(k, pv, static_cast<size_t>(icnc));
+                                continue;
+                            }
+                            std::memcpy(k,
+                                        in + id * in_d_stride + ih * in_row_stride +
+                                            iw * in_pix_stride,
+                                        static_cast<size_t>(icnc));
                         }
                     }
                 }

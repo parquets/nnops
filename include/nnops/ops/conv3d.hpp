@@ -18,6 +18,12 @@
 
 namespace nnops {
 
+/// True when the weight dtype selects the quantized route; the CPU backend
+/// dispatches on this predicate.
+inline constexpr bool is_quantized_conv3d(DataType weight_dtype) noexcept {
+    return weight_dtype == DataType::s8;
+}
+
 /// Attributes describing a 3D convolution.
 struct Conv3DAttributes {
     std::array<int64_t, 3> kernel_size = {1, 1, 1};
@@ -38,6 +44,31 @@ struct Conv3DAttributes {
 
     /// Accumulate into the existing output instead of overwriting.
     bool add_to = false;
+
+    // ---- quantized route (is_quantized_conv3d(weight): s8 weights) ----------
+    // Same contract as Conv2D's: same field names, same meaning, ignored on the
+    // floating-point route.
+
+    /// Quantized-route output dtype.
+    ///   f32 (default) / f16: dequantize the int32 accumulate. With an fp
+    ///                        activation the output follows the activation's
+    ///                        dtype and this value is ignored — the two must be
+    ///                        one float type, so an f16 activation against a
+    ///                        f32 output (or the reverse) is unsupported, not
+    ///                        converted. With a pre-quantized (u8/s8) activation
+    ///                        this value is honoured.
+    ///   s8 / u8:             requantize with the output's QuantParams (scale
+    ///                        s_w·s_x/out_scale, round half away from zero,
+    ///                        clamped to the storage range; the product is f32).
+    ///                        Honoured for every activation dtype; the bias is
+    ///                        then int32 rather than the output dtype.
+    /// Any other value is refused (s32 included: the raw MatMulInteger
+    /// destination exists on MatMul, not here).
+    DataType output_dtype = DataType::f32;
+
+    /// Integer storage an fp activation is quantized to inside the kernel, per
+    /// im2col tile: s8 (default) or u8, selecting the clamp range.
+    DataType act_quant_dtype = DataType::s8;
 };
 
 class Conv3D : public OpBase {

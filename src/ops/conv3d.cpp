@@ -14,8 +14,21 @@ NNOPS_OP_BOILERPLATE(Conv3D, Conv3DAttributes, backend::cpu::conv3d_cpu, nullptr
 
 std::vector<TensorDesc> Conv3D::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {
-    return {conv3d_output_shape(attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
-                                static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs)};
+    std::vector<TensorDesc> outs =
+        conv3d_output_shape(attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
+                            static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs);
+
+    // The quantized route writes s8/u8 when output_dtype says so, else the fp
+    // activation's dtype (output_dtype for a pre-quantized one); an unsupported
+    // request passes through for the kernel to refuse.
+    if (inputs.size() > 1 && is_quantized_conv3d(inputs[1].dtype)) {
+        const DataType act = inputs[0].dtype;
+        const bool fp_act = (act == DataType::f32 || act == DataType::f16);
+        const DataType odt = attrs_.output_dtype;
+        const bool int_out = odt == DataType::s8 || odt == DataType::u8;
+        outs[0].dtype = (int_out || !fp_act) ? odt : act;
+    }
+    return outs;
 }
 
 Status Conv3D::validate(std::span<const TensorDesc> inputs,
@@ -23,7 +36,24 @@ Status Conv3D::validate(std::span<const TensorDesc> inputs,
 {
     // input, weight [, bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
-    return detail::require(is_layout_supported(inputs[0].layout, LayoutSupport::ChannelLastOnly));
+    NNOPS_TRY(
+        detail::require(is_layout_supported(inputs[0].layout, LayoutSupport::ChannelLastOnly)));
+
+    // A quantized filter quantizes its activation per call and requantizes into
+    // the same float, so a floating-point activation and output are one type:
+    // getOutputTensorDesc reports the activation's dtype for such a call, and
+    // this refuses the view that asks for the other one instead of converting
+    // it silently.
+    if (inputs.size() > 1 && is_quantized_conv3d(inputs[1].dtype) && !outputs.empty()) {
+        const DataType act = inputs[0].dtype;
+        const DataType odt = outputs[0].dtype;
+        const bool fp_act = act == DataType::f32 || act == DataType::f16;
+        const bool fp_out = odt == DataType::f32 || odt == DataType::f16;
+        if (fp_act && fp_out && odt != act) {
+            return Status::unsupported;
+        }
+    }
+    return Status::ok;
 }
 
 Status Conv3D::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

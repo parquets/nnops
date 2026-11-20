@@ -75,6 +75,7 @@ add_library(nnops_test_reference STATIC
     reference/conv2d_int8_ref.cpp
     reference/conv2d_ref.cpp
     reference/conv3d_ref.cpp
+    reference/conv3d_int8_ref.cpp
     reference/depthwise_conv_ref.cpp
     reference/depthwise_transpose_conv_ref.cpp
     reference/depthwise_transpose_conv_int8_ref.cpp
