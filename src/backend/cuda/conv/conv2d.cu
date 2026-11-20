@@ -319,6 +319,27 @@ __device__ inline void conv_store(const ConvParams& p, int64_t base, int pixel, 
     *dst = Elem(v);
 }
 
+/// The same store when the caller already decoded the pixel to a row base. An
+/// epilogue writes a run of channels per pixel, and `conv_out_addr`'s division
+/// is what it pays for the privilege: the f16 tile wrote 32 elements a block,
+/// 32 divisions of which 28 were redundant.
+template <class Elem>
+__device__ inline void conv_row_store(const ConvParams& p, int64_t row_base, int n, float v)
+{
+    Elem* dst = conv_row_addr<Elem>(p, row_base, n);
+    if (p.add_to) {
+        v += float(*dst);
+    }
+    *dst = Elem(v);
+}
+
+/// Output row base for `pixel`: the address `conv_row_addr` adds the channel to.
+__device__ inline int64_t conv_pixel_base(const ConvParams& p, int64_t base, int pixel)
+{
+    const int oh = pixel / p.ow;
+    return base + int64_t(oh) * p.out_h + int64_t(pixel - oh * p.ow) * p.out_w;
+}
+
 // ============================================================
 // f16 tensor-core kernel
 // ============================================================
@@ -485,6 +506,7 @@ void conv_gemm_h_kernel(ConvParams p)
                 if (m >= M) {
                     continue;
                 }
+                const int64_t row_base = conv_pixel_base(p, out_base, m);
 #pragma unroll
                 for (int cc = 0; cc < 2; ++cc) {
                     const int n = gn + cc;
@@ -501,7 +523,7 @@ void conv_gemm_h_kernel(ConvParams p)
                     }
                     v = fminf(fmaxf(v, p.min_clip), p.max_clip);
                     v = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, v);
-                    conv_store<Elem>(p, out_base, m, n, v);
+                    conv_row_store<Elem>(p, row_base, n, v);
                 }
             }
         }
@@ -650,6 +672,7 @@ void conv_gemm_f_kernel(ConvParams p)
         if (m >= M) {
             continue;
         }
+        const int64_t row_base = conv_pixel_base(p, out_base, m);
 #pragma unroll
         for (int c = 0; c < S::LaneCol; ++c) {
             const int n = n0 + col0 + c;
@@ -666,7 +689,7 @@ void conv_gemm_f_kernel(ConvParams p)
             }
             v = fminf(fmaxf(v, p.min_clip), p.max_clip);
             v = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, v);
-            conv_store<float>(p, out_base, m, n, v);
+            conv_row_store<float>(p, row_base, n, v);
         }
     }
 }
