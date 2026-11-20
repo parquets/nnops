@@ -392,6 +392,41 @@ __device__ inline void conv_row_store(const ConvParams& p, int64_t row_base, int
     *dst = Elem(v);
 }
 
+/// The activation tags a conv kernel is compiled for.
+///
+/// `EpilogueActivateType` has ten kinds, and a kernel per kind would be ten
+/// instantiations a dtype -- but a CNN's graph carries two of them. Those two
+/// are dispatched at compile time, so their kernel holds no switch at all, and
+/// the other eight share one run-time switch. The tail is out of the hot path
+/// either way; what this buys is a store site of a couple of instructions
+/// instead of a copy of every arm.
+constexpr int kConvEpiNone = 0;
+constexpr int kConvEpiRelu = 1;
+constexpr int kConvEpiGeneral = 2;
+
+template <int Epi> __device__ inline float conv_activate(const ConvParams& p, float v)
+{
+    if constexpr (Epi == kConvEpiNone) {
+        return v;
+    } else if constexpr (Epi == kConvEpiRelu) {
+        return fmaxf(v, 0.0f);
+    } else {
+        return gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, v);
+    }
+}
+
+/// Which of the three a call needs.
+inline int conv_epi_tag(const ConvParams& p)
+{
+    if (p.epilogue == EpilogueActivateType::None) {
+        return kConvEpiNone;
+    }
+    if (p.epilogue == EpilogueActivateType::Relu) {
+        return kConvEpiRelu;
+    }
+    return kConvEpiGeneral;
+}
+
 /// Output row base for `pixel`: the address `conv_row_addr` adds the channel to.
 __device__ inline int64_t conv_pixel_base(const ConvParams& p, int64_t base, int pixel)
 {
@@ -425,10 +460,14 @@ __device__ inline int64_t conv_pixel_base(const ConvParams& p, int64_t base, int
 /// the latency the extra warps are there to hide.
 using ConvShapeH = F16TileShape<32, 16, 2, 4, 64, 2, 1, false, 3>;
 
+/// The four-warp tile the eight-warp one replaced, kept for the deep k axis
+/// (see `kConvDeepKTiles`): 32x32 per warp, two stages, the same 64x64 of output.
+using ConvShapeHDeep = F16TileShape<32, 32, 2, 2, 64, 2, 1, false, 1>;
+
 /// The gather's (row, col, stage) indexer over the k-major swizzled panel.
 template <class S, class Elem> using ConvHPanel = conv::KMajorPanel<S, Elem>;
 
-template <class Elem, class S>
+template <class Elem, class S, int Epi>
 __global__ __launch_bounds__(S::threads, S::MinBlocks)
 void conv_gemm_h_kernel(ConvParams p)
 {
@@ -584,7 +623,7 @@ void conv_gemm_h_kernel(ConvParams p)
                         v += float(bias[n]);
                     }
                     v = fminf(fmaxf(v, p.min_clip), p.max_clip);
-                    v = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, v);
+                    v = conv_activate<Epi>(p, v);
                     conv_row_store<Elem>(p, row_base, n, v);
                 }
             }
@@ -607,14 +646,19 @@ void conv_gemm_h_kernel(ConvParams p)
 /// which is 20 KB and four resident blocks rather than 30 KB and three.
 using ConvShapeF = F32TileShape<4, 8, 2, 2, 16, 2, 4, 8, 4, 4>;
 
+/// The three-stage arm, kept for the deep k axis: 20 KB becomes 30 KB and three
+/// resident blocks, which is the wrong trade until the pipeline has enough k to
+/// run, and then it is the right one.
+using ConvShapeFDeep = F32TileShape<4, 8, 2, 2, 16, 3, 4, 8, 4, 1>;
+
 /// The A panel in float units: rows of `BK + Pad`, the padding being what keeps
 /// a 16 B gather vector 16 B aligned on every row.
-using ConvFPanel = conv::PaddedPanel<ConvShapeF::LDA>;
+template <class S> using ConvFPanel = conv::PaddedPanel<S::LDA>;
 
-__global__ __launch_bounds__(ConvShapeF::threads, ConvShapeF::MinBlocks)
+template <class S, int Epi>
+__global__ __launch_bounds__(S::threads, S::MinBlocks)
 void conv_gemm_f_kernel(ConvParams p)
 {
-    using S = ConvShapeF;
     constexpr int BM = S::BM;
     constexpr int BN = S::BN;
     constexpr int BK = S::BK;
@@ -669,9 +713,9 @@ void conv_gemm_f_kernel(ConvParams p)
         float* const sA = sAbase + stage * S::kAMax;
         float* const sB = sBbase + stage * S::kBMax;
         if (p.fill_vec) {
-            conv_fill_a_vec<float, BK>(p, ConvFPanel{sA}, stage, in, rows, k0, tap_walk);
+            conv_fill_a_vec<float, BK>(p, ConvFPanel<S>{sA}, stage, in, rows, k0, tap_walk);
         } else {
-            conv_fill_a<float, S::threads, BM, BK>(p, ConvFPanel{sA}, stage, in, m0, k0);
+            conv_fill_a<float, S::threads, BM, BK>(p, ConvFPanel<S>{sA}, stage, in, m0, k0);
         }
         // The filter is HWIO with the channel innermost, so a vector is four
         // consecutive output channels of one k and the k stride is the group's
@@ -751,7 +795,7 @@ void conv_gemm_f_kernel(ConvParams p)
                 v += bias[n];
             }
             v = fminf(fmaxf(v, p.min_clip), p.max_clip);
-            v = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, v);
+            v = conv_activate<Epi>(p, v);
             conv_row_store<float>(p, row_base, n, v);
         }
     }
@@ -908,11 +952,11 @@ inline void conv_reduce(ConvParams& p, detail::GemmWorkspace ws, cudaStream_t st
     detail::gemm_workspace_free(ws, stream);
 }
 
-template <class Elem> void launch_conv_h(ConvParams& p, cudaStream_t stream)
+template <class Elem, class S, int Epi>
+inline void launch_conv_h_as(ConvParams& p, cudaStream_t stream)
 {
-    using S = ConvShapeH;
     constexpr int smem = S::kSmemBytes;
-    auto kernel = conv_gemm_h_kernel<Elem, S>;
+    auto kernel = conv_gemm_h_kernel<Elem, S, Epi>;
     static const cudaError_t cfg =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
@@ -928,11 +972,48 @@ template <class Elem> void launch_conv_h(ConvParams& p, cudaStream_t stream)
     }
 }
 
-inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
+/// The reduction depth past which the other arm wins its turn.
+///
+/// Eight warps of 32x16 are there to hide the gather's latency with more
+/// resident warps, and a deep k axis does that by itself: the prologue is the
+/// first tile and nothing after it, so once the pipeline is running the latency
+/// is gone and what is left is instructions per MMA -- where four warps of 32x32
+/// carry a quarter fewer ldmatrix per MMA. The f32 twin's lever is the third
+/// stage rather than the warp count, and it turns at the same place.
+///
+/// The line is drawn on K, not on k tiles, because the two dtypes use different
+/// k depths (64 halves against 16 floats) and the crossover is the same shape in
+/// both: 112x112x128 3x3 (K = 1152) still wants the shallow arm, 56x56x256 3x3
+/// (K = 2304) and 28x28x128 5x5 (K = 3200) want the deep one.
+constexpr int kConvDeepK = 1536;
+
+inline int conv_k_depth(const ConvParams& p)
 {
-    using S = ConvShapeF;
+    return p.icg * p.kh * p.kw;
+}
+
+inline bool conv_wants_deep(const ConvParams& p)
+{
+    return conv_k_depth(p) >= kConvDeepK;
+}
+
+template <class Elem> void launch_conv_h(ConvParams& p, cudaStream_t stream)
+{
+    if (conv_wants_deep(p)) {
+        launch_conv_h_as<Elem, ConvShapeHDeep, kConvEpiGeneral>(p, stream);
+        return;
+    }
+    switch (conv_epi_tag(p)) {
+    case kConvEpiNone: launch_conv_h_as<Elem, ConvShapeH, kConvEpiNone>(p, stream); break;
+    case kConvEpiRelu: launch_conv_h_as<Elem, ConvShapeH, kConvEpiRelu>(p, stream); break;
+    default: launch_conv_h_as<Elem, ConvShapeH, kConvEpiGeneral>(p, stream); break;
+    }
+}
+
+template <class S, int Epi> inline void launch_conv_f_as(ConvParams& p, cudaStream_t stream)
+{
     constexpr int smem = S::stages * (S::kAMax + S::kBMax) * int(sizeof(float));
-    auto kernel = conv_gemm_f_kernel;
+    auto kernel = conv_gemm_f_kernel<S, Epi>;
     static const cudaError_t cfg =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
@@ -943,6 +1024,19 @@ inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
     kernel<<<grid, S::threads, smem, stream>>>(p);
     if (p.k_splits > 1) {
         conv_reduce<float>(p, ws, stream);
+    }
+}
+
+inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
+{
+    if (conv_wants_deep(p)) {
+        launch_conv_f_as<ConvShapeFDeep, kConvEpiGeneral>(p, stream);
+        return;
+    }
+    switch (conv_epi_tag(p)) {
+    case kConvEpiNone: launch_conv_f_as<ConvShapeF, kConvEpiNone>(p, stream); break;
+    case kConvEpiRelu: launch_conv_f_as<ConvShapeF, kConvEpiRelu>(p, stream); break;
+    default: launch_conv_f_as<ConvShapeF, kConvEpiGeneral>(p, stream); break;
     }
 }
 
