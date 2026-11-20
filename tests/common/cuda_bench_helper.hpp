@@ -39,9 +39,13 @@ void cuda_launch(Op& op, TensorView& out, std::span<const TensorView> ins)
     }
 }
 
-/// Median GPU milliseconds of `launch`, after `warmup` untimed calls.
+/// Median GPU milliseconds of one `launch`, after `warmup` untimed calls.
+///
+/// `inner` submits that many calls inside each timed window and divides: on a
+/// kernel of 25-70 us a single-launch window carries 15-20% of event and launch
+/// jitter, which is enough to hide a 20% change in either direction.
 template <class F>
-double cuda_median_ms(F&& launch, int warmup = 3, int samples = 11)
+double cuda_median_ms(F&& launch, int warmup = 3, int samples = 11, int inner = 1)
 {
     CudaBuffer::sync();
     for (int i = 0; i < warmup; ++i) { launch(); }
@@ -56,12 +60,12 @@ double cuda_median_ms(F&& launch, int warmup = 3, int samples = 11)
     ms.reserve(static_cast<size_t>(samples));
     for (int i = 0; i < samples; ++i) {
         NNOPS_CUDA_CHECK(cudaEventRecord(begin));
-        launch();
+        for (int j = 0; j < inner; ++j) { launch(); }
         NNOPS_CUDA_CHECK(cudaEventRecord(end));
         NNOPS_CUDA_CHECK(cudaEventSynchronize(end));
         float elapsed = 0.0f;
         NNOPS_CUDA_CHECK(cudaEventElapsedTime(&elapsed, begin, end));
-        ms.push_back(static_cast<double>(elapsed));
+        ms.push_back(static_cast<double>(elapsed) / inner);
     }
     NNOPS_CUDA_CHECK(cudaEventDestroy(begin));
     NNOPS_CUDA_CHECK(cudaEventDestroy(end));

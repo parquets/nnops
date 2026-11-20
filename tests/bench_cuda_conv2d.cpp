@@ -78,7 +78,7 @@ std::string conv_geometry(const ConvBenchCase& c, const char* layout)
 
 /// Build the case's three device tensors and the operator, upload once, and
 /// return the median GPU milliseconds of a single compute().
-double measure(const ConvBenchCase& c)
+double measure(const ConvBenchCase& c, int inner = 1)
 {
     Conv2DAttributes attrs;
     attrs.kernel_size = {c.kh, c.kw};
@@ -107,15 +107,18 @@ double measure(const ConvBenchCase& c)
     const TensorView ins[] = {dact.view, dwgt.view};
     TensorView o = dout.view;
     auto launch = [&] { cuda_launch(*op, o, ins); };
-    return cuda_median_ms(launch);
+    return cuda_median_ms(launch, 3, 11, inner);
 }
 
 /// Time one convolution and print its row. Returns GFLOPS.
-double run_conv(const ConvBenchCase& c, const char* label)
+double run_conv(const ConvBenchCase& c, const char* label, bool print = true,
+                int inner = 1)
 {
-    const double ms = measure(c);
-    print_cuda_row(label, conv_geometry(c, "nhwc"), ms,
-                   cuda_gflops(ms, c.flops()));
+    const double ms = measure(c, inner);
+    if (print) {
+        print_cuda_row(label, conv_geometry(c, "nhwc"), ms,
+                       cuda_gflops(ms, c.flops()));
+    }
     return cuda_gflops(ms, c.flops());
 }
 
@@ -207,7 +210,7 @@ std::vector<ConvBenchCase> wide_layers()
 /// activation parameters and per-channel weight ones, into an s8 destination.
 /// The same layer set as the fp tables, so the rows are comparable.
 double run_conv_i8(const ConvBenchCase& c, const char* label, bool packed = false,
-                   bool print = true, DataType adt = DataType::u8)
+                   bool print = true, DataType adt = DataType::u8, int inner = 1)
 {
     Conv2DAttributes attrs;
     attrs.kernel_size = {c.kh, c.kw};
@@ -298,7 +301,7 @@ double run_conv_i8(const ConvBenchCase& c, const char* label, bool packed = fals
         NNOPS_CUDA_CHECK(cudaDeviceSynchronize());
     }
     std::vector<TensorView> ins = {dav, packed ? bv : dwv};
-    const double ms = cuda_median_ms([&] { cuda_launch(*op, dcv, ins); });
+    const double ms = cuda_median_ms([&] { cuda_launch(*op, dcv, ins); }, 3, 11, inner);
     if (print) {
         print_cuda_row(label, conv_geometry(c, "nhwc"), ms, cuda_gflops(ms, c.flops()));
     }
@@ -384,14 +387,89 @@ NNOPS_BENCH(cuda_conv2d_i8_splitk) {
     print_cuda_header("CUDA Conv2D int8 s8: split-K off vs the automatic rule");
     for (ConvBenchCase c : cnn_layers()) {
         double best[2] = {0.0, 0.0};
-        for (int rep = 0; rep < 3; ++rep) {
-            nnops::detail::cuda_splitk.store(0, std::memory_order_relaxed);
-            best[0] = std::max(best[0], run_conv_i8(c, "i8", true, false, DataType::s8));
-            nnops::detail::cuda_splitk.store(-1, std::memory_order_relaxed);
-            best[1] = std::max(best[1], run_conv_i8(c, "i8", true, false, DataType::s8));
+        // The arm order flips every repetition: this host's clock ramps over a
+        // process, so an arm that is always measured second inherits the ramp
+        // and a 20% ratio swing can be nothing but that.
+        for (int rep = 0; rep < 4; ++rep) {
+            for (int arm = 0; arm < 2; ++arm) {
+                const int a = (rep & 1) ? 1 - arm : arm;
+                nnops::detail::cuda_splitk.store(a == 0 ? 0 : -1, std::memory_order_relaxed);
+                const double g = run_conv_i8(c, "i8", true, false, DataType::s8, 8);
+                best[a] = std::max(best[a], g);
+            }
         }
+        nnops::detail::cuda_splitk.store(-1, std::memory_order_relaxed);
         std::printf("  %-8s %-34s whole %8.0f split %8.0f GFLOPS  %.2fx\n", "i8s8",
                     conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[1] / best[0]);
+    }
+}
+
+/// The fp arms have their own split rule (half wave for f32, quarter for f16);
+/// this is the only instrument that sees whether it fires where it should.
+NNOPS_BENCH(cuda_conv2d_splitk) {
+    print_cuda_header("CUDA Conv2D fp: split-K off vs the automatic rule");
+    for (DataType dt : {DataType::f32, DataType::f16}) {
+        const char* label = dt == DataType::f32 ? "f32" : "f16";
+        for (ConvBenchCase c : cnn_layers()) {
+            c.dtype = dt;
+            double best[2] = {0.0, 0.0};
+            for (int rep = 0; rep < 4; ++rep) {
+                for (int arm = 0; arm < 2; ++arm) {
+                    const int a = (rep & 1) ? 1 - arm : arm;
+                    nnops::detail::cuda_splitk.store(a == 0 ? 0 : -1,
+                                                     std::memory_order_relaxed);
+                    best[a] = std::max(best[a], run_conv(c, label, false, 8));
+                }
+            }
+            nnops::detail::cuda_splitk.store(-1, std::memory_order_relaxed);
+            std::printf("  %-8s %-34s whole %8.0f split %8.0f GFLOPS  %.2fx\n", label,
+                        conv_geometry(c, "nhwc").c_str(), best[0], best[1],
+                        best[1] / best[0]);
+        }
+    }
+}
+
+/// The split count as a knob on the shapes the rule cuts. Each count is a
+/// competition between the parallelism a cut buys and the second launch it
+/// costs, so the optimum is per shape and no single ratio can be derived from
+/// another.
+NNOPS_BENCH(cuda_conv2d_splitk_sweep) {
+    print_cuda_header("CUDA Conv2D split-K: the split count, shape by shape");
+    struct Probe { int64_t ic, oc, side, k; };
+    const Probe probes[] = {
+        {128, 128, 28, 3},   // K = 1152: the shallow end
+        {256, 256, 14, 3},   // K = 2304
+        {128, 128, 28, 5},   // K = 3200
+        {512, 512, 7, 1},    // K = 512, a plane smaller than one tile row
+    };
+    for (DataType dt : {DataType::f32, DataType::f16}) {
+        const char* label = dt == DataType::f32 ? "f32" : "f16";
+        for (const Probe& pr : probes) {
+            ConvBenchCase c;
+            c.dtype = dt;
+            c.ic = c.oc = pr.ic;
+            c.ih = c.iw = pr.side;
+            c.kh = c.kw = pr.k;
+            c.ph = c.pw = pr.k / 2;
+            const int counts[] = {0, 2, 3, 4, 6, 8, 12};
+            double best[7] = {0};
+            // These kernels are 25-70 us, so a single reading carries 15% of
+            // launch jitter. Best of four, with the count order rotated each
+            // repetition so the clock ramp cannot favour one column.
+            for (int rep = 0; rep < 4; ++rep) {
+                for (int i = 0; i < 7; ++i) {
+                    const int k = (i + rep) % 7;
+                    nnops::detail::cuda_splitk.store(counts[k], std::memory_order_relaxed);
+                    best[k] = std::max(best[k], run_conv(c, label, false, 8));
+                }
+            }
+            nnops::detail::cuda_splitk.store(-1, std::memory_order_relaxed);
+            std::printf("  %-4s %-30s", label, conv_geometry(c, "nhwc").c_str());
+            for (int i = 0; i < 7; ++i) {
+                std::printf(" %5.0f", best[i]);
+            }
+            std::printf("   (n = 0 2 3 4 6 8 12)\n");
+        }
     }
 }
 
