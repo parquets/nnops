@@ -363,18 +363,19 @@ NNOPS_BENCH(cuda_conv2d_i8_packed) {
 }
 
 NNOPS_BENCH(cuda_conv2d_i8_s8) {
-    print_cuda_header("CUDA Conv2D int8, packed filter: u8 (zp 128) vs s8 (zp 0) activation");
+    print_cuda_header("CUDA Conv2D int8 s8 x s8 -> s8: raw vs packed, and the u8 twin");
     for (ConvBenchCase c : wide_layers()) {
-        double best[2] = {0.0, 0.0};
+        // 0: raw s8, 1: packed s8, 2: packed u8 (the same kernel on the unsigned
+        // activation, so the zero-point and signed-dp4a cost shows up as a ratio).
+        double best[3] = {0.0, 0.0, 0.0};
         for (int rep = 0; rep < 3; ++rep) {
-            for (int arm = 0; arm < 2; ++arm) {
-                best[arm] = std::max(best[arm], run_conv_i8(c, "i8", true, false,
-                                                           arm == 1 ? DataType::s8
-                                                                    : DataType::u8));
-            }
+            best[0] = std::max(best[0], run_conv_i8(c, "i8s8", false, false, DataType::s8));
+            best[1] = std::max(best[1], run_conv_i8(c, "i8s8", true, false, DataType::s8));
+            best[2] = std::max(best[2], run_conv_i8(c, "i8", true, false, DataType::u8));
         }
-        std::printf("  %-8s %-34s u8 %8.0f s8 %8.0f GFLOPS  s8/u8 %.3f\n", "i8",
-                    conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[1] / best[0]);
+        std::printf("  %-8s %-34s raw %8.0f packed %8.0f (u8 %8.0f) GFLOPS  %.2fx\n", "i8s8",
+                    conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[2],
+                    best[1] / best[0]);
     }
 }
 
