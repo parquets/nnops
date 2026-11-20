@@ -1,4 +1,4 @@
-/// @file i8depthwise_transpose_conv.cpp
+/// @file depthwise_transpose_conv_i8.cpp
 /// @brief CPU depthwise transposed 2D convolution on NHWC — the quantized route.
 ///
 /// s8 weight against a u8/s8/f16/f32 activation and an int32 accumulate, with a

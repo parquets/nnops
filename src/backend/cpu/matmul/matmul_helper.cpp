@@ -13,7 +13,7 @@
 ///    a wider kernel rather than a narrow one (3 rows through the 4-wide kernel),
 ///    since the float kernels alias rows past the live count — one redundant row
 ///    is cheaper than a second B pass. The int8 packers take no live width, so
-///    their ladder keeps exact panels (see i8matmul_helper.cpp).
+///    their ladder keeps exact panels (see matmul_helper_i8.cpp).
 ///  - B is uniform: ceil(nc/nr_max) nr_max-wide panels at one 64-byte-aligned
 ///    stride. The MMA reads whole lanes, so callers pass the live width and
 ///    each kernel's N-tail path drops the lanes past it.

@@ -7,7 +7,7 @@
 ///
 ///   - conv2d_implicit_gemm.cpp    — the f32/f16/bf16 route, the plan, the
 ///                                   shared driver and the prepacked-filter pack;
-///   - i8conv2d_implicit_gemm.cpp  — the quantized route (s8 weight against an
+///   - conv2d_implicit_gemm_i8.cpp — the quantized route (s8 weight against an
 ///                                   s8/u8/f32/f16 activation, fp or requantized
 ///                                   output) and the int8 panels' prepack.
 ///
@@ -133,7 +133,7 @@ void with_stage(const ComputeContext& ctx, int64_t n, int64_t stage_len, Body bo
 } // namespace impl
 
 // =========================================================================
-//  The quantized filter prepack (i8conv2d_implicit_gemm.cpp)
+//  The quantized filter prepack (conv2d_implicit_gemm_i8.cpp)
 // =========================================================================
 
 /// Fill an s8 blob's panels from the raw HWIO filter and write the R_b table

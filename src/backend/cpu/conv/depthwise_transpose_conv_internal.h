@@ -8,7 +8,7 @@
 ///   - depthwise_transpose_conv.cpp    — the float routes (the per-tap channel
 ///                                       form and the scalar gather) and the
 ///                                       entry point;
-///   - i8depthwise_transpose_conv.cpp  — the quantized route (s8 weight,
+///   - depthwise_transpose_conv_i8.cpp — the quantized route (s8 weight,
 ///                                       u8/s8/f16/f32 activation, int32
 ///                                       accumulate) and its merges.
 ///
@@ -90,7 +90,7 @@ inline TapList col_taps(const DwtConvGeom& gm, int64_t r, int64_t mic) noexcept
     return t;
 }
 
-/// The quantized family's entry (i8depthwise_transpose_conv.cpp): which
+/// The quantized family's entry (depthwise_transpose_conv_i8.cpp): which
 /// activation/weight/output/bias combinations have an arithmetic there.
 Status depthwise_transpose_conv_int8_cpu(const DepthwiseTransposeConv2DAttributes& attrs,
                                          const DwtConvGeom& gm, TensorView& output,

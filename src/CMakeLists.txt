@@ -92,8 +92,8 @@ set(NNOPS_CPU_SOURCES
     # Q4_1). matmul_helper is the shared pack/MMA layer that conv2d and
     # attention also drive.
     backend/cpu/matmul/matmul.cpp
-    backend/cpu/matmul/i8matmul.cpp
-    backend/cpu/matmul/i8matmul_helper.cpp
+    backend/cpu/matmul/matmul_i8.cpp
+    backend/cpu/matmul/matmul_helper_i8.cpp
     backend/cpu/matmul/matmul_helper.cpp
     backend/cpu/matmul/matmul_small.cpp
     backend/cpu/matmul/matmul_qblock_fused.cpp
@@ -112,17 +112,17 @@ set(NNOPS_CPU_SOURCES
     # pooling (which sweeps the same windows the two above do, and shares their
     # channel-lane / width-lane split).
     backend/cpu/conv/conv2d_implicit_gemm.cpp
-    backend/cpu/conv/i8conv2d_implicit_gemm.cpp
+    backend/cpu/conv/conv2d_implicit_gemm_i8.cpp
     backend/cpu/conv/conv2d_winograd.cpp
     backend/cpu/conv/depthwise_conv.cpp
-    backend/cpu/conv/i8depthwise_conv.cpp
+    backend/cpu/conv/depthwise_conv_i8.cpp
     backend/cpu/conv/depthwise_transpose_conv.cpp
-    backend/cpu/conv/i8depthwise_transpose_conv.cpp
+    backend/cpu/conv/depthwise_transpose_conv_i8.cpp
     backend/cpu/conv/transpose_conv2d.cpp
-    backend/cpu/conv/i8transpose_conv2d.cpp
+    backend/cpu/conv/transpose_conv2d_i8.cpp
     backend/cpu/conv/transpose_conv3d.cpp
     backend/cpu/conv/pooling.cpp
-    backend/cpu/conv/i8pooling.cpp
+    backend/cpu/conv/pooling_i8.cpp
     backend/cpu/conv/conv3d.cpp
 
     # Conv1D is the 2D GEMM kernel on a rank-4 lift (conv1d_common.h), so this

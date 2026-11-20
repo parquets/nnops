@@ -59,7 +59,7 @@ namespace {
 /// is output channel g, so the vector axis is the channel itself: an output
 /// pixel accumulates the whole C-wide tap vector at once, and the "col" the
 /// scatter reads is the input plane. The skeleton — the repack to [KH·KW][C],
-/// the row scratch, the merge — is tconv_common.h's; only the walk is 2-D.
+/// the row scratch, the merge — is transpose_conv_common.h's; only the walk is 2-D.
 template <typename T>
 bool tconv2d_depthwise(const Geom& gm, TensorView& output,
                                     std::span<const TensorView> inputs, const ComputeContext& ctx)
@@ -96,7 +96,7 @@ bool tconv2d_depthwise(const Geom& gm, TensorView& output,
 /// once per group instead of once per pixel tile, and a stride-residue scatter
 /// then adds whole oc vectors out of the col. That pass over the filter is the
 /// entire point on a layer where the pixel kernel's re-read goes to DRAM.
-/// The chunk skeleton is tconv_common.h's; only the walk is 2-D.
+/// The chunk skeleton is transpose_conv_common.h's; only the walk is 2-D.
 /// Returns false when the operands cannot be read as flat matrices.
 template <typename T>
 bool tconv2d_gemm(const Geom& gm, TensorView& output,

@@ -7,14 +7,14 @@
 ///
 ///   - transpose_conv2d.cpp    — the float routes (pixel gather, col-matrix
 ///                               GEMM, depthwise) and the entry point;
-///   - i8transpose_conv2d.cpp  — the quantized routes (s8 weight, u8/s8/f32/f16
+///   - transpose_conv2d_i8.cpp — the quantized routes (s8 weight, u8/s8/f32/f16
 ///                               activation, int32 accumulate) and their
 ///                               dequant/requant merges.
 ///
 /// The geometry is one struct for both: the routes read the same numbers and
 /// only disagree on what an element is.
 
-#include "backend/cpu/conv/tconv_common.h"
+#include "backend/cpu/conv/transpose_conv_common.h"
 #include "backend/cpu/simd_kernel/simd_col2im.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -42,7 +42,7 @@ struct Geom {
     }
 };
 
-/// The quantized family's entry (i8transpose_conv2d.cpp): s8 weights only; the
+/// The quantized family's entry (transpose_conv2d_i8.cpp): s8 weights only; the
 /// activation ladder and the output ladder are the route's own.
 Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs, const Geom& gm,
                                  TensorView& output, std::span<const TensorView> inputs,

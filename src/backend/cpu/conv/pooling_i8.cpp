@@ -1,4 +1,4 @@
-/// @file i8pooling.cpp
+/// @file pooling_i8.cpp
 /// @brief Quantized CPU pooling (s8/u8 input and output) on NHWC/NDHWC.
 ///
 /// PerTensor activation: values are dequantized to float, pooled, and requantized

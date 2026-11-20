@@ -1,5 +1,5 @@
 #pragma once
-/// @file tconv_common.h
+/// @file transpose_conv_common.h
 /// @brief The spatial route of transposed convolution, shared by the 2-D
 ///        and 3-D operators: the col chunk driver and the depthwise driver.
 ///

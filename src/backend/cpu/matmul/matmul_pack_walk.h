@@ -2,7 +2,7 @@
 /// @file matmul_pack_walk.h
 /// @brief The M-panel decomposition both pack/MMA layers walk.
 ///
-/// Shared by matmul_helper.cpp (float) and i8matmul_helper.cpp (int8): the
+/// Shared by matmul_helper.cpp (float) and matmul_helper_i8.cpp (int8): the
 /// cascade is the arch's MR ladder either way, and the cost model — panels
 /// first, then duplicate rows, then kernel width — does not depend on the
 /// element type. The int8 ladder keeps its panels exact (its packers take no

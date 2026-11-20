@@ -1,4 +1,4 @@
-/// @file i8matmul.cpp
+/// @file matmul_i8.cpp
 /// @brief The quantized MatMul routes — s8 weights against an integer or
 /// fp-quantized activation.
 ///

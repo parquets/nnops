@@ -24,7 +24,7 @@
 /// The weight stays [IC, OC/G, KD, KH, KW].
 
 #include "nnops/ops/transpose_conv3d.hpp"
-#include "backend/cpu/conv/tconv_common.h"
+#include "backend/cpu/conv/transpose_conv_common.h"
 #include "backend/cpu/simd_kernel/simd_col2im.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
@@ -76,7 +76,7 @@ struct Geom3 {
 /// NDHWC through a col matrix — the 2-D route one axis deeper, and what
 /// MNN's NC4HW4 deconvolution does: one GEMM per (batch, group) does the channel
 /// reduction for the whole volume, and a depth/height tap list plus a
-/// stride-residue scatter fold the col back. The chunk skeleton is tconv_common.h's;
+/// stride-residue scatter fold the col back. The chunk skeleton is transpose_conv_common.h's;
 /// only the walk is 3-D. Returns false when the operands cannot be read as flat
 /// matrices.
 template <typename T>
@@ -126,7 +126,7 @@ bool tconv3d_gemm(const Geom3& gm, TensorView& output,
 /// is output channel g, so the vector axis is the channel itself and an output
 /// voxel accumulates the whole C-wide tap vector at once, the "col" being the
 /// input volume. The skeleton — the repack to [KD·KH·KW][C], the row scratch,
-/// the merge — is tconv_common.h's; only the walk is 3-D.
+/// the merge — is transpose_conv_common.h's; only the walk is 3-D.
 template <typename T>
 bool tconv3d_depthwise(const Geom3& gm, TensorView& output,
                                     std::span<const TensorView> inputs, const ComputeContext& ctx)

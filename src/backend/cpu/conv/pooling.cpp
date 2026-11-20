@@ -22,7 +22,7 @@
 /// Dispatch:
 ///   pooling_cpu
 ///     adaptive all-ones  -> global
-///     s8/u8              -> i8pooling.cpp (full extent)
+///     s8/u8              -> pooling_i8.cpp (full extent)
 ///     f32/f16/bf16       -> pooling_fp
 ///       global           -> pooling_global_impl
 ///       adaptive         -> pooling_adaptive_impl

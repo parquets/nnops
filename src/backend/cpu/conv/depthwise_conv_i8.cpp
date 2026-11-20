@@ -1,4 +1,4 @@
-/// @file i8depthwise_conv.cpp
+/// @file depthwise_conv_i8.cpp
 /// @brief CPU depthwise 2D/3D convolution on NHWC/NDHWC — the quantized route.
 ///
 /// s8/u8 activation against an s8/u8 per-channel weight, the destination picking

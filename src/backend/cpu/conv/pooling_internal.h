@@ -6,7 +6,7 @@
 ///
 ///   - pooling.cpp    — the float routes (spatial, global, adaptive), the Pool1D
 ///                      lift and the entry point;
-///   - i8pooling.cpp  — quantized pooling (s8/u8 in and out), which runs the
+///   - pooling_i8.cpp — quantized pooling (s8/u8 in and out), which runs the
 ///                      same four-row grid over dequantize/requantize kernels.
 ///
 /// Both take the same PoolingAttributes; the quantized family has no
@@ -21,7 +21,7 @@
 
 namespace nnops::backend::cpu {
 
-/// The quantized family's entry (i8pooling.cpp): s8/u8 input, s8/u8 output.
+/// The quantized family's entry (pooling_i8.cpp): s8/u8 input, s8/u8 output.
 void pooling_quant_run(const PoolingAttributes& attrs, TensorView& output,
                        std::span<const TensorView> inputs, const ComputeContext& ctx);
 

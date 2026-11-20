@@ -8,7 +8,7 @@
 /// — reduces to "add this tap's run into that row", so these are the leaves of
 /// all of them. The walks that produce the runs are
 /// simd_col2im.hpp; the merge that ends a row is route glue and
-/// lives in conv/tconv_common.h.
+/// lives in conv/transpose_conv_common.h.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_permute.hpp"

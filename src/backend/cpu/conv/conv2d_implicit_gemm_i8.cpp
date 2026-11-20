@@ -1,4 +1,4 @@
-/// @file i8conv2d_implicit_gemm.cpp
+/// @file conv2d_implicit_gemm_i8.cpp
 /// @brief Conv2D as implicit GEMM over NHWC activations — the quantized route.
 ///
 /// The same (pixels on M, packed oc on N, k tap-major) product as the float

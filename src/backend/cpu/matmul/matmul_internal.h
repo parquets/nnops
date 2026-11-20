@@ -8,7 +8,7 @@
 ///
 ///   - matmul.cpp      — the float routes (f32/f16, and bf16 on aarch64), the
 ///                       classification and the public entry point;
-///   - i8matmul.cpp    — the quantized routes: s8|u8 × s8 into int32 or an
+///   - matmul_i8.cpp   — the quantized routes: s8|u8 × s8 into int32 or an
 ///                       fp dequantize, and the fp-activation twin.
 ///
 /// The two alternate routes that bypass the plan altogether are self-contained
@@ -21,7 +21,7 @@
 ///                                aarch64; M <= 16 trans, 8 copy by default).
 ///
 /// The AArch64 SME tiles are not a separate driver: they are a route variant
-/// (SmeFpRoute in matmul.cpp, SmeI8Route in i8matmul.cpp) on the same
+/// (SmeFpRoute in matmul.cpp, SmeI8Route in matmul_i8.cpp) on the same
 /// plan-driven skeleton, reached through the tile_pack_*_sme /
 /// tile_mma_pack_*_sme layer.
 ///
@@ -202,7 +202,7 @@ inline bool any_zp_differs(const int32_t* zp, int32_t scalar, int64_t num_scales
 /// Raw int8 reductions for the output pass: r_a[m] = Σ_k A[m,k], r_b[n] =
 /// Σ_k B[k,n] (the transposes mirror them). Disjoint slabs, so no atomics; the
 /// kernels are in simd_int8_reduce.hpp. @p a_u8 sums A unsigned; a null
-/// @p r_a / @p r_b skips that sweep. Defined in i8matmul.cpp.
+/// @p r_a / @p r_b skips that sweep. Defined in matmul_i8.cpp.
 void compute_int8_reductions(const int8_t* a_ptr, bool a_u8, int64_t lda, const int8_t* b_ptr,
                              int64_t ldb, const MatMulAttributes& attrs, int64_t M, int64_t N,
                              int64_t K, int32_t* r_a, int32_t* r_b, const ComputeContext& ctx);
@@ -220,7 +220,7 @@ bool matmul_qblock_fused(const MatMulAttributes& attrs, TensorView& output,
                          int N, int K);
 #endif
 
-/// The quantized family (i8matmul.cpp): s8 weights, with an activation that is
+/// The quantized family (matmul_i8.cpp): s8 weights, with an activation that is
 /// already integer or fp carrying the quantization to apply.
 Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
                              std::span<const TensorView> inputs, const ComputeContext& ctx);

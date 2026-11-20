@@ -14,7 +14,7 @@
 /// This file is the float route: f32/f16/bf16 tiles, the plan both families
 /// share, the driver, and the float filter prepack. The quantized route (s8
 /// weight against an s8/u8/f32/f16 activation, fp or requantized output) and
-/// the s8 panels' prepack are i8conv2d_implicit_gemm.cpp; the two family leaves
+/// the s8 panels' prepack are conv2d_implicit_gemm_i8.cpp; the two family leaves
 /// meet in conv2d_implicit_gemm_internal.h.
 ///
 /// What not to "fix" later:

@@ -10,7 +10,7 @@
 ///
 /// This file owns the float family (FpRoute, plus FpRoute over the AArch64 ZA
 /// tiles) and the classification: matmul_dispatch_impl validates the call and
-/// forks once on the compute dtype, sending s8 weights to i8matmul.cpp
+/// forks once on the compute dtype, sending s8 weights to matmul_i8.cpp
 /// (matmul_dispatch_quant) and everything else to matmul_dispatch_fp below.
 ///
 /// An optional fp [N] bias reaches the output in the first k-block: with no old

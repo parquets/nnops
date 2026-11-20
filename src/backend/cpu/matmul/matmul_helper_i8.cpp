@@ -1,4 +1,4 @@
-/// @file i8matmul_helper.cpp
+/// @file matmul_helper_i8.cpp
 /// @brief The int8 half of the arch-neutral pack/MMA layer: the s8 packers, the
 /// integer MMA dispatch, and the int8 prepacked-RHS readers.
 ///

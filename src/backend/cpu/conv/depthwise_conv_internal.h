@@ -6,7 +6,7 @@
 ///
 ///   - depthwise_conv.cpp    — the float route (lane on C, raw HWCM filter) and
 ///                             the entry point's dtype dispatch;
-///   - i8depthwise_conv.cpp  — the quantized route (s8/u8 activation and weight,
+///   - depthwise_conv_i8.cpp — the quantized route (s8/u8 activation and weight,
 ///                             dequantized per row into a staging vector).
 ///
 /// Both run the same task grid — a strip of rows, cut to fit L2, with the
@@ -21,7 +21,7 @@
 
 namespace nnops::backend::cpu {
 
-/// The quantized family's entry (i8depthwise_conv.cpp): s8/u8 activation and
+/// The quantized family's entry (depthwise_conv_i8.cpp): s8/u8 activation and
 /// weight, the destination picking the requantize.
 Status dwconv_quant_run(const DepthwiseConvAttributes& attrs, TensorView& output,
                         std::span<const TensorView> inputs, const ComputeContext& ctx);

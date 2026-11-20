@@ -1,7 +1,7 @@
 #pragma once
 /// @file matmul_tile_impl.h
 /// @brief The plan-driven tile skeleton, shared by the float routes
-/// (matmul.cpp) and the quantized ones (i8matmul.cpp).
+/// (matmul.cpp) and the quantized ones (matmul_i8.cpp).
 ///
 /// One body for every route: per batch element, split the output on its larger
 /// dimension and run the blocks on the pool. The route is a type — its packs,

@@ -15,7 +15,7 @@
 /// Dispatch:
 ///   depthwise_conv_cpu
 ///     f32/f16/bf16       -> dwconv_fp_impl       (lane on C)
-///     s8/u8              -> i8depthwise_conv.cpp (dwconv_quant_run)
+///     s8/u8              -> depthwise_conv_i8.cpp (dwconv_quant_run)
 
 #include "depthwise_conv_internal.h"
 #include "nnops/detail/assert.hpp"

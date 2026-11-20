@@ -1,4 +1,4 @@
-/// @file i8transpose_conv2d.cpp
+/// @file transpose_conv2d_i8.cpp
 /// @brief CPU TransposeConv2D on NHWC — the quantized routes.
 ///
 /// The same output-driven gather as the float route, with an s8 weight
