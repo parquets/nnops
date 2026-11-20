@@ -1164,7 +1164,8 @@ __device__ inline int32_t conv_fill_a_i8(const ConvParams& p, SmemA sA, int stag
 /// per owned row and folds them into shared memory once, after the k loop.
 template <class Elem, int bK, class SmemA>
 __device__ inline void conv_fill_a_vec_i8(const ConvParams& p, SmemA sA, int stage, const Elem* in,
-                                          const ConvRows& rows, int k0, int32_t* sums, bool add)
+                                          const ConvRows& rows, int k0, ConvTapWalk& walk,
+                                          int32_t* sums, bool add)
 {
     constexpr int kGroup = 16 / int(sizeof(Elem));
     using Vec = uint4;
@@ -1172,10 +1173,8 @@ __device__ inline void conv_fill_a_vec_i8(const ConvParams& p, SmemA sA, int sta
     const int K = p.icg * p.kh * p.kw;
     const int kg = int(threadIdx.x) % (bK / kGroup);
     const int k = k0 + kg * kGroup;
-    const int tap = k / p.icg;
-    const int ic = k - tap * p.icg;
-    const int kh = tap / p.kw;
-    const int kw = tap - kh * p.kw;
+    conv_tap_seek(p, walk, k);
+    const int ic = walk.ic, kh = walk.kh, kw = walk.kw;
     const int inc = int(p.in_c), inh = int(p.in_h), inw = int(p.in_w);
     const int koff = ic * inc + (kh * p.dh) * inh + (kw * p.dw) * inw;
     const int dh = kh * p.dh, dw = kw * p.dw;
@@ -1207,11 +1206,17 @@ __device__ inline void conv_fill_a_vec_i8(const ConvParams& p, SmemA sA, int sta
         }
         *reinterpret_cast<Vec*>(&sA(rows.row[i], kg * kGroup, stage)) = v;
         if (add) {
-            const Elem* e = reinterpret_cast<const Elem*>(&v);
+            // Four bytes a step: the scalar fold was a shift and an add per
+            // element -- 32 of the fill's ~143 instructions per k tile.
+            const uint32_t* const w = reinterpret_cast<const uint32_t*>(&v);
             int32_t sum = 0;
         #pragma unroll
-            for (int t = 0; t < kGroup; ++t) {
-                sum += int32_t(e[t]);
+            for (int t = 0; t < kGroup / 4; ++t) {
+                if constexpr (std::is_same_v<Elem, uint8_t>) {
+                    sum = int(__dp4a(w[t], 0x01010101u, unsigned(sum)));
+                } else {
+                    sum = __dp4a(int(w[t]), 0x01010101, sum);
+                }
             }
             sums[i] += sum;
         }
@@ -1422,6 +1427,9 @@ void conv_gemm_i8_kernel(ConvParams p)
     int32_t ra_single = 0;
     int32_t ra_vec[ConvRows::kMax] = {};
     int ra_kt = -1;
+    // The fill's k-region odometer, as on the fp tiles: the ring asks for
+    // monotonic k, so the tap decode is carried instead of divided.
+    ConvTapWalk tap_walk;
 
     const int k_tiles = (K + BK - 1) / BK;
     // The filter gather's bytes per thread per k tile, and whether such a run
@@ -1447,7 +1455,7 @@ void conv_gemm_i8_kernel(ConvParams p)
         int8_t* const sB = sBbase + stage * S::kBBytes;
         if (p.fill_vec) {
             conv_fill_a_vec_i8<AElem, BK>(p, ConvI8Panel<AElem>{reinterpret_cast<AElem*>(sA)},
-                                          stage, in, rows, k0, ra_vec, add);
+                                          stage, in, rows, k0, tap_walk, ra_vec, add);
         } else {
             const int32_t s =
                 conv_fill_a_i8<AElem, S::threads, BM, BK>(
