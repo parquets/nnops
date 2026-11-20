@@ -47,6 +47,8 @@
 #include "conv2d_pack.h"
 #include "nnops/ops/conv2d.hpp"
 
+#include <cstdio>
+
 namespace nnops::backend::cuda {
 namespace {
 
@@ -937,6 +939,14 @@ inline int conv_pick_splits(int m, int n, int K, int64_t zg, int bM, int bN, int
     return splits >= 2 ? int(splits) : 1;
 }
 
+/// `NNOPS_SPLITK_LOG=1` reports the split count each launch chose, against the
+/// geometry it was chosen from. Read once, so a timed launch pays nothing.
+inline bool conv_splitk_log()
+{
+    static const bool on = std::getenv("NNOPS_SPLITK_LOG") != nullptr;
+    return on;
+}
+
 /// Cut the reduction into k ranges when the grid is shallower than the resident
 /// block count wants, and carve the scratch the split blocks write into. A null
 /// workspace means single-pass: either the rule declined or the carve failed
@@ -951,6 +961,14 @@ inline detail::GemmWorkspace conv_split_workspace(ConvParams& p, int bM, int bN,
     int splits = conv_pick_splits(p.oh * p.ow, p.ocg, p.icg * p.kh * p.kw, zg, bM, bN, bK,
                                   detail::device_sm_count() * blocks, wave_div,
                                   min_tiles_per_split);
+    if (conv_splitk_log()) {
+        std::fprintf(stderr,
+                     "conv splitk: %dx%d k%lld m=%lld n=%d K=%d tile=%dx%dx%d blocks/SM=%d "
+                     "capacity=%d -> %d split(s)\n",
+                     int(p.oh), int(p.ow), (long long)p.kh, (long long)p.oh * p.ow, p.ocg,
+                     p.icg * p.kh * p.kw, bM, bN, bK, blocks,
+                     detail::device_sm_count() * blocks, splits);
+    }
 
     // gridDim.z is 16-bit, and every split costs one f32 plane of stores.
     const int64_t bytes_per_split = zg * plane * int64_t(sizeof(float));
