@@ -192,7 +192,7 @@ public:
             const auto* h = actual.ptr<nnops::backend::cpu::half>();
             widened.resize(static_cast<size_t>(n));
             for (int64_t i = 0; i < n; ++i) {
-                widened[static_cast<size_t>(i)] = static_cast<float>(h[i]);
+                widened[static_cast<size_t>(i)] = nnops::backend::cpu::half_to_float(h[i]);
             }
             a = widened.data();
         } else {

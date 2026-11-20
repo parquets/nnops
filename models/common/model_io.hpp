@@ -253,8 +253,7 @@ public:
                 static_cast<size_t>(src.numel()));
             const float* p = src.ptr<float>();
             for (int64_t i = 0; i < src.numel(); ++i) {
-                buf[static_cast<size_t>(i)] =
-                    static_cast<nnops::backend::cpu::half>(p[i]);
+                buf[static_cast<size_t>(i)] = nnops::backend::cpu::float_to_half(p[i]);
             }
             it = mirrors_.emplace(name, std::move(buf)).first;
         }

@@ -181,7 +181,7 @@ namespace detail {
 inline float load_elem(const TensorView& t, int64_t i) noexcept
 {
     if (t.data_type() == DataType::f16) {
-        return static_cast<float>(t.ptr<nnops::backend::cpu::half>()[i]);
+        return nnops::backend::cpu::half_to_float(t.ptr<nnops::backend::cpu::half>()[i]);
     }
     return t.ptr<float>()[i];
 }
@@ -191,8 +191,7 @@ inline float load_elem(const TensorView& t, int64_t i) noexcept
 inline void store_elem(TensorView& t, int64_t i, float v) noexcept
 {
     if (t.data_type() == DataType::f16) {
-        t.ptr<nnops::backend::cpu::half>()[i] =
-            static_cast<nnops::backend::cpu::half>(v);
+        t.ptr<nnops::backend::cpu::half>()[i] = nnops::backend::cpu::float_to_half(v);
     } else {
         t.ptr<float>()[i] = v;
     }
