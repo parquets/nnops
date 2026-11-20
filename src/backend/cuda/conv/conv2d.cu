@@ -87,6 +87,7 @@ struct ConvParams {
     // second kernel sums the planes and epilogues once.
     int k_splits = 1;
     float* partial = nullptr; ///< [(batch·group)][split][M][OC/G], row-major
+    int32_t* partial_i32 = nullptr; ///< the same planes for the int8 route
 
     // ---- int8 route (pre-quantized activation) ----------------------------
     // The activation's parameters are per-tensor; the filter's per-channel
@@ -912,7 +913,7 @@ template <class Elem> __global__ void conv_splitk_reduce_kernel(ConvParams p)
 /// and a MAC floor high enough to decline them both (which is what a first
 /// attempt did) costs that 1.6x to buy back nothing but the sixth run.
 inline int conv_pick_splits(int m, int n, int K, int64_t zg, int bM, int bN, int bK, int capacity,
-                            int wave_div)
+                            int wave_div, int min_tiles_per_split = 4)
 {
     const int forced = detail::splitk_env();
     const int k_tiles = (K + bK - 1) / bK;
@@ -932,7 +933,7 @@ inline int conv_pick_splits(int m, int n, int K, int64_t zg, int bM, int bN, int
     }
 
     int64_t splits = std::min<int64_t>(detail::kSplitKMaxSplits, capacity / tiles);
-    splits = std::min<int64_t>(splits, k_tiles / 4);
+    splits = std::min<int64_t>(splits, k_tiles / min_tiles_per_split);
     return splits >= 2 ? int(splits) : 1;
 }
 
@@ -941,13 +942,15 @@ inline int conv_pick_splits(int m, int n, int K, int64_t zg, int bM, int bN, int
 /// workspace means single-pass: either the rule declined or the carve failed
 /// (`k_splits` stays 1).
 inline detail::GemmWorkspace conv_split_workspace(ConvParams& p, int bM, int bN, int bK,
-                                                  int smem_bytes, int wave_div, cudaStream_t stream)
+                                                  int smem_bytes, int wave_div, cudaStream_t stream,
+                                                  int min_tiles_per_split = 4)
 {
     const int64_t zg = int64_t(p.batch) * p.groups;
     const int blocks = std::max(1, int(detail::kSmemPerSm / smem_bytes));
     const int64_t plane = int64_t(p.oh) * p.ow * p.ocg;
     int splits = conv_pick_splits(p.oh * p.ow, p.ocg, p.icg * p.kh * p.kw, zg, bM, bN, bK,
-                                  detail::device_sm_count() * blocks, wave_div);
+                                  detail::device_sm_count() * blocks, wave_div,
+                                  min_tiles_per_split);
 
     // gridDim.z is 16-bit, and every split costs one f32 plane of stores.
     const int64_t bytes_per_split = zg * plane * int64_t(sizeof(float));
@@ -1440,7 +1443,14 @@ void conv_gemm_i8_kernel(ConvParams p)
     // monotonic k, so the tap decode is carried instead of divided.
     ConvTapWalk tap_walk;
 
+    // The blob's own k tiling, then the slice of it this block owns: a split is
+    // a proportional cut, and the sums it hands the reduce carry their own k
+    // count -- the only term that cannot be summed later.
     const int k_tiles = (K + BK - 1) / BK;
+    int kt_begin = 0, kt_count = 0;
+    conv_split_range(K, BK, p.k_splits, blk.split, kt_begin, kt_count);
+    const int kt_end = kt_begin + kt_count;
+    const int K_split = std::min(K, kt_end * BK) - kt_begin * BK;
     // The filter gather's bytes per thread per k tile, and whether such a run
     // can cross a tap. It cannot when icg is a multiple of the run, which the
     // tail check below is what makes sufficient.
@@ -1456,7 +1466,7 @@ void conv_gemm_i8_kernel(ConvParams p)
     ConvTapWalk w_walk;
 
     auto fill = [&](int kt, int stage) {
-        if (kt >= k_tiles) {
+        if (kt >= kt_end) {
             cp_async_commit_group();
             return;
         }
@@ -1576,9 +1586,9 @@ void conv_gemm_i8_kernel(ConvParams p)
 
 #pragma unroll
     for (int t = 0; t < ST - 1; ++t) {
-        fill(t, t % ST);
+        fill(kt_begin + t, (kt_begin + t) % ST);
     }
-    for (int kt = 0; kt < k_tiles; ++kt) {
+    for (int kt = kt_begin; kt < kt_end; ++kt) {
         const int stage = kt % ST;
         // One barrier a tile: the wait retires this tile's group, the barrier
         // then publishes the gather's plain stores and retires every warp's
@@ -1621,6 +1631,11 @@ void conv_gemm_i8_kernel(ConvParams p)
     const int pitch = conv_i8_stage_pitch<S>(esz);
     unsigned char* const sC = conv_smem;
 
+    // A split's block stops at its accumulator plane; the whole-K compensation,
+    // the bias and the requant all belong to the reduce.
+    int32_t* const part =
+        p.k_splits > 1 ? p.partial_i32 + int64_t(blockIdx.z) * int64_t(M) * N : nullptr;
+
     // C: lane l holds (m = l/4, n = 2*(l%4)), plus the +1 column and the +8 row.
     const int cm = lane / 4;
     const int cn = 2 * (lane % 4);
@@ -1646,6 +1661,15 @@ void conv_gemm_i8_kernel(ConvParams p)
                     }
                     const int32_t zpw = p.zp_w != nullptr ? p.zp_w[gi + n] : p.zp_w_scalar;
                     int32_t v = acc[i][j][rr * 2 + cc];
+                    if (part != nullptr) {
+                        // A split stops at its own slice: the activation term
+                        // uses its own k count and the weight term is left to
+                        // the reduce, which is the only place the whole K is
+                        // known. `m` is the global pixel; sums are tile rows.
+                        v -= (s_ra[m - m0] - K_split * p.zp_x) * zpw;
+                        part[int64_t(m) * N + n] = v;
+                        continue;
+                    }
                     v -= p.zp_x * p.r_b[gi + n];
                     // `m` is the global pixel; the sums are indexed by tile row.
                     v -= (s_ra[m - m0] - K * p.zp_x) * zpw;
@@ -1756,6 +1780,118 @@ void conv_gemm_i8_kernel(ConvParams p)
     }
 }
 
+/// The int8 epilogue's bias and relu, on the compensated accumulator. Shared by
+/// the tile and by the split reduce so the two cannot drift.
+__device__ inline int32_t conv_i8_out_int(const ConvParams& p, int n, int32_t v,
+                                          const int32_t* bias32)
+{
+    if (bias32 != nullptr) {
+        v += bias32[n];
+    }
+    if (p.relu) {
+        v = v < 0 ? 0 : v;
+    }
+    return v;
+}
+
+/// The same for a dequantizing destination: scale, bias, clip, activation.
+__device__ inline float conv_i8_out_f32(const ConvParams& p, int gi, int n, int32_t v,
+                                        const float* biasf32, const __half* biasf16)
+{
+    const float s_w = p.sc_w != nullptr ? p.sc_w[gi + n] : p.sc_w_scalar;
+    float f = float(v) * (s_w * p.sc_x);
+    float b = 0.0f;
+    if (biasf32 != nullptr) {
+        b = biasf32[n];
+    } else if (biasf16 != nullptr) {
+        b = __half2float(biasf16[n]);
+    }
+    if (b != 0.0f) {
+        f += b;
+    }
+    f = fminf(fmaxf(f, p.min_clip), p.max_clip);
+    return gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, f);
+}
+
+/// The int8 split's second pass: sum the planes, apply the whole-K weight
+/// compensation no split could see, then the epilogue once -- the same order the
+/// single-pass kernel runs. One thread per output element, so its stores are
+/// coalesced whatever the fragment order was.
+__global__ void conv_i8_splitk_reduce_kernel(ConvParams p)
+{
+    const I8OutKind kind = static_cast<I8OutKind>(p.out_kind);
+    const int M = p.oh * p.ow;
+    const int N = p.ocg;
+    const int64_t plane = int64_t(M) * N;
+    const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= plane) {
+        return;
+    }
+    const int pixel = int(idx / N);
+    const int n = int(idx - int64_t(pixel) * N);
+    const int zg = int(blockIdx.y);
+
+    const int32_t* src = p.partial_i32 + int64_t(zg) * p.k_splits * plane + idx;
+    int32_t v = 0;
+    for (int s = 0; s < p.k_splits; ++s) {
+        v += src[int64_t(s) * plane];
+    }
+
+    const int zb = zg / p.groups;
+    const int g = zg - zb * p.groups;
+    const int gi = g * p.ocg;
+    const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c;
+    v -= p.zp_x * p.r_b[gi + n];
+
+    switch (kind) {
+    case I8OutKind::S32:
+        break;
+    case I8OutKind::S8:
+    case I8OutKind::U8: {
+        const int32_t* bias32 =
+            p.bias != nullptr ? static_cast<const int32_t*>(p.bias) + gi : nullptr;
+        const int32_t q = conv_i8_out_int(p, n, v, bias32);
+        const float s_w = p.sc_w != nullptr ? p.sc_w[gi + n] : p.sc_w_scalar;
+        const float row_k = s_w / p.out_scale;
+        if (kind == I8OutKind::S8) {
+            *conv_out_addr<int8_t>(p, out_base, pixel, n) =
+                detail::i8_requant<int8_t>(q, row_k, p.sc_x, float(p.out_zp));
+        } else {
+            *conv_out_addr<uint8_t>(p, out_base, pixel, n) =
+                detail::i8_requant<uint8_t>(q, row_k, p.sc_x, float(p.out_zp));
+        }
+        break;
+    }
+    case I8OutKind::F32:
+    case I8OutKind::F16: {
+        const float* biasf32 = kind == I8OutKind::F32 && p.bias != nullptr ?
+                                   static_cast<const float*>(p.bias) + gi :
+                                   nullptr;
+        const __half* biasf16 = kind == I8OutKind::F16 && p.bias != nullptr ?
+                                    static_cast<const __half*>(p.bias) + gi :
+                                    nullptr;
+        const float f = conv_i8_out_f32(p, gi, n, v, biasf32, biasf16);
+        if (kind == I8OutKind::F32) {
+            *conv_out_addr<float>(p, out_base, pixel, n) = f;
+        } else {
+            *conv_out_addr<__half>(p, out_base, pixel, n) = __float2half(f);
+        }
+        break;
+    }
+    }
+}
+
+/// The int8 split reduce, kept beside its workspace the way the fp tiles do it.
+inline void conv_i8_reduce(ConvParams& p, detail::GemmWorkspace ws, cudaStream_t stream)
+{
+    constexpr int kReduceThreads = 256;
+    const int64_t plane = int64_t(p.oh) * p.ow * p.ocg;
+    dim3 rgrid(unsigned((plane + kReduceThreads - 1) / kReduceThreads),
+               unsigned(p.batch * p.groups), 1);
+    conv_i8_splitk_reduce_kernel<<<rgrid, kReduceThreads, 0, stream>>>(p);
+    detail::gemm_workspace_free(ws, stream);
+}
+
 template <class AElem> void launch_conv_i8(ConvParams& p, cudaStream_t stream)
 {
     // A group narrower than the wide tile would waste half its MMA work, so the
@@ -1767,9 +1903,18 @@ template <class AElem> void launch_conv_i8(ConvParams& p, cudaStream_t stream)
         static const cudaError_t cfg =
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         (void)cfg;
+        // Eight k tiles a split: the two-tile pipeline prologue is then at
+        // most a quarter of it. At four the cut measured 0.88x on 28x28x128 k3.
+        const detail::GemmWorkspace ws = conv_split_workspace(p, S::BM, S::BN, S::BK, smem, 4,
+                                                              stream, 8);
+        p.partial_i32 = reinterpret_cast<int32_t*>(p.partial);
         dim3 grid(unsigned((p.oh * p.ow + S::BM - 1) / S::BM),
-                  unsigned((p.ocg + S::BN - 1) / S::BN), unsigned(p.batch * p.groups));
+                  unsigned((p.ocg + S::BN - 1) / S::BN),
+                  unsigned(p.batch * p.groups * p.k_splits));
         kernel<<<grid, S::threads, smem, stream>>>(p);
+        if (p.k_splits > 1) {
+            conv_i8_reduce(p, ws, stream);
+        }
         return;
     }
     using S = ConvShapeI8;
@@ -1779,9 +1924,16 @@ template <class AElem> void launch_conv_i8(ConvParams& p, cudaStream_t stream)
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
+    const detail::GemmWorkspace ws = conv_split_workspace(p, S::BM, S::BN, S::BK, smem, 4,
+                                                          stream, 8);
+    p.partial_i32 = reinterpret_cast<int32_t*>(p.partial);
     dim3 grid(unsigned((p.oh * p.ow + S::BM - 1) / S::BM),
-              unsigned((p.ocg + S::BN - 1) / S::BN), unsigned(p.batch * p.groups));
+              unsigned((p.ocg + S::BN - 1) / S::BN),
+              unsigned(p.batch * p.groups * p.k_splits));
     kernel<<<grid, S::threads, smem, stream>>>(p);
+    if (p.k_splits > 1) {
+        conv_i8_reduce(p, ws, stream);
+    }
 }
 
 /// The quantized route's CUDA entry: pre-quantized u8/s8 activation against an

@@ -20,6 +20,7 @@
 #include "nnops/ops/conv2d.hpp"
 #include "common/bench_harness.hpp"
 #include "common/cuda_test_helper.hpp"
+#include "detail/bench_knobs.hpp"
 #include "common/cuda_bench_helper.hpp"
 
 #include <cstdio>
@@ -376,6 +377,21 @@ NNOPS_BENCH(cuda_conv2d_i8_s8) {
         std::printf("  %-8s %-34s raw %8.0f packed %8.0f (u8 %8.0f) GFLOPS  %.2fx\n", "i8s8",
                     conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[2],
                     best[1] / best[0]);
+    }
+}
+
+NNOPS_BENCH(cuda_conv2d_i8_splitk) {
+    print_cuda_header("CUDA Conv2D int8 s8: split-K off vs the automatic rule");
+    for (ConvBenchCase c : cnn_layers()) {
+        double best[2] = {0.0, 0.0};
+        for (int rep = 0; rep < 3; ++rep) {
+            nnops::detail::cuda_splitk.store(0, std::memory_order_relaxed);
+            best[0] = std::max(best[0], run_conv_i8(c, "i8", true, false, DataType::s8));
+            nnops::detail::cuda_splitk.store(-1, std::memory_order_relaxed);
+            best[1] = std::max(best[1], run_conv_i8(c, "i8", true, false, DataType::s8));
+        }
+        std::printf("  %-8s %-34s whole %8.0f split %8.0f GFLOPS  %.2fx\n", "i8s8",
+                    conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[1] / best[0]);
     }
 }
 

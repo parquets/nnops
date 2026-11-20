@@ -18,6 +18,7 @@
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/cuda_test_helper.hpp"
+#include "detail/bench_knobs.hpp"
 #include "common/channel_last.hpp"
 
 #include <algorithm>
@@ -287,6 +288,12 @@ NNOPS_TEST(cuda_conv2d_i8) {
         {1, 32, 32, 32, 24, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::s8, true, true, 303, true, -6, false},
         {1, 32, 16, 16, 32, 3, 3, 1, 1, 1, 1, 1, 1, 2, DataType::s8, DataType::s8, true, false, 305, true, 0, false},
         {1, 64, 56, 56, 128, 1, 1, 1, 1, 1, 1, 0, 0, 1, DataType::s8, DataType::s8, true, false, 307, true, 0, true},
+
+        // Planes small enough for the k reduction to be cut, so the split
+        // reduce's plane sums and the per-split activation sums are what
+        // produce the answer; the second one leaves through the dequant path.
+        {1, 256, 14, 14, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::s8, true, true, 311, true, 0, false},
+        {1, 128, 7, 7, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::s8, DataType::f32, false, false, 313, true, 0, false},
     };
 
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
@@ -402,11 +409,22 @@ NNOPS_TEST(cuda_conv2d_i8) {
             dins.push_back(view({c.oc}, bdt, dbias.data(), TensorLayout::Dense));
         }
         CudaBuffer dout(obytes);
-        dout.zero();
         TensorView dcv = view(odims, od.dtype, dout.data(), od.layout, qc);
         auto op_dev = Conv2D::create(attrs, Backend::CUDA);
-        cuda_run(*op_dev, dcv, dins);
-        dout.download(out_dev.data(), obytes);
+        // Twice: the automatic split-K rule, then a forced cut. The forced arm is
+        // the one compared with the CPU below, and the two must agree with each
+        // other on every shape -- not just the ones the heuristic picks.
+        auto run_arm = [&](int forced) {
+            nnops::detail::cuda_splitk.store(forced, std::memory_order_relaxed);
+            dout.zero();
+            cuda_run(*op_dev, dcv, dins);
+            dout.download(out_dev.data(), obytes);
+        };
+        run_arm(-1);
+        std::vector<uint8_t> out_auto(out_dev);
+        run_arm(3);
+        nnops::detail::cuda_splitk.store(-1, std::memory_order_relaxed);
+        NNOPS_EXPECT_TRUE(out_auto == out_dev);
 
         if (int_out) {
             if (std::memcmp(out_cpu.data(), out_dev.data(), obytes) != 0) {
