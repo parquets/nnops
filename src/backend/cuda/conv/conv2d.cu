@@ -10,11 +10,10 @@
 /// channel-major inside a tap (k = tap·ICG + ic); the filter's fill and the
 /// gather walk are both built for that order.
 ///
-/// Shape indices follow the library's convention: they are the logical [N, C, H,
-/// W] ones, and the layout tag only changes the element strides. The epilogue
-/// writes through the operator's own address arithmetic rather than a strided C
-/// tensor, because an NHWC row is padded to a 32 B pitch and the pixel
-/// axis is only uniform inside one row. add_to reads the old output at that same
+/// Shape indices follow the library's convention: an NHWC activation's dims are
+/// the storage order, [N, H, W, C]. The epilogue writes through the operator's
+/// own address arithmetic rather than a strided C tensor, because an NHWC row is
+/// padded to a 32 B pitch and the pixel axis is only uniform inside one row. add_to reads the old output at that same
 /// address before overwriting it, so the residual lands after the activation as
 /// it does on the CPU.
 ///
@@ -1264,12 +1263,12 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
 
     ConvParams p;
     p.batch = static_cast<int>(act.shape(0));
-    p.ic = static_cast<int>(act.shape(1));
-    p.ih = static_cast<int>(act.shape(2));
-    p.iw = static_cast<int>(act.shape(3));
-    p.oc = static_cast<int>(output.shape(1));
-    p.oh = static_cast<int>(output.shape(2));
-    p.ow = static_cast<int>(output.shape(3));
+    p.ic = static_cast<int>(act.shape(3));
+    p.ih = static_cast<int>(act.shape(1));
+    p.iw = static_cast<int>(act.shape(2));
+    p.oc = static_cast<int>(output.shape(3));
+    p.oh = static_cast<int>(output.shape(1));
+    p.ow = static_cast<int>(output.shape(2));
     p.icg = static_cast<int>(wgt.shape(2));
     p.groups = static_cast<int>(attrs.groups);
     p.ocg = p.oc / p.groups;
@@ -1283,15 +1282,15 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
     p.pw = static_cast<int>(attrs.padding[1]);
 
     p.in_batch = act.stride_elems(0);
-    p.in_c = act.stride_elems(1);
-    p.in_h = act.stride_elems(2);
-    p.in_w = act.stride_elems(3);
+    p.in_c = act.stride_elems(3);
+    p.in_h = act.stride_elems(1);
+    p.in_w = act.stride_elems(2);
     const int64_t esz = static_cast<int64_t>(data_type_size(output.data_type()));
     (void)esz;
     p.out_batch = output.stride_elems(0);
-    p.out_c = output.stride_elems(1);
-    p.out_h = output.stride_elems(2);
-    p.out_w = output.stride_elems(3);
+    p.out_c = output.stride_elems(3);
+    p.out_h = output.stride_elems(1);
+    p.out_w = output.stride_elems(2);
 
     p.input = act.ptr<void>();
     p.weight = wgt.ptr<void>();
@@ -1425,12 +1424,12 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
 
     ConvParams p;
     p.batch = static_cast<int>(act.shape(0));
-    p.ic = static_cast<int>(act.shape(1));
-    p.ih = static_cast<int>(act.shape(2));
-    p.iw = static_cast<int>(act.shape(3));
-    p.oc = static_cast<int>(output.shape(1));
-    p.oh = static_cast<int>(output.shape(2));
-    p.ow = static_cast<int>(output.shape(3));
+    p.ic = static_cast<int>(act.shape(3));
+    p.ih = static_cast<int>(act.shape(1));
+    p.iw = static_cast<int>(act.shape(2));
+    p.oc = static_cast<int>(output.shape(3));
+    p.oh = static_cast<int>(output.shape(1));
+    p.ow = static_cast<int>(output.shape(2));
     p.icg = static_cast<int>(wgt.shape(2));
     p.groups = static_cast<int>(attrs.groups);
     p.ocg = p.oc / p.groups;
@@ -1445,13 +1444,13 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
     p.pw = static_cast<int>(attrs.padding[1]);
 
     p.in_batch = act.stride_elems(0);
-    p.in_c = act.stride_elems(1);
-    p.in_h = act.stride_elems(2);
-    p.in_w = act.stride_elems(3);
+    p.in_c = act.stride_elems(3);
+    p.in_h = act.stride_elems(1);
+    p.in_w = act.stride_elems(2);
     p.out_batch = output.stride_elems(0);
-    p.out_c = output.stride_elems(1);
-    p.out_h = output.stride_elems(2);
-    p.out_w = output.stride_elems(3);
+    p.out_c = output.stride_elems(3);
+    p.out_h = output.stride_elems(1);
+    p.out_w = output.stride_elems(2);
 
     p.input = act.ptr<void>();
     p.weight = wgt.ptr<void>();

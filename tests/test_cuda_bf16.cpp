@@ -363,7 +363,7 @@ NNOPS_TEST(cuda_bf16_conv2d) {
         attrs.stride = {c.sh, c.sw};
         attrs.padding = {c.ph, c.pw};
 
-        HostTensor act = rnd({1, c.ic, 10, 12}, false, 23, -0.5f, 0.5f,
+        HostTensor act = rnd({1, 10, 12, c.ic}, false, 23, -0.5f, 0.5f,
                              TensorLayout::NHWC);
         HostTensor wgt = rnd({c.kh, c.kw, c.ic, c.oc}, false, 29, -0.25f, 0.25f,
                              TensorLayout::HWIO);
@@ -381,7 +381,7 @@ NNOPS_TEST(cuda_bf16_transpose_conv2d) {
     attrs.stride = {2, 2};
     attrs.padding = {1, 1};
 
-    HostTensor act = rnd({1, 6, 7, 9}, false, 23, -0.5f, 0.5f,
+    HostTensor act = rnd({1, 7, 9, 6}, false, 23, -0.5f, 0.5f,
                          TensorLayout::NHWC);
     HostTensor wgt = rnd({6, 4, 3, 3}, false, 29, -0.25f, 0.25f);
     HostTensor bias = rnd({4}, false, 31, -0.25f, 0.25f);
@@ -397,7 +397,7 @@ NNOPS_TEST(cuda_bf16_depthwise_conv) {
     attrs.padding = {0, 1, 1};
 
     const int64_t C = 8;
-    HostTensor in = rnd({1, C, 9, 11}, false, 17, -1.0f, 1.0f,
+    HostTensor in = rnd({1, 9, 11, C}, false, 17, -1.0f, 1.0f,
                         TensorLayout::NHWC);
     HostTensor w = rnd({3, 3, C}, false, 23, -0.5f, 0.5f, TensorLayout::HWCM);
     HostTensor b = rnd({C}, false, 29, -0.25f, 0.25f);
@@ -413,7 +413,7 @@ NNOPS_TEST(cuda_bf16_depthwise_transpose_conv) {
     attrs.stride = {2, 2};
 
     const int64_t C = 7;
-    HostTensor act = rnd({1, C, 5, 6}, false, 23, -0.5f, 0.5f,
+    HostTensor act = rnd({1, 5, 6, C}, false, 23, -0.5f, 0.5f,
                          TensorLayout::NHWC);
     HostTensor wgt = rnd({2, 2, C}, false, 29, -0.25f, 0.25f,
                          TensorLayout::HWCM);
@@ -433,7 +433,7 @@ NNOPS_TEST(cuda_bf16_pooling) {
     for (PoolingType type : {PoolingType::Max, PoolingType::Average}) {
         PoolingAttributes attrs = window(type, 3, 2, 1);
         if (type == PoolingType::Average) { attrs.exclude_pad = true; }
-        HostTensor a = rnd({1, 8, 9, 11}, false, 13, -1.0f, 1.0f,
+        HostTensor a = rnd({1, 9, 11, 8}, false, 13, -1.0f, 1.0f,
                            TensorLayout::NHWC);
         const HostTensor in[] = {a};
         run_op_bf16([attrs](Backend be) { return Pooling::create(attrs, be); },
@@ -445,9 +445,11 @@ NNOPS_TEST(cuda_bf16_pooling) {
 NNOPS_TEST(cuda_bf16_softmax) {
     for (bool log_softmax : {false, true}) {
         SoftmaxAttributes attrs;
-        attrs.axis = -1;
+        // The rank-3 channel-last dims are [N, L, C]; softmax over the 37-long
+        // axis is position 1.
+        attrs.axis = 1;
         attrs.log_softmax = log_softmax;
-        HostTensor a = rnd({2, 5, 37}, false, 17, -2.0f, 2.0f,
+        HostTensor a = rnd({2, 37, 5}, false, 17, -2.0f, 2.0f,
                            TensorLayout::NHWC);
         const HostTensor in[] = {a};
         run_op_bf16([attrs](Backend be) { return Softmax::create(attrs, be); },
@@ -482,7 +484,7 @@ NNOPS_TEST(cuda_bf16_norm) {
         NormAttributes attrs;
         attrs.type = NormType::GroupNorm;
         attrs.num_groups = 4;
-        HostTensor x = rnd({2, 8, 6, 7}, false, 23, -1.0f, 1.0f,
+        HostTensor x = rnd({2, 6, 7, 8}, false, 23, -1.0f, 1.0f,
                            TensorLayout::NHWC);
         HostTensor scale = rnd({8}, false, 95, -1.0f, 1.0f);
         HostTensor bias = rnd({8}, false, 96, -1.0f, 1.0f);
@@ -514,7 +516,7 @@ NNOPS_TEST(cuda_bf16_resize) {
         ResizeAttributes attrs;
         attrs.mode = mode;
         attrs.output_size = {0, 13, 17};
-        HostTensor a = rnd({1, 4, 7, 9}, false, 17, -1.0f, 1.0f,
+        HostTensor a = rnd({1, 7, 9, 4}, false, 17, -1.0f, 1.0f,
                            TensorLayout::NHWC);
         const HostTensor in[] = {a};
         run_op_bf16([attrs](Backend be) { return Resize::create(attrs, be); },

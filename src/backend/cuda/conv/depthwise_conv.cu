@@ -370,16 +370,16 @@ void depthwise_conv_impl(const DepthwiseConvAttributes& attrs, TensorView& outpu
     const bool has_bias = inputs.size() > 2;
     const int64_t rank = input.rank();
     const bool three_d = rank == 5;
-    const int64_t C = input.shape(1);
+    const int64_t C = input.shape(rank - 1);
 
     DwGeom g{};
     g.N = input.shape(0);
-    g.ID = three_d ? input.shape(2) : 1;
-    g.IH = input.shape(rank - 2);
-    g.IW = input.shape(rank - 1);
-    g.OD = three_d ? output.shape(2) : 1;
-    g.OH = output.shape(rank - 2);
-    g.OW = output.shape(rank - 1);
+    g.ID = three_d ? input.shape(rank - 4) : 1;
+    g.IH = input.shape(rank - 3);
+    g.IW = input.shape(rank - 2);
+    g.OD = three_d ? output.shape(rank - 4) : 1;
+    g.OH = output.shape(rank - 3);
+    g.OW = output.shape(rank - 2);
 
     g.KD = three_d ? attrs.kernel_size[0] : 1;
     g.KH = attrs.kernel_size[1];

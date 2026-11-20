@@ -82,7 +82,7 @@ double measure(const PoolBenchCase& c)
 
     const TensorLayout layout = TensorLayout::NHWC;
 
-    HostTensor in = make_host_random(std::vector<int64_t>{c.n, c.c, c.ih, c.iw},
+    HostTensor in = make_host_random(std::vector<int64_t>{c.n, c.ih, c.iw, c.c},
                                      c.dtype, false, 23, -1.0f, 1.0f, layout);
 
     auto op = Pooling::create(attrs, Backend::CUDA);

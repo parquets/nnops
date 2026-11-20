@@ -107,7 +107,7 @@ NNOPS_TEST(cuda_activation_f16_and_add_to) {
                    true, "cuda_activation_silu_add_to");
     // NHWC rows are one spatial line of W·C, which is the last dim the
     // kernel is handed.
-    run_activation(ActivationType::Relu, {2, 8, 7, 5}, DataType::f32, false,
+    run_activation(ActivationType::Relu, {2, 7, 5, 8}, DataType::f32, false,
                    TensorLayout::NHWC, false, "cuda_activation");
 }
 
@@ -131,8 +131,9 @@ NNOPS_TEST(cuda_softmax_contiguous) {
 }
 
 NNOPS_TEST(cuda_softmax_and_f16) {
-    // NHWC with the axis on C: the groups are the layout's own rows.
-    run_softmax({1, 8, 16, 16}, 1, DataType::f32, false, TensorLayout::NHWC,
+    // NHWC with the axis on C (the innermost dim of [N, H, W, C]): the groups
+    // are the layout's own rows.
+    run_softmax({1, 16, 16, 8}, 3, DataType::f32, false, TensorLayout::NHWC,
                 false, "cuda_softmax", kF32Abs, kF32Rel);
     run_softmax({128, 1024}, -1, DataType::f16, true, TensorLayout::NHWC, false,
                 "cuda_softmax_f16", kF16Abs, kF16Rel);

@@ -71,7 +71,8 @@ Outputs run_case(const ConvCase& c, const char* what)
     const int64_t icg = c.ic / c.groups;
     const int64_t ocg = c.oc / c.groups;
 
-    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ic, c.ih, c.iw}, c.dtype,
+    // NHWC dims are the storage order: [N, H, W, C].
+    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ih, c.iw, c.ic}, c.dtype,
                                       false, 23, -0.5f, 0.5f, act_layout);
     HostTensor wgt = make_host_random(
         std::vector<int64_t>{c.kh, c.kw, icg, c.oc},
@@ -91,8 +92,9 @@ Outputs run_case(const ConvCase& c, const char* what)
     const TensorDesc od = outs.front();
 
     Outputs res;
-    res.oh = od.dims[2];
-    res.ow = od.dims[3];
+    // NHWC output dims are [N, H, W, C], so H and W sit above the channel axis.
+    res.oh = od.dims[static_cast<size_t>(od.rank - 3)];
+    res.ow = od.dims[static_cast<size_t>(od.rank - 2)];
 
     const auto seed = [&](uint64_t s) {
         return c.add_to ? make_host_random(od.dims, od.dtype, false, s, 0.0f, 0.5f,
@@ -309,7 +311,7 @@ NNOPS_TEST(cuda_conv2d_i8) {
         };
         const TensorLayout alay = TensorLayout::NHWC;
         const TensorLayout wlay = TensorLayout::HWIO;
-        const std::vector<int64_t> ashape = {c.n, c.ic, c.ih, c.iw};
+        const std::vector<int64_t> ashape = {c.n, c.ih, c.iw, c.ic};
         const std::vector<int64_t> wshape = {c.kh, c.kw, icg, c.oc};
 
         TensorView av = view(ashape, c.adt, a.data(), alay, qa);
@@ -406,7 +408,7 @@ NNOPS_TEST(cuda_conv2d_i8) {
 
     // An s32 destination has no Conv2D route on either backend (MatMul keeps it).
     {
-        const int64_t ashape[] = {1, 4, 8, 8};
+        const int64_t ashape[] = {1, 8, 8, 4};   // NHWC [N, H, W, C]
         const int64_t wshape[] = {3, 3, 4, 6};
         std::vector<uint8_t> a(1 * 4 * 8 * 8, 1);
         std::vector<int8_t> w(6 * 4 * 3 * 3, 1);

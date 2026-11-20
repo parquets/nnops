@@ -59,7 +59,8 @@ void run_case(const DwCase& c, const char* what)
 
     const TensorLayout layout = TensorLayout::NHWC;
 
-    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.c, c.ih, c.iw},
+    // NHWC dims are the storage order: [N, H, W, C].
+    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ih, c.iw, c.c},
                                       c.dtype, false, 23, -0.5f, 0.5f, layout);
     const bool hwcm = !c.filter_channel_first;
     HostTensor wgt = hwcm

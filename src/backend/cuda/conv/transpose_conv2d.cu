@@ -642,12 +642,12 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     }
     ConvParams p;
     p.batch = static_cast<int>(act.shape(0));
-    p.ic = static_cast<int>(act.shape(1));
-    p.ih = static_cast<int>(act.shape(2));
-    p.iw = static_cast<int>(act.shape(3));
-    p.oc = static_cast<int>(output.shape(1));
-    p.oh = static_cast<int>(output.shape(2));
-    p.ow = static_cast<int>(output.shape(3));
+    p.ic = static_cast<int>(act.shape(3));
+    p.ih = static_cast<int>(act.shape(1));
+    p.iw = static_cast<int>(act.shape(2));
+    p.oc = static_cast<int>(output.shape(3));
+    p.oh = static_cast<int>(output.shape(1));
+    p.ow = static_cast<int>(output.shape(2));
     p.groups = static_cast<int>(attrs.groups);
     p.icg = p.ic / p.groups;
     p.ocg = p.oc / p.groups;
@@ -662,13 +662,13 @@ Status transpose_conv2d_cuda(const TransposeConv2DAttributes& attrs, TensorView&
     p.pw = static_cast<int>(attrs.padding[1]);
 
     p.in_batch = act.stride_elems(0);
-    p.in_c = act.stride_elems(1);
-    p.in_h = act.stride_elems(2);
-    p.in_w = act.stride_elems(3);
+    p.in_c = act.stride_elems(3);
+    p.in_h = act.stride_elems(1);
+    p.in_w = act.stride_elems(2);
     p.out_batch = output.stride_elems(0);
-    p.out_c = output.stride_elems(1);
-    p.out_h = output.stride_elems(2);
-    p.out_w = output.stride_elems(3);
+    p.out_c = output.stride_elems(3);
+    p.out_h = output.stride_elems(1);
+    p.out_w = output.stride_elems(2);
 
     p.input = act.ptr<void>();
     p.weight = wgt.ptr<void>();

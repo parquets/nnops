@@ -91,14 +91,14 @@ double measure(const TConvBenchCase& c)
     const TensorLayout act_layout = TensorLayout::NHWC;
     const TensorLayout out_layout = act_layout;
 
-    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ic, c.ih, c.iw},
+    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ih, c.iw, c.ic},
                                       c.dtype, false, 23, -0.5f, 0.5f, act_layout);
     // The filter is [IC, OC/G, KH, KW] in both memory orders.
     HostTensor wgt = make_host_random(
         std::vector<int64_t>{c.ic, c.ocg(), c.kh, c.kw}, c.dtype, false, 29, -0.25f,
         0.25f, TensorLayout::Dense);
     HostTensor out = make_host_zeroed(
-        std::vector<int64_t>{c.n, c.oc, c.oh(), c.ow()}, c.dtype, false, out_layout);
+        std::vector<int64_t>{c.n, c.oh(), c.ow(), c.oc}, c.dtype, false, out_layout);
 
     DeviceTensor dact = to_device(act);
     DeviceTensor dwgt = to_device(wgt);

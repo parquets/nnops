@@ -495,13 +495,13 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
 
     ResizeGeom g{};
     g.n = input.shape(0);
-    g.c = input.shape(1);
-    g.id = three_d ? input.shape(2) : 1;
-    g.ih = input.shape(srank);
-    g.iw = input.shape(srank + 1);
-    g.od = three_d ? output.shape(2) : 1;
-    g.oh = output.shape(srank);
-    g.ow = output.shape(srank + 1);
+    g.c = input.shape(rank - 1);
+    g.id = three_d ? input.shape(rank - 4) : 1;
+    g.ih = input.shape(rank - 3);
+    g.iw = input.shape(rank - 2);
+    g.od = three_d ? output.shape(rank - 4) : 1;
+    g.oh = output.shape(rank - 3);
+    g.ow = output.shape(rank - 2);
     g.coord_mode = int(attrs.coord_mode);
     g.cubic_a = attrs.cubic_coeff_a;
     g.add_to = attrs.add_to;
@@ -510,15 +510,15 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
     if (attrs.has_crop()) {
         if (three_d && attrs.crop_end[0] > 0) {
             g.id = attrs.crop_end[0] - attrs.crop_start[0];
-            g.crop_off += attrs.crop_start[0] * input.stride_elems(2);
+            g.crop_off += attrs.crop_start[0] * input.stride_elems(1);
         }
         if (attrs.crop_end[1] > 0) {
             g.ih = attrs.crop_end[1] - attrs.crop_start[1];
-            g.crop_off += attrs.crop_start[1] * input.stride_elems(rank - 2);
+            g.crop_off += attrs.crop_start[1] * input.stride_elems(rank - 3);
         }
         if (attrs.crop_end[2] > 0) {
             g.iw = attrs.crop_end[2] - attrs.crop_start[2];
-            g.crop_off += attrs.crop_start[2] * input.stride_elems(rank - 1);
+            g.crop_off += attrs.crop_start[2] * input.stride_elems(rank - 2);
         }
     }
 

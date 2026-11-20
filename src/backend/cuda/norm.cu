@@ -109,11 +109,11 @@ inline SpatWalk make_spat_walk(const TensorView& x, const TensorView& y)
     SpatWalk w;
     const int64_t rank = x.rank();
     w.n_step = x.stride_elems(0);
-    w.c_step = (rank >= 2) ? x.stride_elems(1) : 0;
+    w.c_step = (rank >= 2) ? x.stride_elems(rank - 1) : 0;
     w.out_n_step = y.stride_elems(0);
-    w.out_c_step = (rank >= 2) ? y.stride_elems(1) : 0;
-    detail::axis_fill_group_unit(w.sp, x, 2, rank);
-    detail::axis_fill_group_unit(w.out_sp, y, 2, y.rank());
+    w.out_c_step = (rank >= 2) ? y.stride_elems(rank - 1) : 0;
+    detail::axis_fill_group_unit(w.sp, x, 1, rank - 1);
+    detail::axis_fill_group_unit(w.out_sp, y, 1, y.rank() - 1);
     return w;
 }
 
@@ -636,9 +636,9 @@ Status batch_norm_launch(const NormAttributes& attrs, TensorView& output,
     }
 
     const int64_t N = x.shape(0);
-    const int64_t C = (rank >= 2) ? x.shape(1) : 1;
+    const int64_t C = (rank >= 2) ? x.shape(rank - 1) : 1;
     int64_t plane = 1;
-    for (int64_t d = 2; d < rank; ++d) {
+    for (int64_t d = 1; d < rank - 1; ++d) {
         plane *= x.shape(d);
     }
     // Rank one has no channel axis of its own, and rank two's channel is the
@@ -676,7 +676,7 @@ Status group_norm_launch(const NormAttributes& attrs, TensorView& output,
     }
 
     const int64_t N = x.shape(0);
-    const int64_t C = x.shape(1);
+    const int64_t C = x.shape(rank - 1);
     const int64_t G = attrs.num_groups > 0 ? attrs.num_groups : 1;
     if (G <= 0 || C % G != 0) {
         return Status::invalid_argument;
@@ -684,7 +684,7 @@ Status group_norm_launch(const NormAttributes& attrs, TensorView& output,
     const int64_t cpg = C / G;
 
     int64_t spatial = 1;
-    for (int64_t d = 2; d < rank; ++d) {
+    for (int64_t d = 1; d < rank - 1; ++d) {
         spatial *= x.shape(d);
     }
     if (N == 0 || spatial == 0 || cpg == 0) {

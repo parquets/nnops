@@ -89,13 +89,13 @@ double measure(const ConvBenchCase& c)
     const TensorLayout act_layout = TensorLayout::NHWC;
     const TensorLayout wgt_layout = TensorLayout::HWIO;
 
-    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ic, c.ih, c.iw}, c.dtype, false, 23,
+    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ih, c.iw, c.ic}, c.dtype, false, 23,
                                       -0.5f, 0.5f, act_layout);
     HostTensor wgt = make_host_random(
         std::vector<int64_t>{c.kh, c.kw, c.icg(), c.oc},
         c.dtype, false, 29, -0.25f, 0.25f, wgt_layout);
     HostTensor out =
-        make_host_zeroed(std::vector<int64_t>{c.n, c.oc, c.oh(), c.ow()}, c.dtype,
+        make_host_zeroed(std::vector<int64_t>{c.n, c.oh(), c.ow(), c.oc}, c.dtype,
                          false, act_layout);
 
     DeviceTensor dact = to_device(act);
@@ -219,7 +219,7 @@ double run_conv_i8(const ConvBenchCase& c, const char* label)
     };
     const TensorLayout alay = TensorLayout::NHWC;
     const TensorLayout wlay = TensorLayout::HWIO;
-    const std::vector<int64_t> ashape = {c.n, c.ic, c.ih, c.iw};
+    const std::vector<int64_t> ashape = {c.n, c.ih, c.iw, c.ic};
     const std::vector<int64_t> wshape = {c.kh, c.kw, icg, c.oc};
 
     TensorView av = view(ashape, DataType::u8, a.data(), alay, qa);

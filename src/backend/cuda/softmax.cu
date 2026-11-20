@@ -388,12 +388,12 @@ void softmax_cuda_impl(const SoftmaxAttributes& attrs, TensorView& output,
     } else if (spatial) {
         // The groups are the layout's own rows, so both sides share the shape's
         // stride whatever their pitches are.
-        if (axis == 1) {
-            contiguous_axis = true;
-            in_group_stride = out_group_stride = X.shape(1);
-        } else if (axis == rank - 1 && X.shape(1) == 1) {
+        if (axis == rank - 1) {
             contiguous_axis = true;
             in_group_stride = out_group_stride = X.shape(rank - 1);
+        } else if (axis == rank - 2 && X.shape(rank - 1) == 1) {
+            contiguous_axis = true;
+            in_group_stride = out_group_stride = X.shape(rank - 2);
         }
     }
 

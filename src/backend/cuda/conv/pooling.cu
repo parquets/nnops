@@ -452,16 +452,17 @@ pooling_global_kernel(const T* __restrict__ input, T* __restrict__ output, int64
 inline PoolGeom pooling_geom(const PoolingAttributes& attrs, const TensorView& input,
                              const TensorView& output)
 {
-    const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
+    const int64_t rank = input.rank();
+    const int64_t srank = PoolingAttributes::spatial_rank(rank);
     PoolGeom g{};
     g.N = input.shape(0);
-    g.C = input.shape(1);
-    g.ID = (srank == 3) ? input.shape(2) : 1;
-    g.IH = input.shape(srank);
-    g.IW = input.shape(srank + 1);
-    g.OD = (srank == 3) ? output.shape(2) : 1;
-    g.OH = output.shape(srank);
-    g.OW = output.shape(srank + 1);
+    g.C = input.shape(rank - 1);
+    g.ID = (srank == 3) ? input.shape(rank - 4) : 1;
+    g.IH = input.shape(rank - 3);
+    g.IW = input.shape(rank - 2);
+    g.OD = (srank == 3) ? output.shape(rank - 4) : 1;
+    g.OH = output.shape(rank - 3);
+    g.OW = output.shape(rank - 2);
     g.KD = (srank == 3) ? attrs.kernel_shape[0] : 1;
     g.KH = attrs.kernel_shape[1];
     g.KW = attrs.kernel_shape[2];
@@ -478,10 +479,10 @@ inline PoolGeom pooling_geom(const PoolingAttributes& attrs, const TensorView& i
     g.exclude_pad = attrs.exclude_pad;
     g.add_to = attrs.add_to;
 
-    g.in_pix_stride = input.shape(1);
+    g.in_pix_stride = input.shape(rank - 1);
     g.in_row_stride = input.row_stride_elems();
     g.in_d_stride = g.IH * g.in_row_stride;
-    g.out_pix_stride = output.shape(1);
+    g.out_pix_stride = output.shape(rank - 1);
     g.out_row_stride = output.row_stride_elems();
     g.out_d_stride = g.OH * g.out_row_stride;
     return g;

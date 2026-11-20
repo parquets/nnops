@@ -597,7 +597,7 @@ void group_norm_impl(const NormAttributes& attrs, TensorView& output,
     const int64_t channels_per_group = C / G;
 
     int64_t spatial_size = 1;
-    for (int64_t i = 2; i < rank; ++i) {
+    for (int64_t i = 1; i < rank - 1; ++i) {
         spatial_size *= X.shape(i);
     }
     const int64_t norm_size = channels_per_group * spatial_size;
@@ -612,8 +612,8 @@ void group_norm_impl(const NormAttributes& attrs, TensorView& output,
 
     // Channels are contiguous inside each pixel, so a group is
     // channels_per_group consecutive elements at every spatial offset.
-    const auto x_sp = build_offsets(X, 2, rank - 1, spatial_size);
-    const auto y_sp = build_offsets(output, 2, rank - 1, spatial_size);
+    const auto x_sp = build_offsets(X, 1, rank - 2, spatial_size);
+    const auto y_sp = build_offsets(output, 1, rank - 2, spatial_size);
     const int64_t x_n = X.stride_elems(0);
     const int64_t y_n = output.stride_elems(0);
 

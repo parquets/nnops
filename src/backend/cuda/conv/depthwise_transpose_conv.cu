@@ -296,19 +296,19 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     if (!is_channel_last(act.layout()) || !is_channel_last(output.layout())) {
         return Status::unsupported;
     }
-    const int64_t ch = act.shape(1);
-    if (ch <= 0 || output.shape(1) != ch) {
+    const int64_t ch = act.shape(3);
+    if (ch <= 0 || output.shape(3) != ch) {
         return Status::unsupported;
     }
 
     tconv::ConvParams p;
     p.batch = int(act.shape(0));
     p.ic = int(ch);
-    p.ih = int(act.shape(2));
-    p.iw = int(act.shape(3));
+    p.ih = int(act.shape(1));
+    p.iw = int(act.shape(2));
     p.oc = p.ic;
-    p.oh = int(output.shape(2));
-    p.ow = int(output.shape(3));
+    p.oh = int(output.shape(1));
+    p.ow = int(output.shape(2));
     p.groups = p.ic;
     p.icg = 1;
     p.ocg = 1;
@@ -323,13 +323,13 @@ Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& a
     p.pw = int(attrs.padding[1]);
 
     p.in_batch = act.stride_elems(0);
-    p.in_c = act.stride_elems(1);
-    p.in_h = act.stride_elems(2);
-    p.in_w = act.stride_elems(3);
+    p.in_c = act.stride_elems(3);
+    p.in_h = act.stride_elems(1);
+    p.in_w = act.stride_elems(2);
     p.out_batch = output.stride_elems(0);
-    p.out_c = output.stride_elems(1);
-    p.out_h = output.stride_elems(2);
-    p.out_w = output.stride_elems(3);
+    p.out_c = output.stride_elems(3);
+    p.out_h = output.stride_elems(1);
+    p.out_w = output.stride_elems(2);
 
     p.input = act.ptr<void>();
     p.weight = wgt.ptr<void>();

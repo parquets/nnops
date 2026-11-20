@@ -108,7 +108,7 @@ NNOPS_TEST(cuda_pooling_vector_lane) {
     for (int64_t C : {4, 5, 8, 17}) {
         for (PoolingType type : {PoolingType::Max, PoolingType::Average}) {
             PoolCase c;
-            c.shape = {2, C, 9, 11};
+            c.shape = {2, 9, 11, C};
             c.layout = TensorLayout::NHWC;
             c.attrs = window(type, 3, 2, 1);
             run_case(c, "cuda_pooling_vector_lane");
@@ -118,7 +118,7 @@ NNOPS_TEST(cuda_pooling_vector_lane) {
 
 NNOPS_TEST(cuda_pooling_average_exclude_pad) {
     PoolCase c;
-    c.shape = {1, 16, 8, 10};
+    c.shape = {1, 8, 10, 16};
     c.layout = TensorLayout::NHWC;
     c.attrs = window(PoolingType::Average, 3, 2, 1);
     c.attrs.exclude_pad = true;
@@ -129,7 +129,7 @@ NNOPS_TEST(cuda_pooling_average_exclude_pad) {
 
 NNOPS_TEST(cuda_pooling_f16) {
     PoolCase c;
-    c.shape = {1, 8, 7, 7};
+    c.shape = {1, 7, 7, 8};
     c.dtype = DataType::f16;
     c.layout = TensorLayout::NHWC;
     c.attrs = window(PoolingType::Max, 2, 2);
@@ -144,7 +144,7 @@ NNOPS_TEST(cuda_pooling_rows) {
     // the exclude_pad average divides by a count that changes at the border.
     for (DataType dt : {DataType::f32, DataType::f16}) {
         PoolCase c;
-        c.shape = {1, 16, 10, 10};
+        c.shape = {1, 10, 10, 16};
         c.dtype = dt;
         c.layout = TensorLayout::NHWC;
         c.attrs = window(PoolingType::Max, 3, 1, 1);
@@ -155,7 +155,7 @@ NNOPS_TEST(cuda_pooling_rows) {
     }
     // A 3D unit-stride window takes the same walk with a depth loop.
     PoolCase d;
-    d.shape = {1, 8, 3, 6, 6};
+    d.shape = {1, 3, 6, 6, 8};
     d.layout = TensorLayout::NDHWC;
     d.attrs = window(PoolingType::Average, 3, 1, 1);
     d.attrs.exclude_pad = true;
@@ -166,7 +166,7 @@ NNOPS_TEST(cuda_pooling_flat_fallback) {
     // (image, depth, row) past blockIdx.z's range, on a window that is neither
     // square nor of the walkable sizes: the flat script.
     PoolCase c;
-    c.shape = {1, 8, 300, 250, 2};
+    c.shape = {1, 300, 250, 2, 8};
     c.layout = TensorLayout::NDHWC;
     c.attrs = window(PoolingType::Max, 1, 1, 0);
     run_case(c, "cuda_pooling_flat_fallback");
@@ -174,7 +174,7 @@ NNOPS_TEST(cuda_pooling_flat_fallback) {
 
 NNOPS_TEST(cuda_pooling_3d) {
     PoolCase c;
-    c.shape = {1, 8, 3, 5, 6};
+    c.shape = {1, 3, 5, 6, 8};
     c.layout = TensorLayout::NDHWC;
     c.attrs = window(PoolingType::Max, 2, 2);
     run_case(c, "cuda_pooling_3d");
@@ -187,7 +187,7 @@ NNOPS_TEST(cuda_pooling_global_nhwc) {
     for (int64_t C : {8, 5, 17}) {
         for (PoolingType type : {PoolingType::Max, PoolingType::Average}) {
             PoolCase c;
-            c.shape = {2, C, 6, 7};
+            c.shape = {2, 6, 7, C};
             c.layout = TensorLayout::NHWC;
             c.attrs.global = true;
             c.attrs.type = type;
@@ -195,7 +195,7 @@ NNOPS_TEST(cuda_pooling_global_nhwc) {
         }
     }
     PoolCase d;
-    d.shape = {1, 4, 3, 4, 5};
+    d.shape = {1, 3, 4, 5, 4};
     d.layout = TensorLayout::NDHWC;
     d.attrs.global = true;
     d.attrs.type = PoolingType::Average;

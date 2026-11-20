@@ -31,7 +31,7 @@ using namespace nnops::test;
 namespace {
 
 struct DwCase {
-    std::vector<int64_t> in_shape;   // logical [N, C, H, W] or [N, C, D, H, W]
+    std::vector<int64_t> in_shape;   // NHWC [N, H, W, C] or NDHWC [N, D, H, W, C]
     std::array<int64_t, 3> kernel = {1, 3, 3};
     std::array<int64_t, 3> stride = {1, 1, 1};
     std::array<int64_t, 3> dilation = {1, 1, 1};
@@ -58,7 +58,7 @@ void run_case(const DwCase& c, const char* what)
     attrs.epilogue = c.epilogue;
     attrs.add_to = c.add_to;
 
-    const int64_t C = c.in_shape[1];
+    const int64_t C = c.in_shape.back();   // the channel is the innermost dim
     const int64_t srank = static_cast<int64_t>(c.in_shape.size()) - 2;
     const bool three_d = srank == 3;
     const TensorLayout in_layout =
@@ -134,7 +134,7 @@ NNOPS_TEST(cuda_dwconv_vector_lane) {
         for (DataType dt : {DataType::f32, DataType::f16}) {
             if (dt == DataType::f32 && (C == 8 || C == 17)) { continue; }
             DwCase c;
-            c.in_shape = {2, C, 9, 11};
+            c.in_shape = {2, 9, 11, C};
             c.dtype = dt;
             run_case(c, "cuda_dwconv_vector_lane");
         }
@@ -143,13 +143,13 @@ NNOPS_TEST(cuda_dwconv_vector_lane) {
 
 NNOPS_TEST(cuda_dwconv_window) {
     DwCase c;
-    c.in_shape = {1, 16, 14, 13};
+    c.in_shape = {1, 14, 13, 16};
     c.stride = {1, 2, 2};
     c.padding = {0, 1, 1};
     c.bias = true;
     run_case(c, "cuda_dwconv_window");
 
-    c.in_shape = {1, 8, 10, 10};
+    c.in_shape = {1, 10, 10, 8};
     c.stride = {1, 1, 1};
     c.dilation = {1, 2, 2};
     c.padding = {0, 0, 0};
@@ -160,7 +160,7 @@ NNOPS_TEST(cuda_dwconv_window) {
 
 NNOPS_TEST(cuda_dwconv_f16) {
     DwCase c;
-    c.in_shape = {1, 8, 7, 7};
+    c.in_shape = {1, 7, 7, 8};
     c.dtype = DataType::f16;
     c.kernel = {1, 1, 1};
     c.stride = {1, 2, 2};
@@ -175,7 +175,7 @@ NNOPS_TEST(cuda_dwconv_f16) {
 
 NNOPS_TEST(cuda_dwconv_3d) {
     DwCase c;
-    c.in_shape = {1, 8, 3, 5, 6};
+    c.in_shape = {1, 3, 5, 6, 8};
     c.kernel = {2, 2, 2};
     c.stride = {1, 1, 1};
     run_case(c, "cuda_dwconv_3d");

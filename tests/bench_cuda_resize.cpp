@@ -82,11 +82,11 @@ double measure(const RszBenchCase& c)
         c.three_d ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
     const std::vector<int64_t> in_shape = c.three_d
-        ? std::vector<int64_t>{c.n, c.c, c.id, c.ih, c.iw}
-        : std::vector<int64_t>{c.n, c.c, c.ih, c.iw};
+        ? std::vector<int64_t>{c.n, c.id, c.ih, c.iw, c.c}
+        : std::vector<int64_t>{c.n, c.ih, c.iw, c.c};
     const std::vector<int64_t> out_shape = c.three_d
-        ? std::vector<int64_t>{c.n, c.c, c.od, c.oh, c.ow}
-        : std::vector<int64_t>{c.n, c.c, c.oh, c.ow};
+        ? std::vector<int64_t>{c.n, c.od, c.oh, c.ow, c.c}
+        : std::vector<int64_t>{c.n, c.oh, c.ow, c.c};
 
     HostTensor act = make_host_random(in_shape, c.dtype, false, 23, -0.5f, 0.5f,
                                       layout);

@@ -769,7 +769,7 @@ void eltwise_cuda_impl(const EltwiseAttributes& attrs, TensorView& output,
         // Row-by-row processing, respecting pitch. An NHWC row is one
         // spatial line — W pixels × C channels.
         const int64_t last_dim = (rank >= 3 && is_channel_last(A.layout())) ?
-                                     A.shape(1) * A.shape(rank - 1) :
+                                     A.shape(rank - 2) * A.shape(rank - 1) :
                                      A.shape(rank - 1);
         const int64_t num_rows = A.total_rows();
         const int64_t a_row_stride = A.row_stride_elems();

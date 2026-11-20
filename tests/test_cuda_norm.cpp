@@ -74,7 +74,12 @@ void run_case(const NormCase& c, const char* what)
     for (int64_t d = ax; d < rank; ++d) {
         norm_size *= c.shape[static_cast<size_t>(d)];
     }
-    const int64_t C = (rank >= 2) ? c.shape[1] : 1;
+    // The channel is dim 1 for a dense tensor and innermost for channel-last,
+    // whose dims are the storage order.
+    const int64_t C = (rank >= 2)
+        ? (is_channel_last(c.layout) ? c.shape[static_cast<size_t>(rank - 1)]
+                                     : c.shape[1])
+        : 1;
 
     std::vector<HostTensor> own;
     const auto add = [&](std::vector<int64_t> sh, uint64_t seed, float lo, float hi,
@@ -262,7 +267,7 @@ NNOPS_TEST(cuda_layer_norm_row_span) {
 
 NNOPS_TEST(cuda_layer_norm_nhwc) {
     NormCase c;
-    c.shape = {2, 6, 5};
+    c.shape = {2, 5, 6};  // NHWC storage order: [N, L, C]
     c.layout = TensorLayout::NHWC;
     run_case(c, "cuda_layer_norm_nhwc");
     c.bias = true;
@@ -280,7 +285,7 @@ NNOPS_TEST(cuda_layer_norm_f16) {
     c.bias = true;
     run_case(c, "cuda_layer_norm_f16");
     c.layout = TensorLayout::NHWC;
-    c.shape = {2, 4, 8};
+    c.shape = {2, 8, 4};  // [N, L, C]
     run_case(c, "cuda_layer_norm_f16");
     // A one-element scale tensor: the row kernel broadcasts it, and the CPU's
     // SIMD path has to as well instead of loading a lane past its end.
@@ -326,7 +331,7 @@ NNOPS_TEST(cuda_rms_norm_residual) {
 NNOPS_TEST(cuda_rms_norm_and_f16) {
     NormCase c;
     c.type = NormType::RMSNorm;
-    c.shape = {2, 7, 8};
+    c.shape = {2, 8, 7};  // [N, L, C]
     c.layout = TensorLayout::NHWC;
     run_case(c, "cuda_rms_norm");
     c.dtype = DataType::f16;
@@ -357,7 +362,8 @@ NNOPS_TEST(cuda_l2_norm_inner_axis) {
     c.axis = 1;
     run_case(c, "cuda_l2_norm_inner_axis");
     c.layout = TensorLayout::NHWC;
-    c.axis = 2;
+    c.shape = {2, 5, 6};  // [N, L, C]; L is storage axis 1
+    c.axis = 1;
     run_case(c, "cuda_l2_norm_inner_axis");
 }
 
@@ -371,13 +377,13 @@ NNOPS_TEST(cuda_group_norm_group_shapes) {
     c.layout = TensorLayout::NHWC;
     // One channel per group is instance norm; one group over all of them is the
     // layer-norm-like extreme.
-    c.shape = {2, 4, 3, 5};
+    c.shape = {2, 3, 5, 4};  // NHWC storage order: [N, H, W, C]
     c.groups = 4;
     run_case(c, "cuda_group_norm_instance");
-    c.shape = {2, 6, 2, 3};
+    c.shape = {2, 2, 3, 6};
     c.groups = 1;
     run_case(c, "cuda_group_norm_single");
-    c.shape = {3, 6, 7};
+    c.shape = {3, 7, 6};     // [N, L, C]
     c.groups = 3;
     run_case(c, "cuda_group_norm_rank3");
 }
@@ -385,7 +391,7 @@ NNOPS_TEST(cuda_group_norm_group_shapes) {
 NNOPS_TEST(cuda_group_norm_and_f16) {
     NormCase c;
     c.type = NormType::GroupNorm;
-    c.shape = {2, 8, 5, 6};   // dims stay [N][C][spatial] in either layout
+    c.shape = {2, 5, 6, 8};   // NHWC storage order: [N, H, W, C]
     c.layout = TensorLayout::NHWC;
     c.groups = 4;
     run_case(c, "cuda_group_norm");
@@ -401,7 +407,7 @@ NNOPS_TEST(cuda_group_norm_and_f16) {
 NNOPS_TEST(cuda_batch_norm_nhwc) {
     NormCase c;
     c.type = NormType::BatchNorm;
-    c.shape = {2, 5, 4, 3};
+    c.shape = {2, 4, 3, 5};  // NHWC storage order: [N, H, W, C]
     c.layout = TensorLayout::NHWC;
     run_case(c, "cuda_batch_norm_nhwc");
 }
@@ -420,7 +426,7 @@ NNOPS_TEST(cuda_batch_norm_nonspatial) {
 NNOPS_TEST(cuda_batch_norm_f16) {
     NormCase c;
     c.type = NormType::BatchNorm;
-    c.shape = {2, 8, 3};
+    c.shape = {2, 3, 8};  // [N, L, C]
     c.dtype = DataType::f16;
     c.layout = TensorLayout::NHWC;
     run_case(c, "cuda_batch_norm_f16");

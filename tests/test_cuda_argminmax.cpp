@@ -277,29 +277,29 @@ NNOPS_TEST(cuda_argmax_padded) {
 NNOPS_TEST(cuda_argmax_nhwc) {
     {
         ArgCase c;   // the channel is the axis, the spatial tail is interleaved
-        c.shape = {4, 16, 8, 8};
-        c.axis = 1;
+        c.shape = {4, 8, 8, 16};
+        c.axis = 3;
         c.layout = TensorLayout::NHWC;
         run_case(c, "cuda_argmax_nhwc");
     }
     {
         ArgCase c;   // a spatial axis: the channel sits inside the inner group
-        c.shape = {2, 8, 12, 10};
-        c.axis = 2;
+        c.shape = {2, 12, 10, 8};
+        c.axis = 1;
         c.layout = TensorLayout::NHWC;
         run_case(c, "cuda_argmax_nhwc");
     }
     {
         ArgCase c;   // the batch axis: a single outer position, a wide tail
-        c.shape = {4, 6, 5};
+        c.shape = {4, 5, 6};
         c.axis = 0;
         c.layout = TensorLayout::NHWC;
         run_case(c, "cuda_argmax_nhwc");
     }
     {
         ArgCase c;   // keepdims, ArgMin, f16
-        c.shape = {3, 8, 5, 7};
-        c.axis = 3;
+        c.shape = {3, 5, 7, 8};
+        c.axis = 2;
         c.keepdims = true;
         c.type = ArgMinMaxType::Min;
         c.use_argmin = true;

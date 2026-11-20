@@ -275,7 +275,7 @@ void unary_cuda_impl(const UnaryAttributes& attrs, TensorView& output,
         // Row-by-row processing, respecting pitch. An NHWC row is one
         // spatial line — W pixels × C channels.
         const int64_t last_dim = (rank >= 3 && is_channel_last(input.layout())) ?
-                                     input.shape(1) * input.shape(rank - 1) :
+                                     input.shape(rank - 2) * input.shape(rank - 1) :
                                      input.shape(rank - 1);
         const int64_t num_rows = input.total_rows();
         const int64_t in_row_stride = input.row_stride_elems();

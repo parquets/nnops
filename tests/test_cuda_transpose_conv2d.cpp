@@ -67,7 +67,8 @@ Outputs run_case(const TConvCase& c, const char* what)
     // The filter is [IC, OC/G, KH, KW].
     const int64_t ocg = c.oc / c.groups;
 
-    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ic, c.ih, c.iw},
+    // NHWC dims are the storage order: [N, H, W, C].
+    HostTensor act = make_host_random(std::vector<int64_t>{c.n, c.ih, c.iw, c.ic},
                                       c.dtype, false, 23, -0.5f, 0.5f, layout);
     HostTensor wgt = make_host_random(
         std::vector<int64_t>{c.ic, ocg, c.kh, c.kw}, c.dtype, false, 29, -0.25f,
@@ -87,8 +88,9 @@ Outputs run_case(const TConvCase& c, const char* what)
     const TensorDesc od = outs.front();
 
     Outputs res;
-    res.oh = od.dims[2];
-    res.ow = od.dims[3];
+    // NHWC output dims are [N, H, W, C], so H and W sit above the channel axis.
+    res.oh = od.dims[static_cast<size_t>(od.rank - 3)];
+    res.ow = od.dims[static_cast<size_t>(od.rank - 2)];
 
     const auto seed = [&](uint64_t s) {
         return c.add_to ? make_host_random(od.dims, od.dtype, false, s, 0.0f,

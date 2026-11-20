@@ -62,9 +62,10 @@ void run_case(const RszCase& c, const char* what)
     const TensorLayout layout =
         c.three_d ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
+    // NHWC/NDHWC dims are the storage order: [N, (D,) H, W, C].
     std::vector<int64_t> in_shape = c.three_d
-        ? std::vector<int64_t>{c.n, c.c, c.id, c.ih, c.iw}
-        : std::vector<int64_t>{c.n, c.c, c.ih, c.iw};
+        ? std::vector<int64_t>{c.n, c.id, c.ih, c.iw, c.c}
+        : std::vector<int64_t>{c.n, c.ih, c.iw, c.c};
     HostTensor act = make_host_random(in_shape, c.dtype, false, 23, -0.5f, 0.5f,
                                       layout);
 

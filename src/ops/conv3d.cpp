@@ -39,7 +39,7 @@ Status Conv3D::compute(std::span<TensorView> outputs, std::span<const TensorView
         const int ap = static_cast<int>(attrs.auto_pad);
         for (int i = 0; i < 3; ++i) {
             attrs.padding[static_cast<size_t>(i)] = resolve_leading_padding(
-                inputs[0].shape(2 + i), attrs.kernel_size[static_cast<size_t>(i)],
+                inputs[0].shape(1 + i), attrs.kernel_size[static_cast<size_t>(i)],
                 attrs.stride[static_cast<size_t>(i)], attrs.dilation[static_cast<size_t>(i)],
                 attrs.padding[static_cast<size_t>(i)], ap);
         }
