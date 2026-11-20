@@ -1075,13 +1075,41 @@ void conv_gemm_i8_kernel(ConvParams p)
             }
         }
         // The filter is HWIO with the channel innermost, so its k axis is not
-        // contiguous and B is gathered byte-wise into a k-major panel.
-        for (int i = tid; i < BN * BK; i += S::threads) {
-            const int row = i / BK;
-            const int col = i - row * BK;
+        // contiguous and B is gathered byte-wise into a k-major panel. A thread
+        // owns one weight row and a run of consecutive k inside the tile, so
+        // the (ic, kh, kw) odometer is decoded once and then stepped: the two
+        // runtime divisions that used to be paid per byte cost one row.
+        {
+            constexpr int kPer = BK / (S::threads / BN);
+            const int row = tid % BN;
+            const int col0 = (tid / BN) * kPer;
             const int n = n0 + row;
-            const int k = k0 + col;
-            sB[row * LD + col] = (n < N && k < K) ? conv_weight<BElem>(p, W, n, k) : BElem(0);
+            const int8_t* const row_w = W + int64_t(n) * p.w_n;
+            const int32_t w_ic = int32_t(p.w_ic), w_kh = int32_t(p.w_kh), w_kw = int32_t(p.w_kw);
+            const int32_t icg = int32_t(p.icg), kw_end = int32_t(p.kw);
+            int k = k0 + col0;
+            const int32_t tap0 = k / icg;
+            int32_t ic = k - tap0 * icg;
+            int32_t kh = tap0 / kw_end;
+            int32_t kw = tap0 - kh * kw_end;
+            int64_t off = int64_t(ic) * w_ic + int64_t(kh) * w_kh + int64_t(kw) * w_kw;
+            const bool n_ok = n < N;
+#pragma unroll
+            for (int j = 0; j < kPer; ++j) {
+                sB[row * LD + col0 + j] = (n_ok && k < K) ? row_w[off] : BElem(0);
+                ++k;
+                off += w_ic;
+                if (++ic == icg) {
+                    ic = 0;
+                    off -= int64_t(icg) * w_ic;
+                    off += w_kw;
+                    if (++kw == kw_end) {
+                        kw = 0;
+                        off -= int64_t(kw_end) * w_kw;
+                        off += w_kh;
+                    }
+                }
+            }
         }
         cp_async_commit_group();
     };
