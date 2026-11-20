@@ -24,8 +24,8 @@
 /// The weight stays [IC, OC/G, KD, KH, KW].
 
 #include "nnops/ops/transpose_conv3d.hpp"
+#include "backend/cpu/conv/conv_geom.h"
 #include "backend/cpu/conv/transpose_conv_common.h"
-#include "backend/cpu/simd_kernel/simd_col2im.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
 #include "backend/cpu/matmul/matmul.h"
@@ -41,21 +41,11 @@ using namespace nnops::kernel;
 
 namespace {
 
-/// One transposed convolution's geometry, read off the tensors once.
-struct Geom3 {
-    int64_t N, IC, ID, IH, IW;
-    int64_t OC_per_G, IC_per_G, OC, G;
-    int64_t KD, KH, KW, OD, OH, OW;
-    int64_t SD, SH, SW, DD, DH, DW, PD, PH, PW;
-    Epilogue epilogue;
-    bool add_to;
-    bool pre_act; ///< fold add_to's old value in before the epilogue
-
-    /// The col2im module's view of the same numbers.
-    Tconv3dColGeom col_geom() const
-    {
-        return make_col3_geom(ID, IH, IW, OW, KD, KH, KW, SD, SH, SW, DD, DH, DW, PD, PH, PW);
-    }
+/// One transposed convolution's geometry, read off the tensors once. The axes
+/// and the epilogue flags are conv_geom.h's; the channels are this operator's.
+/// `col3_geom()` is the base's 3-D col2im view.
+struct Geom3 : ConvAxes {
+    int64_t N, IC, IC_per_G, OC_per_G, OC, G;
 };
 
 // =========================================================================
@@ -111,7 +101,7 @@ bool tconv3d_gemm(const Geom3& gm, TensorView& output,
     // per voxel instead. Walk the smaller of the filter and the col.
     const bool direct_w = npix * gm.N < gm.IC_per_G;
 
-    const Tconv3dColGeom cg = gm.col_geom();
+    const Tconv3dColGeom cg = gm.col3_geom();
     const int64_t OH = gm.OH;
     return tconv_route<T>(
         gm, output, inputs, ctx, npix, gm.OD * gm.OH, gm.KD * gm.KH * gm.KW, direct_w,
@@ -148,7 +138,7 @@ bool tconv3d_depthwise(const Geom3& gm, TensorView& output,
         return false;
     }
 
-    const Tconv3dColGeom cg = gm.col_geom();
+    const Tconv3dColGeom cg = gm.col3_geom();
     const int64_t OH = gm.OH;
     return tconv_depthwise<T>(
         gm, output, inputs, ctx, gm.OD * gm.OH, gm.KD * gm.KH * gm.KW, gm.IC,
@@ -288,33 +278,13 @@ Status transpose_conv3d_cpu(const TransposeConv3DAttributes& attrs, TensorView& 
     const auto& weight = inputs[1];
 
     Geom3 gm{};
+    fill_conv_axes<3>(gm, attrs, input, output);
     gm.N = input.shape(0);
     gm.IC = input.shape(4);
-    gm.ID = input.shape(1);
-    gm.IH = input.shape(2);
-    gm.IW = input.shape(3);
     gm.OC_per_G = weight.shape(1);
-    gm.KD = attrs.kernel_size[0];
-    gm.KH = attrs.kernel_size[1];
-    gm.KW = attrs.kernel_size[2];
     gm.G = attrs.groups;
     gm.OC = gm.OC_per_G * gm.G;
     gm.IC_per_G = gm.IC / gm.G;
-    gm.OD = output.shape(1);
-    gm.OH = output.shape(2);
-    gm.OW = output.shape(3);
-    gm.SD = attrs.stride[0];
-    gm.SH = attrs.stride[1];
-    gm.SW = attrs.stride[2];
-    gm.DD = attrs.dilation[0];
-    gm.DH = attrs.dilation[1];
-    gm.DW = attrs.dilation[2];
-    gm.PD = attrs.padding[0];
-    gm.PH = attrs.padding[1];
-    gm.PW = attrs.padding[2];
-    gm.epilogue = attrs.epilogue;
-    gm.add_to = attrs.add_to;
-    gm.pre_act = attrs.add_to && attrs.residual_pre_activation;
 
     dispatch_f32_f16(input.data_type(), "transpose_conv3d_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;

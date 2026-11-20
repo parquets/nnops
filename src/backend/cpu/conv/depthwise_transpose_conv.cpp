@@ -331,23 +331,9 @@ Status depthwise_transpose_conv_cpu(const DepthwiseTransposeConv2DAttributes& at
     const auto& weight = inputs[1];
 
     DwtConvGeom gm{};
+    fill_conv_axes<2>(gm, attrs, input, output);
     gm.N = input.shape(0);
     gm.C = input.shape(3);
-    gm.IH = input.shape(1);
-    gm.IW = input.shape(2);
-    gm.OH = output.shape(1);
-    gm.OW = output.shape(2);
-    gm.KH = attrs.kernel_size[0];
-    gm.KW = attrs.kernel_size[1];
-    gm.SH = attrs.stride[0];
-    gm.SW = attrs.stride[1];
-    gm.DH = attrs.dilation[0];
-    gm.DW = attrs.dilation[1];
-    gm.PH = attrs.padding[0];
-    gm.PW = attrs.padding[1];
-    gm.epilogue = attrs.epilogue;
-    gm.add_to = attrs.add_to;
-    gm.pre_act = attrs.add_to && attrs.residual_pre_activation;
 
     if (!is_channel_last(input.layout())) {
         return Status::unsupported;

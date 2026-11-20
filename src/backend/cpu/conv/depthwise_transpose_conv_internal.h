@@ -16,9 +16,9 @@
 /// (kw, shift) taps land on one output-column residue — are tap lists, not
 /// arithmetic, and both families walk them unchanged. They live here.
 
+#include "backend/cpu/conv/conv_geom.h"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/tensor_view.hpp"
-#include "nnops/core/epilogue.hpp"
 #include "nnops/ops/depthwise_transpose_conv.hpp"
 
 #include <cstdint>
@@ -26,16 +26,10 @@
 
 namespace nnops::backend::cpu {
 
-struct DwtConvGeom {
-    int64_t N, C, IH, IW; // input
-    int64_t OH, OW;       // output
-    int64_t KH, KW;       // kernel
-    int64_t SH, SW;       // stride
-    int64_t DH, DW;       // dilation
-    int64_t PH, PW;       // padding
-    Epilogue epilogue;
-    bool add_to;
-    bool pre_act; ///< fold add_to's old value in before the epilogue
+/// The axes are conv_geom.h's; depthwise means one channel per group, so the
+/// only extra member is that channel count.
+struct DwtConvGeom : ConvAxes {
+    int64_t N = 0, C = 0;
 };
 
 /// The tap lists hold at most ceil(K) entries; a taller kernel takes the scalar

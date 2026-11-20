@@ -36,6 +36,7 @@
 /// order).
 
 #include "nnops/ops/conv3d.hpp"
+#include "backend/cpu/conv/conv_geom.h"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"
 #include "backend/cpu/common/dtype_dispatch.hpp"
@@ -52,17 +53,11 @@ using namespace nnops::simd;
 
 namespace {
 
-/// One convolution's geometry, read off the tensors once.
-struct Geom {
-    int64_t N, IC, ID, IH, IW;
-    int64_t OC_per_G, IC_per_G, OC, G;
-    int64_t KD, KH, KW, OD, OH, OW;
-    int64_t SD, SH, SW, DD, DH, DW, PD, PH, PW;
-    Epilogue epilogue;
-    bool add_to;
-
-    int64_t karea() const { return KD * KH * KW; }
-    int64_t npix() const { return OD * OH * OW; }
+/// One convolution's geometry, read off the tensors once. The axes, the
+/// epilogue flags and karea()/npix() are conv_geom.h's; the channels are this
+/// operator's.
+struct Geom : ConvAxes {
+    int64_t N, IC, IC_per_G, OC_per_G, OC, G;
 };
 
 /// Largest col one GEMM call may materialise; past it the pixel block splits.
@@ -342,32 +337,13 @@ Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
     const auto& weight = inputs[1];
 
     Geom gm{};
+    fill_conv_axes<3>(gm, attrs, input, output);
     gm.N = input.shape(0);
     gm.IC = input.shape(4);
-    gm.ID = input.shape(1);
-    gm.IH = input.shape(2);
-    gm.IW = input.shape(3);
     gm.OC = weight.shape(0);
     gm.IC_per_G = weight.shape(1);
-    gm.KD = attrs.kernel_size[0];
-    gm.KH = attrs.kernel_size[1];
-    gm.KW = attrs.kernel_size[2];
     gm.G = attrs.groups;
     gm.OC_per_G = gm.OC / gm.G;
-    gm.OD = output.shape(1);
-    gm.OH = output.shape(2);
-    gm.OW = output.shape(3);
-    gm.SD = attrs.stride[0];
-    gm.SH = attrs.stride[1];
-    gm.SW = attrs.stride[2];
-    gm.DD = attrs.dilation[0];
-    gm.DH = attrs.dilation[1];
-    gm.DW = attrs.dilation[2];
-    gm.PD = attrs.padding[0];
-    gm.PH = attrs.padding[1];
-    gm.PW = attrs.padding[2];
-    gm.epilogue = attrs.epilogue;
-    gm.add_to = attrs.add_to;
 
     dispatch_f32_f16(input.data_type(), "conv3d_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;

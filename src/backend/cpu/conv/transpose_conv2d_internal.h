@@ -14,8 +14,8 @@
 /// The geometry is one struct for both: the routes read the same numbers and
 /// only disagree on what an element is.
 
+#include "backend/cpu/conv/conv_geom.h"
 #include "backend/cpu/conv/transpose_conv_common.h"
-#include "backend/cpu/simd_kernel/simd_col2im.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/ops/transpose_conv2d.hpp"
@@ -25,21 +25,10 @@
 
 namespace nnops::backend::cpu {
 
-/// One transposed convolution's geometry, read off the tensors once.
-struct Geom {
-    int64_t N, IC, IH, IW;
-    int64_t OC_per_G, IC_per_G, OC, G;
-    int64_t KH, KW, OH, OW;
-    int64_t SH, SW, DH, DW, PH, PW;
-    Epilogue epilogue;
-    bool add_to;
-    bool pre_act; ///< fold add_to's old value in before the epilogue
-
-    /// The col2im module's view of the same numbers.
-    Tconv2dColGeom col_geom() const
-    {
-        return make_col_geom(IH, IW, OW, KH, KW, SH, SW, DH, DW, PH, PW);
-    }
+/// One transposed convolution's geometry, read off the tensors once. The axes
+/// and the epilogue flags are conv_geom.h's; the channels are this operator's.
+struct Geom : ConvAxes {
+    int64_t N, IC, IC_per_G, OC_per_G, OC, G;
 };
 
 /// The quantized family's entry (transpose_conv2d_i8.cpp): s8 weights only; the

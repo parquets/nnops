@@ -442,28 +442,14 @@ Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs, TensorView& 
     const auto& weight = inputs[1];
 
     Geom gm{};
+    fill_conv_axes<2>(gm, attrs, input, output);
     gm.N = input.shape(0);
-    // Channel-last [N, IH, IW, IC].
-    gm.IH = input.shape(input.rank() - 3);
-    gm.IW = input.shape(input.rank() - 2);
+    // Channel-last [N, IH, IW, IC]; the filter is [IC, OC/G, KH, KW].
     gm.IC = weight.shape(0);
     gm.OC_per_G = weight.shape(1);
-    gm.KH = attrs.kernel_size[0];
-    gm.KW = attrs.kernel_size[1];
     gm.G = attrs.groups;
     gm.OC = gm.OC_per_G * gm.G;
     gm.IC_per_G = gm.IC / gm.G;
-    gm.OH = output.shape(1);
-    gm.OW = output.shape(2);
-    gm.SH = attrs.stride[0];
-    gm.SW = attrs.stride[1];
-    gm.DH = attrs.dilation[0];
-    gm.DW = attrs.dilation[1];
-    gm.PH = attrs.padding[0];
-    gm.PW = attrs.padding[1];
-    gm.epilogue = attrs.epilogue;
-    gm.add_to = attrs.add_to;
-    gm.pre_act = attrs.add_to && attrs.residual_pre_activation;
 
     if (is_quantized_transpose_conv2d(weight.data_type())) {
         return transpose_conv2d_int8_cpu(attrs, gm, output, inputs, ctx);
