@@ -12,7 +12,7 @@ namespace nnops::backend::cuda {
 /// The pose the f32 kernel covers: A `[M, K]` row-major, B k-major `[N, K]` or
 /// n-major `[K, N]`, an f32 destination, and a batch axis whose strides may be
 /// zero for a broadcast operand.
-struct ManualFCall {
+struct F32Call {
     const void* a = nullptr;
     const void* b = nullptr;
     void* c = nullptr;
@@ -46,11 +46,13 @@ struct ManualFCall {
     float max_clip = 3.402823466e+38f;
     /// Tile index into the compiled candidate list (-1 = the automatic pick).
     int tile = -1;
+    /// 1 when a 16 B cp.async can address both operands; 0 takes the fill's
+    /// scalar path. Resolved by the entry point from the alignment it checks.
+    int vec = 1;
 };
 
 /// Launch the hand-written f32 kernel; false when the call is outside its pose.
-/// The fill resolves every gmem offset in 32 bits, so an operand whose element
-/// count overflows an int32 is refused here and left to the CuTe engine.
-bool manual_dense_f_call(const ManualFCall& call, cudaStream_t stream);
+/// `force` skips the grid-fill gate, so a shallow product runs on this tile too.
+bool f32_dense_call(const F32Call& call, cudaStream_t stream, bool force = false);
 
 } // namespace nnops::backend::cuda

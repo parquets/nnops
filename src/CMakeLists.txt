@@ -158,26 +158,6 @@ if(NNOPS_BUILD_CUDA)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-    # Only the dense MatMul engines still use CuTe (the hand-written PTX engines
-    # carry Linear and the conv family); the CUTLASS host-side GEMM layer is not
-    # used. CuTe's own headers still reach into cutlass/numeric_types.h, so the
-    # checkout's include/ root is on the path.
-    set(NNOPS_CUTLASS_DIR "" CACHE PATH
-        "CUTLASS checkout whose include/cute the dense CUDA MatMul engines build on")
-    if(NOT NNOPS_CUTLASS_DIR)
-        foreach(_candidate "D:/git/cutlass" "$ENV{CUTLASS_DIR}"
-                           "${CMAKE_SOURCE_DIR}/third_party/cutlass")
-            if(EXISTS "${_candidate}/include/cute/tensor.hpp")
-                set(NNOPS_CUTLASS_DIR "${_candidate}")
-                break()
-            endif()
-        endforeach()
-    endif()
-    if(NOT EXISTS "${NNOPS_CUTLASS_DIR}/include/cute/tensor.hpp")
-        message(FATAL_ERROR
-            "CuTe headers not found. Set -DNNOPS_CUTLASS_DIR=<cutlass checkout> "
-            "(need <dir>/include/cute/tensor.hpp).")
-    endif()
     if(NOT CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES 80)
     endif()
@@ -227,8 +207,7 @@ if(NNOPS_BUILD_CUDA)
     target_link_libraries(nnops_cuda PUBLIC nnops)
     target_include_directories(nnops_cuda PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_SOURCE_DIR}/include
-        ${NNOPS_CUTLASS_DIR}/include)
+        ${CMAKE_SOURCE_DIR}/include)
     target_compile_options(nnops_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --expt-extended-lambda>)
     # A fat translation unit -- matmul_i8_ptx.cu carries three tiles x four poses

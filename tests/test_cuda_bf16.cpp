@@ -264,15 +264,7 @@ NNOPS_TEST(cuda_bf16_matmul) {
 NNOPS_TEST(cuda_bf16_matmul_ptx) {
     // The hand-written PTX kernel counts bf16 as its own element type -- same
     // registers, different mma opcode -- so it is checked on both B layouts and
-    // on a geometry the grid gate would otherwise keep on the CuTe engine.
-    auto& knob = nnops::detail::cuda_ptx_h;
-    const int saved = knob.exchange(1);
-    struct Restore {
-        std::atomic<int>& k;
-        int v;
-        ~Restore() { k.store(v); }
-    } restore{knob, saved};
-
+    // on a geometry the grid gate would otherwise skip.
     {
         HostTensor a = rnd({512, 96}, true, 17);
         HostTensor b = rnd({96, 640}, true, 29);

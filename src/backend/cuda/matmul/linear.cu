@@ -156,80 +156,8 @@ Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
         return Status::unsupported;
     }
 
-    // Same hand-written TN kernel as MatMul: Linear's weight is already [N, K].
-    const int ptx_h = ::nnops::detail::cuda_ptx_h.load(std::memory_order_relaxed);
-    if ((dt == DataType::f16 || dt == DataType::bf16) && ptx_h >= 0) {
-        ManualHCall call;
-        call.a = p.a;
-        call.b = p.b;
-        call.c = p.c;
-        call.m = p.m;
-        call.n = p.n;
-        call.k = p.k;
-        call.lda = p.lda;
-        call.ldb = p.ldb;
-        call.ldc = p.ldc;
-        call.trans_b = true;
-        call.bf16 = dt == DataType::bf16;
-        call.bias = p.bias;
-        call.bias_row = p.bias_row;
-        call.residual = attrs.add_to ? p.c : nullptr;
-        call.ldr = p.ldc;
-        call.epilogue = int(attrs.epilogue.type);
-        call.ep_alpha = attrs.epilogue.alpha;
-        call.ep_beta = attrs.epilogue.beta;
-        call.min_clip = attrs.epilogue.min_clip;
-        call.max_clip = attrs.epilogue.max_clip;
-        call.batch_rank = p.batch_rank;
-        call.batch = detail::gemm_batch_count(p);
-        for (int d = 0; d < 4; ++d) {
-            call.bsize[d] = p.batch_size[d];
-            call.a_bstr[d] = p.a_batch[d];
-            call.b_bstr[d] = p.b_batch[d];
-            call.c_bstr[d] = p.c_batch[d];
-        }
-        if (manual_dense_h_call(call, static_cast<cudaStream_t>(ctx.cuda_stream))) {
-            return Status::ok;
-        }
-    }
-
-    // Same SIMT tile as MatMul; Linear's weight is already [N, K].
-    const int ptx_f = ::nnops::detail::cuda_ptx_f.load(std::memory_order_relaxed);
-    if (dt == DataType::f32 && ptx_f >= 0) {
-        ManualFCall call;
-        call.a = p.a;
-        call.b = p.b;
-        call.c = p.c;
-        call.m = p.m;
-        call.n = p.n;
-        call.k = p.k;
-        call.lda = p.lda;
-        call.ldb = p.ldb;
-        call.ldc = p.ldc;
-        call.trans_b = true;
-        call.bias = p.bias;
-        call.bias_row = p.bias_row;
-        // Linear's add_to is a post-activation residual, read in place.
-        call.residual = attrs.add_to ? p.c : nullptr;
-        call.ldr = p.ldc;
-        call.epilogue = int(attrs.epilogue.type);
-        call.ep_alpha = attrs.epilogue.alpha;
-        call.ep_beta = attrs.epilogue.beta;
-        call.min_clip = attrs.epilogue.min_clip;
-        call.max_clip = attrs.epilogue.max_clip;
-        call.batch_rank = p.batch_rank;
-        call.batch = detail::gemm_batch_count(p);
-        for (int d = 0; d < 4; ++d) {
-            call.bsize[d] = p.batch_size[d];
-            call.a_bstr[d] = p.a_batch[d];
-            call.b_bstr[d] = p.b_batch[d];
-            call.c_bstr[d] = p.c_batch[d];
-        }
-        if (manual_dense_f_call(call, static_cast<cudaStream_t>(ctx.cuda_stream))) {
-            return Status::ok;
-        }
-    }
-
+    // Same ladder as MatMul: Linear's weight is already [N, K], so the pose is
+    // the n-major one throughout.
     return dense_gemm_status(p, dt, /*transpose_a=*/false, /*transpose_b=*/true,
                              static_cast<cudaStream_t>(ctx.cuda_stream));
 }

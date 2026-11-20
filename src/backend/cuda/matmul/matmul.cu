@@ -1,5 +1,5 @@
 /// @file matmul.cu
-/// @brief CUDA MatMul — the dense CuTe GEMM behind the batched, transposable
+/// @brief CUDA MatMul - the dense GEMM behind the batched, transposable
 ///        operator front end.
 ///
 /// The op resolves the logical (M, N, K) out of the two transpose flags and
@@ -153,90 +153,8 @@ Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
         return Status::unsupported;
     }
 
-    // The hand-written PTX f16 kernel (64x32 per warp) owns the TN pose once the
-    // grid can fill the machine; below that the CuTe family's split-K does. It
-    // covers alpha 1, no bias, no epilogue, one batch element.
-    const int ptx_h = ::nnops::detail::cuda_ptx_h.load(std::memory_order_relaxed);
-    if ((dt == DataType::f16 || dt == DataType::bf16) && ptx_h >= 0) {
-        {
-            ManualHCall call;
-            call.a = p.a;
-            call.b = p.b;
-            call.c = p.c;
-            call.m = p.m;
-            call.n = p.n;
-            call.k = p.k;
-            call.lda = p.lda;
-            call.ldb = p.ldb;
-            call.ldc = p.ldc;
-            call.trans_a = attrs.transpose_a;
-            call.trans_b = attrs.transpose_b;
-            call.bf16 = dt == DataType::bf16;
-            call.alpha = attrs.alpha;
-            call.bias = p.bias;
-            call.bias_row = p.bias_row;
-            call.beta = attrs.beta;
-            call.residual = p.residual;
-            call.ldr = p.ldr;
-            call.epilogue = int(attrs.epilogue.type);
-            call.ep_alpha = attrs.epilogue.alpha;
-            call.ep_beta = attrs.epilogue.beta;
-            call.min_clip = attrs.epilogue.min_clip;
-            call.max_clip = attrs.epilogue.max_clip;
-            call.batch_rank = p.batch_rank;
-            call.batch = detail::gemm_batch_count(p);
-            for (int d = 0; d < 4; ++d) {
-                call.bsize[d] = p.batch_size[d];
-                call.a_bstr[d] = p.a_batch[d];
-                call.b_bstr[d] = p.b_batch[d];
-                call.c_bstr[d] = p.c_batch[d];
-            }
-            if (manual_dense_h_call(call, static_cast<cudaStream_t>(ctx.cuda_stream))) {
-                return Status::ok;
-            }
-        }
-    }
-
-    // The hand-written f32 SIMT tile, on the same terms as the 16-bit one: the
-    // dense unadorned product, once the grid can fill the machine.
-    const int ptx_f = ::nnops::detail::cuda_ptx_f.load(std::memory_order_relaxed);
-    if (dt == DataType::f32 && ptx_f >= 0) {
-        ManualFCall call;
-        call.a = p.a;
-        call.b = p.b;
-        call.c = p.c;
-        call.m = p.m;
-        call.n = p.n;
-        call.k = p.k;
-        call.lda = p.lda;
-        call.ldb = p.ldb;
-        call.ldc = p.ldc;
-        call.trans_a = attrs.transpose_a;
-        call.trans_b = attrs.transpose_b;
-        call.alpha = attrs.alpha;
-        call.bias = p.bias;
-        call.bias_row = p.bias_row;
-        call.beta = attrs.beta;
-        call.residual = p.residual;
-        call.ldr = p.ldr;
-        call.epilogue = int(attrs.epilogue.type);
-        call.ep_alpha = attrs.epilogue.alpha;
-        call.ep_beta = attrs.epilogue.beta;
-        call.min_clip = attrs.epilogue.min_clip;
-        call.max_clip = attrs.epilogue.max_clip;
-        call.batch_rank = p.batch_rank;
-        call.batch = detail::gemm_batch_count(p);
-        for (int d = 0; d < 4; ++d) {
-            call.bsize[d] = p.batch_size[d];
-            call.a_bstr[d] = p.a_batch[d];
-            call.b_bstr[d] = p.b_batch[d];
-            call.c_bstr[d] = p.c_batch[d];
-        }
-        if (manual_dense_f_call(call, static_cast<cudaStream_t>(ctx.cuda_stream))) {
-            return Status::ok;
-        }
-    }
-
+    // One ladder for every float product: the tiled hand-written kernel, the
+    // narrow-m pair, then the tile again with its fill gate bypassed.
     return dense_gemm_status(p, dt, attrs.transpose_a, attrs.transpose_b,
                              static_cast<cudaStream_t>(ctx.cuda_stream));
 }

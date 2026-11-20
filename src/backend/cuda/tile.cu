@@ -97,7 +97,7 @@ __global__ void tile_rows_kernel(const T* __restrict__ src, T* __restrict__ dst,
         }
 
         const int64_t flat = q * g.out_last;
-        const int64_t base = g.dst_compact ? flat : g.dst(flat);
+        const int64_t base = g.dst_compact ? flat : move_offset(g.dst, flat);
         for (int64_t j = 0; j < g.rep_last; ++j) {
             copy_run(dst + base + j * g.cols * g.out_step, src + so, g.cols, g.in_step, g.out_step);
         }

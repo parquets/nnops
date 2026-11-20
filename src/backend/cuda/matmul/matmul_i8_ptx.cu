@@ -18,16 +18,382 @@
 
 namespace nnops::backend::cuda {
 
+/// The integer GEMM: per-warp value tile from `S`, cp.async ring, k-major panels.
+template <class S, class AElem, bool TransA, bool TransB, bool Dequant>
+__global__ __launch_bounds__(S::threads, S::MinBlocks) void i8_gemm_kernel(GemmI8Params q)
+{
+    const GemmParams& gp = q.g;
+    constexpr int BM = S::BM, BN = S::BN, BK = S::BK, ST = S::stages;
+    constexpr int WM = S::WM, WN = S::WN, MA = S::MA, NA = S::NA;
+    constexpr int LD = S::LD;
+
+    extern __shared__ __align__(16) unsigned char i8_smem[];
+    int8_t* const sAbase = reinterpret_cast<int8_t*>(i8_smem);
+    int8_t* const sBbase = sAbase + ST * S::kABytes;
+
+    const int M = int(gp.m), N = int(gp.n), K = int(gp.k);
+    const int k_tiles = (K + BK - 1) / BK;
+    const int tid = int(threadIdx.x);
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int warp_m = warp / S::wn;
+    const int warp_n = warp - warp_m * S::wn;
+    // An int8 tile re-reads its whole operand band from L2 on every pass, which
+    // is enough traffic to make 4096^3 bandwidth-bound if consecutive blocks do
+    // not share one. `blockIdx.x` therefore walks a band of `kGroupM` m tiles by
+    // every n tile: a wave shares the band's k-slab of A and one n tile's slab
+    // of B, and the tail band simply has fewer m tiles in it.
+    constexpr int kGroupM = 4;
+    const int num_m = (M + BM - 1) / BM;
+    const int num_n = (N + BN - 1) / BN;
+    const int group_span = kGroupM * num_n;
+    const int gid = int(blockIdx.x) / group_span;
+    const int within = int(blockIdx.x) - gid * group_span;
+    const int m_span = (num_m - gid * kGroupM) < kGroupM ? (num_m - gid * kGroupM) : kGroupM;
+    const int m_tile = (gid * kGroupM + within % m_span) * BM;
+    const int n_tile = (within / m_span) * BN;
+    const int batch = detail::gemm_block_batch(gp);
+
+    const AElem* const A =
+        static_cast<const AElem*>(gp.a) + detail::gemm_batch_offset(gp, gp.a_batch, batch);
+    const int8_t* const B =
+        static_cast<const int8_t*>(gp.b) + detail::gemm_batch_offset(gp, gp.b_batch, batch);
+
+    /// One 16 B segment of a k-major panel per thread per pass.
+    const int vrow = tid / S::kVecPerRow;
+    const int vcol = (tid % S::kVecPerRow) * 16;
+    // A 16 B cp.async needs the base and the pitch 16 B aligned (`q.a_vec` /
+    // `q.b_vec`, decided by the launcher); a 4 B word otherwise, and a byte only
+    // when even that fails.
+    const bool aWord = (reinterpret_cast<uintptr_t>(A) % 4 == 0) && (gp.lda % 4 == 0);
+    const bool bWord = (reinterpret_cast<uintptr_t>(B) % 4 == 0) && (gp.ldb % 4 == 0);
+
+    // One call is one committed group, whether or not it copies anything: the
+    // wait's group count has to stay uniform across the ring.
+    auto fill = [&](int kt, int stage) {
+        if (kt >= k_tiles) {
+            cp_async_commit_group();
+            return;
+        }
+        const int k0 = kt * BK;
+        int8_t* const sA = sAbase + stage * S::kABytes;
+        int8_t* const sB = sBbase + stage * S::kBBytes;
+        const bool kFull = k0 + BK <= K;
+        const bool aFull = kFull && m_tile + BM <= M;
+        const bool bFull = kFull && n_tile + BN <= N;
+        const int8_t* const a8 = reinterpret_cast<const int8_t*>(A);
+
+        // The async half first, so the transpose's global reads overlap it.
+        if constexpr (TransB) {
+            if (bFull) {
+                i8_fill_kcontig<true, S, BN>(sB, B, gp.ldb, n_tile, N, k0, K, vrow, vcol, q.b_vec,
+                                             bWord);
+            } else {
+                i8_fill_kcontig<false, S, BN>(sB, B, gp.ldb, n_tile, N, k0, K, vrow, vcol, q.b_vec,
+                                              bWord);
+            }
+        }
+        if constexpr (!TransA) {
+            if (aFull) {
+                i8_fill_kcontig<true, S, BM>(sA, a8, gp.lda, m_tile, M, k0, K, vrow, vcol, q.a_vec,
+                                             aWord);
+            } else {
+                i8_fill_kcontig<false, S, BM>(sA, a8, gp.lda, m_tile, M, k0, K, vrow, vcol, q.a_vec,
+                                              aWord);
+            }
+        } else {
+            // A arrives `[k][m]`: the transpose fill's 4x4 byte blocks are the
+            // only way to a k-major panel without a scatter per byte.
+            detail::i8_transpose_fill<BM, BK>(sA, LD, a8, m_tile, k0, M, K, int(gp.lda), aWord,
+                                              tid, S::threads);
+        }
+        if constexpr (!TransB) {
+            detail::i8_transpose_fill<BN, BK>(sB, LD, B, n_tile, k0, N, K, int(gp.ldb), bWord,
+                                              tid, S::threads);
+        }
+        cp_async_commit_group();
+    };
+
+    int32_t acc[MA][NA][4];
+#pragma unroll
+    for (int i = 0; i < MA; ++i)
+#pragma unroll
+        for (int j = 0; j < NA; ++j)
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                acc[i][j][t] = 0;
+            }
+
+    // Prime every stage but one; the loop then keeps exactly ST groups in
+    // flight, so `wait_group<ST-2>` retires precisely the tile about to be read.
+#pragma unroll
+    for (int t = 0; t < ST - 1; ++t) {
+        fill(t, t % ST);
+    }
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        const int stage = kt % ST;
+        // One barrier a tile: the wait retires this tile's group, the barrier
+        // then publishes it and retires every warp's reads of the tile before
+        // it -- whose stage is the one the fill now overwrites.
+        cp_async_wait_group<ST - 2>();
+        __syncthreads();
+        fill(kt + ST - 1, (kt + ST - 1) % ST);
+
+        i8_gemm_tile<S, AElem>(sAbase + stage * S::kABytes, sBbase + stage * S::kBBytes,
+                                      warp_m, warp_n, lane, acc);
+    }
+
+    // ---- the destination --------------------------------------------------
+    // C: lane l holds (m = l/4, n = 2*(l%4)), plus the +1 column and the +8 row,
+    // so the two adjacent columns of an atom row leave as one store whenever the
+    // pitch keeps that pair's alignment.
+    const int64_t c_off = detail::gemm_batch_offset(gp, gp.c_batch, batch);
+    const int32_t* const r_a_b = q.r_a + int64_t(batch) * int64_t(gp.m);
+    const int32_t* const r_b_b = q.r_b + int64_t(batch) * int64_t(gp.n);
+    const bool even_pitch = (gp.ldc % 2) == 0;
+    const int cm = lane / 4;
+    const int cn = 2 * (lane % 4);
+
+    if constexpr (!Dequant) {
+        // s32 keeps the raw integer; s8/u8 requantize with the CPU's exact
+        // round-away-from-zero. One branch for the kind, then one loop nest.
+        const bool wide = q.out == I8OutKind::S32;
+        int32_t* const c32 = wide ? static_cast<int32_t*>(gp.c) + c_off : nullptr;
+        int8_t* const c8 = wide ? nullptr : static_cast<int8_t*>(gp.c) + c_off;
+        const bool pair32 = wide && even_pitch && (reinterpret_cast<uintptr_t>(c32) % 8) == 0;
+        const bool pair2 = !wide && even_pitch && (reinterpret_cast<uintptr_t>(c8) % 2) == 0;
+        // The compensation `raw - zp_a*R_b[n] - (R_a[m] - K*zp_a)*zp_b[n]`
+        // factors into a row scalar and a column scalar,
+        //   v = raw - P[m]*R[n] - Q[m]*S[n],
+        // P = zp_a + a_shift, Q = R_a + a_shift*K - K*zp_a, R = R_b, S = zp_b.
+        // A thread's warp tile spans only MA*2 rows and NA*2 columns, so the
+        // four global loads the per-element form costs collapse to a couple of
+        // dozen -- and the hundreds of IMADs fall to two per element. This is
+        // where the profile said the instructions were: in an int8 GEMM there is
+        // one MMA per output element, so every instruction the epilogue spends
+        // is one the tensor pipe does not get.
+        const auto vint = [](int32_t raw, int32_t P, int32_t Q, int32_t R, int32_t S, int32_t bias,
+                             bool relu) {
+            int32_t v = raw - P * R - Q * S + bias;
+            if (relu) {
+                v = v < 0 ? 0 : v;
+            }
+            return v;
+        };
+        const int32_t zp_b_scalar = q.zp_b_scalar;
+        const int32_t* const zp_b = q.zp_b;
+        const int32_t* const bias32 = static_cast<const int32_t*>(q.bias);
+        // The requant's two scale factors are per row and per column as well.
+        // A division, not a reciprocal multiply: the CPU oracle divides, and
+        // the two are not bit-identical.
+        const float rq_out = q.out_scale;
+        const float rq_zp = float(q.out_zp);
+        const bool s8out = q.out == I8OutKind::S8;
+#pragma unroll
+        for (int i = 0; i < MA; ++i) {
+            const int gm = m_tile + warp_m * WM + i * 16 + cm;
+            if (gm >= M) {
+                continue;
+            }
+            int32_t* const r32 = wide ? c32 + int64_t(gm) * gp.ldc : nullptr;
+            int8_t* const rb = wide ? nullptr : c8 + int64_t(gm) * gp.ldc;
+            const bool lo8 = gm + 8 < M;
+            // Rows gm and gm+8: two scalars each, and the requant's row factor.
+            const int32_t zp0 = (q.zp_a != nullptr ? q.zp_a[gm] : q.zp_a_scalar) + q.a_shift;
+            const int32_t P0 = zp0;
+            const int32_t Q0 = r_a_b[gm] + q.a_shift * gp.k - gp.k * zp0;
+            const float rk0 = (q.sc_a != nullptr ? q.sc_a[gm] : q.sc_a_scalar) / rq_out;
+            const int32_t zp8 =
+                lo8 ? (q.zp_a != nullptr ? q.zp_a[gm + 8] : q.zp_a_scalar) + q.a_shift : 0;
+            const int32_t P8 = zp8;
+            const int32_t Q8 = lo8 ? r_a_b[gm + 8] + q.a_shift * gp.k - gp.k * zp8 : 0;
+            const float rk8 =
+                lo8 ? (q.sc_a != nullptr ? q.sc_a[gm + 8] : q.sc_a_scalar) / rq_out : 0.0f;
+#pragma unroll
+            for (int j = 0; j < NA; ++j) {
+                const int gn = n_tile + warp_n * WN + j * 8 + cn;
+                if (gn >= N) {
+                    continue;
+                }
+                const bool hi = gn + 1 < N;
+                // Columns gn and gn+1.
+                const int32_t R0 = r_b_b[gn];
+                const int32_t S0 = zp_b != nullptr ? zp_b[gn] : zp_b_scalar;
+                const int32_t B0 = bias32 != nullptr ? bias32[gn] : 0;
+                const float sb0 = q.sc_b != nullptr ? q.sc_b[gn] : q.sc_b_scalar;
+                const int32_t R1 = hi ? r_b_b[gn + 1] : 0;
+                const int32_t S1 = hi ? (zp_b != nullptr ? zp_b[gn + 1] : zp_b_scalar) : 0;
+                const int32_t B1 = (hi && bias32 != nullptr) ? bias32[gn + 1] : 0;
+                const float sb1 = hi ? (q.sc_b != nullptr ? q.sc_b[gn + 1] : q.sc_b_scalar) : 0.0f;
+                if (wide) {
+                    const int32_t v0 = vint(acc[i][j][0], P0, Q0, R0, S0, B0, q.relu);
+                    const int32_t v1 = hi ? vint(acc[i][j][1], P0, Q0, R1, S1, B1, q.relu) : 0;
+                    const int32_t v2 = lo8 ? vint(acc[i][j][2], P8, Q8, R0, S0, B0, q.relu) : 0;
+                    const int32_t v3 =
+                        (lo8 && hi) ? vint(acc[i][j][3], P8, Q8, R1, S1, B1, q.relu) : 0;
+                    int32_t* const row8 = r32 + 8 * gp.ldc;
+                    if (pair32 && hi) {
+                        *reinterpret_cast<int2*>(r32 + gn) = make_int2(v0, v1);
+                        if (lo8) {
+                            *reinterpret_cast<int2*>(row8 + gn) = make_int2(v2, v3);
+                        }
+                    } else {
+                        r32[gn] = v0;
+                        if (hi) {
+                            r32[gn + 1] = v1;
+                        }
+                        if (lo8) {
+                            row8[gn] = v2;
+                            if (hi) {
+                                row8[gn + 1] = v3;
+                            }
+                        }
+                    }
+                } else {
+                    // Same factoring, and the requant's per-row and per-column
+                    // scales are already resolved above.
+                    const uint8_t b0 = uint8_t(
+                        s8out ?
+                            int32_t(detail::i8_requant<int8_t>(
+                                vint(acc[i][j][0], P0, Q0, R0, S0, B0, q.relu), rk0, sb0, rq_zp)) :
+                            int32_t(detail::i8_requant<uint8_t>(
+                                vint(acc[i][j][0], P0, Q0, R0, S0, B0, q.relu), rk0, sb0, rq_zp)));
+                    const uint8_t b1 =
+                        hi ? uint8_t(s8out ? int32_t(detail::i8_requant<int8_t>(
+                                                 vint(acc[i][j][1], P0, Q0, R1, S1, B1, q.relu),
+                                                 rk0, sb1, rq_zp)) :
+                                             int32_t(detail::i8_requant<uint8_t>(
+                                                 vint(acc[i][j][1], P0, Q0, R1, S1, B1, q.relu),
+                                                 rk0, sb1, rq_zp))) :
+                             uint8_t(0);
+                    const uint8_t b2 =
+                        lo8 ? uint8_t(s8out ? int32_t(detail::i8_requant<int8_t>(
+                                                  vint(acc[i][j][2], P8, Q8, R0, S0, B0, q.relu),
+                                                  rk8, sb0, rq_zp)) :
+                                              int32_t(detail::i8_requant<uint8_t>(
+                                                  vint(acc[i][j][2], P8, Q8, R0, S0, B0, q.relu),
+                                                  rk8, sb0, rq_zp))) :
+                              uint8_t(0);
+                    const uint8_t b3 =
+                        (lo8 && hi) ?
+                            uint8_t(s8out ? int32_t(detail::i8_requant<int8_t>(
+                                                vint(acc[i][j][3], P8, Q8, R1, S1, B1, q.relu), rk8,
+                                                sb1, rq_zp)) :
+                                            int32_t(detail::i8_requant<uint8_t>(
+                                                vint(acc[i][j][3], P8, Q8, R1, S1, B1, q.relu), rk8,
+                                                sb1, rq_zp))) :
+                            uint8_t(0);
+                    int8_t* const row8 = rb + 8 * gp.ldc;
+                    if (pair2 && hi) {
+                        *reinterpret_cast<uint16_t*>(rb + gn) = uint16_t(b0 | (uint16_t(b1) << 8));
+                        if (lo8) {
+                            *reinterpret_cast<uint16_t*>(row8 + gn) =
+                                uint16_t(b2 | (uint16_t(b3) << 8));
+                        }
+                    } else {
+                        rb[gn] = int8_t(b0);
+                        if (hi) {
+                            rb[gn + 1] = int8_t(b1);
+                        }
+                        if (lo8) {
+                            row8[gn] = int8_t(b2);
+                            if (hi) {
+                                row8[gn + 1] = int8_t(b3);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // A dequantizing destination: f32 or f16 under the operator's epilogue.
+    const bool wide = q.out == I8OutKind::F32;
+    float* const cf = wide ? static_cast<float*>(gp.c) + c_off : nullptr;
+    __half* const ch = wide ? nullptr : static_cast<__half*>(gp.c) + c_off;
+    const bool pair32 = wide && even_pitch && (reinterpret_cast<uintptr_t>(cf) % 8) == 0;
+    const bool pair4 = !wide && even_pitch && (reinterpret_cast<uintptr_t>(ch) % 4) == 0;
+#pragma unroll
+    for (int i = 0; i < MA; ++i) {
+        const int gm = m_tile + warp_m * WM + i * 16 + cm;
+        if (gm >= M) {
+            continue;
+        }
+        float* const rf = wide ? cf + int64_t(gm) * gp.ldc : nullptr;
+        __half* const rh = wide ? nullptr : ch + int64_t(gm) * gp.ldc;
+        const bool lo8 = gm + 8 < M;
+#pragma unroll
+        for (int j = 0; j < NA; ++j) {
+            const int gn = n_tile + warp_n * WN + j * 8 + cn;
+            if (gn >= N) {
+                continue;
+            }
+            const bool hi = gn + 1 < N;
+            const float f0 = detail::i8_fp_value(q, acc[i][j][0], gm, gn, r_a_b, r_b_b);
+            const float f1 =
+                hi ? detail::i8_fp_value(q, acc[i][j][1], gm, gn + 1, r_a_b, r_b_b) : 0.0f;
+            const float f2 =
+                lo8 ? detail::i8_fp_value(q, acc[i][j][2], gm + 8, gn, r_a_b, r_b_b) : 0.0f;
+            const float f3 =
+                (lo8 && hi) ? detail::i8_fp_value(q, acc[i][j][3], gm + 8, gn + 1, r_a_b, r_b_b) :
+                              0.0f;
+            if (wide) {
+                float* const row8 = rf + 8 * gp.ldc;
+                if (pair32 && hi) {
+                    *reinterpret_cast<float2*>(rf + gn) = make_float2(f0, f1);
+                    if (lo8) {
+                        *reinterpret_cast<float2*>(row8 + gn) = make_float2(f2, f3);
+                    }
+                } else {
+                    rf[gn] = f0;
+                    if (hi) {
+                        rf[gn + 1] = f1;
+                    }
+                    if (lo8) {
+                        row8[gn] = f2;
+                        if (hi) {
+                            row8[gn + 1] = f3;
+                        }
+                    }
+                }
+            } else {
+                __half* const row8 = rh + 8 * gp.ldc;
+                if (pair4 && hi) {
+                    const __half2 h0 = __floats2half2_rn(f0, f1);
+                    *reinterpret_cast<uint32_t*>(rh + gn) = *reinterpret_cast<const uint32_t*>(&h0);
+                    if (lo8) {
+                        const __half2 h8 = __floats2half2_rn(f2, f3);
+                        *reinterpret_cast<uint32_t*>(row8 + gn) =
+                            *reinterpret_cast<const uint32_t*>(&h8);
+                    }
+                } else {
+                    rh[gn] = __float2half(f0);
+                    if (hi) {
+                        rh[gn + 1] = __float2half(f1);
+                    }
+                    if (lo8) {
+                        row8[gn] = __float2half(f2);
+                        if (hi) {
+                            row8[gn + 1] = __float2half(f3);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 namespace detail {
 
 /// The candidate tiles. 64x64x64 on four warps is the default: the s8 panels are
 /// half the fp16 footprint, so two stages cost 20 KB and four blocks fit an SM.
-using I8Tile0 = ManualI8Shape<32, 32, 2, 2, 64, 2, 4>;
+using I8Tile0 = I8TileShape<32, 32, 2, 2, 64, 2, 4>;
 /// Twice the rows per CTA: the byte transpose of a transposed operand is paid
 /// once per 128 rows instead of per 64, which is what an n-major B wants.
-using I8Tile1 = ManualI8Shape<64, 32, 2, 2, 64, 2, 2>;
+using I8Tile1 = I8TileShape<64, 32, 2, 2, 64, 2, 2>;
 /// Twice the rows *and* the columns per CTA on eight warps.
-using I8Tile2 = ManualI8Shape<64, 32, 2, 4, 64, 2, 2>;
+using I8Tile2 = I8TileShape<64, 32, 2, 4, 64, 2, 2>;
 
 constexpr int kI8TileCount = 3;
 constexpr int kI8DefaultTile = 0;
@@ -44,13 +410,13 @@ template <class S, class AElem, bool Dequant> bool i8_prepare()
                    cudaSuccess;
         };
         if (!set(reinterpret_cast<const void*>(
-                &manual_gemm_i8_kernel<S, AElem, true, true, Dequant>)) ||
+                &i8_gemm_kernel<S, AElem, true, true, Dequant>)) ||
             !set(reinterpret_cast<const void*>(
-                &manual_gemm_i8_kernel<S, AElem, true, false, Dequant>)) ||
+                &i8_gemm_kernel<S, AElem, true, false, Dequant>)) ||
             !set(reinterpret_cast<const void*>(
-                &manual_gemm_i8_kernel<S, AElem, false, true, Dequant>)) ||
+                &i8_gemm_kernel<S, AElem, false, true, Dequant>)) ||
             !set(reinterpret_cast<const void*>(
-                &manual_gemm_i8_kernel<S, AElem, false, false, Dequant>))) {
+                &i8_gemm_kernel<S, AElem, false, false, Dequant>))) {
             cudaGetLastError();
             return false;
         }
@@ -71,16 +437,16 @@ bool i8_run(GemmI8Params q, bool trans_a, bool trans_b, int batch, cudaStream_t 
                     unsigned(batch));
     constexpr int kSmem = S::kSmemBytes;
     if (trans_a && trans_b) {
-        manual_gemm_i8_kernel<S, AElem, true, true, Dequant>
+        i8_gemm_kernel<S, AElem, true, true, Dequant>
             <<<grid, S::threads, kSmem, stream>>>(q);
     } else if (trans_a) {
-        manual_gemm_i8_kernel<S, AElem, true, false, Dequant>
+        i8_gemm_kernel<S, AElem, true, false, Dequant>
             <<<grid, S::threads, kSmem, stream>>>(q);
     } else if (trans_b) {
-        manual_gemm_i8_kernel<S, AElem, false, true, Dequant>
+        i8_gemm_kernel<S, AElem, false, true, Dequant>
             <<<grid, S::threads, kSmem, stream>>>(q);
     } else {
-        manual_gemm_i8_kernel<S, AElem, false, false, Dequant>
+        i8_gemm_kernel<S, AElem, false, false, Dequant>
             <<<grid, S::threads, kSmem, stream>>>(q);
     }
     return cudaGetLastError() == cudaSuccess;
@@ -107,7 +473,7 @@ bool i8_run_tile(GemmI8Params q, bool trans_a, bool trans_b, int batch, cudaStre
 /// operand can only be staged synchronously, so its cost per MAC is 1/tile rows.
 /// A k-contiguous B (NT) leaves only A's vector copy, so the widest tile wins as
 /// soon as it has a wave to fill (4096^3: 1.79 ms against 2.33 for the 128x64
-/// tile, and 2.31 for the CuTe engine it replaces). An n-major B (NN) pays the
+/// tile, and 2.31 for the tiled engine it replaces). An n-major B (NN) pays the
 /// byte transpose on every tile, and the 128-row tile is what halves it -- but
 /// only once the grid is deep enough to keep the machine busy without the extra
 /// rows (2.30 against 3.29 there, while at 512^3 the smaller tile is ahead).
@@ -125,7 +491,7 @@ int i8_auto_tile(const GemmParams& g, bool trans_b)
 /// The hand-written int8 tile. `tile` picks a candidate explicitly (-1 takes the
 /// default row); false means the caller keeps its own engine, which is the
 /// contract for a pose this kernel does not cover.
-bool manual_dense_i8_tile(GemmI8Params q, DataType a_dt, bool trans_a, bool trans_b,
+bool i8_dense_tile(GemmI8Params q, DataType a_dt, bool trans_a, bool trans_b,
                           cudaStream_t stream, int tile)
 {
     if (a_dt != DataType::s8 && a_dt != DataType::u8) {
@@ -138,19 +504,8 @@ bool manual_dense_i8_tile(GemmI8Params q, DataType a_dt, bool trans_a, bool tran
     if (q.r_a == nullptr || q.r_b == nullptr) {
         return false;
     }
-    // The transposed-side fills read 4-byte words out of a source whose
-    // contiguous run is along the other axis, so both the base and the row pitch
-    // have to be word-addressable. The k-contiguous fills have their own byte
-    // path and need no alignment.
-    const auto word_ok = [](const void* p, int64_t ld) {
-        return (reinterpret_cast<uintptr_t>(p) % 4 == 0) && (ld % 4 == 0);
-    };
-    if (trans_a && !word_ok(g.a, g.lda)) {
-        return false;
-    }
-    if (!trans_b && !word_ok(g.b, g.ldb)) {
-        return false;
-    }
+    // The transposed fills read 4-byte words where they can and fall back to
+    // a byte scatter where they cannot, so no pose is refused on alignment.
     const int batch = detail::gemm_batch_count(g);
     if (batch <= 0) {
         return false;

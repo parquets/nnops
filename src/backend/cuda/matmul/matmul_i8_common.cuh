@@ -1,13 +1,12 @@
 /// @file matmul_i8_common.cuh
-/// @brief The integer GEMM's contract and its CuTe-free pieces: the parameter
-///        struct, the zero-point compensation, the requant, the per-element
-///        epilogue, the two reduction prepasses, and the byte transpose fill.
+/// @brief The integer GEMM's contract: the parameter struct, the zero-point
+///        compensation, the requant, the per-element epilogue, the two
+///        reduction prepasses, and the byte transpose fill.
 ///
-/// Everything here is shared by the three int8 engines — the CuTe tile, the
-/// hand-written PTX tile and the narrow-m `__dp4a` kernel — so they cannot drift
-/// apart. Nothing in this file touches CuTe: the fill takes a plain pointer and
-/// a row stride, which is what lets a hand-written kernel include it without the
-/// tile machinery.
+/// Everything here is shared by the two int8 engines — the hand-written PTX
+/// tile and the narrow-m `__dp4a` kernel — so they cannot drift apart. The
+/// fill takes a plain pointer and a row stride, which is what lets either
+/// kernel include it without any tile machinery.
 ///
 /// MatMulInteger semantics over the SM80 16x8x32 s8 tensor-core atom. A is s8 or
 /// u8 and B is s8; a u8 A takes `u8.s8` so the raw accumulate is the true integer
@@ -358,12 +357,12 @@ static __global__ void i8_col_sums_kernel(GemmI8Params q, int32_t* out)
 /// is one instruction where the byte scatter is four.
 ///
 /// `dst` is the stage's panel base and `ld` its row stride in bytes, so the
-/// caller keeps its own layout: the CuTe tile passes its padded tensor base, the
-/// hand-written one a plain pointer. A 4-byte-aligned source is the caller's
+/// caller keeps its own layout: a strided view and a plain pointer both work.
+/// A 4-byte-aligned source is the caller's
 /// contract (the word reads below assume it).
 template <int bN, int bK>
 __device__ inline void i8_transpose_fill(int8_t* dst, int ld, const int8_t* b, int n0, int k0,
-                                         int N, int K, int ldb, int tid, int nthr)
+                                         int N, int K, int ldb, bool word, int tid, int nthr)
 {
     constexpr int nb4 = bN / 4;
     constexpr int nblocks = nb4 * (bK / 4);
@@ -373,7 +372,10 @@ __device__ inline void i8_transpose_fill(int8_t* dst, int ld, const int8_t* b, i
         const int n = n0 + n4 * 4;
         const int k = k0 + k4 * 4;
         int8_t* const row = dst + (n4 * 4) * ld + k4 * 4;
-        if (n + 4 <= N && k + 4 <= K) {
+        // The 4 B reads below need a word-addressable base and pitch; a source
+        // that is not takes the byte scatter, which is why this is a runtime
+        // flag rather than a template.
+        if (word && n + 4 <= N && k + 4 <= K) {
             const int8_t* p = b + int64_t(k) * ldb + n;
             const uint32_t w0 = *reinterpret_cast<const uint32_t*>(p);
             const uint32_t w1 = *reinterpret_cast<const uint32_t*>(p + ldb);

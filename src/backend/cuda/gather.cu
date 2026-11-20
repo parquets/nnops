@@ -93,7 +93,7 @@ __global__ void gather_rows_kernel(const T* __restrict__ data, const I* __restri
         }
         const int64_t k = gather_index(int64_t(idx[iofs]), g.axis_dim);
         const int64_t flat = r * g.cols;
-        const int64_t oo = g.dst_compact ? flat : g.dst(flat);
+        const int64_t oo = g.dst_compact ? flat : move_offset(g.dst, flat);
         copy_run(out + oo, data + dofs + k * g.axis_stride, g.cols, g.src_step, g.out_step);
     }
 }
@@ -114,7 +114,7 @@ __global__ void gather_elems_kernel(const T* __restrict__ data, const I* __restr
         for (int64_t i = int64_t(threadIdx.x); i < g.cols; i += int64_t(blockDim.x)) {
             const int64_t k = gather_index(int64_t(idx[iofs + i * g.idx_last_step]), g.axis_dim);
             const int64_t flat = r * g.cols + i;
-            const int64_t oo = g.dst_compact ? flat : g.dst(flat);
+            const int64_t oo = g.dst_compact ? flat : move_offset(g.dst, flat);
             // With the gathered axis inside the row, the last axis still steps
             // the source once per element.
             out[oo] = data[dofs + i * g.elem_trail + k * g.axis_stride];
@@ -226,7 +226,7 @@ __global__ void gather_nd_rows_kernel(const T* __restrict__ data, const I* __res
             dofs += v * g.data_stride[j];
         }
         const int64_t flat = r * g.cols;
-        const int64_t oo = g.dst_compact ? flat : g.dst(flat);
+        const int64_t oo = g.dst_compact ? flat : move_offset(g.dst, flat);
         copy_run(out + oo, data + dofs, g.cols, g.src_step, g.out_step);
     }
 }
@@ -253,7 +253,7 @@ __global__ void gather_nd_elems_kernel(const T* __restrict__ data, const I* __re
                 ds += v * g.data_stride[j];
             }
             const int64_t flat = r * g.cols + i;
-            const int64_t oo = g.dst_compact ? flat : g.dst(flat);
+            const int64_t oo = g.dst_compact ? flat : move_offset(g.dst, flat);
             out[oo] = data[ds];
         }
     }

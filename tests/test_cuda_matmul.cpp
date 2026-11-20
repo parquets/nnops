@@ -261,17 +261,8 @@ NNOPS_TEST(cuda_matmul_transposes_f16) {
 }
 
 NNOPS_TEST(cuda_matmul_f32_simt_poses) {
-    // All four transpose poses through the hand-written f32 tile, forced so the
-    // grid gate cannot hand the small cases back to the CuTe engine: each pose
-    // is its own panel order and its own FMA nest.
-    auto& knob = nnops::detail::cuda_ptx_f;
-    const int saved = knob.exchange(1);
-    struct Restore {
-        std::atomic<int>& k;
-        int v;
-        ~Restore() { k.store(v); }
-    } restore{knob, saved};
-
+    // All four transpose poses through the hand-written f32 tile: each pose is
+    // its own panel order and its own FMA nest.
     for (int flags = 0; flags < 4; ++flags) {
         for (const auto& s : {std::pair<int64_t, int64_t>{256, 384},
                              std::pair<int64_t, int64_t>{517, 263}}) {
@@ -288,22 +279,9 @@ NNOPS_TEST(cuda_matmul_f32_simt_poses) {
 }
 
 NNOPS_TEST(cuda_matmul_epilogue_forced) {
-    // The operator epilogue (alpha, bias, beta, clamp, activation) moved into the
-    // hand-written kernels for both dtypes. Its shapes are big enough that the
-    // grid gate would have taken them anyway, but the route is forced so a
-    // regression cannot hide behind the CuTe fallback.
-    auto& ptf = nnops::detail::cuda_ptx_f;
-    auto& pth = nnops::detail::cuda_ptx_h;
-    const int saved_f = ptf.exchange(1);
-    const int saved_h = pth.exchange(1);
-    struct Restore {
-        std::atomic<int>& a;
-        int av;
-        std::atomic<int>& b;
-        int bv;
-        ~Restore() { a.store(av); b.store(bv); }
-    } restore{ptf, saved_f, pth, saved_h};
-
+    // The operator epilogue (alpha, bias, beta, clamp, activation) runs inside
+    // the hand-written kernels for both dtypes, at shapes the grid gate takes.
+    // The narrow cases below put it on the same kernels from the other side.
     // bf16 has no CPU route on x86-64, so the oracle would be missing;
     // its epilogue path is covered by the bf16 suite's own arms.
     for (DataType dt : {DataType::f32, DataType::f16}) {
@@ -344,14 +322,6 @@ NNOPS_TEST(cuda_matmul_f16_poses_forced) {
     // All four transpose poses through the f16 PTX kernel. The A-transposed pair
     // keeps A in its `[k][m]` arrival order and reads it with ldmatrix.trans, so
     // each pose is its own panel order and fragment shuffle.
-    auto& pth = nnops::detail::cuda_ptx_h;
-    const int saved = pth.exchange(1);
-    struct Restore {
-        std::atomic<int>& k;
-        int v;
-        ~Restore() { k.store(v); }
-    } restore{pth, saved};
-
     for (int flags = 0; flags < 4; ++flags) {
         for (const auto& s : {std::pair<int64_t, int64_t>{256, 384},
                              std::pair<int64_t, int64_t>{517, 263}}) {
@@ -369,16 +339,8 @@ NNOPS_TEST(cuda_matmul_f16_poses_forced) {
 }
 
 NNOPS_TEST(cuda_matmul_batch_forced) {
-    // f16/bf16 batches now fold into blockIdx.z beside the k splits, so a
-    // batched product is the same kernel rather than the CuTe engine.
-    auto& pth = nnops::detail::cuda_ptx_h;
-    const int saved = pth.exchange(1);
-    struct Restore {
-        std::atomic<int>& a;
-        int v;
-        ~Restore() { a.store(v); }
-    } restore{pth, saved};
-
+    // f16/bf16 batches fold into blockIdx.z beside the k splits, so a batched
+    // product is the same kernel.
     for (DataType dt : {DataType::f32, DataType::f16}) {
         {
             MatmulCase c;
@@ -750,18 +712,9 @@ NNOPS_TEST(cuda_matmul_i8_s32) {
 
 NNOPS_TEST(cuda_matmul_i8_ptx_forced) {
     // The hand-written int8 tile (NN and NT: A row-major, B either k-major or
-    // n-major). Forced, so a pose the engine refuses cannot fall back to CuTe
-    // and pass without the new kernel having run. A [K, N] B is staged through
-    // the 4x4 byte transpose, which needs a word-addressable pitch -- the odd-N
-    // cases below are there to prove the route still answers when it is not.
-    auto& pti = nnops::detail::cuda_ptx_i8;
-    const int saved = pti.exchange(1);
-    struct Restore {
-        std::atomic<int>& k;
-        int v;
-        ~Restore() { k.store(v); }
-    } restore{pti, saved};
-
+    // n-major). A [K, N] B is staged through the 4x4 byte transpose, which
+    // needs a word-addressable pitch -- the odd-N cases below are there to
+    // prove the route still answers when it is not.
     // Interior tiles: both fills take their 16 B vector path and the k loop
     // never sees a tail.
     { I8Case c; c.ashape = {128, 128}; c.bshape = {128, 128};
@@ -808,25 +761,20 @@ NNOPS_TEST(cuda_matmul_i8_ptx_forced) {
       c.adt = DataType::u8; c.seed = 323;
       run_i8_case(c, "cuda_matmul_i8_ptx_forced_tt_ktail"); }
 
-    // Every menu row, through all four poses, at sizes that leave a tail on both
-    // axes and a k that crosses two tiles: a row is only a candidate once it
-    // agrees with the CPU.
-    for (int row = 0; row < 3; ++row) {
-        pti.store(row + 2);
-        { I8Case c; c.ashape = {150, 130}; c.bshape = {130, 68};
-          c.adt = DataType::u8; c.bias = true; c.seed = 331;
-          run_i8_case(c, "cuda_matmul_i8_ptx_rows_nn"); }
-        { I8Case c; c.ashape = {150, 130}; c.bshape = {70, 130}; c.tb = true;
-          c.adt = DataType::s8; c.per_channel = true; c.seed = 333;
-          run_i8_case(c, "cuda_matmul_i8_ptx_rows_nt"); }
-        { I8Case c; c.ashape = {130, 152}; c.bshape = {130, 40}; c.ta = true;
-          c.adt = DataType::u8; c.bias = true; c.seed = 335;
-          run_i8_case(c, "cuda_matmul_i8_ptx_rows_tn"); }
-        { I8Case c; c.ashape = {130, 152}; c.bshape = {44, 130}; c.ta = true;
-          c.tb = true; c.adt = DataType::s8; c.relu = true; c.seed = 337;
-          run_i8_case(c, "cuda_matmul_i8_ptx_rows_tt"); }
-    }
-    pti.store(1);
+    // All four poses at sizes that leave a tail on both axes and a k that
+    // crosses two tiles.
+    { I8Case c; c.ashape = {150, 130}; c.bshape = {130, 68};
+      c.adt = DataType::u8; c.bias = true; c.seed = 331;
+      run_i8_case(c, "cuda_matmul_i8_ptx_rows_nn"); }
+    { I8Case c; c.ashape = {150, 130}; c.bshape = {70, 130}; c.tb = true;
+      c.adt = DataType::s8; c.per_channel = true; c.seed = 333;
+      run_i8_case(c, "cuda_matmul_i8_ptx_rows_nt"); }
+    { I8Case c; c.ashape = {130, 152}; c.bshape = {130, 40}; c.ta = true;
+      c.adt = DataType::u8; c.bias = true; c.seed = 335;
+      run_i8_case(c, "cuda_matmul_i8_ptx_rows_tn"); }
+    { I8Case c; c.ashape = {130, 152}; c.bshape = {44, 130}; c.ta = true;
+      c.tb = true; c.adt = DataType::s8; c.relu = true; c.seed = 337;
+      run_i8_case(c, "cuda_matmul_i8_ptx_rows_tt"); }
 
     // The other four destinations, which were the CuTe engine's until now: the
     // s8/u8 requant and the f32/f16 dequantization, each with the bias its

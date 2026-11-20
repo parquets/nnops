@@ -9,7 +9,9 @@
 
 #pragma once
 
-#include "cute_gemm.cuh"
+#include "matmul_f16_host.hpp"
+#include "matmul_f32_host.hpp"
+#include "matmul_narrow.cuh"
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/status.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -79,7 +81,88 @@ inline bool gemm_vectorizable(const GemmParams& p, int64_t elem_size)
            (reinterpret_cast<uintptr_t>(p.b) % 16 == 0) && (p.lda % vec == 0) && (p.ldb % vec == 0);
 }
 
+/// The hand-written 16-bit engine's view of a configured product.
+inline F16Call make_f16_call(const GemmParams& p, bool trans_a, bool trans_b, bool bf16)
+{
+    F16Call call;
+    call.a = p.a;
+    call.b = p.b;
+    call.c = p.c;
+    call.m = p.m;
+    call.n = p.n;
+    call.k = p.k;
+    call.lda = p.lda;
+    call.ldb = p.ldb;
+    call.ldc = p.ldc;
+    call.alpha = p.alpha;
+    call.trans_a = trans_a;
+    call.trans_b = trans_b;
+    call.bf16 = bf16;
+    call.bias = p.bias;
+    call.bias_row = p.bias_row;
+    call.beta = p.beta;
+    call.residual = p.residual;
+    call.ldr = p.ldr;
+    call.epilogue = int(p.epilogue);
+    call.ep_alpha = p.ep_alpha;
+    call.ep_beta = p.ep_beta;
+    call.min_clip = p.min_clip;
+    call.max_clip = p.max_clip;
+    call.batch_rank = p.batch_rank;
+    call.batch = detail::gemm_batch_count(p);
+    for (int d = 0; d < 4; ++d) {
+        call.bsize[d] = p.batch_size[d];
+        call.a_bstr[d] = p.a_batch[d];
+        call.b_bstr[d] = p.b_batch[d];
+        call.c_bstr[d] = p.c_batch[d];
+    }
+    return call;
+}
+
+/// The hand-written f32 engine's view of the same product.
+inline F32Call make_f32_call(const GemmParams& p, bool trans_a, bool trans_b)
+{
+    F32Call call;
+    call.a = p.a;
+    call.b = p.b;
+    call.c = p.c;
+    call.m = p.m;
+    call.n = p.n;
+    call.k = p.k;
+    call.lda = p.lda;
+    call.ldb = p.ldb;
+    call.ldc = p.ldc;
+    call.alpha = p.alpha;
+    call.trans_a = trans_a;
+    call.trans_b = trans_b;
+    call.bias = p.bias;
+    call.bias_row = p.bias_row;
+    call.beta = p.beta;
+    call.residual = p.residual;
+    call.ldr = p.ldr;
+    call.epilogue = int(p.epilogue);
+    call.ep_alpha = p.ep_alpha;
+    call.ep_beta = p.ep_beta;
+    call.min_clip = p.min_clip;
+    call.max_clip = p.max_clip;
+    call.batch_rank = p.batch_rank;
+    call.batch = detail::gemm_batch_count(p);
+    for (int d = 0; d < 4; ++d) {
+        call.bsize[d] = p.batch_size[d];
+        call.a_bstr[d] = p.a_batch[d];
+        call.b_bstr[d] = p.b_batch[d];
+        call.c_bstr[d] = p.c_batch[d];
+    }
+    return call;
+}
+
 /// Launch a fully configured dense GEMM; f32, f16 and bf16 only.
+///
+/// Three engines, tried in the order that made them fastest: the tiled
+/// hand-written kernel while its grid fills the machine, the narrow-m pair for
+/// a product of at most sixteen rows, and then the tiled kernel again with its
+/// fill gate bypassed. The last step is what makes every pose reachable: a
+/// shape the gate declines still runs, just at the rate its grid allows.
 inline Status dense_gemm_status(const GemmParams& p, DataType dtype, bool transpose_a,
                                 bool transpose_b, cudaStream_t stream)
 {
@@ -101,11 +184,47 @@ inline Status dense_gemm_status(const GemmParams& p, DataType dtype, bool transp
     }
 
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
-    if (!dense_gemm_launch(p, elem, transpose_a, transpose_b, gemm_vectorizable(p, elem_size),
-                           stream)) {
-        return Status::unsupported;
+    const bool vectorized = gemm_vectorizable(p, elem_size);
+
+    // The tiled kernel, while its grid fills the machine.
+    if (dtype == DataType::f32) {
+        if (f32_dense_call(make_f32_call(p, transpose_a, transpose_b), stream)) {
+            return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+        }
+    } else if (f16_dense_call(
+                   make_f16_call(p, transpose_a, transpose_b, dtype == DataType::bf16), stream)) {
+        return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
     }
-    return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+
+    // A product of at most sixteen rows is a bandwidth problem; the narrow-m
+    // loop streams B once instead of computing a tile's worth of mma for it.
+    if (elem == GemmElem::F16 || elem == GemmElem::F32) {
+        const bool half = elem == GemmElem::F16;
+        bool ran = false;
+        if (detail::small_m_applies(p, elem, transpose_a, transpose_b, vectorized)) {
+            ran = half ? detail::launch_small_m<__half>(p, stream) :
+                         detail::launch_small_m<float>(p, stream);
+        }
+        if (!ran && detail::small_nt_applies(p, elem, transpose_a, transpose_b, vectorized)) {
+            ran = half ? detail::launch_small_nt<__half>(p, stream) :
+                         detail::launch_small_nt<float>(p, stream);
+        }
+        if (ran && cudaGetLastError() == cudaSuccess) {
+            return Status::ok;
+        }
+    }
+
+    // The tiled kernel again, with the fill gate bypassed.
+    if (dtype == DataType::f32) {
+        if (f32_dense_call(make_f32_call(p, transpose_a, transpose_b), stream, true)) {
+            return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+        }
+    } else if (f16_dense_call(
+                   make_f16_call(p, transpose_a, transpose_b, dtype == DataType::bf16), stream,
+                   true)) {
+        return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+    }
+    return Status::unsupported;
 }
 
 } // namespace nnops::backend::cuda

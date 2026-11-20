@@ -215,7 +215,7 @@ __device__ inline Elem* tconv_out_addr(const ConvParams& p, int64_t base, int pi
 /// two stages — the depth that keeps three blocks resident per SM, which is
 /// what the shallow upsampler grids need. A wider n tile is the tempting lever
 /// and it is worse here for the same reason it is worse there.
-using ConvShapeH = ManualHShape<32, 32, 2, 2, 64, 2, 1, false, 1>;
+using ConvShapeH = F16TileShape<32, 32, 2, 2, 64, 2, 1, false, 1>;
 
 /// The gather's (row, col, stage) indexer over the k-major swizzled panel.
 template <class S, class Elem> using TConvHPanel = conv::KMajorPanel<S, Elem>;
@@ -301,8 +301,8 @@ void tconv_gemm_h_kernel(ConvParams pin)
         const Elem* wc = W + int64_t(ic) * p.w_ic + int64_t(kh) * p.w_kh + int64_t(kw) * p.w_kw;
         for (int row = tid / BK; row < BN; row += per) {
             const int n = n0 + row;
-            sB[manual_swz_n<S>(col, row)] =
-                (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : manual_zero<Elem>();
+            sB[f16_swz_n<S>(col, row)] =
+                (k_ok && n < N) ? wc[int64_t(n) * p.w_n] : gemm_zero<Elem>();
         }
         cp_async_commit_group();
     };
@@ -331,7 +331,7 @@ void tconv_gemm_h_kernel(ConvParams pin)
         cp_async_wait_group<ST - 2>();
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
-        manual_gemm_h_tile<S, Elem, false, false>(sAbase + stage * S::kAMax,
+        f16_gemm_tile<S, Elem, false, false>(sAbase + stage * S::kAMax,
                                                   sBbase + stage * S::kBMax, warp_m, warp_n, lane,
                                                   acc);
     }
@@ -372,7 +372,7 @@ void tconv_gemm_h_kernel(ConvParams pin)
 // f32 SIMT kernel
 // ============================================================
 
-using ConvShapeF = ManualFShape<4, 8, 2, 2, 16, 3>;
+using ConvShapeF = F32TileShape<4, 8, 2, 2, 16, 3>;
 
 /// The A panel in float units, padded rows of `BK + Pad`.
 using TConvFPanel = conv::PaddedPanel<ConvShapeF::LDA>;
@@ -477,7 +477,7 @@ void tconv_gemm_f_kernel(ConvParams pin)
         cp_async_wait_group<ST - 2>();
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
-        manual_gemm_f_tile<S, false, false>(sAbase + stage * S::kAMax,
+        f32_gemm_tile<S, false, false>(sAbase + stage * S::kAMax,
                                             sBbase + stage * S::kBMax, warp_m, warp_n, lane, acc);
     }
 

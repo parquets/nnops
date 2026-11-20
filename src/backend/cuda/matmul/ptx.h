@@ -4,7 +4,7 @@
  * 适用: __CUDA_ARCH__ >= 800 (SM80/SM86 Ampere)
  * 依赖: CUDA 11+, Clang 14+
  *
- * 剥离 CuTe 的 Layout/Tensor/TiledMMA 抽象层，每个函数直接对应一条 PTX 指令。
+ * 每个函数直接对应一条 PTX 指令，不经过任何库的 layout/tensor 抽象层。
  **************************************************************************************************/
 
 #pragma once
@@ -296,7 +296,7 @@ __device__ __forceinline__ void mma_m16n8k32_u8s8_satfinite(uint32_t* d0, uint32
 // ---------------------------------------------------------------------------
 // CUTLASS 的 SM80_16x8x32_S32S8S8S32_TN 不带 .satfinite，累加器溢出时按补码回绕。
 // 上面 2.7/2.9 是饱和变体，两者在 K·127·127 < 2^31 时逐位相同；这里给的是
-// CuTe 原子逐位对应的非饱和形式，供手写 int8 GEMM 使用。
+// 逐位对应的非饱和形式，供手写 int8 GEMM 使用。
 
 __device__ __forceinline__ void mma_m16n8k32_s8s8(uint32_t* d0, uint32_t* d1, uint32_t* d2,
                                                   uint32_t* d3, uint32_t a0, uint32_t a1,

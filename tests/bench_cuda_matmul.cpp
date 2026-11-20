@@ -1,5 +1,6 @@
 /// @file bench_cuda_matmul.cpp
-/// @brief CUDA MatMul throughput — the CuTe GEMM across sizes, dtypes and layouts.
+/// @brief CUDA MatMul throughput — the hand-written PTX GEMM across sizes,
+///        dtypes and layouts.
 ///
 /// One row per geometry, reporting GPU milliseconds per call and GFLOPS over
 /// 2·M·N·K. The kernel behind it is one CTA tile per dtype, 128 threads and a
@@ -414,21 +415,16 @@ NNOPS_BENCH(cuda_matmul_cublas) {
     }
 }
 
-/// The hand-written PTX kernel alone against cuBLAS, every 128 along the
-/// diagonal, both B layouts. `detail::cuda_ptx_h` is forced to 1 so the grid
-/// gate -- which sends a shape this kernel does not yet win back to CuTe -- is
-/// out of the picture and the rows are the kernel's own.
+/// The hand-written PTX kernel against cuBLAS, every 128 along the diagonal,
+/// both B layouts.
 NNOPS_BENCH(cuda_matmul_ptx_cublas) {
     print_cuda_header("CUDA MatMul f16: hand-written PTX vs cuBLAS, 128..4096");
-    auto& knob = nnops::detail::cuda_ptx_h;
-    knob.store(1);
     for (int64_t side = 128; side <= 4096; side += 128) {
         bench_vs_cublas(side, side, side, DataType::f16, true);
     }
     for (int64_t side = 128; side <= 4096; side += 512) {
         bench_vs_cublas(side, side, side, DataType::f16, false);
     }
-    knob.store(0);
 }
 
 /// The decode product alone, so `detail::cuda_splitk` can sweep its narrow-m
@@ -528,13 +524,10 @@ double run_i8(int64_t m, int64_t n, int64_t k, const char* tag,
     return cuda_gflops(ms, flops);
 }
 
-/// The hand-written PTX f16 GEMM (64x32 per warp) against the CuTe engine. Both
-/// arms go through the operator: `detail::cuda_ptx_h` is what separates them, so
-/// the ratio is the route's, not one kernel call's. Correctness is the CPU
-/// route's, for the same reason the arm below states.
-NNOPS_BENCH(cuda_matmul_manual_nn) {
-    print_cuda_header("CUDA MatMul f16 NN: hand-written PTX vs CuTe");
-    auto& knob = nnops::detail::cuda_ptx_h;
+/// The hand-written PTX f16 GEMM (64x32 per warp) through the operator, against
+/// cuBLAS, on the NN pose.
+NNOPS_BENCH(cuda_matmul_f16_nn) {
+    print_cuda_header("CUDA MatMul f16 NN: hand-written PTX vs cuBLAS");
     for (int64_t side : {256, 512, 1024, 2048, 4096}) {
         MatMulAttributes attrs;   // NN: B is [K, N]
         HostTensor ha = make_host_random(std::vector<int64_t>{side, side},
@@ -545,11 +538,10 @@ NNOPS_BENCH(cuda_matmul_manual_nn) {
                                          DataType::f16, false);
         DeviceTensor da = to_device(ha);
         DeviceTensor db = to_device(hb);
-        DeviceTensor dc_ref = to_device(hc);
         DeviceTensor dc_man = to_device(hc);
 
-        // The oracle is the CPU route, so the manual kernel is checked against
-        // the operator contract rather than against the same device engine.
+        // The oracle is the CPU route, so the kernel is checked against the
+        // operator contract rather than against another device engine.
         auto op_cpu = MatMul::create(attrs, Backend::CPU);
         const std::vector<TensorDesc> descs = {ha.view.desc(), hb.view.desc()};
         const TensorDesc od = op_cpu->getOutputTensorDesc(descs).front();
@@ -559,16 +551,11 @@ NNOPS_BENCH(cuda_matmul_manual_nn) {
 
         auto op = MatMul::create(attrs, Backend::CUDA);
         const TensorView ins[] = {da.view, db.view};
-        knob.store(-1);
-        TensorView o_ref = dc_ref.view;
-        const double ms_ref = cuda_median_ms([&] { cuda_launch(*op, o_ref, ins); });
-        knob.store(0);
         TensorView o_ptx = dc_man.view;
         const double ms_man = cuda_median_ms([&] { cuda_launch(*op, o_ptx, ins); });
-        knob.store(0);
 
         from_device(dc_man, hc);
-        expect_same(hc, href, kF16AccumTol, 2e-2f, "cuda_matmul_manual_nn");
+        expect_same(hc, href, kF16AccumTol, 2e-2f, "cuda_matmul_f16_nn");
 
         DeviceTensor gda = to_device(ha);
         DeviceTensor gdb = to_device(hb);
@@ -582,8 +569,6 @@ NNOPS_BENCH(cuda_matmul_manual_nn) {
         cublasDestroy(handle);
 
         const double flops = 2.0 * double(side) * double(side) * double(side);
-        print_cuda_row("cute", matmul_geometry(side, side, side, false, false),
-                       ms_ref, cuda_gflops(ms_ref, flops));
         print_cuda_row("ptx", matmul_geometry(side, side, side, false, false),
                        ms_man, cuda_gflops(ms_man, flops));
         print_cuda_row("cublas", matmul_geometry(side, side, side, false, false),
@@ -591,9 +576,8 @@ NNOPS_BENCH(cuda_matmul_manual_nn) {
     }
 }
 
-NNOPS_BENCH(cuda_matmul_manual_h) {
-    print_cuda_header("CUDA MatMul f16 TN: hand-written PTX vs CuTe");
-    auto& knob = nnops::detail::cuda_ptx_h;
+NNOPS_BENCH(cuda_matmul_f16_tn) {
+    print_cuda_header("CUDA MatMul f16 TN: hand-written PTX vs cuBLAS");
     for (int64_t side : {256, 512, 1024, 2048, 4096}) {
         MatMulAttributes attrs;
         attrs.transpose_b = true;
@@ -605,7 +589,6 @@ NNOPS_BENCH(cuda_matmul_manual_h) {
                                          DataType::f16, false);
         DeviceTensor da = to_device(ha);
         DeviceTensor db = to_device(hb);
-        DeviceTensor dc_ref = to_device(hc);
         DeviceTensor dc_man = to_device(hc);
 
         auto op_cpu = MatMul::create(attrs, Backend::CPU);
@@ -617,21 +600,15 @@ NNOPS_BENCH(cuda_matmul_manual_h) {
 
         auto op = MatMul::create(attrs, Backend::CUDA);
         const TensorView ins[] = {da.view, db.view};
-        knob.store(-1);
-        TensorView o_ref = dc_ref.view;
-        const double ms_ref =
-            cuda_median_ms([&] { cuda_launch(*op, o_ref, ins); });
-        knob.store(0);
         TensorView o_ptx = dc_man.view;
         const double ms_man =
             cuda_median_ms([&] { cuda_launch(*op, o_ptx, ins); });
-        knob.store(0);
 
         from_device(dc_man, hc);
-        expect_same(hc, href, kF16AccumTol, 2e-2f, "cuda_matmul_manual_h");
+        expect_same(hc, href, kF16AccumTol, 2e-2f, "cuda_matmul_f16_tn");
 
-        // cuBLAS on its own buffers, in the same warm state as the other two, so
-        // the three rows of a size are one measurement rather than three runs.
+        // cuBLAS on its own buffers, in the same warm state, so the two rows of
+        // a size are one measurement rather than two runs.
         DeviceTensor gda = to_device(ha);
         DeviceTensor gdb = to_device(hb);
         DeviceTensor gdc = to_device(hc);
@@ -644,8 +621,6 @@ NNOPS_BENCH(cuda_matmul_manual_h) {
         cublasDestroy(handle);
 
         const double flops = 2.0 * double(side) * double(side) * double(side);
-        print_cuda_row("cute", matmul_geometry(side, side, side, false, true),
-                       ms_ref, cuda_gflops(ms_ref, flops));
         print_cuda_row("ptx", matmul_geometry(side, side, side, false, true),
                        ms_man, cuda_gflops(ms_man, flops));
         print_cuda_row("cublas", matmul_geometry(side, side, side, false, true),
@@ -659,7 +634,7 @@ NNOPS_BENCH(cuda_matmul_manual_h) {
 NNOPS_BENCH(cuda_matmul_k_ramp) {
     print_cuda_header("CUDA MatMul f32 1024x1024xK: k ramp at a fixed grid");
     for (int64_t k : {1024, 2048, 4096, 8192}) {
-        nnops::backend::cuda::ManualFCall call_ours;
+        nnops::backend::cuda::F32Call call_ours;
         HostTensor ha = make_host_random(std::vector<int64_t>{1024, k},
                                          DataType::f32, false, 17, -0.5f, 0.5f);
         HostTensor hb = make_host_random(std::vector<int64_t>{1024, k},
@@ -681,7 +656,7 @@ NNOPS_BENCH(cuda_matmul_k_ramp) {
         call_ours.trans_b = true;
         call_ours.tile = 0;
         const double ms = cuda_median_ms([&] {
-            nnops::backend::cuda::manual_dense_f_call(call_ours, nullptr);
+            nnops::backend::cuda::f32_dense_call(call_ours, nullptr);
         });
 
         cublasHandle_t handle = nullptr;
@@ -731,7 +706,7 @@ NNOPS_BENCH(cuda_matmul_shallow_f) {
         for (int tile = 0; tile < 4; ++tile) {
             for (int splits : {0, 2, 4}) {
                 knob.store(splits);
-                nnops::backend::cuda::ManualFCall call;
+                nnops::backend::cuda::F32Call call;
                 call.a = da.view.ptr<void>();
                 call.b = db.view.ptr<void>();
                 call.c = dc.view.ptr<void>();
@@ -744,7 +719,7 @@ NNOPS_BENCH(cuda_matmul_shallow_f) {
                 call.trans_b = true;
                 call.tile = tile;
                 const double ms = cuda_median_ms([&] {
-                    nnops::backend::cuda::manual_dense_f_call(call, nullptr);
+                    nnops::backend::cuda::f32_dense_call(call, nullptr);
                 });
                 char tag[48];
                 std::snprintf(tag, sizeof(tag), "tile%d/split%d", tile, splits);
@@ -781,10 +756,10 @@ NNOPS_BENCH(cuda_matmul_one_nn_nt) {
     }
 }
 
-/// 4096^3 f32 NN, one launch each: the hand-written SIMT kernel and the CuTe
-/// engine it is chasing, back to back so a profiler catches both.
+/// 4096^3 f32 NN, one launch: the hand-written SIMT kernel, so a profiler lands
+/// on it rather than on a ladder of launches.
 NNOPS_BENCH(cuda_matmul_profile_nn) {
-    print_cuda_header("CUDA MatMul f32 4096^3 NN: SIMT then CuTe (one launch each)");
+    print_cuda_header("CUDA MatMul f32 4096^3 NN (single launch)");
     MatMulAttributes attrs;   // NN: B is [K, N]
     HostTensor ha = make_host_random(std::vector<int64_t>{4096, 4096},
                                      DataType::f32, false, 17, -0.5f, 0.5f);
@@ -797,16 +772,9 @@ NNOPS_BENCH(cuda_matmul_profile_nn) {
     DeviceTensor dc = to_device(hc);
     auto op = MatMul::create(attrs, Backend::CUDA);
     const TensorView ins[] = {da.view, db.view};
-    auto& knob = nnops::detail::cuda_ptx_f;
-    knob.store(0);
-    TensorView o1 = dc.view;
-    cuda_launch(*op, o1, ins);
+    TensorView out = dc.view;
+    cuda_launch(*op, out, ins);
     CudaBuffer::sync();
-    knob.store(-1);
-    TensorView o2 = dc.view;
-    cuda_launch(*op, o2, ins);
-    CudaBuffer::sync();
-    knob.store(0);
 }
 
 /// One 1024^3 f32 launch each -- ours and cuBLAS -- so a profiler lands on a
@@ -851,26 +819,18 @@ NNOPS_BENCH(cuda_matmul_one_f_cublas) {
     cublasDestroy(handle);
 }
 
-/// The f32 engines against cuBLAS on the interleaved harness -- twelve samples
-/// with the arms alternating, which is the only comparison this host's +-10%
-/// drift leaves trustworthy. The three-way arm times each arm to completion and
-/// so prices a clock excursion into one side.
+/// The f32 GEMM against cuBLAS on the interleaved harness -- twelve samples with
+/// the arms alternating, which is the only comparison this host's +-10% drift
+/// leaves trustworthy.
 NNOPS_BENCH(cuda_matmul_interleaved_f) {
     print_cuda_header("CUDA MatMul f32 TN: interleaved vs cuBLAS");
-    auto& knob = nnops::detail::cuda_ptx_f;
-    // Both B layouts: the record that CuTe matched cuBLAS on f32 was taken on
-    // an NN ladder, so the pose is the first thing to check a claim against.
+    // Both B layouts, since the k-major and n-major poses take different tiles.
     for (bool tb : {true, false}) {
         for (int64_t side : {2048, 4096}) {
-            knob.store(-1);
-            bench_vs_cublas(side, side, side, DataType::f32, tb,
-                            tb ? "f32 cute TN" : "f32 cute NN");
-            knob.store(0);
             bench_vs_cublas(side, side, side, DataType::f32, tb,
                             tb ? "f32 simt TN" : "f32 simt NN");
         }
     }
-    knob.store(0);
 }
 
 /// The f32 split-K cut, swept by the knob: which shapes want the reduction cut
@@ -940,7 +900,7 @@ NNOPS_BENCH(cuda_matmul_simt_tiles) {
 
         const double flops = 2.0 * double(side) * double(side) * double(side);
         for (int t = 0; t < 9; ++t) {
-            nnops::backend::cuda::ManualFCall call;
+            nnops::backend::cuda::F32Call call;
             call.a = da.view.ptr<void>();
             call.b = db.view.ptr<void>();
             call.c = dc.view.ptr<void>();
@@ -953,7 +913,7 @@ NNOPS_BENCH(cuda_matmul_simt_tiles) {
             call.trans_b = true;
             call.tile = t;
             const double ms = cuda_median_ms([&] {
-                nnops::backend::cuda::manual_dense_f_call(call, nullptr);
+                nnops::backend::cuda::f32_dense_call(call, nullptr);
             });
             if (side == 1024) {
                 from_device(dc, hc);
@@ -981,7 +941,7 @@ NNOPS_BENCH(cuda_matmul_simt_tiles) {
         DeviceTensor dc = to_device(hc);
         const double flops = 2.0 * double(side) * double(side) * double(side);
         for (int t = 0; t < 9; ++t) {
-            nnops::backend::cuda::ManualFCall call;
+            nnops::backend::cuda::F32Call call;
             call.a = da.view.ptr<void>();
             call.b = db.view.ptr<void>();
             call.c = dc.view.ptr<void>();
@@ -994,7 +954,7 @@ NNOPS_BENCH(cuda_matmul_simt_tiles) {
             call.trans_b = false;
             call.tile = t;
             const double ms = cuda_median_ms([&] {
-                nnops::backend::cuda::manual_dense_f_call(call, nullptr);
+                nnops::backend::cuda::f32_dense_call(call, nullptr);
             });
             print_cuda_row(kNames[t],
                            matmul_geometry(side, side, side, false, false), ms,
@@ -1028,7 +988,7 @@ NNOPS_BENCH(cuda_matmul_h_path_cmp) {
     TensorView out = dc.view;
     const double ms_op = cuda_median_ms([&] { cuda_launch(*op, out, ins); });
 
-    nnops::backend::cuda::ManualHCall call;
+    nnops::backend::cuda::F16Call call;
     call.a = da.view.ptr<void>();
     call.b = db.view.ptr<void>();
     call.c = dc.view.ptr<void>();
@@ -1044,7 +1004,7 @@ NNOPS_BENCH(cuda_matmul_h_path_cmp) {
     for (int t : {0, 0, 0, 0, 0}) {
         call.tile = t;
         const double ms = cuda_median_ms([&] {
-            nnops::backend::cuda::manual_dense_h_call(call, nullptr);
+            nnops::backend::cuda::f16_dense_call(call, nullptr);
         });
         char tag[32];
         std::snprintf(tag, sizeof(tag), "direct tile%d", t);
@@ -1066,11 +1026,10 @@ NNOPS_BENCH(cuda_matmul_interleaved_h) {
     }
 }
 
-/// f32 three-way in one warm state: the CuTe engine, the hand-written SIMT tile
-/// forced on, and cuBLAS, on its own buffers.
-NNOPS_BENCH(cuda_matmul_manual_f) {
-    print_cuda_header("CUDA MatMul f32 TN: CuTe vs hand-written SIMT vs cuBLAS");
-    auto& knob = nnops::detail::cuda_ptx_f;
+/// f32 across all four transpose poses in one warm state: the hand-written SIMT
+/// tile and cuBLAS, on its own buffers.
+NNOPS_BENCH(cuda_matmul_f32_poses) {
+    print_cuda_header("CUDA MatMul f32: hand-written SIMT vs cuBLAS");
     for (int pose = 0; pose < 4; ++pose)
     for (int64_t side : {256, 512, 1024, 2048, 4096}) {
         const bool ta = (pose & 1) != 0;
@@ -1086,7 +1045,6 @@ NNOPS_BENCH(cuda_matmul_manual_f) {
                                          DataType::f32, false);
         DeviceTensor da = to_device(ha);
         DeviceTensor db = to_device(hb);
-        DeviceTensor dc_ref = to_device(hc);
         DeviceTensor dc_simt = to_device(hc);
 
         auto op_cpu = MatMul::create(attrs, Backend::CPU);
@@ -1098,16 +1056,11 @@ NNOPS_BENCH(cuda_matmul_manual_f) {
 
         auto op = MatMul::create(attrs, Backend::CUDA);
         const TensorView ins[] = {da.view, db.view};
-        knob.store(-1);
-        TensorView o_ref = dc_ref.view;
-        const double ms_ref = cuda_median_ms([&] { cuda_launch(*op, o_ref, ins); });
-        knob.store(1);
         TensorView o_simt = dc_simt.view;
         const double ms_simt = cuda_median_ms([&] { cuda_launch(*op, o_simt, ins); });
-        knob.store(0);
 
         from_device(dc_simt, hc);
-        expect_same(hc, href, 1e-4f, 1e-3f, "cuda_matmul_manual_f");
+        expect_same(hc, href, 1e-4f, 1e-3f, "cuda_matmul_f32_poses");
 
         DeviceTensor gda = to_device(ha);
         DeviceTensor gdb = to_device(hb);
@@ -1132,8 +1085,6 @@ NNOPS_BENCH(cuda_matmul_manual_f) {
         cublasDestroy(handle);
 
         const double flops = 2.0 * double(side) * double(side) * double(side);
-        print_cuda_row("cute", matmul_geometry(side, side, side, ta, tb),
-                       ms_ref, cuda_gflops(ms_ref, flops));
         print_cuda_row("simt", matmul_geometry(side, side, side, ta, tb),
                        ms_simt, cuda_gflops(ms_simt, flops));
         print_cuda_row("cublas", matmul_geometry(side, side, side, ta, tb),
@@ -1141,7 +1092,7 @@ NNOPS_BENCH(cuda_matmul_manual_f) {
     }
 }
 
-/// The tile menu: every compiled `ManualHShape`, at the same geometry, so the
+/// The tile menu: every compiled `F16TileShape`, at the same geometry, so the
 /// per-warp value tile and the cp.async ring can be compared without rebuilding.
 /// Correctness rides on the smallest size only; the large ones are timings.
 NNOPS_BENCH(cuda_matmul_ptx_tiles) {
@@ -1174,7 +1125,7 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
 
         const double flops = 2.0 * double(side) * double(side) * double(side);
         for (int t = 0; t < 6; ++t) {
-            nnops::backend::cuda::ManualHCall call;
+            nnops::backend::cuda::F16Call call;
             call.a = da.view.ptr<void>();
             call.b = db.view.ptr<void>();
             call.c = dc.view.ptr<void>();
@@ -1186,7 +1137,7 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
             call.ldc = side;
             call.trans_b = true;
             call.tile = t;
-            const bool ok = nnops::backend::cuda::manual_dense_h_call(call, nullptr);
+            const bool ok = nnops::backend::cuda::f16_dense_call(call, nullptr);
             if (cudaDeviceSynchronize() != cudaSuccess) {
                 std::fprintf(stderr, "tile %d @%lld: %s\n", t,
                              static_cast<long long>(side),
@@ -1195,7 +1146,7 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
                 continue;
             }
             const double ms = cuda_median_ms([&] {
-                nnops::backend::cuda::manual_dense_h_call(call, nullptr);
+                nnops::backend::cuda::f16_dense_call(call, nullptr);
             });
             from_device(dc, hc);
             char what[96];
@@ -1225,7 +1176,7 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
         DeviceTensor dc = to_device(hc);
         const double flops = 2.0 * double(side) * double(side) * double(side);
         for (int t = 0; t < 6; ++t) {
-            nnops::backend::cuda::ManualHCall call;
+            nnops::backend::cuda::F16Call call;
             call.a = da.view.ptr<void>();
             call.b = db.view.ptr<void>();
             call.c = dc.view.ptr<void>();
@@ -1238,7 +1189,7 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
             call.trans_b = false;
             call.tile = t;
             const double ms = cuda_median_ms([&] {
-                nnops::backend::cuda::manual_dense_h_call(call, nullptr);
+                nnops::backend::cuda::f16_dense_call(call, nullptr);
             });
             print_cuda_row(kNames[t], matmul_geometry(side, side, side, false, false),
                            ms, cuda_gflops(ms, flops));
@@ -1311,17 +1262,14 @@ NNOPS_BENCH(cuda_matmul_i8) {
     run_i8(4096, 4096, 2048, "i8 tb", true);
 }
 
-/// The int8 engines against each other on the interleaved harness: twelve
-/// samples each, alternating which arm leads. `cuda_ptx_i8` is the only thing
-/// that separates them, so the ratio is the route's rather than one kernel
-/// call's, and correctness has already been settled by the CPU oracle in
-/// test_cuda_matmul.
+/// The int8 operator route across its output dtypes and both B layouts, on the
+/// interleaved harness: twelve samples, so the number is not one lucky launch.
+/// Correctness has already been settled by the CPU oracle in test_cuda_matmul.
 NNOPS_BENCH(cuda_matmul_i8_ptx) {
-    print_cuda_header("CUDA MatMul int8 u8xs8->s32: PTX vs CuTe");
-    auto& knob = nnops::detail::cuda_ptx_i8;
+    print_cuda_header("CUDA MatMul int8 u8xs8->s32: output dtypes, both B layouts");
 
-    // The raw integer destination and one dequantizing one: the two epilogue
-    // families the hand-written kernel now answers for.
+    // The raw integer destination and the dequantizing ones: the epilogue
+    // families the hand-written kernel answers for.
     for (DataType odt : {DataType::s32, DataType::s8, DataType::u8,
                         DataType::f32, DataType::f16}) {
     for (bool tb : {true, false}) {
@@ -1362,70 +1310,42 @@ NNOPS_BENCH(cuda_matmul_i8_ptx) {
 
             auto op = MatMul::create(attrs, Backend::CUDA);
             const TensorView ins[] = {av, bv};
-            auto cute = [&] {
-                knob.store(-1);
-                cuda_launch(*op, cv, ins);
-            };
-            auto ptx = [&] {
-                knob.store(0);
-                cuda_launch(*op, cv, ins);
-            };
+            auto ptx = [&] { cuda_launch(*op, cv, ins); };
 
             cudaEvent_t begin = nullptr;
             cudaEvent_t end = nullptr;
             NNOPS_CUDA_CHECK(cudaEventCreate(&begin));
             NNOPS_CUDA_CHECK(cudaEventCreate(&end));
             CudaBuffer::sync();
-            cute();
             ptx();
             CudaBuffer::sync();
 
-            std::vector<double> ms_cute, ms_ptx;
+            std::vector<double> ms_ptx;
             for (int i = 0; i < 12; ++i) {
-                if (i % 2 == 0) {
-                    ms_cute.push_back(timed_launch(cute, begin, end));
-                    ms_ptx.push_back(timed_launch(ptx, begin, end));
-                } else {
-                    ms_ptx.push_back(timed_launch(ptx, begin, end));
-                    ms_cute.push_back(timed_launch(cute, begin, end));
-                }
+                ms_ptx.push_back(timed_launch(ptx, begin, end));
             }
             NNOPS_CUDA_CHECK(cudaEventDestroy(begin));
             NNOPS_CUDA_CHECK(cudaEventDestroy(end));
-            knob.store(0);
 
-            std::sort(ms_cute.begin(), ms_cute.end());
             std::sort(ms_ptx.begin(), ms_ptx.end());
-            const double c = ms_cute[ms_cute.size() / 2];
             const double p = ms_ptx[ms_ptx.size() / 2];
             const double flops = 2.0 * double(m) * double(n) * double(k);
             const auto geo = matmul_geometry(m, n, k, false, tb);
-            print_cuda_row(tb ? "i8 cute NT" : "i8 cute NN", geo, c,
-                           cuda_gflops(c, flops));
             print_cuda_row(tb ? "i8 ptx NT" : "i8 ptx NN", geo, p,
                            cuda_gflops(p, flops));
-            std::printf("    ratio ptx/cute %.3f  (%s dst)\n", p / c,
-                        odt == DataType::s32   ? "s32"
-                        : odt == DataType::s8  ? "s8"
-                        : odt == DataType::u8  ? "u8"
-                        : odt == DataType::f32 ? "f32"
-                                               : "f16");
         }
     }
     }
 }
 
 /// The hand-written int8 PTX tile against cuBLAS, which reaches the same IMMA
-/// instructions through `CUBLAS_COMPUTE_32I`. Two caveats travel with the
-/// numbers. cuBLAS computes the bare integer product, while the operator's
+/// instructions through `CUBLAS_COMPUTE_32I`. One caveat travels with the
+/// numbers: cuBLAS computes the bare integer product, while the operator's
 /// MatMulInteger contract also sweeps the two reduction planes and applies the
 /// zero-point compensation per output element -- that extra work is ours and is
-/// included. And the route is forced with `cuda_ptx_i8`, so no shape here can
-/// fall back to the engine this replaced and pass itself off as the new kernel.
+/// included.
 NNOPS_BENCH(cuda_matmul_i8_cublas) {
     print_cuda_header("CUDA MatMul int8 s8xs8->s32: hand-written PTX vs cuBLAS");
-    auto& knob = nnops::detail::cuda_ptx_i8;
-    const int saved = knob.exchange(1);
 
     struct Shape {
         int64_t m, n, k;
@@ -1588,14 +1508,13 @@ NNOPS_BENCH(cuda_matmul_i8_cublas) {
         std::printf("    ratio %s/cublas %.3f\n", narrow ? "dp4a" : "ptx",
                     o / t);
     }
-    knob.store(saved);
 }
 
-/// The same 4096^3 with every menu row forced, so "is cuBLAS's lead a tiling
-/// difference or an instruction-path one" is a measurement, not an argument.
+/// The same 4096^3 at the automatic tile against cuBLAS, both B layouts, so "is
+/// cuBLAS's lead a tiling difference or an instruction-path one" is a
+/// measurement, not an argument.
 NNOPS_BENCH(cuda_matmul_i8_cublas_tiles) {
-    print_cuda_header("CUDA MatMul int8 4096^3: menu rows vs cuBLAS");
-    auto& knob = nnops::detail::cuda_ptx_i8;
+    print_cuda_header("CUDA MatMul int8 4096^3: auto tile vs cuBLAS");
 
     for (bool tb : {true, false}) {
         const int64_t m = 4096, n = 4096, k = 4096;
@@ -1650,90 +1569,10 @@ NNOPS_BENCH(cuda_matmul_i8_cublas_tiles) {
         print_cuda_row(tb ? "i8 cublas NT" : "i8 cublas NN", geo, cm,
                        cuda_gflops(cm, flops));
 
-        // Rows 0..2 are 64x64, 128x64 and 128x128; the knob names one as N + 2.
-        for (int row = 0; row < 3; ++row) {
-            knob.store(row + 2);
-            const double ms = cuda_median_ms([&] { cuda_launch(*op, cv, ins); });
-            char tag[48];
-            std::snprintf(tag, sizeof(tag), "i8 row%d %s", row,
-                          tb ? "NT" : "NN");
-            print_cuda_row(tag, geo, ms, cuda_gflops(ms, flops));
-            std::printf("    ratio row%d/cublas %.3f\n", row, ms / cm);
-        }
-        knob.store(1);
-        const double auto_ms =
-            cuda_median_ms([&] { cuda_launch(*op, cv, ins); });
-        print_cuda_row(tb ? "i8 auto NT" : "i8 auto NN", geo, auto_ms,
-                       cuda_gflops(auto_ms, flops));
-        std::printf("    ratio auto/cublas %.3f\n", auto_ms / cm);
-    }
-    knob.store(0);
-}
-
-NNOPS_BENCH(cuda_matmul_i8_tiles) {
-    print_cuda_header("CUDA MatMul int8: the tile menu");
-    auto& knob = nnops::detail::cuda_ptx_i8;
-
-    // Menu rows: 0 = 64x64x64 s2, 1 = 128x64x64, 2 = 128x128x64 on eight warps.
-    for (int64_t side : {512, 1024, 2048, 4096}) {
-        for (bool tb : {false, true}) {
-            const int64_t m = side, n = side, k = side;
-            MatMulAttributes attrs;
-            attrs.output_dtype = DataType::s32;
-            attrs.transpose_b = tb;
-
-            test::XorShift128 rng(17);
-            std::vector<uint8_t> a(static_cast<size_t>(m * k));
-            for (auto& e : a) { e = static_cast<uint8_t>(rng.next_u64() & 0xFFu); }
-            std::vector<int8_t> b(static_cast<size_t>(k * n));
-            for (auto& e : b) {
-                e = static_cast<int8_t>(int32_t(rng.next_u64() % 255) - 127);
-            }
-            QuantParams qa;
-            qa.scale = 0.01f;
-            qa.zero_point = 128;
-            QuantParams qb;
-            qb.scale = 0.004f;
-            qb.zero_point = 3;
-
-            CudaBuffer da(a.size()), db(b.size());
-            CudaBuffer dc(static_cast<size_t>(m * n) * sizeof(int32_t));
-            da.upload(a.data(), a.size());
-            db.upload(b.data(), b.size());
-            dc.zero();
-            const int64_t as[] = {m, k};
-            const int64_t bs[] = {tb ? n : k, tb ? k : n};
-            const int64_t cs[] = {m, n};
-            TensorView av(std::span<const int64_t>(as, 2), DataType::u8,
-                          da.data(), TensorLayout::Dense, qa);
-            TensorView bv(std::span<const int64_t>(bs, 2), DataType::s8,
-                          db.data(), TensorLayout::Dense, qb);
-            TensorView cv(std::span<const int64_t>(cs, 2), DataType::s32,
-                          dc.data());
-            auto op = MatMul::create(attrs, Backend::CUDA);
-            const TensorView ins[] = {av, bv};
-            const double flops = 2.0 * double(m) * double(n) * double(k);
-            const auto geo = matmul_geometry(m, n, k, false, tb);
-
-            for (int t = 0; t < 4; ++t) {
-                knob.store(t < 2 ? t : t + 1);   // -1 (CuTe) is index 0 here
-                const double ms = cuda_median_ms([&] {
-                    cuda_launch(*op, cv, ins);
-                });
-                char tag[32];
-                if (t == 0) {
-                    std::snprintf(tag, sizeof(tag), "i8 cute %s",
-                                  tb ? "NT" : "NN");
-                } else if (t == 1) {
-                    std::snprintf(tag, sizeof(tag), "i8 t0 %s   ", tb ? "NT" : "NN");
-                } else {
-                    std::snprintf(tag, sizeof(tag), "i8 t%d %s   ", t - 1,
-                                  tb ? "NT" : "NN");
-                }
-                print_cuda_row(tag, geo, ms, cuda_gflops(ms, flops));
-            }
-            knob.store(0);
-        }
+        const double ms = cuda_median_ms([&] { cuda_launch(*op, cv, ins); });
+        print_cuda_row(tb ? "i8 auto NT" : "i8 auto NN", geo, ms,
+                       cuda_gflops(ms, flops));
+        std::printf("    ratio auto/cublas %.3f\n", ms / cm);
     }
 }
 

@@ -3,8 +3,8 @@
 ///
 /// Permute, Slice, Tile, Expand, Concat and Split all reduce to one loop: an
 /// output row is a source run copied element by element, and the row's source
-/// base is a mixed-radix walk over the output coordinate. That walk is a CuTe
-/// layout — `make_move_layout` builds one from the output extents and a stride
+/// base is a mixed-radix walk over the output coordinate. That walk is a
+/// `MoveLayout` — `make_move_layout` builds one from the extents and a stride
 /// per output axis — so each operator only states its mapping (which input axis
 /// each output axis reads, with what offset and step) and the address algebra
 /// stays here. The destination is described the same way, except that the
@@ -28,8 +28,6 @@
 #include "nnops/core/status.hpp"
 #include "nnops/core/tensor_view.hpp"
 
-#include <cute/tensor.hpp>
-
 #include <algorithm>
 #include <cstdint>
 
@@ -39,22 +37,41 @@ namespace nnops::backend::cuda {
 // The layout pair
 // ============================================================
 
-/// One runtime layout, rank 8 (unused modes: extent 1, stride 0).
-using MoveShape =
-    cute::Shape<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
-using MoveStride =
-    cute::Stride<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
-using MoveLayout = cute::Layout<MoveShape, MoveStride>;
+/// One runtime layout, rank 8 (unused modes: extent 1, stride 0), mode 0
+/// fastest. A flat coordinate is decoded as a mixed-radix odometer over `dims`
+/// and folded into an element offset through the matching `strides` — the same
+/// arithmetic a row-major view's own index decode does, spelled out here
+/// because every operand of a move is a strided view of a different rank.
+struct MoveLayout {
+    int64_t dims[8] = {};
+    int64_t strides[8] = {};
+};
 
-/// CuTe's flat coordinate runs mode 0 fastest, which is the tensor's *last*
-/// axis, so the modes are filled in reverse axis order; the extent-1 modes the
-/// padding adds end up in front, where they contribute nothing.
+/// Offset of flat index `flat` under `l`. Runs once per row, so it stays out
+/// of line: inlined into `move_rows_kernel` the unrolled odometer makes cicc
+/// abort with "Failed to read bitcode" under `--split-compile=0`.
+static __host__ __device__ __noinline__ int64_t move_offset(const MoveLayout& l, int64_t flat)
+{
+    int64_t off = 0;
+    for (int i = 0; i < 8; ++i) {
+        const int64_t q = flat / l.dims[i];
+        off += (flat - q * l.dims[i]) * l.strides[i];
+        flat = q;
+    }
+    return off;
+}
+
+/// Mode 0 is the tensor's *last* axis, so the arrays are filled in reverse axis
+/// order; the extent-1 modes the padding adds end up in front, where they
+/// contribute nothing.
 inline MoveLayout make_move_layout(const int64_t (&dims)[8], const int64_t (&strides)[8])
 {
-    return cute::make_layout(
-        cute::make_shape(dims[7], dims[6], dims[5], dims[4], dims[3], dims[2], dims[1], dims[0]),
-        cute::make_stride(strides[7], strides[6], strides[5], strides[4], strides[3], strides[2],
-                          strides[1], strides[0]));
+    MoveLayout l;
+    for (int i = 0; i < 8; ++i) {
+        l.dims[i] = dims[7 - i];
+        l.strides[i] = strides[7 - i];
+    }
+    return l;
 }
 
 /// `view`'s logical strides as the layout's stride array, padded to rank 8.
@@ -183,8 +200,8 @@ __global__ void move_rows_kernel(const T* __restrict__ src, T* __restrict__ dst,
     // both operands advance by a constant stride.
     for (int64_t r = blockIdx.x; r < p.rows; r += gridDim.x) {
         const int64_t flat = r * p.cols;
-        const int64_t so = p.src_base + p.src(flat);
-        const int64_t dof = p.dst_base + (p.dst_compact ? flat : p.dst(flat));
+        const int64_t so = p.src_base + move_offset(p.src, flat);
+        const int64_t dof = p.dst_base + (p.dst_compact ? flat : move_offset(p.dst, flat));
         copy_run(dst + dof, src + so, p.cols, p.src_step, p.dst_step);
     }
 }

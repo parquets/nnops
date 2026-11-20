@@ -17,7 +17,7 @@
 namespace nnops::backend::cuda {
 
 /// `tile` picks a menu row explicitly (-1 takes the automatic one).
-bool manual_dense_i8_tile(GemmI8Params q, DataType a_dt, bool trans_a, bool trans_b,
+bool i8_dense_tile(GemmI8Params q, DataType a_dt, bool trans_a, bool trans_b,
                           cudaStream_t stream, int tile = -1);
 
 } // namespace nnops::backend::cuda

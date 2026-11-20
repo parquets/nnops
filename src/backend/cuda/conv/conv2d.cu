@@ -330,7 +330,7 @@ __device__ inline void conv_store(const ConvParams& p, int64_t base, int pixel, 
 /// ones where it does, because the wider tile halves the block count of planes
 /// that were already too short to fill the machine. Wider m tiles and deeper k
 /// panels lose the same way, on resident blocks.
-using ConvShapeH = ManualHShape<32, 32, 2, 2, 64, 2, 1, false, 1>;
+using ConvShapeH = F16TileShape<32, 32, 2, 2, 64, 2, 1, false, 1>;
 
 /// The gather's (row, col, stage) indexer over the k-major swizzled panel.
 template <class S, class Elem> using ConvHPanel = conv::KMajorPanel<S, Elem>;
@@ -402,7 +402,7 @@ void conv_gemm_h_kernel(ConvParams p)
             for (int i = tid; i < BK * kNVec; i += S::threads) {
                 const int kr = i / kNVec;
                 const int nv = i - kr * kNVec;
-                cp_async_ca_16B(&sB[manual_swz_n<S>(kr, nv * 8)],
+                cp_async_ca_16B(&sB[f16_swz_n<S>(kr, nv * 8)],
                                 W + int64_t(n0 + nv * 8) * p.w_n + int64_t(k0 + kr) * p.w_ic);
             }
         } else {
@@ -411,8 +411,8 @@ void conv_gemm_h_kernel(ConvParams p)
                 const int col = i - row * BK;
                 const int n = n0 + row;
                 const int k = k0 + col;
-                sB[manual_swz_n<S>(col, row)] =
-                    (n < N && k < K) ? conv_weight<Elem>(p, W, n, k) : manual_zero<Elem>();
+                sB[f16_swz_n<S>(col, row)] =
+                    (n < N && k < K) ? conv_weight<Elem>(p, W, n, k) : gemm_zero<Elem>();
             }
         }
         cp_async_commit_group();
@@ -442,7 +442,7 @@ void conv_gemm_h_kernel(ConvParams p)
         cp_async_wait_group<ST - 2>();
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
-        manual_gemm_h_tile<S, Elem, false, false>(sAbase + stage * S::kAMax,
+        f16_gemm_tile<S, Elem, false, false>(sAbase + stage * S::kAMax,
                                                   sBbase + stage * S::kBMax, warp_m, warp_n, lane,
                                                   acc);
     }
@@ -501,7 +501,7 @@ void conv_gemm_h_kernel(ConvParams p)
 // ============================================================
 
 /// The f32 tile: 8x8 per lane, a three-deep ring, and 16 elements of k a stage.
-using ConvShapeF = ManualFShape<4, 8, 2, 2, 16, 3>;
+using ConvShapeF = F32TileShape<4, 8, 2, 2, 16, 3>;
 
 /// The A panel in float units: rows of `BK + Pad`, the padding being what keeps
 /// a 16 B gather vector 16 B aligned on every row.
@@ -606,7 +606,7 @@ void conv_gemm_f_kernel(ConvParams p)
         cp_async_wait_group<ST - 2>();
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
-        manual_gemm_f_tile<S, false, false>(sAbase + stage * S::kAMax,
+        f32_gemm_tile<S, false, false>(sAbase + stage * S::kAMax,
                                             sBbase + stage * S::kBMax, warp_m, warp_n, lane, acc);
     }
 
@@ -847,7 +847,7 @@ inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
 /// The int8 tile: 64 pixels by 64 channels, 64 bytes of k, three stages. The s8
 /// panels are half the fp16 footprint, so a third stage still leaves four blocks
 /// a SM.
-using ConvShapeI8 = ManualI8Shape<32, 32, 2, 2, 64, 3>;
+using ConvShapeI8 = I8TileShape<32, 32, 2, 2, 64, 3>;
 
 /// Either k-major s8 panel, as the gather's (row, col, stage) indexer. The base
 /// already carries the stage; rows are `LD` bytes apart.
@@ -1108,7 +1108,7 @@ void conv_gemm_i8_kernel(ConvParams p)
         cp_async_wait_group<ST - 2>();
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
-        manual_gemm_i8_tile<S, AElem>(sAbase + stage * S::kABytes, sBbase + stage * S::kBBytes,
+        i8_gemm_tile<S, AElem>(sAbase + stage * S::kABytes, sBbase + stage * S::kBBytes,
                                       warp_m, warp_n, lane, acc);
     }
 

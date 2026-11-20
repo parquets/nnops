@@ -1,11 +1,11 @@
 /// @file gemm_common.cuh
-/// @brief The CuTe-free half of the dense GEMM contract: the parameter struct,
+/// @brief The shared half of the dense GEMM contract: the parameter struct,
 ///        the shared epilogue, the batch/block/split geometry, the device
 ///        queries, and the split-K scratch.
 ///
 /// Everything but the tile algebra lives here, so a kernel that fills its own
 /// panels -- the int8 engines, and the conv policies built on the hand-written
-/// PTX mainloops -- can include it without pulling in CuTe.
+/// PTX mainloops -- can include it without the tile machinery.
 
 #pragma once
 
@@ -29,6 +29,14 @@ inline constexpr int kGemmMaxBatchRank = 4;
 /// blockIdx.y in the split-K reduce pass, and the f32 tile's n axis, which walks
 /// blockIdx.y. The front end refuses a call that would overflow any of them.
 inline constexpr int64_t kGemmMaxGridAxis = 65535;
+
+/// The dense GEMM's element formats: the f32 SIMT tile, or one of the two
+/// 2-byte tensor-core formats (same MMA shape, different operand format).
+enum class GemmElem {
+    F32,
+    F16,
+    BF16
+};
 
 /// Everything a dense GEMM needs besides the element type and the two
 /// transpose flags (which are template parameters, since they pick the copy

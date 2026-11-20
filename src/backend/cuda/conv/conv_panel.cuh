@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "../matmul/matmul_f16.cuh" // manual_swz
+#include "../matmul/matmul_f16.cuh" // f16_swz
 
 namespace nnops::backend::cuda::conv {
 
@@ -17,7 +17,7 @@ struct KMajorPanel {
     Elem* base;
     __device__ __forceinline__ Elem& operator()(int row, int col, int) const
     {
-        return base[manual_swz<S>(row, col)];
+        return base[f16_swz<S>(row, col)];
     }
 };
 

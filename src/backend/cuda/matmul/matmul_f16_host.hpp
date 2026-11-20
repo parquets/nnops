@@ -15,7 +15,7 @@ namespace nnops::backend::cuda {
 /// The poses the hand-written kernel covers today: A `[M, K]` row-major, B
 /// k-major `[N, K]` or n-major `[K, N]`, alpha 1, no bias, no epilogue, f16 or
 /// bf16 in and out.
-struct ManualHCall {
+struct F16Call {
     const void* a = nullptr;
     const void* b = nullptr;
     void* c = nullptr;
@@ -50,9 +50,14 @@ struct ManualHCall {
     /// Tile index into the compiled candidate list (-1 = the automatic pick).
     /// A bench sweeps it; every production caller leaves it alone.
     int tile = -1;
+    /// 1 when a 16 B cp.async can address both operands; 0 takes the fill's
+    /// scalar path. Resolved by the entry point from the alignment it checks.
+    int vec = 1;
 };
 
 /// Launch the hand-written kernel; false when the call is outside its pose.
-bool manual_dense_h_call(const ManualHCall& call, cudaStream_t stream);
+/// `force` skips the grid-fill gate: a shallow product runs on this tile too,
+/// at whatever rate it gets.
+bool f16_dense_call(const F16Call& call, cudaStream_t stream, bool force = false);
 
 } // namespace nnops::backend::cuda

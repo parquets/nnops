@@ -15,12 +15,13 @@
 /// pool (the default pool releases on every free, which measured at 1.45 ms a
 /// pair on WDDM). `detail::cuda_splitk` forces or disables it for a bench; -1
 /// means the heuristic.
+///
+/// What lives here is the reduce pass alone; each engine keeps its own k-split
+/// heuristic and launches this pass over its planes.
 
 #pragma once
 
 #include "gemm_common.cuh"
-#include "matmul_tile_h.cuh"
-#include "matmul_tile_f.cuh"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -84,73 +85,6 @@ template <class Elem> inline void launch_splitk_reduce(const GemmParams& p, cuda
     dim3 grid(static_cast<unsigned>((plane + kThreads - 1) / kThreads),
               static_cast<unsigned>(gemm_batch_count(p)), 1);
     dense_gemm_splitk_reduce_kernel<Elem><<<grid, kThreads, 0, stream>>>(p);
-}
-
-/// Launch a tile, cutting the reduction into k ranges when the grid is shallower
-/// than the tile wants, and reducing the planes afterwards. Falls back to the
-/// single-pass launch whenever a split cannot help or its scratch cannot be
-/// carved.
-template <class Elem, class Tile, bool TransA, bool TransB, bool Vectorized, int Groups = 1>
-inline void launch_dense_split(const GemmParams& p, cudaStream_t stream)
-{
-    constexpr bool Half = !std::is_same_v<Elem, float>;
-    auto launch_one = [&](const GemmParams& q) {
-        if constexpr (Half) {
-            launch_dense_h<Tile, Elem, TransA, TransB, Vectorized, Groups>(q, stream);
-        } else {
-            launch_dense_f<Tile, TransA, TransB, Vectorized>(q, stream);
-        }
-    };
-
-    // A grouped CTA is wider and takes more smem, so it holds fewer residents:
-    // two 39 KB blocks against three 27 KB ones.
-    constexpr int blocks_per_sm = [] {
-        if constexpr (Half) {
-            return Groups == 1 ? 3 : 2;
-        } else {
-            return Tile::blocks;
-        }
-    }();
-    const int elem_size = Half ? 2 : 4;
-    int splits = pick_split_k(p, Tile::bM, Tile::bN * Groups, Tile::bK,
-                              device_sm_count() * blocks_per_sm, elem_size);
-    if (splits <= 1) {
-        launch_one(p);
-        return;
-    }
-
-    const int64_t batch = gemm_batch_count(p);
-    const int64_t plane = static_cast<int64_t>(p.m) * p.n;
-    // gridDim.z is 16-bit, and the partial planes are f32 whatever the operands.
-    while (splits > 1 && batch * splits > 65535) {
-        splits /= 2;
-    }
-    int64_t bytes = int64_t(splits) * batch * plane * int64_t(sizeof(float));
-    while (splits > 1 && bytes > kSplitKMaxBytes) {
-        splits /= 2;
-        bytes = int64_t(splits) * batch * plane * int64_t(sizeof(float));
-    }
-    if (splits <= 1) {
-        launch_one(p);
-        return;
-    }
-
-    const GemmWorkspace ws = gemm_workspace_alloc(bytes, stream);
-    if (ws.ptr == nullptr) {
-        launch_one(p);
-        return;
-    }
-
-    GemmParams q = p;
-    q.k_splits = splits;
-    q.partial = static_cast<float*>(ws.ptr);
-    launch_one(q);
-    if constexpr (Half) {
-        launch_splitk_reduce<Elem>(q, stream);
-    } else {
-        launch_splitk_reduce<float>(q, stream);
-    }
-    gemm_workspace_free(ws, stream);
 }
 
 } // namespace detail

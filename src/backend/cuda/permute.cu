@@ -1,5 +1,5 @@
 /// @file permute.cu
-/// @brief CUDA Permute — a CuTe layout walk, plus a tiled transpose for the
+/// @brief CUDA Permute — a layout walk, plus a tiled transpose for the
 ///        one permutation that has no contiguous run to walk.
 ///
 /// The general case is `move_common.cuh`: output axis d reads input axis
