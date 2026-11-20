@@ -2276,6 +2276,88 @@ NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
     }
 }
 
+NNOPS_TEST(matmul_int8_nn_tile_remainders) {
+    // The integer route has the same M/N/K boundaries as fp, but its own pack
+    // (four K per group, a 12/16-wide B panel with a k-group tail) and its own
+    // M ladder. SME is pinned off so the generic route runs on an SME host too;
+    // shapes below the small/GEMV gates stay there, and the rest walk the tiled
+    // path. Symmetric per-tensor operands keep the expected value an exact int32
+    // dot, so a tail read one group short fails by a value, not by noise.
+    const SmePin sme_off(/*on=*/false);
+
+    struct Shape {
+        int64_t M, N, K;
+        bool ta, tb;
+    };
+    const Shape shapes[] = {
+        {1, 1, 1, false, false},     // the scalar/small route
+        {1, 13, 4, false, false},    // one row, one k group
+        {4, 17, 9, false, false},    // the GEMV rung, N past one panel
+        {5, 33, 7, false, false},    // just past the one-row rung
+        {8, 16, 8, false, false},    // exactly one M panel and one k group
+        {9, 13, 17, false, false},   // M, N and K all on tails
+        {17, 12, 129, false, false}, // M and K past their blocks
+        {33, 64, 64, false, false},  // several tiles in both axes
+        {33, 65, 3, false, false},   // N one past a 64-block, tiny K
+        {65, 17, 65, false, false},  // several M blocks, N tails
+        {64, 1, 7, false, false},    // a single output column
+        {17, 16, 1, false, false},   // one k group only
+        {143, 17, 4, false, false},  // lopsided, K one group
+        {144, 145, 8, false, false}, // M and N on full MR/panel boundaries
+        {9, 33, 17, false, true},    // B stored N×K
+        {17, 12, 129, true, false},  // A stored K×M (forces the A pack)
+        {33, 70, 129, true, true},   // both packed
+    };
+
+    for (size_t ci = 0; ci < std::size(shapes); ++ci) {
+        const Shape& s = shapes[ci];
+        const int64_t a_rows = s.ta ? s.K : s.M, a_cols = s.ta ? s.M : s.K;
+        const int64_t b_rows = s.tb ? s.N : s.K, b_cols = s.tb ? s.K : s.N;
+        const int64_t ashape[] = {a_rows, a_cols};
+        const int64_t bshape[] = {b_rows, b_cols};
+
+        nnops::test::XorShift128 rng(7000 + static_cast<uint64_t>(ci));
+        std::vector<int8_t> av(static_cast<size_t>(a_rows * a_cols));
+        std::vector<int8_t> bv(static_cast<size_t>(b_rows * b_cols));
+        for (auto& e : av) { e = static_cast<int8_t>(static_cast<int>(rng.next_u64() % 255) - 127); }
+        for (auto& e : bv) { e = static_cast<int8_t>(static_cast<int>(rng.next_u64() % 255) - 127); }
+
+        TensorView a(ashape, DataType::s8, av.data(), TensorLayout::Dense,
+                     bias_per_tensor(0.01f, 0));
+        TensorView b(bshape, DataType::s8, bv.data(), TensorLayout::Dense,
+                     bias_per_tensor(0.004f, 0));
+
+        MatMulAttributes attrs;
+        attrs.transpose_a = s.ta;
+        attrs.transpose_b = s.tb;
+        attrs.output_dtype = DataType::s32;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc descs[] = {a.desc(), b.desc()};
+        const auto od = op->getOutputTensorDesc(descs)[0];
+        std::vector<int32_t> out_buf(static_cast<size_t>(od.numel()));
+        TensorView out(std::span<const int64_t>(od.dims.data(),
+                                                static_cast<size_t>(od.rank)),
+                       DataType::s32, out_buf.data());
+        const TensorView ins[] = {a, b};
+        NNOPS_EXPECT_EQ(op->compute(out, ins, {}, nullptr), Status::ok);
+
+        for (int64_t m = 0; m < s.M; ++m) {
+            for (int64_t n = 0; n < s.N; ++n) {
+                int64_t acc = 0;
+                for (int64_t k = 0; k < s.K; ++k) {
+                    const int64_t ai = s.ta ? k * a_cols + m : m * a_cols + k;
+                    const int64_t bi = s.tb ? n * b_cols + k : k * b_cols + n;
+                    acc += static_cast<int32_t>(av[static_cast<size_t>(ai)]) *
+                           static_cast<int32_t>(bv[static_cast<size_t>(bi)]);
+                }
+                NNOPS_EXPECT_EQ(out_buf[static_cast<size_t>(m * s.N + n)],
+                                static_cast<int32_t>(acc));
+            }
+        }
+    }
+}
+
 NNOPS_TEST(matmul_mkn_transpose_a_multik) {
     // transpose_a → pack_a (NKM order, B always packed); multi-k/multi-m exercise
     // beta@k==0, Relu clamp, the last-k epilogue.
@@ -2989,6 +3071,15 @@ NNOPS_TEST(matmul_sme_matches_reference) {
         {33, 70, 129, false, false},  // row, column and K tails
         {17, 16, 1, false, false},    // one K
         {128, 320, 512, false, false},
+        // The tiles' three M shapes: a partial low row group (17 < 32), a
+        // partial second group (20 and 31), and exactly one full group.
+        {17, 48, 33, false, false},
+        {20, 48, 33, false, false},
+        {31, 48, 33, false, false},
+        {32, 48, 33, false, false},
+        // N in the second 32-column B block only, and a single column.
+        {64, 40, 7, false, false},
+        {64, 1, 33, false, false},
     };
 
     const auto run = [&](auto dtype_tag) {
@@ -3085,6 +3176,12 @@ NNOPS_TEST(matmul_sme_i8_matches_reference) {
         {64, 96, 257, false, false, false, true, false, false, DataType::s8},
         {64, 96, 257, false, false, true, true, true, false, DataType::u8},
         {16, 16, 17, false, false, false, false, false, false, DataType::s8},
+        // The SMOPA tile's M and N tails: a partial 16-row group, a 64-column
+        // block with 1 and 48 live columns, and a single output column.
+        {20, 48, 33, false, false, false, false, false, false, DataType::s32},
+        {31, 1, 65, false, false, false, true, false, false, DataType::s32},
+        {17, 65, 32, false, false, true, false, false, false, DataType::s32},
+        {17, 129, 4, false, true, false, false, true, false, DataType::s8},
     };
 
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
@@ -3823,6 +3920,29 @@ NNOPS_TEST(matmul_bf16_tiled_and_odd_k) {
         MatMulAttributes attrs{};
         run_bf16_case(attrs, {33, 100}, {100, 33}, 921, kBF16AccumTol, wide);
         run_bf16_case(attrs, {5, 37}, {37, 17}, 931, kBF16AccumTol, wide);
+    }
+}
+
+NNOPS_TEST(matmul_bf16_tile_remainders) {
+    // The bf16 route has its own MR/panel ladder and k-group rounding, and the
+    // BFMMLA panel's k tail is the path a wrong group count breaks. Walk the
+    // first panel boundary on each axis and a K past the 128 k-block, on both
+    // the narrow and the forced-wide kernel.
+    for (const bool wide : {false, true}) {
+        for (int64_t M : {int64_t{1}, int64_t{9}, int64_t{17}}) {
+            for (int64_t K : {int64_t{1}, int64_t{5}, int64_t{129}}) {
+                for (int64_t N : {int64_t{1}, int64_t{17}, int64_t{33}}) {
+                    MatMulAttributes attrs{};
+                    run_bf16_case(attrs, {M, K}, {K, N},
+                                  7100 + static_cast<uint64_t>(M * 100 + K * 10 + N),
+                                  kBF16AccumTol, wide);
+                }
+            }
+        }
+        // K not a multiple of the eight-wide group at both ends of a panel.
+        MatMulAttributes attrs{};
+        run_bf16_case(attrs, {7, 13}, {13, 25}, 7200, kBF16AccumTol, wide);
+        run_bf16_case(attrs, {33, 37}, {37, 19}, 7201, kBF16AccumTol, wide);
     }
 }
 

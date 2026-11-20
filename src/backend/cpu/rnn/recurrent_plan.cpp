@@ -136,6 +136,14 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
     if (p.dtype == DataType::bf16) {
         plan.kc = (plan.kc + 3) & ~int64_t{3};
     }
+    // f16's SME B panels are addressed in K pairs: sme_b_k_offset() steps two k
+    // at a time, so every block start has to be even. The caps are even, but a
+    // short H gives kc = H, and the input projection splits I on that kc even
+    // when I > H — a block starting on an odd k then reads the next pair's
+    // first half. Rounding costs at most one padded k row per block.
+    if (p.dtype == DataType::f16) {
+        plan.kc = (plan.kc + 1) & ~int64_t{1};
+    }
 
     // Chunk the input projection so its buffer stays inside a shared L3.
     const int64_t budget = int64_t{8} << 20;

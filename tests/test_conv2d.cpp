@@ -518,6 +518,34 @@ NNOPS_TEST(conv2d_fp_matches_ref) {
         // 2x2 stride 2 with groups.
         {{{1, 4, 20, 20},   8, 2, 2, 2, 2, 1, 1, 1, 1, 2, false},  16},
 
+        // ---- icn_block boundaries -----------------------------------------
+        // IC 33 = 32 + 1: the trailing k block is one channel (kdim 9), so the
+        // last panel uses the short slot_tail stride.
+        {{{1, 33, 12, 12},  24, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  26},
+        // 5x5 over 16 channels: below kSmeIcMin, so the whole group is one K
+        // block and the gather walks a 400-wide panel.
+        {{{1, 16, 18, 18},  16, 5, 5, 1, 1, 2, 2, 1, 1, 1, false}, 27},
+        // 7x7 over 40 channels: one full 32-channel block plus an 8-channel
+        // tail, each of which is a whole tap-major panel set.
+        {{{1, 40, 11, 11},  40, 7, 7, 1, 1, 3, 3, 1, 1, 1, true},  28},
+        // 9x9 over 4 channels: karea > 49, and the whole group still fits the
+        // narrow rule (4 · 81 > 256, so the ladder returns 1 and the 32 floor
+        // caps at icg).
+        {{{1, 4, 20, 20},    8, 9, 9, 1, 1, 4, 4, 1, 1, 1, false}, 29},
+        // 11x11 is past every ladder rung; 3 channels stay whole and the gather
+        // is 121 elements a pixel.
+        {{{1, 3, 24, 24},    8, 11, 11, 1, 1, 5, 5, 1, 1, 1, false}, 30},
+
+        // ---- the oc-block ladder ------------------------------------------
+        // OC 200 is past kOcnSingleCap 192, so it balances into two blocks of
+        // 100 rounded to the panel width, not 128 + 72.
+        {{{1, 12, 16, 16}, 200, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  44},
+        // OC 40 is above the SME gate (32) but below a 64-wide ZA block: on an
+        // SME host the tile rounds up to 64 and leaves the tail predicated off.
+        {{{1, 8, 14, 14},   40, 3, 3, 1, 1, 1, 1, 1, 1, 1, false}, 45},
+        // OC == the SME gate exactly.
+        {{{1, 8, 14, 14},   32, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  46},
+
         // ---- the tiny filter: a square K <= 7 over <= 4 channels --------
         // The MobileNetV2 stem, which also has no packed form to prepack.
         {{{1, 3, 32, 32},   32, 3, 3, 2, 2, 1, 1, 1, 1, 1, true},  60},
@@ -583,6 +611,12 @@ NNOPS_TEST(conv2d_f16_matches_ref) {
         {{{1, 4, 11, 13},  48, 3, 3, 1, 1, 0, 0, 2, 1, 1, true},  41},  // IC 4, no pad, dilation
         {{{1, 3, 32, 32},  64, 7, 7, 2, 2, 3, 3, 1, 1, 1, true},  42},  // the ResNet stem
         {{{1, 2, 15, 18},  16, 5, 5, 1, 1, 2, 1, 1, 1, 1, false}, 43},  // 5x5, pad one axis
+        // icn_block boundaries at half precision: a one-channel k tail (33 =
+        // 32 + 1) and a whole-group 5x5.
+        {{{1, 33, 10, 10}, 24, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  47},
+        {{{1, 16, 16, 16}, 16, 5, 5, 1, 1, 2, 2, 1, 1, 1, false}, 48},
+        // multi-block OC, balanced the same way as the f32 route.
+        {{{1, 12, 12, 12}, 200, 3, 3, 1, 1, 1, 1, 1, 1, 1, false}, 49},
     };
 
     for (size_t i = 0; i < std::size(cases); ++i) {
@@ -847,6 +881,13 @@ NNOPS_TEST(conv2d_wino_matches_ref) {
         // 64 channels per group is where prepack switches to F(4,3), so this one
         // runs 4x4 tiles off a 6x6 window and still holds the F(2,3) tolerance.
         {{{1, 64, 16, 16},  64, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},  85},
+        // The 7x7 plane floor: the flattened tile grid ends on partial rows and
+        // the policy stays on F(2,3) below the 14x14 F(4,3) floor.
+        {{{1, 64, 7, 7},    64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   95},
+        // IC/G 33 = 32 + 1: a one-channel tail in the U's k panels. Pinned to
+        // F(2,3) so the tail stays on this order rather than following the
+        // 16x16 plane to F(4,3).
+        {{{1, 33, 16, 16},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, false, 2}, 96},
     };
     for (size_t i = 0; i < std::size(f32_cases); ++i) {
         expect_fp_close(f32_cases[i].c, DataType::f32, 2e-4f,
@@ -869,6 +910,12 @@ NNOPS_TEST(conv2d_wino_matches_ref) {
         {{{1, 512, 9, 9},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   89},
         // The case that set the tolerance above: 512 channels and 3x3 tiles.
         {{{1, 512, 8, 8},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   88},
+        // OC 48 leaves a partial 16-wide GEMM panel on both sides of the tile
+        // split; the plane is just over the F(4,3) floor.
+        {{{1, 64, 14, 16},  48, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},  97},
+        // groups 2 with IC/G 48 and OC/G 16, so the per-group panel set is
+        // narrower than one tile.
+        {{{1, 96, 20, 20},  32, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},  98},
     };
     for (size_t i = 0; i < std::size(f43_cases); ++i) {
         expect_fp_close(f43_cases[i].c, DataType::f32, 1e-3f,
@@ -884,6 +931,8 @@ NNOPS_TEST(conv2d_wino_matches_ref) {
         {{{1, 64, 14, 14},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, false, 2},   82},
         {{{1, 40, 13, 15},  24, 3, 3, 1, 1, 1, 1, 1, 1, 1, true,  2},   83},
         {{{2, 16, 20, 20},   8, 3, 3, 1, 1, 1, 1, 1, 1, 2, false, 2},   84},
+        // The 7x7 plane floor at half precision, pinned to F(2,3).
+        {{{1, 32, 7, 7},    32, 3, 3, 1, 1, 1, 1, 1, 1, 1, true,  2},   99},
     };
     for (size_t i = 0; i < std::size(f16_f23_cases); ++i) {
         expect_fp_close(f16_f23_cases[i].c, DataType::f16, nnops::test::kF16AccumTol,
@@ -1778,10 +1827,67 @@ NNOPS_TEST(conv2d_i8_matches_ref_all_routes) {
     // ---- f16 output with bias -------------------------------------------
     { QCase c; c.ishape = {1, 8, 8, 8}; c.wshape = {8, 8, 3, 3}; c.kh = c.kw = 3;
       c.act = DataType::f16; c.out = DataType::f16; c.bias = true; add(c); }
+    // ---- icn_block boundaries: the quantized route takes the whole group as
+    //      one K block, so these are the widths that leave a 1-channel k tail
+    //      and the kdim4 rounding of a non-multiple-of-four K --------------
+    { QCase c; c.ishape = {1, 33, 12, 12}; c.wshape = {24, 33, 3, 3}; c.kh = c.kw = 3;
+      c.asym_w = true; c.bias = true; add(c); }
+    // ---- a 5x5 over 16 channels: kdim 400, and the whole group in one pass
+    { QCase c; c.ishape = {1, 16, 16, 16}; c.wshape = {16, 16, 5, 5}; c.kh = c.kw = 5;
+      c.ph = c.pw = 2; c.act = DataType::u8; c.zp_x = 128; add(c); }
+    // ---- a 7x7 over 8 channels, and a 9x9 over 4: the widest gathers -----
+    { QCase c; c.ishape = {1, 8, 12, 12}; c.wshape = {8, 8, 7, 7}; c.kh = c.kw = 7;
+      c.ph = c.pw = 3; add(c); }
+    { QCase c; c.ishape = {1, 4, 20, 20}; c.wshape = {8, 4, 9, 9}; c.kh = c.kw = 9;
+      c.ph = c.pw = 4; c.asym_w = true; add(c); }
+    // ---- OC past kOcnSingleCap 192: two balanced filter blocks -----------
+    { QCase c; c.ishape = {1, 12, 12, 12}; c.wshape = {200, 12, 3, 3};
+      c.kh = c.kw = 3; c.ph = c.pw = 1; c.act = DataType::u8; c.zp_x = 128;
+      c.asym_w = true; c.bias = true; add(c); }
+    // ---- OC 40 is below the SME gate (64), so this one stays on the
+    //      generic int8 route even on an SME host -------------------------
+    { QCase c; c.ishape = {1, 16, 14, 14}; c.wshape = {40, 16, 3, 3};
+      c.kh = c.kw = 3; c.ph = c.pw = 1; c.asym_w = true; add(c); }
 
     for (size_t i = 0; i < cases.size(); ++i) {
         cases[i].seed = 1000 + i;
         expect_q_match(cases[i], static_cast<int>(i));
+    }
+}
+
+NNOPS_TEST(conv2d_i8_neon_route_matches_ref) {
+    // On an SME host a wide-OC s8 filter takes the ZA route before the plan is
+    // even built, so the generic int8 route loses its end-to-end coverage
+    // there. Pin SME off for these shapes: OC 64 is exactly the SME gate, 128
+    // is two 64-column blocks, and 200 crosses kOcnSingleCap. The int_out case
+    // takes the generic int8 epilogue (the fused requantizing store is SME-only).
+    const int prev = nnops::detail::disable_sme.exchange(1, std::memory_order_relaxed);
+    struct SmeRestore {
+        int previous;
+        ~SmeRestore() { nnops::detail::disable_sme.store(previous, std::memory_order_relaxed); }
+    } restore{prev};
+
+    struct Case { int64_t IC, IH, IW, OC; DataType out; bool asym; bool u8; };
+    const Case cases[] = {
+        {16, 12, 12, 64, DataType::f32, false, false},
+        {16, 12, 12, 128, DataType::f32, true, true},
+        {12, 12, 12, 200, DataType::s8, true, true},
+        {32, 6, 6, 96, DataType::f32, false, false},
+    };
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        QCase c;
+        c.ishape = {1, cases[i].IC, cases[i].IH, cases[i].IW};
+        c.wshape = {cases[i].OC, cases[i].IC, 3, 3};
+        c.kh = c.kw = 3;
+        c.ph = c.pw = 1;
+        c.act = cases[i].u8 ? DataType::u8 : DataType::s8;
+        c.zp_x = cases[i].u8 ? 128 : 0;
+        c.asym_w = cases[i].asym;
+        c.bias = true;
+        c.out = cases[i].out;
+        c.ep = EpilogueActivateType::Relu6;
+        c.seed = 5000 + i;
+        expect_q_match(c, static_cast<int>(i), {}, /*exact=*/cases[i].out == DataType::s8);
     }
 }
 
