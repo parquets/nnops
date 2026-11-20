@@ -18,12 +18,13 @@
 /// prepackWeights answers the same geometry with no packed form, so the two
 /// cannot disagree.
 ///
-/// prepackWeights() produces one of two things: the Winograd U —
+/// prepackWeights() produces one of three things: the Winograd U —
 /// [pos][nb][G·jb][ldd] B panels, pos being 16 (F(2,3)) or 36 (F(4,3)) — when
-/// asked for Winograd (under Auto, only for a non-quantized k3s1 filter), and
-/// the im2col route's PackedHWIO (or PackedHWIOSme on an SME machine)
-/// otherwise. Both are built once at load time so
-/// compute() reads them in place instead of repacking per call.
+/// asked for Winograd (under Auto, only for a non-quantized k3s1 filter), the
+/// im2col route's PackedHWIO (or PackedHWIOSme on an SME machine), and on CUDA
+/// the int8 kernel's own PackedHWIOCuda. All are built once at load time so
+/// compute() reads them in place instead of repacking per call. A blob belongs
+/// to exactly one route: each backend refuses the others' forms.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
@@ -33,6 +34,9 @@
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"
 #include "backend/cpu/conv/conv2d_winograd.h"
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
+#if defined(NNOPS_HAS_CUDA)
+#include "backend/cuda/conv/conv2d_pack.h"
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -195,6 +199,7 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::require(is_channel_last_weight(wl) ||
                               wl == TensorLayout::PackedWinoWeightLast ||
                               wl == TensorLayout::PackedHWIO ||
+                              wl == TensorLayout::PackedHWIOCuda ||
                               wl == TensorLayout::PackedHWIOSme));
 
     // A quantized filter quantizes its activation per call and requantizes into
@@ -302,10 +307,37 @@ Status Conv2D::compute(std::span<TensorView> outputs, std::span<const TensorView
 void Conv2D::prepackWeights(std::span<const TensorView> inputs, std::span<TensorView> outputs,
                             const ComputeContext& ctx)
 {
-    // The CUDA kernels read the raw filter in place (implicit GEMM only), so
-    // this backend has no packed product: the query stays empty, the same
-    // "no packed form" answer MatMul gives a dtype it cannot pack.
+    // The fp CUDA kernels read the raw filter in place (implicit GEMM only), so
+    // the query stays empty for them — the same "no packed form" answer MatMul
+    // gives a dtype it cannot pack. The quantized CUDA route does have one: its
+    // fill would otherwise gather the HWIO filter per block per k tile.
     if (backend_ != Backend::CPU) {
+#if defined(NNOPS_HAS_CUDA)
+        if (backend_ == Backend::CUDA && inputs.size() >= 1 && outputs.size() >= 1 &&
+            inputs[0].data_type() == DataType::s8 && inputs[0].rank() == 4 &&
+            is_channel_last_weight(inputs[0].layout()) &&
+            attrs_.algorithm != ConvAlgorithm::Winograd) {
+            const TensorView& weight = inputs[0];
+            const TensorDesc d = backend::cuda::conv_i8_packed_weight_desc(attrs_, weight.desc());
+            if (d.rank == 0) {
+                return;
+            }
+            std::vector<int64_t> shape(d.dims.begin(), d.dims.begin() + d.rank);
+            if (outputs[0].is_empty()) {
+                outputs[0] = TensorView(shape, d.dtype, nullptr, d.row_stride_elems,
+                                        d.layout, weight.quant_params());
+                return;
+            }
+            NNOPS_ASSERT(outputs[0].layout() == d.layout && outputs[0].rank() == d.rank &&
+                         outputs[0].shape(0) == shape[0] && outputs[0].shape(1) == shape[1] &&
+                         "Conv2D::prepackWeights: the packed buffer does not match the "
+                         "geometry");
+            const Status packed =
+                backend::cuda::conv_i8_packed_weight_pack(attrs_, weight, outputs[0], ctx);
+            NNOPS_ASSERT(packed == Status::ok &&
+                         "Conv2D::prepackWeights: the CUDA pack pass failed");
+        }
+#endif
         return;
     }
     NNOPS_ASSERT(inputs.size() >= 1);

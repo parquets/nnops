@@ -479,4 +479,125 @@ NNOPS_TEST(cuda_conv2d_i8) {
     }
 }
 
+/// The prepacked filter is the same bytes the gather would have produced, so
+/// the packed call must be bit-identical to the raw one — not merely close. The
+/// cases walk the packer's three tails: an oc block the tile only half fills, an
+/// icg that does not divide a 16-byte run, and a group count that makes every
+/// group one row wide.
+NNOPS_TEST(cuda_conv2d_i8_packed_filter) {
+    struct PackedCase {
+        int64_t ic, ih, iw, oc, kh, kw, groups;
+    };
+    const PackedCase cases[] = {
+        {64, 32, 32, 64, 3, 3, 1},
+        {16, 8, 8, 40, 3, 3, 1},
+        {8, 8, 8, 16, 3, 3, 8},
+        {64, 16, 16, 128, 1, 1, 1},
+        {24, 8, 8, 64, 3, 3, 1},
+    };
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+        const PackedCase& c = cases[ci];
+        const int64_t icg = c.ic / c.groups;
+        test::XorShift128 rng(311 + ci);
+
+        const int64_t an = c.ic * c.ih * c.iw;
+        std::vector<uint8_t> a(static_cast<size_t>(an));
+        for (auto& e : a) { e = static_cast<uint8_t>(rng.next_u64() & 0xFFu); }
+        const int64_t wn = c.oc * icg * c.kh * c.kw;
+        std::vector<int8_t> w(static_cast<size_t>(wn));
+        for (auto& e : w) { e = static_cast<int8_t>(int32_t(rng.next_u64() % 255) - 127); }
+
+        std::vector<float> w_s(static_cast<size_t>(c.oc));
+        std::vector<int32_t> w_zp(static_cast<size_t>(c.oc));
+        for (int64_t i = 0; i < c.oc; ++i) {
+            w_s[static_cast<size_t>(i)] = 0.008f + 0.001f * float(i % 5);
+            w_zp[static_cast<size_t>(i)] = int32_t(i % 7) - 3;
+        }
+        QuantParams qa;
+        qa.scale = 0.0078125f;
+        qa.zero_point = 128;
+        QuantParams qw;
+        qw.granularity = QuantGranularity::PerChannel;
+        qw.scale_data = w_s.data();
+        qw.zero_point_data = w_zp.data();
+        qw.num_scales = c.oc;
+        qw.scale = 0.008f;
+        qw.zero_point = 0;
+        QuantParams qc;
+        qc.scale = 0.03f;
+        qc.zero_point = 0;
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {c.kh, c.kw};
+        attrs.padding = {c.kh / 2, c.kw / 2};
+        attrs.groups = c.groups;
+        attrs.output_dtype = DataType::s8;
+
+        const auto view = [](const std::vector<int64_t>& sh, DataType dt, void* d,
+                             TensorLayout lay, const QuantParams& qp) {
+            return TensorView(std::span<const int64_t>(sh.data(), sh.size()), dt, d, lay, qp);
+        };
+        const std::vector<int64_t> ashape = {1, c.ih, c.iw, c.ic};
+        const std::vector<int64_t> wshape = {c.kh, c.kw, icg, c.oc};
+        TensorView av = view(ashape, DataType::u8, nullptr, TensorLayout::NHWC, qa);
+        TensorView wv = view(wshape, DataType::s8, nullptr, TensorLayout::HWIO, qw);
+        const std::vector<TensorDesc> descs = {av.desc(), wv.desc()};
+        const TensorDesc od =
+            Conv2D::create(attrs, Backend::CPU)->getOutputTensorDesc(descs).front();
+        const std::vector<int64_t> odims(od.dims.begin(), od.dims.begin() + od.rank);
+        int64_t on = 1;
+        for (auto d : odims) { on *= d; }
+
+        CudaBuffer da(static_cast<size_t>(an)), dw(static_cast<size_t>(wn));
+        da.upload(a.data(), a.size());
+        dw.upload(w.data(), w.size());
+        TensorView dav = view(ashape, DataType::u8, da.data(), TensorLayout::NHWC, qa);
+        TensorView dwv = view(wshape, DataType::s8, dw.data(), TensorLayout::HWIO, qw);
+        auto op = Conv2D::create(attrs, Backend::CUDA);
+
+        // The raw arm, then the two-step pack and the same call over the blob.
+        CudaBuffer draw(static_cast<size_t>(on));
+        draw.zero();
+        TensorView drawv = view(odims, DataType::s8, draw.data(), od.layout, qc);
+        const TensorView raw_ins[] = {dav, dwv};
+        cuda_run(*op, drawv, raw_ins);
+
+        std::vector<TensorView> qin = {dwv};
+        std::vector<TensorView> qout = {TensorView{}};
+        op->prepackWeights(qin, qout, cuda_context());
+        NNOPS_EXPECT_TRUE(qout[0].rank() == 2);
+        NNOPS_EXPECT_TRUE(qout[0].layout() == TensorLayout::PackedHWIOCuda);
+        NNOPS_EXPECT_EQ(qout[0].shape(0), c.oc);
+        CudaBuffer dblob(static_cast<size_t>(qout[0].numel()));
+        const std::vector<int64_t> bshape = {qout[0].shape(0), qout[0].shape(1)};
+        TensorView bv = view(bshape, DataType::s8, dblob.data(), qout[0].layout(), qw);
+        std::vector<TensorView> pin = {dwv};
+        std::vector<TensorView> pout = {bv};
+        op->prepackWeights(pin, pout, cuda_context());
+        NNOPS_CUDA_CHECK(cudaDeviceSynchronize());
+
+        CudaBuffer dpacked(static_cast<size_t>(on));
+        dpacked.zero();
+        TensorView dpackedv = view(odims, DataType::s8, dpacked.data(), od.layout, qc);
+        const TensorView packed_ins[] = {dav, bv};
+        cuda_run(*op, dpackedv, packed_ins);
+
+        std::vector<int8_t> raw(static_cast<size_t>(on)), packed(static_cast<size_t>(on));
+        draw.download(raw.data(), raw.size());
+        dpacked.download(packed.data(), packed.size());
+        if (std::memcmp(raw.data(), packed.data(), raw.size()) != 0) {
+            size_t bad = 0;
+            while (bad < raw.size() && raw[bad] == packed[bad]) { ++bad; }
+            char msg[512];
+            std::snprintf(msg, sizeof(msg),
+                          "conv2d_i8 packed case %zu (ic=%lld oc=%lld g=%lld k%lldx%lld): "
+                          "elem %zu of %zu; raw %d packed %d",
+                          ci, (long long)c.ic, (long long)c.oc, (long long)c.groups,
+                          (long long)c.kh, (long long)c.kw, bad, raw.size(), int(raw[bad]),
+                          int(packed[bad]));
+            throw std::runtime_error(msg);
+        }
+    }
+}
+
 #endif  // NNOPS_HAS_CUDA

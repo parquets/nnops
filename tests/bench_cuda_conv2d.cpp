@@ -205,7 +205,8 @@ std::vector<ConvBenchCase> wide_layers()
 /// int8: a pre-quantized u8 activation against an s8 filter, per-tensor
 /// activation parameters and per-channel weight ones, into an s8 destination.
 /// The same layer set as the fp tables, so the rows are comparable.
-double run_conv_i8(const ConvBenchCase& c, const char* label)
+double run_conv_i8(const ConvBenchCase& c, const char* label, bool packed = false,
+                   bool print = true)
 {
     Conv2DAttributes attrs;
     attrs.kernel_size = {c.kh, c.kw};
@@ -274,11 +275,32 @@ double run_conv_i8(const ConvBenchCase& c, const char* label)
     TensorView dcv = view(odims, od.dtype, dout.data(), od.layout, qc);
 
     auto op = Conv2D::create(attrs, Backend::CUDA);
-    const TensorView ins[] = {dav, dwv};
+
+    // The packed arm packs once, outside the timer, exactly as a caller with a
+    // loaded model would.
+    CudaBuffer dblob;
+    std::vector<int64_t> bshape;
+    TensorView bv;
+    if (packed) {
+        std::vector<TensorView> qin = {dwv};
+        std::vector<TensorView> qout = {TensorView{}};
+        op->prepackWeights(qin, qout, cuda_context());
+        if (qout[0].rank() != 2) {
+            throw std::runtime_error("conv2d int8: the packed filter query is empty");
+        }
+        dblob = CudaBuffer(static_cast<size_t>(qout[0].numel()));
+        bshape = {qout[0].shape(0), qout[0].shape(1)};
+        bv = view(bshape, DataType::s8, dblob.data(), qout[0].layout(), qw);
+        std::vector<TensorView> pin = {dwv};
+        std::vector<TensorView> pout = {bv};
+        op->prepackWeights(pin, pout, cuda_context());
+        NNOPS_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    std::vector<TensorView> ins = {dav, packed ? bv : dwv};
     const double ms = cuda_median_ms([&] { cuda_launch(*op, dcv, ins); });
-    print_cuda_row(label,
-                   conv_geometry(c, "nhwc"), ms,
-                   cuda_gflops(ms, c.flops()));
+    if (print) {
+        print_cuda_row(label, conv_geometry(c, "nhwc"), ms, cuda_gflops(ms, c.flops()));
+    }
     return cuda_gflops(ms, c.flops());
 }
 
@@ -320,6 +342,24 @@ NNOPS_BENCH(cuda_conv2d) {
 NNOPS_BENCH(cuda_conv2d_i8) {
     print_cuda_header("CUDA Conv2D int8 (u8 x s8 -> s8)");
     run_table_i8("i8 nhwc");
+}
+
+/// The prepacked filter against the raw one, both arms alternated inside this
+/// process: the filter gather is the one part of the int8 kernel a caller can
+/// pay for once, and this is the only instrument on this host that can see the
+/// difference.
+NNOPS_BENCH(cuda_conv2d_i8_packed) {
+    print_cuda_header("CUDA Conv2D int8: raw filter vs PackedHWIOCuda");
+    for (ConvBenchCase c : wide_layers()) {
+        double best[2] = {0.0, 0.0};
+        for (int rep = 0; rep < 3; ++rep) {
+            for (int arm = 0; arm < 2; ++arm) {
+                best[arm] = std::max(best[arm], run_conv_i8(c, "i8", arm == 1, false));
+            }
+        }
+        std::printf("  %-8s %-34s raw %8.0f packed %8.0f GFLOPS  %.2fx\n", "i8",
+                    conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[1] / best[0]);
+    }
 }
 
 NNOPS_BENCH(cuda_conv2d_f16) {

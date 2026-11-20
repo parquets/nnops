@@ -31,7 +31,11 @@
 /// quantized family (an s8 filter against a pre-quantized u8/s8 activation) is
 /// its own kernel at the bottom of this file: 16x8x32 s8 MMA over the same CTA
 /// tile, MatMulInteger compensation with the per-pixel
-/// activation sums folded in during the gather.
+/// activation sums folded in during the gather. That kernel is also the one
+/// route with a prepacked filter of its own — `PackedHWIOCuda`, the k-major
+/// panels cut at the tile's own geometry plus the per-channel sums, which turns
+/// the fill's sixteen strided byte gathers into one `cp.async` (see
+/// conv2d_pack.h).
 
 #include "../cuda_common.cuh"
 #include "../matmul/gemm_common.cuh"
@@ -40,6 +44,7 @@
 #include "../matmul/matmul_i8_common.cuh" // I8OutKind + the shared int8 epilogue pieces
 #include "../matmul/matmul_i8_ptx.cuh"
 #include "conv_panel.cuh"
+#include "conv2d_pack.h"
 #include "nnops/ops/conv2d.hpp"
 
 namespace nnops::backend::cuda {
@@ -94,6 +99,11 @@ struct ConvParams {
     const float* sc_w = nullptr;
     float sc_w_scalar = 1.0f;
     int32_t* r_b = nullptr;
+    /// A PackedHWIOCuda blob, or null for a raw HWIO filter. When set, the
+    /// k-major panel is a plain copy out of it and the per-channel sums come
+    /// from its tail instead of the separate reduction kernel.
+    const void* w_panel = nullptr;
+    int w_nblk = 0; ///< oc blocks per k tile
     float out_scale = 1.0f;
     int32_t out_zp = 0;
     int out_kind = 0;  ///< I8OutKind
@@ -1197,6 +1207,138 @@ __global__ void conv_i8_col_sums_kernel(ConvParams p)
     p.r_b[oc] = s;
 }
 
+// ============================================================
+// int8 packed filter (PackedHWIOCuda)
+// ============================================================
+
+/// The blob's geometry, derived from the filter's shape and the attributes so
+/// the descriptor query, the pack pass and the kernel cannot disagree. Bytes:
+/// `[group][k tile][oc block]` panels of BN rows at LD bytes, then the
+/// per-channel sums as `[group][OC/G]` int32.
+struct ConvI8PackGeom {
+    bool ok = false;
+    int groups = 0, icg = 0, ocg = 0, oc = 0;
+    int kh = 0, kw = 0;
+    int K = 0, ktiles = 0, nblk = 0;
+    int64_t panel = 0;    ///< bytes of one panel
+    int64_t data = 0;     ///< bytes of every panel
+    int64_t sums_off = 0; ///< where the int32 sums start
+    int64_t total = 0;
+};
+
+inline ConvI8PackGeom conv_i8_pack_geom(int64_t groups, int64_t icg, int64_t ocg, int64_t kh,
+                                        int64_t kw)
+{
+    ConvI8PackGeom g;
+    if (groups <= 0 || icg <= 0 || ocg <= 0 || kh <= 0 || kw <= 0) {
+        return g;
+    }
+    const int64_t K = icg * kh * kw;
+    const int64_t ktiles = (K + kConvI8PackBK - 1) / kConvI8PackBK;
+    const int64_t nblk = (ocg + kConvI8PackBN - 1) / kConvI8PackBN;
+    const int64_t oc = groups * ocg;
+    g.groups = int(groups);
+    g.icg = int(icg);
+    g.ocg = int(ocg);
+    g.oc = int(oc);
+    g.kh = int(kh);
+    g.kw = int(kw);
+    g.K = int(K);
+    g.ktiles = int(ktiles);
+    g.nblk = int(nblk);
+    g.panel = int64_t(kConvI8PackBN) * kConvI8PackLD;
+    g.data = groups * ktiles * nblk * g.panel;
+    g.sums_off = (g.data + 15) & ~int64_t(15);
+    g.total = g.sums_off + oc * 4;
+    g.ok = groups * ocg <= 65535 && K <= (int64_t(1) << 24) &&
+           g.total <= (int64_t(1) << 40);
+    return g;
+}
+
+struct ConvI8PackParams {
+    const void* weight;
+    void* blob;
+    ConvI8PackGeom g;
+    int32_t w_n, w_ic, w_kh, w_kw;
+};
+
+/// One launch builds the whole blob: the panels first, then the sums. The
+/// gather is the one the kernel used to run once per block per k tile, so
+/// paying it here once per call — or never, when the caller caches the blob —
+/// is the entire point. Byte-wise, because that is what a pack pass can afford
+/// and the kernel's fill could not.
+__global__ void conv_i8_pack_kernel(ConvI8PackParams q)
+{
+    constexpr int BN = kConvI8PackBN, BK = kConvI8PackBK, LD = kConvI8PackLD;
+    constexpr int kVec = BK / 16;
+    const int64_t per_panel = int64_t(BN) * kVec;
+    const int G = q.g.groups, K = q.g.K, kt = q.g.ktiles, nb = q.g.nblk;
+    const int64_t chunks = int64_t(G) * kt * nb * per_panel;
+    int8_t* const blob = static_cast<int8_t*>(q.blob);
+    const int8_t* const W = static_cast<const int8_t*>(q.weight);
+    const int32_t w_n = q.w_n, w_ic = q.w_ic, w_kh = q.w_kh, w_kw = q.w_kw;
+    const int32_t icg = q.g.icg, kw_end = q.g.kw;
+
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < chunks;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        const int64_t panel = i / per_panel;
+        const int64_t r = i - panel * per_panel;
+        const int row = int(r / kVec);
+        const int c = int(r - int64_t(row) * kVec);
+        const int nbi = int(panel % nb);
+        const int kti = int((panel / nb) % kt);
+        const int g = int(panel / (int64_t(nb) * kt));
+        const int n = nbi * BN + row;
+        const int k0 = kti * BK + c * 16;
+        int8_t* const d = blob + panel * q.g.panel + row * LD + c * 16;
+        if (n >= q.g.ocg) {
+            *reinterpret_cast<uint4*>(d) = uint4{};
+            continue;
+        }
+        const int8_t* const row_w = W + int64_t(g) * q.g.ocg * w_n + int64_t(n) * w_n;
+        const int32_t tap = k0 / icg;
+        int32_t ic = k0 - tap * icg;
+        int32_t kh = tap / kw_end;
+        int32_t kw = tap - kh * kw_end;
+        int32_t off = ic * w_ic + kh * w_kh + kw * w_kw;
+        int k = k0;
+        uint4 v;
+        int8_t* const vb = reinterpret_cast<int8_t*>(&v);
+#pragma unroll 4
+        for (int j = 0; j < 16; ++j) {
+            vb[j] = k < K ? row_w[off] : int8_t(0);
+            ++k;
+            off += w_ic;
+            if (++ic == icg) {
+                ic = 0;
+                off -= icg * w_ic;
+                off += w_kw;
+                if (++kw == kw_end) {
+                    kw = 0;
+                    off -= kw_end * w_kw;
+                    off += w_kh;
+                }
+            }
+        }
+        *reinterpret_cast<uint4*>(d) = v;
+    }
+
+    int32_t* const sums = reinterpret_cast<int32_t*>(blob + q.g.sums_off);
+    for (int oc = int(blockIdx.x) * blockDim.x + threadIdx.x; oc < q.g.oc;
+         oc += int(gridDim.x) * blockDim.x) {
+        const int8_t* const row_w = W + int64_t(oc) * w_n;
+        int32_t s = 0;
+        for (int32_t kh = 0; kh < q.g.kh; ++kh) {
+            for (int32_t kw = 0; kw < q.g.kw; ++kw) {
+                for (int32_t ic = 0; ic < icg; ++ic) {
+                    s += int32_t(row_w[ic * w_ic + kh * w_kh + kw * w_kw]);
+                }
+            }
+        }
+        sums[oc] = s;
+    }
+}
+
 template <class AElem>
 __global__ __launch_bounds__(ConvShapeI8::threads, ConvShapeI8::MinBlocks)
 void conv_gemm_i8_kernel(ConvParams p)
@@ -1290,16 +1432,27 @@ void conv_gemm_i8_kernel(ConvParams p)
         // vector costs four. ncu on 448x448x64: 12.4M of the kernel's 16.9M
         // store wavefronts were conflicts, against 79,799 on all the ldmatrix
         // reads together.
+        //
+        // A prepacked filter removes the gather altogether — and the sixteen
+        // strided loads with it, which the vector store above leaves alone.
         {
             const int row = tid % BN;
             const int col0 = (tid / BN) * kBFillK;
+            int8_t* const d = sB + row * LD + col0;
             const int n = n0 + row;
             const int8_t* const row_w = W + int64_t(n) * p.w_n;
-            int8_t* const d = sB + row * LD + col0;
             const int k = k0 + col0;
             const bool n_ok = n < N;
             const int32_t w_ic = int32_t(p.w_ic), w_kh = int32_t(p.w_kh), w_kw = int32_t(p.w_kw);
-            if (n_ok && k + kBFillK <= K && w_tap_aligned) {
+            if (p.w_panel != nullptr) {
+                // The blob already holds this panel row for row: no predicate
+                // (its tails are zeroed), no odometer, one asynchronous copy.
+                const int8_t* const src = static_cast<const int8_t*>(p.w_panel) +
+                                          ((int64_t(g) * k_tiles + kt) * p.w_nblk + blockIdx.y) *
+                                              S::kBBytes +
+                                          row * LD + col0;
+                cp_async_ca_16B(d, src);
+            } else if (n_ok && k + kBFillK <= K && w_tap_aligned) {
                 // Inside one tap the run is a fixed `w_ic` stride, so the
                 // odometer the fallback steps is not needed at all.
                 const int tap = k / p.icg;
@@ -1510,7 +1663,11 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
     if (attrs.algorithm == ConvAlgorithm::Winograd) {
         return Status::unsupported;
     }
-    if (is_packed_conv_weight(wgt.layout()) || is_wino_weight(wgt.layout())) {
+    // PackedHWIO and the SME blob are the CPU routes' products and the Winograd
+    // U has no CUDA consumer, so only this route's own blob is admitted here.
+    const bool w_packed = is_cuda_conv_weight(wgt.layout());
+    if (is_packed_conv_weight(wgt.layout()) || is_wino_weight(wgt.layout()) ||
+        (w_packed && wgt.rank() != 2)) {
         return Status::unsupported;
     }
     // The int8 store has no residual stage, so an add_to conv is refused.
@@ -1531,8 +1688,10 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
     p.oc = static_cast<int>(output.shape(3));
     p.oh = static_cast<int>(output.shape(1));
     p.ow = static_cast<int>(output.shape(2));
-    p.icg = static_cast<int>(wgt.shape(2));
     p.groups = static_cast<int>(attrs.groups);
+    // A blob's descriptor leads with OC, so the reduction's channel count comes
+    // from the activation; a raw filter carries it on its third axis.
+    p.icg = w_packed ? p.ic / p.groups : static_cast<int>(wgt.shape(2));
     p.ocg = p.oc / p.groups;
     p.kh = static_cast<int>(attrs.kernel_size[0]);
     p.kw = static_cast<int>(attrs.kernel_size[1]);
@@ -1566,14 +1725,32 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
     p.max_clip = attrs.epilogue.max_clip;
     p.add_to = false;
 
-    // HWIO [KH][KW][IC/G][OC]: n is innermost, k is not contiguous.
-    p.w_kh = wgt.stride_elems(0);
-    p.w_kw = wgt.stride_elems(1);
-    p.w_ic = wgt.stride_elems(2);
-    p.w_n = wgt.stride_elems(3);
-    p.w_k_dense = p.w_n == 1 && p.w_ic == p.oc && p.w_kw == int64_t(p.icg) * p.oc &&
-                  p.w_kh == int64_t(p.kw) * p.icg * p.oc;
+    // HWIO [KH][KW][IC/G][OC]: n is innermost, k is not contiguous. A blob has
+    // no such axes -- its descriptor is [OC, ...] -- so the gather's strides are
+    // only meaningful on the raw arm.
+    if (!w_packed) {
+        p.w_kh = wgt.stride_elems(0);
+        p.w_kw = wgt.stride_elems(1);
+        p.w_ic = wgt.stride_elems(2);
+        p.w_n = wgt.stride_elems(3);
+        p.w_k_dense = p.w_n == 1 && p.w_ic == p.oc && p.w_kw == int64_t(p.icg) * p.oc &&
+                      p.w_kh == int64_t(p.kw) * p.icg * p.oc;
+    }
     p.weight_vec = false;
+
+    if (w_packed) {
+        // The blob is what the panel would have gathered, so the geometry has to
+        // agree to the byte: same groups, same channel count, same tiles.
+        const ConvI8PackGeom pg = conv_i8_pack_geom(p.groups, p.icg, p.ocg, p.kh, p.kw);
+        const char* const blob = wgt.ptr<const char>();
+        if (!pg.ok || wgt.shape(0) != p.oc || wgt.numel() < pg.total ||
+            (reinterpret_cast<uintptr_t>(blob) % 16 != 0)) {
+            return Status::unsupported;
+        }
+        p.w_panel = blob;
+        p.w_nblk = pg.nblk;
+        p.r_b = reinterpret_cast<int32_t*>(const_cast<char*>(blob + pg.sums_off));
+    }
 
     // The 16 B A-fill needs a dense channel axis and 16 channels of one tap per
     // vector (k/groups is tap-major there).
@@ -1603,8 +1780,9 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
     p.out_kind = static_cast<int>(kind);
 
     // ---- workspace: R_b and the staged per-channel arrays -----------------
+    // A packed filter brings its own sums, so it needs no R_b plane.
     const int64_t rb_off = 0;
-    int64_t cursor = int64_t(p.oc) * 4;
+    int64_t cursor = w_packed ? 0 : int64_t(p.oc) * 4;
     int64_t off_zpw = -1, off_scw = -1;
     if (qw.zero_point_data != nullptr) {
         off_zpw = cursor;
@@ -1616,12 +1794,15 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
     }
 
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
-    const detail::GemmWorkspace ws = detail::gemm_workspace_alloc(cursor, stream);
-    if (ws.ptr == nullptr) {
+    const detail::GemmWorkspace ws =
+        cursor > 0 ? detail::gemm_workspace_alloc(cursor, stream) : detail::GemmWorkspace{};
+    if (cursor > 0 && ws.ptr == nullptr) {
         return Status::internal;
     }
     char* base = static_cast<char*>(ws.ptr);
-    p.r_b = reinterpret_cast<int32_t*>(base + rb_off);
+    if (!w_packed) {
+        p.r_b = reinterpret_cast<int32_t*>(base + rb_off);
+    }
     const auto copy_in = [&](const void* src, int64_t off) {
         if (off < 0) {
             return true;
@@ -1637,9 +1818,13 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
     p.zp_w = off_zpw >= 0 ? reinterpret_cast<const int32_t*>(base + off_zpw) : nullptr;
     p.sc_w = off_scw >= 0 ? reinterpret_cast<const float*>(base + off_scw) : nullptr;
 
-    constexpr int kSumThreads = 128;
-    const dim3 sgrid(unsigned((p.oc + kSumThreads - 1) / kSumThreads), 1, 1);
-    conv_i8_col_sums_kernel<<<sgrid, kSumThreads, 0, stream>>>(p);
+    // A blob carries the sums its pack pass wrote, so the reduction — and its
+    // grid — is skipped rather than run and overwritten.
+    if (!w_packed) {
+        constexpr int kSumThreads = 128;
+        const dim3 sgrid(unsigned((p.oc + kSumThreads - 1) / kSumThreads), 1, 1);
+        conv_i8_col_sums_kernel<<<sgrid, kSumThreads, 0, stream>>>(p);
+    }
 
     if (adt == DataType::u8) {
         launch_conv_i8<uint8_t>(p, stream);
@@ -1680,7 +1865,10 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
     if (attrs.algorithm == ConvAlgorithm::Winograd) {
         return Status::unsupported;
     }
-    if (is_packed_conv_weight(wgt.layout()) || is_wino_weight(wgt.layout())) {
+    // The int8 blob is the quantized kernel's, and this route would read its
+    // descriptor as an HWIO filter.
+    if (is_packed_conv_weight(wgt.layout()) || is_wino_weight(wgt.layout()) ||
+        is_cuda_conv_weight(wgt.layout())) {
         return Status::unsupported;
     }
 
@@ -1771,6 +1959,76 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
     } else {
         launch_conv_f(p, stream);
     }
+    return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+}
+
+// ============================================================
+// the int8 route's prepacked filter, for Conv2D::prepackWeights
+// ============================================================
+
+static_assert(kConvI8PackBN == ConvShapeI8::BN && kConvI8PackBK == ConvShapeI8::BK &&
+                  kConvI8PackLD == ConvShapeI8::LD,
+              "the blob's panels are the kernel's shared-memory panels");
+
+TensorDesc conv_i8_packed_weight_desc(const Conv2DAttributes& attrs, const TensorDesc& weight)
+{
+    TensorDesc d;
+    if (weight.rank != 4 || weight.dtype != DataType::s8 ||
+        weight.layout != TensorLayout::HWIO || attrs.algorithm == ConvAlgorithm::Winograd ||
+        attrs.groups <= 0 || weight.dims[3] % attrs.groups != 0) {
+        return d;
+    }
+    const int64_t oc = weight.dims[3];
+    const ConvI8PackGeom g =
+        conv_i8_pack_geom(attrs.groups, weight.dims[2], oc / attrs.groups, weight.dims[0],
+                          weight.dims[1]);
+    if (!g.ok) {
+        return d;
+    }
+    d.rank = 2;
+    d.layout = TensorLayout::PackedHWIOCuda;
+    d.dtype = DataType::s8;
+    d.dims[0] = oc;
+    d.dims[1] = (g.total + oc - 1) / oc;
+    d.row_stride_elems = d.dims[1];
+    return d;
+}
+
+Status conv_i8_packed_weight_pack(const Conv2DAttributes& attrs, const TensorView& weight,
+                                  TensorView& out, const ComputeContext& ctx)
+{
+    if (weight.rank() != 4 || weight.data_type() != DataType::s8 ||
+        weight.layout() != TensorLayout::HWIO || attrs.groups <= 0 ||
+        weight.shape(3) % attrs.groups != 0) {
+        return Status::unsupported;
+    }
+    const int64_t oc = weight.shape(3);
+    const ConvI8PackGeom g =
+        conv_i8_pack_geom(attrs.groups, weight.shape(2), oc / attrs.groups, weight.shape(0),
+                          weight.shape(1));
+    if (!g.ok || out.rank() != 2 || out.data_type() != DataType::s8 ||
+        out.layout() != TensorLayout::PackedHWIOCuda || out.shape(0) != oc ||
+        out.numel() < g.total ||
+        (reinterpret_cast<uintptr_t>(out.ptr<const void>()) % 16 != 0)) {
+        return Status::unsupported;
+    }
+
+    ConvI8PackParams q;
+    q.weight = weight.ptr<const void>();
+    q.blob = out.ptr<void>();
+    q.g = g;
+    q.w_kh = int32_t(weight.stride_elems(0));
+    q.w_kw = int32_t(weight.stride_elems(1));
+    q.w_ic = int32_t(weight.stride_elems(2));
+    q.w_n = int32_t(weight.stride_elems(3));
+
+    const int64_t chunks = int64_t(g.groups) * g.ktiles * g.nblk * kConvI8PackBN *
+                           (kConvI8PackBK / 16);
+    const int64_t work = chunks > oc ? chunks : oc;
+    const int threads = 256;
+    const int blocks = int((work + threads - 1) / threads);
+    const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
+    conv_i8_pack_kernel<<<blocks, threads, 0, stream>>>(q);
     return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
 }
 

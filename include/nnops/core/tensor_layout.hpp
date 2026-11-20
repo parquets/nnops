@@ -58,6 +58,14 @@ enum class TensorLayout : uint8_t {
     // Opaque, like PackedHWIO; only the im2col route reads it.
     PackedHWIOSme = 13,
 
+    // PackedHWIOCuda — the same filter for the CUDA int8 conv: per group, one
+    // 64-row by 64-byte panel per (k tile, oc block), each row `LD = BK + 16`
+    // bytes so the kernel copies it into shared memory verbatim (the pad lane is
+    // never read), then the per-channel filter sums the requant's compensation
+    // needs. Whole-K and whole-OC, so compute() gathers nothing. Opaque, like
+    // PackedHWIO, and refused by every route but that one.
+    PackedHWIOCuda = 14,
+
     // ---- Prepacked matmul RHS (MatMul / Linear ::prepackWeights) ----
     //
     // The GEMM's B operand, packed over its *whole* K once at load time instead of
@@ -132,6 +140,13 @@ constexpr bool is_packed_conv_weight(TensorLayout layout) noexcept {
 /// True for the AArch64 SME filter blob (the ZA tiles' B layout).
 constexpr bool is_sme_conv_weight(TensorLayout layout) noexcept {
     return layout == TensorLayout::PackedHWIOSme;
+}
+
+/// True for the CUDA int8 conv's filter blob. Deliberately outside
+/// is_packed_conv_weight: that predicate is what the CPU im2col route accepts,
+/// and this blob's bytes are a CUDA tile's, not that route's panels.
+constexpr bool is_cuda_conv_weight(TensorLayout layout) noexcept {
+    return layout == TensorLayout::PackedHWIOCuda;
 }
 
 /// True for the prepacked matmul RHS; opaque, addressed by matmul_packed_b_geom.
