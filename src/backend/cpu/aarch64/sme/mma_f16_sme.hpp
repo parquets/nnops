@@ -112,9 +112,76 @@ inline void store_op(half* p, svbool_t pg32, svfloat32_t v, int live) noexcept
     } while (0)
 
 __arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
-inline void mma_f16_sme(int mc, int nc, int kc, half* c, int ldc, const half* a,
-                         const half* b, bool zero_mode, float lo, float hi,
-                         const half* col_bias, int64_t b_block_stride = 0) noexcept
+inline void mma_f16_sme_skinny(int mc, int nc, int kc, half* c, int ldc, const half* a,
+                               const half* b, bool zero_mode, float lo, float hi,
+                               const half* col_bias, int64_t b_block_stride = 0) noexcept
+{
+    constexpr int kRows = 2 * sme_mr;   // 32 rows: two A groups
+    constexpr int kCols = 2 * sme_za_n; // 32 columns: two B groups
+    const int n_tiles = (nc + kCols - 1) / kCols;
+    const int k_pairs = (kc + 1) / 2;
+    const svfloat32_t vlo = svdup_n_f32(lo);
+    const svfloat32_t vhi = svdup_n_f32(hi);
+    // A bias seed builds the tile from the bias; the destination's old value
+    // is not part of the sum, so the store overwrites even when zero_mode
+    // is off.
+    const bool accumulate = !zero_mode && col_bias == nullptr;
+
+    // A single 16-row tile: the four ZA tiles are four column groups, so one
+    // K-pair step is one A vector, two B pair loads and four MOPAs — as in the
+    // f32 kernel.
+    const svbool_t pmh = svwhilelt_b16(0, 2 * mc);
+    const svbool_t pg = svptrue_b32();
+    // Both column groups of both tiles are live here; the wide-store
+    // macro names them.
+    const svbool_t pn0 = pg;
+    const svbool_t pn1 = pg;
+    const svbool_t qg = svptrue_b16();
+    const svcount_t q16 = svptrue_c16();
+    const int64_t block_stride =
+        b_block_stride != 0 ? b_block_stride :
+                              static_cast<int64_t>(k_pairs) * (2 * sme_fp_nr);
+    for (int nt = 0; nt < n_tiles; nt += 2) {
+        const int na = nt * kCols;
+        const int nb = na + kCols;
+        const half* const bpa =
+            b + static_cast<int64_t>(na / sme_fp_nr) * block_stride;
+        const half* const bpb =
+            b + static_cast<int64_t>(nb / sme_fp_nr) * block_stride;
+        svzero_za();
+        const half* arow = a;
+        const half* browa = bpa;
+        const half* browb = bpb;
+        for (int kp = 0; kp < k_pairs;
+             ++kp, arow += 2 * kRows, browa += 2 * sme_fp_nr,
+                  browb += 2 * sme_fp_nr) {
+            const svfloat16_t av = sme_detail::load_h32(pmh, arow);
+            const svfloat16x2_t bva = svld1_f16_x2(
+                q16, reinterpret_cast<const float16_t*>(browa));
+            const svfloat16x2_t bvb = svld1_f16_x2(
+                q16, reinterpret_cast<const float16_t*>(browb));
+            svmopa_za32_f16_m(0, pmh, qg, av, svget2_f16(bva, 0));
+            svmopa_za32_f16_m(2, pmh, qg, av, svget2_f16(bva, 1));
+            svmopa_za32_f16_m(1, pmh, qg, av, svget2_f16(bvb, 0));
+            svmopa_za32_f16_m(3, pmh, qg, av, svget2_f16(bvb, 1));
+        }
+        for (int r = 0; r < mc; ++r) {
+            half* const rowa = c + static_cast<int64_t>(r) * ldc + na;
+            NNOPS_SME_STORE_WIDE_F16(
+                svread_hor_za32_f32_m(svundef_f32(), pg, 0, r),
+                svread_hor_za32_f32_m(svundef_f32(), pg, 2, r), rowa);
+            half* const rowb = c + static_cast<int64_t>(r) * ldc + nb;
+            NNOPS_SME_STORE_WIDE_F16(
+                svread_hor_za32_f32_m(svundef_f32(), pg, 1, r),
+                svread_hor_za32_f32_m(svundef_f32(), pg, 3, r), rowb);
+        }
+    }
+}
+
+__arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
+inline void mma_f16_sme_tiles(int mc, int nc, int kc, half* c, int ldc, const half* a,
+                              const half* b, bool zero_mode, float lo, float hi,
+                              const half* col_bias, int64_t b_block_stride = 0) noexcept
 {
     constexpr int kRows = 2 * sme_mr;   // 32 rows: two A groups
     constexpr int kCols = 2 * sme_za_n; // 32 columns: two B groups
@@ -127,58 +194,6 @@ inline void mma_f16_sme(int mc, int nc, int kc, half* c, int ldc, const half* a,
     // is not part of the sum, so the store overwrites even when zero_mode
     // is off.
     const bool accumulate = !zero_mode && col_bias == nullptr;
-    // A single 16-row tile: the four ZA tiles are four column groups, so one
-    // K-pair step is one A vector, two B pair loads and four MOPAs — as in the
-    // f32 kernel.
-    if (mc <= sme_mr && col_bias == nullptr && nc % (2 * kCols) == 0) {
-        const svbool_t pmh = svwhilelt_b16(0, 2 * mc);
-        const svbool_t pg = svptrue_b32();
-        // Both column groups of both tiles are live here; the wide-store
-        // macro names them.
-        const svbool_t pn0 = pg;
-        const svbool_t pn1 = pg;
-        const svbool_t qg = svptrue_b16();
-        const svcount_t q16 = svptrue_c16();
-        const int64_t block_stride =
-            b_block_stride != 0 ? b_block_stride :
-                                  static_cast<int64_t>(k_pairs) * (2 * sme_fp_nr);
-        for (int nt = 0; nt < n_tiles; nt += 2) {
-            const int na = nt * kCols;
-            const int nb = na + kCols;
-            const half* const bpa =
-                b + static_cast<int64_t>(na / sme_fp_nr) * block_stride;
-            const half* const bpb =
-                b + static_cast<int64_t>(nb / sme_fp_nr) * block_stride;
-            svzero_za();
-            const half* arow = a;
-            const half* browa = bpa;
-            const half* browb = bpb;
-            for (int kp = 0; kp < k_pairs;
-                 ++kp, arow += 2 * kRows, browa += 2 * sme_fp_nr,
-                      browb += 2 * sme_fp_nr) {
-                const svfloat16_t av = sme_detail::load_h32(pmh, arow);
-                const svfloat16x2_t bva = svld1_f16_x2(
-                    q16, reinterpret_cast<const float16_t*>(browa));
-                const svfloat16x2_t bvb = svld1_f16_x2(
-                    q16, reinterpret_cast<const float16_t*>(browb));
-                svmopa_za32_f16_m(0, pmh, qg, av, svget2_f16(bva, 0));
-                svmopa_za32_f16_m(2, pmh, qg, av, svget2_f16(bva, 1));
-                svmopa_za32_f16_m(1, pmh, qg, av, svget2_f16(bvb, 0));
-                svmopa_za32_f16_m(3, pmh, qg, av, svget2_f16(bvb, 1));
-            }
-            for (int r = 0; r < mc; ++r) {
-                half* const rowa = c + static_cast<int64_t>(r) * ldc + na;
-                NNOPS_SME_STORE_WIDE_F16(
-                    svread_hor_za32_f32_m(svundef_f32(), pg, 0, r),
-                    svread_hor_za32_f32_m(svundef_f32(), pg, 2, r), rowa);
-                half* const rowb = c + static_cast<int64_t>(r) * ldc + nb;
-                NNOPS_SME_STORE_WIDE_F16(
-                    svread_hor_za32_f32_m(svundef_f32(), pg, 1, r),
-                    svread_hor_za32_f32_m(svundef_f32(), pg, 3, r), rowb);
-            }
-        }
-        return;
-    }
 
     // Same loop order as the f32 kernel: n tile outside, M tiles inside.
     for (int nt = 0; nt < n_tiles; ++nt) {
@@ -397,6 +412,24 @@ inline void mma_f16_sme(int mc, int nc, int kc, half* c, int ldc, const half* a,
         }
     }
 }
+
+/// Dispatch the single 16-row tile (four column groups) to its own kernel;
+/// see mma_f32_sme: both callees are ZA kernels, so the split costs one
+/// branch, not a second streaming-mode transition.
+inline void mma_f16_sme(int mc, int nc, int kc, half* c, int ldc, const half* a,
+                        const half* b, bool zero_mode, float lo, float hi,
+                        const half* col_bias, int64_t b_block_stride = 0) noexcept
+{
+    constexpr int kCols = 2 * sme_za_n;
+    if (mc <= sme_mr && col_bias == nullptr && nc % (2 * kCols) == 0) {
+        mma_f16_sme_skinny(mc, nc, kc, c, ldc, a, b, zero_mode, lo, hi, col_bias,
+                           b_block_stride);
+        return;
+    }
+    mma_f16_sme_tiles(mc, nc, kc, c, ldc, a, b, zero_mode, lo, hi, col_bias,
+                      b_block_stride);
+}
+
 
 } // namespace nnops::backend::cpu::aarch64
 

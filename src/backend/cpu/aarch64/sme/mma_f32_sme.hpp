@@ -85,13 +85,12 @@ inline svfloat32_t load_op(svbool_t pg, const float* p) noexcept
     } while (0)
 
 __arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
-inline void mma_f32_sme(int mc, int nc, int kc, float* c, int ldc, const float* a,
-                        const float* b, bool zero_mode, float lo, float hi,
-                        const float* col_bias, int64_t b_block_stride = 0) noexcept
+inline void mma_f32_sme_skinny(int mc, int nc, int kc, float* c, int ldc, const float* a,
+                               const float* b, bool zero_mode, float lo, float hi,
+                               const float* col_bias, int64_t b_block_stride = 0) noexcept
 {
     constexpr int kRows = 2 * sme_mr;   // 32 rows: two A groups
     constexpr int kCols = 2 * sme_za_n; // 32 columns: two B groups
-    const int m_tiles = (mc + kRows - 1) / kRows;
     const int n_tiles = (nc + kCols - 1) / kCols;
     const int64_t block_stride = b_block_stride != 0 ? b_block_stride :
                                                        static_cast<int64_t>(kc) * sme_fp_nr;
@@ -106,67 +105,83 @@ inline void mma_f32_sme(int mc, int nc, int kc, float* c, int ldc, const float* 
     // K step is one A vector, two B pair loads and four MOPAs. With only two
     // tiles the same K step would issue two MOPAs, and the loop overhead —
     // not the MOPA — became the limit (half the throughput).
-    if (mc <= sme_mr && col_bias == nullptr && nc % (2 * kCols) == 0) {
-        const svbool_t pm = svwhilelt_b32(0, mc);
-        const svbool_t pg = svptrue_b32();
-        // The wide-store macro names the column predicates; here every column
-        // of both tiles is live.
-        const svbool_t pn0 = pg;
-        const svbool_t pn1 = pg;
-        const svcount_t p32 = svptrue_c32();
-        const float* const ap = a;
-        for (int nt = 0; nt < n_tiles; nt += 2) {
-            const int na = nt * kCols;
-            const int nb = na + kCols;
-            const float* const bpa = b + static_cast<int64_t>(na / sme_fp_nr) * block_stride;
-            const float* const bpb = b + static_cast<int64_t>(nb / sme_fp_nr) * block_stride;
-            svzero_za();
-            const float* arow = ap;
-            const float* browa = bpa;
-            const float* browb = bpb;
-            int k = 0;
-            for (; k + 4 <= kc; k += 4) {
-                for (int u = 0; u < 4; ++u) {
-                    const float* const ak = arow + static_cast<int64_t>(u) * kRows;
-                    const float* const ba = browa + u * sme_fp_nr;
-                    const float* const bb = browb + u * sme_fp_nr;
-                    const svfloat32_t av = sme_detail::load_op(pm, ak);
-                    const svfloat32x2_t bva = svld1_f32_x2(p32, ba);
-                    const svfloat32x2_t bvb = svld1_f32_x2(p32, bb);
-                    svmopa_za32_f32_m(0, pm, pg, av, svget2_f32(bva, 0));
-                    svmopa_za32_f32_m(2, pm, pg, av, svget2_f32(bva, 1));
-                    svmopa_za32_f32_m(1, pm, pg, av, svget2_f32(bvb, 0));
-                    svmopa_za32_f32_m(3, pm, pg, av, svget2_f32(bvb, 1));
-                }
-                arow += 4 * kRows;
-                browa += 4 * sme_fp_nr;
-                browb += 4 * sme_fp_nr;
-            }
-            for (; k < kc; ++k) {
-                const svfloat32_t av = sme_detail::load_op(pm, arow);
-                const svfloat32x2_t bva = svld1_f32_x2(p32, browa);
-                const svfloat32x2_t bvb = svld1_f32_x2(p32, browb);
+    const svbool_t pm = svwhilelt_b32(0, mc);
+    const svbool_t pg = svptrue_b32();
+    // The wide-store macro names the column predicates; here every column
+    // of both tiles is live.
+    const svbool_t pn0 = pg;
+    const svbool_t pn1 = pg;
+    const svcount_t p32 = svptrue_c32();
+    const float* const ap = a;
+    for (int nt = 0; nt < n_tiles; nt += 2) {
+        const int na = nt * kCols;
+        const int nb = na + kCols;
+        const float* const bpa = b + static_cast<int64_t>(na / sme_fp_nr) * block_stride;
+        const float* const bpb = b + static_cast<int64_t>(nb / sme_fp_nr) * block_stride;
+        svzero_za();
+        const float* arow = ap;
+        const float* browa = bpa;
+        const float* browb = bpb;
+        int k = 0;
+        for (; k + 4 <= kc; k += 4) {
+            for (int u = 0; u < 4; ++u) {
+                const float* const ak = arow + static_cast<int64_t>(u) * kRows;
+                const float* const ba = browa + u * sme_fp_nr;
+                const float* const bb = browb + u * sme_fp_nr;
+                const svfloat32_t av = sme_detail::load_op(pm, ak);
+                const svfloat32x2_t bva = svld1_f32_x2(p32, ba);
+                const svfloat32x2_t bvb = svld1_f32_x2(p32, bb);
                 svmopa_za32_f32_m(0, pm, pg, av, svget2_f32(bva, 0));
                 svmopa_za32_f32_m(2, pm, pg, av, svget2_f32(bva, 1));
                 svmopa_za32_f32_m(1, pm, pg, av, svget2_f32(bvb, 0));
                 svmopa_za32_f32_m(3, pm, pg, av, svget2_f32(bvb, 1));
-                arow += kRows;
-                browa += sme_fp_nr;
-                browb += sme_fp_nr;
             }
-            for (int r = 0; r < mc; ++r) {
-                float* const rowa = c + static_cast<int64_t>(r) * ldc + na;
-                NNOPS_SME_STORE_WIDE_ROW_F32(
-                    svread_hor_za32_f32_m(svundef_f32(), pg, 0, r),
-                    svread_hor_za32_f32_m(svundef_f32(), pg, 2, r), rowa);
-                float* const rowb = c + static_cast<int64_t>(r) * ldc + nb;
-                NNOPS_SME_STORE_WIDE_ROW_F32(
-                    svread_hor_za32_f32_m(svundef_f32(), pg, 1, r),
-                    svread_hor_za32_f32_m(svundef_f32(), pg, 3, r), rowb);
-            }
+            arow += 4 * kRows;
+            browa += 4 * sme_fp_nr;
+            browb += 4 * sme_fp_nr;
         }
-        return;
+        for (; k < kc; ++k) {
+            const svfloat32_t av = sme_detail::load_op(pm, arow);
+            const svfloat32x2_t bva = svld1_f32_x2(p32, browa);
+            const svfloat32x2_t bvb = svld1_f32_x2(p32, browb);
+            svmopa_za32_f32_m(0, pm, pg, av, svget2_f32(bva, 0));
+            svmopa_za32_f32_m(2, pm, pg, av, svget2_f32(bva, 1));
+            svmopa_za32_f32_m(1, pm, pg, av, svget2_f32(bvb, 0));
+            svmopa_za32_f32_m(3, pm, pg, av, svget2_f32(bvb, 1));
+            arow += kRows;
+            browa += sme_fp_nr;
+            browb += sme_fp_nr;
+        }
+        for (int r = 0; r < mc; ++r) {
+            float* const rowa = c + static_cast<int64_t>(r) * ldc + na;
+            NNOPS_SME_STORE_WIDE_ROW_F32(
+                svread_hor_za32_f32_m(svundef_f32(), pg, 0, r),
+                svread_hor_za32_f32_m(svundef_f32(), pg, 2, r), rowa);
+            float* const rowb = c + static_cast<int64_t>(r) * ldc + nb;
+            NNOPS_SME_STORE_WIDE_ROW_F32(
+                svread_hor_za32_f32_m(svundef_f32(), pg, 1, r),
+                svread_hor_za32_f32_m(svundef_f32(), pg, 3, r), rowb);
+        }
     }
+}
+
+__arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
+inline void mma_f32_sme_tiles(int mc, int nc, int kc, float* c, int ldc, const float* a,
+                              const float* b, bool zero_mode, float lo, float hi,
+                              const float* col_bias, int64_t b_block_stride = 0) noexcept
+{
+    constexpr int kRows = 2 * sme_mr;   // 32 rows: two A groups
+    constexpr int kCols = 2 * sme_za_n; // 32 columns: two B groups
+    const int m_tiles = (mc + kRows - 1) / kRows;
+    const int n_tiles = (nc + kCols - 1) / kCols;
+    const int64_t block_stride = b_block_stride != 0 ? b_block_stride :
+                                                       static_cast<int64_t>(kc) * sme_fp_nr;
+    const svfloat32_t vlo = svdup_n_f32(lo);
+    const svfloat32_t vhi = svdup_n_f32(hi);
+    // A bias seed builds the tile from the bias; the destination's old value
+    // is not part of the sum, so the store overwrites even when zero_mode
+    // is off.
+    const bool accumulate = !zero_mode && col_bias == nullptr;
 
     // The n tile is the outer loop: its 32 columns per k stay in L1 across all
     // M tiles, while an M tile is only 32 rows.
@@ -394,6 +409,24 @@ inline void mma_f32_sme(int mc, int nc, int kc, float* c, int ldc, const float* 
         }
     }
 }
+
+/// Dispatch the single 16-row tile (four column groups) to its own kernel;
+/// the general path keeps the n-tile-outer loop. Both are ZA kernels, so the
+/// split costs one branch, not a second streaming-mode transition.
+inline void mma_f32_sme(int mc, int nc, int kc, float* c, int ldc, const float* a,
+                        const float* b, bool zero_mode, float lo, float hi,
+                        const float* col_bias, int64_t b_block_stride = 0) noexcept
+{
+    constexpr int kCols = 2 * sme_za_n;
+    if (mc <= sme_mr && col_bias == nullptr && nc % (2 * kCols) == 0) {
+        mma_f32_sme_skinny(mc, nc, kc, c, ldc, a, b, zero_mode, lo, hi, col_bias,
+                           b_block_stride);
+        return;
+    }
+    mma_f32_sme_tiles(mc, nc, kc, c, ldc, a, b, zero_mode, lo, hi, col_bias,
+                      b_block_stride);
+}
+
 
 } // namespace nnops::backend::cpu::aarch64
 
