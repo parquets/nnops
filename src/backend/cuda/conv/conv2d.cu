@@ -512,8 +512,16 @@ void conv_gemm_h_kernel(ConvParams p)
 // f32 SIMT kernel
 // ============================================================
 
-/// The f32 tile: 8x8 per lane, a three-deep ring, and 16 elements of k a stage.
-using ConvShapeF = F32TileShape<4, 8, 2, 2, 16, 3>;
+/// The f32 tile: 64 pixels by 64 channels, 8x8 per lane, and 16 elements of k a
+/// stage.
+///
+/// Unlike the f16 twin the warp count is not the lever here. Eight warps of a
+/// 32x16 lane tile do buy 24 warps and 50% occupancy, but the 4x4 lane tile
+/// under them costs a quarter of the per-FMA reuse (2 loads a k step against 2.7)
+/// and the sum comes out even: 112x112x64 k1 gains 28% and 56x56x256 k3 loses 9%.
+/// The 4x8 lane tile keeps its reuse and takes a second stage instead of a third,
+/// which is 20 KB and four resident blocks rather than 30 KB and three.
+using ConvShapeF = F32TileShape<4, 8, 2, 2, 16, 2, 4, 8, 4, 4>;
 
 /// The A panel in float units: rows of `BK + Pad`, the padding being what keeps
 /// a 16 B gather vector 16 B aligned on every row.
