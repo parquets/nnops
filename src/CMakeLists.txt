@@ -195,8 +195,9 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/gather.cu
         backend/cuda/scatter.cu
         # Convolutions and the pooling that goes with them, one file an
-        # operator family: Conv2D (the PTX implicit GEMM), depthwise, and
-        # spatial pooling.
+        # operator family: Conv2D (the PTX implicit GEMM, split one file per
+        # arithmetic family with the shared geometry in conv2d_common.cuh),
+        # depthwise, and spatial pooling.
         backend/cuda/matmul/matmul.cu
         backend/cuda/matmul/linear.cu
         backend/cuda/matmul/matmul_f16.cu
@@ -205,6 +206,7 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/matmul/matmul_f32.cu
         backend/cuda/matmul/matmul_i8_ptx.cu
         backend/cuda/conv/conv2d.cu
+        backend/cuda/conv/conv2d_i8.cu
         backend/cuda/conv/transpose_conv2d.cu
         backend/cuda/conv/depthwise_transpose_conv.cu
         backend/cuda/conv/depthwise_conv.cu
