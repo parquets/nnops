@@ -189,6 +189,16 @@ std::vector<ConvBenchCase> wide_layers()
     c = ConvBenchCase{}; c.ic = 64; c.oc = 128; c.ih = c.iw = 224;
     c.sh = c.sw = 2; c.ph = c.pw = 0;               v.push_back(c); // stride 2
 
+    // Past a wave several times over and at the widths the large-image
+    // backbones use: 448x448x64 and 224x224x128 are each 14.8 GFLOP a call, so
+    // a row reads as a steady-state rate rather than a launch.
+    c = ConvBenchCase{}; c.ic = 64; c.oc = 64; c.ih = c.iw = 448;  v.push_back(c);
+    c = ConvBenchCase{}; c.ic = 64; c.oc = 64; c.ih = c.iw = 512;  v.push_back(c);
+    c = ConvBenchCase{}; c.ic = 128; c.oc = 128; c.ih = c.iw = 224; v.push_back(c);
+    c = ConvBenchCase{}; c.n = 4; c.ic = c.oc = 64; c.ih = c.iw = 224; v.push_back(c);
+    c = ConvBenchCase{}; c.ic = 256; c.oc = 256; c.ih = c.iw = 224;
+    c.kh = c.kw = 1; c.ph = c.pw = 0;               v.push_back(c); // pointwise
+
     return v;
 }
 

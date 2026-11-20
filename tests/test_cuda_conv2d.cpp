@@ -191,6 +191,45 @@ NNOPS_TEST(cuda_conv2d_wide_channels) {
     run_case(c, "cuda_conv2d_wide_channels");
 }
 
+NNOPS_TEST(cuda_conv2d_wide_planes) {
+    // Planes of thousands of pixels rather than tens, so the grid is full and
+    // the three things a small case masks all run at scale: the M edge and the
+    // partial last tile, the split-K range, and the epilogue's per-row pixel
+    // decode. 7x7 and 14x14 sit under one wave of the 64-pixel tile.
+    struct Wide {
+        int64_t n, ic, oc, side, kh, sh, groups;
+        DataType dtype;
+    };
+    const Wide cases[] = {
+        {1, 64, 64, 112, 3, 1, 1, DataType::f32},
+        {1, 64, 64, 112, 3, 1, 1, DataType::f16},
+        {1, 64, 128, 112, 3, 1, 1, DataType::f16},
+        {1, 32, 32, 224, 1, 1, 1, DataType::f16},
+        {1, 64, 64, 224, 3, 2, 1, DataType::f32},
+        {2, 48, 64, 112, 3, 1, 1, DataType::f16},
+        {1, 32, 32, 224, 3, 1, 2, DataType::f32},
+        // Past the 65535-pixel wall the old guard stood at, and a stride-2 plane
+        // that lands exactly on it: both are the fill's 32-bit offset span, and
+        // the CPU oracle is what proves the span is the right bound.
+        {1, 32, 32, 320, 3, 1, 1, DataType::f16},
+        {1, 16, 32, 512, 3, 2, 1, DataType::f32},
+    };
+    for (const Wide& w : cases) {
+        ConvCase c;
+        c.n = w.n;
+        c.ic = w.ic;
+        c.oc = w.oc;
+        c.ih = c.iw = w.side;
+        c.kh = c.kw = w.kh;
+        c.sh = c.sw = w.sh;
+        c.ph = c.pw = w.kh / 2;
+        c.groups = w.groups;
+        c.dtype = w.dtype;
+        c.use_bias = true;
+        run_case(c, "cuda_conv2d_wide_planes");
+    }
+}
+
 NNOPS_TEST(cuda_conv2d_i8) {
     // The quantized route on CUDA: a pre-quantized u8/s8 activation against an
     // s8 HWIO filter, compared bit for bit with the CPU route.
@@ -232,6 +271,11 @@ NNOPS_TEST(cuda_conv2d_i8) {
         // activation sums are shared memory indexed by tile row.
         {1, 16, 16, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::s8, true, true, 133, true},
         {1, 16, 12, 12, 16, 3, 3, 1, 1, 1, 1, 1, 1, 2, DataType::u8, DataType::u8, true, true, 137, true},
+
+        // And planes of thousands of pixels, for the same three reasons as the
+        // fp wide-plane table.
+        {1, 64, 112, 112, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, DataType::u8, DataType::s8, true, true, 211, true},
+        {1, 32, 224, 224, 32, 1, 1, 1, 1, 1, 1, 0, 0, 1, DataType::s8, DataType::f32, false, false, 213, true},
 
         // Depthwise-shaped groups (IC/G = OC/G = 1) stay on the quantized GEMM.
         {1, 16, 8, 8, 16, 3, 3, 1, 1, 1, 1, 1, 1, 16, DataType::s8, DataType::u8, true, true, 131, true},

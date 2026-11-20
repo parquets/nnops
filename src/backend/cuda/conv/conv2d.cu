@@ -100,6 +100,21 @@ struct ConvParams {
     bool relu = false; ///< integer destinations: Relu before the store
 };
 
+/// The largest element offset the fills form inside one group slice of the
+/// activation: a tap reaches KH rows and KW columns past the output's own
+/// extent, and the innermost axis is the full channel count (the slice's base is
+/// pre-shifted, so the strides are the tensor's, not the group's).
+///
+/// The fills keep that offset in 32 bits -- a runtime 64-bit offset costs an
+/// IADD.X on every vector -- so a slice wider than the int range is refused
+/// rather than silently wrapped. It is the span that matters, not the pixel
+/// count: 448x448 of output is 13M, while the 65535-pixel limit that used to
+/// stand here refused anything past 255x255.
+inline int64_t conv_offset_span(const ConvParams& p)
+{
+    return (int64_t(p.ih) + p.kh * p.dh) * (int64_t(p.iw) + p.kw * p.dw) * p.ic;
+}
+
 /// Element (n, k) of one group's filter, walked through its own strides so a
 /// padded or sliced filter tensor is read correctly. The k-flattening is
 /// channel-major inside a tap (HWIO): k = tap·ICG + ic.
@@ -1445,8 +1460,8 @@ Status conv2d_i8_cuda(const Conv2DAttributes& attrs, TensorView& output,
     p.fill_vec = p.in_c == 1 && p.icg % kGroup == 0 && (p.in_w % 16 == 0) &&
                  (reinterpret_cast<uintptr_t>(p.input) % 16 == 0);
 
-    if (p.oh * p.ow > 65535 || p.batch * p.groups > 65535 || (p.ocg + 63) / 64 > 65535 ||
-        p.ocg <= 0) {
+    if (conv_offset_span(p) >= (int64_t(1) << 30) || p.batch * p.groups > 65535 ||
+        (p.ocg + 63) / 64 > 65535 || p.ocg <= 0) {
         return Status::unsupported;
     }
 
@@ -1620,10 +1635,10 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
                  (reinterpret_cast<uintptr_t>(p.input) % 16 == 0);
 
     // The fill addresses the activation with 32-bit offsets from its block's
-    // slice; a tensor past the halfway point of the int range is refused rather
-    // than silently wrapping.
-    if (p.oh * p.ow > 65535 || p.batch * p.groups > 65535 || p.ocg <= 0 ||
-        act.numel() > (int64_t(1) << 30)) {
+    // slice, so it is the slice's span -- not the pixel count -- that has to fit
+    // the int range. `conv_offset_span` is that span.
+    if (conv_offset_span(p) >= (int64_t(1) << 30) || p.batch * p.groups > 65535 ||
+        p.ocg <= 0 || act.numel() > (int64_t(1) << 30)) {
         return Status::unsupported;
     }
 
