@@ -3,15 +3,15 @@
 /// @brief 1D convolution — NHWC input and HWIO filter, with groups and dilation.
 ///
 /// 1D is the 2D convolution with a 1-wide second spatial axis, and that is
-/// exactly how it runs: the activation is lifted from [N, C, L] to
-/// [N, C, 1, L] and the Conv2D implicit-GEMM kernel is called with a kernel of
+/// exactly how it runs: the activation is lifted from [N, L, C] to
+/// [N, 1, L, C] and the Conv2D implicit-GEMM kernel is called with a kernel of
 /// {1, K}. The lift keeps the caller's row pitch and layout, and because the
 /// lifted height is one the derived channel/batch/output strides are the 1D
 /// ones — so the GEMM geometry is the one a native 1D conv would have
 /// (pixel-major).
 ///
-/// Activation [N, IC, L] stored NWC, weight [K, IC/G, OC] (HWIO), bias [OC]
-/// optional, output [N, OC, OL].
+/// Activation [N, L, IC] (channel-last), weight [K, IC/G, OC] (HWIO), bias [OC]
+/// optional, output [N, OL, OC].
 ///
 /// Data types: f32/f16 on every tensor (the floating-point route), or the
 /// quantized route — an s8 weight with per-channel QuantParams against a
@@ -96,7 +96,7 @@ struct Conv1DAttributes {
     DataType act_quant_dtype = DataType::s8;
 };
 
-/// [N, IC, L] → [N, OC, OL], either layout.
+/// [N, L, IC] → [N, OL, OC], channel-last.
 class Conv1D : public OpBase {
 public:
     static std::unique_ptr<Conv1D> create(const Conv1DAttributes& attrs,

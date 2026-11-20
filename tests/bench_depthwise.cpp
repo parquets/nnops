@@ -115,7 +115,7 @@ struct DepthwiseCase {
 
 void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters,
               int rounds) {
-    const int64_t ishape[] = {1, c.C, c.IH, c.IW};
+    const int64_t ishape[] = {1, c.IH, c.IW, c.C};  // channel-last
     const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
     const int64_t bshape[] = {c.C};
 
@@ -147,8 +147,8 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
     const TensorView ins[] = {in_cl, w_cl, b_v};
     const TensorDesc descs[] = {in_cl.desc(), w_cl.desc(), b_v.desc()};
     auto out_desc = op->getOutputTensorDesc(descs)[0];
-    const int64_t OH = out_desc.dims[2];
-    const int64_t OW = out_desc.dims[3];
+    const int64_t OH = out_desc.dims[1];
+    const int64_t OW = out_desc.dims[2];
     std::vector<float> out_buf(static_cast<size_t>(out_desc.numel()));
     auto out = test::make_channel_first(out_desc, out_buf.data());
     const auto call = [&](const ComputeContext& ctx) {

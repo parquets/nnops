@@ -3,16 +3,15 @@
 /// @brief The rank-3 → rank-4 view lifts that let the 1D operators run on the
 ///        2D kernels with a 1-wide spatial axis.
 ///
-/// A 1D activation is [N, C, L] and maps onto 2D as [N, C, 1, L]: H is 1 and W
-/// is the signal. Every 2D kernel reads H from dim 2 and W from dim 3, so the
-/// conv gather, the pooling window and the im2col N axis all see the signal as
-/// one row. The lift keeps the caller's pitch, so the derived channel and batch
-/// strides are the 1D ones and a sub-view that starts mid-row still addresses
-/// right.
+/// A channel-last 1D activation is [N, L, C] and maps onto 2D as
+/// [N, 1, L, C]: H is 1 and W is the signal. Every 2D kernel reads H from axis
+/// 1 and W from axis 2, so the conv gather, the pooling window and the im2col
+/// N axis all see the signal as one row. The lift keeps the caller's pitch, so
+/// the derived channel and batch strides are the 1D ones and a sub-view that
+/// starts mid-row still addresses right.
 ///
-/// The NHWC form works through the same call because a rank-3 view
-/// keeps its logical dims [N, C, L] whatever the layout says; [N, L, C] in
-/// memory lifts to [N, H=1, W=L, C].
+/// A dense (channel-first) activation is not a 1D operator input: Conv1D and
+/// Pool1D take channel-last tensors only.
 ///
 /// Conv1D and Pool1D both use this lift, and neither owns a kernel.
 
@@ -29,10 +28,10 @@ inline void* view_data(const TensorView& v) noexcept
     return const_cast<void*>(static_cast<const void*>(v.ptr<uint8_t>()));
 }
 
-/// [N, C, L] → [N, C, 1, L], pitch and layout preserved.
+/// [N, L, C] → [N, 1, L, C], pitch and layout preserved.
 inline TensorView lift_wide(const TensorView& v)
 {
-    const int64_t s[4] = {v.shape(0), v.shape(1), 1, v.shape(2)};
+    const int64_t s[4] = {v.shape(0), 1, v.shape(1), v.shape(2)};
     return TensorView(std::span<const int64_t>(s, 4), v.data_type(), view_data(v), v.pitch(),
                       v.layout(), v.quant_params());
 }

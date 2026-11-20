@@ -32,8 +32,8 @@
 /// output-driven gather, which is correct for every shape.
 ///
 /// The weight stays [OC, IC/G, KD, KH, KW]; both the input and the output are
-/// stored NDHWC ([N, D, H, W, C] in memory, logical dims
-/// [N, C, D, H, W]).
+/// channel-last NDHWC ([N, D, H, W, C] as both the logical dims and the memory
+/// order).
 
 #include "nnops/ops/conv3d.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
@@ -109,11 +109,11 @@ bool conv3d_im2col_gemm(const Geom& gm, TensorView& output, std::span<const Tens
     }
 
     const int64_t in_n_stride = input.stride_elems(0);
-    const int64_t in_d_stride = input.stride_elems(2);
+    const int64_t in_d_stride = input.stride_elems(1);
     const int64_t in_row_stride = input.row_stride_elems();
-    const int64_t in_pix = input.shape(1); // W step: one whole channel vector
+    const int64_t in_pix = input.shape(4); // W step: one whole channel vector
     const int64_t out_n_stride = output.stride_elems(0);
-    const int64_t out_d_stride = output.stride_elems(2);
+    const int64_t out_d_stride = output.stride_elems(1);
     const int64_t out_row_stride = output.row_stride_elems();
 
     const bool in_dense =
@@ -251,11 +251,11 @@ void conv3d_gather(const Geom& gm, TensorView& output, std::span<const TensorVie
     const bool has_bias = inputs.size() > 2;
 
     const int64_t in_n_stride = input.stride_elems(0);
-    const int64_t in_d_stride = input.stride_elems(2);
+    const int64_t in_d_stride = input.stride_elems(1);
     const int64_t in_row_stride = input.row_stride_elems();
-    const int64_t in_pix = input.shape(1);
+    const int64_t in_pix = input.shape(4);
     const int64_t out_n_stride = output.stride_elems(0);
-    const int64_t out_d_stride = output.stride_elems(2);
+    const int64_t out_d_stride = output.stride_elems(1);
     const int64_t out_row_stride = output.row_stride_elems();
 
     // The filter is walked by its own strides rather than as one k block.
@@ -343,10 +343,10 @@ Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
 
     Geom gm{};
     gm.N = input.shape(0);
-    gm.IC = input.shape(1);
-    gm.ID = input.shape(2);
-    gm.IH = input.shape(3);
-    gm.IW = input.shape(4);
+    gm.IC = input.shape(4);
+    gm.ID = input.shape(1);
+    gm.IH = input.shape(2);
+    gm.IW = input.shape(3);
     gm.OC = weight.shape(0);
     gm.IC_per_G = weight.shape(1);
     gm.KD = attrs.kernel_size[0];
@@ -354,9 +354,9 @@ Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
     gm.KW = attrs.kernel_size[2];
     gm.G = attrs.groups;
     gm.OC_per_G = gm.OC / gm.G;
-    gm.OD = output.shape(2);
-    gm.OH = output.shape(3);
-    gm.OW = output.shape(4);
+    gm.OD = output.shape(1);
+    gm.OH = output.shape(2);
+    gm.OW = output.shape(3);
     gm.SD = attrs.stride[0];
     gm.SH = attrs.stride[1];
     gm.SW = attrs.stride[2];

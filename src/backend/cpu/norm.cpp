@@ -190,7 +190,7 @@ void batch_norm_impl(const NormAttributes& attrs, TensorView& output,
         C = 1;
     } else {
         N = X.shape(0);
-        C = X.shape(1);
+        C = X.shape(X.rank() - 1);
     }
 
     const auto* x_ptr = X.ptr<T>();
@@ -210,9 +210,10 @@ void batch_norm_impl(const NormAttributes& attrs, TensorView& output,
                 s_load(&b_ptr[c]) - s_load(&m_ptr[c]) * ns_f[static_cast<size_t>(c)];
         }
 
-        // One row is a spatial line of W pixels × C channels; each pixel
-        // takes the same C factors. Rank 2 has C as its only row.
-        const int64_t pixels = (rank >= 3) ? X.shape(rank - 1) : 1;
+        // One row is a spatial line of W pixels × C channels (channel-last, so
+        // W is the second-innermost axis); each pixel takes the same C factors.
+        // Rank 2 has C as its only row.
+        const int64_t pixels = (rank >= 3) ? X.shape(rank - 2) : 1;
         const int64_t num_rows = (rank >= 3) ? X.total_rows() : N;
         const int64_t x_rs = X.row_stride_elems();
         const int64_t y_rs = output.row_stride_elems();
@@ -586,7 +587,7 @@ void group_norm_impl(const NormAttributes& attrs, TensorView& output,
     NNOPS_ASSERT(rank >= 2);
 
     const int64_t N = X.shape(0);
-    const int64_t C = X.shape(1);
+    const int64_t C = X.shape(X.rank() - 1);
     int64_t G = attrs.num_groups;
     if (G <= 0) {
         G = 1;

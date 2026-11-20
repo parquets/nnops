@@ -311,7 +311,7 @@ struct PoolPair {
         qp.scale = 1.0f / 32.0f;
         qp.zero_point = std::is_same_v<T, uint8_t> ? 128 : 0;
 
-        const int64_t sh[] = {c.N, c.C, c.L};
+        const int64_t sh[] = {c.N, c.L, c.C};  // channel-last
         const TensorLayout lay = TensorLayout::NHWC;
         in = TensorView(std::span<const int64_t>(sh, 3), dt, buf.data(), lay,
                         quant ? qp : QuantParams{});
@@ -319,7 +319,7 @@ struct PoolPair {
         op1d = Pool1D::create(attrs_of(c), Backend::CPU);
         const TensorDesc d[] = {in.desc()};
         const auto od = op1d->getOutputTensorDesc(d);
-        OL = od[0].dims[2];
+        OL = od[0].dims[1];
 
         out_buf.assign(static_cast<size_t>(od[0].numel()), T{});
         out = TensorView(od[0].dims, dt, out_buf.data(), lay,

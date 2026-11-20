@@ -488,12 +488,12 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    // Logical [N, C, H, W]; NHWC stores [N][H][W][C], so a "row" is one spatial
-    // line and a pixel's channel vector is contiguous.
+    // Channel-last [N, H, W, C]: a "row" is one spatial line and a pixel's
+    // channel vector is contiguous.
     const int64_t N = input.shape(0);
-    const int64_t IC = input.shape(1);
-    const int64_t IH = input.shape(2);
-    const int64_t IW = input.shape(3);
+    const int64_t IC = input.shape(3);
+    const int64_t IH = input.shape(1);
+    const int64_t IW = input.shape(2);
     const int64_t in_row_stride = input.row_stride_elems();
 
     // HWIO: the output channel is the last axis; a prepacked blob leads with it.
@@ -509,8 +509,8 @@ void conv2d_impl(const Conv2DAttributes& attrs, TensorView& output,
     constexpr DataType sme_be_dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
 #endif
 
-    const int64_t OH = output.shape(2);
-    const int64_t OW = output.shape(3);
+    const int64_t OH = output.shape(1);
+    const int64_t OW = output.shape(2);
     const int64_t out_row_stride = output.row_stride_elems();
 
     const int64_t G = attrs.groups;
@@ -1114,9 +1114,9 @@ void materialize_plane(const TensorView& in, int8_t* dst, float scale, int32_t z
 {
     constexpr bool kPreQuant = std::is_same_v<TAct, int8_t> || std::is_same_v<TAct, uint8_t>;
 
-    const int64_t IC = in.shape(1);
-    const int64_t IH = in.shape(2);
-    const int64_t IW = in.shape(3);
+    const int64_t IC = in.shape(3);
+    const int64_t IH = in.shape(1);
+    const int64_t IW = in.shape(2);
     const int64_t N = in.shape(0);
     const int64_t rs = in.row_stride_elems();
     const TAct* src = in.ptr<TAct>();
@@ -1220,17 +1220,17 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
     const bool has_bias = inputs.size() > 2;
 
     const int64_t N = input.shape(0);
-    const int64_t IC = input.shape(1);
-    const int64_t IH = input.shape(2);
-    const int64_t IW = input.shape(3);
+    const int64_t IC = input.shape(3);
+    const int64_t IH = input.shape(1);
+    const int64_t IW = input.shape(2);
 
     // HWIO: the output channel is the last axis; a prepacked blob leads with it.
     const bool prepacked = is_packed_conv_weight(weight.layout());
     const bool sme_blob = weight.layout() == TensorLayout::PackedHWIOSme;
     const int64_t OC = prepacked ? weight.shape(0) : weight.shape(3);
 
-    const int64_t OH = output.shape(2);
-    const int64_t OW = output.shape(3);
+    const int64_t OH = output.shape(1);
+    const int64_t OW = output.shape(2);
     const int64_t out_row_stride = output.row_stride_elems();
 
     const int64_t G = attrs.groups;
@@ -1982,7 +1982,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     }
 
     const int64_t N = in.dims[0];
-    const int64_t IC = in.dims[1];
+    const int64_t IC = in.dims[3];
     // The weight is TensorFlow's [KH, KW, IC/G, OC]; anything else
     // is not this route's — except the prepacked blob, whose shape leads with OC
     // (see conv_packed_weight_desc).
@@ -1992,8 +1992,8 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
         return plan;
     }
     const int64_t OC = prepacked ? wt.dims[0] : wt.dims[3];
-    const int64_t OH = out.dims[2];
-    const int64_t OW = out.dims[3];
+    const int64_t OH = out.dims[1];
+    const int64_t OW = out.dims[2];
 
     const int64_t G = attrs.groups;
     const int64_t ic_per_group = IC / G;
@@ -2146,7 +2146,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     const bool fp_act = (dt == DataType::f32 || dt == DataType::f16);
     plan.quant_size = (quant && (fp_act || (dt == DataType::u8 &&
                                             (plan.pointwise || sme_blob || sme_i8_plane)))) ?
-                          N * in.dims[2] * in.dims[3] * IC :
+                          N * in.dims[1] * in.dims[2] * IC :
                           0;
 
     const int64_t total = NG * plan.oh_chunks * plan.oc_chunks;
@@ -2272,13 +2272,13 @@ Status conv2d_fp_run(const Conv2DAttributes& attrs, TensorView& output,
     }
 }
 
-/// [N, C, H, W] cut to `len` columns from `col0`, pitch and layout kept: a
+/// [N, H, W, C] cut to `len` columns from `col0`, pitch and layout kept: a
 /// column is a whole channel vector.
 TensorView wide_window(const TensorView& v, int64_t col0, int64_t len)
 {
     const int64_t unit = static_cast<int64_t>(data_type_stride_unit(v.data_type()));
-    const int64_t off = col0 * v.shape(1) * unit;
-    const int64_t s[4] = {v.shape(0), v.shape(1), v.shape(2), len};
+    const int64_t off = col0 * v.shape(3) * unit;
+    const int64_t s[4] = {v.shape(0), v.shape(1), len, v.shape(3)};
     auto* base =
         const_cast<char*>(static_cast<const char*>(static_cast<const void*>(v.ptr<uint8_t>())));
     return TensorView(std::span<const int64_t>(s, 4), v.data_type(), base + off, v.pitch(),
@@ -2296,10 +2296,10 @@ int64_t wide_split_chunks(const Conv2DAttributes& attrs, std::span<const TensorV
 {
     const TensorView& input = inputs[0];
     const TensorView& weight = inputs[1];
-    const int64_t OW = output.shape(3);
-    const int64_t IW = input.shape(3);
+    const int64_t OW = output.shape(2);
+    const int64_t IW = input.shape(2);
     const int64_t workers = std::max<int64_t>(ctx.cpu.worker_count(), 1);
-    if (output.shape(2) != 1 || workers <= 1 || inputs.size() > 4) {
+    if (output.shape(1) != 1 || workers <= 1 || inputs.size() > 4) {
         return 1;
     }
 
@@ -2361,8 +2361,8 @@ Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
     // bit-exact whatever the count.
     const int64_t col_chunks = wide_split_chunks(attrs, inputs, output, plan, ctx);
     if (col_chunks > 1) {
-        const int64_t OW = output.shape(3);
-        const int64_t IW = inputs[0].shape(3);
+        const int64_t OW = output.shape(2);
+        const int64_t IW = inputs[0].shape(2);
         const int64_t S = attrs.stride[1];
         const int64_t P = attrs.padding[1];
         std::atomic<int> fail{0};

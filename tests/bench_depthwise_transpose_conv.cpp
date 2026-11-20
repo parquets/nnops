@@ -131,7 +131,7 @@ struct DwtCase {
 /// Both routes are the same function, so every timed call also checks the
 /// others: the general route's output is the yardstick for the dedicated one.
 void run_case(const DwtCase& c, const std::vector<int>& threads, int iters, int rounds) {
-    const int64_t ishape[] = {1, c.C, c.IH, c.IW};
+    const int64_t ishape[] = {1, c.IH, c.IW, c.C};  // channel-last
     const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
 
     auto [in_vec, in_raw] = test::make_random_tensor(ishape, -1.0f, 1.0f, 31);
@@ -172,8 +172,8 @@ void run_case(const DwtCase& c, const std::vector<int>& threads, int iters, int 
     const TensorView cl_ins[] = {in_cl, w_hwcm};
     const TensorDesc cl_desc[] = {in_cl.desc(), w_hwcm.desc()};
     const auto cl_out_desc = dwt_op->getOutputTensorDesc(cl_desc)[0];
-    const int64_t OH = cl_out_desc.dims[2];
-    const int64_t OW = cl_out_desc.dims[3];
+    const int64_t OH = cl_out_desc.dims[1];
+    const int64_t OW = cl_out_desc.dims[2];
     const int64_t out_numel = cl_out_desc.numel();
 
     const TensorView gen_cl_ins[] = {in_cl, w_cf};
@@ -196,9 +196,8 @@ void run_case(const DwtCase& c, const std::vector<int>& threads, int iters, int 
     // ---- agreement before timing: both routes must agree ----------------
     dwt_cl(ComputeContext{});
     gen_cl(ComputeContext{});
-    const auto gen_cl_as_cf = test::to_channel_first<float>(
-        std::span<const float>(gen_cl_buf.data(), gen_cl_buf.size()), 1, c.C, OH * OW);
-    const double d_gen_cl = max_abs_diff(dwt_cl_buf.data(), gen_cl_as_cf.data(), out_numel);
+    // Both arms write the same channel-last buffer, so compare them in place.
+    const double d_gen_cl = max_abs_diff(dwt_cl_buf.data(), gen_cl_buf.data(), out_numel);
 
     const double flops = 2.0 * static_cast<double>(c.C) * OH * OW * c.KH * c.KW;
     std::printf("  %s\n", c.name);
@@ -237,7 +236,7 @@ void run_case(const DwtCase& c, const std::vector<int>& threads, int iters, int 
 
 /// The quantized arm: the s8 operands in TensorFlow's orders.
 void run_quantized_arm(const DwtCase& c, const std::vector<int>& threads, int iters) {
-    const int64_t ishape[] = {1, c.C, c.IH, c.IW};
+    const int64_t ishape[] = {1, c.IH, c.IW, c.C};  // channel-last
 
     std::vector<int8_t> act(static_cast<size_t>(c.C * c.IH * c.IW), 7);
     std::vector<int8_t> w(static_cast<size_t>(c.C * c.KH * c.KW), 9);
@@ -281,8 +280,8 @@ void run_quantized_arm(const DwtCase& c, const std::vector<int>& threads, int it
         return;
     }
 
-    const double flops = 2.0 * static_cast<double>(c.C) * out_desc.dims[2] *
-                         out_desc.dims[3] * c.KH * c.KW;
+    const double flops = 2.0 * static_cast<double>(c.C) * out_desc.dims[1] *
+                         out_desc.dims[2] * c.KH * c.KW;
 
     for (int nt : threads) {
         BenchPool pool(nt);

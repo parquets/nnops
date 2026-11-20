@@ -434,8 +434,9 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
     // disappears is one whole read-modify-write pass over the output.
     nnops::Conv2DAttributes use = attrs;
     if (residual != nullptr) { use.add_to = true; }
+    // Channel-last: [N, H, W, C].
     const bool wino =
-        nnops::winograd_applicable(use, x.shape(1) / use.groups, x.shape(2), x.shape(3));
+        nnops::winograd_applicable(use, x.shape(3) / use.groups, x.shape(1), x.shape(2));
     if (wino && winograd_order_override() != 0) {
         use.winograd_order = winograd_order_override();
     }
@@ -450,8 +451,8 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
         std::snprintf(text, sizeof text, "conv k%llds%lld @%lld %lld->%lld g%lld%s",
                       static_cast<long long>(hwio ? wl.shape(0) : wl.shape(2)),
                       static_cast<long long>(use.stride[0]),
-                      static_cast<long long>(x.shape(2)),
-                      static_cast<long long>(x.shape(1) / use.groups),
+                      static_cast<long long>(x.shape(1)),
+                      static_cast<long long>(x.shape(3) / use.groups),
                       static_cast<long long>(hwio ? wl.shape(3) : wl.shape(0)),
                       static_cast<long long>(use.groups),
                       residual != nullptr ? "+add" : "");
@@ -828,7 +829,7 @@ inline Buf linear(const TensorView& x, const TensorView& w, const TensorView& b)
 /// pool has one pixel, so [N][1][1][C] is [N][C] too.
 inline TensorView flatten_to_2d(TensorView& pooled)
 {
-    const int64_t shape[] = {pooled.shape(0), pooled.shape(1)};
+    const int64_t shape[] = {pooled.shape(0), pooled.shape(pooled.rank() - 1)};
     return TensorView(shape, pooled.data_type(), pooled.ptr<uint8_t>());
 }
 
@@ -844,7 +845,8 @@ inline Buf to_channel_last(const TensorView& x)
     d.dtype = x.data_type();
     d.layout = nnops::TensorLayout::NHWC;
     d.dims.resize(4);
-    d.dims[0] = N; d.dims[1] = C; d.dims[2] = H; d.dims[3] = W;
+    // Channel-last dims: the storage order is the logical order.
+    d.dims[0] = N; d.dims[1] = H; d.dims[2] = W; d.dims[3] = C;
     Buf out = alloc(d);
 
     for (int64_t n = 0; n < N; ++n) {
@@ -865,8 +867,9 @@ inline Buf to_channel_last(const TensorView& x)
 /// Verification only — a timed pass does not call it.
 inline Buf channel_first_copy_of(const TensorView& x)
 {
-    const int64_t N = x.shape(0), C = x.shape(1);
-    const int64_t H = x.shape(2), W = x.shape(3);
+    // x is channel-last: [N, H, W, C].
+    const int64_t N = x.shape(0), C = x.shape(x.rank() - 1);
+    const int64_t H = x.shape(1), W = x.shape(2);
     const int64_t shape[] = {N, C, H, W};
     TensorDesc d;
     d.rank = 4;

@@ -28,13 +28,13 @@ Status Activation::validate(std::span<const TensorDesc> inputs,
         return Status::ok;
     }
 
-    // The slope rides as a second input: [C] (channel = dim 1) or [1].
+    // The slope rides as a second input: [C] (the channel axis, last) or [1].
     const auto& x = inputs[0];
     const auto& slope = inputs[1];
     if (x.rank < 2 || slope.rank != 1) {
         return Status::invalid_argument;
     }
-    const int64_t c = x.dims[1];
+    const int64_t c = x.dims[x.rank - 1];
     if (slope.dims[0] != c && slope.dims[0] != 1) {
         return Status::invalid_argument;
     }

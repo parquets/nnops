@@ -327,34 +327,44 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     Fixture f(c);
     auto op = DepthwiseTransposeConv2D::create(f.attrs, Backend::CPU);
 
-    // The dense descriptor carries the logical output geometry either way; the
-    // call only changes the storage order.
+    // Shape inference speaks channel-last whatever the storage, so the query
+    // uses the NHWC dims; the reference reads the dense order.
+    const int64_t N  = c.ishape[0];
+    const int64_t C  = c.ishape[1];
+    const int64_t IH = c.ishape[2];
+    const int64_t IW = c.ishape[3];
+    const int64_t ishape_cl[] = {N, IH, IW, C};
     const std::vector<TensorDesc> cf_ins = f.descs();
-    const auto cf_outs = op->getOutputTensorDesc(cf_ins);
-    const int64_t N  = cf_outs[0].dims[0];
-    const int64_t C  = cf_outs[0].dims[1];
-    const int64_t OH = cf_outs[0].dims[2];
-    const int64_t OW = cf_outs[0].dims[3];
-    const size_t  esz = elem_size(cf_outs[0].dtype);
+    TensorDesc in_cl_desc = cf_ins[0];
+    in_cl_desc.dims = std::span<const int64_t>(ishape_cl, 4);
+    in_cl_desc.layout = TensorLayout::NHWC;
+    std::vector<TensorDesc> q_ins = {in_cl_desc};
+    for (size_t i = 1; i < cf_ins.size(); ++i) { q_ins.push_back(cf_ins[i]); }
+    const auto cl_out_desc = op->getOutputTensorDesc(q_ins);
+    const int64_t OH = cl_out_desc[0].dims[1];
+    const int64_t OW = cl_out_desc[0].dims[2];
+    const int64_t dense_out_dims[] = {N, C, OH, OW};
+    TensorDesc cf_out = cl_out_desc[0];
+    cf_out.layout = TensorLayout::Dense;
+    cf_out.dims = std::span<const int64_t>(dense_out_dims, 4);
+    const size_t  esz = elem_size(cf_out.dtype);
 
     Result r;
-    r.desc = cf_outs[0];
+    r.desc = cf_out;
 
     if (reference) {
-        r.buf.assign(static_cast<size_t>(cf_outs[0].numel()) * esz, 0);
-        seed_output(r.buf, cf_outs[0].dtype, c.seed + 3);
-        auto out = make_view(cf_outs[0], r.buf.data(), f.out_q);
+        r.buf.assign(static_cast<size_t>(cf_out.numel()) * esz, 0);
+        seed_output(r.buf, cf_out.dtype, c.seed + 3);
+        auto out = make_view(cf_out, r.buf.data(), f.out_q);
         nnops::backend::cpu::reference::depthwise_transpose_conv_int8_ref(
             f.attrs, out, f.ins, ctx, nullptr);
         return r;
     }
 
     // ---- permute the activation in, the output back ----
-    const int64_t IH = c.ishape[2], IW = c.ishape[3];
     std::vector<uint8_t> act_cl =
         to_cl(f.act, elem_size(c.act), N, C, IH, IW);
 
-    const int64_t ishape_cl[] = {N, C, IH, IW};
     TensorView in_cl(std::span<const int64_t>(ishape_cl, 4), c.act, act_cl.data(),
                      TensorLayout::NHWC, f.qa);
 
@@ -369,7 +379,7 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     cl_ins.push_back(w_cl_v.desc());
     if (c.bias) { cl_ins.push_back(f.ins.back().desc()); }
     const auto cl_outs = op->getOutputTensorDesc(cl_ins);
-    NNOPS_EXPECT_EQ(cl_outs[0].dtype, cf_outs[0].dtype);
+    NNOPS_EXPECT_EQ(cl_outs[0].dtype, cf_out.dtype);
     NNOPS_EXPECT_EQ(cl_outs[0].layout, TensorLayout::NHWC);
 
     std::vector<uint8_t> out_cl(static_cast<size_t>(cl_outs[0].numel()) * esz, 0);
@@ -674,7 +684,7 @@ NNOPS_TEST(dwt_i8_threaded_matches_serial) {
 NNOPS_TEST(dwt_i8_output_desc) {
     // f32 activation: the output follows the activation unless output_dtype is
     // an integer storage.
-    const int64_t ishape[] = {1, 8, 6, 6};
+    const int64_t ishape[] = {1, 6, 6, 8};   // [N, H, W, C]
     std::vector<float> in(1 * 8 * 6 * 6, 0.0f);
     std::vector<int8_t> w(8 * 9, 1);
     std::vector<float> ws(8, 0.01f);
@@ -697,10 +707,10 @@ NNOPS_TEST(dwt_i8_output_desc) {
     auto outs = op->getOutputTensorDesc(descs);
     NNOPS_EXPECT_EQ(outs[0].layout, TensorLayout::NHWC);
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(outs[0].dims[1], 8);
+    NNOPS_EXPECT_EQ(outs[0].dims[3], 8);   // C is the last axis
     // (6-1)*2 - 2 + 1*(3-1) + 1 + 1 = 12
+    NNOPS_EXPECT_EQ(outs[0].dims[1], 12);
     NNOPS_EXPECT_EQ(outs[0].dims[2], 12);
-    NNOPS_EXPECT_EQ(outs[0].dims[3], 12);
 
     attrs.output_dtype = DataType::u8;
     op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
@@ -710,7 +720,7 @@ NNOPS_TEST(dwt_i8_output_desc) {
 }
 
 NNOPS_TEST(dwt_i8_refusals) {
-    const int64_t ishape[] = {1, 4, 6, 6};
+    const int64_t ishape[] = {1, 6, 6, 4};   // [N, H, W, C]
     std::vector<int8_t> in(4 * 36, 1);
     std::vector<int8_t> w(4 * 9, 1);
     std::vector<float> ws(4, 0.01f);

@@ -5,8 +5,8 @@
 /// walk. Every tensor is split into *lines* — the run that is physically
 /// contiguous and perpendicular to the concat axis:
 ///
-///   Dense         line = one row of the innermost dimension
-///   Spatial       line = one pixel's C channels
+///   line = the innermost logical dim — one pixel's C channels channel-last,
+///   one row of W in a dense tensor
 ///
 /// The axis coordinate selects the source input; the remaining coordinates give
 /// the source and destination offsets through stride_elems(), so pitch padding
@@ -53,8 +53,9 @@ void concat_impl(const ConcatAttributes& attrs, TensorView& output,
             axis_offset[static_cast<size_t>(i)] + inputs[static_cast<size_t>(i)].shape(ax);
     }
 
-    const bool spatial = is_channel_last(output.layout());
-    const int64_t line_axis = spatial ? 1 : rank - 1;
+    // The line is the physically contiguous run perpendicular to the concat
+    // axis: the innermost logical dim in either layout (C channel-last, W dense).
+    const int64_t line_axis = rank - 1;
     const int64_t line_len = output.shape(line_axis);
 
     // Every dimension except the line axis is walked as one output line.

@@ -10,8 +10,8 @@
 /// and output geometry, and random roundtrips against
 /// reference::transpose_conv2d_channel_first_ref (tests/reference).
 ///
-/// Input:  logical [N, IC, IH, IW] stored [N, IH, IW, IC]
-/// Output: logical [N, OC, OH, OW] stored [N, OH, OW, OC]
+/// Input:  [N, IH, IW, IC] (channel-last)
+/// Output: [N, OH, OW, OC]
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "common/test_harness.hpp"
@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 
@@ -39,6 +40,65 @@ namespace nnops::backend::cpu::reference {
                                     const ComputeContext& ctx,
                                     void* workspace);
 }
+
+namespace {
+
+/// Channel-last [N, spatial..., C] dims for a dense [N, C, spatial...] view.
+std::vector<int64_t> cl_dims_of(const TensorView& cf)
+{
+    const int64_t rank = cf.rank();
+    std::vector<int64_t> d(static_cast<size_t>(rank));
+    d[0] = cf.shape(0);
+    for (int64_t i = 2; i < rank; ++i) { d[static_cast<size_t>(i - 1)] = cf.shape(i); }
+    d[static_cast<size_t>(rank - 1)] = cf.shape(1);
+    return d;
+}
+
+/// Dense [N, C, spatial...] dims for a channel-last view.
+std::vector<int64_t> dense_dims_of(const TensorView& cl)
+{
+    const int64_t rank = cl.rank();
+    std::vector<int64_t> d(static_cast<size_t>(rank));
+    d[0] = cl.shape(0);
+    d[1] = cl.shape(rank - 1);
+    for (int64_t i = 1; i + 1 < rank; ++i) { d[static_cast<size_t>(i + 1)] = cl.shape(i); }
+    return d;
+}
+
+/// The channel-last output desc for a dense input: shape inference speaks
+/// channel-last whatever the storage.
+TensorDesc cl_out_desc_of(const TensorView& in_cf, const TensorView& w,
+                          const TensorView* b,
+                          const TransposeConv2DAttributes& attrs)
+{
+    auto op = TransposeConv2D::create(attrs, Backend::CPU);
+    const std::vector<int64_t> cl = cl_dims_of(in_cf);
+    TensorDesc in_cl = in_cf.desc();
+    in_cl.dims = std::span<const int64_t>(cl.data(), cl.size());
+    in_cl.layout = (in_cf.rank() == 5) ? TensorLayout::NDHWC : TensorLayout::NHWC;
+    std::vector<TensorDesc> ds = {in_cl, w.desc()};
+    if (b != nullptr) { ds.push_back(b->desc()); }
+    return op->getOutputTensorDesc(ds)[0];
+}
+
+/// Dense [N, C, OH, OW] desc built from a channel-last one.
+TensorDesc dense_desc_of(const TensorDesc& cl)
+{
+    const int64_t rank = cl.rank;
+    TensorDesc d;
+    d.rank = rank;
+    d.dtype = cl.dtype;
+    d.layout = TensorLayout::Dense;
+    d.dims.resize(static_cast<size_t>(rank));
+    d.dims[0] = cl.dims[0];
+    d.dims[1] = cl.dims[static_cast<size_t>(rank - 1)];
+    for (int64_t i = 1; i + 1 < rank; ++i) {
+        d.dims[static_cast<size_t>(i + 1)] = cl.dims[static_cast<size_t>(i)];
+    }
+    return d;
+}
+
+}  // namespace
 
 /// Roundtrip: convert input to NHWC -> TransposeConv2D::compute -> convert back
 /// -> compare with the scalar golden.
@@ -62,22 +122,14 @@ static void test_vs_ref(
         b_channel_first = p.second;
     }
 
-    auto tconv_op_ref = TransposeConv2D::create(attrs, Backend::CPU);
+    // The reference keeps the dense order: the query is channel-last, the
+    // buffer it writes is [N, C, OH, OW].
+    const TensorDesc ref_desc =
+        dense_desc_of(cl_out_desc_of(in_channel_first, w_channel_first,
+                                     has_bias ? &b_channel_first : nullptr, attrs));
 
-    TensorDesc in_desc_ref = in_channel_first.desc();
-    TensorDesc w_desc_ref  = w_channel_first.desc();
-    std::vector<TensorDesc> ref_descs;
-    if (has_bias) {
-        TensorDesc b_desc_ref = b_channel_first.desc();
-        const TensorDesc ref_desc_arr[] = {in_desc_ref, w_desc_ref, b_desc_ref};
-        ref_descs = tconv_op_ref->getOutputTensorDesc(ref_desc_arr);
-    } else {
-        const TensorDesc ref_desc_arr[] = {in_desc_ref, w_desc_ref};
-        ref_descs = tconv_op_ref->getOutputTensorDesc(ref_desc_arr);
-    }
-
-    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
-    auto out_ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    std::vector<float> ref_buf(static_cast<size_t>(ref_desc.numel()));
+    auto out_ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         if (has_bias) {
@@ -96,7 +148,8 @@ static void test_vs_ref(
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     (void)w_vec;  // w_channel_first references it
@@ -106,10 +159,11 @@ static void test_vs_ref(
     TensorDesc in_cl_desc = in_cl.desc();
     std::vector<TensorDesc> out_descs;
     if (has_bias) {
-        const TensorDesc tc_desc_arr[] = {in_cl_desc, w_desc_ref, b_channel_first.desc()};
+        const TensorDesc tc_desc_arr[] = {in_cl_desc, w_channel_first.desc(),
+                                          b_channel_first.desc()};
         out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
     } else {
-        const TensorDesc tc_desc_arr[] = {in_cl_desc, w_desc_ref};
+        const TensorDesc tc_desc_arr[] = {in_cl_desc, w_channel_first.desc()};
         out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
     }
 
@@ -133,9 +187,10 @@ static void test_vs_ref(
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
     NNOPS_EXPECT_TRUE(test::allclose(result, out_ref, 1e-4f, 1e-4f));
@@ -162,7 +217,8 @@ NNOPS_TEST(tconv2d_basic_1x1_kernel) {
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     TransposeConv2DAttributes attrs;
@@ -178,11 +234,11 @@ NNOPS_TEST(tconv2d_basic_1x1_kernel) {
     const TensorDesc tc_desc_arr[] = {in_cl_desc, w_desc};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
-    // [1, 1, 2, 2]
+    // [N, OH, OW, OC] = [1, 2, 2, 1]
     NNOPS_EXPECT_EQ(out_descs[0].dims[0], 1);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 1);
+    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 2);
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 2);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 2);
+    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 1);
 
     std::vector<float> cl_out_buf(static_cast<size_t>(out_descs[0].numel()));
     TensorView out_cl(std::span<const int64_t>(out_descs[0].dims.data(),
@@ -197,9 +253,10 @@ NNOPS_TEST(tconv2d_basic_1x1_kernel) {
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
     for (int i = 0; i < 4; ++i) {
@@ -224,7 +281,8 @@ NNOPS_TEST(tconv2d_basic_2x2_kernel) {
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     TransposeConv2DAttributes attrs;
@@ -240,9 +298,10 @@ NNOPS_TEST(tconv2d_basic_2x2_kernel) {
     const TensorDesc tc_desc_arr[] = {in_cl_desc, w_desc};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
-    // [1, 1, 3, 3]
+    // [N, OH, OW, OC] = [1, 3, 3, 1]
+    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 3);
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 3);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 3);
+    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 1);
 
     std::vector<float> cl_out_buf(static_cast<size_t>(out_descs[0].numel()));
     TensorView out_cl(std::span<const int64_t>(out_descs[0].dims.data(),
@@ -256,9 +315,10 @@ NNOPS_TEST(tconv2d_basic_2x2_kernel) {
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
     // [[1, 2, 0], [3, 4, 0], [0, 0, 0]]
@@ -290,7 +350,8 @@ NNOPS_TEST(tconv2d_stride_2) {
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     TransposeConv2DAttributes attrs;
@@ -304,8 +365,8 @@ NNOPS_TEST(tconv2d_stride_2) {
     const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_channel_first.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
+    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 4);
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 4);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 4);
 
     std::vector<float> cl_out_buf(static_cast<size_t>(out_descs[0].numel()));
     TensorView out_cl(std::span<const int64_t>(out_descs[0].dims.data(),
@@ -319,17 +380,18 @@ NNOPS_TEST(tconv2d_stride_2) {
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
     auto tconv_op_ref = TransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc ref_desc_arr[] = {in_channel_first.desc(), w_channel_first.desc()};
-    auto ref_descs = tconv_op_ref->getOutputTensorDesc(ref_desc_arr);
+    const TensorDesc ref_desc =
+        dense_desc_of(cl_out_desc_of(in_channel_first, w_channel_first, nullptr, attrs));
 
-    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
-    auto out_ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    std::vector<float> ref_buf(static_cast<size_t>(ref_desc.numel()));
+    auto out_ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         const TensorView ref_arr[] = {in_channel_first, w_channel_first};
@@ -357,7 +419,8 @@ NNOPS_TEST(tconv2d_with_padding) {
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     TransposeConv2DAttributes attrs;
@@ -386,20 +449,20 @@ NNOPS_TEST(tconv2d_with_padding) {
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
     // input[0][0] maps to (oh, ow) = (-1, -1) and is clipped; only input[1][1]
     // survives, at (0, 0): 4 * 2 = 8.
     NNOPS_EXPECT_NEAR(result_buf[0], 8.0f, 1e-4f);
 
-    auto tconv_op_ref = TransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc ref_desc_arr[] = {in_channel_first.desc(), w_channel_first.desc()};
-    auto ref_descs = tconv_op_ref->getOutputTensorDesc(ref_desc_arr);
-    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
-    auto out_ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    const TensorDesc ref_desc =
+        dense_desc_of(cl_out_desc_of(in_channel_first, w_channel_first, nullptr, attrs));
+    std::vector<float> ref_buf(static_cast<size_t>(ref_desc.numel()));
+    auto out_ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         const TensorView ref_arr[] = {in_channel_first, w_channel_first};
@@ -428,7 +491,8 @@ NNOPS_TEST(tconv2d_with_bias) {
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     TransposeConv2DAttributes attrs;
@@ -442,8 +506,8 @@ NNOPS_TEST(tconv2d_with_bias) {
     const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_channel_first.desc(), b_channel_first.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
+    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 2);
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 2);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 2);
 
     std::vector<float> cl_out_buf(static_cast<size_t>(out_descs[0].numel()));
     TensorView out_cl(std::span<const int64_t>(out_descs[0].dims.data(),
@@ -457,9 +521,10 @@ NNOPS_TEST(tconv2d_with_bias) {
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
     for (int i = 0; i < 4; ++i) {
@@ -486,7 +551,8 @@ NNOPS_TEST(tconv2d_epilogue_relu) {
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     TransposeConv2DAttributes attrs;
@@ -513,9 +579,10 @@ NNOPS_TEST(tconv2d_epilogue_relu) {
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
     NNOPS_EXPECT_NEAR(result_buf[0], 0.0f, 1e-4f);
@@ -538,7 +605,8 @@ NNOPS_TEST(tconv2d_groups) {
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     TransposeConv2DAttributes attrs;
@@ -553,7 +621,7 @@ NNOPS_TEST(tconv2d_groups) {
     const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_channel_first.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
-    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 2);  // OC = 2
+    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 2);  // OC = 2, the last axis
 
     std::vector<float> cl_out_buf(static_cast<size_t>(out_descs[0].numel()));
     TensorView out_cl(std::span<const int64_t>(out_descs[0].dims.data(),
@@ -567,9 +635,10 @@ NNOPS_TEST(tconv2d_groups) {
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
     NNOPS_EXPECT_NEAR(result_buf[0], 20.0f, 1e-4f);
@@ -593,7 +662,8 @@ NNOPS_TEST(tconv2d_output_padding) {
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     TransposeConv2DAttributes attrs;
@@ -608,14 +678,13 @@ NNOPS_TEST(tconv2d_output_padding) {
     const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_channel_first.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
+    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 4);
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 4);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 4);
 
-    auto tconv_op_ref = TransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc ref_desc_arr[] = {in_channel_first.desc(), w_channel_first.desc()};
-    auto ref_descs = tconv_op_ref->getOutputTensorDesc(ref_desc_arr);
-    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
-    auto out_ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    const TensorDesc ref_desc =
+        dense_desc_of(cl_out_desc_of(in_channel_first, w_channel_first, nullptr, attrs));
+    std::vector<float> ref_buf(static_cast<size_t>(ref_desc.numel()));
+    auto out_ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         const TensorView ref_arr[] = {in_channel_first, w_channel_first};
@@ -635,9 +704,10 @@ NNOPS_TEST(tconv2d_output_padding) {
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
     NNOPS_EXPECT_TRUE(test::allclose(result, out_ref, 1e-4f, 1e-4f));
@@ -660,7 +730,8 @@ NNOPS_TEST(tconv2d_dilation) {
                                static_cast<size_t>(in_channel_first.numel())),
         in_channel_first.shape(0), in_channel_first.shape(1),
         in_channel_first.numel() / (in_channel_first.shape(0) * in_channel_first.shape(1)));
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     TransposeConv2DAttributes attrs;
@@ -674,8 +745,8 @@ NNOPS_TEST(tconv2d_dilation) {
     const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_channel_first.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
+    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 5);
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 5);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 5);
 
     std::vector<float> cl_out_buf(static_cast<size_t>(out_descs[0].numel()));
     TensorView out_cl(std::span<const int64_t>(out_descs[0].dims.data(),
@@ -689,16 +760,16 @@ NNOPS_TEST(tconv2d_dilation) {
 
     std::vector<float> result_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
-        out_cl.shape(0), out_cl.shape(1),
-        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(1)));
-    TensorView result(out_cl.shape_span(), DataType::f32, result_buf.data(),
+        out_cl.shape(0), out_cl.shape(out_cl.rank() - 1),
+        out_cl.numel() / (out_cl.shape(0) * out_cl.shape(out_cl.rank() - 1)));
+    const std::vector<int64_t> result_dims = dense_dims_of(out_cl);
+    TensorView result(result_dims, DataType::f32, result_buf.data(),
                       TensorLayout::Dense);
 
-    auto tconv_op_ref = TransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc ref_desc_arr[] = {in_channel_first.desc(), w_channel_first.desc()};
-    auto ref_descs = tconv_op_ref->getOutputTensorDesc(ref_desc_arr);
-    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
-    auto out_ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    const TensorDesc ref_desc =
+        dense_desc_of(cl_out_desc_of(in_channel_first, w_channel_first, nullptr, attrs));
+    std::vector<float> ref_buf(static_cast<size_t>(ref_desc.numel()));
+    auto out_ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         const TensorView ref_arr[] = {in_channel_first, w_channel_first};
@@ -808,25 +879,21 @@ static void test_residual_vs_ref(
     }
 
     auto op = TransposeConv2D::create(attrs, Backend::CPU);
-    std::vector<TensorDesc> out_descs;
-    if (has_bias) {
-        const TensorDesc d[] = {in_cf.desc(), w_cf.desc(), b_cf.desc()};
-        out_descs = op->getOutputTensorDesc(d);
-    } else {
-        const TensorDesc d[] = {in_cf.desc(), w_cf.desc()};
-        out_descs = op->getOutputTensorDesc(d);
-    }
-    const int64_t on  = out_descs[0].dims[0];
-    const int64_t och = out_descs[0].dims[1];
-    const int64_t oh  = out_descs[0].dims[2];
-    const int64_t ow  = out_descs[0].dims[3];
+    // Channel-last query: [N, OH, OW, OC]; the reference reads dense order.
+    const TensorDesc cl_out = cl_out_desc_of(in_cf, w_cf,
+                                             has_bias ? &b_cf : nullptr, attrs);
+    const TensorDesc dense_out = dense_desc_of(cl_out);
+    const int64_t on  = cl_out.dims[0];
+    const int64_t oh  = cl_out.dims[1];
+    const int64_t ow  = cl_out.dims[2];
+    const int64_t och = cl_out.dims[3];
 
     auto [res_vec, res_view] = test::make_random_tensor(
         {on, och, oh, ow}, -1.0f, 1.0f, 11);
     (void)res_view;
 
     std::vector<float> ref_buf(res_vec);
-    auto out_ref = test::make_channel_first(out_descs[0], ref_buf.data());
+    auto out_ref = test::make_channel_first(dense_out, ref_buf.data());
     {
         ComputeContext ctx;
         if (has_bias) {
@@ -845,8 +912,8 @@ static void test_residual_vs_ref(
     auto out_cl = test::channel_first_to_channel_last<float>(
         std::span<const float>(res_vec.data(), res_vec.size()), on, och, oh, ow);
 
-    const std::vector<int64_t> ishape = {on, IC, IH, IW};
-    const std::vector<int64_t> oshape = {on, och, oh, ow};
+    const std::vector<int64_t> ishape = {on, IH, IW, IC};
+    const std::vector<int64_t> oshape = {on, oh, ow, och};
     TensorView in_view(ishape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
     TensorView out_view(oshape, DataType::f32, out_cl.data(), TensorLayout::NHWC);
     {
@@ -863,7 +930,8 @@ static void test_residual_vs_ref(
 
     auto got = test::channel_last_to_channel_first<float>(
         std::span<const float>(out_cl.data(), out_cl.size()), on, och, oh, ow);
-    TensorView got_view(oshape, DataType::f32, got.data(), TensorLayout::Dense);
+    const std::vector<int64_t> got_shape = {on, och, oh, ow};
+    TensorView got_view(got_shape, DataType::f32, got.data(), TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
 }
 
@@ -895,16 +963,18 @@ static void test_f16_vs_ref(const std::vector<int64_t>& in_shape,
     auto w_r  = test::f16_to_f32(w16);
 
     auto op = TransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc d[] = {in_f32_view.desc(), w_f32_view.desc()};
-    const auto out_descs = op->getOutputTensorDesc(d);
-    const int64_t OH = out_descs[0].dims[2];
-    const int64_t OW = out_descs[0].dims[3];
-    const auto numel = static_cast<size_t>(out_descs[0].numel());
+    // Channel-last query; the reference reads dense [N, OC, OH, OW].
+    const TensorDesc cl_desc =
+        cl_out_desc_of(in_f32_view, w_f32_view, nullptr, attrs);
+    const int64_t OH = cl_desc.dims[1];
+    const int64_t OW = cl_desc.dims[2];
+    const auto numel = static_cast<size_t>(cl_desc.numel());
+    const TensorDesc ref_desc = dense_desc_of(cl_desc);
 
     TensorView in_ref(in_shape, DataType::f32, in_r.data(), TensorLayout::Dense);
     TensorView w_ref(w_shape, DataType::f32, w_r.data(), TensorLayout::Dense);
     std::vector<float> ref_buf(numel);
-    auto out_ref = test::make_channel_first(out_descs[0], ref_buf.data());
+    auto out_ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         const TensorView ins[] = {in_ref, w_ref};
         ComputeContext ctx;
@@ -918,10 +988,12 @@ static void test_f16_vs_ref(const std::vector<int64_t>& in_shape,
 
     auto in_cl = test::channel_first_to_channel_last<half>(
         std::span<const half>(in16.data(), in16.size()), N, IC, IH, IW);
-    TensorView in16_view(in_shape, DataType::f16, in_cl.data(),
-                         TensorLayout::NHWC);
-    TensorView out16_view(out_descs[0].dims, DataType::f16, out16.data(),
-                          TensorLayout::NHWC);
+    // Channel-last dims: [N, IH, IW, IC].
+    const int64_t in_cl_shape[] = {N, IH, IW, IC};
+    TensorView in16_view(std::span<const int64_t>(in_cl_shape, 4), DataType::f16,
+                         in_cl.data(), TensorLayout::NHWC);
+    TensorView out16_view(std::span<const int64_t>(cl_desc.dims.data(), 4),
+                          DataType::f16, out16.data(), TensorLayout::NHWC);
     TensorView outs[] = {out16_view};
     const TensorView ins[] = {in16_view, w16_view};
     ComputeContext ctx;
@@ -930,8 +1002,8 @@ static void test_f16_vs_ref(const std::vector<int64_t>& in_shape,
     auto got = test::f16_to_f32(test::channel_last_to_channel_first<half>(
         std::span<const half>(out16.data(), out16.size()), N, OC, OH, OW));
 
-    TensorView got_view(out_descs[0].dims, DataType::f32, got.data(),
-                        TensorLayout::Dense);
+    TensorView got_view(std::span<const int64_t>(ref_desc.dims.data(), 4),
+                        DataType::f32, got.data(), TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, test::kF16AccumTol,
                                      test::kF16AccumTol));
 }
@@ -1048,20 +1120,19 @@ NNOPS_TEST(tconv2d_add_to) {
     auto [w_vec,  w_channel_first]  = test::make_random_tensor({16, 32, 4, 4});
 
     auto op = TransposeConv2D::create(attrs, Backend::CPU);
-    const TensorDesc d[] = {in_channel_first.desc(), w_channel_first.desc()};
-    const auto out_descs = op->getOutputTensorDesc(d);
-    const int64_t ON = out_descs[0].dims[0];
-    const int64_t OC = out_descs[0].dims[1];
-    const int64_t OH = out_descs[0].dims[2];
-    const int64_t OW = out_descs[0].dims[3];
+    const TensorDesc cl_out = cl_out_desc_of(in_channel_first, w_channel_first, nullptr, attrs);
+    const TensorDesc dense_out = dense_desc_of(cl_out);
+    const int64_t ON = cl_out.dims[0];
+    const int64_t OH = cl_out.dims[1];
+    const int64_t OW = cl_out.dims[2];
+    const int64_t OC = cl_out.dims[3];
 
     auto [res_vec, res_view] = test::make_random_tensor(
-        std::span<const int64_t>(out_descs[0].dims.begin(), out_descs[0].dims.size()),
-        -1.0f, 1.0f, 11);
+        {ON, OC, OH, OW}, -1.0f, 1.0f, 11);
     (void)res_view;
 
     std::vector<float> ref_buf(res_vec);
-    auto out_ref = test::make_channel_first(out_descs[0], ref_buf.data());
+    auto out_ref = test::make_channel_first(dense_out, ref_buf.data());
     {
         const TensorView ins[] = {in_channel_first, w_channel_first};
         ComputeContext ctx;
@@ -1074,8 +1145,8 @@ NNOPS_TEST(tconv2d_add_to) {
     auto out_cl = test::channel_first_to_channel_last<float>(
         std::span<const float>(res_vec.data(), res_vec.size()), ON, OC, OH, OW);
 
-    const std::vector<int64_t> ishape = {ON, 16, 8, 8};
-    const std::vector<int64_t> oshape = {ON, OC, OH, OW};
+    const std::vector<int64_t> ishape = {ON, 8, 8, 16};
+    const std::vector<int64_t> oshape = {ON, OH, OW, OC};
     TensorView in_view(ishape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
     TensorView out_view(oshape, DataType::f32, out_cl.data(), TensorLayout::NHWC);
     {
@@ -1087,7 +1158,8 @@ NNOPS_TEST(tconv2d_add_to) {
 
     auto got = test::channel_last_to_channel_first<float>(
         std::span<const float>(out_cl.data(), out_cl.size()), ON, OC, OH, OW);
-    TensorView got_view(oshape, DataType::f32, got.data(), TensorLayout::Dense);
+    const std::vector<int64_t> got_shape = {ON, OC, OH, OW};
+    TensorView got_view(got_shape, DataType::f32, got.data(), TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
 }
 
@@ -1225,7 +1297,8 @@ NNOPS_TEST(tconv2d_threaded_matches_serial) {
         std::span<const float>(in_cf.ptr<float>(), static_cast<size_t>(in_cf.numel())),
         in_cf.shape(0), in_cf.shape(1),
         in_cf.numel() / (in_cf.shape(0) * in_cf.shape(1)));
-    TensorView in_cl(in_cf.shape_span(), DataType::f32, cl_in_buf.data(),
+    const std::vector<int64_t> in_cl_dims = cl_dims_of(in_cf);
+    TensorView in_cl(in_cl_dims, DataType::f32, cl_in_buf.data(),
                      TensorLayout::NHWC);
 
     const TensorDesc cl_in_desc = in_cl.desc();

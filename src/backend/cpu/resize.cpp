@@ -78,19 +78,20 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
     const int64_t srank = ResizeAttributes::spatial_rank(rank);
 
     const int64_t N = input.shape(0);
-    const int64_t C = input.shape(1);
+    const int64_t C = input.shape(input.rank() - 1);
 
-    const int64_t raw_ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t raw_IH = input.shape(srank);
-    const int64_t raw_IW = input.shape(srank + 1);
+    // Channel-last dims: [N, (D,) H, W, C].
+    const int64_t raw_ID = (srank == 3) ? input.shape(1) : 1;
+    const int64_t raw_IH = input.shape(rank - 3);
+    const int64_t raw_IW = input.shape(rank - 2);
 
     int64_t eff_ID = raw_ID, eff_IH = raw_IH, eff_IW = raw_IW;
     int64_t crop_off = 0;
 
     if (attrs.has_crop()) {
-        const int64_t d_dim = (srank == 3) ? 2 : -1;
-        const int64_t h_dim = rank - 2;
-        const int64_t w_dim = rank - 1;
+        const int64_t d_dim = (srank == 3) ? 1 : -1;
+        const int64_t h_dim = rank - 3;
+        const int64_t w_dim = rank - 2;
 
         if (srank == 3 && attrs.crop_end[0] > 0) {
             NNOPS_ASSERT(attrs.crop_start[0] >= 0 && attrs.crop_start[0] < raw_ID);
@@ -112,9 +113,9 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
         }
     }
 
-    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH = output.shape(srank);
-    const int64_t OW = output.shape(srank + 1);
+    const int64_t OD = (srank == 3) ? output.shape(1) : 1;
+    const int64_t OH = output.shape(rank - 3);
+    const int64_t OW = output.shape(rank - 2);
 
     const bool cubic = (attrs.mode == ResizeMode::Cubic);
     const bool linear = (attrs.mode == ResizeMode::Linear);

@@ -9,9 +9,9 @@
 /// both orders — including the depthwise route, whose channel is the vector
 /// axis, and the layout-aware gather fallback.
 ///
-/// Input:   [N, IC, ID, IH, IW]
-/// Weight:  [IC, OC/G, KD, KH, KW], dense in both layouts
-/// Output:  [N, OC, OD, OH, OW], in the input's layout
+/// Input:   [N, ID, IH, IW, IC] (channel-last)
+/// Weight:  [IC, OC/G, KD, KH, KW] (dense)
+/// Output:  [N, OD, OH, OW, OC]
 
 #include "nnops/ops/transpose_conv3d.hpp"
 #include "common/test_harness.hpp"
@@ -70,7 +70,10 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     // The same values in NDHWC, and the descriptors asked of an NDHWC call
     // — so the output layout the operator reports is part of what is checked.
     const auto in_cl = test::to_channel_last<float>(in_vec, N, IC, S_in);
-    TensorView in_cl_view(in_shape, DataType::f32,
+    // Channel-last dims: [N, ID, IH, IW, IC].
+    const int64_t in_cl_shape[] = {in_shape[0], in_shape[2], in_shape[3], in_shape[4],
+                                   in_shape[1]};
+    TensorView in_cl_view(std::span<const int64_t>(in_cl_shape, 5), DataType::f32,
                           const_cast<float*>(in_cl.data()), TensorLayout::NDHWC);
 
     auto op = TransposeConv3D::create(attrs, Backend::CPU);
@@ -86,20 +89,23 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     NNOPS_EXPECT_EQ(out_descs[0].layout, TensorLayout::NDHWC);
 
     const auto numel = static_cast<size_t>(out_descs[0].numel());
+    // The reported desc is channel-last [N, OD, OH, OW, OC]; the golden reads
+    // dense [N, OC, OD, OH, OW].
+    const int64_t OD = out_descs[0].dims[1];
+    const int64_t OH = out_descs[0].dims[2];
+    const int64_t OW = out_descs[0].dims[3];
+    const int64_t ref_dims[] = {N, OC, OD, OH, OW};
     std::vector<float> seed;
     if (residual) {
-        seed = test::make_random_tensor(
-            std::span<const int64_t>(out_descs[0].dims.data(),
-                                     static_cast<size_t>(out_descs[0].rank)))
-                   .first;
+        seed = test::make_random_tensor(std::span<const int64_t>(ref_dims, 5)).first;
     }
 
-    // The golden: dense in, dense out — the descriptor says
-    // NDHWC, so the golden's view is built by hand in the layout it reads.
+    // The golden: dense in, dense out.
     const auto out_dims = std::span<const int64_t>(
         out_descs[0].dims.data(), static_cast<size_t>(out_descs[0].rank));
     std::vector<float> ref_buf = seed.empty() ? std::vector<float>(numel, 0.0f) : seed;
-    TensorView out_ref(out_dims, DataType::f32, ref_buf.data(), TensorLayout::Dense);
+    TensorView out_ref(std::span<const int64_t>(ref_dims, 5), DataType::f32,
+                       ref_buf.data(), TensorLayout::Dense);
     {
         ComputeContext ctx;
         if (has_bias) {
@@ -134,7 +140,7 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
 
     const auto got = test::to_channel_first<float>(
         out_cl, N, OC, numel / static_cast<size_t>(N * OC));
-    TensorView got_view(out_dims, DataType::f32,
+    TensorView got_view(std::span<const int64_t>(ref_dims, 5), DataType::f32,
                         const_cast<float*>(got.data()), TensorLayout::Dense);
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
 }

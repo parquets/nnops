@@ -1265,8 +1265,9 @@ Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs, TensorView& 
 
     Geom gm{};
     gm.N = input.shape(0);
-    gm.IH = input.shape(input.rank() - 2);
-    gm.IW = input.shape(input.rank() - 1);
+    // Channel-last [N, IH, IW, IC].
+    gm.IH = input.shape(input.rank() - 3);
+    gm.IW = input.shape(input.rank() - 2);
     gm.IC = weight.shape(0);
     gm.OC_per_G = weight.shape(1);
     gm.KH = attrs.kernel_size[0];
@@ -1274,8 +1275,8 @@ Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs, TensorView& 
     gm.G = attrs.groups;
     gm.OC = gm.OC_per_G * gm.G;
     gm.IC_per_G = gm.IC / gm.G;
-    gm.OH = output.shape(2);
-    gm.OW = output.shape(3);
+    gm.OH = output.shape(1);
+    gm.OW = output.shape(2);
     gm.SH = attrs.stride[0];
     gm.SW = attrs.stride[1];
     gm.DH = attrs.dilation[0];

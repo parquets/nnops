@@ -65,7 +65,7 @@ struct ResizeAttributes {
     }
 };
 
-/// 2D: [N, C, IH, IW] → [N, C, OH, OW]; 3D adds a D axis.
+/// 2D: [N, IH, IW, C] → [N, OH, OW, C]; 3D adds a D axis.
 class Resize : public OpBase {
 public:
     static std::unique_ptr<Resize> create(const ResizeAttributes& attrs,

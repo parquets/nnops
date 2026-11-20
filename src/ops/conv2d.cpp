@@ -236,14 +236,16 @@ Status Conv2D::compute(std::span<TensorView> outputs, std::span<const TensorView
     auto& output = outputs[0];
 
     // auto_pad lives in the descriptor; kernels only see explicit leading padding.
+    // A channel-last activation is [N, H, W, C]: H is axis 1, W axis 2.
+    const auto& in = inputs[0];
     Conv2DAttributes attrs = attrs_;
     if (attrs.auto_pad != Conv2DAttributes::AutoPad::NOTSET) {
         const int ap = static_cast<int>(attrs.auto_pad);
         attrs.padding[0] =
-            resolve_leading_padding(inputs[0].shape(2), attrs.kernel_size[0], attrs.stride[0],
+            resolve_leading_padding(in.shape(1), attrs.kernel_size[0], attrs.stride[0],
                                     attrs.dilation[0], attrs.padding[0], ap);
         attrs.padding[1] =
-            resolve_leading_padding(inputs[0].shape(3), attrs.kernel_size[1], attrs.stride[1],
+            resolve_leading_padding(in.shape(2), attrs.kernel_size[1], attrs.stride[1],
                                     attrs.dilation[1], attrs.padding[1], ap);
         attrs.auto_pad = Conv2DAttributes::AutoPad::NOTSET;
     }

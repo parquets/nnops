@@ -12,8 +12,8 @@
 /// op dispatch switch.
 ///
 /// Two rules the helpers encode:
-///  - An NHWC "row" is one whole spatial line — W pixels × C channels —
-///    so last_dim is shape(1) * shape(rank-1), not W.
+///  - A channel-last "row" is one whole spatial line — W pixels × C channels —
+///    so last_dim is shape(rank-2) * shape(rank-1), not W.
 ///  - The fused quantized paths require input and output to share one
 ///    granularity (PerTensor or PerToken); the tile drivers assert it.
 ///
@@ -69,7 +69,7 @@ inline RowGeometry rowwise_geometry(const TensorView& input, const TensorView& o
     int64_t last_dim = 1;
     if (rank >= 1) {
         last_dim = (rank >= 3 && is_channel_last(input.layout())) ?
-                       input.shape(1) * input.shape(rank - 1) :
+                       input.shape(rank - 2) * input.shape(rank - 1) :
                        input.shape(rank - 1);
     }
     const int64_t num_rows = (rank >= 2) ? input.total_rows() : total / last_dim;

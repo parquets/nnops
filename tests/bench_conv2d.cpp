@@ -259,7 +259,7 @@ template <class T>
 struct AbFp : AbLayer {
     explicit AbFp(const Shape& c) : s(c) {
         icg = c.IC / c.groups;
-        const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t ish[] = {c.N, c.IH, c.IW, c.IC};  // channel-last
         const int64_t wsh[] = {c.KH, c.KW, icg, c.OC};        // HWIO
         const int64_t bsh[] = {c.OC};
         constexpr DataType dt = dtype_of<T>();
@@ -286,8 +286,8 @@ struct AbFp : AbLayer {
 
         const TensorDesc d0[] = {in_nhwc.desc(), w_nhwc.desc()};
         const auto od = op->getOutputTensorDesc(d0);
-        OH = od[0].dims[2];
-        OW = od[0].dims[3];
+        OH = od[0].dims[1];
+        OW = od[0].dims[2];
         work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
 
         out_nhwc_buf.assign(static_cast<size_t>(od[0].numel()), T{});
@@ -316,7 +316,7 @@ struct AbFp : AbLayer {
 struct AbI8 : AbLayer {
     explicit AbI8(const Shape& c) : s(c) {
         icg = c.IC / c.groups;
-        const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t ish[] = {c.N, c.IH, c.IW, c.IC};  // channel-last
         const int64_t wsh[] = {c.OC, icg, c.KH, c.KW};        // OIHW
         const int64_t wsh_cl[] = {c.KH, c.KW, icg, c.OC};     // HWIO
         const int64_t bsh[] = {c.OC};
@@ -381,8 +381,8 @@ struct AbI8 : AbLayer {
 
         const TensorDesc d0[] = {in_nhwc.desc(), w_nhwc.desc(), b_v.desc()};
         const auto od = op->getOutputTensorDesc(d0);
-        OH = od[0].dims[2];
-        OW = od[0].dims[3];
+        OH = od[0].dims[1];
+        OW = od[0].dims[2];
         work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
 
         out_nhwc_buf.assign(static_cast<size_t>(od[0].numel()), 0.0f);
@@ -461,7 +461,7 @@ struct AbWino {
     /// @param order pins the transform order (2 = F(2,3), 4 = F(4,3)); 0 lets
     /// prepack pick it from the channel count and the plane.
     explicit AbWino(const Shape& c, int nt, int64_t order = 0) : s(c) {
-        const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t ish[] = {c.N, c.IH, c.IW, c.IC};  // channel-last
         const int64_t wsh[] = {c.KH, c.KW, c.IC, c.OC};   // HWIO
         constexpr DataType dt = dtype_of<T>();
 
@@ -493,8 +493,8 @@ struct AbWino {
         const TensorDesc d0[] = {in_v.desc(), w_v.desc()};
         const auto od = im_op->getOutputTensorDesc(d0);
         out_desc = od[0];
-        OH = od[0].dims[2];
-        OW = od[0].dims[3];
+        OH = od[0].dims[1];
+        OW = od[0].dims[2];
         work_im = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * c.IC * 9.0;
 
         out_buf.assign(static_cast<size_t>(od[0].numel()), T{});
@@ -638,7 +638,7 @@ template <class T>
 struct AbPacked {
     explicit AbPacked(const Shape& c) : s(c) {
         icg = c.IC / c.groups;
-        const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t ish[] = {c.N, c.IH, c.IW, c.IC};  // channel-last
         const int64_t wsh[] = {c.KH, c.KW, icg, c.OC};   // HWIO
         const int64_t bsh[] = {c.OC};
         constexpr DataType dt = dtype_of<T>();
@@ -668,8 +668,8 @@ struct AbPacked {
         const TensorDesc d0[] = {in_v.desc(), w_v.desc(), b_v.desc()};
         const auto od = op->getOutputTensorDesc(d0);
         out_desc = od[0];
-        OH = od[0].dims[2];
-        OW = od[0].dims[3];
+        OH = od[0].dims[1];
+        OW = od[0].dims[2];
         work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
 
         out_buf.assign(static_cast<size_t>(od[0].numel()), T{});

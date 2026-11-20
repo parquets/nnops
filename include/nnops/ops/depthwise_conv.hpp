@@ -7,8 +7,8 @@
 /// and layout; the optional bias is [C].
 ///
 /// The spatial rank comes from the input rank: rank 4 is 2D
-/// (Input [N, C, IH, IW] stored NHWC, Weight HWCM [KH][KW][C]), rank 5 is 3D
-/// (Input [N, C, ID, IH, IW] stored NDHWC, Weight [KD][KH][KW][C]).
+/// (Input [N, IH, IW, C], Weight HWCM [KH][KW][C]), rank 5 is 3D
+/// (Input [N, ID, IH, IW, C], Weight [KD][KH][KW][C]).
 ///
 /// The route reads the raw HWCM filter: every tap is a contiguous run of C
 /// channels, the pattern the channel-lane kernel loads as one vector. It covers

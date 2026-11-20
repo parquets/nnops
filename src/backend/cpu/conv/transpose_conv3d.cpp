@@ -94,7 +94,7 @@ bool tconv3d_gemm(const Geom3& gm, TensorView& output,
     }
     // The volume view is [ID·IH·IW] × [IC/G] voxels, so a depth slice has to be
     // one contiguous plane whose stride the H rows already imply.
-    if (input.stride_elems(2) != gm.IH * gm.IW * gm.IC) {
+    if (input.stride_elems(1) != gm.IH * gm.IW * gm.IC) {
         return false;
     }
     if (gm.KD > kMaxRowTaps || gm.KH > kMaxRowTaps) {
@@ -144,7 +144,7 @@ bool tconv3d_depthwise(const Geom3& gm, TensorView& output,
     if (input.row_stride_elems() != gm.IW * gm.IC) {
         return false;
     }
-    if (input.stride_elems(2) != gm.IH * gm.IW * gm.IC) {
+    if (input.stride_elems(1) != gm.IH * gm.IW * gm.IC) {
         return false;
     }
 
@@ -171,12 +171,13 @@ void tconv3d_gather(const Geom3& gm, TensorView& output, std::span<const TensorV
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t in_c_stride = input.stride_elems(1);
-    const int64_t in_d_stride = input.stride_elems(2);
+    // Channel-last: C is the innermost axis, D the one below H.
+    const int64_t in_c_stride = input.stride_elems(4);
+    const int64_t in_d_stride = input.stride_elems(1);
     const int64_t in_row_stride = input.row_stride_elems();
     const int64_t in_n_stride = input.stride_elems(0);
-    const int64_t out_c_stride = output.stride_elems(1);
-    const int64_t out_d_stride = output.stride_elems(2);
+    const int64_t out_c_stride = output.stride_elems(4);
+    const int64_t out_d_stride = output.stride_elems(1);
     const int64_t out_row_stride = output.row_stride_elems();
     const int64_t out_n_stride = output.stride_elems(0);
 
@@ -288,10 +289,10 @@ Status transpose_conv3d_cpu(const TransposeConv3DAttributes& attrs, TensorView& 
 
     Geom3 gm{};
     gm.N = input.shape(0);
-    gm.IC = input.shape(1);
-    gm.ID = input.shape(2);
-    gm.IH = input.shape(3);
-    gm.IW = input.shape(4);
+    gm.IC = input.shape(4);
+    gm.ID = input.shape(1);
+    gm.IH = input.shape(2);
+    gm.IW = input.shape(3);
     gm.OC_per_G = weight.shape(1);
     gm.KD = attrs.kernel_size[0];
     gm.KH = attrs.kernel_size[1];
@@ -299,9 +300,9 @@ Status transpose_conv3d_cpu(const TransposeConv3DAttributes& attrs, TensorView& 
     gm.G = attrs.groups;
     gm.OC = gm.OC_per_G * gm.G;
     gm.IC_per_G = gm.IC / gm.G;
-    gm.OD = output.shape(2);
-    gm.OH = output.shape(3);
-    gm.OW = output.shape(4);
+    gm.OD = output.shape(1);
+    gm.OH = output.shape(2);
+    gm.OW = output.shape(3);
     gm.SD = attrs.stride[0];
     gm.SH = attrs.stride[1];
     gm.SW = attrs.stride[2];

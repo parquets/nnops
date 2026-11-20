@@ -2,7 +2,7 @@
 /// @brief Pool1D against a scalar 1D oracle and, where it applies, the 2D
 ///        pooling reference.
 ///
-/// Pool1D is Pooling on [N, C, 1, L] with a {1, K} window, on NHWC storage. The
+/// Pool1D is Pooling on the channel-last [N, 1, L, C] with a {1, K} window. The
 /// f32 arm uses ref1d, written out below: the 2D
 /// reference's windowed walk computes `id = od·SD + kd - PD` and so never
 /// applies dilation, while a 1D window's dilation stretches the very axis that
@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -115,7 +116,7 @@ void run_case(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shap
     const int64_t L = *(shape.begin() + 2);
 
     auto cl_vec = test::to_channel_last<float>(in_vec, N, C, L);
-    const int64_t cl_shape[] = {N, C, L};
+    const int64_t cl_shape[] = {N, L, C};   // channel-last
     TensorView cl_in(std::span<const int64_t>(cl_shape, 3), DataType::f32, cl_vec.data(),
                      TensorLayout::NHWC);
 
@@ -123,7 +124,7 @@ void run_case(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shap
     const TensorDesc cl_ds[] = {cl_in.desc()};
     auto cl_out_d = op->getOutputTensorDesc(cl_ds);
     NNOPS_EXPECT_TRUE(cl_out_d[0].layout == TensorLayout::NHWC);
-    const int64_t OL = cl_out_d[0].dims[2];
+    const int64_t OL = cl_out_d[0].dims[1];   // [N, OL, C]
 
     // Ground truth: the scalar oracle over the dense-order values.
     std::vector<float> ref_buf(static_cast<size_t>(N * C * OL));
@@ -137,6 +138,8 @@ void run_case(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shap
     }
 
     const auto back = test::to_channel_first<float>(cl_buf, N, C, OL);
+    for (size_t i = 0; i < ref_buf.size(); ++i) {
+    }
     for (size_t i = 0; i < ref_buf.size(); ++i) {
         NNOPS_EXPECT_NEAR(back[i], ref_buf[i], 1e-5f);
     }
@@ -170,16 +173,23 @@ void run_int8(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shap
         v = static_cast<T>(x);
     }
     const int64_t cf_shape[] = {N, C, L};
+    const int64_t cl_shape8[] = {N, L, C};   // channel-last
     TensorView cf_in(std::span<const int64_t>(cf_shape, 3), dt, cf_vec.data(),
                      TensorLayout::Dense, qp);
 
     auto op = Pool1D::create(attrs);
-    const TensorDesc cf_ds[] = {cf_in.desc()};
+    // Shape inference speaks channel-last whatever the storage.
+    TensorDesc cf_cl = cf_in.desc();
+    cf_cl.dims = std::span<const int64_t>(cl_shape8, 3);
+    cf_cl.layout = TensorLayout::NHWC;
+    const TensorDesc cf_ds[] = {cf_cl};
     auto out_d = op->getOutputTensorDesc(cf_ds);
-    const int64_t OL = out_d[0].dims[2];
+    const int64_t OL = out_d[0].dims[1];   // [N, OL, C]
+    // The reference reads dense [N, C, OL].
+    const int64_t ref_dims[] = {N, C, OL};
 
     std::vector<T> ref_buf(static_cast<size_t>(N * C * OL));
-    TensorView ref(std::span<const int64_t>(out_d[0].dims.data(), 3), dt, ref_buf.data(),
+    TensorView ref(std::span<const int64_t>(ref_dims, 3), dt, ref_buf.data(),
                    TensorLayout::Dense, qp);
     {
         ComputeContext ctx;
@@ -189,7 +199,7 @@ void run_int8(const Pool1DAttributes& attrs, std::initializer_list<int64_t> shap
     }
 
     auto cl_vec = test::to_channel_last<T>(cf_vec, N, C, L);
-    TensorView cl_in(std::span<const int64_t>(cf_shape, 3), dt, cl_vec.data(),
+    TensorView cl_in(std::span<const int64_t>(cl_shape8, 3), dt, cl_vec.data(),
                      TensorLayout::NHWC, qp);
     const TensorDesc cl_ds[] = {cl_in.desc()};
     auto cl_out_d = op->getOutputTensorDesc(cl_ds);

@@ -412,9 +412,9 @@ Status dwtconv_i8_plane(const TensorView& in, bool act_u8, DwtI8Plane& pl,
     constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
 
     const int64_t N = in.shape(0);
-    const int64_t C = in.shape(1);
-    const int64_t IH = in.shape(2);
-    const int64_t IW = in.shape(3);
+    const int64_t C = in.shape(3);
+    const int64_t IH = in.shape(1);
+    const int64_t IW = in.shape(2);
     const int64_t row_len = IW * C;
 
     pl.scale = quant_scale_at(in.quant_params(), 0);
@@ -867,11 +867,11 @@ Status depthwise_transpose_conv_cpu(const DepthwiseTransposeConv2DAttributes& at
 
     DwtConvGeom gm{};
     gm.N = input.shape(0);
-    gm.C = input.shape(1);
-    gm.IH = input.shape(2);
-    gm.IW = input.shape(3);
-    gm.OH = output.shape(2);
-    gm.OW = output.shape(3);
+    gm.C = input.shape(3);
+    gm.IH = input.shape(1);
+    gm.IW = input.shape(2);
+    gm.OH = output.shape(1);
+    gm.OW = output.shape(2);
     gm.KH = attrs.kernel_size[0];
     gm.KW = attrs.kernel_size[1];
     gm.SH = attrs.stride[0];

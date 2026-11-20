@@ -61,18 +61,18 @@ void pooling_impl(const PoolingAttributes& attrs, TensorView& output,
     const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
 
     const int64_t N = input.shape(0);
-    const int64_t C = input.shape(1);
+    const int64_t C = input.shape(input.rank() - 1);
     // Sixteen channels a chunk, not eight: a pixel's 16 f32 are one 64-byte
     // line, and a chunk spanning a whole line touches it once rather than
     // leaving the other half for the next chunk to fetch again.
     const int64_t nblocks = (C + 15) / 16;
 
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
-    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH = output.shape(srank);
-    const int64_t OW = output.shape(srank + 1);
+    const int64_t ID = (srank == 3) ? input.shape(1) : 1;
+    const int64_t IH = input.shape(srank - 1);
+    const int64_t IW = input.shape(srank);
+    const int64_t OD = (srank == 3) ? output.shape(1) : 1;
+    const int64_t OH = output.shape(srank - 1);
+    const int64_t OW = output.shape(srank);
 
     k::PoolingKernelParams p{};
     p.ID = ID;
@@ -199,16 +199,17 @@ void pooling_global_impl(const PoolingAttributes& attrs, TensorView& output,
     const auto& input = inputs[0];
     const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
     const int64_t N = input.shape(0);
-    const int64_t C = input.shape(1);
+    const int64_t C = input.shape(input.rank() - 1);
     // A task reads sixteen channels — one 64-byte line of f32 — per pixel, so
     // the plane is fetched once and still splits across the pool.
     constexpr int64_t kGlobalCh = 16;
     const int64_t blocks = (C + kGlobalCh - 1) / kGlobalCh;
 
     k::PoolingKernelParams p{};
-    p.ID = (srank == 3) ? input.shape(2) : 1;
-    p.IH = input.shape(srank);
-    p.IW = input.shape(srank + 1);
+    // Channel-last dims: [N, (D,) H, W, C].
+    p.ID = (srank == 3) ? input.shape(1) : 1;
+    p.IH = input.shape(srank - 1);
+    p.IW = input.shape(srank);
     p.in_d_stride = p.IH * input.row_stride_elems();
     p.in_row_stride = input.row_stride_elems();
     p.pix_stride = C;
@@ -281,23 +282,23 @@ void pooling_adaptive_impl(const PoolingAttributes& attrs, TensorView& output,
     const int64_t srank = PoolingAttributes::spatial_rank(rank);
 
     const int64_t N = input.shape(0);
-    const int64_t C = input.shape(1);
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
-    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH = output.shape(srank);
-    const int64_t OW = output.shape(srank + 1);
+    const int64_t C = input.shape(input.rank() - 1);
+    const int64_t ID = (srank == 3) ? input.shape(1) : 1;
+    const int64_t IH = input.shape(srank - 1);
+    const int64_t IW = input.shape(srank);
+    const int64_t OD = (srank == 3) ? output.shape(1) : 1;
+    const int64_t OH = output.shape(srank - 1);
+    const int64_t OW = output.shape(srank);
 
     const int64_t in_n = input.stride_elems(0);
     const int64_t out_n = output.stride_elems(0);
-    const int64_t in_d = (srank == 3) ? input.stride_elems(2) : 0;
-    const int64_t out_d = (srank == 3) ? output.stride_elems(2) : 0;
-    const int64_t in_h = input.stride_elems(srank);
-    const int64_t out_h = output.stride_elems(srank);
+    const int64_t in_d = (srank == 3) ? input.stride_elems(1) : 0;
+    const int64_t out_d = (srank == 3) ? output.stride_elems(1) : 0;
+    const int64_t in_h = input.stride_elems(srank - 1);
+    const int64_t out_h = output.stride_elems(srank - 1);
     // A pixel step is the channel count in this layout.
-    const int64_t in_pix = input.stride_elems(rank - 1);
-    const int64_t out_pix = output.stride_elems(rank - 1);
+    const int64_t in_pix = input.shape(rank - 1);
+    const int64_t out_pix = output.shape(rank - 1);
 
     const auto* in_ptr = input.ptr<T>();
     auto* out_ptr = output.ptr<T>();
@@ -435,15 +436,15 @@ void pooling_quant_impl(const PoolingAttributes& attrs, TensorView& output,
     const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
 
     const int64_t N = input.shape(0);
-    const int64_t C = input.shape(1);
+    const int64_t C = input.shape(input.rank() - 1);
     const int64_t nblocks = (C + 7) / 8;
 
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
-    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH = output.shape(srank);
-    const int64_t OW = output.shape(srank + 1);
+    const int64_t ID = (srank == 3) ? input.shape(1) : 1;
+    const int64_t IH = input.shape(srank - 1);
+    const int64_t IW = input.shape(srank);
+    const int64_t OD = (srank == 3) ? output.shape(1) : 1;
+    const int64_t OH = output.shape(srank - 1);
+    const int64_t OW = output.shape(srank);
 
     const auto& in_qp = input.quant_params();
     const auto& out_qp = output.quant_params();

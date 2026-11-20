@@ -30,11 +30,12 @@ std::vector<TensorDesc> Pooling::getOutputTensorDesc(std::span<const TensorDesc>
         out.layout = in.layout;
         out.dtype = in.dtype;
         out.dims.resize(static_cast<size_t>(in.rank));
+        // Channel-last: C is the last axis, the spatial axes sit between.
         out.dims[0] = in.dims[0];
-        out.dims[1] = in.dims[1];
-        for (int64_t d = 2; d < in.rank; ++d) {
+        out.dims[in.rank - 1] = in.dims[in.rank - 1];
+        for (int64_t d = 1; d < in.rank - 1; ++d) {
             // A 2D input reads output_size's H/W slots; 3D reads all three.
-            const size_t ai = static_cast<size_t>(3 - srank + (d - 2));
+            const size_t ai = static_cast<size_t>(3 - srank + (d - 1));
             out.dims[static_cast<size_t>(d)] = attrs_.global ? 1 : attrs_.output_size[ai];
         }
         return {out};

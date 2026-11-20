@@ -3,9 +3,9 @@
 /// @brief TransposeConv3D — transposed 3D convolution (deconvolution).
 ///
 /// The 3-D form of TransposeConv2D, in ONNX's ConvTranspose convention: the
-/// image is [N, IC, ID, IH, IW] stored NDHWC; the weight is
+/// image is [N, ID, IH, IW, IC] (channel-last); the weight is
 /// [IC, OC/G, KD, KH, KW] — input channel outermost, the opposite of Conv3D's
-/// weight; and the output is [N, OC, OD, OH, OW] in the input's layout, bias
+/// weight; and the output is [N, OD, OH, OW, OC], bias
 /// [OC] optional. Grouped, dilated and strided, with output_padding
 /// resolving the output size when the stride does not:
 ///   OD = (ID - 1)·SD - 2·PD + DD·(KD - 1) + output_padding[0] + 1.

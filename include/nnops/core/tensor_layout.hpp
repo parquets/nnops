@@ -2,10 +2,11 @@
 /// @file tensor_layout.hpp
 /// @brief TensorLayout enum for describing data arrangement in memory.
 ///
-/// Spatial activations are NHWC/NDHWC or dense (Dense). A spatial layout keeps
-/// the logical [N, C, ...] dims in the descriptor; only the physical order
-/// changes, so the "row" of the pitch model is one spatial line — (n, h) over
-/// all W pixels and all C channels — and the channel axis is contiguous.
+/// Spatial activations are NHWC/NDHWC or dense (Dense). A channel-last layout
+/// keeps the channel-last logical dims in the descriptor — [N, H, W, C] and
+/// [N, D, H, W, C] — so the dims *are* the physical order, the "row" of the
+/// pitch model is one spatial line — (n, h) over all W pixels and all C
+/// channels — and the channel axis is contiguous.
 /// A [W][C] row is one contiguous block, with pitch =
 /// align_up(W * C * elem_size, 32) (see TensorDesc::row_pitch()); a TensorView
 /// built with an explicit pitch may use any larger value.
@@ -24,8 +25,8 @@ namespace nnops {
 /// Memory layout of tensor data.
 enum class TensorLayout : uint8_t {
     // ---- spatial activations, 2D / 3D ----
-    NHWC      = 2,  ///< logical [N, C, H, W], stored [N, H, W, C]
-    NDHWC     = 3,  ///< logical [N, C, D, H, W], stored [N, D, H, W, C]
+    NHWC      = 2,  ///< logical and stored [N, H, W, C]
+    NDHWC     = 3,  ///< logical and stored [N, D, H, W, C]
 
     // ---- Spatial conv weight ----
     HWIO      = 5,  ///< [KH][KW][IC/G][OC] — TF filter order for spatial

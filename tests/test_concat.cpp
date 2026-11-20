@@ -75,21 +75,37 @@ void test_concat_nhwc(const std::vector<std::vector<int64_t>>& in_shapes,
         backend::cpu::reference::concat_ref(attrs, out_ref, ref_ins, ctx, nullptr);
     }
 
-    // NHWC path: convert each input, concat, convert back.
+    // Channel-last path: convert each input, concat, convert back. The dense
+    // dims [N, C, spatial...] become [N, spatial..., C] and the concat axis
+    // moves with them.
+    const auto to_cl_axis = [&](int64_t a) {
+        const int64_t ax = a < 0 ? a + rank : a;
+        if (ax == 0) { return int64_t(0); }
+        if (ax == 1) { return rank - 1; }
+        return ax - 1;
+    };
     std::vector<std::vector<float>> cl_bufs(N);
     std::vector<TensorView> in_cls(N);
     for (int64_t i = 0; i < N; ++i) {
         const TensorView& cf = in_channel_firsts[static_cast<size_t>(i)];
-        const int64_t in_S = cf.numel() / (cf.shape(0) * cf.shape(1));
+        const int64_t in_N = cf.shape(0);
+        const int64_t in_C = cf.shape(1);
+        const int64_t in_S = cf.numel() / (in_N * in_C);
         cl_bufs[static_cast<size_t>(i)] = test::to_channel_last(
             std::span<const float>(cf.ptr<float>(), static_cast<size_t>(cf.numel())),
-            cf.shape(0), cf.shape(1), in_S);
+            in_N, in_C, in_S);
+        int64_t cl_shape[8] = {};
+        cl_shape[0] = in_N;
+        for (int64_t d = 2; d < rank; ++d) { cl_shape[d - 1] = cf.shape(d); }
+        cl_shape[rank - 1] = in_C;
         in_cls[static_cast<size_t>(i)] = TensorView(
-            cf.shape_span(), DataType::f32,
+            std::span<const int64_t>(cl_shape, static_cast<size_t>(rank)), DataType::f32,
             cl_bufs[static_cast<size_t>(i)].data(), cl_layout);
     }
 
-    auto concat_op = Concat::create(attrs, Backend::CPU);
+    ConcatAttributes cl_attrs = attrs;
+    cl_attrs.axis = to_cl_axis(axis);
+    auto concat_op = Concat::create(cl_attrs, Backend::CPU);
     std::vector<TensorDesc> cl_descs_in(N);
     for (int64_t i = 0; i < N; ++i) {
         cl_descs_in[static_cast<size_t>(i)] = in_cls[static_cast<size_t>(i)].desc();
@@ -112,7 +128,7 @@ void test_concat_nhwc(const std::vector<std::vector<int64_t>>& in_shapes,
     concat_op->compute(out_cl, concat_ins);
 
     const int64_t out_N = out_cl.shape(0);
-    const int64_t out_C = out_cl.shape(1);
+    const int64_t out_C = out_cl.shape(rank - 1);
     const int64_t out_S = out_cl.numel() / (out_N * out_C);
     std::vector<float> res_channel_first = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),

@@ -51,14 +51,14 @@ void dwconv_fp_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
 
     const int64_t N = input.shape(0);
-    const int64_t C = input.shape(1);
+    const int64_t C = input.shape(input.rank() - 1);
 
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
-    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH = output.shape(srank);
-    const int64_t OW = output.shape(srank + 1);
+    const int64_t ID = (srank == 3) ? input.shape(1) : 1;
+    const int64_t IH = input.shape(srank - 1);
+    const int64_t IW = input.shape(srank);
+    const int64_t OD = (srank == 3) ? output.shape(1) : 1;
+    const int64_t OH = output.shape(srank - 1);
+    const int64_t OW = output.shape(srank);
 
     k::DwConvParams p{};
     p.ID = ID;
@@ -234,15 +234,15 @@ Status dwconv_quant_impl(const DepthwiseConvAttributes& attrs, TensorView& outpu
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
 
     const int64_t N = input.shape(0);
-    const int64_t C = input.shape(1);
+    const int64_t C = input.shape(input.rank() - 1);
     const int64_t nblocks = (C + 7) / 8;
 
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
-    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH = output.shape(srank);
-    const int64_t OW = output.shape(srank + 1);
+    const int64_t ID = (srank == 3) ? input.shape(1) : 1;
+    const int64_t IH = input.shape(srank - 1);
+    const int64_t IW = input.shape(srank);
+    const int64_t OD = (srank == 3) ? output.shape(1) : 1;
+    const int64_t OH = output.shape(srank - 1);
+    const int64_t OW = output.shape(srank);
 
     if (attrs.kernel_size[0] * attrs.kernel_size[1] * attrs.kernel_size[2] > k::kMaxQuantTaps) {
         return Status::unsupported; // the staging buffer is sized for 9x9x9

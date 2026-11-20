@@ -62,6 +62,26 @@ static int64_t pool_spatial_elems(const Shape& shape)
     return s;
 }
 
+/// Channel-last [N, spatial..., C] dims for a dense [N, C, spatial...] shape.
+static void pool_cl_dims(const std::vector<int64_t>& dense, int64_t* out)
+{
+    const int64_t rank = static_cast<int64_t>(dense.size());
+    out[0] = dense[0];
+    for (int64_t d = 2; d < rank; ++d) { out[d - 1] = dense[d]; }
+    out[rank - 1] = dense[1];
+}
+
+/// The channel-last desc of a dense one, for shape queries.
+static TensorDesc pool_cl_desc(const TensorDesc& dense, const std::vector<int64_t>& shape)
+{
+    TensorDesc d = dense;
+    int64_t dims[8] = {};
+    pool_cl_dims(shape, dims);
+    d.dims = std::span<const int64_t>(dims, shape.size());
+    d.layout = (shape.size() == 5) ? TensorLayout::NDHWC : TensorLayout::NHWC;
+    return d;
+}
+
 template <typename T>
 static void test_vs_ref(const std::vector<int64_t>& shape,
                              const PoolingAttributes& attrs,
@@ -93,14 +113,28 @@ static void test_vs_ref(const std::vector<int64_t>& shape,
     auto op = Pooling::create(attrs, Backend::CPU);
 
     // ---- Reference, in dense order ----------------------------------------------
-    const TensorDesc ref_in[] = {in_channel_first.desc()};
+    // Shape inference speaks channel-last whatever the storage, so the query
+    // uses the NHWC dims while the reference keeps the dense tensor.
+    const TensorDesc ref_in[] = {pool_cl_desc(in_channel_first.desc(), shape)};
     auto ref_descs = op->getOutputTensorDesc(ref_in);
-    const int64_t outS  = pool_spatial_elems(ref_descs[0].dims);
+    const int64_t rank = static_cast<int64_t>(shape.size());
+    const int64_t outS = ref_descs[0].numel() / (N * C);
     const int64_t out_n = N * C * outS;
+    int64_t ref_dims[8] = {};
+    ref_dims[0] = N;
+    ref_dims[1] = C;
+    for (int64_t d = 1; d + 1 < rank; ++d) {
+        ref_dims[d + 1] = ref_descs[0].dims[static_cast<size_t>(d)];
+    }
+    TensorDesc ref_desc;
+    ref_desc.rank = rank;
+    ref_desc.dims = std::span<const int64_t>(ref_dims, static_cast<size_t>(rank));
+    ref_desc.dtype = dt;
+    ref_desc.layout = TensorLayout::Dense;
 
     std::vector<float> ref_buf(static_cast<size_t>(out_n),
                                attrs.add_to ? 1.0f : 0.0f);
-    auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    auto ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         const TensorView r[] = {in_channel_first};
@@ -112,7 +146,9 @@ static void test_vs_ref(const std::vector<int64_t>& shape,
     std::vector<T> in_cl(in_cl_f.size());
     for (size_t i = 0; i < in_cl.size(); ++i) { in_cl[i] = to_T(in_cl_f[i]); }
 
-    TensorView in_v(std::span<const int64_t>(shape), dt, in_cl.data(), cl);
+    int64_t in_shape_cl[8] = {};
+    pool_cl_dims(shape, in_shape_cl);
+    TensorView in_v(std::span<const int64_t>(in_shape_cl, shape.size()), dt, in_cl.data(), cl);
     const TensorDesc cl_in[] = {in_v.desc()};
     auto out_descs = op->getOutputTensorDesc(cl_in);
     NNOPS_EXPECT_TRUE(out_descs[0].layout == cl);
@@ -283,12 +319,17 @@ static void pooling_q_test(const std::vector<int64_t>& shape,
     auto op = Pooling::create(attrs, Backend::CPU);
 
     // ---- Reference (dense order, ground truth) ----
-    const TensorDesc ref_in[] = {in_channel_first.desc()};
-    auto ref_desc = op->getOutputTensorDesc(ref_in)[0];
-    const int64_t outS = pool_spatial_elems(ref_desc.dims);
+    // Shape inference speaks channel-last whatever the storage.
+    const TensorDesc ref_in[] = {pool_cl_desc(in_channel_first.desc(), shape)};
+    const TensorDesc cl_out = op->getOutputTensorDesc(ref_in)[0];
+    const int64_t rank = static_cast<int64_t>(shape.size());
+    const int64_t outS = cl_out.numel() / (N * C);
+    int64_t ref_dims[8] = {};
+    ref_dims[0] = N;
+    ref_dims[1] = C;
+    for (int64_t d = 1; d + 1 < rank; ++d) { ref_dims[d + 1] = cl_out.dims[static_cast<size_t>(d)]; }
     std::vector<OutT> ref_buf(static_cast<size_t>(N * C * outS));
-    TensorView ref_out(std::span<const int64_t>(ref_desc.dims.data(),
-                                                static_cast<size_t>(ref_desc.rank)),
+    TensorView ref_out(std::span<const int64_t>(ref_dims, static_cast<size_t>(rank)),
                        out_dt, ref_buf.data(), TensorLayout::Dense, out_qp);
     {
         ComputeContext ctx;
@@ -300,7 +341,10 @@ static void pooling_q_test(const std::vector<int64_t>& shape,
     auto in_cl = test::to_channel_last<InT>(in_data, N, C, inS);
     const TensorLayout cl = (shape.size() == 5) ? TensorLayout::NDHWC
                                                 : TensorLayout::NHWC;
-    TensorView in_v(std::span<const int64_t>(shape), in_dt, in_cl.data(), cl, in_qp);
+    int64_t in_shape_cl[8] = {};
+    pool_cl_dims(shape, in_shape_cl);
+    TensorView in_v(std::span<const int64_t>(in_shape_cl, shape.size()), in_dt, in_cl.data(),
+                    cl, in_qp);
 
     const TensorDesc cl_in[] = {in_v.desc()};
     auto out_desc = op->getOutputTensorDesc(cl_in)[0];

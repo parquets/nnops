@@ -67,7 +67,7 @@ Status conv1d_cpu(const Conv1DAttributes& attrs, TensorView& output,
 
     if (attrs.auto_pad != Conv1DAttributes::AutoPad::NOTSET) {
         a.padding[1] =
-            resolve_leading_padding(input.shape(2), attrs.kernel_size, attrs.stride, attrs.dilation,
+            resolve_leading_padding(input.shape(1), attrs.kernel_size, attrs.stride, attrs.dilation,
                                     attrs.padding, static_cast<int>(attrs.auto_pad));
     }
 

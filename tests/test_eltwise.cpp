@@ -861,17 +861,17 @@ NNOPS_TEST(eltwise_broadcast_add_to) {
 }
 
 NNOPS_TEST(eltwise_broadcast_per_channel) {
-    // [N,C,H,W] logical in NHWC storage, times a [1,C,1,1] per-channel scale.
+    // [N,H,W,C] channel-last, times a [1,1,1,C] per-channel scale.
     constexpr int64_t N = 2, C = 3, H = 5, W = 4;
     auto [a_vec, a_channel_first] = test::make_random_tensor({N, C, H, W}, -2.0f, 2.0f);
     auto [s_vec, s] = test::make_random_tensor({1, C, 1, 1}, -2.0f, 2.0f);
 
     auto a_cl = test::to_channel_last<float>(a_vec, N, C, H * W);
-    const int64_t a_shape[] = {N, C, H, W};
+    const int64_t a_shape[] = {N, H, W, C};
     TensorView a(a_shape, DataType::f32, a_cl.data(), TensorLayout::NHWC);
 
-    // A [1,C,1,1] tensor is the same bytes in either layout.
-    const int64_t s_shape[] = {1, C, 1, 1};
+    // A [1,1,1,C] tensor is the same bytes in either layout.
+    const int64_t s_shape[] = {1, 1, 1, C};
     TensorView scale(s_shape, DataType::f32, s_vec.data(), TensorLayout::NHWC);
 
     EltwiseAttributes attrs;

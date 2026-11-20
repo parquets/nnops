@@ -24,6 +24,28 @@ using namespace nnops;
 
 namespace {
 
+/// Dense [N, C, spatial...] dims → channel-last [N, spatial..., C].
+std::vector<int64_t> cl_dims_of(const TensorView& cf)
+{
+    const int64_t rank = cf.rank();
+    std::vector<int64_t> d(static_cast<size_t>(rank));
+    d[0] = cf.shape(0);
+    for (int64_t i = 2; i < rank; ++i) { d[static_cast<size_t>(i - 1)] = cf.shape(i); }
+    d[static_cast<size_t>(rank - 1)] = cf.shape(1);
+    return d;
+}
+
+/// Channel-last [N, spatial..., C] dims → dense [N, C, spatial...].
+std::vector<int64_t> dense_dims_of(const TensorView& cl)
+{
+    const int64_t rank = cl.rank();
+    std::vector<int64_t> d(static_cast<size_t>(rank));
+    d[0] = cl.shape(0);
+    d[1] = cl.shape(rank - 1);
+    for (int64_t i = 1; i + 1 < rank; ++i) { d[static_cast<size_t>(i + 1)] = cl.shape(i); }
+    return d;
+}
+
 /// Pixel-major reorder of a dense view.
 std::vector<float> to_channel_last_data(const TensorView& cf)
 {
@@ -39,7 +61,7 @@ std::vector<float> to_channel_last_data(const TensorView& cf)
 std::vector<float> to_channel_first_data(const TensorView& cl)
 {
     const int64_t N = cl.shape(0);
-    const int64_t C = cl.shape(1);
+    const int64_t C = cl.shape(cl.rank() - 1);
     const int64_t S = cl.numel() / (N * C);
     return test::to_channel_first(
         std::span<const float>(cl.ptr<float>(), static_cast<size_t>(cl.numel())),
@@ -70,7 +92,8 @@ NNOPS_TEST(grid_sample_2d_bilinear_identity) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         auto gs_op = GridSample::create({});
@@ -91,7 +114,8 @@ NNOPS_TEST(grid_sample_2d_bilinear_identity) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[0], 1.0f, 1e-5f);
@@ -122,7 +146,8 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         GridSampleAttributes attrs;
@@ -135,10 +160,11 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
         NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
+        // [N, OH, OW, C]
         NNOPS_EXPECT_EQ(gs_descs[0].dims[0], 1);
-        NNOPS_EXPECT_EQ(gs_descs[0].dims[1], 1);
+        NNOPS_EXPECT_EQ(gs_descs[0].dims[1], 4);
         NNOPS_EXPECT_EQ(gs_descs[0].dims[2], 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].dims[3], 4);
+        NNOPS_EXPECT_EQ(gs_descs[0].dims[3], 1);
 
         std::vector<float> gs_buf(static_cast<size_t>(gs_descs[0].numel()));
         TensorView out_cl(
@@ -149,7 +175,8 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[0],  1.0f, 1e-5f);
@@ -176,7 +203,8 @@ NNOPS_TEST(grid_sample_2d_bilinear_random) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         auto gs_op = GridSample::create({});
@@ -196,7 +224,8 @@ NNOPS_TEST(grid_sample_2d_bilinear_random) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (size_t i = 0; i < 72; ++i) {
@@ -225,7 +254,8 @@ NNOPS_TEST(grid_sample_2d_nearest_basic) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         GridSampleAttributes attrs;
@@ -247,7 +277,8 @@ NNOPS_TEST(grid_sample_2d_nearest_basic) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (int i = 0; i < 4; ++i) {
@@ -268,7 +299,8 @@ NNOPS_TEST(grid_sample_2d_nearest_random) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         GridSampleAttributes attrs;
@@ -290,7 +322,8 @@ NNOPS_TEST(grid_sample_2d_nearest_random) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (size_t i = 0; i < 75; ++i) {
@@ -319,7 +352,8 @@ NNOPS_TEST(grid_sample_2d_zeros_padding) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         auto gs_op = GridSample::create({});
@@ -339,7 +373,8 @@ NNOPS_TEST(grid_sample_2d_zeros_padding) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (int i = 0; i < 4; ++i) {
@@ -363,7 +398,8 @@ NNOPS_TEST(grid_sample_2d_border_padding) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         GridSampleAttributes attrs;
@@ -386,7 +422,8 @@ NNOPS_TEST(grid_sample_2d_border_padding) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (int i = 0; i < 4; ++i) {
@@ -413,7 +450,8 @@ NNOPS_TEST(grid_sample_2d_reflection_padding) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         GridSampleAttributes attrs;
@@ -435,7 +473,8 @@ NNOPS_TEST(grid_sample_2d_reflection_padding) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (size_t i = 0; i < 16; ++i) {
@@ -478,7 +517,8 @@ NNOPS_TEST(grid_sample_3d_bilinear_basic) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_ncdhw);
-        TensorView in_cl(in_ncdhw.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_ncdhw);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NDHWC);
 
         auto gs_op = GridSample::create({});
@@ -499,7 +539,8 @@ NNOPS_TEST(grid_sample_3d_bilinear_basic) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_ncdhw(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_ncdhw_dims = dense_dims_of(out_cl);
+        TensorView res_ncdhw(res_ncdhw_dims, DataType::f32, res_buf.data(),
                              TensorLayout::Dense);
 
         for (size_t i = 0; i < 8; ++i) {
@@ -520,7 +561,8 @@ NNOPS_TEST(grid_sample_3d_nearest_basic) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_ncdhw);
-        TensorView in_cl(in_ncdhw.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_ncdhw);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NDHWC);
 
         GridSampleAttributes attrs;
@@ -542,7 +584,8 @@ NNOPS_TEST(grid_sample_3d_nearest_basic) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_ncdhw(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_ncdhw_dims = dense_dims_of(out_cl);
+        TensorView res_ncdhw(res_ncdhw_dims, DataType::f32, res_buf.data(),
                              TensorLayout::Dense);
 
         for (size_t i = 0; i < 27; ++i) {
@@ -573,7 +616,8 @@ NNOPS_TEST(grid_sample_add_to) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         GridSampleAttributes attrs;
@@ -599,7 +643,8 @@ NNOPS_TEST(grid_sample_add_to) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (size_t i = 0; i < 16; ++i) {
@@ -625,7 +670,8 @@ NNOPS_TEST(grid_sample_multisample) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         auto gs_op = GridSample::create({});
@@ -636,8 +682,11 @@ NNOPS_TEST(grid_sample_multisample) {
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
         NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
+        // [N, OH, OW, C]
         NNOPS_EXPECT_EQ(gs_descs[0].dims[0], 2);
-        NNOPS_EXPECT_EQ(gs_descs[0].dims[1], 1);
+        NNOPS_EXPECT_EQ(gs_descs[0].dims[1], 3);
+        NNOPS_EXPECT_EQ(gs_descs[0].dims[2], 3);
+        NNOPS_EXPECT_EQ(gs_descs[0].dims[3], 1);
 
         std::vector<float> gs_buf(static_cast<size_t>(gs_descs[0].numel()));
         TensorView out_cl(
@@ -648,7 +697,8 @@ NNOPS_TEST(grid_sample_multisample) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (size_t i = 0; i < 18; ++i) {
@@ -683,7 +733,8 @@ NNOPS_TEST(grid_sample_2d_align_corners_corners_exact) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         GridSampleAttributes attrs;
@@ -706,7 +757,8 @@ NNOPS_TEST(grid_sample_2d_align_corners_corners_exact) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (int i = 0; i < 9; ++i) {
@@ -736,7 +788,8 @@ NNOPS_TEST(grid_sample_partial_channels) {
 
     {
         std::vector<float> cl_buf = to_channel_last_data(in_channel_first);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+        const std::vector<int64_t> in_cl_dims = cl_dims_of(in_channel_first);
+        TensorView in_cl(in_cl_dims, DataType::f32, cl_buf.data(),
                          TensorLayout::NHWC);
 
         auto gs_op = GridSample::create({});
@@ -757,7 +810,8 @@ NNOPS_TEST(grid_sample_partial_channels) {
         gs_op->compute(out_cl, gs_ins);
 
         std::vector<float> res_buf = to_channel_first_data(out_cl);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
+        const std::vector<int64_t> res_channel_first_dims = dense_dims_of(out_cl);
+        TensorView res_channel_first(res_channel_first_dims, DataType::f32, res_buf.data(),
                                      TensorLayout::Dense);
 
         for (size_t i = 0; i < 48; ++i) {

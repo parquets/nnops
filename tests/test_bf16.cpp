@@ -366,7 +366,7 @@ void run_normalization()
         a.type = NormType::GroupNorm;
         a.num_groups = 4;
         check_case("groupnorm", [a] { return Norm::create(a, Backend::CPU); },
-                   {{{2, 8, 4, 4}, TensorLayout::NHWC}, {{8}}, {{8}}}, 3e-2f);
+                   {{{2, 4, 4, 8}, TensorLayout::NHWC}, {{8}}, {{8}}}, 3e-2f);
     }
 }
 
@@ -380,7 +380,7 @@ void run_conv()
         a.padding = {1, 1};
         check_case("conv2d_cl_3x3",
                    [a] { return Conv2D::create(a, Backend::CPU); },
-                   {{{1, 4, 8, 8}, TensorLayout::NHWC},
+                   {{{1, 8, 8, 4}, TensorLayout::NHWC},
                     {{3, 3, 4, 6}, TensorLayout::HWIO}}, 5e-2f);
     }
     {
@@ -388,7 +388,7 @@ void run_conv()
         a.kernel_size = {1, 1};
         check_case("conv2d_cl_1x1",
                    [a] { return Conv2D::create(a, Backend::CPU); },
-                   {{{1, 4, 6, 6}, TensorLayout::NHWC},
+                   {{{1, 6, 6, 4}, TensorLayout::NHWC},
                     {{1, 1, 4, 6}, TensorLayout::HWIO}, {{6}}}, 5e-2f);
     }
     {
@@ -397,7 +397,7 @@ void run_conv()
         a.padding = {0, 1, 1};
         check_case("depthwise",
                    [a] { return DepthwiseConv::create(a, Backend::CPU); },
-                   {{{1, 4, 8, 8}, TensorLayout::NHWC},
+                   {{{1, 8, 8, 4}, TensorLayout::NHWC},
                     {{1, 3, 3, 4}, TensorLayout::HWCM}}, 5e-2f);
     }
     {
@@ -408,7 +408,7 @@ void run_conv()
         a.output_padding = {1, 1};
         check_case("depthwise_transpose",
                    [a] { return DepthwiseTransposeConv2D::create(a, Backend::CPU); },
-                   {{{1, 4, 6, 6}, TensorLayout::NHWC}, {{4, 1, 3, 3}}}, 5e-2f);
+                   {{{1, 6, 6, 4}, TensorLayout::NHWC}, {{4, 1, 3, 3}}}, 5e-2f);
     }
     {
         TransposeConv2DAttributes a;
@@ -418,7 +418,7 @@ void run_conv()
         a.output_padding = {1, 1};
         check_case("transpose_conv2d",
                    [a] { return TransposeConv2D::create(a, Backend::CPU); },
-                   {{{1, 3, 6, 6}, TensorLayout::NHWC}, {{3, 4, 3, 3}}}, 5e-2f);
+                   {{{1, 6, 6, 3}, TensorLayout::NHWC}, {{3, 4, 3, 3}}}, 5e-2f);
     }
     {
         Conv1DAttributes a;
@@ -426,7 +426,7 @@ void run_conv()
         a.padding = 1;
         check_case("conv1d",
                    [a] { return Conv1D::create(a, Backend::CPU); },
-                   {{{1, 4, 20}, TensorLayout::NHWC},
+                   {{{1, 20, 4}, TensorLayout::NHWC},
                     {{3, 4, 6}, TensorLayout::HWIO}}, 5e-2f);
     }
     {
@@ -434,7 +434,7 @@ void run_conv()
         a.kernel_size = {2, 2, 2};
         check_case("conv3d",
                    [a] { return Conv3D::create(a, Backend::CPU); },
-                   {{{1, 2, 5, 5, 5}, TensorLayout::NDHWC}, {{3, 2, 2, 2, 2}}}, 5e-2f);
+                   {{{1, 5, 5, 5, 2}, TensorLayout::NDHWC}, {{3, 2, 2, 2, 2}}}, 5e-2f);
     }
 }
 
@@ -551,7 +551,7 @@ void run_pooling_and_movement()
         a.stride = {1, 2, 2};
         a.padding = {0, 1, 1};
         check_case("pooling", [a] { return Pooling::create(a, Backend::CPU); },
-                   {{{1, 4, 8, 8}, TensorLayout::NHWC}}, 3e-2f);
+                   {{{1, 8, 8, 4}, TensorLayout::NHWC}}, 3e-2f);
     }
     {
         ConcatAttributes a;
@@ -653,14 +653,14 @@ void run_misc_ops()
         a.stride = 2;
         a.padding = 1;
         check_case("pool1d", [a] { return Pool1D::create(a, Backend::CPU); },
-                   {{{1, 4, 9}, TensorLayout::NHWC}}, 3e-2f);
+                   {{{1, 9, 4}, TensorLayout::NHWC}}, 3e-2f);
     }
     {
         TransposeConv3DAttributes a;
         a.kernel_size = {2, 2, 2};
         check_case("transpose_conv3d",
                    [a] { return TransposeConv3D::create(a, Backend::CPU); },
-                   {{{1, 2, 3, 3, 3}, TensorLayout::NDHWC}, {{2, 3, 2, 2, 2}}}, 5e-2f);
+                   {{{1, 3, 3, 3, 2}, TensorLayout::NDHWC}, {{2, 3, 2, 2, 2}}}, 5e-2f);
     }
     {
         // cond is u8; the two value operands decide the output dtype.

@@ -2,10 +2,10 @@
 /// @file conv2d.hpp
 /// @brief 2D convolution over NHWC activations.
 ///
-/// Input [N, IC, IH, IW] stored NHWC, weight HWIO [KH, KW, IC/G, OC] — there the
-/// tensor's *shape* is the filter itself — output [N, OC, OH, OW], bias [OC]. The
-/// activation and the filter order must pair (see validate()). Groups and
-/// dilation are supported.
+/// Input [N, IH, IW, IC] (channel-last), weight HWIO [KH, KW, IC/G, OC] — there
+/// the tensor's *shape* is the filter itself — output [N, OH, OW, OC], bias
+/// [OC]. The activation and the filter order must pair (see validate()). Groups
+/// and dilation are supported.
 ///
 /// Data types: f32/f16 on every input and output (the floating-point route), or
 /// the quantized route — an s8 weight with per-channel QuantParams against a

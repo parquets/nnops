@@ -85,8 +85,8 @@ void apply_activation_flt(ActivationType type, const T* in, T* out, int64_t M, i
 
 } // anonymous namespace
 
-/// PRelu: one slope per logical channel (dim 1). NHWC packs C inside
-/// every pixel, so the slope vector loads alongside the pixel vector.
+/// PRelu: one slope per logical channel (the last dim). Channel-last packs C
+/// inside every pixel, so the slope vector loads alongside the pixel vector.
 template <typename T>
 void prelu_impl(const ActivationAttributes& attrs, TensorView& output,
                 std::span<const TensorView> inputs, const ComputeContext& ctx)
@@ -94,7 +94,7 @@ void prelu_impl(const ActivationAttributes& attrs, TensorView& output,
     using namespace simd;
     const auto& x = inputs[0];
     const auto& slope = inputs[1];
-    const int64_t C = x.shape(1);
+    const int64_t C = x.shape(x.rank() - 1);
     const int64_t slope_n = slope.numel();
     const T* sp = slope.ptr<T>();
     const T* in = x.ptr<T>();
@@ -114,8 +114,11 @@ void prelu_impl(const ActivationAttributes& attrs, TensorView& output,
     constexpr int L = simd_lane_for<T>;
     constexpr int64_t kTileRows = 32;
     const int64_t num_tiles = (rows_total + kTileRows - 1) / kTileRows;
-    const int64_t last = (C > 0) ? x.shape(x.rank() - 1) : 0;
-    const int64_t cols = is_channel_last(x.layout()) ? C * last : last;
+    // A row is one spatial line: W * C in channel-last, the innermost dim
+    // otherwise. row_stride_elems() also carries any pitch padding.
+    const int64_t cols = (C > 0 && is_channel_last(x.layout()))
+        ? x.row_stride_elems()
+        : x.shape(x.rank() - 1);
     const bool c_aligned = (C % L) == 0;
 
     // The slope vector for the L lanes starting at column @p c0.

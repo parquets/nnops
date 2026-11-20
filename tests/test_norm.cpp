@@ -93,7 +93,8 @@ NNOPS_TEST(norm_batchnorm_spatial) {
         std::span<const float>(in_channel_first.ptr<float>(),
                                static_cast<size_t>(in_channel_first.numel())),
         N, C, S);
-    TensorView x_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
+    const int64_t shape_cl[] = {N, H, W, C};
+    TensorView x_cl(std::span<const int64_t>(shape_cl, 4), DataType::f32, cl_buf.data(),
                     TensorLayout::NHWC);
 
     const TensorDesc cl_norm_desc[] = {x_cl.desc(), ds, db, dm, dv};

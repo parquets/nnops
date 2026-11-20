@@ -133,7 +133,7 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
                      int rounds, int iters)
 {
     constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
-    const int64_t shape[] = {1, c.C, c.H, c.W};
+    const int64_t shape[] = {1, c.H, c.W, c.C};  // channel-last
     auto [in_vec, in_raw] = make_random<T>(shape, 11);
     (void)in_raw;
 
@@ -297,7 +297,7 @@ void run_window_case(const WindowCase& c, const std::vector<int>& threads,
                      int rounds, int iters)
 {
     constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
-    const int64_t shape[] = {1, c.C, c.H, c.W};
+    const int64_t shape[] = {1, c.H, c.W, c.C};  // channel-last
     auto [in_vec, in_raw] = make_random<T>(shape, 31);
     (void)in_raw;
     auto cl_vec = test::to_channel_last<T>(

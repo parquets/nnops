@@ -95,12 +95,13 @@ void reduce_spatial(const ReduceAttributes& attrs, TensorView& output, const Ten
     T* y_ptr = output.ptr<T>();
     const float inv_D = 1.0f / static_cast<float>(D);
 
-    // axis==1 is C: contiguous in every spatial tensor.
-    if (axis == 1) {
+    // A run with a unit stride is one contiguous row: C in a channel-last
+    // tensor, the innermost axis in a dense one.
+    if (axis_stride == 1) {
         const auto process_pos = [&](int64_t s) {
-            const int64_t in_off = decompose_flat_offset(s, input, 0, rank - 1, /*skip_dim=*/1);
+            const int64_t in_off = decompose_flat_offset(s, input, 0, rank - 1, axis);
             const int64_t out_off =
-                decompose_flat_offset(s, output, 0, rank_out - 1, keepdims ? 1 : -1);
+                decompose_flat_offset(s, output, 0, rank_out - 1, keepdims ? axis : -1);
             float result = 0.0f;
             kernel::reduce_process_contiguous_row<T>(x_ptr + in_off, &result, D, attrs.type);
             s_store(&y_ptr[out_off], result);

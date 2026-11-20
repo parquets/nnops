@@ -119,7 +119,13 @@ public:
         CheckRow row;
         row.name = name;
 
-        if (!same_shape(actual, expected)) {
+        // The checkpoint is a dense [N, C, spatial...] PyTorch tensor. A
+        // channel-last activation carries the same logical tensor in
+        // [N, spatial..., C], so the comparison permutes its indices instead of
+        // demanding the same dim order.
+        const bool cl_pair = is_channel_last(actual.layout()) &&
+                             same_channel_last_shape(actual, expected);
+        if (!cl_pair && !same_shape(actual, expected)) {
             row.shape_ok = false;
             if (verbose_) {
                 std::printf("  %-24s SHAPE MISMATCH\n", name.c_str());
@@ -153,7 +159,36 @@ public:
         const int64_t n = actual.numel();
         std::vector<float> widened;
         const float* a = nullptr;
-        if (dt == nnops::DataType::f16) {
+        if (cl_pair) {
+            // Walk the channel-first logical order and read the channel-last
+            // view through its own strides.
+            widened.resize(static_cast<size_t>(n));
+            const int64_t rank = expected.rank();
+            int64_t map[8];
+            map[0] = 0;
+            map[1] = rank - 1;
+            for (int64_t d = 2; d < rank; ++d) { map[d] = d - 1; }
+            int64_t idx[8] = {};
+            const auto* src = actual.ptr<uint8_t>();
+            const int64_t unit = static_cast<int64_t>(
+                nnops::data_type_stride_unit(actual.data_type()));
+            for (int64_t i = 0; i < n; ++i) {
+                int64_t off = 0;
+                for (int64_t d = 0; d < rank; ++d) {
+                    off += idx[d] * actual.stride_elems(map[d]);
+                }
+                widened[static_cast<size_t>(i)] =
+                    dt == nnops::DataType::f16
+                        ? nnops::simd::s_load(
+                              reinterpret_cast<const nnops::backend::cpu::half*>(src) + off)
+                        : *reinterpret_cast<const float*>(src + off * unit);
+                for (int64_t d = rank - 1; d >= 0; --d) {
+                    if (++idx[d] < expected.shape(d)) { break; }
+                    idx[d] = 0;
+                }
+            }
+            a = widened.data();
+        } else if (dt == nnops::DataType::f16) {
             const auto* h = actual.ptr<nnops::backend::cpu::half>();
             widened.resize(static_cast<size_t>(n));
             for (int64_t i = 0; i < n; ++i) {
@@ -209,6 +244,21 @@ public:
     size_t size() const { return rows_.size(); }
 
 private:
+    /// True when @p cl is the channel-last form of the channel-first @p cf:
+    /// [N, spatial..., C] against [N, C, spatial...].
+    static bool same_channel_last_shape(const nnops::TensorView& cl,
+                                        const nnops::TensorView& cf)
+    {
+        if (cl.rank() != cf.rank() || cl.rank() < 3) { return false; }
+        const int64_t rank = cl.rank();
+        if (cl.shape(0) != cf.shape(0)) { return false; }
+        if (cl.shape(rank - 1) != cf.shape(1)) { return false; }
+        for (int64_t d = 2; d < rank; ++d) {
+            if (cl.shape(d - 1) != cf.shape(d)) { return false; }
+        }
+        return true;
+    }
+
     static bool same_shape(const nnops::TensorView& a,
                            const nnops::TensorView& b)
     {

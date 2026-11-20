@@ -7,8 +7,8 @@
 /// the outer left/top/front border and 1 the right/bottom/back one. f32/f16
 /// images only.
 ///
-/// 2D: Input [N, C, IH, IW], Grid [N, OH, OW, 2] → Output [N, C, OH, OW]
-/// 3D: Input [N, C, ID, IH, IW], Grid [N, OD, OH, OW, 3] → Output [N, C, OD, OH, OW]
+/// 2D: Input [N, IH, IW, C], Grid [N, OH, OW, 2] → Output [N, OH, OW, C]
+/// 3D: Input [N, ID, IH, IW, C], Grid [N, OD, OH, OW, 3] → Output [N, OD, OH, OW, C]
 ///
 /// Reference: ONNX GridSample operator (since opset 16).
 

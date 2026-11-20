@@ -205,7 +205,8 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
     const int64_t N = c.ishape[0], IC = c.ishape[1];
     const int64_t IH = c.ishape[2], IW = c.ishape[3];
     const int64_t ICG = IC / c.groups;
-    const int64_t ish[] = {N, IC, IH, IW};
+    const int64_t ish[] = {N, IC, IH, IW};                  // NCHW: the reference
+    const int64_t ish_cl[] = {N, IH, IW, IC};               // NHWC: the kernel
     const int64_t wsh[] = {c.oc, ICG, c.kh, c.kw};          // OIHW: the reference
     const int64_t wsh_cl[] = {c.kh, c.kw, ICG, c.oc};       // HWIO: the kernel
     const int64_t bsh[] = {c.oc};
@@ -237,15 +238,28 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
 
     std::vector<TensorView> ref_ins = {in32, w32};
     {
-        std::vector<TensorDesc> d = {in32.desc(), w32.desc()};
+        // Shape inference speaks channel-last whatever the storage, so the query
+        // uses the NHWC dims while the reference keeps the dense tensors.
+        TensorDesc in_for_shape = in32.desc();
+        in_for_shape.dims = std::span<const int64_t>(ish_cl, 4);
+        in_for_shape.layout = TensorLayout::NHWC;
+        std::vector<TensorDesc> d = {in_for_shape, w32.desc()};
         if (c.bias) {
             TensorView bv(bsh, DataType::f32, b32v.data());
             ref_ins.push_back(bv);
             d.push_back(bv.desc());
         }
         auto od = op->getOutputTensorDesc(d);
-        const int64_t OC = od[0].dims[1], OH = od[0].dims[2], OW = od[0].dims[3];
+        // Channel-last output dims: [N, OH, OW, OC].
+        const int64_t OH = od[0].dims[1], OW = od[0].dims[2], OC = od[0].dims[3];
         const int64_t out_n = N * OC * OH * OW;
+        // The reference reads and writes dense [N, OC, OH, OW].
+        const int64_t ref_dims[] = {N, OC, OH, OW};
+        TensorDesc ref_desc;
+        ref_desc.rank = 4;
+        ref_desc.dims = std::span<const int64_t>(ref_dims, 4);
+        ref_desc.dtype = DataType::f32;
+        ref_desc.layout = TensorLayout::Dense;
 
         std::vector<float> res_channel_first;
         if (add_to) {
@@ -258,7 +272,7 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
         for (int64_t i = 0; i < out_n; ++i) {
             ref_buf[static_cast<size_t>(i)] = add_to ? res_channel_first[static_cast<size_t>(i)] : 0.0f;
         }
-        auto ref_out = test::make_channel_first(od[0], ref_buf.data());
+        auto ref_out = test::make_channel_first(ref_desc, ref_buf.data());
         nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ref_ins, {}, nullptr);
 
         auto in_cl = test::channel_first_to_channel_last<float>(in32v, N, IC, IH, IW);
@@ -295,7 +309,7 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
             for (size_t i = 0; i < in_buf.size(); ++i) { in_buf[i] = to_T(in_cl[i]); }
             for (size_t i = 0; i < w_buf.size(); ++i) { w_buf[i] = to_T(w_cl[i]); }
 
-            TensorView in_v(std::span<const int64_t>(ish, 4), dtt, in_buf.data(),
+            TensorView in_v(std::span<const int64_t>(ish_cl, 4), dtt, in_buf.data(),
                             TensorLayout::NHWC);
             TensorView w_v(std::span<const int64_t>(wsh_cl, 4), dtt, w_buf.data(),
                            TensorLayout::HWIO);
@@ -328,7 +342,7 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
                 out_buf[static_cast<size_t>(i)] = to_T(
                     add_to ? res_cl[static_cast<size_t>(i)] : 0.0f);
             }
-            const int64_t osh[] = {N, OC, OH, OW};
+            const int64_t osh[] = {N, OH, OW, OC};
             TensorView out_v(std::span<const int64_t>(osh, 4), dtt, out_buf.data(),
                              TensorLayout::NHWC);
             const std::vector<T> out_seed = out_buf;
@@ -388,9 +402,10 @@ void expect_fp_close(const FpCase& c, DataType dt, float tol,
 // ============================================================
 
 NNOPS_TEST(conv2d_fp_hand_exact) {
-    // 1x1x4x4 all-ones, 3x3 kernel all-0.5, stride 1, pad 0, bias 0.5: each of
-    // the 2x2 outputs is 9 · 1 · 0.5 + 0.5 = 5.0, in HWIO as in OIHW.
-    const int64_t ishape[] = {1, 1, 4, 4};
+    // [N=1, H=4, W=4, C=1] all-ones, 3x3 kernel all-0.5, stride 1, pad 0,
+    // bias 0.5: each of the 2x2 outputs is 9 · 1 · 0.5 + 0.5 = 5.0, in HWIO as
+    // in OIHW.
+    const int64_t ishape[] = {1, 4, 4, 1};
     const int64_t wshape[] = {3, 3, 1, 1};
     const int64_t bshape[] = {1};
 
@@ -411,8 +426,10 @@ NNOPS_TEST(conv2d_fp_hand_exact) {
     const TensorDesc descs[] = {input.desc(), weight.desc(), bias.desc()};
     auto outs = op->getOutputTensorDesc(descs);
     NNOPS_EXPECT_EQ(outs[0].layout, TensorLayout::NHWC);
+    // [N, OH, OW, OC]
+    NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t{2});
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t{2});
-    NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t{2});
+    NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t{1});
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()), 0.0f);
     auto out = test::make_channel_first(outs[0], out_buf.data());
@@ -647,8 +664,8 @@ NNOPS_TEST(conv2d_fp_epilogues) {
 // compute, the int8 compensation sums among them, so packing cannot lose.
 
 NNOPS_TEST(conv2d_prepack_query) {
-    const int64_t ish[] = {1, 8, 10, 10};
-    const int64_t wsh[] = {3, 3, 8, 16};   // HWIO: [KH][KW][IC/G][OC]
+    const int64_t ish[] = {1, 10, 10, 8};   // [N, H, W, C]
+    const int64_t wsh[] = {3, 3, 8, 16};    // HWIO: [KH][KW][IC/G][OC]
     std::vector<float> in_buf(1 * 8 * 10 * 10, 0.0f);
     std::vector<float> w_buf(3 * 3 * 8 * 16, 0.0f);
     TensorView in_v(std::span<const int64_t>(ish, 4), DataType::f32, in_buf.data(),
@@ -687,7 +704,7 @@ NNOPS_TEST(conv2d_prepack_query) {
     op->prepackWeights(pv, pf);
 
     std::vector<float> out_buf(1 * 16 * 8 * 8, 0.0f);
-    const int64_t osh[] = {1, 16, 8, 8};
+    const int64_t osh[] = {1, 8, 8, 16};   // [N, OH, OW, OC]
     TensorView out_v(std::span<const int64_t>(osh, 4), DataType::f32, out_buf.data(),
                      TensorLayout::NHWC);
 
@@ -929,7 +946,7 @@ NNOPS_TEST(conv2d_wino_hand_exact) {
     // flattening, the 2x2 write-back, the channel mapping and the transform
     // round trip at once.
     constexpr int64_t IC = 8, OC = 8, H = 4, W = 4;
-    const int64_t ish[] = {1, IC, H, W};
+    const int64_t ish[] = {1, H, W, IC};   // channel-last
     const int64_t wsh[] = {3, 3, IC, OC};
     std::vector<float> in_buf(static_cast<size_t>(IC * H * W)), w_buf(9 * IC * OC, 0.0f);
     for (int64_t h = 0; h < H; ++h) {
@@ -964,7 +981,7 @@ NNOPS_TEST(conv2d_wino_hand_exact) {
     TensorView of[] = {u_v};
     op->prepackWeights(wf, of);
 
-    const int64_t osh[] = {1, OC, H, W};
+    const int64_t osh[] = {1, H, W, OC};   // channel-last
     std::vector<float> out_buf(static_cast<size_t>(OC * H * W), 0.0f);
     TensorView out_v(std::span<const int64_t>(osh, 4), DataType::f32, out_buf.data(),
                      TensorLayout::NHWC);
@@ -986,8 +1003,8 @@ NNOPS_TEST(conv2d_wino_plan_and_auto) {
     // Auto follows the U it is handed: the panels pair with an NHWC
     // activation, and a U that is not the panels must not resolve to a plan at
     // all.
-    const int64_t ishape[] = {1, 32, 16, 16};
-    const int64_t oshape[] = {1, 32, 14, 14};
+    const int64_t ishape[] = {1, 16, 16, 32};   // [N, H, W, C]
+    const int64_t oshape[] = {1, 14, 14, 32};
     std::vector<float> in_buf(32 * 16 * 16, 0.5f);
     std::vector<float> out_buf(32 * 14 * 14, 0.0f);
     TensorView input(std::span<const int64_t>(ishape, 4), DataType::f32,
@@ -1091,6 +1108,7 @@ NNOPS_TEST(conv2d_threaded_matches_serial) {
         const int64_t IH = c.ishape[2], IW = c.ishape[3];
         const int64_t ICG = IC / c.groups;
         const int64_t ish[] = {N, IC, IH, IW};
+        const int64_t ish_cl[] = {N, IH, IW, IC};             // NHWC
         const int64_t wsh[] = {c.oc, ICG, c.kh, c.kw};        // OIHW
         const int64_t wsh_cl[] = {c.kh, c.kw, ICG, c.oc};     // HWIO
         const int64_t bsh[] = {c.oc};
@@ -1117,7 +1135,7 @@ NNOPS_TEST(conv2d_threaded_matches_serial) {
         attrs.groups = c.groups;
 
         auto op = Conv2D::create(attrs, Backend::CPU);
-        TensorView in_v(std::span<const int64_t>(ish, 4), DataType::f32, in_cl.data(),
+        TensorView in_v(std::span<const int64_t>(ish_cl, 4), DataType::f32, in_cl.data(),
                         TensorLayout::NHWC);
         TensorView w_v(std::span<const int64_t>(wsh_cl, 4), DataType::f32, w_cl.data(),
                        TensorLayout::HWIO);
@@ -1127,8 +1145,9 @@ NNOPS_TEST(conv2d_threaded_matches_serial) {
         for (const auto& v : ins) { descs.push_back(v.desc()); }
         auto od = op->getOutputTensorDesc(descs);
         const int64_t out_n = od[0].numel();
-        const int64_t OC = od[0].dims[1], OH = od[0].dims[2], OW = od[0].dims[3];
-        const int64_t osh[] = {N, OC, OH, OW};
+        // [N, OH, OW, OC]
+        const int64_t OH = od[0].dims[1], OW = od[0].dims[2], OC = od[0].dims[3];
+        const int64_t osh[] = {N, OH, OW, OC};
 
         auto make_out = [&](std::vector<float>& buf) {
             TensorView v(std::span<const int64_t>(osh, 4), DataType::f32, buf.data(),
@@ -1209,12 +1228,16 @@ NNOPS_TEST(conv2d_plan_blocks) {
 
         const std::array<int64_t, 4> w_hwio = {
             c.wshape[2], c.wshape[3], c.wshape[1], c.wshape[0]};
-        const TensorDesc ins[] = {shape_desc(c.ishape, DataType::f32, TensorLayout::NHWC),
+        // Channel-last activation and output dims.
+        const std::array<int64_t, 4> in_cl = {
+            c.ishape[0], c.ishape[2], c.ishape[3], c.ishape[1]};
+        const TensorDesc ins[] = {shape_desc(in_cl, DataType::f32, TensorLayout::NHWC),
                                   shape_desc(w_hwio, DataType::f32, TensorLayout::HWIO)};
         const int64_t OH = c.ishape[2] - c.wshape[2] + 1;
         const int64_t OW = c.ishape[3] - c.wshape[3] + 1;
         const TensorDesc outs[] = {
-            shape_desc({c.ishape[0], c.wshape[0], OH, OW}, DataType::f32, TensorLayout::NHWC)};
+            shape_desc({c.ishape[0], OH, OW, c.wshape[0]}, DataType::f32,
+                       TensorLayout::NHWC)};
 
         const auto plan = get_conv2d_implicit_gemm_plan(attrs, ins, outs, /*num_threads=*/1, false);
 
@@ -1250,19 +1273,19 @@ NNOPS_TEST(conv2d_plan_blocks) {
         Conv2DAttributes attrs;
         attrs.kernel_size = {3, 3};
         const TensorDesc small_ins[] = {
-            shape_desc({1, 128, 16, 16}, DataType::f32, TensorLayout::NHWC),
+            shape_desc({1, 16, 16, 128}, DataType::f32, TensorLayout::NHWC),
             shape_desc({3, 3, 128, 128}, DataType::f32, TensorLayout::HWIO)};
         const TensorDesc small_outs[] = {
-            shape_desc({1, 128, 16, 16}, DataType::f32, TensorLayout::NHWC)};
+            shape_desc({1, 14, 14, 128}, DataType::f32, TensorLayout::NHWC)};
         const auto small = get_conv2d_implicit_gemm_plan(attrs, small_ins, small_outs, 1, false);
         NNOPS_EXPECT_TRUE(small.shared_elems > 0);
         NNOPS_EXPECT_EQ(small.pack_size, int64_t{0});
 
         const TensorDesc big_ins[] = {
-            shape_desc({1, 512, 8, 8}, DataType::f32, TensorLayout::NHWC),
+            shape_desc({1, 8, 8, 512}, DataType::f32, TensorLayout::NHWC),
             shape_desc({3, 3, 512, 512}, DataType::f32, TensorLayout::HWIO)};
         const TensorDesc big_outs[] = {
-            shape_desc({1, 512, 8, 8}, DataType::f32, TensorLayout::NHWC)};
+            shape_desc({1, 6, 6, 512}, DataType::f32, TensorLayout::NHWC)};
         const auto big = get_conv2d_implicit_gemm_plan(attrs, big_ins, big_outs, 1, false);
         NNOPS_EXPECT_EQ(big.shared_elems, int64_t{0});
         NNOPS_EXPECT_TRUE(big.pack_size > 0);
@@ -1342,7 +1365,8 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
     const bool is_u8 = c.act == DataType::u8;
     const bool int_out = c.out == DataType::s8 || c.out == DataType::u8;
     const size_t esz = elem_size(c.act);
-    const int64_t ish[] = {N, IC, IH, IW};
+    const int64_t ish[] = {N, IC, IH, IW};                // NCHW: the reference
+    const int64_t ish_cl[] = {N, IH, IW, IC};             // NHWC: the kernel
     const int64_t wsh[] = {OC, ICG, c.kh, c.kw};          // OIHW: the reference
     const int64_t wsh_cl[] = {c.kh, c.kw, ICG, OC};       // HWIO: the kernel
     const int64_t bsh[] = {OC};
@@ -1432,22 +1456,30 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
 
     std::vector<TensorView> ref_ins = {ref_in, ref_w};
     if (c.bias) { ref_ins.push_back(ref_b); }
-    std::vector<TensorDesc> ref_descs;
-    for (const auto& v : ref_ins) { ref_descs.push_back(v.desc()); }
+    // Shape inference speaks channel-last whatever the storage, so the query
+    // uses the NHWC dims while the reference keeps the dense tensors.
+    TensorDesc in_for_shape = ref_in.desc();
+    in_for_shape.dims = std::span<const int64_t>(ish_cl, 4);
+    in_for_shape.layout = TensorLayout::NHWC;
+    std::vector<TensorDesc> ref_descs = {in_for_shape};
+    for (size_t i = 1; i < ref_ins.size(); ++i) { ref_descs.push_back(ref_ins[i].desc()); }
     const auto od = op->getOutputTensorDesc(ref_descs);
 
-    const int64_t OH = od[0].dims[2], OW = od[0].dims[3];
+    // [N, OH, OW, OC]
+    const int64_t OH = od[0].dims[1], OW = od[0].dims[2];
     const int64_t out_n = od[0].numel();
     const DataType odt = od[0].dtype;
+    // The reference reads and writes dense [N, OC, OH, OW].
+    const int64_t ref_dims[] = {N, OC, OH, OW};
 
     std::vector<uint8_t> ref_buf(od[0].nbytes(), 0);
     {
-        auto ref_out = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), odt,
+        auto ref_out = TensorView(std::span<const int64_t>(ref_dims, 4), odt,
                                   ref_buf.data(), TensorLayout::Dense, qo);
         nnops::backend::cpu::reference::conv2d_int8_ref(attrs, ref_out, ref_ins, ctx, nullptr);
     }
 
-    TensorView op_in(std::span<const int64_t>(ish, 4), c.act,
+    TensorView op_in(std::span<const int64_t>(ish_cl, 4), c.act,
                      act_op.data(), TensorLayout::NHWC, qa);
     TensorView op_w(std::span<const int64_t>(wsh_cl, 4), DataType::s8,
                     w_hwio.data(), TensorLayout::HWIO, qw);
@@ -1555,7 +1587,7 @@ NNOPS_TEST(conv2d_i8_hand_exact) {
     //   input  [1,1,3,3] = 1 2 3 / 4 5 6 / 7 8 9     s8, zp_x = 2,  s_x = 0.25
     //   weight [KH,KW,IC,OC] = [2,2,1,1] = 1 -1 / 2 0    s8, zp_w = 1,  s_w = 0.5
     //   accumulators  -1, -3, -7, -9   →  -0.125, -0.375, -0.875, -1.125
-    const int64_t ishape[] = {1, 1, 3, 3};
+    const int64_t ishape[] = {1, 3, 3, 1};   // [N, H, W, C]
     const int64_t wshape[] = {2, 2, 1, 1};
 
     std::vector<int8_t> in = {1, 2, 3, 4, 5, 6, 7, 8, 9};   // [h][w][c], c == 1
@@ -1577,8 +1609,10 @@ NNOPS_TEST(conv2d_i8_hand_exact) {
     const TensorDesc descs[] = {input.desc(), weight.desc()};
     auto outs = op->getOutputTensorDesc(descs);
     NNOPS_EXPECT_EQ(outs[0].layout, TensorLayout::NHWC);
+    // [N, OH, OW, OC]
+    NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t{2});
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t{2});
-    NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t{2});
+    NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t{1});
 
     std::vector<float> out_buf(4, 0.0f);
     auto out = test::make_channel_first(outs[0], out_buf.data());
@@ -1598,9 +1632,9 @@ NNOPS_TEST(conv2d_i8_mixed_float_refused) {
     // whatever output_dtype says; a view asking for the other float type is
     // refused rather than converted.
     const int64_t IC = 4, IH = 6, OC = 8;
-    const int64_t ishape[] = {1, IC, IH, IH};   // NCHW dims, NHWC layout
+    const int64_t ishape[] = {1, IH, IH, IC};   // [N, H, W, C]
     const int64_t wshape[] = {3, 3, IC, OC};    // HWIO
-    const int64_t oshape[] = {1, OC, IH - 2, IH - 2};
+    const int64_t oshape[] = {1, IH - 2, IH - 2, OC};
 
     std::vector<float> act_f32(static_cast<size_t>(IC) * IH * IH, 0.25f);
     std::vector<half> act_f16(act_f32.size(), float_to_half(0.25f));

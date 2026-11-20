@@ -31,19 +31,25 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-/// Convert a dense view into `target` (NHWC) and return the view; the
-/// caller keeps `buf` alive.
+/// Convert a dense [N, C, spatial...] view into `target` and return the view;
+/// the caller keeps `buf` alive. The returned dims are channel-last —
+/// [N, spatial..., C] — so they match the storage.
 TensorView to_channel_last(const TensorView& channel_first, TensorLayout target,
                            std::vector<float>& buf)
 {
+    const int64_t rank = channel_first.rank();
     const int64_t N = channel_first.shape(0);
     const int64_t C = channel_first.shape(1);
     const int64_t S = channel_first.numel() / (N * C);
     buf = test::to_channel_last(
         std::span<const float>(channel_first.ptr<float>(),
                                static_cast<size_t>(channel_first.numel())), N, C, S);
-    return TensorView(channel_first.shape_span(), channel_first.data_type(),
-                      buf.data(), target);
+    int64_t cl_shape[8] = {};
+    cl_shape[0] = N;
+    for (int64_t d = 2; d < rank; ++d) { cl_shape[d - 1] = channel_first.shape(d); }
+    cl_shape[rank - 1] = C;
+    return TensorView(std::span<const int64_t>(cl_shape, static_cast<size_t>(rank)),
+                      channel_first.data_type(), buf.data(), target);
 }
 
 }  // anonymous namespace
@@ -95,7 +101,10 @@ NNOPS_TEST(flatten_nhwc_to_dense) {
     const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_channel_first, flat_ins);
 
-    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, in_channel_first, 1e-5f, 1e-5f));
+    // Flatten preserves the channel-last logical order, so the dense output
+    // matches the packed channel-last buffer.
+    TensorView expected(in_cl.shape_span(), DataType::f32, cl_buf.data());
+    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, expected, 1e-5f, 1e-5f));
 }
 
 NNOPS_TEST(flatten_full_c) {
@@ -115,7 +124,10 @@ NNOPS_TEST(flatten_full_c) {
     const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_channel_first, flat_ins);
 
-    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, in_channel_first, 1e-5f, 1e-5f));
+    // Flatten preserves the channel-last logical order, so the dense output
+    // matches the packed channel-last buffer.
+    TensorView expected(in_cl.shape_span(), DataType::f32, cl_buf.data());
+    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, expected, 1e-5f, 1e-5f));
 }
 
 NNOPS_TEST(flatten_single_channel) {
@@ -135,7 +147,10 @@ NNOPS_TEST(flatten_single_channel) {
     const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_channel_first, flat_ins);
 
-    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, in_channel_first, 1e-5f, 1e-5f));
+    // Flatten preserves the channel-last logical order, so the dense output
+    // matches the packed channel-last buffer.
+    TensorView expected(in_cl.shape_span(), DataType::f32, cl_buf.data());
+    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, expected, 1e-5f, 1e-5f));
 }
 
 NNOPS_TEST(flatten_ndhwc_to_ncdhw) {
@@ -161,7 +176,10 @@ NNOPS_TEST(flatten_ndhwc_to_ncdhw) {
     const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_channel_first, flat_ins);
 
-    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, in_channel_first, 1e-5f, 1e-5f));
+    // Flatten preserves the channel-last logical order, so the dense output
+    // matches the packed channel-last buffer.
+    TensorView expected(in_cl.shape_span(), DataType::f32, cl_buf.data());
+    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, expected, 1e-5f, 1e-5f));
 }
 
 NNOPS_TEST(flatten_multibatch) {
@@ -181,7 +199,10 @@ NNOPS_TEST(flatten_multibatch) {
     const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_channel_first, flat_ins);
 
-    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, in_channel_first, 1e-5f, 1e-5f));
+    // Flatten preserves the channel-last logical order, so the dense output
+    // matches the packed channel-last buffer.
+    TensorView expected(in_cl.shape_span(), DataType::f32, cl_buf.data());
+    NNOPS_EXPECT_TRUE(test::allclose(out_channel_first, expected, 1e-5f, 1e-5f));
 }
 
 NNOPS_TEST(flatten_simd_vs_ref) {

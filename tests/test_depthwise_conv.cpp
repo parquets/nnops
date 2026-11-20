@@ -23,6 +23,7 @@
 #include "common/channel_last.hpp"
 
 #include <vector>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -85,6 +86,40 @@ static int64_t dw_spatial_elems(const Shape& shape)
     return s;
 }
 
+/// Dense [N, C, spatial...] desc for a channel-last [N, spatial..., C] output —
+/// the order the references read and write.
+static TensorDesc dense_from_cl(const TensorDesc& cl, int64_t N, int64_t C)
+{
+    TensorDesc d;
+    d.rank = cl.rank;
+    d.dtype = cl.dtype;
+    d.layout = TensorLayout::Dense;
+    d.dims.push_back(N);
+    d.dims.push_back(C);
+    for (int64_t i = 1; i + 1 < cl.rank; ++i) { d.dims.push_back(cl.dims[i]); }
+    return d;
+}
+
+/// Channel-last [N, spatial..., C] dims for a dense [N, C, spatial...] shape.
+static void cl_dims_from(const std::vector<int64_t>& dense, int64_t* out)
+{
+    const int64_t rank = static_cast<int64_t>(dense.size());
+    out[0] = dense[0];
+    for (int64_t d = 2; d < rank; ++d) { out[d - 1] = dense[d]; }
+    out[rank - 1] = dense[1];
+}
+
+/// A dense [N, C, spatial...] desc re-expressed channel-last, for shape queries.
+static TensorDesc cl_desc_of(const TensorDesc& dense, const std::vector<int64_t>& dense_shape)
+{
+    TensorDesc d = dense;
+    int64_t dims[8] = {};
+    cl_dims_from(dense_shape, dims);
+    d.dims = std::span<const int64_t>(dims, dense_shape.size());
+    d.layout = (dense_shape.size() == 5) ? TensorLayout::NDHWC : TensorLayout::NHWC;
+    return d;
+}
+
 template <typename T>
 static void test_vs_ref(const std::vector<int64_t>& in_shape,
                              const std::vector<int64_t>& w_shape,
@@ -127,10 +162,12 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     auto op = DepthwiseConv::create(attrs, Backend::CPU);
 
     // ---- Reference, in dense order ----------------------------------------------
-    const TensorDesc ref_in[] = {in_channel_first.desc(), w_channel_first.desc(), b_channel_first.desc()};
+    const TensorDesc ref_in[] = {cl_desc_of(in_channel_first.desc(), in_shape),
+                                 w_channel_first.desc(), b_channel_first.desc()};
     auto ref_descs = op->getOutputTensorDesc(
         std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
-    const int64_t outS  = dw_spatial_elems(ref_descs[0].dims);
+    const TensorDesc ref_desc = dense_from_cl(ref_descs[0], N, C);
+    const int64_t outS  = ref_desc.numel() / (N * C);
     const int64_t out_n = N * C * outS;
 
     const auto residual_at = [](int64_t i) {
@@ -140,7 +177,7 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     for (int64_t i = 0; attrs.add_to && i < out_n; ++i) {
         ref_buf[static_cast<size_t>(i)] = residual_at(i);
     }
-    auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    auto ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         const TensorView r[] = {in_channel_first, w_channel_first, b_channel_first};
@@ -156,7 +193,10 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     for (size_t i = 0; i < in_cl.size(); ++i) { in_cl[i] = to_T(in_cl_f[i]); }
     for (size_t i = 0; i < w_cl.size(); ++i)  { w_cl[i]  = to_T(w_cl_f[i]); }
 
-    TensorView in_v(std::span<const int64_t>(in_shape), dt, in_cl.data(), cl);
+    int64_t in_shape_cl[8] = {};
+    cl_dims_from(in_shape, in_shape_cl);
+    TensorView in_v(std::span<const int64_t>(in_shape_cl, in_shape.size()), dt,
+                    in_cl.data(), cl);
     const int64_t KD = (srank == 3) ? w_shape[2] : 1;
     const int64_t KH = w_shape[w_shape.size() - 2];
     const int64_t KW = w_shape.back();
@@ -399,10 +439,12 @@ static void dwconv_q_test(const std::vector<int64_t>& in_shape,
     auto op = DepthwiseConv::create(attrs, Backend::CPU);
 
     // ---- Reference, in dense order ----------------------------------------------
-    const TensorDesc ref_in[] = {in_channel_first.desc(), w_channel_first.desc(), b_channel_first.desc()};
+    const TensorDesc ref_in[] = {cl_desc_of(in_channel_first.desc(), in_shape),
+                                 w_channel_first.desc(), b_channel_first.desc()};
     auto ref_descs = op->getOutputTensorDesc(
         std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
-    const int64_t outS = dw_spatial_elems(ref_descs[0].dims);
+    const TensorDesc ref_dense = dense_from_cl(ref_descs[0], N, C);
+    const int64_t outS = ref_dense.numel() / (N * C);
     std::vector<OutT> ref_buf(static_cast<size_t>(N * C * outS));
     // A signed shortcut in the output's domain, so the pre- and post-epilogue
     // orders give different answers under a clamp or a ReLU.
@@ -413,8 +455,9 @@ static void dwconv_q_test(const std::vector<int64_t>& in_shape,
     for (int64_t i = 0; attrs.add_to && i < N * C * outS; ++i) {
         ref_buf[static_cast<size_t>(i)] = residual_at(i);
     }
-    TensorView ref_out(std::span<const int64_t>(ref_descs[0].dims), out_dt,
-                       ref_buf.data(), TensorLayout::Dense, out_qp);
+    TensorView ref_out(std::span<const int64_t>(ref_dense.dims.data(),
+                                                static_cast<size_t>(ref_dense.rank)),
+                       out_dt, ref_buf.data(), TensorLayout::Dense, out_qp);
     {
         ComputeContext ctx;
         const TensorView r[] = {in_channel_first, w_channel_first, b_channel_first};
@@ -427,8 +470,10 @@ static void dwconv_q_test(const std::vector<int64_t>& in_shape,
     auto in_cl = test::to_channel_last<InT>(in_data, N, C, inS);
     auto w_cl  = test::depthwise_to_hwcm<InT>(w_data, C, taps);
 
-    TensorView in_v(std::span<const int64_t>(in_shape), in_dt, in_cl.data(), cl,
-                    in_qp);
+    int64_t in_shape_cl[8] = {};
+    cl_dims_from(in_shape, in_shape_cl);
+    TensorView in_v(std::span<const int64_t>(in_shape_cl, in_shape.size()), in_dt,
+                    in_cl.data(), cl, in_qp);
     const int64_t KD = (srank == 3) ? w_shape[2] : 1;
     const int64_t KH = w_shape[w_shape.size() - 2];
     const int64_t KW = w_shape.back();
@@ -563,9 +608,11 @@ static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
 
     // ---- The reference: the depthwise operator's own shape rule and kernel ---
     auto dw_op = DepthwiseConv::create(dw, Backend::CPU);
-    const TensorDesc ref_in[] = {in_cf.desc(), w_cf.desc(), b_cf.desc()};
+    const TensorDesc ref_in[] = {cl_desc_of(in_cf.desc(), in_shape), w_cf.desc(),
+                                 b_cf.desc()};
     auto ref_descs = dw_op->getOutputTensorDesc(
         std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
+    const TensorDesc ref_desc = dense_from_cl(ref_descs[0], N, C);
     const int64_t out_n = ref_descs[0].numel();
 
     const auto residual_at = [](int64_t i) {
@@ -575,7 +622,7 @@ static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
     for (int64_t i = 0; dw.add_to && i < out_n; ++i) {
         ref_buf[static_cast<size_t>(i)] = residual_at(i);
     }
-    auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    auto ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         const TensorView r[] = {in_cf, w_cf, b_cf};
@@ -606,9 +653,8 @@ static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
     auto in_cl = test::to_channel_last<float>(in_vec, N, C, S);
     auto w_cl  = test::depthwise_to_hwcm<float>(w_vec, C, taps);
 
-    // A tensor's dims stay logical [N, C, H, W]; the layout tag is what
-    // says the storage is pixel-major.
-    const int64_t in_cl_shape[] = {N, C, H, W};
+    // The dims are channel-last: [N, H, W, C].
+    const int64_t in_cl_shape[] = {N, H, W, C};
     TensorView in_v(in_cl_shape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
     const int64_t w_cl_shape[] = {KH, KW, 1, C};
     TensorView w_v(w_cl_shape, DataType::f32, w_cl.data(), TensorLayout::HWIO);
@@ -626,6 +672,8 @@ static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
     out_buf = test::to_channel_first<float>(
         out_buf, N, C, out_descs[0].numel() / (N * C));
 
+    for (int64_t i = 0; i < out_n; ++i) {
+    }
     for (int64_t i = 0; i < out_n; ++i) {
         NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(i)],
                           ref_buf[static_cast<size_t>(i)], 1e-4f);

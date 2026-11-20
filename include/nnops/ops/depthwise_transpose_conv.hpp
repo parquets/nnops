@@ -4,14 +4,14 @@
 ///        backward of DepthwiseConv, on an NHWC/NDHWC tensor.
 ///
 /// One filter per channel and no cross-channel mixing, so the output has the
-/// input's channel count. The input is [N, C, IH, IW] stored NHWC; the weight
-/// is [KH][KW][C] (TensorLayout::HWCM) — TensorFlow's depthwise order with the
+/// input's channel count. The input is [N, IH, IW, C] (channel-last); the
+/// weight is [KH][KW][C] (TensorLayout::HWCM) — TensorFlow's depthwise order with the
 /// multiplier dropped, so every tap is a run of C contiguous channels and the
 /// channel lane reads it as one vector. The [C, 1, KH, KW] form is accepted too,
 /// for the grouped TransposeConv2D that hands its filter over unconverted; the
 /// entry repacks it.
 ///
-/// Bias [C] is optional. The output is [N, C, OH, OW] with
+/// Bias [C] is optional. The output is [N, OH, OW, C] with
 /// OH = (IH - 1)·SH - 2·PH + DH·(KH - 1) + OP_h + 1, and likewise for W.
 ///
 /// Data types: f32/f16 on every operand. A weight of s8 selects the quantized

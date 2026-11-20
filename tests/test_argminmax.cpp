@@ -321,9 +321,9 @@ NNOPS_TEST(argmax_pitched_row) {
     }
 }
 
-/// NHWC memory: (n, h, w, c) with the channel innermost, reduced over
-/// the channel — the dims after the axis are interleaved, so the flat inner
-/// index has to be decoded, not added.
+/// Channel-last memory: dims are (n, h, w, c) with the channel innermost,
+/// reduced over the channel — nothing follows the axis, so the remaining dims
+/// are a plain dense walk.
 NNOPS_TEST(argmax_nhwc) {
     constexpr int64_t N = 2, C = 4, H = 3, W = 5;
 
@@ -336,12 +336,12 @@ NNOPS_TEST(argmax_nhwc) {
         return storage[((n * H + h) * W + w) * C + c];
     };
 
-    const int64_t shape[] = {N, C, H, W};
+    const int64_t shape[] = {N, H, W, C};
     TensorView in(shape, DataType::f32, storage.data(), TensorLayout::NHWC);
 
     ArgMinMaxAttributes attrs;
     attrs.type = ArgMinMaxType::Max;
-    attrs.axis = 1;
+    attrs.axis = 3;  // the channel is the last axis
     auto op = ArgMax::create(attrs, Backend::CPU);
     const TensorDesc d_in = in.desc();
     const TensorDesc desc_arr[] = {d_in};

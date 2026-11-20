@@ -94,12 +94,12 @@ Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
     // outermost, and the entry repacks it — the fp kernels only, since the
     // int8 route reads the per-channel scales off that filter in place.
     if (weight.layout == TensorLayout::HWCM && weight.rank == 3) {
-        return detail::require(weight.dims[2] == in.dims[1]);
+        return detail::require(weight.dims[2] == in.dims[in.rank - 1]);
     }
     NNOPS_TRY(detail::require(!is_quantized_depthwise_transpose_conv2d(weight.dtype),
                               Status::unsupported));
     NNOPS_TRY(detail::require(weight.rank == 4, Status::unsupported));
-    return detail::require(weight.dims[1] == 1 && weight.dims[0] == in.dims[1]);
+    return detail::require(weight.dims[1] == 1 && weight.dims[0] == in.dims[in.rank - 1]);
 }
 
 Status DepthwiseTransposeConv2D::compute(std::span<TensorView> outputs,

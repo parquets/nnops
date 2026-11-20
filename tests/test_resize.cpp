@@ -29,6 +29,17 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
+/// Dense [N, C, spatial...] dims → channel-last [N, spatial..., C].
+std::vector<int64_t> to_cl_shape(const std::vector<int64_t>& dense)
+{
+    const size_t rank = dense.size();
+    std::vector<int64_t> cl(rank);
+    cl[0] = dense[0];
+    for (size_t d = 2; d < rank; ++d) { cl[d - 1] = dense[d]; }
+    cl[rank - 1] = dense[1];
+    return cl;
+}
+
 /// 2D+3D roundtrip: convert -> resize -> convert back -> compare with the
 /// reference.
 void test_nhwc_vs_dense(const std::vector<int64_t>& in_shape,
@@ -82,14 +93,15 @@ void test_nhwc_vs_dense(const std::vector<int64_t>& in_shape,
             std::span<const float>(in_channel_first.ptr<float>(),
                                    static_cast<size_t>(in_channel_first.numel())),
             N, C, in_S);
-        TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(),
-                         cl_layout);
+        const std::vector<int64_t> in_cl_shape = to_cl_shape(in_shape);
+        TensorView in_cl(std::span<const int64_t>(in_cl_shape.data(), in_cl_shape.size()),
+                         DataType::f32, cl_buf.data(), cl_layout);
 
         NNOPS_EXPECT_EQ(in_cl.rank(), rank);
         NNOPS_EXPECT_EQ(in_cl.layout(), cl_layout);
         NNOPS_EXPECT_EQ(in_cl.data_type(), DataType::f32);
         NNOPS_EXPECT_EQ(in_cl.shape(0), in_shape[0]);
-        NNOPS_EXPECT_EQ(in_cl.shape(1), in_shape[1]);
+        NNOPS_EXPECT_EQ(in_cl.shape(rank - 1), in_shape[1]);   // C is last
 
         auto resize_op = Resize::create(attrs, Backend::CPU);
         auto pd = in_cl.desc();
@@ -100,14 +112,14 @@ void test_nhwc_vs_dense(const std::vector<int64_t>& in_shape,
         NNOPS_EXPECT_EQ(resize_descs[0].layout, cl_layout);
         NNOPS_EXPECT_EQ(resize_descs[0].dtype, DataType::f32);
         NNOPS_EXPECT_EQ(resize_descs[0].dims[0], in_shape[0]);  // N unchanged
-        NNOPS_EXPECT_EQ(resize_descs[0].dims[1], in_shape[1]);  // C unchanged
+        NNOPS_EXPECT_EQ(resize_descs[0].dims[rank - 1], in_shape[1]);  // C unchanged
         if (srank == 3) {
-            NNOPS_EXPECT_EQ(resize_descs[0].dims[2], attrs.output_size[0]);
-            NNOPS_EXPECT_EQ(resize_descs[0].dims[3], attrs.output_size[1]);
-            NNOPS_EXPECT_EQ(resize_descs[0].dims[4], attrs.output_size[2]);
-        } else {
+            NNOPS_EXPECT_EQ(resize_descs[0].dims[1], attrs.output_size[0]);
             NNOPS_EXPECT_EQ(resize_descs[0].dims[2], attrs.output_size[1]);
             NNOPS_EXPECT_EQ(resize_descs[0].dims[3], attrs.output_size[2]);
+        } else {
+            NNOPS_EXPECT_EQ(resize_descs[0].dims[1], attrs.output_size[1]);
+            NNOPS_EXPECT_EQ(resize_descs[0].dims[2], attrs.output_size[2]);
         }
 
         std::vector<float> resize_buf(static_cast<size_t>(resize_descs[0].numel()));
@@ -121,13 +133,20 @@ void test_nhwc_vs_dense(const std::vector<int64_t>& in_shape,
         resize_op->compute(out_cl, resize_ins);
 
         const int64_t out_N = out_cl.shape(0);
-        const int64_t out_C = out_cl.shape(1);
+        const int64_t out_C = out_cl.shape(rank - 1);
         const int64_t out_S = out_cl.numel() / (out_N * out_C);
         std::vector<float> res_buf = test::to_channel_first(
             std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
             out_N, out_C, out_S);
-        TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
-                                     channel_first_layout);
+        // The converted buffer is dense [N, C, spatial...].
+        std::vector<int64_t> res_dims(static_cast<size_t>(rank));
+        res_dims[0] = out_N;
+        res_dims[1] = out_C;
+        for (int64_t d = 1; d + 1 < rank; ++d) {
+            res_dims[static_cast<size_t>(d + 1)] = out_cl.shape(d);
+        }
+        TensorView res_channel_first(std::span<const int64_t>(res_dims.data(), res_dims.size()),
+                                     DataType::f32, res_buf.data(), channel_first_layout);
 
         const float tol = (attrs.mode == ResizeMode::Nearest) ? 1e-4f : 1e-3f;
         NNOPS_EXPECT_TRUE(test::allclose(res_channel_first, out_ref, tol, tol));
@@ -159,7 +178,9 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
         std::span<const float>(in_channel_first.ptr<float>(),
                                static_cast<size_t>(in_channel_first.numel())),
         N, C, in_S);
-    TensorView in_cl(in_channel_first.shape_span(), DataType::f32, cl_buf.data(), cl_layout);
+    const std::vector<int64_t> in_cl_shape = to_cl_shape(in_shape);
+    TensorView in_cl(std::span<const int64_t>(in_cl_shape.data(), in_cl_shape.size()),
+                     DataType::f32, cl_buf.data(), cl_layout);
 
     NNOPS_EXPECT_EQ(in_cl.rank(), rank);
     NNOPS_EXPECT_EQ(in_cl.layout(), cl_layout);
@@ -182,13 +203,20 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
     resize_op->compute(out_cl, resize_ins);
 
     const int64_t out_N = out_cl.shape(0);
-    const int64_t out_C = out_cl.shape(1);
+    const int64_t out_C = out_cl.shape(rank - 1);
     const int64_t out_S = out_cl.numel() / (out_N * out_C);
     std::vector<float> res_buf = test::to_channel_first(
         std::span<const float>(out_cl.ptr<float>(), static_cast<size_t>(out_cl.numel())),
         out_N, out_C, out_S);
-    TensorView res_channel_first(out_cl.shape_span(), DataType::f32, res_buf.data(),
-                                 channel_first_layout);
+    // The converted buffer is dense [N, C, spatial...].
+    std::vector<int64_t> res_dims(static_cast<size_t>(rank));
+    res_dims[0] = out_N;
+    res_dims[1] = out_C;
+    for (int64_t d = 1; d + 1 < rank; ++d) {
+        res_dims[static_cast<size_t>(d + 1)] = out_cl.shape(d);
+    }
+    TensorView res_channel_first(std::span<const int64_t>(res_dims.data(), res_dims.size()),
+                                 DataType::f32, res_buf.data(), channel_first_layout);
 
     validate_fn(res_channel_first);
 }

@@ -8,8 +8,8 @@
 /// granularity is supported.
 ///
 /// Every type but PRelu takes one input. PRelu takes the activation first and
-/// the slope second: a [C] vector (channel is logical dim 1, in either layout)
-/// or a [1] scalar shared by every channel. PRelu is float-only.
+/// the slope second: a [C] vector (the channel is the last logical axis) or a
+/// [1] scalar shared by every channel. PRelu is float-only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

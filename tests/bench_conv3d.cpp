@@ -25,6 +25,7 @@
 #include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"
 #include "common/test_helpers.hpp"
+#include "common/channel_last.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -155,26 +156,42 @@ void run_one(const Case& c, int nt, int rounds)
     auto [in_vec, in_view] = test::make_random_tensor(c.in_shape);
     auto [w_vec, w_view] = test::make_random_tensor(c.w_shape);
 
+    // The operator reads a channel-last [N, ID, IH, IW, IC] activation; the
+    // scalar reference keeps the dense [N, IC, ID, IH, IW] one.
+    const int64_t S_in = c.in_shape[2] * c.in_shape[3] * c.in_shape[4];
+    const auto in_cl_vec = test::to_channel_last<float>(in_vec, N, c.in_shape[1], S_in);
+    const int64_t in_cl_dims[] = {c.in_shape[0], c.in_shape[2], c.in_shape[3],
+                                  c.in_shape[4], c.in_shape[1]};
+    TensorView in_cl(std::span<const int64_t>(in_cl_dims, 5), DataType::f32,
+                     const_cast<float*>(in_cl_vec.data()), TensorLayout::NDHWC);
+
     auto op = Conv3D::create(c.attrs, Backend::CPU);
-    const TensorDesc d[] = {in_view.desc(), w_view.desc()};
+    const TensorDesc d[] = {in_cl.desc(), w_view.desc()};
     const auto descs = op->getOutputTensorDesc(d);
     const auto numel = static_cast<size_t>(descs[0].numel());
 
+    // Channel-last output for the operator, dense for the reference.
+    const int64_t ref_dims[] = {c.in_shape[0], c.w_shape[0], descs[0].dims[1],
+                                descs[0].dims[2], descs[0].dims[3]};
     std::vector<float> out_buf(numel, 0.0f);
     auto out = test::make_channel_first(descs[0], out_buf.data());
+    std::vector<float> ref_buf(numel, 0.0f);
+    TensorView ref_out(std::span<const int64_t>(ref_dims, 5), DataType::f32,
+                       ref_buf.data(), TensorLayout::Dense);
 
     BenchPool pool(nt);
     ComputeContext ctx;
     ctx.cpu = pool.cpu;
     const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
-    const TensorView ins[] = {in_view, w_view};
+    const TensorView ins[] = {in_cl, w_view};
     TensorView outs[] = {out};
 
     auto arm_op = [&]() { op->compute(outs, ins, use_ctx); };
     auto arm_ref = [&]() {
-        backend::cpu::reference::conv3d_channel_first_ref(c.attrs, out, ins, use_ctx,
-                                                          nullptr);
+        const TensorView ref_ins[] = {in_view, w_view};
+        backend::cpu::reference::conv3d_channel_first_ref(c.attrs, ref_out, ref_ins,
+                                                          use_ctx, nullptr);
     };
 
     // The operator arm is sub-millisecond on the smaller rows, where a single
@@ -199,9 +216,9 @@ void run_one(const Case& c, int nt, int rounds)
     const double ref_t = median_of(ref_ms);
     const double null_pct_med = median_of(null_pct);
 
-    const int64_t OD = descs[0].dims[2];
-    const int64_t OH = descs[0].dims[3];
-    const int64_t OW = descs[0].dims[4];
+    const int64_t OD = descs[0].dims[1];
+    const int64_t OH = descs[0].dims[2];
+    const int64_t OW = descs[0].dims[3];
     const double flops = 2.0 * static_cast<double>(N) * static_cast<double>(OC) *
                          static_cast<double>(IC_per_G) *
                          static_cast<double>(OD * OH * OW) *

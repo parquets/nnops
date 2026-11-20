@@ -79,8 +79,11 @@ struct TensorDesc {
         if (rank < 2) {
             return static_cast<int64_t>(data_type_stride_unit(dtype));
         }
-        const int64_t row_elems = is_channel_last(layout)
-            ? dims[1] * dims[static_cast<size_t>(rank - 1)]
+        // A rank-2 tensor has one pixel per row either way, so the channel-last
+        // row is W*C only from rank 3 up.
+        const int64_t row_elems = (is_channel_last(layout) && rank >= 3)
+            ? dims[static_cast<size_t>(rank - 2)] *
+                  dims[static_cast<size_t>(rank - 1)]
             : dims[static_cast<size_t>(rank - 1)];
         const int64_t row_bytes =
             static_cast<int64_t>(data_type_row_bytes(dtype, row_elems));
@@ -93,15 +96,26 @@ struct TensorDesc {
             return nbytes();
         }
         const int64_t aligned_row = row_pitch(alignment);
-        int64_t rows = dims[0];
-        // dims[1] merges into the row pitch only where it is a channel axis of
-        // its own; at rank 2 it *is* the last dim, which row_pitch already
-        // covers, so counting it here sizes the tensor by another factor of W.
-        if (!is_channel_last(layout) && rank > 2) {
-            rows *= dims[1];
-        }
-        for (int64_t d = 2; d < rank - 1; ++d) {
-            rows *= dims[static_cast<size_t>(d)];
+        int64_t rows = 1;
+        if (is_channel_last(layout)) {
+            // [N][spatial…][W][C]: a row is one spatial line, so every axis
+            // outside the two innermost multiplies the row count. At rank 2
+            // there is no W axis: one row is one [N][C] pixel block.
+            const int64_t outer = (rank >= 3) ? rank - 2 : 1;
+            for (int64_t d = 0; d < outer; ++d) {
+                rows *= dims[static_cast<size_t>(d)];
+            }
+        } else {
+            // dims[1] merges into the row pitch only where it is a channel axis
+            // of its own; at rank 2 it *is* the last dim, which row_pitch already
+            // covers, so counting it here sizes the tensor by another factor of W.
+            rows = dims[0];
+            if (rank > 2) {
+                rows *= dims[1];
+            }
+            for (int64_t d = 2; d < rank - 1; ++d) {
+                rows *= dims[static_cast<size_t>(d)];
+            }
         }
         return static_cast<size_t>(rows * aligned_row);
     }
@@ -125,9 +139,11 @@ public:
         rank_ = static_cast<int64_t>(shape.size());
         shape_ = shape;
         if (rank_ >= 2) {
-            const int64_t row_elems = is_channel_last(layout)
-                ? shape_[1] * shape_[static_cast<size_t>(rank_ - 1)]
-                : shape_[static_cast<size_t>(rank_ - 1)];
+            const int64_t row_elems =
+                (is_channel_last(layout) && rank_ >= 3)
+                    ? shape_[static_cast<size_t>(rank_ - 2)] *
+                          shape_[static_cast<size_t>(rank_ - 1)]
+                    : shape_[static_cast<size_t>(rank_ - 1)];
             pitch_ = static_cast<int64_t>(data_type_row_bytes(dtype, row_elems));
         } else if (rank_ == 1) {
             pitch_ = static_cast<int64_t>(data_type_stride_unit(dtype));
@@ -147,8 +163,9 @@ public:
         rank_ = static_cast<int64_t>(shape.size());
         shape_ = shape;
         if (rank_ >= 2) {
-            const int64_t row_elems = is_channel_last(layout)
-                ? shape_[1] * shape_[static_cast<size_t>(rank_ - 1)]
+            const int64_t row_elems = (is_channel_last(layout) && rank_ >= 3)
+                ? shape_[static_cast<size_t>(rank_ - 2)] *
+                      shape_[static_cast<size_t>(rank_ - 1)]
                 : shape_[static_cast<size_t>(rank_ - 1)];
             const int64_t min_pitch =
                 static_cast<int64_t>(data_type_row_bytes(dtype, row_elems));
@@ -248,17 +265,16 @@ public:
     /// pitch, so it may exceed shape[rank-1].
     int64_t stride_elems(int64_t dim) const noexcept {
         NNOPS_ASSERT(dim >= 0 && dim < rank_);
-        // A spatial layout stores [N][spatial…][C]: C (dim 1) is the innermost
-        // axis, a spatial step moves a whole C block. A step in H is one row
-        // pitch, so a pitched view's outer strides account for the padding.
+        // A channel-last layout's dims *are* its memory order: [N][spatial…][C].
+        // C is innermost, a spatial step inside a row moves a whole C block, and
+        // the outermost spatial axis is one row pitch (which a pitched view may
+        // pad), so everything outside it steps by whole rows.
         if (is_channel_last(layout_)) {
-            if (dim == 1) { return 1; }
-            if (dim == rank_ - 1) { return shape_[1]; }
+            if (dim == rank_ - 1) { return 1; }
+            if (dim == rank_ - 2) { return shape_[static_cast<size_t>(rank_ - 1)]; }
             int64_t s = row_stride_elems();
-            for (int64_t i = rank_ - 2; i > dim; --i) {
-                // C is already inside the row; multiplying by it again would
-                // size a batch step by another factor of C.
-                if (i != 1) { s *= shape_[static_cast<size_t>(i)]; }
+            for (int64_t i = rank_ - 3; i > dim; --i) {
+                s *= shape_[static_cast<size_t>(i)];
             }
             return s;
         }
@@ -291,13 +307,15 @@ public:
         if (rank_ < 2) {
             return 1;
         }
+        // A channel-last tensor keeps all of C inside every pixel: one block.
+        // Any other order keeps each channel as its own block.
         return is_channel_last(layout_) ? 1 : shape_[1];
     }
 
     /// Element stride between channel blocks: row_stride_elems() × inner
-    /// spatial dims.
+    /// spatial dims (a channel-last tensor has one block, so the row stride).
     int64_t channel_block_stride_elems() const noexcept {
-        if (rank_ < 3) {
+        if (rank_ < 3 || is_channel_last(layout_)) {
             return row_stride_elems();
         }
         int64_t s = row_stride_elems();
@@ -314,8 +332,12 @@ public:
             return 0;
         }
         if (is_channel_last(layout_)) {
-            int64_t rows = shape_[0];
-            for (int64_t d = 2; d < rank_ - 1; ++d) {
+            // [N][spatial…][W][C]: a row is one spatial line, so everything
+            // outside the two innermost axes multiplies the count. A rank-2
+            // tensor has no W axis: one row is one [N][C] pixel block.
+            const int64_t outer = (rank_ >= 3) ? rank_ - 2 : 1;
+            int64_t rows = 1;
+            for (int64_t d = 0; d < outer; ++d) {
                 rows *= shape_[static_cast<size_t>(d)];
             }
             return rows;

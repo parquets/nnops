@@ -147,7 +147,10 @@ void run_one(const Case& c, int nt, int rounds)
     const int64_t IC = c.in_shape[1];
     const int64_t S_in = c.in_shape[2] * c.in_shape[3] * c.in_shape[4];
     const auto in_cl = test::to_channel_last<float>(in_vec, N, IC, S_in);
-    TensorView in_cl_view(c.in_shape, DataType::f32,
+    // Channel-last dims: [N, ID, IH, IW, IC].
+    const int64_t in_cl_dims[] = {c.in_shape[0], c.in_shape[2], c.in_shape[3],
+                                  c.in_shape[4], c.in_shape[1]};
+    TensorView in_cl_view(std::span<const int64_t>(in_cl_dims, 5), DataType::f32,
                           const_cast<float*>(in_cl.data()), TensorLayout::NDHWC);
 
     auto op = TransposeConv3D::create(c.attrs, Backend::CPU);

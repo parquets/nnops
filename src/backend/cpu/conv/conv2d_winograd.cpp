@@ -153,21 +153,21 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
     const auto& u_tensor = inputs[1]; // prepacked transform-domain weight
     const bool has_bias = inputs.size() > 2;
 
-    // Shape is the logical [N, C, H, W]; NHWC is the physical order, so the
+    // Shape is channel-last [N, H, W, C] — the physical order too — so the
     // memory steps come from the view's strides, not from the shape product
     // (a row may be pitch-padded).
-    const int64_t logical_h = input.shape(2);
-    const int64_t logical_w = input.shape(3);
-    const int64_t logical_c = input.shape(1);
-    const int64_t in_w_stride = input.stride_elems(3);
-    const int64_t in_h_stride = input.stride_elems(2);
+    const int64_t logical_h = input.shape(1);
+    const int64_t logical_w = input.shape(2);
+    const int64_t logical_c = input.shape(3);
+    const int64_t in_w_stride = input.stride_elems(2);
+    const int64_t in_h_stride = input.stride_elems(1);
     const int64_t in_n_stride = input.stride_elems(0);
 
-    const int64_t logical_oc = output.shape(1);
-    const int64_t logical_oh = output.shape(2);
-    const int64_t logical_ow = output.shape(3);
-    const int64_t out_w_stride = output.stride_elems(3);
-    const int64_t out_h_stride = output.stride_elems(2);
+    const int64_t logical_oc = output.shape(3);
+    const int64_t logical_oh = output.shape(1);
+    const int64_t logical_ow = output.shape(2);
+    const int64_t out_w_stride = output.stride_elems(2);
+    const int64_t out_h_stride = output.stride_elems(1);
     const int64_t out_n_stride = output.stride_elems(0);
 
     const int64_t G = attrs.groups;
@@ -393,8 +393,8 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const Tens
         return plan;
     }
 
-    const int64_t IC = in.dims[1];
-    const int64_t OC = out.dims[1];
+    const int64_t IC = in.dims[3];
+    const int64_t OC = out.dims[3];
     const int64_t G = attrs.groups;
     if (G < 1 || IC % G != 0 || OC % G != 0) {
         return plan;
@@ -417,8 +417,8 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const Tens
     plan.u = ug;
     plan.order = order;
 
-    const int64_t OH = out.dims[2];
-    const int64_t OW = out.dims[3];
+    const int64_t OH = out.dims[1];
+    const int64_t OW = out.dims[2];
     if (OH <= 0 || OW <= 0) {
         return plan;
     }

@@ -27,15 +27,15 @@ void grid_sample_impl(const GridSampleAttributes& attrs, TensorView& output,
     const int64_t srank = GridSampleAttributes::spatial_rank(irank);
 
     const int64_t N = input.shape(0);
-    const int64_t C = input.shape(1);
+    const int64_t C = input.shape(input.rank() - 1);
 
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
+    const int64_t ID = (srank == 3) ? input.shape(1) : 1;
+    const int64_t IH = input.shape(srank - 1);
+    const int64_t IW = input.shape(srank);
 
-    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH = output.shape(srank);
-    const int64_t OW = output.shape(srank + 1);
+    const int64_t OD = (srank == 3) ? output.shape(1) : 1;
+    const int64_t OH = output.shape(srank - 1);
+    const int64_t OW = output.shape(srank);
 
     if (N == 0 || C == 0 || OD == 0 || OH == 0 || OW == 0) {
         return;

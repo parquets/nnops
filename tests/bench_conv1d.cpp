@@ -272,7 +272,7 @@ template <class T>
 struct Conv1DPair {
     explicit Conv1DPair(const ConvShape& c) : s(c) {
         const int64_t icg = c.IC / c.G;
-        const int64_t ish[] = {c.N, c.IC, c.L};
+        const int64_t ish[] = {c.N, c.L, c.IC};  // channel-last
         constexpr DataType dt = dtype_of<T>();
 
         in_buf = random_vec<T>(std::span<const int64_t>(ish, 3), 1);
@@ -305,7 +305,7 @@ struct Conv1DPair {
 
         const TensorDesc d1[] = {in.desc(), w.desc(), b.desc()};
         const auto od = op1d->getOutputTensorDesc(d1);
-        OL = od[0].dims[2];
+        OL = od[0].dims[1];
         out_buf.assign(static_cast<size_t>(od[0].numel()), T{});
         out = TensorView(od[0].dims, dt, out_buf.data(), TensorLayout::NHWC);
         ins1d = {in, w, b};
@@ -384,7 +384,7 @@ struct I8Conv1DPair {
         w_layout = TensorLayout::HWIO;
         b_buf = random_vec<float>(std::span<const int64_t>(&c.OC, 1), 3, 0.05f);
 
-        const int64_t ish[] = {c.N, c.IC, c.L};
+        const int64_t ish[] = {c.N, c.L, c.IC};  // channel-last
         const QuantParams qa = q_per_tensor(s_x, zp_x);
         const QuantParams qw = q_per_channel(w_s.data(), w_zp.data(), c.OC);
 
@@ -406,7 +406,7 @@ struct I8Conv1DPair {
 
         const TensorDesc d1[] = {in.desc(), w.desc(), b.desc()};
         const auto od = op1d->getOutputTensorDesc(d1);
-        OL = od[0].dims[2];
+        OL = od[0].dims[1];
         out_buf.assign(static_cast<size_t>(od[0].numel()), 0.0f);
         out = TensorView(od[0].dims, DataType::f32, out_buf.data(),
                          TensorLayout::NHWC);

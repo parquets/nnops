@@ -27,9 +27,10 @@ std::vector<TensorDesc> Pool1D::getOutputTensorDesc(std::span<const TensorDesc> 
         out.layout = in.layout;
         out.dtype = in.dtype;
         out.dims.resize(3);
+        // Channel-last [N, L, C]: the length is axis 1, the channel axis last.
         out.dims[0] = in.dims[0];
-        out.dims[1] = in.dims[1];
-        out.dims[2] = attrs_.global ? 1 : attrs_.output_size;
+        out.dims[1] = attrs_.global ? 1 : attrs_.output_size;
+        out.dims[2] = in.dims[2];
         return {out};
     }
     return {pool1d_output_shape(attrs_.kernel_shape, attrs_.stride, attrs_.dilation, attrs_.padding,

@@ -43,13 +43,15 @@ bool axis_is_innermost(const TensorView& x, int64_t axis, int64_t& unit_stride)
         unit_stride = 1;
         return true;
     }
-    if (axis == 1) {
-        unit_stride = x.shape(1);
+    // A channel-last tensor's innermost axis is C, so a softmax over the last
+    // dimension walks a contiguous run.
+    if (axis == rank - 1) {
+        unit_stride = x.shape(rank - 1);
         return true;
     }
     // C == 1 leaves the spatial axis as the innermost one as well.
-    if (axis == rank - 1 && x.shape(1) == 1) {
-        unit_stride = x.shape(rank - 1);
+    if (axis == rank - 2 && x.shape(rank - 1) == 1) {
+        unit_stride = x.shape(rank - 2);
         return true;
     }
     return false;
@@ -89,7 +91,7 @@ void softmax_group_scalar(const T* x, T* y, int64_t D, int64_t stride, int64_t s
 }
 
 /// The dims whose flat index selects a group's position — everything but the
-/// softmax axis, and (in NHWC) the channel axis, which supplies the lanes.
+/// softmax axis, and (channel-last) the channel axis, which supplies the lanes.
 struct PositionWalk {
     int64_t count = 1;
     int64_t n = 0;
@@ -129,16 +131,17 @@ void softmax_strided_axis(const T* x_ptr, T* y_ptr, const TensorView& X, const T
     const int64_t axis_stride = X.stride_elems(axis);
     const int64_t axis_stride_y = Y.stride_elems(axis);
 
-    // Lanes: the channels of an NHWC tensor are one vector.
-    const bool lanes_are_channels = rank > 1 && axis != 1;
-    const int64_t nlanes = lanes_are_channels ? X.shape(1) : 1;
+    // Lanes: the channels of a channel-last tensor are one vector.
+    const int64_t channel_axis = rank - 1;
+    const bool lanes_are_channels = rank > 1 && axis != channel_axis;
+    const int64_t nlanes = lanes_are_channels ? X.shape(channel_axis) : 1;
 
     // Both sides walk the same positions, each over its own strides: the output
     // may be pitched differently from the input.
     PositionWalk pos;
     PositionWalk pos_y;
     for (int64_t d = 0; d < rank; ++d) {
-        if (d == axis || (lanes_are_channels && d == 1)) {
+        if (d == axis || (lanes_are_channels && d == channel_axis)) {
             continue;
         }
         pos.add(X, d);

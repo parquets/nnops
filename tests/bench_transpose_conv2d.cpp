@@ -193,7 +193,7 @@ template <class T>
 struct Layer {
     explicit Layer(const Shape& c) : s(c) {
         const int64_t icg = c.IC / c.groups;
-        const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t ish[] = {c.N, c.IH, c.IW, c.IC};  // channel-last
         const int64_t wsh[] = {c.IC, c.OC / c.groups, c.KH, c.KW};  // [IC][OC/G][KH][KW]
         const int64_t bsh[] = {c.OC};
         constexpr DataType dt = dtype_of<T>();
@@ -221,8 +221,8 @@ struct Layer {
 
         const TensorDesc dn[] = {in_nhwc.desc(), w.desc(), b.desc()};
         const auto od = op->getOutputTensorDesc(dn);
-        OH = od[0].dims[2];
-        OW = od[0].dims[3];
+        OH = od[0].dims[1];
+        OW = od[0].dims[2];
         out_cl.assign(static_cast<size_t>(od[0].numel()), T{});
 
         out_nhwc = TensorView(od[0].dims, dt, out_cl.data(), TensorLayout::NHWC);
@@ -398,7 +398,7 @@ struct Int8Layer {
 
         op = TransposeConv2D::create(attrs, Backend::CPU);
 
-        const int64_t ish[] = {s.N, s.IC, s.IH, s.IW};
+        const int64_t ish[] = {s.N, s.IH, s.IW, s.IC};  // channel-last
         const int64_t wsh[] = {s.IC, s.OC / s.groups, s.KH, s.KW};
         in_cl = TensorView(std::span<const int64_t>(ish, 4), act_dt, in_cl_buf.data(),
                            TensorLayout::NHWC, qa);
@@ -410,8 +410,8 @@ struct Int8Layer {
 
         out_cl_buf.assign(static_cast<size_t>(od[0].numel()) * elem_bytes(out_dt), 0);
         out_cl = TensorView(od[0].dims, out_dt, out_cl_buf.data(), TensorLayout::NHWC, qo);
-        OH = od[0].dims[2];
-        OW = od[0].dims[3];
+        OH = od[0].dims[1];
+        OW = od[0].dims[2];
 
         ins_cl = {in_cl, w};
         // Same contributions count as the fp arms, so the rates line up.

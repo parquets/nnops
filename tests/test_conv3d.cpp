@@ -9,9 +9,9 @@
 /// row stride wider than its row, which is what selects the staged write pass
 /// and the gather fallback respectively.
 ///
-/// Input:   [N, IC, ID, IH, IW] stored NDHWC
+/// Input:   [N, ID, IH, IW, IC] (channel-last)
 /// Weight:  [OC, IC/G, KD, KH, KW]
-/// Output:  [N, OC, OD, OH, OW] stored NDHWC
+/// Output:  [N, OD, OH, OW, OC]
 
 #include "nnops/ops/conv3d.hpp"
 #include "common/test_harness.hpp"
@@ -96,7 +96,8 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     }
 
     auto in_cl = test::to_channel_last<float>(in_vec, N, IC, in_spatial);
-    const int64_t in_dims[] = {in_shape[0], in_shape[1], in_shape[2], in_shape[3], in_shape[4]};
+    // Channel-last dims: [N, ID, IH, IW, IC].
+    const int64_t in_dims[] = {in_shape[0], in_shape[2], in_shape[3], in_shape[4], in_shape[1]};
     TensorView in_view(in_dims, DataType::f32, in_cl.data(), TensorLayout::NDHWC);
 
     // A pitched filter: same values, rows pushed apart. The operator has to notice
@@ -129,20 +130,23 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     }
 
     const auto numel = static_cast<size_t>(out_descs[0].numel());
-    const int64_t OD = out_descs[0].dims[2];
-    const int64_t OH = out_descs[0].dims[3];
-    const int64_t OW = out_descs[0].dims[4];
+    // The output desc is channel-last: [N, OD, OH, OW, OC].
+    const int64_t OD = out_descs[0].dims[1];
+    const int64_t OH = out_descs[0].dims[2];
+    const int64_t OW = out_descs[0].dims[3];
     const int64_t out_spatial = OD * OH * OW;
     const int64_t out_row = OW * OC;
+    // The reference reads and writes dense [N, OC, OD, OH, OW].
+    const int64_t ref_dims[] = {N, OC, OD, OH, OW};
 
     std::vector<float> seed_cf;
     std::vector<float> seed_cl;
     if (residual) {
-        seed_cf = test::make_random_tensor(
+        seed_cl = test::make_random_tensor(
                       std::span<const int64_t>(out_descs[0].dims.data(),
                                                static_cast<size_t>(out_descs[0].rank)))
                       .first;
-        seed_cl = test::to_channel_last<float>(seed_cf, N, OC, out_spatial);
+        seed_cf = test::to_channel_first<float>(seed_cl, N, OC, out_spatial);
     }
 
     // The operator's output: dense, or one row pitch wide.
@@ -169,7 +173,7 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     }
 
     std::vector<float> ref_buf = seed_cf.empty() ? std::vector<float>(numel, 0.0f) : seed_cf;
-    TensorView out_ref(out_descs[0].dims, DataType::f32, ref_buf.data());
+    TensorView out_ref(std::span<const int64_t>(ref_dims, 5), DataType::f32, ref_buf.data());
     {
         ComputeContext ctx;
         if (has_bias) {
@@ -185,7 +189,7 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
 
     const std::vector<float> got_cl = pitch_out ? depitch(out, out_row) : out_buf;
     const auto got_cf = test::to_channel_first<float>(got_cl, N, OC, out_spatial);
-    TensorView got_view(out_descs[0].dims, DataType::f32,
+    TensorView got_view(std::span<const int64_t>(ref_dims, 5), DataType::f32,
                         const_cast<float*>(got_cf.data()));
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
 }
@@ -210,10 +214,11 @@ NNOPS_TEST(conv3d_kernel1x1_exact) {
     const TensorDesc d[] = {in_view.desc(), w_view.desc(), b_view.desc()};
     const auto descs = op->getOutputTensorDesc(d);
     NNOPS_EXPECT_EQ(descs[0].rank, 5);
-    NNOPS_EXPECT_EQ(descs[0].dims[1], 1);
+    // [N, OD, OH, OW, OC]
+    NNOPS_EXPECT_EQ(descs[0].dims[1], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[2], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[3], 2);
-    NNOPS_EXPECT_EQ(descs[0].dims[4], 2);
+    NNOPS_EXPECT_EQ(descs[0].dims[4], 1);
 
     std::vector<float> out_buf(8, 0.0f);
     auto out = test::make_channel_first(descs[0], out_buf.data());
@@ -236,7 +241,8 @@ NNOPS_TEST(conv3d_output_shape_formula) {
     auto op = Conv3D::create(attrs, Backend::CPU);
     auto [in_vec, in_dense] = test::make_random_tensor({1, 4, 5, 6, 7});
     auto [w_vec,  w_view]   = test::make_random_tensor({3, 4, 3, 4, 2});
-    const int64_t ishape[] = {1, 4, 5, 6, 7};
+    // Channel-last: [N, ID, IH, IW, IC].
+    const int64_t ishape[] = {1, 5, 6, 7, 4};
     TensorView in_view(ishape, DataType::f32, in_vec.data(), TensorLayout::NDHWC);
     (void)in_dense;
     const TensorDesc d[] = {in_view.desc(), w_view.desc()};
@@ -245,10 +251,11 @@ NNOPS_TEST(conv3d_output_shape_formula) {
     // OD = floor((5 + 2 - 2 - 1)/2) + 1 = 3
     // OH = floor((6 + 2 - 3 - 1)/3) + 1 = 2
     // OW = floor((7 + 4 - 1 - 1)/1) + 1 = 10
+    // [N, OD, OH, OW, OC]
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
-    NNOPS_EXPECT_EQ(descs[0].dims[2], 3);
-    NNOPS_EXPECT_EQ(descs[0].dims[3], 2);
-    NNOPS_EXPECT_EQ(descs[0].dims[4], 10);
+    NNOPS_EXPECT_EQ(descs[0].dims[2], 2);
+    NNOPS_EXPECT_EQ(descs[0].dims[3], 10);
+    NNOPS_EXPECT_EQ(descs[0].dims[4], 3);
 }
 
 NNOPS_TEST(conv3d_k3_pad1) {
@@ -381,7 +388,10 @@ NNOPS_TEST(conv3d_f16) {
     auto in_r = test::f16_to_f32(in16);
     auto w_r  = test::f16_to_f32(w16);
 
-    const int64_t in_dims[] = {in_shape[0], in_shape[1], in_shape[2], in_shape[3], in_shape[4]};
+    // Channel-last activation dims [N, ID, IH, IW, IC].
+    const int64_t in_dims[] = {in_shape[0], in_shape[2], in_shape[3], in_shape[4], in_shape[1]};
+    // Dense dims for the reference [N, IC, ID, IH, IW].
+    const int64_t in_dims_cf[] = {in_shape[0], in_shape[1], in_shape[2], in_shape[3], in_shape[4]};
     auto op = Conv3D::create(attrs, Backend::CPU);
     const TensorDesc d[] = {in_f32.desc(), w_f32.desc()};
     const auto descs = op->getOutputTensorDesc(d);
@@ -389,12 +399,14 @@ NNOPS_TEST(conv3d_f16) {
     const int64_t N = in_shape[0];
     const int64_t IC = in_shape[1];
     const int64_t OC = w_shape[0];
-    const int64_t out_spatial = descs[0].dims[2] * descs[0].dims[3] * descs[0].dims[4];
+    // [N, OD, OH, OW, OC]
+    const int64_t out_spatial = descs[0].dims[1] * descs[0].dims[2] * descs[0].dims[3];
+    const int64_t ref_dims5[] = {N, OC, descs[0].dims[1], descs[0].dims[2], descs[0].dims[3]};
 
-    TensorView in_ref(in_dims, DataType::f32, in_r.data());
+    TensorView in_ref(std::span<const int64_t>(in_dims_cf, 5), DataType::f32, in_r.data());
     TensorView w_ref(w_shape, DataType::f32, w_r.data());
     std::vector<float> ref_buf(numel, 0.0f);
-    TensorView out_ref(descs[0].dims, DataType::f32, ref_buf.data());
+    TensorView out_ref(std::span<const int64_t>(ref_dims5, 5), DataType::f32, ref_buf.data());
     {
         const TensorView ins[] = {in_ref, w_ref};
         ComputeContext ctx;
@@ -417,7 +429,8 @@ NNOPS_TEST(conv3d_f16) {
 
     const auto got_cl = test::f16_to_f32(out16);
     const auto got_cf = test::to_channel_first<float>(got_cl, N, OC, out_spatial);
-    TensorView got_view(descs[0].dims, DataType::f32, const_cast<float*>(got_cf.data()));
+    TensorView got_view(std::span<const int64_t>(ref_dims5, 5), DataType::f32,
+                        const_cast<float*>(got_cf.data()));
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, test::kF16AccumTol,
                                      test::kF16AccumTol));
 }
@@ -477,7 +490,8 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
     (void)in_dense;
 
     auto in_cl = test::to_channel_last<float>(in_vec, N, IC, in_spatial);
-    const int64_t in_dims[] = {in_shape[0], in_shape[1], in_shape[2], in_shape[3], in_shape[4]};
+    // Channel-last dims: [N, ID, IH, IW, IC].
+    const int64_t in_dims[] = {in_shape[0], in_shape[2], in_shape[3], in_shape[4], in_shape[1]};
     TensorView in_view(in_dims, DataType::f32, in_cl.data(), TensorLayout::NDHWC);
 
     Conv3DAttributes attrs;
@@ -489,15 +503,16 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
     const TensorDesc d[] = {in_view.desc(), w_view.desc()};
     const auto out_descs = op->getOutputTensorDesc(d);
     const auto numel = static_cast<size_t>(out_descs[0].numel());
-    const int64_t OC = out_descs[0].dims[1];
-    const int64_t OW = out_descs[0].dims[4];
-    const int64_t out_spatial = out_descs[0].dims[2] * out_descs[0].dims[3] * OW;
+    // [N, OD, OH, OW, OC]
+    const int64_t OC = out_descs[0].dims[4];
+    const int64_t OW = out_descs[0].dims[3];
+    const int64_t out_spatial = out_descs[0].dims[1] * out_descs[0].dims[2] * OW;
     const int64_t out_row = OW * OC;
-    const auto seed_cf = test::make_random_tensor(
-                             std::span<const int64_t>(out_descs[0].dims.data(),
-                                                      static_cast<size_t>(out_descs[0].rank)))
-                             .first;
-    const auto seed = test::to_channel_last<float>(seed_cf, N, OC, out_spatial);
+    // The seed is already channel-last, the order the destination is written in.
+    const auto seed = test::make_random_tensor(
+                          std::span<const int64_t>(out_descs[0].dims.data(),
+                                                   static_cast<size_t>(out_descs[0].rank)))
+                          .first;
 
     std::vector<float> ref_buf = seed;
     TensorView ref = test::make_channel_first(out_descs[0], ref_buf.data());

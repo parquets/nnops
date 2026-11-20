@@ -139,7 +139,8 @@ inline detail::SmallVector<int64_t, TensorDesc::kMaxRank> compute_broadcast_shap
 // Per-operator shape inference functions
 // ============================================================
 
-/// Returns [N, OC, OH, OW]; `weight_hwio` selects the HWIO reading of the weight.
+/// Returns [N, OH, OW, OC] under the channel-last convention (the activation is
+/// [N, IH, IW, IC]); `weight_hwio` selects the HWIO reading of the weight.
 inline std::vector<TensorDesc> conv2d_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
@@ -160,18 +161,18 @@ inline std::vector<TensorDesc> conv2d_output_shape(
 
     out.dims.resize(4);
     out.dims[0] = in.dims[0];
-    out.dims[1] = weight_hwio ? wt.dims[3] : wt.dims[0];
+    out.dims[3] = weight_hwio ? wt.dims[3] : wt.dims[0];
 
+    out.dims[1] = compute_spatial_output_size(
+        in.dims[1], kernel_size[0], stride[0], dilation[0], padding[0], auto_pad);
     out.dims[2] = compute_spatial_output_size(
-        in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], auto_pad);
-    out.dims[3] = compute_spatial_output_size(
-        in.dims[3], kernel_size[1], stride[1], dilation[1], padding[1], auto_pad);
+        in.dims[2], kernel_size[1], stride[1], dilation[1], padding[1], auto_pad);
 
     return {out};
 }
 
-/// Returns [N, OC, OL] — the 1D twin of conv2d_output_shape, on a rank-3
-/// activation [N, IC, IL]; `weight_hwio` selects the HWIO [K, IC/G, OC] reading.
+/// Returns [N, OL, OC] — the 1D twin of conv2d_output_shape, on a rank-3
+/// activation [N, IL, IC]; `weight_hwio` selects the HWIO [K, IC/G, OC] reading.
 inline std::vector<TensorDesc> conv1d_output_shape(
     int64_t kernel_size,
     int64_t stride,
@@ -192,16 +193,16 @@ inline std::vector<TensorDesc> conv1d_output_shape(
 
     out.dims.resize(3);
     out.dims[0] = in.dims[0];
-    out.dims[1] = weight_hwio ? wt.dims[2] : wt.dims[0];
+    out.dims[2] = weight_hwio ? wt.dims[2] : wt.dims[0];
 
-    out.dims[2] = compute_spatial_output_size(
-        in.dims[2], kernel_size, stride, dilation, padding, auto_pad);
+    out.dims[1] = compute_spatial_output_size(
+        in.dims[1], kernel_size, stride, dilation, padding, auto_pad);
 
     (void)groups;  // OC comes from the filter; the caller validates the split
     return {out};
 }
 
-/// Returns [N, C, OL] — one spatial axis, so the per-axis spans of
+/// Returns [N, OL, C] — one spatial axis, so the per-axis spans of
 /// pooling_output_shape collapse to scalars.
 inline std::vector<TensorDesc> pool1d_output_shape(
     int64_t kernel_size,
@@ -220,14 +221,15 @@ inline std::vector<TensorDesc> pool1d_output_shape(
 
     out.dims.resize(3);
     out.dims[0] = in.dims[0];
-    out.dims[1] = in.dims[1];
-    out.dims[2] = compute_spatial_output_size(
-        in.dims[2], kernel_size, stride, dilation, padding, auto_pad);
+    out.dims[1] = compute_spatial_output_size(
+        in.dims[1], kernel_size, stride, dilation, padding, auto_pad);
+    out.dims[2] = in.dims[2];
 
     return {out};
 }
 
-/// Returns [N, OC, OD, OH, OW] from an OIHW weight.
+/// Returns [N, OD, OH, OW, OC] from an OIHW weight; the activation is
+/// [N, ID, IH, IW, IC].
 inline std::vector<TensorDesc> conv3d_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
@@ -247,19 +249,19 @@ inline std::vector<TensorDesc> conv3d_output_shape(
 
     out.dims.resize(5);
     out.dims[0] = in.dims[0];
-    out.dims[1] = wt.dims[0];
+    out.dims[4] = wt.dims[0];
 
+    out.dims[1] = compute_spatial_output_size(
+        in.dims[1], kernel_size[0], stride[0], dilation[0], padding[0], auto_pad);
     out.dims[2] = compute_spatial_output_size(
-        in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], auto_pad);
+        in.dims[2], kernel_size[1], stride[1], dilation[1], padding[1], auto_pad);
     out.dims[3] = compute_spatial_output_size(
-        in.dims[3], kernel_size[1], stride[1], dilation[1], padding[1], auto_pad);
-    out.dims[4] = compute_spatial_output_size(
-        in.dims[4], kernel_size[2], stride[2], dilation[2], padding[2], auto_pad);
+        in.dims[3], kernel_size[2], stride[2], dilation[2], padding[2], auto_pad);
 
     return {out};
 }
 
-/// Returns [N, OC, OH, OW] with OC = weight.dims[1] * groups.
+/// Returns [N, OH, OW, OC] with OC = weight.dims[1] * groups.
 inline std::vector<TensorDesc> transpose_conv2d_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
@@ -279,22 +281,22 @@ inline std::vector<TensorDesc> transpose_conv2d_output_shape(
 
     out.dims.resize(4);
     out.dims[0] = in.dims[0];
-    out.dims[1] = wt.dims[1] * groups;
+    out.dims[3] = wt.dims[1] * groups;
 
     auto compute_output = [](int64_t I, int64_t K, int64_t S,
                               int64_t D, int64_t P, int64_t OP) {
         return (I - 1) * S - 2 * P + D * (K - 1) + OP + 1;
     };
 
+    out.dims[1] = compute_output(
+        in.dims[1], kernel_size[0], stride[0], dilation[0], padding[0], output_padding[0]);
     out.dims[2] = compute_output(
-        in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], output_padding[0]);
-    out.dims[3] = compute_output(
-        in.dims[3], kernel_size[1], stride[1], dilation[1], padding[1], output_padding[1]);
+        in.dims[2], kernel_size[1], stride[1], dilation[1], padding[1], output_padding[1]);
 
     return {out};
 }
 
-/// Returns [N, OC, OD, OH, OW] with OC = weight.dims[1] * groups, the 3-D form
+/// Returns [N, OD, OH, OW, OC] with OC = weight.dims[1] * groups, the 3-D form
 /// of the above: the same trailing-edge term, one per spatial axis.
 inline std::vector<TensorDesc> transpose_conv3d_output_shape(
     std::span<const int64_t> kernel_size,
@@ -315,24 +317,24 @@ inline std::vector<TensorDesc> transpose_conv3d_output_shape(
 
     out.dims.resize(5);
     out.dims[0] = in.dims[0];
-    out.dims[1] = wt.dims[1] * groups;
+    out.dims[4] = wt.dims[1] * groups;
 
     auto compute_output = [](int64_t I, int64_t K, int64_t S,
                               int64_t D, int64_t P, int64_t OP) {
         return (I - 1) * S - 2 * P + D * (K - 1) + OP + 1;
     };
 
+    out.dims[1] = compute_output(
+        in.dims[1], kernel_size[0], stride[0], dilation[0], padding[0], output_padding[0]);
     out.dims[2] = compute_output(
-        in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], output_padding[0]);
+        in.dims[2], kernel_size[1], stride[1], dilation[1], padding[1], output_padding[1]);
     out.dims[3] = compute_output(
-        in.dims[3], kernel_size[1], stride[1], dilation[1], padding[1], output_padding[1]);
-    out.dims[4] = compute_output(
-        in.dims[4], kernel_size[2], stride[2], dilation[2], padding[2], output_padding[2]);
+        in.dims[3], kernel_size[2], stride[2], dilation[2], padding[2], output_padding[2]);
 
     return {out};
 }
 
-/// Returns [N, C, OH, OW], C inherited from the input: a depthwise transposed
+/// Returns [N, OH, OW, C], C inherited from the input: a depthwise transposed
 /// conv keeps the input's channel count (OC == IC == weight.dims[0]).
 inline std::vector<TensorDesc> depthwise_transpose_conv_output_shape(
     std::span<const int64_t> kernel_size,
@@ -351,22 +353,22 @@ inline std::vector<TensorDesc> depthwise_transpose_conv_output_shape(
 
     out.dims.resize(4);
     out.dims[0] = in.dims[0];
-    out.dims[1] = in.dims[1];
+    out.dims[3] = in.dims[3];
 
     auto compute_output = [](int64_t I, int64_t K, int64_t S,
                               int64_t D, int64_t P, int64_t OP) {
         return (I - 1) * S - 2 * P + D * (K - 1) + OP + 1;
     };
 
+    out.dims[1] = compute_output(
+        in.dims[1], kernel_size[0], stride[0], dilation[0], padding[0], output_padding[0]);
     out.dims[2] = compute_output(
-        in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], output_padding[0]);
-    out.dims[3] = compute_output(
-        in.dims[3], kernel_size[1], stride[1], dilation[1], padding[1], output_padding[1]);
+        in.dims[2], kernel_size[1], stride[1], dilation[1], padding[1], output_padding[1]);
 
     return {out};
 }
 
-/// Returns [N, C, ...spatial]; rank 4 is 2D, rank 5 is 3D.
+/// Returns [N, ...spatial, C]; rank 4 is 2D, rank 5 is 3D.
 inline std::vector<TensorDesc> depthwise_conv_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
@@ -386,26 +388,26 @@ inline std::vector<TensorDesc> depthwise_conv_output_shape(
 
     out.dims.resize(static_cast<size_t>(rank));
     out.dims[0] = in.dims[0];
-    out.dims[1] = in.dims[1];
+    out.dims[rank - 1] = in.dims[rank - 1];
 
     const int64_t k_offset = (srank == 2) ? 1 : 0;
 
     for (int64_t d = 0; d < srank; ++d) {
-        const int64_t in_dim   = in.dims[static_cast<size_t>(2 + d)];
+        const int64_t in_dim   = in.dims[static_cast<size_t>(1 + d)];
         const int64_t k_idx    = static_cast<size_t>(k_offset + d);
         const int64_t k_size   = kernel_size[k_idx];
         const int64_t k_stride = stride[k_idx];
         const int64_t k_dil    = dilation[k_idx];
         const int64_t k_pad    = padding[k_idx];
 
-        out.dims[static_cast<size_t>(2 + d)] = compute_spatial_output_size(
+        out.dims[static_cast<size_t>(1 + d)] = compute_spatial_output_size(
             in_dim, k_size, k_stride, k_dil, k_pad, auto_pad);
     }
 
     return {out};
 }
 
-/// Returns [N, C, ...spatial]; rank 4 is 2D, rank 5 is 3D.
+/// Returns [N, ...spatial, C]; rank 4 is 2D, rank 5 is 3D.
 inline std::vector<TensorDesc> pooling_output_shape(
     std::span<const int64_t> kernel_shape,
     std::span<const int64_t> stride,
@@ -425,19 +427,19 @@ inline std::vector<TensorDesc> pooling_output_shape(
 
     out.dims.resize(static_cast<size_t>(rank));
     out.dims[0] = in.dims[0];
-    out.dims[1] = in.dims[1];
+    out.dims[rank - 1] = in.dims[rank - 1];
 
     const int64_t k_offset = (srank == 2) ? 1 : 0;
 
     for (int64_t d = 0; d < srank; ++d) {
-        const int64_t in_dim   = in.dims[static_cast<size_t>(2 + d)];
+        const int64_t in_dim   = in.dims[static_cast<size_t>(1 + d)];
         const int64_t k_idx    = static_cast<size_t>(k_offset + d);
         const int64_t k_size   = kernel_shape[k_idx];
         const int64_t k_stride = stride[k_idx];
         const int64_t k_dil    = dilation[k_idx];
         const int64_t k_pad    = padding[k_idx];
 
-        out.dims[static_cast<size_t>(2 + d)] = compute_spatial_output_size(
+        out.dims[static_cast<size_t>(1 + d)] = compute_spatial_output_size(
             in_dim, k_size, k_stride, k_dil, k_pad, auto_pad);
     }
 
@@ -554,9 +556,9 @@ inline std::vector<TensorDesc> identity_output_shape(
 /// Element-wise binary output: the NumPy broadcast of the two input shapes.
 ///
 /// The layout tag follows the first input when the rank survives — the channel
-/// slot is then still dim 1 in the result — and falls back to Dense otherwise
-/// (a rank change moves C, so a spatial tag would no longer describe where it
-/// sits).
+/// slot then stays the last axis of the result — and falls back to Dense
+/// otherwise (a rank change moves C, so a spatial tag would no longer describe
+/// where it sits).
 inline std::vector<TensorDesc> broadcast_binary_output_shape(
     std::span<const TensorDesc> inputs)
 {
@@ -668,11 +670,11 @@ inline std::vector<TensorDesc> resize_output_shape(
 
     out.dims.resize(static_cast<size_t>(rank));
     out.dims[0] = in.dims[0];
-    out.dims[1] = in.dims[1];
+    out.dims[rank - 1] = in.dims[rank - 1];
 
     const int64_t os_offset = (srank == 2) ? 1 : 0;
     for (int64_t d = 0; d < srank; ++d) {
-        out.dims[static_cast<size_t>(2 + d)] = output_size[static_cast<size_t>(os_offset + d)];
+        out.dims[static_cast<size_t>(1 + d)] = output_size[static_cast<size_t>(os_offset + d)];
     }
 
     return {out};
@@ -694,10 +696,10 @@ inline std::vector<TensorDesc> grid_sample_output_shape(
 
     out.dims.resize(static_cast<size_t>(irank));
     out.dims[0] = in.dims[0];
-    out.dims[1] = in.dims[1];
+    out.dims[irank - 1] = in.dims[irank - 1];
 
     for (int64_t d = 0; d < srank; ++d) {
-        out.dims[static_cast<size_t>(2 + d)] =
+        out.dims[static_cast<size_t>(1 + d)] =
             grid.dims[static_cast<size_t>(1 + d)];
     }
 

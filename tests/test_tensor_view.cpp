@@ -93,9 +93,9 @@ NNOPS_TEST(tensor_view_1d_pitch) {
 // ============================================================
 
 NNOPS_TEST(dense_construction) {
-    // Logical: [N=2, C=16, H=3, W=4]. A row is one spatial line of W pixels
-    // times C channels: 4 * 16 = 64 elements, pitch = 256 bytes.
-    const int64_t shape[] = {2, 16, 3, 4};
+    // Logical and stored: [N=2, H=3, W=4, C=16]. A row is one spatial line of
+    // W pixels times C channels: 4 * 16 = 64 elements, pitch = 256 bytes.
+    const int64_t shape[] = {2, 3, 4, 16};
     float data[2 * 3 * 4 * 16] = {};
 
     TensorView tv(shape, DataType::f32, data, TensorLayout::NHWC);
@@ -105,36 +105,36 @@ NNOPS_TEST(dense_construction) {
     NNOPS_EXPECT_EQ(tv.pitch(), 256);
     NNOPS_EXPECT_EQ(tv.row_stride_elems(), 64);   // 256/4 = W * C
     // stride_elems: C is innermost (1), W steps a whole pixel, H is one pitch.
-    NNOPS_EXPECT_EQ(tv.stride_elems(1), 1);
-    NNOPS_EXPECT_EQ(tv.stride_elems(3), 16);      // W: C
-    NNOPS_EXPECT_EQ(tv.stride_elems(2), 64);      // H: row_stride
+    NNOPS_EXPECT_EQ(tv.stride_elems(3), 1);       // C: innermost
+    NNOPS_EXPECT_EQ(tv.stride_elems(2), 16);      // W: C
+    NNOPS_EXPECT_EQ(tv.stride_elems(1), 64);      // H: row_stride
     NNOPS_EXPECT_EQ(tv.stride_elems(0), 192);     // N: H * row_stride = 3 * 64
     NNOPS_EXPECT_EQ(tv.numel(), 2 * 16 * 3 * 4);  // logical numel
 }
 
 NNOPS_TEST(total_rows_and_storage) {
-    const int64_t shape[] = {2, 8, 4, 5};
+    const int64_t shape[] = {2, 4, 5, 8};
     float data[2 * 4 * 5 * 8] = {};
 
     TensorView tv(shape, DataType::f32, data, TensorLayout::NHWC);
-    NNOPS_EXPECT_EQ(tv.total_rows(), 2 * 4);          // N * H (no channel axis)
-    NNOPS_EXPECT_EQ(tv.channel_block_stride_elems(), 4 * 5 * 8);
+    NNOPS_EXPECT_EQ(tv.total_rows(), 2 * 4);          // N * H (a row is one line)
+    NNOPS_EXPECT_EQ(tv.channel_block_stride_elems(), 5 * 8);
     NNOPS_EXPECT_EQ(tv.storage_bytes(), static_cast<size_t>(2 * 4 * 5 * 8 * 4));
 
-    // Channel-first counts C among the rows: 2 * 8 * 4 = 64.
-    TensorView tv_channel_first(shape, DataType::f32, data, TensorLayout::Dense);
-    NNOPS_EXPECT_EQ(tv_channel_first.total_rows(), 2 * 8 * 4);
+    // A dense view counts its axes in memory order: N * H * W = 2 * 4 * 5.
+    TensorView tv_dense(shape, DataType::f32, data, TensorLayout::Dense);
+    NNOPS_EXPECT_EQ(tv_dense.total_rows(), 2 * 4 * 5);
 }
 
 NNOPS_TEST(explicit_pitch) {
     // W*C = 64 floats = 256 bytes; give it 288 so the pad is visible.
-    const int64_t shape[] = {1, 16, 2, 4};
+    const int64_t shape[] = {1, 2, 4, 16};
     std::vector<float> data(2 * 288 / sizeof(float));
 
     TensorView tv(shape, DataType::f32, data.data(), 288, TensorLayout::NHWC);
     NNOPS_EXPECT_EQ(tv.pitch(), 288);
     NNOPS_EXPECT_EQ(tv.row_stride_elems(), 72);
-    NNOPS_EXPECT_EQ(tv.stride_elems(2), 72);      // H: one pitch
+    NNOPS_EXPECT_EQ(tv.stride_elems(1), 72);      // H: one pitch
     NNOPS_EXPECT_EQ(tv.stride_elems(0), 2 * 72);  // N: H * pitch
 }
 
@@ -143,8 +143,8 @@ NNOPS_TEST(explicit_pitch) {
 // ============================================================
 
 NNOPS_TEST(ndhwc_dense_construction) {
-    // Logical: [N=1, C=16, D=2, H=3, W=4]
-    const int64_t shape[] = {1, 16, 2, 3, 4};
+    // Logical and stored: [N=1, D=2, H=3, W=4, C=16]
+    const int64_t shape[] = {1, 2, 3, 4, 16};
     float data[1 * 2 * 3 * 4 * 16] = {};
 
     TensorView tv(shape, DataType::f32, data, TensorLayout::NDHWC);
@@ -152,12 +152,12 @@ NNOPS_TEST(ndhwc_dense_construction) {
     NNOPS_EXPECT_EQ(tv.layout(), TensorLayout::NDHWC);
     NNOPS_EXPECT_EQ(tv.num_channel_blocks(), 1);
     NNOPS_EXPECT_EQ(tv.row_stride_elems(), 64);
-    NNOPS_EXPECT_EQ(tv.stride_elems(1), 1);       // C: innermost
-    NNOPS_EXPECT_EQ(tv.stride_elems(4), 16);      // W: C
-    NNOPS_EXPECT_EQ(tv.stride_elems(3), 64);      // H: row_stride
-    NNOPS_EXPECT_EQ(tv.stride_elems(2), 3 * 64);  // D: H * row_stride
+    NNOPS_EXPECT_EQ(tv.stride_elems(4), 1);       // C: innermost
+    NNOPS_EXPECT_EQ(tv.stride_elems(3), 16);      // W: C
+    NNOPS_EXPECT_EQ(tv.stride_elems(2), 64);      // H: row_stride
+    NNOPS_EXPECT_EQ(tv.stride_elems(1), 3 * 64);  // D: H * row_stride
     NNOPS_EXPECT_EQ(tv.stride_elems(0), 2 * 3 * 64);  // N: D * H * row_stride
-    NNOPS_EXPECT_EQ(tv.channel_block_stride_elems(), 2 * 3 * 64);
+    NNOPS_EXPECT_EQ(tv.channel_block_stride_elems(), 64);
     NNOPS_EXPECT_EQ(tv.total_rows(), 1 * 2 * 3);  // N * D * H
 }
 

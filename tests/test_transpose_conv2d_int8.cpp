@@ -324,49 +324,62 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     Fixture f(c);
     auto op = TransposeConv2D::create(f.attrs, Backend::CPU);
 
-    // The dense descriptor carries the logical output geometry either way; the
-    // call only changes the storage order.
+    // Shape inference speaks channel-last whatever the storage, so the query
+    // uses the NHWC dims; the reference reads the dense order.
+    const int64_t N  = c.ishape[0];
+    const int64_t IC = c.ishape[1];
+    const int64_t IH = c.ishape[2];
+    const int64_t IW = c.ishape[3];
+    const int64_t ishape_cl[] = {N, IH, IW, IC};
     std::vector<TensorDesc> cf_ins = f.descs();
-    const auto cf_outs = op->getOutputTensorDesc(cf_ins);
-    const int64_t N  = cf_outs[0].dims[0];
-    const int64_t OC = cf_outs[0].dims[1];
-    const int64_t OH = cf_outs[0].dims[2];
-    const int64_t OW = cf_outs[0].dims[3];
-    const size_t  esz = elem_size(cf_outs[0].dtype);
+    TensorDesc in_cl_desc = cf_ins[0];
+    in_cl_desc.dims = std::span<const int64_t>(ishape_cl, 4);
+    in_cl_desc.layout = TensorLayout::NHWC;
+    std::vector<TensorDesc> q_ins = {in_cl_desc};
+    for (size_t i = 1; i < cf_ins.size(); ++i) { q_ins.push_back(cf_ins[i]); }
+    const auto cl_outs = op->getOutputTensorDesc(q_ins);
+    const int64_t OH = cl_outs[0].dims[1];
+    const int64_t OW = cl_outs[0].dims[2];
+    const int64_t OC = cl_outs[0].dims[3];
+    const int64_t dense_out_dims[] = {N, OC, OH, OW};
+    TensorDesc cf_out = cl_outs[0];
+    cf_out.layout = TensorLayout::Dense;
+    cf_out.dims = std::span<const int64_t>(dense_out_dims, 4);
+    const TensorDesc* cf_outs_view = &cf_out;
+    (void)cf_outs_view;
+    const size_t  esz = elem_size(cf_out.dtype);
 
     if (reference) {
         Result r;
-        r.desc = cf_outs[0];
-        const OutPlan p = out_plan(cf_outs[0], c);
+        r.desc = cf_out;
+        const OutPlan p = out_plan(cf_out, c);
         r.buf.assign(p.bytes, 0);
         // The same pre-existing contents as the kernel's buffer: a pitched row's
         // tail is nobody's to write, and seeding both makes that show up.
-        seed_output(r.buf, cf_outs[0].dtype, c.seed + 3);
-        auto out = make_out_view(cf_outs[0], r.buf.data(), f.out_q, p.pitch);
+        seed_output(r.buf, cf_out.dtype, c.seed + 3);
+        auto out = make_out_view(cf_out, r.buf.data(), f.out_q, p.pitch);
         nnops::backend::cpu::reference::transpose_conv2d_int8_ref(
             f.attrs, out, f.ins, ctx, nullptr);
         return r;
     }
 
     // ---- permute the activation in, the output back ----
-    const int64_t IC = c.ishape[1], IH = c.ishape[2], IW = c.ishape[3];
     const int64_t in_pitch = c.in_pitch ? c.in_pitch : IW;
     std::vector<uint8_t> act_cl =
         to_cl(f.act, elem_size(c.act), N, IC, IH, IW, in_pitch);
 
-    const int64_t ishape_cl[] = {N, IC, IH, IW};
     TensorView in_cl(std::span<const int64_t>(ishape_cl, 4), c.act, act_cl.data(),
                      TensorLayout::NHWC, f.qa);
 
     std::vector<TensorDesc> cl_ins;
     cl_ins.push_back(in_cl.desc());
     for (size_t i = 1; i < f.ins.size(); ++i) { cl_ins.push_back(f.ins[i].desc()); }
-    const auto cl_outs = op->getOutputTensorDesc(cl_ins);
-    NNOPS_EXPECT_EQ(cl_outs[0].dtype, cf_outs[0].dtype);
-    NNOPS_EXPECT_EQ(cl_outs[0].layout, TensorLayout::NHWC);
+    const auto cl_outs2 = op->getOutputTensorDesc(cl_ins);
+    NNOPS_EXPECT_EQ(cl_outs2[0].dtype, cf_out.dtype);
+    NNOPS_EXPECT_EQ(cl_outs2[0].layout, TensorLayout::NHWC);
 
-    std::vector<uint8_t> out_cl(static_cast<size_t>(cl_outs[0].numel()) * esz, 0);
-    auto cl_view = make_out_view(cl_outs[0], out_cl.data(), f.out_q);
+    std::vector<uint8_t> out_cl(static_cast<size_t>(cl_outs2[0].numel()) * esz, 0);
+    auto cl_view = make_out_view(cl_outs2[0], out_cl.data(), f.out_q);
 
     std::vector<TensorView> cl_views;
     cl_views.push_back(in_cl);
@@ -374,7 +387,7 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     NNOPS_EXPECT_EQ(op->compute(cl_view, cl_views, ctx, nullptr), Status::ok);
 
     Result r;
-    r.desc = cf_outs[0];
+    r.desc = cf_out;
     r.buf = to_cf(out_cl, esz, N, OC, OH, OW);
     return r;
 }

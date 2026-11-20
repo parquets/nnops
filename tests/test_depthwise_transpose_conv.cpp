@@ -59,6 +59,15 @@ static int64_t dwt_spatial_elems(const Shape& shape)
     return s;
 }
 
+/// Channel-last [N, H, W, C] dims for a dense [N, C, H, W] shape.
+static void dwt_cl_dims(const std::vector<int64_t>& dense, int64_t* out)
+{
+    out[0] = dense[0];
+    out[1] = dense[2];
+    out[2] = dense[3];
+    out[3] = dense[1];
+}
+
 template <typename T>
 static void test_vs_ref(const std::vector<int64_t>& in_shape,
                                      const std::vector<int64_t>& w_shape,
@@ -99,12 +108,24 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     auto op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);
 
     // ---- Reference, in dense order ---------------------------------------------
+    // Shape inference speaks channel-last whatever the storage.
+    int64_t cl_dims[4] = {};
+    dwt_cl_dims(in_shape, cl_dims);
+    TensorDesc in_for_shape = in_channel_first.desc();
+    in_for_shape.dims = std::span<const int64_t>(cl_dims, 4);
+    in_for_shape.layout = TensorLayout::NHWC;
     const TensorDesc ref_in[] = {
-        in_channel_first.desc(), w_channel_first.desc(), b_channel_first.desc()};
+        in_for_shape, w_channel_first.desc(), b_channel_first.desc()};
     auto ref_descs = op->getOutputTensorDesc(
         std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
-    const int64_t outS  = dwt_spatial_elems(ref_descs[0].dims);
+    const int64_t outS  = ref_descs[0].numel() / (N * C);
     const int64_t out_n = N * C * outS;
+    const int64_t ref_dims[] = {N, C, ref_descs[0].dims[1], ref_descs[0].dims[2]};
+    TensorDesc ref_desc;
+    ref_desc.rank = 4;
+    ref_desc.dims = std::span<const int64_t>(ref_dims, 4);
+    ref_desc.dtype = dt;
+    ref_desc.layout = TensorLayout::Dense;
 
     // The residual, snapshotted before the reference overwrites its copy.
     std::vector<float> res_cf(static_cast<size_t>(out_n), 0.0f);
@@ -115,7 +136,7 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
         }
     }
     std::vector<float> ref_buf(res_cf);
-    auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    auto ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         const TensorView r[] = {in_channel_first, w_channel_first, b_channel_first};
@@ -131,7 +152,9 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     for (size_t i = 0; i < in_cl.size(); ++i) { in_cl[i] = to_T(in_cl_f[i]); }
     for (size_t i = 0; i < w_cl.size(); ++i)  { w_cl[i]  = to_T(w_cl_f[i]); }
 
-    TensorView in_v(std::span<const int64_t>(in_shape), dt, in_cl.data(),
+    int64_t in_shape_cl[4] = {};
+    dwt_cl_dims(in_shape, in_shape_cl);
+    TensorView in_v(std::span<const int64_t>(in_shape_cl, 4), dt, in_cl.data(),
                     TensorLayout::NHWC);
     const int64_t wsh[] = {w_shape[2], w_shape[3], C};
     TensorView w_v(std::span<const int64_t>(wsh, 3), dt, w_cl.data(),
@@ -327,7 +350,8 @@ NNOPS_TEST(dwtconv_threaded_matches_serial) {
         const auto in_cl = test::to_channel_last<float>(in_vec, c.in[0], c.in[1],
                                                         c.in[2] * c.in[3]);
         const auto w_cl = test::depthwise_to_hwcm<float>(w_vec, c.in[1], c.kh * c.kw);
-        TensorView in(std::span<const int64_t>(c.in, 4), DataType::f32,
+        const int64_t in_dims_cl[] = {c.in[0], c.in[2], c.in[3], c.in[1]};
+        TensorView in(std::span<const int64_t>(in_dims_cl, 4), DataType::f32,
                       const_cast<float*>(in_cl.data()), TensorLayout::NHWC);
         const int64_t wsh[] = {c.kh, c.kw, c.in[1]};
         TensorView w(std::span<const int64_t>(wsh, 3), DataType::f32,
@@ -372,7 +396,7 @@ NNOPS_TEST(dwtconv_threaded_matches_serial) {
 // ============================================================
 
 NNOPS_TEST(dwtconv_output_desc) {
-    const int64_t ishape[] = {2, 4, 7, 9};
+    const int64_t ishape[] = {2, 7, 9, 4};   // [N, H, W, C]
     std::vector<float> in_buf(2 * 4 * 7 * 9, 0.0f);
     TensorView in(std::span<const int64_t>(ishape, 4), DataType::f32, in_buf.data(),
                   TensorLayout::NHWC);
@@ -387,11 +411,12 @@ NNOPS_TEST(dwtconv_output_desc) {
     const TensorDesc in_desc[] = {in.desc(), w.desc()};
     auto out_descs = op->getOutputTensorDesc(in_desc);
     NNOPS_EXPECT_EQ(out_descs[0].rank, 4);
+    // [N, OH, OW, C]
     NNOPS_EXPECT_EQ(out_descs[0].dims[0], 2);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 4);
+    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 4);
     // (7-1)*2 - 2 + 1*(3-1) + 1 + 1 = 14; (9-1)*2 - 2 + 2 + 1 + 1 = 18
-    NNOPS_EXPECT_EQ(out_descs[0].dims[2], 14);
-    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 18);
+    NNOPS_EXPECT_EQ(out_descs[0].dims[1], 14);
+    NNOPS_EXPECT_EQ(out_descs[0].dims[2], 18);
     NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
     NNOPS_EXPECT_TRUE(out_descs[0].dtype == DataType::f32);
 }
@@ -476,11 +501,22 @@ static void transpose_conv2d_depthwise_vs_ref(
 
     // ---- The reference: the depthwise operator's own shape rule and kernel ---
     auto dw_op = DepthwiseTransposeConv2D::create(dw, Backend::CPU);
-    const TensorDesc ref_in[] = {in_cf.desc(), w_cf.desc(), b_cf.desc()};
+    int64_t cl_dims[4] = {};
+    dwt_cl_dims(in_shape, cl_dims);
+    TensorDesc in_for_shape = in_cf.desc();
+    in_for_shape.dims = std::span<const int64_t>(cl_dims, 4);
+    in_for_shape.layout = TensorLayout::NHWC;
+    const TensorDesc ref_in[] = {in_for_shape, w_cf.desc(), b_cf.desc()};
     auto ref_descs = dw_op->getOutputTensorDesc(
         std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
     const int64_t out_n = ref_descs[0].numel();
     const int64_t out_S = out_n / (N * C);
+    const int64_t ref_dims[] = {N, C, ref_descs[0].dims[1], ref_descs[0].dims[2]};
+    TensorDesc ref_desc;
+    ref_desc.rank = 4;
+    ref_desc.dims = std::span<const int64_t>(ref_dims, 4);
+    ref_desc.dtype = DataType::f32;
+    ref_desc.layout = TensorLayout::Dense;
 
     std::vector<float> res_cf(static_cast<size_t>(out_n), 0.0f);
     if (dw.add_to) {
@@ -489,7 +525,7 @@ static void transpose_conv2d_depthwise_vs_ref(
         }
     }
     std::vector<float> ref_buf(res_cf);
-    auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    auto ref = test::make_channel_first(ref_desc, ref_buf.data());
     {
         ComputeContext ctx;
         const TensorView r[] = {in_cf, w_cf, b_cf};
@@ -518,7 +554,7 @@ static void transpose_conv2d_depthwise_vs_ref(
         out_buf = test::to_channel_last<float>(res_cf, N, C, out_S);
     }
     auto in_cl = test::to_channel_last<float>(in_vec, N, C, S);
-    const int64_t in_cl_shape[] = {N, C, H, W};
+    const int64_t in_cl_shape[] = {N, H, W, C};
     TensorView in_v(in_cl_shape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
 
     const TensorDesc cl_in[] = {in_v.desc(), w_cf.desc(), b_cf.desc()};

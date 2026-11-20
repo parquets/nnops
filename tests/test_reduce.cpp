@@ -7,11 +7,12 @@
 /// from the end, so the negative-axis test runs axis=2 and axis=-1 on one
 /// input and compares the two outputs.
 ///
-/// The layout section converts a dense input to NHWC, reduces, and compares the
-/// result against the dense reduce in logical order. The layout only changes
-/// where the values live: the axis means the same thing either way. A
-/// rank-dropping reduce on an NHWC input produces a Dense output -- dropping an
-/// axis shifts whichever axis C sat on, so the tag cannot describe the shorter
+/// The layout section converts a dense input to the channel-last view, reduces,
+/// and compares the result against the dense reduce in logical order. The axis
+/// numbering follows the channel-last dims, so the helper translates the dense
+/// axis it was given. A rank-dropping reduce on an NHWC input produces a Dense
+/// output -- dropping an axis shifts whichever axis C sat on, so the tag cannot
+/// describe the shorter
 /// rank any more -- while keepdims keeps the rank and the NHWC tag.
 ///
 /// f16 goes through the SIMD f16 path and is compared against the f32
@@ -589,18 +590,25 @@ NNOPS_TEST(reduce_3d_first_axis) {
 
 namespace {
 
-/// Convert a dense view into `target` and return the view; `buf` outlives it.
+/// Convert a dense [N, C, spatial...] view into `target` and return the view;
+/// `buf` outlives it. The returned dims are channel-last — [N, spatial..., C] —
+/// so the logical order matches the storage.
 TensorView to_layout(const TensorView& channel_first, TensorLayout target,
                      std::vector<float>& buf)
 {
+    const int64_t rank = channel_first.rank();
     const int64_t N = channel_first.shape(0);
     const int64_t C = channel_first.shape(1);
     const int64_t S = channel_first.numel() / (N * C);
     buf = test::to_channel_last(
         std::span<const float>(channel_first.ptr<float>(),
                                static_cast<size_t>(channel_first.numel())), N, C, S);
-    return TensorView(channel_first.shape_span(), channel_first.data_type(),
-                      buf.data(), target);
+    int64_t cl_shape[8] = {};
+    cl_shape[0] = N;
+    for (int64_t d = 2; d < rank; ++d) { cl_shape[d - 1] = channel_first.shape(d); }
+    cl_shape[rank - 1] = C;
+    return TensorView(std::span<const int64_t>(cl_shape, static_cast<size_t>(rank)),
+                      channel_first.data_type(), buf.data(), target);
 }
 
 /// Compare two same-dimension views in logical order (any layout).
@@ -640,7 +648,13 @@ bool same_logical_f32(const TensorView& a, const TensorView& b)
     return true;
 }
 
-/// Run the reduce on a dense input and on its NHWC twin; the results must agree
+std::vector<float> reduce_reference(const std::vector<int64_t>& shape,
+                                    const std::vector<float>& in,
+                                    const std::vector<int64_t>& axes,
+                                    ReduceType type, bool keepdims);
+
+/// Run the reduce on a channel-last view whose dense twin carries `shape`
+/// ([N, C, spatial...]) and `axes` in that order; the results must agree
 /// element for element in logical order.
 void check_reduce_layout(const std::vector<int64_t>& shape,
                          ReduceType type, const std::vector<int64_t>& axes,
@@ -650,44 +664,57 @@ void check_reduce_layout(const std::vector<int64_t>& shape,
         100 + (axes.empty() ? 0 : axes.front()) * 7 + (keepdims ? 1 : 0) +
         static_cast<int>(type) * 31 + axes.size() * 17);
     auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -2.0f, 2.0f, seed);
+    (void)in_vec;
+
+    const int64_t rank = static_cast<int64_t>(shape.size());
+    const TensorLayout cl_layout =
+        (rank == 5) ? TensorLayout::NDHWC : TensorLayout::NHWC;
+    std::vector<float> cl_buf;
+    auto in_cl = to_layout(in_channel_first, cl_layout, cl_buf);
+
+    // Channel-last axis for a dense one: N stays, C becomes the last axis, and
+    // a spatial axis shifts down by one.
+    const auto to_cl_axis = [&](int64_t a) {
+        const int64_t ax = a < 0 ? a + rank : a;
+        if (ax == 0) { return int64_t(0); }
+        if (ax == 1) { return rank - 1; }
+        return ax - 1;
+    };
+    std::vector<int64_t> cl_axes;
+    for (const int64_t a : axes) { cl_axes.push_back(to_cl_axis(a)); }
 
     ReduceAttributes attrs;
     attrs.type = type;
-    attrs.axes = std::span<const int64_t>(axes.data(), axes.size());
+    attrs.axes = std::span<const int64_t>(cl_axes.data(), cl_axes.size());
     attrs.keepdims = keepdims;
     auto op = Reduce::create(attrs, Backend::CPU);
 
-    const TensorDesc channel_first_in[] = {in_channel_first.desc()};
-    auto ref_desc = op->getOutputTensorDesc(channel_first_in);
-    std::vector<float> ref_buf(static_cast<size_t>(ref_desc[0].numel()));
-    auto ref_out = test::make_channel_first(ref_desc[0], ref_buf.data());
-    const TensorView ref_ins[] = {in_channel_first};
-    op->compute(ref_out, ref_ins);
-
-    std::vector<float> cl_buf;
-    const TensorLayout cl_layout =
-        (shape.size() == 5) ? TensorLayout::NDHWC : TensorLayout::NHWC;
-    auto in_cl = to_layout(in_channel_first, cl_layout, cl_buf);
-
     const TensorDesc cl_in[] = {in_cl.desc()};
     auto cl_desc = op->getOutputTensorDesc(cl_in);
-    NNOPS_EXPECT_EQ(cl_desc[0].rank, ref_desc[0].rank);
-    for (int64_t d = 0; d < cl_desc[0].rank; ++d) {
-        NNOPS_EXPECT_EQ(cl_desc[0].dims[static_cast<size_t>(d)],
-                        ref_desc[0].dims[static_cast<size_t>(d)]);
-    }
-    // A rank-preserving output stays NHWC; a rank-dropping one is Dense.
-    const TensorLayout channel_first_layout =
-        TensorLayout::Dense;
-    NNOPS_EXPECT_EQ(cl_desc[0].layout, keepdims ? cl_layout : channel_first_layout);
+    // A rank-preserving output stays channel-last; a rank-dropping one is Dense.
+    NNOPS_EXPECT_EQ(cl_desc[0].layout, keepdims ? cl_layout : TensorLayout::Dense);
 
-    std::vector<float> out_buf(
-        static_cast<size_t>(cl_desc[0].storage_bytes() / sizeof(float)));
+    std::vector<char> out_buf(static_cast<size_t>(cl_desc[0].storage_bytes()));
     auto out_cl = test::make_packed(cl_desc[0], out_buf.data());
     const TensorView cl_ins[] = {in_cl};
     op->compute(out_cl, cl_ins);
 
-    NNOPS_EXPECT_TRUE(same_logical_f32(out_cl, ref_out));
+    // Reference over the channel-last logical dims: the physical buffer of an
+    // NHWC/NDHWC plane *is* row-major in that order.
+    const std::vector<int64_t> cl_shape(in_cl.shape(), in_cl.shape() + rank);
+    auto ref_buf = reduce_reference(cl_shape, cl_buf, cl_axes, type, keepdims);
+    std::vector<int64_t> ref_dims;
+    for (int64_t d = 0; d < rank; ++d) {
+        bool reduced = false;
+        for (const int64_t a : cl_axes) { reduced = reduced || (a == d); }
+        if (reduced && !keepdims) { continue; }
+        ref_dims.push_back(reduced ? int64_t(1) : cl_shape[static_cast<size_t>(d)]);
+    }
+    TensorView ref_view(std::span<const int64_t>(ref_dims.data(), ref_dims.size()),
+                        DataType::f32, ref_buf.data(),
+                        keepdims ? cl_layout : TensorLayout::Dense);
+
+    NNOPS_EXPECT_TRUE(same_logical_f32(out_cl, ref_view));
 }
 
 void check_reduce_layout(const std::vector<int64_t>& shape,
@@ -779,7 +806,8 @@ std::vector<float> reduce_reference(const std::vector<int64_t>& shape,
 }  // anonymous namespace
 
 NNOPS_TEST(reduce_nhwc_axis_c_sum) {
-    // Hand-checked: C is contiguous in NHWC, so this is the SIMD row path.
+    // Hand-checked: C is the last axis and contiguous in NHWC, so this is the
+    // SIMD row path.
     const int64_t N = 1, C = 4, H = 1, W = 3;
     float in_channel_first_data[] = {
         1.0f, 2.0f, 3.0f,        // c=0
@@ -795,7 +823,7 @@ NNOPS_TEST(reduce_nhwc_axis_c_sum) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Sum;
-    attrs.axes = {1};
+    attrs.axes = {3};  // C is the last axis
     auto op = Reduce::create(attrs, Backend::CPU);
 
     const TensorDesc in_desc[] = {in_cl.desc()};

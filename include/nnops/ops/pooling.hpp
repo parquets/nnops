@@ -74,7 +74,7 @@ struct PoolingAttributes {
     }
 };
 
-/// 2D: [N, C, IH, IW] → [N, C, OH, OW]; 3D adds a D axis; global → [N, C, 1, ...].
+/// 2D: [N, IH, IW, C] → [N, OH, OW, C]; 3D adds a D axis; global → [N, 1, ..., C].
 class Pooling : public OpBase {
 public:
     static std::unique_ptr<Pooling> create(const PoolingAttributes& attrs,

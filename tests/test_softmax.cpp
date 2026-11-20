@@ -164,10 +164,10 @@ NNOPS_TEST(softmax_random) {
 // Layout coverage — dense and NHWC
 // ============================================================
 //
-// Both families keep the logical dims [N][C][H][W]; only the physical order
-// differs. Every axis is compared against a reference that re-derives the
-// offsets from that order on its own, so an axis walked with the wrong stride
-// cannot pass. Dimensions stay <= 16 so a group fits a stack array.
+// A channel-last tensor's logical dims [N][H][W][C] are its physical order.
+// Every axis is compared against a reference that re-derives the offsets from
+// that order on its own, so an axis walked with the wrong stride cannot pass.
+// Dimensions stay <= 16 so a group fits a stack array.
 
 template <typename Off>
 static std::vector<float> layout_softmax_reference(const std::vector<float>& in,
@@ -249,21 +249,21 @@ NNOPS_TEST(softmax_all_axes) {
     // C = 12 is a full one plus a half; the channel axis itself is one NHWC
     // row, whose own tail is the last group's.
     for (const int64_t C : {int64_t{5}, int64_t{12}}) {
-        const int64_t dims[4] = {2, C, 3, 4};
-        const int64_t H = dims[2], W = dims[3];
+        const int64_t dims[4] = {2, 3, 4, C};
+        const int64_t H = dims[1], W = dims[2];
 
         auto [in_data, view] = test::make_random_tensor({dims[0], C, H, W}, -2.0f, 2.0f, 13);
         (void)view;
 
         check_all_axes(in_data, dims, TensorLayout::NHWC,
-                       [&](int64_t n, int64_t c, int64_t h, int64_t w) {
+                       [&](int64_t n, int64_t h, int64_t w, int64_t c) {
                            return ((n * H + h) * W + w) * C + c;
                        });
     }
 }
 
 NNOPS_TEST(softmax_2d_channel) {
-    // Rank-2 NHWC is still [N][C]: axis 1 is one contiguous pixel.
+    // Rank-2 NHWC is [N][C]: axis 1 is the channel axis and one contiguous pixel.
     const int64_t N = 3, C = 5;
     const int64_t shape[] = {N, C};
 
@@ -295,7 +295,7 @@ NNOPS_TEST(softmax_2d_channel) {
 
 NNOPS_TEST(softmax_channel_axis_f16) {
     const int64_t N = 1, C = 10, H = 2, W = 2;
-    const int64_t shape[] = {N, C, H, W};
+    const int64_t shape[] = {N, H, W, C};
 
     auto [f32_buf, view] = test::make_random_tensor({N, C, H, W}, -2.0f, 2.0f, 23);
     (void)view;
@@ -303,7 +303,7 @@ NNOPS_TEST(softmax_channel_axis_f16) {
     TensorView input(shape, DataType::f16, f16_buf.data(), TensorLayout::NHWC);
 
     SoftmaxAttributes attrs;
-    attrs.axis = 1;
+    attrs.axis = 3;  // the channel axis is the last one
     auto op = Softmax::create(attrs, Backend::CPU);
 
     std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(N * C * H * W));

@@ -87,7 +87,7 @@ void run_case(const Geom& g)
     // NHWC activation [N, L, C], filter [K, IC/G, OC].
     auto cl_in_vec = test::to_channel_last<float>(in_vec, g.N, g.IC, g.L);
     auto hwio_vec = test::oihw_to_hwio<float>(w_vec, g.OC, ICG, 1, g.K);
-    const int64_t cl_shape[] = {g.N, g.IC, g.L};
+    const int64_t cl_shape[] = {g.N, g.L, g.IC};   // channel-last
     const int64_t hw_shape[] = {g.K, ICG, g.OC};
     TensorView cl_in(std::span<const int64_t>(cl_shape, 3), DataType::f32, cl_in_vec.data(),
                      TensorLayout::NHWC);
@@ -97,13 +97,15 @@ void run_case(const Geom& g)
     const TensorDesc cl_ds[] = {cl_in.desc(), hwio.desc()};
     auto cl_out_d = op->getOutputTensorDesc(cl_ds);
     NNOPS_EXPECT_TRUE(cl_out_d[0].layout == TensorLayout::NHWC);
-    const int64_t OL = cl_out_d[0].dims[2];
+    const int64_t OL = cl_out_d[0].dims[1];   // [N, OL, OC]
 
     // The expectation: the 2D reference on the same logical values, in the
     // dense order it reads.
     std::vector<float> ref_buf(static_cast<size_t>(cl_out_d[0].numel()));
     {
-        TensorView ref3(std::span<const int64_t>(cl_out_d[0].dims.data(), 3),
+        // Dense [N, OC, OL]: the order the 2D reference reads.
+        const int64_t ref_dims[] = {g.N, g.OC, OL};
+        TensorView ref3(std::span<const int64_t>(ref_dims, 3),
                         DataType::f32, ref_buf.data(), TensorLayout::Dense);
         ComputeContext ctx;
         TensorView ref4 = wide_act(ref3);

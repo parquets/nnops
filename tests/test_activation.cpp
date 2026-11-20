@@ -427,7 +427,7 @@ NNOPS_TEST(activation_quick_gelu) {
 }
 
 // ============================================================
-// PRelu — the slope is a second input, one per logical channel (dim 1)
+// PRelu — the slope is a second input, one per logical channel (the last dim)
 // ============================================================
 
 NNOPS_TEST(activation_prelu_nhwc) {
@@ -437,8 +437,8 @@ NNOPS_TEST(activation_prelu_nhwc) {
     for (int64_t c = 0; c < C; ++c) { slope_data[c] = 0.1f * (c + 1); }
 
     auto cl = test::to_channel_last<float>(in_vec, N, C, H * W);
-    // Logical shape stays [N, C, H, W]; the NHWC tag changes only the storage.
-    const int64_t in_shape[] = {N, C, H, W};
+    // Logical dims are already channel-last: [N, H, W, C].
+    const int64_t in_shape[] = {N, H, W, C};
     TensorView input(in_shape, DataType::f32, cl.data(), TensorLayout::NHWC);
 
     const int64_t sshape[] = {C};
@@ -473,7 +473,7 @@ NNOPS_TEST(activation_prelu_single_slope) {
     auto [in_vec, input_cf] = test::make_random_tensor({N, C, H, W}, -4.0f, 4.0f);
     (void)input_cf;
     auto cl = test::to_channel_last<float>(in_vec, N, C, H * W);
-    const int64_t in_shape[] = {N, C, H, W};
+    const int64_t in_shape[] = {N, H, W, C};
     TensorView input(in_shape, DataType::f32, cl.data(), TensorLayout::NHWC);
 
     float slope_data[] = {0.25f};
