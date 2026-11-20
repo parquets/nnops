@@ -18,6 +18,7 @@
 /// The packed weight tags describe filter blobs produced by prepackWeights,
 /// never activations.
 
+#include <cstddef>
 #include <cstdint>
 
 namespace nnops {
@@ -99,7 +100,12 @@ enum class TensorLayout : uint8_t {
     // apart under linear_before_reset). Opaque and self-describing — the blob
     // leads with its own header, so a compute() handed one reads it in place
     // instead of running the interleave and the two pack passes.
-    PackedRecurrent = 11,
+    //
+    // 15, not 11: 11 is PackedBSme, and this tag held the same value until the
+    // guard below was added. Numbering is append-only — a new tag takes the next
+    // free value and an old one is never renumbered, so a value that outlives a
+    // build still means what it meant.
+    PackedRecurrent = 15,
 
     // ---- dense row-major, no channel-axis semantics ----
     //
@@ -111,6 +117,41 @@ enum class TensorLayout : uint8_t {
     // artifact buffers, reference data).
     Dense = 12,
 };
+
+/// Every tag above, so the check below cannot be silently outgrown: a value
+/// left out of this list is a value the collision guard does not see.
+constexpr TensorLayout kAllTensorLayouts[] = {
+    TensorLayout::NHWC,
+    TensorLayout::NDHWC,
+    TensorLayout::HWIO,
+    TensorLayout::PackedWinoWeightLast,
+    TensorLayout::HWCM,
+    TensorLayout::PackedHWIO,
+    TensorLayout::PackedHWIOSme,
+    TensorLayout::PackedHWIOCuda,
+    TensorLayout::PackedB,
+    TensorLayout::PackedBSme,
+    TensorLayout::PackedRecurrent,
+    TensorLayout::Dense,
+};
+
+/// Two tags sharing a value makes every predicate on them wrong at once —
+/// PackedBSme and PackedRecurrent both read 11, which quietly made
+/// is_packed_recurrent() true of an SME matmul panel. No rank, no arithmetic
+/// and no wire format depends on what these numbers are, only on their being
+/// distinct.
+static_assert([] {
+                  constexpr size_t n = sizeof(kAllTensorLayouts) / sizeof(kAllTensorLayouts[0]);
+                  for (size_t i = 0; i < n; ++i) {
+                      for (size_t j = i + 1; j < n; ++j) {
+                          if (kAllTensorLayouts[i] == kAllTensorLayouts[j]) {
+                              return false;
+                          }
+                      }
+                  }
+                  return true;
+              }(),
+              "TensorLayout values must be distinct");
 
 /// True for the spatial layouts, NHWC and NDHWC.
 constexpr bool is_channel_last(TensorLayout layout) noexcept {
