@@ -426,7 +426,7 @@ void tconv_gemm_f_kernel(ConvParams pin)
 
     extern __shared__ __align__(16) unsigned char tconv_smem[];
     float* const sAbase = reinterpret_cast<float*>(tconv_smem);
-    float* const sBbase = sAbase + ST * S::kAMax;
+    float* const sBbase = sAbase + ST * S::a_panel(false);
 
     const int k_tiles = (K + BK - 1) / BK;
     constexpr int per = S::threads / BK; // filter rows per round
@@ -437,8 +437,8 @@ void tconv_gemm_f_kernel(ConvParams pin)
             return;
         }
         const int k0 = kt * BK;
-        float* const sA = sAbase + stage * S::kAMax;
-        float* const sB = sBbase + stage * S::kBMax;
+        float* const sA = sAbase + stage * S::a_panel(false);
+        float* const sB = sBbase + stage * S::b_panel(false);
         if (p.fill_vec) {
             conv_fill_a_vec<Elem, BK>(p, TConvFPanel{sA}, stage, in, rows, k0);
         } else {
@@ -477,8 +477,9 @@ void tconv_gemm_f_kernel(ConvParams pin)
         cp_async_wait_group<ST - 2>();
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
-        f32_gemm_tile<S, false, false>(sAbase + stage * S::kAMax,
-                                            sBbase + stage * S::kBMax, warp_m, warp_n, lane, acc);
+        f32_gemm_tile<S, false, false>(sAbase + stage * S::a_panel(false),
+                                            sBbase + stage * S::b_panel(false), warp_m, warp_n,
+                                            lane, acc);
     }
 
     Elem const* bias =
@@ -598,7 +599,7 @@ void launch_tconv_gemm_h(const ConvParams& p, int m_max, cudaStream_t stream)
 inline void launch_tconv_gemm_f(const ConvParams& p, int m_max, cudaStream_t stream)
 {
     using S = ConvShapeF;
-    constexpr int smem = S::stages * (S::kAMax + S::kBMax) * int(sizeof(float));
+    constexpr int smem = S::panel_bytes(false, false);
     auto kernel = tconv_gemm_f_kernel;
     static const cudaError_t cfg =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);

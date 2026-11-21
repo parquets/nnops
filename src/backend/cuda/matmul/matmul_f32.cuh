@@ -74,12 +74,18 @@ struct F32TileShape {
     static constexpr int kKSteps = BK / KU;
     static constexpr int kVecPerRow = BK / KU;
     static constexpr int kRowsPerPass = threads / kVecPerRow;
-    /// One buffer serves every pose: each panel is sized to the larger of its
-    /// two orders.
-    static constexpr int kAMax = BM * LDA > BK* LDAt ? BM* LDA : BK* LDAt;
-    static constexpr int kBMax = BN * LDk > BK* LDN ? BN* LDk : BK* LDN;
-    static constexpr int kPanelFloats = stages * (kAMax + kBMax);
-    static constexpr int kSmemBytes = kPanelFloats * int(sizeof(float));
+    /// A panel holds one operand in one arrival order, so a pose pays for the
+    /// order it is handed and not the other: A is `[m][k]` -- BM rows of LDA --
+    /// or `[k][m]`, BK rows of LDAt; B is `[n][k]` or `[k][n]` the same way.
+    /// The two orders differ by the pad times the other dimension, which is
+    /// 10-30% of a panel, so sizing both to the larger cost the kernel bytes it
+    /// never touched.
+    static constexpr int a_panel(bool trans_a) { return trans_a ? BK * LDAt : BM * LDA; }
+    static constexpr int b_panel(bool trans_b) { return trans_b ? BN * LDk : BK * LDN; }
+    static constexpr int panel_bytes(bool trans_a, bool trans_b)
+    {
+        return stages * (a_panel(trans_a) + b_panel(trans_b)) * int(sizeof(float));
+    }
 
     static_assert(BK % KU == 0, "the k unroll must divide the stage depth");
     static_assert(LaneCol % 4 == 0, "a lane's columns fill whole 16 B vectors in the n-major pose");

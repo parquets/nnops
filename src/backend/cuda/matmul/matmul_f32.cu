@@ -23,10 +23,14 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void f32_gemm_kernel(F32P
     constexpr int KU = S::KU, LR = S::LaneRow, LC = S::LaneCol;
     constexpr int LDA = TransA ? S::LDAt : S::LDA;
     constexpr int LDK = TransB ? S::LDk : S::LDN;
+    // This pose's panel sizes: what the launch above asked for, and all this
+    // kernel ever addresses.
+    constexpr int kAPanel = S::a_panel(TransA);
+    constexpr int kBPanel = S::b_panel(TransB);
 
     extern __shared__ __align__(16) unsigned char f32_smem[];
     float* const sAbase = reinterpret_cast<float*>(f32_smem);
-    float* const sBbase = sAbase + ST * S::kAMax;
+    float* const sBbase = sAbase + ST * kAPanel;
 
     const int tid = int(threadIdx.x);
     const int warp = tid / 32;
@@ -112,8 +116,8 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void f32_gemm_kernel(F32P
             return;
         }
         const int k0 = kt * BK;
-        float* const sA = sAbase + stage * S::kAMax;
-        float* const sB = sBbase + stage * S::kBMax;
+        float* const sA = sAbase + stage * kAPanel;
+        float* const sB = sBbase + stage * kBPanel;
         // Block-level fullness, decided once per k tile: an interior tile fills
         // with no bounds test at all. Per-vector tests were 41 ISETP per k tile
         // in the SASS body and the FFMA density sat at 72%.
@@ -248,8 +252,8 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void f32_gemm_kernel(F32P
         __syncthreads();
         fill(kt + ST - 1, (kt + ST - 1) % ST);
 
-        f32_gemm_tile<S, TransA, TransB>(sAbase + stage * S::kAMax,
-                                              sBbase + stage * S::kBMax, warp_m, warp_n, lane,
+        f32_gemm_tile<S, TransA, TransB>(sAbase + stage * kAPanel,
+                                              sBbase + stage * kBPanel, warp_m, warp_n, lane,
                                               acc);
     }
 
@@ -373,7 +377,7 @@ using Tile8 = F32TileShape<8, 8, 2, 2, 16, 2, 4, 8, 0, 4>; ///< 128x64, 128 thr
 using Tile9 = F32TileShape<8, 4, 1, 4, 16, 2, 4, 8, 4, 4>;
 
 struct TileDesc {
-    int bm, bn, bk, threads, smem_bytes;
+    int bm, bn, bk, threads;
 };
 
 constexpr int kTileCount = 10;
@@ -382,16 +386,16 @@ constexpr int kTileCount = 10;
 /// say so — a named row is the only thing that reads it, and a missing row is a
 /// zero descriptor the grid gate would divide by.
 constexpr TileDesc kTileTable[kTileCount] = {
-    {Tile0::BM, Tile0::BN, Tile0::BK, Tile0::threads, Tile0::kSmemBytes},
-    {Tile1::BM, Tile1::BN, Tile1::BK, Tile1::threads, Tile1::kSmemBytes},
-    {Tile2::BM, Tile2::BN, Tile2::BK, Tile2::threads, Tile2::kSmemBytes},
-    {Tile3::BM, Tile3::BN, Tile3::BK, Tile3::threads, Tile3::kSmemBytes},
-    {Tile4::BM, Tile4::BN, Tile4::BK, Tile4::threads, Tile4::kSmemBytes},
-    {Tile6::BM, Tile6::BN, Tile6::BK, Tile6::threads, Tile6::kSmemBytes},
-    {Tile9::BM, Tile9::BN, Tile9::BK, Tile9::threads, Tile9::kSmemBytes},
-    {Tile7::BM, Tile7::BN, Tile7::BK, Tile7::threads, Tile7::kSmemBytes},
-    {Tile8::BM, Tile8::BN, Tile8::BK, Tile8::threads, Tile8::kSmemBytes},
-    {Tile9::BM, Tile9::BN, Tile9::BK, Tile9::threads, Tile9::kSmemBytes},
+    {Tile0::BM, Tile0::BN, Tile0::BK, Tile0::threads},
+    {Tile1::BM, Tile1::BN, Tile1::BK, Tile1::threads},
+    {Tile2::BM, Tile2::BN, Tile2::BK, Tile2::threads},
+    {Tile3::BM, Tile3::BN, Tile3::BK, Tile3::threads},
+    {Tile4::BM, Tile4::BN, Tile4::BK, Tile4::threads},
+    {Tile6::BM, Tile6::BN, Tile6::BK, Tile6::threads},
+    {Tile9::BM, Tile9::BN, Tile9::BK, Tile9::threads},
+    {Tile7::BM, Tile7::BN, Tile7::BK, Tile7::threads},
+    {Tile8::BM, Tile8::BN, Tile8::BK, Tile8::threads},
+    {Tile9::BM, Tile9::BN, Tile9::BK, Tile9::threads},
 };
 
 constexpr int kDefaultTile = 0;
@@ -534,15 +538,19 @@ int f32_splits(const F32Call& call, const TileDesc& tile)
 template <class S> bool f32_prepare()
 {
     static const bool ok = [] {
-        const int bytes = S::kSmemBytes;
-        const auto set = [bytes](const void* fn) {
+        // Each pose asks for what its own panels need; the four differ.
+        const auto set = [](const void* fn, int bytes) {
             return cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) ==
                    cudaSuccess;
         };
-        if (!set(reinterpret_cast<const void*>(&f32_gemm_kernel<S, false, true>)) ||
-            !set(reinterpret_cast<const void*>(&f32_gemm_kernel<S, false, false>)) ||
-            !set(reinterpret_cast<const void*>(&f32_gemm_kernel<S, true, true>)) ||
-            !set(reinterpret_cast<const void*>(&f32_gemm_kernel<S, true, false>))) {
+        if (!set(reinterpret_cast<const void*>(&f32_gemm_kernel<S, false, true>),
+                 S::panel_bytes(false, true)) ||
+            !set(reinterpret_cast<const void*>(&f32_gemm_kernel<S, false, false>),
+                 S::panel_bytes(false, false)) ||
+            !set(reinterpret_cast<const void*>(&f32_gemm_kernel<S, true, true>),
+                 S::panel_bytes(true, true)) ||
+            !set(reinterpret_cast<const void*>(&f32_gemm_kernel<S, true, false>),
+                 S::panel_bytes(true, false))) {
             cudaGetLastError();
             return false;
         }
@@ -593,7 +601,7 @@ template <class S> bool f32_run(const F32Call& call, cudaStream_t stream)
 
     const dim3 grid(unsigned((call.m + S::BM - 1) / S::BM), unsigned((call.n + S::BN - 1) / S::BN),
                     1);
-    const TileDesc tile{S::BM, S::BN, S::BK, S::threads, S::kSmemBytes};
+    const TileDesc tile{S::BM, S::BN, S::BK, S::threads};
     int splits = f32_splits(call, tile);
     float* partial = nullptr;
     if (splits > 1) {
@@ -605,15 +613,18 @@ template <class S> bool f32_run(const F32Call& call, cudaStream_t stream)
     }
 
     const auto launch = [&](const dim3& g) {
-        const unsigned blocks = S::kSmemBytes;
         if (call.trans_a && call.trans_b) {
-            f32_gemm_kernel<S, true, true><<<g, S::threads, blocks, stream>>>(q);
+            f32_gemm_kernel<S, true, true>
+                <<<g, S::threads, S::panel_bytes(true, true), stream>>>(q);
         } else if (call.trans_a) {
-            f32_gemm_kernel<S, true, false><<<g, S::threads, blocks, stream>>>(q);
+            f32_gemm_kernel<S, true, false>
+                <<<g, S::threads, S::panel_bytes(true, false), stream>>>(q);
         } else if (call.trans_b) {
-            f32_gemm_kernel<S, false, true><<<g, S::threads, blocks, stream>>>(q);
+            f32_gemm_kernel<S, false, true>
+                <<<g, S::threads, S::panel_bytes(false, true), stream>>>(q);
         } else {
-            f32_gemm_kernel<S, false, false><<<g, S::threads, blocks, stream>>>(q);
+            f32_gemm_kernel<S, false, false>
+                <<<g, S::threads, S::panel_bytes(false, false), stream>>>(q);
         }
     };
     if (splits > 1) {
