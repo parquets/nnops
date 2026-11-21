@@ -23,6 +23,8 @@
 #include "backend/cpu/simd_kernel/activation_kernels.hpp"
 #include "backend/cpu/simd_kernel/tiled_map.hpp"
 
+#include <cmath>
+
 namespace nnops::backend::cpu {
 
 /// True for the gated activations this helper implements.
