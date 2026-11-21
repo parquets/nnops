@@ -247,7 +247,13 @@ template <class T> struct SmeFpRoute : FpRoute<T> {
     static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc, int n_start,
                        int nc, T* dst, int /*ldd*/, bool /*a_biased*/)
     {
-        NNOPS_ASSERT(!b.blocked());
+        // A Q4_1 B is a block stream: the decode fuses into the panel pack, so
+        // the kernels still read rows of T.
+        if (b.blocked()) {
+            tile_pack_rhs_q4_1_sme(attrs.transpose_b, n_start, nc, k, kc, dst, b.ptr,
+                                   b.row_blocks, attrs.alpha);
+            return;
+        }
         const T* base = static_cast<const T*>(b.ptr);
         const T* src = attrs.transpose_b ? base + n_start * b.ldb + k
                                          : base + k * b.ldb + n_start;
@@ -384,13 +390,16 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
     }
 
 #if defined(NNOPS_ARCH_SME)
-    // Dense f32/f16 on the ZA tiles, before the plan. The route packs A, so a
-    // transposed A is fine; alpha rides the generic RHS pack, which this route
-    // does not have. A raw B keeps the small-shape gate, but a prepacked blob
-    // has no other reader.
+    // Dense f32/f16 on the ZA tiles, before the plan, plus a Q4_1 B decoded
+    // straight into those panels. The route packs A, so a transposed A is
+    // fine; alpha rides the generic RHS pack, which this route does not have —
+    // except for a Q4_1 decode, which folds it into every weight as the NEON
+    // route does. A raw B keeps the small-shape gate, but a prepacked blob has
+    // no other reader.
     const bool sme_blob = b.layout() == TensorLayout::PackedBSme;
-    if ((dt_a == DataType::f32 || dt_a == DataType::f16) && same_type && !block_b &&
-        attrs.alpha == 1.0f && aarch64::available_sme() &&
+    const bool sme_pair = (dt_a == DataType::f32 || dt_a == DataType::f16) &&
+                          (same_type || block_b);
+    if (sme_pair && (attrs.alpha == 1.0f || block_b) && aarch64::available_sme() &&
         (!is_packed_matmul_b(b.layout()) || sme_blob)) {
         const auto [M, N, K] = matmul_dims(attrs, a, b);
         if ((sme_blob || (M > 4 && N >= 16)) && K > 0) {

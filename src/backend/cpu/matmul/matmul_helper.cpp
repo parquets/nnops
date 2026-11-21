@@ -47,6 +47,7 @@
 #include "backend/cpu/aarch64/sme/mma_f32_sme.hpp"
 #include "backend/cpu/aarch64/sme/pack_f16_sme.hpp"
 #include "backend/cpu/aarch64/sme/pack_f32_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_q4_1_sme.hpp"
 #endif
 
 #ifdef NNOPS_ARCH_X86_64
@@ -850,6 +851,18 @@ void tile_pack_rhs_sme(bool trans, int nc, int kc, half* dst, const half* src, i
     aarch64::pack_b_f16_sme(nc, kc, dst, src, lds, trans);
 }
 
+void tile_pack_rhs_q4_1_sme(bool trans, int n_start, int nc, int k_start, int kc, float* dst,
+                            const void* src, int64_t src_row_blocks, float scale) noexcept
+{
+    aarch64::pack_q4_1_b_sme(trans, n_start, nc, k_start, kc, dst, src, src_row_blocks, scale);
+}
+
+void tile_pack_rhs_q4_1_sme(bool trans, int n_start, int nc, int k_start, int kc, half* dst,
+                            const void* src, int64_t src_row_blocks, float scale) noexcept
+{
+    aarch64::pack_q4_1_b_sme(trans, n_start, nc, k_start, kc, dst, src, src_row_blocks, scale);
+}
+
 void tile_mma_pack_sme(int mc, int nc, int kc, float* c, int ldc, const float* packed_a,
                        const float* b, int64_t block_stride, float clamp_min, float clamp_max,
                        bool zero_mode, const float* col_bias)
@@ -1102,8 +1115,10 @@ MatMulPlan get_matmul_plan_sme(const MatMulAttributes& attrs, const TensorDesc& 
     const DataType dt_a = a_desc.dtype;
     const DataType dt_b = b_desc.dtype;
     const bool i8_pair = is_int8_matmul(dt_a, dt_b);
-    const bool fp_pair =
-        (dt_a == DataType::f32 || dt_a == DataType::f16) && dt_b == dt_a;
+    // A Q4_1 B decodes into the activation's element type, so it rides the fp
+    // pair without being one.
+    const bool fp_pair = (dt_a == DataType::f32 || dt_a == DataType::f16) &&
+                         (dt_b == dt_a || is_block_packed_dtype(dt_b));
     if ((!i8_pair && !fp_pair) || a_desc.rank < 2 || b_desc.rank < 2) {
         return plan;
     }
@@ -1111,10 +1126,6 @@ MatMulPlan get_matmul_plan_sme(const MatMulAttributes& attrs, const TensorDesc& 
     const bool packed_b = is_packed_matmul_b(b_desc.layout);
     // Only the ZA blob is readable here; a NEON panel blob is another route's.
     if (packed_b && b_desc.layout != TensorLayout::PackedBSme) {
-        return plan;
-    }
-    // A block-quantised B has no SME kernel.
-    if (!packed_b && is_block_packed_dtype(dt_b)) {
         return plan;
     }
 
@@ -1159,7 +1170,9 @@ MatMulPlan get_matmul_plan_sme(const MatMulAttributes& attrs, const TensorDesc& 
     plan.kc = kc;
     plan.split_n = true;
     plan.pack_a = true;
-    plan.ldd_b = sme_b_panel_stride(dt_b, kc);
+    // Panels are sized by the decoded element type: a Q4_1 B is its A's dtype
+    // once unpacked.
+    plan.ldd_b = sme_b_panel_stride(dt_a, kc);
     plan.ldd_a = sme_a_panel_stride(dt_a, kc);
     plan.np_a = i8_pair ? (mc + aarch64::sme_mr - 1) / aarch64::sme_mr :
                           (mc + 2 * aarch64::sme_mr - 1) / (2 * aarch64::sme_mr);

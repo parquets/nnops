@@ -45,7 +45,9 @@
 /// f16 A), which keeps these rows comparable with the dense ones; what is under
 /// test is 0.625 bytes/value against 4 or 2 — pack/decode cost traded against
 /// weight bandwidth. The GEMV gate and the fused small-M kernels are the two ends
-/// of that trade, and the balance shifts with M.
+/// of that trade, and the balance shifts with M. On an SME build the planned
+/// route decodes into the ZA panels instead; matmul_q4_sme_ab reads that engine
+/// against the generic one on the same stream.
 ///
 /// dq route (fp activations × s8 weights, fp out): quantization parameters are
 /// fixed offline, A arrives as f32/f16, B is s8 with one scale per output
@@ -425,7 +427,22 @@ GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int i
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
 
-    const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
+    // The route the call will take. Past the fused small-M limits a Q4_1 B is
+    // the planned route, and on an SME machine that is the ZA plan.
+    [[maybe_unused]] constexpr bool sme_dtype =
+        std::is_same_v<T, float> || std::is_same_v<T, half>;
+    [[maybe_unused]] const int fused_max =
+        c.tb ? (std::is_same_v<T, half> ? cpu::arch::Q4Block::fused_max_m_trans_f16 :
+                                          cpu::arch::Q4Block::fused_max_m_trans) :
+               cpu::arch::Q4Block::fused_max_m_copy;
+    bool sme_route = false;
+#if defined(NNOPS_ARCH_SME)
+    sme_route = sme_dtype && cpu::aarch64::available_sme() && c.M > 4 && c.N >= 16 && c.K > 0 &&
+                c.M > fused_max && attrs.alpha == 1.0f;
+#endif
+    const cpu::MatMulPlan plan = sme_route ?
+                                     cpu::get_matmul_plan_sme(attrs, a_desc, b_desc, 1) :
+                                     cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
 
     std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = test::make_channel_first(descs[0], out_buf.data());
@@ -433,7 +450,7 @@ GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int i
 
     GeMMReport rep;
     rep.name = c.name;
-    rep.route = plan.split_n ? "q4-NKM" : "q4-MKN";
+    rep.route = sme_route ? "q4-SME" : (plan.split_n ? "q4-NKM" : "q4-MKN");
     rep.unit = "GFLOPS";
     rep.pack_a = plan.pack_a;
     rep.pack_b = true;
@@ -478,6 +495,66 @@ void bench_q4_case(const GeMMCase& c) {
         threads.push_back(hw);
     }
     print_report(run_geMM_q4<T>(c, threads, iters));
+}
+
+/// The Q4_1 twin of bench_sme_ab: the same block stream through the ZA tiles and
+/// through the generic tiled engine, one op object, interleaved round by round.
+/// Both arms fuse the decode into their own panel layout, so the ratio is the
+/// kernel plus the two packs — a shape the ZA route declines (M or N below its
+/// gate) reads 1.000.
+template <typename T>
+void bench_q4_sme_ab(const char* tag, int64_t M, int64_t K, int64_t N, bool transpose_b,
+                     int rounds = 4, int iters = 20) {
+    if (!cpu::aarch64::available_sme()) {
+        std::printf("  Q4 SME A/B %s skipped: no SME kernels on this build or CPU\n", tag);
+        return;
+    }
+    const int64_t b_rows = transpose_b ? N : K;
+    const int64_t b_cols = transpose_b ? K : N;
+    auto [a_vec, a] = make_tensor<T>(M, K, K, 1);
+    auto [b_vec, b] = make_tensor_q4(b_rows, b_cols, 2);
+
+    MatMulAttributes attrs{};
+    attrs.transpose_b = transpose_b;
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto out = test::make_channel_first(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+
+    auto timed = [&](bool sme_on) {
+        detail::disable_sme.store(sme_on ? 0 : 1, std::memory_order_relaxed);
+        for (int i = 0; i < 2; ++i) {
+            op->compute(out, ins);
+        }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            op->compute(out, ins);
+        }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return 2.0 * static_cast<double>(M) * static_cast<double>(N) *
+               static_cast<double>(K) * static_cast<double>(iters) / (ms * 1e6);
+    };
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+
+    std::printf("  Q4 SME A/B %s  %lldx%lldx%lld%s  1T  rounds=%d iters=%d\n", tag,
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), transpose_b ? " tb" : "", rounds, iters);
+    std::vector<double> off, on;
+    for (int r = 0; r < rounds; ++r) {
+        off.push_back(timed(false));
+        on.push_back(timed(true));
+        std::printf("    round %d:  generic=%7.1f  sme=%7.1f   sme/generic=%.3f\n", r,
+                    off.back(), on.back(), on.back() / off.back());
+    }
+    detail::disable_sme.store(0, std::memory_order_relaxed);
+    std::printf("    median:   generic=%7.1f  sme=%7.1f   sme/generic=%.3f\n", median(off),
+                median(on), median(on) / median(off));
 }
 
 // ---- controlled A/B between two routes ------------------------------------
@@ -1754,6 +1831,18 @@ NNOPS_BENCH(matmul_q4_decode) {
     // The block bytes swept per call print as "B=... MB" next to the tiles.
     bench_q4_case<float>({"q4/f32 decode 1x4096x4096", 1, 4096, 4096,
                           /*ta=*/false, /*tb=*/true});
+}
+
+NNOPS_BENCH(matmul_q4_sme_ab) {
+    // The ZA tiles against the generic engine on the same block stream, both
+    // physical B layouts. M is past the fused small-M limits, so the planned
+    // route is the one under test.
+    bench_q4_sme_ab<float>("f32", 512, 2048, 2048, /*tb=*/true);
+    bench_q4_sme_ab<float>("f32", 512, 2048, 2048, /*tb=*/false);
+    bench_q4_sme_ab<float>("f32", 128, 4096, 4096, /*tb=*/true, 4, 8);
+    bench_q4_sme_ab<half>("f16", 512, 2048, 2048, /*tb=*/true);
+    bench_q4_sme_ab<half>("f16", 512, 2048, 2048, /*tb=*/false);
+    bench_q4_sme_ab<half>("f16", 128, 4096, 4096, /*tb=*/true, 4, 8);
 }
 
 NNOPS_BENCH(matmul_q4_pack_only) {

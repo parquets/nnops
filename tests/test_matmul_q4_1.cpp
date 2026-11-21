@@ -17,16 +17,23 @@
 /// matmul_q4_1_fused_small_m sweep that route's edges.
 
 #include "nnops/ops/matmul.hpp"
+#include "nnops/core/compute_context.hpp"
 #include "nnops/detail/q4_1.hpp"
 #include "backend/cpu/matmul/matmul_helper.h"
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme — the ZA route's gate
+#include "detail/bench_knobs.hpp"              // disable_sme — the ZA / NEON A/B pin
+#endif
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 using namespace nnops;
@@ -35,6 +42,60 @@ using nnops::test::bf16_to_f32;
 using nnops::test::f32_to_bf16;
 
 namespace {
+
+#if defined(NNOPS_ARCH_SME)
+/// A fixed-size claim-per-item pool, so the N-split runs on more than one
+/// worker (the default context is sequential).
+struct SimplePool {
+    explicit SimplePool(int nthreads) : nthreads_(nthreads)
+    {
+        cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
+            this->parallel_for(begin, end, body);
+        };
+        cpu.num_threads = [this] { return nthreads_; };
+        cpu.thread_id = [] { return current_thread_id_; };
+    }
+
+    void parallel_for(int64_t begin, int64_t end, const ParallelForBody& body)
+    {
+        std::atomic<int64_t> next{begin};
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nthreads_));
+        for (int t = 0; t < nthreads_; ++t) {
+            workers.emplace_back([&, t]() {
+                current_thread_id_ = t;
+                for (;;) {
+                    const int64_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= end) {
+                        break;
+                    }
+                    body(i);
+                }
+            });
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+    }
+
+    int nthreads_;
+    CpuBackend cpu;
+    inline static thread_local int current_thread_id_ = 0;
+};
+
+/// Pin the ZA route on or off for one test body, restoring the previous knob.
+struct SmePin {
+    explicit SmePin(bool on)
+        : previous(detail::disable_sme.load(std::memory_order_relaxed))
+    {
+        detail::disable_sme.store(on ? 0 : 1, std::memory_order_relaxed);
+    }
+    ~SmePin() { detail::disable_sme.store(previous, std::memory_order_relaxed); }
+    SmePin(const SmePin&) = delete;
+    SmePin& operator=(const SmePin&) = delete;
+    int previous;
+};
+#endif
 
 /// Row-major Q4_1 matrix (whole-block row padding) plus its logical values.
 struct Q4Matrix {
@@ -384,7 +445,10 @@ void run_case(const Case& c) {
 /// Batched A [2, M, K] × B [2, N, K]: the per-batch B offset is N·ceil(K/32)
 /// blocks, exercising the block-unit batch stride.
 NNOPS_TEST(matmul_q4_1_batched) {
-    constexpr int64_t B = 2, M = 4, N = 6, K = 70;
+    // N is wide enough for the SME route, so the larger M rides its own
+    // per-batch block offset; the smaller M stays on the fused decode.
+    constexpr int64_t B = 2, N = 40, K = 70;
+    constexpr int64_t M_values[] = {4, 40};
     constexpr bool transpose_b = true;
 
     std::vector<uint8_t> bbytes;
@@ -393,41 +457,43 @@ NNOPS_TEST(matmul_q4_1_batched) {
     append_q4_matrix(bbytes, b0);
     append_q4_matrix(bbytes, b1);
 
-    const std::vector<float> a0 = gen_floats(M * K, 0x100u);
-    const std::vector<float> a1 = gen_floats(M * K, 0x200u);
-    std::vector<float> adata = a0;
-    adata.insert(adata.end(), a1.begin(), a1.end());
+    for (const int64_t M : M_values) {
+        const std::vector<float> a0 = gen_floats(M * K, 0x100u);
+        const std::vector<float> a1 = gen_floats(M * K, 0x200u);
+        std::vector<float> adata = a0;
+        adata.insert(adata.end(), a1.begin(), a1.end());
 
-    const int64_t ashape[] = {B, M, K};
-    const int64_t bshape[] = {B, N, K};
-    TensorView a(ashape, DataType::f32, adata.data());
-    TensorView bv(bshape, DataType::q4_1, bbytes.data());
+        const int64_t ashape[] = {B, M, K};
+        const int64_t bshape[] = {B, N, K};
+        TensorView a(ashape, DataType::f32, adata.data());
+        TensorView bv(bshape, DataType::q4_1, bbytes.data());
 
-    MatMulAttributes attrs{};
-    attrs.transpose_b = transpose_b;
-    auto op = MatMul::create(attrs, Backend::CPU);
+        MatMulAttributes attrs{};
+        attrs.transpose_b = transpose_b;
+        auto op = MatMul::create(attrs, Backend::CPU);
 
-    const TensorDesc arr[] = {a.desc(), bv.desc()};
-    auto descs = op->getOutputTensorDesc(arr);
-    NNOPS_EXPECT_EQ(descs[0].rank, int64_t(3));
-    NNOPS_EXPECT_EQ(descs[0].dims[0], B);
-    NNOPS_EXPECT_EQ(descs[0].dims[1], M);
-    NNOPS_EXPECT_EQ(descs[0].dims[2], N);
+        const TensorDesc arr[] = {a.desc(), bv.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        NNOPS_EXPECT_EQ(descs[0].rank, int64_t(3));
+        NNOPS_EXPECT_EQ(descs[0].dims[0], B);
+        NNOPS_EXPECT_EQ(descs[0].dims[1], M);
+        NNOPS_EXPECT_EQ(descs[0].dims[2], N);
 
-    std::vector<float> out(static_cast<size_t>(B * M * N));
-    auto output = nnops::test::make_channel_first(descs[0], out.data());
+        std::vector<float> out(static_cast<size_t>(B * M * N));
+        auto output = nnops::test::make_channel_first(descs[0], out.data());
 
-    const TensorView ins[] = {a, bv};
-    op->compute(output, ins);
+        const TensorView ins[] = {a, bv};
+        op->compute(output, ins);
 
-    for (int64_t bi = 0; bi < B; ++bi) {
-        const Q4Matrix& bm = bi == 0 ? b0 : b1;
-        const std::vector<float> want = reference_matmul<float>(
-            adata.data() + bi * M * K, bm, M, N, K, transpose_b);
-        for (int64_t i = 0; i < M * N; ++i) {
-            const float got = out[static_cast<size_t>(bi * M * N + i)];
-            NNOPS_EXPECT_TRUE(std::abs(got - want[static_cast<size_t>(i)]) <=
-                              1e-3f + 1e-4f * std::abs(want[static_cast<size_t>(i)]));
+        for (int64_t bi = 0; bi < B; ++bi) {
+            const Q4Matrix& bm = bi == 0 ? b0 : b1;
+            const std::vector<float> want = reference_matmul<float>(
+                adata.data() + bi * M * K, bm, M, N, K, transpose_b);
+            for (int64_t i = 0; i < M * N; ++i) {
+                const float got = out[static_cast<size_t>(bi * M * N + i)];
+                NNOPS_EXPECT_TRUE(std::abs(got - want[static_cast<size_t>(i)]) <=
+                                  1e-3f + 1e-4f * std::abs(want[static_cast<size_t>(i)]));
+            }
         }
     }
 }
@@ -686,3 +752,169 @@ NNOPS_TEST(matmul_q4_1_fused_small_m_bf16) {
              EpilogueActivateType::Relu, /*bias=*/true);
 }
 #endif
+
+#if defined(NNOPS_ARCH_SME)
+/// The ZA route over a Q4_1 B: M past the fused small-M limits (trans 16, copy
+/// 8), N wide enough for the n-block grid, and — the point — K past the plan's
+/// kc, so the second k-block decodes from a nonzero origin. Both physical B
+/// layouts, f32 and f16.
+NNOPS_TEST(matmul_q4_1_sme_route) {
+    const SmePin sme_on(true);
+    // f32: kc 1024, so K = 1050 takes a full block and a 26-value tail.
+    run_case({40, 40, 1050, /*transpose_b=*/true, false, false});
+    run_case({40, 72, 1100, /*transpose_b=*/false, false, false});
+    // Shapes just past the fused limits; the copy case also packs a transposed A.
+    run_case({17, 40, 70, /*transpose_b=*/true, false, false});
+    run_case({17, 40, 70, /*transpose_b=*/false, false, /*transpose_a=*/true});
+    // The planned route's post-accumulation semantics through the ZA tiles.
+    run_case({40, 40, 160, true, false, false, 0.5f, 1.0f, EpilogueActivateType::Relu6,
+              /*bias=*/true});
+    // alpha folds into the decode, which is what lets this route keep a scaled
+    // call rather than falling back to the NEON panels.
+    run_case({40, 40, 160, true, false, false, 0.0f, -1.5f});
+    run_case({40, 40, 160, false, true, false, 0.0f, 2.5f});
+    // f16: kc 2048, so K = 2050 takes a full block and a 2-value tail.
+    run_case({40, 40, 2050, /*transpose_b=*/true, true, false});
+    run_case({40, 72, 2100, /*transpose_b=*/false, true, false});
+    run_case({33, 40, 95, true, true, false, 0.0f, 1.0f, EpilogueActivateType::None,
+              /*bias=*/true});
+}
+
+/// The ZA route splits N across the pool and each block decodes its own Q4_1
+/// slice into its own scratch slot: the threaded product must equal the
+/// single-threaded one. Both physical B layouts, a column tail included.
+NNOPS_TEST(matmul_q4_1_sme_threaded) {
+    const SmePin sme_on(true);
+    for (bool tb : {false, true}) {
+        constexpr int64_t M = 40, K = 1100, N = 300;
+        std::vector<float> a = gen_floats(M * K, 0x31u);
+        Q4Matrix b = tb ? build_q4_matrix(N, K, 0x51u) : build_q4_matrix(K, N, 0x51u);
+        const int64_t ashape[] = {M, K};
+        const int64_t bshape[] = {tb ? N : K, tb ? K : N};
+        TensorView av(ashape, DataType::f32, a.data());
+        TensorView bv(bshape, DataType::q4_1, b.bytes.data());
+
+        MatMulAttributes attrs{};
+        attrs.transpose_b = tb;
+        auto op = MatMul::create(attrs, Backend::CPU);
+        const TensorDesc arr[] = {av.desc(), bv.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        const TensorView ins[] = {av, bv};
+
+        std::vector<float> serial(static_cast<size_t>(M * N));
+        std::vector<float> threaded(static_cast<size_t>(M * N));
+        auto out_serial = nnops::test::make_channel_first(descs[0], serial.data());
+        auto out_threaded = nnops::test::make_channel_first(descs[0], threaded.data());
+        op->compute(out_serial, ins);
+
+        SimplePool pool(4);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        op->compute(out_threaded, ins, ctx, nullptr);
+
+        for (int64_t i = 0; i < M * N; ++i) {
+            const float s = serial[static_cast<size_t>(i)];
+            const float t = threaded[static_cast<size_t>(i)];
+            NNOPS_EXPECT_TRUE(std::abs(s - t) <= 1e-6f + 1e-5f * std::abs(s));
+        }
+    }
+}
+
+/// The same calls with the ZA route pinned off: the NEON packed plan owns them,
+/// so both engines answer to one reference at the same shapes. f16 stays short
+/// here — its NEON kernel accumulates in f16 through every 128-wide k-block, so
+/// a 2k-deep K is outside the shared tolerance; the ZA tile holds f32 across its
+/// (much longer) k-block and covers that depth above.
+NNOPS_TEST(matmul_q4_1_neon_shapes_match_sme) {
+    const SmePin sme_off(false);
+    run_case({40, 40, 1050, true, false, false});
+    run_case({40, 72, 1100, false, false, false});
+    run_case({40, 40, 95, true, true, false});
+    run_case({40, 72, 160, false, true, false});
+}
+
+namespace {
+
+/// The Q4_1 matrix as a dense panel-typed buffer. Exact for the generator's
+/// d/m choices (every product and sum is representable), so the comparison
+/// below can be bitwise.
+template <class T>
+std::vector<T> dense_from_q4(const Q4Matrix& b)
+{
+    std::vector<T> d(b.decoded.size());
+    for (size_t i = 0; i < d.size(); ++i) {
+        if constexpr (std::is_same_v<T, float>) {
+            d[i] = b.decoded[i];
+        } else {
+            d[i] = float_to_half(b.decoded[i]);
+        }
+    }
+    return d;
+}
+
+template <class T> uint32_t pack_bits(T v)
+{
+    if constexpr (std::is_same_v<T, float>) {
+        uint32_t u;
+        std::memcpy(&u, &v, sizeof(u));
+        return u;
+    } else {
+        return static_cast<uint32_t>(backend::cpu::half_to_bits(v));
+    }
+}
+
+/// The ZA Q4_1 pack against decode-then-dense-pack, bit for bit.
+template <class T>
+void check_sme_pack(DataType dt)
+{
+    constexpr int64_t N = 37; // a full 32-column panel plus a 5-column tail
+    constexpr int kc = 70;    // off a 32-value block, and an odd f16 pair count
+    const int ldd = static_cast<int>(backend::cpu::sme_b_panel_stride(dt, kc));
+    constexpr int panels = 2;
+
+    for (bool trans : {false, true}) {
+        // 70 is off a block boundary: the transposed pack takes its scalar
+        // fallback there, so both paths are held to the same answer.
+        for (int k_start : {0, 32, 70}) {
+            const int64_t k_total = k_start + kc;
+            const Q4Matrix b = trans ? build_q4_matrix(N, k_total, 0x77u) :
+                                       build_q4_matrix(k_total, N, 0x77u);
+            const std::vector<T> dense = dense_from_q4<T>(b);
+            const T* const dense_base = trans ?
+                                            dense.data() + k_start :
+                                            dense.data() + static_cast<int64_t>(k_start) * N;
+            const int lds = static_cast<int>(trans ? k_total : N);
+
+            std::vector<T> want(static_cast<size_t>(panels) * ldd, T{});
+            std::vector<T> got(static_cast<size_t>(panels) * ldd, T{});
+            backend::cpu::tile_pack_rhs_sme(trans, static_cast<int>(N), kc, want.data(),
+                                            dense_base, lds);
+            backend::cpu::tile_pack_rhs_q4_1_sme(trans, 0, static_cast<int>(N), k_start, kc,
+                                                 got.data(), b.bytes.data(), b.blocks_per_row,
+                                                 1.0f);
+
+            for (size_t i = 0; i < want.size(); ++i) {
+                const uint32_t w = pack_bits(want[i]);
+                const uint32_t g = pack_bits(got[i]);
+                if (w != g) {
+                    std::printf("  q4 sme pack mismatch dt=%d trans=%d k_start=%d i=%zu "
+                                "want=%08x got=%08x\n",
+                                static_cast<int>(dt), static_cast<int>(trans), k_start, i,
+                                static_cast<unsigned>(w), static_cast<unsigned>(g));
+                }
+                NNOPS_EXPECT_EQ(w, g);
+            }
+        }
+    }
+}
+
+} // namespace
+
+/// The ZA panel pack must be byte-identical to decoding into a dense matrix and
+/// running the ordinary SME RHS pack: the kernels only know the layout, so a
+/// difference is a layout bug no tolerance should hide.
+NNOPS_TEST(pack_q4_1_sme_matches_dense_pack) {
+    check_sme_pack<float>(DataType::f32);
+    check_sme_pack<half>(DataType::f16);
+}
+#endif // NNOPS_ARCH_SME
