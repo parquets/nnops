@@ -24,9 +24,28 @@ void multi_latent_attention_ref(const MultiLatentAttentionAttributes& attrs,
         ? attrs.scale
         : 1.0f / std::sqrt(static_cast<float>(attrs.qk_nope_head_dim +
                                                attrs.qk_rope_head_dim));
-    detail::attention_ref_generic(attrs.num_heads, attrs.kv_num_heads, vd,
-                                  scale, attrs.causal, attrs.absorbed,
-                                  attrs.position_offset, output, inputs, ctx);
+    detail::AttentionRefSlots slots;
+    if (attrs.absorbed) {
+        slots.bias = 2;
+        slots.past_k = 3;
+        slots.past_v = 3;
+        slots.seqlens = 4;
+        slots.pos_ids = 5;
+        slots.cu_q = 6;
+        slots.cu_k = 7;
+    } else {
+        slots.bias = 3;
+        slots.past_k = 4;
+        slots.past_v = 5;
+        slots.seqlens = 6;
+        slots.pos_ids = 7;
+        slots.cu_q = 8;
+        slots.cu_k = 9;
+    }
+    detail::attention_ref_generic(attrs.num_heads, attrs.kv_num_heads, vd, scale, attrs.causal,
+                                  attrs.absorbed, attrs.position_offset, /*bshd=*/false,
+                                  /*kv_bshd=*/false, slots,
+                                  /*mask_filter_value=*/0.0f, output, inputs, ctx);
 }
 
 }  // namespace nnops::backend::cpu::reference

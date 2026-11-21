@@ -35,7 +35,9 @@
 ///   [1] K [B, Sk, H_kv·Dqk] or [B, H_kv, Sk, Dqk]
 ///   [2] V [B, Sk, H_kv·vd]  or [B, H_kv, Sk, vd]
 ///   [3] optional mask / per-head bias, [4]/[5] optional past K/V,
-///   [6] optional seqlens_k, [7]/[8] optional cu_seqlens_q / cu_seqlens_k.
+///   [6] optional seqlens_k, [7] optional int64 [B] position_ids (the same
+///   input GroupQueryAttention and RoPE take: the absolute position of each
+///   batch's first query row), [8]/[9] optional cu_seqlens_q / cu_seqlens_k.
 /// `kv_lora_rank` only supplies the default v_head_dim here; the latent width is
 /// positional, it is checked against the tensor shapes.
 ///
@@ -57,17 +59,21 @@
 /// `position_offset` is the absolute position of query row 0; set it when the
 /// chunk is not the tail of the run.
 ///
-/// inputs[4] is an optional int32 [B] `seqlens_k`: each batch's valid key-run
-/// length, so the run is the prefix [0, seqlens_k[b]) — right padding is
-/// truncated and batches may sit at different positions. Causal masking then
-/// takes the per-batch bottom-right q0 = seqlens_k[b] - Sq unless
-/// position_offset (a scalar for every batch) is given. Absent, every batch
-/// runs to the full Sk.
+/// inputs[4] is an optional int32 [B] `seqlens_k`, with the same meaning as
+/// GroupQueryAttention's: the last valid key index of batch b, so the run is
+/// the prefix [0, seqlens_k[b] + 1) — right padding is truncated and batches
+/// may sit at different positions. Causal masking then takes the per-batch
+/// bottom-right q0 = (seqlens_k[b] + 1) - Sq.
 ///
-/// inputs[5]/[6] (absorbed) or [7]/[8] (non-absorbed) are the optional int32
+/// inputs[5] (absorbed) or [7] (non-absorbed) is the optional int64 [B]
+/// `position_ids`: the absolute position of batch b's first query row, rows
+/// consecutive. It overrides both the bottom-right default and the scalar
+/// `position_offset`, and is the same input RoPE and GroupQueryAttention read.
+///
+/// inputs[6]/[7] (absorbed) or [8]/[9] (non-absorbed) are the optional int32
 /// [segments + 1] `cu_seqlens_q` / `cu_seqlens_k` of a packed varlen batch; see
-/// GroupQueryAttention. Exclusive with the mask, a past segment, seqlens_k and
-/// position_offset.
+/// GroupQueryAttention. Exclusive with the mask, a past segment, seqlens_k,
+/// position_ids and position_offset.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

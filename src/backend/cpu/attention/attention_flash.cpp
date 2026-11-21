@@ -37,40 +37,57 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
     const auto& Q = inputs[0];
     const auto& K = inputs[1];
     const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
-    const bool has_mask = has_mask_input(cfg, inputs);
-    const bool has_bias = mask_is_head_bias(cfg, inputs);
-    const int64_t bias_rs = has_mask ? inputs[mask_slot(cfg)].row_stride_elems() : 0;
+    const MaskView mask = resolve_mask(cfg, inputs);
     const bool split = has_past_view(cfg, inputs);
-    const auto& Kp = split ? inputs[past_slot(cfg)] : K;
-    const auto& Vp = split ? inputs[past_slot(cfg) + (cfg.v_is_k ? 0 : 1)] : V;
-    const int32_t* seqlens =
-        has_seqlens_input(cfg, inputs) ? inputs[seqlens_slot(cfg)].ptr<int32_t>() : nullptr;
+    const auto& Kp = split ? inputs[static_cast<size_t>(cfg.past_k_slot)] : K;
+    const auto& Vp = split ? inputs[static_cast<size_t>(cfg.past_v_slot)] : V;
+    bool seqlens_plus_one = true;
+    const int32_t* seqlens = run_lengths_ptr(cfg, inputs, seqlens_plus_one);
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
     const int64_t Sq = hs.Sq, Dqk = hs.Dqk, Dv = hs.Dv;
     const int64_t Sk_new = hs.Sk, Sk_past = hs.Sk_past;
     const int64_t Sk = Sk_new + Sk_past; // the whole [past | new] run
-    const bool merged = hs.merged;
 
     const float scale =
         (cfg.scale == 0.0f) ? (1.0f / std::sqrt(static_cast<float>(Dqk))) : cfg.scale;
 
+    const bool kv8 = kv_is_int8(inputs);
+    NNOPS_ASSERT(!(kv8 && split)); // a quantized cache has no past segment
+    const int8_t* k8_ptr = kv8 ? K.ptr<int8_t>() : nullptr;
+    const int8_t* v8_ptr = kv8 ? V.ptr<int8_t>() : nullptr;
     const T* q_ptr = Q.ptr<T>();
-    const T* k_ptr = K.ptr<T>();
-    const T* v_ptr = V.ptr<T>();
+    const T* k_ptr = kv8 ? nullptr : K.ptr<T>();
+    const T* v_ptr = kv8 ? nullptr : V.ptr<T>();
     const T* kp_ptr = split ? Kp.ptr<T>() : nullptr;
     const T* vp_ptr = split ? Vp.ptr<T>() : nullptr;
-    const T* mask_ptr = has_mask ? inputs[mask_slot(cfg)].ptr<T>() : nullptr;
+    const KvScale kscale = resolve_kv_scale(cfg, cfg.k_scale_slot, inputs);
+    const KvScale vscale = resolve_kv_scale(cfg, cfg.v_scale_slot, inputs);
+    const T* mask_ptr = static_cast<const T*>(mask.bias);
+    // The sink is one extra logit in the denominator, per query head.
+    const bool has_sink = slot_present(cfg, cfg.sink_slot, inputs);
+    const T* sink_ptr = has_sink ? inputs[static_cast<size_t>(cfg.sink_slot)].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
-    const int64_t q_rs = Q.row_stride_elems();
-    const int64_t k_rs = K.row_stride_elems();
-    const int64_t v_rs = V.row_stride_elems();
-    const int64_t kp_rs = split ? Kp.row_stride_elems() : k_rs;
-    const int64_t vp_rs = split ? Vp.row_stride_elems() : v_rs;
-    const int64_t o_rs = output.row_stride_elems();
+    const int64_t q_rs = head_seq_step(Q, hs.q_layout);
+    const int64_t k_rs = head_seq_step(K, hs.kv_layout);
+    const int64_t v_rs = head_seq_step(V, hs.kv_layout);
+    const int64_t kp_rs = split ? head_seq_step(Kp, hs.kv_layout) : k_rs;
+    const int64_t vp_rs = split ? head_seq_step(Vp, hs.kv_layout) : v_rs;
+    const int64_t o_rs = head_seq_step(output, hs.q_layout);
     const int64_t v_head_stride = merged_v_head_stride(cfg, Dqk, Dv);
+
+    int64_t q_b, q_h, k_b, k_h, v_b, v_h, o_b, o_h;
+    int64_t kp_b = 0, kp_h = 0, vp_b = 0, vp_h = 0;
+    head_strides(Q, hs.q_layout, Dqk, q_b, q_h);
+    head_strides(K, hs.kv_layout, Dqk, k_b, k_h);
+    head_strides(V, hs.kv_layout, v_head_stride, v_b, v_h);
+    head_strides(output, hs.q_layout, Dv, o_b, o_h);
+    if (split) {
+        head_strides(Kp, hs.kv_layout, Dqk, kp_b, kp_h);
+        head_strides(Vp, hs.kv_layout, v_head_stride, vp_b, vp_h);
+    }
 
     constexpr int nr_max = nr_max_flt<T>();
     constexpr int64_t kc = kc_for<T>();
@@ -78,7 +95,7 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
 
     const int Br = plan.Br;
     const int Bc = plan.Bc;
-    const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv);
+    const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, kv8);
 
     const int64_t NQ = (Sq + Br - 1) / Br; // number of Br-row query blocks
     const int64_t NG = B * H * NQ;
@@ -91,24 +108,19 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
         const int64_t hkv = h / (H / Hkv);
         const int64_t i0 = qi * Br;
         const int actual_br = static_cast<int>(std::min<int64_t>(Br, Sq - i0));
-        // The batch's valid key run: its prefix of the [past | new] rows.
-        const int64_t run_len = run_length(seqlens, b, Sk);
+        // The batch's valid key run: its prefix of the [past | new] rows, and
+        // where this batch's query rows sit (vector > scalar > bottom-right).
+        const int64_t run_len = run_length(seqlens, b, Sk, seqlens_plus_one);
+        const int64_t pos0 = batch_pos0(cfg, inputs, b);
 
-        const T* q_head;
-        const T* k_head;
-        const T* v_head;
-        T* o_head;
-        if (merged) {
-            q_head = q_ptr + b * Sq * q_rs + h * Dqk;
-            k_head = k_ptr + b * Sk_new * k_rs + hkv * Dqk;
-            v_head = v_ptr + b * hs.Sv * v_rs + hkv * v_head_stride;
-            o_head = out_ptr + b * Sq * o_rs + h * Dv;
-        } else {
-            q_head = q_ptr + (b * H + h) * Sq * q_rs;
-            k_head = k_ptr + (b * Hkv + hkv) * Sk_new * k_rs;
-            v_head = v_ptr + (b * Hkv + hkv) * hs.Sv * v_rs;
-            o_head = out_ptr + (b * H + h) * Sq * o_rs;
-        }
+        const T* q_head = q_ptr + b * q_b + h * q_h;
+        const T* k_head = kv8 ? nullptr : k_ptr + b * k_b + hkv * k_h;
+        const T* v_head = kv8 ? nullptr : v_ptr + b * v_b + hkv * v_h;
+        const int8_t* k8_head = kv8 ? k8_ptr + b * k_b + hkv * k_h : nullptr;
+        const int8_t* v8_head = kv8 ? v8_ptr + b * v_b + hkv * v_h : nullptr;
+        const KvScaleRow ks_head = kscale.row(b, hkv, Hkv, Sk);
+        const KvScaleRow vs_head = vscale.row(b, hkv, Hkv, Sk);
+        T* o_head = out_ptr + b * o_b + h * o_h;
         // The run is two contiguous segments, past first; without a past the
         // first is empty. Each is streamed in place, so the caller never has to
         // concatenate.
@@ -119,10 +131,8 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
         int64_t seg_lo[2] = {0, 0};
         int64_t seg_hi[2] = {0, Sk};
         if (split) {
-            k_base[0] = merged ? kp_ptr + b * Sk_past * kp_rs + hkv * Dqk :
-                                 kp_ptr + (b * Hkv + hkv) * Sk_past * kp_rs;
-            v_base[0] = merged ? vp_ptr + b * Sk_past * vp_rs + hkv * v_head_stride :
-                                 vp_ptr + (b * Hkv + hkv) * Sk_past * vp_rs;
+            k_base[0] = kp_ptr + b * kp_b + hkv * kp_h;
+            v_base[0] = vp_ptr + b * vp_b + hkv * vp_h;
             k_str[0] = kp_rs;
             v_str[0] = vp_rs;
             seg_lo[1] = Sk_past;
@@ -135,6 +145,10 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
         T* s = l + Br;
         T* o_acc = s + static_cast<int64_t>(Br) * Bc;
         T* pack_b = o_acc + static_cast<int64_t>(Br) * Dv;
+        T* i8_temp = ws_base + slot * per_task +
+                     (per_task - (kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(
+                                            std::max<int64_t>(Dqk, Bc))) :
+                                       0));
 
         // Reset the running online-softmax state through the scalar simd
         // bridge: std::numeric_limits<T> is not specialized for half (it
@@ -150,19 +164,24 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
         // nothing — for a causal prefill that is the whole upper triangle, and
         // skipping it halves the QK and AV work.
         const int64_t kv_end =
-            cfg.causal ? causal_limit(cfg, i0 + actual_br - 1, Sq, run_len) : run_len;
-        // The window's lower bound grows with the query row, so the block's
-        // first row has the smallest one: KV tiles below it are fully masked
-        // for every row and the stream can start there.
-        int64_t j0 = key_lo(cfg, i0, Sq, run_len);
+            cfg.causal ? causal_limit(cfg, pos0, i0 + actual_br - 1, Sq, run_len) : run_len;
+        // Streaming sinks: the first `prefix` positions stay visible to every
+        // row, so they stream as a band of their own ahead of the window.
+        const int64_t prefix = sink_prefix(cfg, run_len);
 
         // o_acc is written by the first KV block (zero_mode) — no pre-zeroing
         // pass. The exp_diff rescale may touch it first on the first block;
         // that garbage is fully overwritten by the first MMA.
         bool first_tile = true;
-        while (j0 < kv_end) {
+
+        // One KV tile over [j0, j0+bc): lanes [max(lo_i, lo_floor), lim_i)
+        // survive for row i — or [0, lim_i) on the sink band, where the window
+        // is exempt — everything else in the tile is -inf. Returns the next
+        // tile's start.
+        const auto do_tile = [&](int64_t j0, int64_t end, int64_t lo_floor,
+                                 bool sink_band) -> int64_t {
             const int seg = (j0 < seg_lo[1]) ? 0 : 1;
-            const int64_t seg_end = std::min(seg_hi[seg], kv_end);
+            const int64_t seg_end = std::min(seg_hi[seg], end);
             // The diagonal block is the last one and is rarely a full Bc wide:
             // clamping it bounds the tile to the block's causal rectangle
             // instead of a full-width strip that is mostly masked. A segment
@@ -181,8 +200,14 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                 const int ldd_b = static_cast<int>(
                     mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T))) /
                     static_cast<int>(sizeof(T)));
-                tile_pack_rhs(true, actual_bc, actual_kc, pack_b, ldd_b, kb + koff * k_step + k0,
-                              static_cast<int>(k_step), scale);
+                if (kv8) {
+                    kv_pack_i8<T>(true, actual_bc, actual_kc, pack_b, ldd_b,
+                                  k8_head + koff * k_step + k0, static_cast<int>(k_step),
+                                  ks_head.shifted(j0), scale, i8_temp);
+                } else {
+                    tile_pack_rhs(true, actual_bc, actual_kc, pack_b, ldd_b,
+                                  kb + koff * k_step + k0, static_cast<int>(k_step), scale);
+                }
                 tile_mma_direct(actual_br, actual_bc, actual_kc, s, actual_bc,
                                 q_head + i0 * q_rs + k0, static_cast<int>(q_rs), pack_b, /*ldb=*/-1,
                                 /*stage=*/nullptr, kNegInf, kPosInf, k0 == 0);
@@ -198,11 +223,14 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                     row_softcap(s + i * actual_bc, actual_bc, 1.0f, cfg.softcap);
                 }
             }
-            if (mask_ptr || cfg.causal || cfg.window > 0) {
+            if (mask.any() || cfg.causal || cfg.window > 0) {
                 for (int i = 0; i < actual_br; ++i) {
                     const int64_t row_i = i0 + i;
-                    const int64_t lo_i = key_lo(cfg, row_i, Sq, run_len);
-                    const int64_t lim = causal_limit(cfg, row_i, Sq, run_len);
+                    const int64_t lo_i =
+                        sink_band ? 0
+                                  : std::max<int64_t>(key_lo(cfg, pos0, row_i, Sq, run_len),
+                                                      lo_floor);
+                    const int64_t lim = causal_limit(cfg, pos0, row_i, Sq, run_len);
                     int64_t n0 = lo_i - j0;
                     int64_t n1 = lim - j0;
                     if (n0 < 0) {
@@ -219,12 +247,15 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                     }
                     const int64_t n = n1 - n0;
                     T* srow = s + i * actual_bc;
-                    if (mask_ptr) {
-                        const T* mrow = has_bias ?
-                                            mask_ptr +
-                                                head_bias_row_offset(b, h, row_i, H, Sq, bias_rs) +
-                                                j0 + n0 :
-                                            mask_ptr + row_i * Sk + j0 + n0;
+                    if (mask.keep != nullptr) {
+                        const int64_t off =
+                            mask_offset(b, h, row_i, mask.keep_b, mask.keep_h, mask.keep_row);
+                        row_apply_keep(srow + n0, mask.keep + off + j0 + n0, n, mask.filter);
+                    }
+                    if (mask_ptr != nullptr) {
+                        const int64_t off =
+                            mask_offset(b, h, row_i, mask.bias_b, mask.bias_h, mask.bias_row);
+                        const T* mrow = mask_ptr + off + j0 + n0;
                         int64_t j = 0;
                         for (; j + L <= n; j += L) {
                             simd::v_store(srow + n0 + j, simd::v_add(simd::v_load(srow + n0 + j),
@@ -280,21 +311,46 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                     static_cast<int>(sizeof(T)));
                 // V rows [j0+k0, +actual_kc) x Dv, packed once for the whole
                 // Br-row block.
-                tile_pack_rhs(false, static_cast<int>(Dv), actual_kc, pack_b, ldd_b,
-                              vb + (koff + k0) * v_step, static_cast<int>(v_step), 1.0f);
+                if (kv8) {
+                    kv_pack_i8<T>(false, static_cast<int>(Dv), actual_kc, pack_b, ldd_b,
+                                  v8_head + (koff + k0) * v_step, static_cast<int>(v_step),
+                                  vs_head.shifted(j0 + k0), 1.0f, i8_temp);
+                } else {
+                    tile_pack_rhs(false, static_cast<int>(Dv), actual_kc, pack_b, ldd_b,
+                                  vb + (koff + k0) * v_step, static_cast<int>(v_step), 1.0f);
+                }
                 tile_mma_direct(actual_br, static_cast<int>(Dv), actual_kc, o_acc,
                                 static_cast<int>(Dv), s + k0, actual_bc, pack_b, /*ldb=*/-1,
                                 /*stage=*/nullptr, kNegInf, kPosInf, first_tile && k0 == 0);
             }
             first_tile = false;
-            j0 += actual_bc;
+            return j0 + actual_bc;
+        };
+
+        // The sink band first, then the window band; the second starts at the
+        // sink's end so no key is counted twice.
+        int64_t j0 = 0;
+        while (j0 < prefix) {
+            j0 = do_tile(j0, prefix, 0, /*sink_band=*/true);
+        }
+        j0 = std::max<int64_t>(key_lo(cfg, pos0, i0, Sq, run_len), prefix);
+        while (j0 < kv_end) {
+            j0 = do_tile(j0, kv_end, prefix, /*sink_band=*/false);
         }
 
         // ---- final normalize: output = o_acc / l -------------------
+        // The sink joins the denominator here, once: a key whose value is zero
+        // leaves the accumulator untouched. A row every tile masked keeps its
+        // zeros — the whole weight lands on that virtual key.
+        const float sink = (sink_ptr != nullptr) ? simd::s_load(&sink_ptr[h]) : kNegInf;
         for (int i = 0; i < actual_br; ++i) {
             const float l_i = simd::s_load(&l[i]);
-            // A row every tile masked has l == 0; its output is zeros.
-            const float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+            const float m_i = simd::s_load(&m[i]);
+            float inv_l = 0.0f;
+            if (m_i != kNegInf) {
+                const float denom = l_i + std::exp(sink - m_i);
+                inv_l = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+            }
             const T* src = o_acc + i * Dv;
             T* dst = o_head + (i0 + i) * o_rs;
             auto v_inv = simd::v_set1(src, inv_l);

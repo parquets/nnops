@@ -486,12 +486,12 @@ void run_attention()
                    {{{2, 4, 32}}, {{2, 6, 32}}, {{2, 6, 32}}}, 1e-1f);
     }
     {
-        // Grouped heads (H = 4, Hkv = 2) with the causal mask: the decode and
+        // Grouped heads (H = 4, Hkv = 2) in the explicit form: the decode and
         // standard routes share this dispatch.
         GroupQueryAttentionAttributes a;
         a.num_heads = 4;
         a.kv_num_heads = 2;
-        a.causal = true;
+        a.causal = false;
         check_case("group_query_attention",
                    [a] { return GroupQueryAttention::create(a, Backend::CPU); },
                    {{{2, 4, 32}}, {{2, 6, 16}}, {{2, 6, 16}}}, 1e-1f);

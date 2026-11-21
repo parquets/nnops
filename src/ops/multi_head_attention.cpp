@@ -1,10 +1,11 @@
 /// @file multi_head_attention.cpp
 /// @brief MultiHeadAttention operator dispatch.
 ///
-/// Q, K, V [, mask] in f32 or f16, dense rows, merged [B, S, H*D] or explicit
-/// [B, H, S, D]. The optional mask is positional and may still arrive as an
-/// empty view (absent, not malformed). Everything below the attribute copy is
-/// the shared CPU attention core.
+/// `causal` picks the input contract, not just the mask. causal = false is the
+/// explicit ViT/encoder form — Q, K, V and an optional external mask; causal =
+/// true is the KV-cache form — Q and a written cache, with the causal range
+/// derived from each batch's kv_seqlens. See the header for the slot lists.
+/// Everything below the attribute copy is the shared CPU attention core.
 
 #include "nnops/ops/multi_head_attention.hpp"
 #include "nnops/detail/assert.hpp"
@@ -16,15 +17,71 @@
 
 namespace nnops {
 
-NNOPS_DECLARE_CPU(MultiHeadAttentionAttributes, multi_head_attention_cpu)
+namespace {
 
-NNOPS_OP_BOILERPLATE(MultiHeadAttention, MultiHeadAttentionAttributes,
-                     backend::cpu::multi_head_attention_cpu, nullptr, nullptr)
+// ---- explicit form (causal = false) ----
+constexpr size_t kAttnBiasSlot = 3;
+constexpr size_t kKpmSlot = 4;
+constexpr size_t kSinkSlot = 5;
+constexpr size_t kCuQSlot = 6;
+constexpr size_t kCuKSlot = 7;
+constexpr size_t kGateSlot = 8;
+// ---- cache form (causal = true) ----
+constexpr size_t kSeqlensSlot = 3;
+constexpr size_t kPosIdsSlot = 4;
+constexpr size_t kKScaleSlot = 5;
+constexpr size_t kVScaleSlot = 6;
+constexpr size_t kSinkSlotCached = 7;
+constexpr size_t kGateSlotCached = 8;
+constexpr size_t kMaxInputs = 9;
 
-std::vector<TensorDesc>
-MultiHeadAttention::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
+bool present(const std::span<const TensorDesc> inputs, size_t slot)
 {
-    return {attention_output_shape(inputs)};
+    return inputs.size() > slot && inputs[slot].rank != 0;
+}
+
+} // anonymous namespace
+
+namespace backend::cpu {
+Status multi_head_attention_cpu(const MultiHeadAttentionAttributes& attrs,
+                                std::span<TensorView> outputs,
+                                std::span<const TensorView> inputs, const ComputeContext& ctx,
+                                void* workspace);
+} // namespace backend::cpu
+
+struct MultiHeadAttention::Impl {
+    using KernelFn = Status (*)(const MultiHeadAttentionAttributes&, std::span<TensorView>,
+                                std::span<const TensorView>, const ComputeContext&, void*);
+    KernelFn kernel_fn = nullptr;
+};
+MultiHeadAttention::~MultiHeadAttention() = default;
+
+namespace {
+auto resolve_mha_kernel(Backend backend) -> MultiHeadAttention::Impl::KernelFn
+{
+    switch (backend) {
+    case Backend::CPU:
+        return backend::cpu::multi_head_attention_cpu;
+    default:
+        return nullptr;
+    }
+}
+} // anonymous namespace
+
+NNOPS_OP_CREATE(MultiHeadAttention, MultiHeadAttentionAttributes)
+
+MultiHeadAttention::MultiHeadAttention(const MultiHeadAttentionAttributes& attrs,
+                                       Backend backend)
+    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
+{
+    impl_->kernel_fn = resolve_mha_kernel(backend);
+}
+
+std::vector<TensorDesc> MultiHeadAttention::getOutputTensorDesc(
+    std::span<const TensorDesc> inputs) const
+{
+    // One output in both forms, following Q's geometry.
+    return {inputs[0]};
 }
 
 size_t MultiHeadAttention::getWorkspaceSize(std::span<const TensorDesc> inputs,
@@ -39,198 +96,243 @@ size_t MultiHeadAttention::getWorkspaceSize(std::span<const TensorDesc> inputs,
 Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
                                     std::span<const TensorDesc> outputs) const
 {
-    // Q, K, V [, mask [, past K, past V [, seqlens_k [,
-    //        cu_seqlens_q, cu_seqlens_k [, gate]]]]
     if (attrs_.output_gate != EpilogueActivateType::None &&
         !is_gate_activation(attrs_.output_gate)) {
         return Status::unsupported;
     }
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 10, 1));
+    if (outputs.size() != 1) {
+        return Status::invalid_argument;
+    }
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, kMaxInputs, 1));
     if (!is_layout_supported(inputs[0].layout, LayoutSupport::Any)) {
         return Status::unsupported;
     }
 
+    const bool cache = attrs_.causal;
     const DataType dt = inputs[0].dtype;
     if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, dt)) {
         return Status::unsupported;
     }
-    for (size_t i = 1; i <= 2; ++i) {
-        if (inputs[i].dtype != dt) {
+    const DataType kdt = inputs[1].dtype;
+    if (cache) {
+        // The cache is the query's dtype or a symmetric int8 one; K and V
+        // share it.
+        if ((kdt != dt && kdt != DataType::s8) || inputs[2].dtype != kdt) {
             return Status::invalid_argument;
         }
+    } else if (kdt != dt || inputs[2].dtype != dt) {
+        return Status::invalid_argument;
     }
     if (outputs[0].dtype != dt) {
         return Status::invalid_argument;
     }
-    // Slot 6 onwards is int32 metadata — run lengths, then the two varlen
-    // offset vectors — not activations.
-    constexpr size_t kSeqlensSlot = 6;
-    for (size_t i = 3; i < inputs.size(); ++i) {
-        if (i >= kSeqlensSlot || inputs[i].rank == 0) {
-            continue;
-        }
-        if (inputs[i].dtype != dt) {
-            return Status::invalid_argument;
-        }
-    }
-    const auto& q = inputs[0];
-    const auto& k = inputs[1];
-    const auto& v = inputs[2];
-    if (q.rank != 3 && q.rank != 4) {
-        return Status::invalid_argument;
-    }
-    if (k.rank != q.rank || v.rank != q.rank) {
-        return Status::invalid_argument;
-    }
+
     if (attrs_.num_heads <= 0) {
         return Status::invalid_argument;
     }
-    if (!(attrs_.softcap >= 0.0f) || !std::isfinite(attrs_.softcap) || attrs_.window < 0) {
+    if (!(attrs_.softcap >= 0.0f) || !std::isfinite(attrs_.softcap) ||
+        attrs_.local_window_size < -1 || attrs_.sink_tokens < 0) {
         return Status::invalid_argument;
     }
-    if (inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0) {
-        const auto& s = inputs[kSeqlensSlot];
-        if (s.dtype != DataType::s32 || s.rank != 1 || s.dims[0] != q.dims[0]) {
+    if (attrs_.head_layout != AttentionHeadLayout::Auto &&
+        attrs_.head_layout != AttentionHeadLayout::BSHD) {
+        return Status::invalid_argument;
+    }
+
+    const int64_t h = attrs_.num_heads;
+    const bool bshd = attrs_.head_layout == AttentionHeadLayout::BSHD;
+    const auto& q = inputs[0];
+    if (q.rank != 3 && q.rank != 4) {
+        return Status::invalid_argument;
+    }
+    const int64_t q_seq = (q.rank == 3 || bshd) ? 1 : 2;
+    const int64_t q_head = (q.rank == 3) ? 2 : (bshd ? 2 : 1);
+    int64_t d = 0;
+    if (q.rank == 3) {
+        if (q.dims[2] <= 0 || q.dims[2] % h != 0) {
+            return Status::invalid_argument;
+        }
+        d = q.dims[2] / h;
+    } else {
+        d = q.dims[3];
+        if (d <= 0 || q.dims[static_cast<size_t>(q_head)] != h) {
             return Status::invalid_argument;
         }
     }
+    const int64_t sq = q.dims[static_cast<size_t>(q_seq)];
+    if (sq <= 0) {
+        return Status::invalid_argument;
+    }
 
-    if (q.rank == 3) {
-        // [B, S, H*D]: every head shares the row, so K and V must be as wide.
-        const int64_t hd = q.dims[2];
-        if (hd <= 0 || hd % attrs_.num_heads != 0) {
+    const auto& k = inputs[1];
+    const auto& v = inputs[2];
+    if (cache) {
+        // k / v are [B, H, Skv, D] BNSH, contiguous, written by the caller.
+        if (k.rank != 4 || v.rank != 4) {
             return Status::invalid_argument;
         }
-        if (k.dims[0] != q.dims[0] || k.dims[2] != hd) {
+        if (k.dims[0] != q.dims[0] || k.dims[1] != h || k.dims[3] != d || k.dims[2] <= 0) {
             return Status::invalid_argument;
         }
-        if (v.dims[0] != q.dims[0] || v.dims[2] != hd) {
+        if (v.dims != k.dims) {
             return Status::invalid_argument;
         }
-        if (v.dims[1] != k.dims[1]) {
+        if (sq > k.dims[2]) {
             return Status::invalid_argument;
+        }
+        // int32 metadata: the per-batch run lengths.
+        if (present(inputs, kSeqlensSlot)) {
+            const auto& s = inputs[kSeqlensSlot];
+            if (s.dtype != DataType::s32 || s.rank != 1 || s.dims[0] != q.dims[0]) {
+                return Status::invalid_argument;
+            }
+        }
+        // int64 metadata: the per-batch first-query-row positions.
+        if (present(inputs, kPosIdsSlot)) {
+            const auto& p = inputs[kPosIdsSlot];
+            if (p.dtype != DataType::s64 || p.rank != 1 || p.dims[0] != q.dims[0]) {
+                return Status::invalid_argument;
+            }
+        }
+        // The dequantization scales are present exactly for an int8 cache, and
+        // are either one value per tensor or one per (batch, kv head, row).
+        const bool q8 = kdt == DataType::s8;
+        for (const size_t s : {kKScaleSlot, kVScaleSlot}) {
+            const bool has = present(inputs, s);
+            if (has != q8) {
+                return Status::invalid_argument;
+            }
+            if (has) {
+                const auto& sc = inputs[s];
+                const bool per_tensor = sc.dtype == DataType::f32 && sc.numel() == 1;
+                const bool per_token = sc.dtype == DataType::f32 && sc.rank == 3 &&
+                                       sc.dims[0] == q.dims[0] && sc.dims[1] == h &&
+                                       sc.dims[2] == k.dims[2];
+                if (!per_tensor && !per_token) {
+                    return Status::invalid_argument;
+                }
+            }
         }
     } else {
-        const int64_t d = q.dims[3];
-        if (d <= 0) {
+        // Explicit K/V in Q's layout; the key run may differ from the query.
+        if (k.rank != q.rank || v.rank != q.rank) {
             return Status::invalid_argument;
         }
-        if (k.dims[0] != q.dims[0] || k.dims[1] != attrs_.num_heads || k.dims[3] != d) {
-            return Status::invalid_argument;
-        }
-        if (v.dims[0] != q.dims[0] || v.dims[1] != attrs_.num_heads || v.dims[2] != k.dims[2] ||
-            v.dims[3] != d) {
-            return Status::invalid_argument;
-        }
-    }
-
-    const int64_t seq_dim = (q.rank == 3) ? 1 : 2;
-    const int64_t sq = q.dims[seq_dim];
-    const int64_t sk = k.dims[seq_dim];
-
-    // Optional trailing segments: [4] past K, [5] past V, same layout as their
-    // new counterpart with Sk_past rows. Both or neither. [6] is the int32 [B]
-    // per-batch run length (seqlens_k), checked above.
-    const bool has_past_k = inputs.size() > 4 && inputs[4].rank != 0;
-    const bool has_past_v = inputs.size() > 5 && inputs[5].rank != 0;
-    if (has_past_k != has_past_v) {
-        return Status::invalid_argument;
-    }
-    int64_t sk_past = 0;
-    if (has_past_k) {
-        const auto& pk = inputs[4];
-        const auto& pv = inputs[5];
-        if (pk.rank != k.rank || pv.rank != v.rank) {
-            return Status::invalid_argument;
-        }
-        for (int64_t i = 0; i < pk.rank; ++i) {
-            if (i == seq_dim) {
-                continue;
-            }
-            if (pk.dims[i] != k.dims[i] || pv.dims[i] != v.dims[i]) {
+        int64_t sk = 0;
+        if (q.rank == 3) {
+            const int64_t hd = q.dims[2];
+            if (k.dims[0] != q.dims[0] || k.dims[2] != hd) {
                 return Status::invalid_argument;
             }
-        }
-        sk_past = pk.dims[seq_dim];
-        if (sk_past <= 0 || pv.dims[seq_dim] != sk_past) {
-            return Status::invalid_argument;
-        }
-    }
-
-    const int64_t sk_all = sk + sk_past;
-    if (inputs.size() > 3 && inputs[3].rank != 0) {
-        const auto& m = inputs[3];
-        // Rank 2 is the flat [Sq, Sk] every head shares; rank 4 is a per-head
-        // additive bias [B, H, Sq, Sk].
-        if (m.rank == 2) {
-            if (m.dims[0] != sq || m.dims[1] != sk_all) {
+            if (v.dims[0] != q.dims[0] || v.dims[2] != hd || v.dims[1] != k.dims[1]) {
                 return Status::invalid_argument;
             }
-        } else if (m.rank == 4) {
-            if (m.dims[0] != q.dims[0] || m.dims[1] != attrs_.num_heads || m.dims[2] != sq ||
-                m.dims[3] != sk_all) {
-                return Status::invalid_argument;
-            }
+            sk = k.dims[1];
         } else {
+            sk = k.dims[static_cast<size_t>(q_seq)];
+            if (k.dims[0] != q.dims[0] || k.dims[static_cast<size_t>(q_head)] != h ||
+                k.dims[3] != d) {
+                return Status::invalid_argument;
+            }
+            if (v.dims[0] != q.dims[0] || v.dims[static_cast<size_t>(q_head)] != h ||
+                v.dims[static_cast<size_t>(q_seq)] != sk || v.dims[3] != d) {
+                return Status::invalid_argument;
+            }
+        }
+        if (sk <= 0) {
+            return Status::invalid_argument;
+        }
+
+        // attention_bias: rank 2 [Sq, Sk] or rank 4 [B|1, H|1, Sq, Sk].
+        if (present(inputs, kAttnBiasSlot)) {
+            const auto& m = inputs[kAttnBiasSlot];
+            if (m.dtype != dt) {
+                return Status::invalid_argument;
+            }
+            if (m.rank == 2) {
+                if (m.dims[0] != sq || m.dims[1] != sk) {
+                    return Status::invalid_argument;
+                }
+            } else if (m.rank == 4) {
+                const bool b_ok = m.dims[0] == q.dims[0] || m.dims[0] == 1;
+                const bool h_ok = m.dims[1] == h || m.dims[1] == 1;
+                if (!b_ok || !h_ok || m.dims[2] != sq || m.dims[3] != sk) {
+                    return Status::invalid_argument;
+                }
+            } else {
+                return Status::invalid_argument;
+            }
+        }
+        // key_padding_mask: [B] lengths, [B, Sk] or [B, Sq, Sk] keep-mask.
+        if (present(inputs, kKpmSlot)) {
+            const auto& m = inputs[kKpmSlot];
+            if (m.dtype != DataType::s32) {
+                return Status::invalid_argument;
+            }
+            if (m.rank == 1) {
+                if (m.dims[0] != q.dims[0]) {
+                    return Status::invalid_argument;
+                }
+            } else if (m.rank == 2) {
+                if (m.dims[0] != q.dims[0] || m.dims[1] != sk) {
+                    return Status::invalid_argument;
+                }
+            } else if (m.rank == 3) {
+                if (m.dims[0] != q.dims[0] || m.dims[1] != sq || m.dims[2] != sk) {
+                    return Status::invalid_argument;
+                }
+            } else {
+                return Status::invalid_argument;
+            }
+        }
+        // Packed documents: the two cu vectors arrive together, are int32
+        // [segments + 1], and rule out a shared mask and a mask bias.
+        const bool has_cu_q = present(inputs, kCuQSlot);
+        const bool has_cu_k = present(inputs, kCuKSlot);
+        if (has_cu_q != has_cu_k) {
+            return Status::invalid_argument;
+        }
+        if (has_cu_q) {
+            const auto& cq = inputs[kCuQSlot];
+            const auto& ck = inputs[kCuKSlot];
+            if (cq.dtype != DataType::s32 || ck.dtype != DataType::s32 || cq.rank != 1 ||
+                ck.rank != 1 || cq.dims[0] != ck.dims[0] || cq.dims[0] < 2) {
+                return Status::invalid_argument;
+            }
+            if (q.rank != 3 || q.dims[0] != 1) {
+                return Status::invalid_argument;
+            }
+            if (present(inputs, kKpmSlot) || present(inputs, kAttnBiasSlot)) {
+                return Status::invalid_argument;
+            }
+        }
+    }
+
+    // head_sink is one logit per query head in both forms; the cache form puts
+    // it after the two scales.
+    const size_t sink_slot = cache ? kSinkSlotCached : kSinkSlot;
+    if (present(inputs, sink_slot)) {
+        const auto& sink = inputs[sink_slot];
+        if (sink.dtype != dt || sink.rank != 1 || sink.dims[0] != h) {
             return Status::invalid_argument;
         }
     }
 
-    // Varlen: the int32 [segments + 1] prefix offsets of a packed batch, after
-    // seqlens_k. Exclusive with the mask, the past pair, seqlens_k and a global
-    // position_offset — the segments are independent documents.
-    const bool has_seqlens = inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0;
-    const bool has_cu_q = inputs.size() > 7 && inputs[7].rank != 0;
-    const bool has_cu_k = inputs.size() > 8 && inputs[8].rank != 0;
-    if (has_cu_q != has_cu_k) {
-        return Status::invalid_argument;
-    }
-    if (has_cu_q) {
-        const auto& cq = inputs[7];
-        const auto& ck = inputs[8];
-        if (cq.dtype != DataType::s32 || ck.dtype != DataType::s32 || cq.rank != 1 ||
-            ck.rank != 1 || cq.dims[0] != ck.dims[0] || cq.dims[0] < 2) {
-            return Status::invalid_argument;
-        }
-        if (q.rank != 3 || q.dims[0] != 1) {
-            return Status::invalid_argument;
-        }
-        if (has_past_k || has_seqlens || attrs_.position_offset >= 0) {
-            return Status::invalid_argument;
-        }
-        if (inputs.size() > 3 && inputs[3].rank != 0) {
-            return Status::invalid_argument;
-        }
-    }
-
-    // The output gate is one element per output element, so it is shaped like
-    // Q (the output); present exactly when the attribute is set.
-    constexpr size_t kGateSlot = 9;
-    const bool has_gate = inputs.size() > kGateSlot && inputs[kGateSlot].rank != 0;
+    const size_t gate_slot = cache ? kGateSlotCached : kGateSlot;
+    const bool has_gate = present(inputs, gate_slot);
     if (attrs_.output_gate != EpilogueActivateType::None) {
         if (!has_gate) {
             return Status::invalid_argument;
         }
-        const auto& g = inputs[kGateSlot];
-        if (g.dtype != dt) {
+        const auto& g = inputs[gate_slot];
+        if (g.dtype != dt || g.rank != q.rank ||
+            g.dims != q.dims) {
             return Status::invalid_argument;
-        }
-        if (g.rank != q.rank) {
-            return Status::invalid_argument;
-        }
-        for (int64_t i = 0; i < q.rank; ++i) {
-            if (g.dims[i] != q.dims[i]) {
-                return Status::invalid_argument;
-            }
         }
     } else if (has_gate) {
         return Status::invalid_argument;
     }
 
-    // Every query row must sit inside the run it attends to.
-    if (attrs_.causal && attrs_.position_offset >= 0 && attrs_.position_offset + sq > sk_all) {
-        return Status::invalid_argument;
-    }
     return Status::ok;
 }
 
@@ -238,9 +340,10 @@ Status MultiHeadAttention::compute(std::span<TensorView> outputs,
                                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                                    void* workspace)
 {
-    // The optional mask and past segments are allowed to arrive as empty views
-    // (meaning absent), so only the three required inputs are checked for data.
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 10, 1));
+    if (outputs.size() != 1) {
+        return Status::invalid_argument;
+    }
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, kMaxInputs, 1));
     for (size_t i = 0; i < 3; ++i) {
         if (inputs[i].is_empty()) {
             return Status::invalid_argument;
@@ -253,7 +356,7 @@ Status MultiHeadAttention::compute(std::span<TensorView> outputs,
     if (!impl_->kernel_fn) {
         return Status::unsupported;
     }
-    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
+    return impl_->kernel_fn(attrs_, outputs, inputs, ctx, workspace);
 }
 
 } // namespace nnops

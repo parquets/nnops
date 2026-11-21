@@ -90,9 +90,14 @@ inline float softmax_xm_scalar(const T* x, const T* mask, int64_t i)
     }
 }
 
+/// One extra additive term in the softmax denominator — the attention sink. It
+/// behaves like a key whose logit is @p sink and whose value is zero: the
+/// weights still sum to one, that key simply contributes nothing to the output.
+/// A -inf sink is the no-sink case (exp(-inf - max) == 0).
 template <typename T, bool HasMask>
 inline void softmax_process_standard_row_impl(const T* x, const T* mask, T* y, int64_t D,
-                                              bool log_softmax, float inv_T)
+                                              bool log_softmax, float inv_T,
+                                              float sink = -std::numeric_limits<float>::infinity())
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
@@ -110,6 +115,9 @@ inline void softmax_process_standard_row_impl(const T* x, const T* mask, T* y, i
         if (xv > max_val) {
             max_val = xv;
         }
+    }
+    if (sink > max_val) {
+        max_val = sink;   // keep exp(sink - max) <= 1
     }
 
     const float neg_max = -max_val;
@@ -141,6 +149,9 @@ inline void softmax_process_standard_row_impl(const T* x, const T* mask, T* y, i
             s_store(&y[i], val);
         }
         sum_exp += val;
+    }
+    if (sink > -std::numeric_limits<float>::infinity()) {
+        sum_exp += std::exp(sink - max_val);
     }
 
     i = 0;
@@ -176,16 +187,18 @@ inline void softmax_process_standard_row_impl(const T* x, const T* mask, T* y, i
 
 template <typename T>
 inline void softmax_process_standard_row(const T* x, T* y, int64_t D, bool log_softmax,
-                                         float inv_T = 1.0f)
+                                         float inv_T = 1.0f,
+                                         float sink = -std::numeric_limits<float>::infinity())
 {
-    softmax_process_standard_row_impl<T, false>(x, nullptr, y, D, log_softmax, inv_T);
+    softmax_process_standard_row_impl<T, false>(x, nullptr, y, D, log_softmax, inv_T, sink);
 }
 
 template <typename T>
 inline void mask_softmax_process_standard_row(const T* x, const T* mask, T* y, int64_t D,
-                                              bool log_softmax, float inv_T = 1.0f)
+                                              bool log_softmax, float inv_T = 1.0f,
+                                              float sink = -std::numeric_limits<float>::infinity())
 {
-    softmax_process_standard_row_impl<T, true>(x, mask, y, D, log_softmax, inv_T);
+    softmax_process_standard_row_impl<T, true>(x, mask, y, D, log_softmax, inv_T, sink);
 }
 
 template <typename T> inline float softmax_row_max(const T* x, int64_t n)

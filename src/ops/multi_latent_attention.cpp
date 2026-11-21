@@ -71,16 +71,17 @@ size_t MultiLatentAttention::getWorkspaceSize(std::span<const TensorDesc> inputs
 Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
                                       std::span<const TensorDesc> outputs) const
 {
-    // Absorbed: Q, KV [, mask [, past KV [, seqlens_k [, cu_q, cu_k]]]].
-    // Non-absorbed takes the GQA slots: Q, K, V [, mask [, past K, past V [,
-    // seqlens_k [, cu_q, cu_k]]]].
+    // Absorbed: Q, KV [, mask [, past KV [, seqlens_k [, position_ids
+    // [, cu_q, cu_k]]]]]. Non-absorbed takes the GQA slots: Q, K, V [, mask
+    // [, past K, past V [, seqlens_k [, position_ids [, cu_q, cu_k]]]]].
     const bool absorbed = attrs_.absorbed;
     const size_t n_req = absorbed ? 2u : 3u;
     const size_t m_slot = absorbed ? 2u : 3u;
     const size_t p_slot = absorbed ? 3u : 4u;
     const size_t s_slot = absorbed ? 4u : 6u;
-    const size_t cq_slot = s_slot + 1;
-    const size_t ck_slot = s_slot + 2;
+    const size_t pos_slot = s_slot + 1;
+    const size_t cq_slot = pos_slot + 1;
+    const size_t ck_slot = pos_slot + 2;
 
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), n_req, ck_slot + 1, 1));
     if (!is_layout_supported(inputs[0].layout, LayoutSupport::Any)) {
@@ -121,6 +122,15 @@ Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
     if (has_seqlens) {
         const auto& s = inputs[s_slot];
         if (s.dtype != DataType::s32 || s.rank != 1 || s.dims[0] != q.dims[0]) {
+            return Status::invalid_argument;
+        }
+    }
+    // The per-batch first-query-row positions, the same int64 [B] input
+    // GroupQueryAttention and RoPE take.
+    const bool has_pos = inputs.size() > pos_slot && inputs[pos_slot].rank != 0;
+    if (has_pos) {
+        const auto& p = inputs[pos_slot];
+        if (p.dtype != DataType::s64 || p.rank != 1 || p.dims[0] != q.dims[0]) {
             return Status::invalid_argument;
         }
     }
@@ -286,7 +296,7 @@ Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
         if (q.rank != 3 || q.dims[0] != 1) {
             return Status::invalid_argument;
         }
-        if (has_past_k || has_seqlens || attrs_.position_offset >= 0) {
+        if (has_past_k || has_seqlens || has_pos || attrs_.position_offset >= 0) {
             return Status::invalid_argument;
         }
         if (inputs.size() > m_slot && inputs[m_slot].rank != 0) {
@@ -306,7 +316,7 @@ Status MultiLatentAttention::compute(std::span<TensorView> outputs,
                                      void* workspace)
 {
     const size_t n_req = attrs_.absorbed ? 2u : 3u;
-    const size_t max_in = attrs_.absorbed ? 7u : 9u;
+    const size_t max_in = attrs_.absorbed ? 8u : 10u;
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), n_req, max_in, 1));
     for (size_t i = 0; i < n_req; ++i) {
         if (inputs[i].is_empty()) {

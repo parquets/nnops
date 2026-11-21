@@ -93,16 +93,16 @@ float correction_dim(int64_t dim, float rotations, float base, int64_t orig)
 }
 
 std::vector<SectionPlan> plan_sections(const RoPEAttributes& attrs,
-                                       const std::vector<RoPESection>& sections, int64_t seq_len)
+                                       const std::vector<RoPESection>& sections, int64_t seq_len,
+                                       int64_t start)
 {
     std::vector<SectionPlan> plans;
     plans.reserve(sections.size());
 
-    // Dynamic NTK pivots on the run's end position: with an offset the chunk
-    // ends at offset + seq_len, which is the seq_len HF derives from
+    // Dynamic NTK pivots on the run's end position: the chunk ends at
+    // start + seq_len, which is the seq_len HF derives from
     // max(position_ids) + 1.
-    const double end_pos =
-        static_cast<double>(attrs.position_offset) + static_cast<double>(seq_len);
+    const double end_pos = static_cast<double>(start) + static_cast<double>(seq_len);
     const double orig = static_cast<double>(attrs.original_max_position);
 
     for (const auto& sec : sections) {
@@ -194,16 +194,23 @@ void build_pair_plans(PoolArray<PairPlan>& pairs, const std::vector<SectionPlan>
 }
 
 void compute_cos_sin_tables(PoolArray<float>& cos_table, PoolArray<float>& sin_table,
-                            int64_t seq_len, int64_t rotary_dim,
-                            const std::vector<RoPESection>& sections, const RoPEAttributes& attrs,
-                            const ComputeContext& ctx)
+                            int64_t blocks, int64_t seq_len, int64_t rotary_dim,
+                            const std::vector<RoPESection>& sections, const int64_t* starts,
+                            const RoPEAttributes& attrs, const ComputeContext& ctx)
 {
     const int64_t half = rotary_dim / 2;
-    const size_t total = static_cast<size_t>(seq_len) * static_cast<size_t>(half);
+    const int64_t rows = blocks * seq_len;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(half);
     cos_table.reset(total);
     sin_table.reset(total);
 
-    const auto plans = plan_sections(attrs, sections, seq_len);
+    // One block of seq_len consecutive positions per batch (or one block when
+    // every batch shares a start). Dynamic NTK pivots on the furthest end.
+    int64_t max_start = starts[0];
+    for (int64_t blk = 1; blk < blocks; ++blk) {
+        max_start = std::max(max_start, starts[blk]);
+    }
+    const auto plans = plan_sections(attrs, sections, seq_len, max_start);
     PoolArray<PairPlan> pairs;
     build_pair_plans(pairs, plans, attrs, half);
 
@@ -213,10 +220,12 @@ void compute_cos_sin_tables(PoolArray<float>& cos_table, PoolArray<float>& sin_t
     const float factor = attrs.scaling_factor;
     const float magnitude = yarn ? yarn_attention_scale(attrs) : 1.0f;
 
-    // One row per position, and each row is independent — so the table builds
-    // across the pool like the rotation pass does.
-    ctx.cpu.run(0, seq_len, [&](int64_t i) {
-        const float pos_f = static_cast<float>(attrs.position_offset + i);
+    // One row per (batch, position), and each row is independent — so the
+    // table builds across the pool like the rotation pass does.
+    ctx.cpu.run(0, rows, [&](int64_t i) {
+        const int64_t blk = i / seq_len;
+        const int64_t r = i % seq_len;
+        const float pos_f = static_cast<float>(starts[blk] + r);
         float* cos_row = cos_table.data() + i * half;
         float* sin_row = sin_table.data() + i * half;
 
@@ -271,11 +280,41 @@ void rope_impl(const RoPEAttributes& attrs, TensorView& output, std::span<const 
     }
 
     // A supplied cos/sin pair replaces the angle computation: its rows are
-    // already the absolute positions the caller wants, so position_offset, the
-    // bases, the mRoPE sections and the scaling types do not apply. A table in
-    // the activation dtype is widened once into f32, the same layout the
-    // computed tables use.
+    // already the absolute positions the caller wants, so position_offset,
+    // position_ids, the bases, the mRoPE sections and the scaling types do not
+    // apply. A table in the activation dtype is widened once into f32, the same
+    // layout the computed tables use.
     const bool has_table = inputs.size() > 3 && !inputs[3].is_empty();
+
+    // Where each batch's row 0 sits: the per-batch int64 vector [5] (axis 0 of
+    // x is the batch axis) or the scalar attribute. Equal starts share one
+    // block of table rows.
+    const int64_t batch = (rank >= 3) ? X.shape(0) : 1;
+    std::vector<int64_t> starts;
+    int64_t blocks = 1;
+    if (!has_table) {
+        const bool has_pos = inputs.size() > 5 && !inputs[5].is_empty();
+        if (has_pos) {
+            const int64_t* ids = inputs[5].ptr<int64_t>();
+            if (inputs[5].numel() == 1) {
+                starts.push_back(ids[0]);
+            } else {
+                starts.assign(ids, ids + batch);
+                bool uniform = true;
+                for (int64_t b = 1; b < batch; ++b) {
+                    uniform = uniform && starts[static_cast<size_t>(b)] == starts[0];
+                }
+                if (uniform) {
+                    starts.resize(1);
+                } else {
+                    blocks = batch;
+                }
+            }
+        } else {
+            starts.push_back(attrs.position_offset);
+        }
+    }
+
     const float* cos_src = nullptr;
     const float* sin_src = nullptr;
     int64_t tbl_stride = half;
@@ -310,7 +349,8 @@ void rope_impl(const RoPEAttributes& attrs, TensorView& output, std::span<const 
         }
     } else {
         auto sections = build_sections(attrs, rotary_dim);
-        compute_cos_sin_tables(cos_table, sin_table, seq_len, rotary_dim, sections, attrs, ctx);
+        compute_cos_sin_tables(cos_table, sin_table, blocks, seq_len, rotary_dim, sections,
+                               starts.data(), attrs, ctx);
         cos_src = cos_table.data();
         sin_src = sin_table.data();
     }
@@ -335,6 +375,9 @@ void rope_impl(const RoPEAttributes& attrs, TensorView& output, std::span<const 
         const int64_t outer = task / pos_tiles;
         const int64_t pos0 = (task % pos_tiles) * kRowsPerTask;
         const int64_t pos1 = std::min(pos0 + kRowsPerTask, seq_len);
+        // Table rows are batch-major: block b starts at b * seq_len.
+        const int64_t tbl_base =
+            (blocks > 1) ? (outer / (outer_count / batch)) * seq_len : 0;
 
         const T* x_outer = x_ptr + outer * seq_len * row_stride;
         T* y_outer = y_ptr + outer * seq_len * out_row_stride;
@@ -342,8 +385,8 @@ void rope_impl(const RoPEAttributes& attrs, TensorView& output, std::span<const 
         for (int64_t pos = pos0; pos < pos1; ++pos) {
             const T* x_row = x_outer + pos * row_stride;
             T* y_row = y_outer + pos * out_row_stride;
-            const float* cos_row = cos_src + pos * tbl_stride;
-            const float* sin_row = sin_src + pos * tbl_stride;
+            const float* cos_row = cos_src + (tbl_base + pos) * tbl_stride;
+            const float* sin_row = sin_src + (tbl_base + pos) * tbl_stride;
 
             if (gamma) {
                 // Normalize the whole head into the output, then rotate the

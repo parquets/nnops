@@ -601,6 +601,80 @@ NNOPS_TEST(rope_position_offset_matches_ref) {
     check_rope_scaled(attrs, {2, 5, 16}, 1023, RefScaling{});
 }
 
+NNOPS_TEST(rope_position_ids_per_batch) {
+    // Each batch rotates at its own first-row position: [B, S, D] with the
+    // int64 [B] position_ids input, so element (b, row) sits at ids[b] + row.
+    const int64_t B = 3, S = 5, D = 16;
+    const int64_t shape[] = {B, S, D};
+    auto [in_vec, in_view] = test::make_random_tensor(shape, -2.0f, 2.0f, 401);
+
+    RoPEAttributes attrs;
+    attrs.position_offset = 1000;   // overridden by the input
+    std::vector<int64_t> ids = {7, 0, 128};
+
+    auto op = RoPE::create(attrs, Backend::CPU);
+    const TensorDesc da[] = {in_view.desc()};
+    auto descs = op->getOutputTensorDesc(da);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
+    auto y = test::make_channel_first(descs[0], out_buf.data());
+
+    TensorView pos_view(std::vector<int64_t>{B}, DataType::s64, ids.data());
+    std::vector<TensorView> ins = {in_view};
+    for (int i = 0; i < 4; ++i) { ins.push_back(TensorView{}); }   // [1]..[4]
+    ins.push_back(pos_view);                                       // [5]
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+    std::vector<float> ref(out_buf.size(), 0.0f);
+    const int64_t stride = S * D;
+    for (int64_t b = 0; b < B; ++b) {
+        compute_rope_ref_scaled(in_vec.data() + b * stride, ref.data() + b * stride, S, D,
+                                attrs.base, attrs.interleaved, ids[static_cast<size_t>(b)],
+                                RefScaling{});
+    }
+    for (size_t i = 0; i < out_buf.size(); ++i) { NNOPS_EXPECT_NEAR(out_buf[i], ref[i], 1e-4f); }
+
+    // Equal ids are the scalar path: the two calls agree element for element.
+    RoPEAttributes scalar;
+    scalar.position_offset = 42;
+    auto scalar_op = RoPE::create(scalar, Backend::CPU);
+    std::vector<float> scalar_buf(out_buf.size(), 0.0f);
+    auto sy = test::make_channel_first(descs[0], scalar_buf.data());
+    const TensorView s_ins[] = {in_view};
+    NNOPS_EXPECT_TRUE(scalar_op->compute(sy, s_ins) == Status::ok);
+
+    std::vector<int64_t> same = {42, 42, 42};
+    TensorView same_view(std::vector<int64_t>{B}, DataType::s64, same.data());
+    std::vector<TensorView> same_ins = {in_view};
+    for (int i = 0; i < 4; ++i) { same_ins.push_back(TensorView{}); }
+    same_ins.push_back(same_view);
+    std::vector<float> ids_buf(out_buf.size(), 0.0f);
+    auto iy = test::make_channel_first(descs[0], ids_buf.data());
+    NNOPS_EXPECT_TRUE(op->compute(iy, same_ins) == Status::ok);
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        NNOPS_EXPECT_NEAR(ids_buf[i], scalar_buf[i], 1e-6f);
+    }
+
+    // A rank-2 [S, D] input takes a one-element vector.
+    const int64_t flat[] = {4, 8};
+    auto [fv, fview] = test::make_random_tensor(flat, -2.0f, 2.0f, 402);
+    std::vector<int64_t> one = {9};
+    TensorView one_view(std::vector<int64_t>{1}, DataType::s64, one.data());
+    std::vector<TensorView> f_ins = {fview};
+    for (int i = 0; i < 4; ++i) { f_ins.push_back(TensorView{}); }
+    f_ins.push_back(one_view);
+    RoPEAttributes f_attrs;
+    auto f_op = RoPE::create(f_attrs, Backend::CPU);
+    const TensorDesc fda[] = {fview.desc()};
+    auto fdescs = f_op->getOutputTensorDesc(fda);
+    std::vector<float> f_buf(static_cast<size_t>(fdescs[0].numel()), 0.0f);
+    auto fy = test::make_channel_first(fdescs[0], f_buf.data());
+    NNOPS_EXPECT_TRUE(f_op->compute(fy, f_ins) == Status::ok);
+    std::vector<float> f_ref(f_buf.size(), 0.0f);
+    compute_rope_ref_scaled(fv.data(), f_ref.data(), 4, 8, f_attrs.base, f_attrs.interleaved,
+                            9, RefScaling{});
+    for (size_t i = 0; i < f_buf.size(); ++i) { NNOPS_EXPECT_NEAR(f_buf[i], f_ref[i], 1e-4f); }
+}
+
 NNOPS_TEST(rope_position_offset_row_shift) {
     // A one-row call at offset k must equal row k of a run starting at 0.
     const int64_t run_shape[] = {9, 8};

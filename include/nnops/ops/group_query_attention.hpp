@@ -6,63 +6,102 @@
 /// h reads kv head h / (H / H_kv), so consecutive query heads share one K/V
 /// pair. H_kv == H is ordinary MHA; H_kv == 1 is multi-query attention.
 ///
-///   scores = Q·Kᵀ·scale (+ mask);  output = softmax(scores, -1)·V
+///   scores = Q·Kᵀ·scale (+ bias);  output = softmax(scores, -1)·V
 ///
-/// Inputs:
-///   [0] Q [B, Sq, H·D]    or [B, H,   Sq, D]
-///   [1] K [B, Sk, H_kv·D] or [B, H_kv, Sk, D]
-///   [2] V [B, Sk, H_kv·D] or [B, H_kv, Sk, D]
-///   [3] optional additive mask, flat [Sq, Sk] shared by every batch and head,
-///       or a per-head bias [B, H, Sq, Sk].
-///   [4] optional past K, [5] optional past V — same layout as K/V, past rows.
-///   [6] optional per-batch key-run length, int32 [B] (see below).
-///   [7]/[8] optional cu_seqlens_q / cu_seqlens_k, int32 [segments + 1] (see
-///           Varlen below).
-///   [9] optional output gate, shaped like the output (see output_gate).
-/// The output follows Q's shape. scale = 0 means 1/sqrt(D).
+/// The `causal` attribute picks between two input contracts, not merely a
+/// masking rule.
 ///
-/// `causal` (default true, as in onnxruntime's GroupQueryAttention) masks query
-/// row i to key positions j <= q0 + i, with q0 = position_offset or, by
-/// default, Sk - Sq: the bottom-right alignment makes a shorter query run the
-/// KV-cache decode case, where the Sq new tokens are the last Sq positions of
-/// the cached key run.
+/// ---- causal = false: explicit attention (ViT / encoder) -------------------
 ///
-/// Chunked input: inputs[4] and inputs[5] are an optional past K and past V —
-/// the same layout as K/V, with Sk_past rows. The operator reads the run
-/// [past | new] by streaming each segment in place, so the caller never
-/// concatenates the cache for a step, and passes position_offset = Sk_past for
-/// a chunked prefill. The mask stays [Sq, Sk_past + Sk_new]. The past is
-/// read-only: no present/cache output is written, growing the cache stays the
-/// caller's job. Optional slots are positional, so a step call without a mask
-/// passes an empty view in inputs[3].
+/// The keys and values are the caller's own tensors. Masking is an external
+/// input: whatever the model means to hide — padding, document isolation,
+/// ALiBi-style relative bias, the fully-masked rows of masked-autoencoder
+/// queries — it says so with the mask, and the operator never derives one from
+/// a position.
 ///
-/// `position_offset` is what makes a non-tail chunk decodable: it is the
-/// absolute position of query row 0, and each row sees j <= position_offset + i
-/// regardless of where the chunk sits in the run.
+///   [0] query  [B, Sq, H·D]  or the rank-4 form (see head_layout)
+///   [1] key    [B, Sk, H_kv·D]  same layout as query; Sk may differ from Sq
+///   [2] value  [B, Sk, H_kv·D]  same layout as key
+///   [3] attention_bias    float additive, [Sq, Sk] shared by every batch and
+///                         head or [B|1, H|1, Sq, Sk] (an extent-1 axis
+///                         broadcasts and is never expanded)
+///   [4] key_padding_mask  int32 keep-mask, nonzero = keep: a padded key takes
+///                         mask_filter_value. [B, Sk] is one row per batch,
+///                         [B, Sq, Sk] one row per query row. Rank 1 [B] is
+///                         not a mask but the batch's valid key-run length
+///                         (right padding is truncated, every batch may sit at
+///                         its own position)
+///   [5] head_sink         float [H]: one extra logit per query head in the
+///                         softmax denominator (a virtual key whose value is
+///                         zero); a row hidden everywhere then reads zeros
+///                         rather than NaN
+///   [6] cu_seqlens_q, [7] cu_seqlens_k   packed documents (see below)
+///   [8] output_gate       shaped like the output (see output_gate)
 ///
-/// `seqlens_k` (inputs[6], ORT's name) is the per-batch counterpart: an int32
-/// [B] vector whose entry is the number of valid keys in batch b's whole run —
-/// the run's prefix [0, seqlens_k[b]), so right padding is truncated and every
-/// batch may sit at its own position. Causal masking then takes the per-batch
-/// bottom-right q0 = seqlens_k[b] - Sq unless position_offset is given (a
-/// scalar, so it applies to every batch). Absent, each batch runs to the full
-/// Sk. The mask, if any, remains a single flat [Sq, Sk] shared by all batches.
+/// Every query row sees the batch's whole valid run — the mask, and only the
+/// mask, narrows it. Fully masked rows read zeros. `softcap` and
+/// `local_window_size` are causal-run attributes and are ignored here.
 ///
-/// `softcap` and `window` are the Gemma-style logit cap and sliding window; see
-/// the attributes. The window lowers each row's first visible key to
-/// pos_i - window + 1, and the cap rewrites the scaled score before the mask.
+/// ---- causal = true: KV-cache attention (decoder) --------------------------
 ///
-/// Varlen (inputs[7]/[8]): `cu_seqlens_q` and `cu_seqlens_k` are the int32
-/// [segments + 1] prefix offsets of a packed batch — Q is [1, total_q, H·D],
-/// K/V are [1, total_kv, ...], and segment s owns query rows
-/// [cu_q[s], cu_q[s+1]) and key rows [cu_k[s], cu_k[s+1]). No query attends
-/// across a segment boundary, and each segment is bottom-right aligned on its
-/// own key run (cu_k[s+1] - cu_k[s] >= its query count). The pair is exclusive
-/// with the mask, the past pair, seqlens_k and position_offset — one packed call
-/// carries many independent documents, so a shared mask or a global position
-/// has no meaning.
+/// The current step's K/V is already in the cache: the caller appends (and
+/// quantizes) it before the call, and the operator only reads. There is no
+/// mask input, no past, and no present output — causality is derived from the
+/// batch's actual position.
+///
+///   [0] query  [B, Sq, H·D]  or the rank-4 form (see head_layout)
+///   [1] k_cache  [B, H_kv, Skv, D]  contiguous, onnxruntime's BNSH order,
+///               always this order whatever head_layout says for the query
+///   [2] v_cache  [B, H_kv, Skv, D]  a separate tensor, same order
+///   [3] kv_seqlens  int32 [B]: the number of valid rows in batch b's cache
+///               (the run length). Absent, every batch runs to Skv.
+///   [4] position_ids  int64 [B]: the absolute position of batch b's first
+///               query row, rows consecutive (row i is at position_ids[b]+i).
+///               This is the same tensor RoPE takes. Absent, the bottom-right
+///               alignment derives it from kv_seqlens (kv_seqlens[b] - Sq).
+///               Present, it alone fixes the causal diagonal and the window;
+///               kv_seqlens still bounds which keys are visible, so the two
+///               may differ (a draft row can sit past its visible prefix).
+///   [5] k_scale, [6] v_scale  f32, present exactly when the cache is int8
+///   [7] head_sink  [H]
+///   [8] output_gate
+///
+/// The cache dtype is the query's (f32 / f16) or s8. An s8 cache is symmetric —
+/// the stored integer times its scale is the value — and the scales come from
+/// whoever wrote the cache (the append quantizes and records them), so they
+/// stay fixed across steps:
+///   - per token: [B, H_kv, Skv], one scale per cache row — the default;
+///   - per tensor: numel 1, one scale for the whole cache.
+/// The operator dequantizes on the fly (the K scale folds into the score, the
+/// V scale into the probabilities); the query stays fp.
+///
+/// The output follows Q's shape in both forms. scale = 0 means 1/sqrt(D).
+///
+/// ---- shared semantics -----------------------------------------------------
+///
+/// The mask is added after the scale and the softcap and before the softmax, so
+/// a mask value of -inf behaves as "hidden", while a finite large negative
+/// (mask_filter_value) waits for the softmax numerator to underflow. A row
+/// whose valid range is empty reads zeros in every route.
+///
+/// `local_window_size` (Gemma2/3 local layers, Mistral) lowers each causal
+/// row's first visible key to pos_i - window + 1; `sink_tokens` then keeps the
+/// cache's first N positions visible regardless, so a row reads
+/// [0, N) ∪ [pos_i - window + 1, pos_i + 1) — the StreamingLLM/Gemma-3 local
+/// pattern with its 4 sink tokens. `softcap` rewrites the scaled logit before
+/// the mask as cap·tanh(s/cap). Both are off at -1 / 0.
+///
+/// Packed documents (inputs[6]/[7]): the int32 [segments + 1] prefix offsets of
+/// a packed batch — Q is [1, total_q, H·D], K/V are [1, total_kv, H_kv·D], and
+/// segment s owns query rows [cu_q[s], cu_q[s+1]) and key rows
+/// [cu_k[s], cu_k[s+1]). No query attends across a segment boundary. The pair
+/// is exclusive with the masks and the cache — one packed call carries many
+/// independent documents.
+///
+/// Optional slots are positional: an omitted input is an empty view.
 
 #include "nnops/core/op_base.hpp"
+#include "nnops/ops/attention_common.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -83,21 +122,33 @@ struct GroupQueryAttentionAttributes {
     /// Attention scale; 0 means 1/sqrt(head_dim).
     float scale = 0.0f;
 
-    /// Causal mask: j <= q0 + i, with q0 = position_offset or Sk - Sq.
+    /// Input contract selector. false is explicit key/value attention with an
+    /// external mask (ViT/encoder); true is KV-cache attention whose causal
+    /// range follows each batch's kv_seqlens (decoder). See the file header.
     bool causal = true;
-
-    /// Absolute position of query row 0; negative means bottom-right. Only
-    /// consulted when causal. With a past segment, the chunked-prefill value is
-    /// the past length.
-    int64_t position_offset = -1;
 
     /// Logit softcap (Gemma2/3): s = softcap·tanh(s/softcap), applied to the
     /// scaled score and before the mask. 0 disables.
     float softcap = 0.0f;
 
-    /// Sliding-window attention (Gemma2/3 local layers, Mistral): query row i
-    /// also skips keys older than its position minus window + 1. 0 disables.
-    int64_t window = 0;
+    /// Sliding-window attention (Gemma2/3 local layers, Mistral): a causal
+    /// query row i also skips keys older than pos_i - local_window_size + 1.
+    /// -1 disables, onnxruntime's sentinel; ignored by the explicit form.
+    int64_t local_window_size = -1;
+
+    /// StreamingLLM-style sinks: the first `sink_tokens` key positions stay
+    /// visible to every query row even outside the window, so a row at
+    /// position i reads [0, sink_tokens) ∪ [i - window + 1, i]. Gemma-3-style
+    /// local layers keep 4. 0 disables; only meaningful with a window.
+    int64_t sink_tokens = 0;
+
+    /// Value a padded key takes in an integer key_padding_mask
+    /// (onnxruntime's mask_filter_value; -10000, not -inf).
+    float mask_filter_value = -10000.0f;
+
+    /// Storage order of the rank-4 per-head form; see AttentionHeadLayout.
+    /// The KV cache keeps BNSH regardless.
+    AttentionHeadLayout head_layout = AttentionHeadLayout::Auto;
 
     /// Output gate (Qwen3-Next / 3.5 / 4): multiply the attention output by
     /// `act(gate)`, where the gate is a trailing input shaped exactly like Q

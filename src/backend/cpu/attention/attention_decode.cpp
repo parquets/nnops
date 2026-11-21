@@ -24,18 +24,20 @@ namespace nnops::backend::cpu {
 
 namespace {
 
-/// Dot product of two n-wide rows, f32 accumulation.
-template <class T> inline float dot_row(const T* a, const T* b, int64_t n)
+/// Dot product of two n-wide rows, f32 accumulation. The key row may be stored
+/// fp (widened on load) or as int8 bytes (expanded and scaled by the caller's
+/// pre-scaled query row).
+template <class Q, class KV> inline float dot_row(const Q* a, const KV* b, int64_t n)
 {
-    constexpr int L = simd::simd_lane_for<T>;
+    constexpr int L = simd::simd_lane_for<Q>;
     auto acc = simd::v_zero_f32x8();
     int64_t i = 0;
     for (; i + L <= n; i += L) {
-        acc = simd::v_fmadd(simd::v_load_f32(a + i), simd::v_load_f32(b + i), acc);
+        acc = simd::v_fmadd(simd::v_load_f32(a + i), kv_load_f32(b + i), acc);
     }
     float s = simd::v_reduce_sum(acc);
     for (; i < n; ++i) {
-        s += simd::s_load(&a[i]) * simd::s_load(&b[i]);
+        s += simd::s_load(&a[i]) * kv_load_scalar(&b[i]);
     }
     return s;
 }
@@ -43,20 +45,20 @@ template <class T> inline float dot_row(const T* a, const T* b, int64_t n)
 /// Four n-wide dot products against one query row, written to @p out. A
 /// horizontal reduce costs about as much as the 16 vector FMAs of a 128-wide
 /// row, so four keys per reduce is what keeps the GEMV off the latency floor.
-template <class T>
-inline void dot_row4(const T* q, const T* k0, const T* k1, const T* k2, const T* k3, int64_t n,
-                     float* out)
+template <class Q, class KV>
+inline void dot_row4(const Q* q, const KV* k0, const KV* k1, const KV* k2, const KV* k3,
+                     int64_t n, float* out)
 {
-    constexpr int L = simd::simd_lane_for<T>;
+    constexpr int L = simd::simd_lane_for<Q>;
     auto a0 = simd::v_zero_f32x8();
     auto a1 = a0, a2 = a0, a3 = a0;
     int64_t i = 0;
     for (; i + L <= n; i += L) {
         auto qv = simd::v_load_f32(q + i);
-        a0 = simd::v_fmadd(qv, simd::v_load_f32(k0 + i), a0);
-        a1 = simd::v_fmadd(qv, simd::v_load_f32(k1 + i), a1);
-        a2 = simd::v_fmadd(qv, simd::v_load_f32(k2 + i), a2);
-        a3 = simd::v_fmadd(qv, simd::v_load_f32(k3 + i), a3);
+        a0 = simd::v_fmadd(qv, kv_load_f32(k0 + i), a0);
+        a1 = simd::v_fmadd(qv, kv_load_f32(k1 + i), a1);
+        a2 = simd::v_fmadd(qv, kv_load_f32(k2 + i), a2);
+        a3 = simd::v_fmadd(qv, kv_load_f32(k3 + i), a3);
     }
     float s0 = simd::v_reduce_sum(a0);
     float s1 = simd::v_reduce_sum(a1);
@@ -64,10 +66,10 @@ inline void dot_row4(const T* q, const T* k0, const T* k1, const T* k2, const T*
     float s3 = simd::v_reduce_sum(a3);
     for (; i < n; ++i) {
         const float qs = simd::s_load(&q[i]);
-        s0 += qs * simd::s_load(&k0[i]);
-        s1 += qs * simd::s_load(&k1[i]);
-        s2 += qs * simd::s_load(&k2[i]);
-        s3 += qs * simd::s_load(&k3[i]);
+        s0 += qs * kv_load_scalar(&k0[i]);
+        s1 += qs * kv_load_scalar(&k1[i]);
+        s2 += qs * kv_load_scalar(&k2[i]);
+        s3 += qs * kv_load_scalar(&k3[i]);
     }
     out[0] = s0;
     out[1] = s1;
@@ -75,26 +77,27 @@ inline void dot_row4(const T* q, const T* k0, const T* k1, const T* k2, const T*
     out[3] = s3;
 }
 
-template <class T>
+template <class T, class KV>
 void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
                            std::span<const TensorView> inputs, const ComputeContext& ctx,
                            const AttentionPlan& plan, void* workspace)
 {
+    constexpr bool kInt8 = std::is_same_v<KV, int8_t>;
     const auto& Q = inputs[0];
     const auto& K = inputs[1];
     const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
     const bool split = has_past_view(cfg, inputs);
-    const auto& Kp = split ? inputs[past_slot(cfg)] : K;
-    const auto& Vp = split ? inputs[past_slot(cfg) + (cfg.v_is_k ? 0 : 1)] : V;
-    const int32_t* seqlens =
-        has_seqlens_input(cfg, inputs) ? inputs[seqlens_slot(cfg)].ptr<int32_t>() : nullptr;
+    NNOPS_ASSERT(!(kInt8 && split)); // a quantized cache has no past segment
+    const auto& Kp = split ? inputs[static_cast<size_t>(cfg.past_k_slot)] : K;
+    const auto& Vp = split ? inputs[static_cast<size_t>(cfg.past_v_slot)] : V;
+    bool seqlens_plus_one = true;
+    const int32_t* seqlens = run_lengths_ptr(cfg, inputs, seqlens_plus_one);
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
     const int64_t Sq = hs.Sq, Dqk = hs.Dqk, Dv = hs.Dv;
     const int64_t Sk_new = hs.Sk, Sk_past = hs.Sk_past;
     const int64_t Sk = Sk_new + Sk_past; // the whole [past | new] run
-    const bool merged = hs.merged;
     NNOPS_ASSERT(Sq == 1);
 
     const float scale =
@@ -105,19 +108,34 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
     const float exp_scale = cfg.softcap > 0.0f ? 1.0f : scale;
 
     const T* q_ptr = Q.ptr<T>();
-    const T* k_ptr = K.ptr<T>();
-    const T* v_ptr = V.ptr<T>();
-    const T* kp_ptr = split ? Kp.ptr<T>() : nullptr;
-    const T* vp_ptr = split ? Vp.ptr<T>() : nullptr;
+    const KV* k_ptr = K.ptr<KV>();
+    const KV* v_ptr = V.ptr<KV>();
+    const KV* kp_ptr = split ? Kp.ptr<KV>() : nullptr;
+    const KV* vp_ptr = split ? Vp.ptr<KV>() : nullptr;
+    const KvScale kscale = resolve_kv_scale(cfg, cfg.k_scale_slot, inputs);
+    const KvScale vscale = resolve_kv_scale(cfg, cfg.v_scale_slot, inputs);
+    const bool has_sink = slot_present(cfg, cfg.sink_slot, inputs);
+    const T* sink_ptr = has_sink ? inputs[static_cast<size_t>(cfg.sink_slot)].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
-    const int64_t q_rs = Q.row_stride_elems();
-    const int64_t k_rs = K.row_stride_elems();
-    const int64_t v_rs = V.row_stride_elems();
-    const int64_t kp_rs = split ? Kp.row_stride_elems() : k_rs;
-    const int64_t vp_rs = split ? Vp.row_stride_elems() : v_rs;
-    const int64_t o_rs = output.row_stride_elems();
+    const int64_t q_rs = head_seq_step(Q, hs.q_layout);
+    const int64_t k_rs = head_seq_step(K, hs.kv_layout);
+    const int64_t v_rs = head_seq_step(V, hs.kv_layout);
+    const int64_t kp_rs = split ? head_seq_step(Kp, hs.kv_layout) : k_rs;
+    const int64_t vp_rs = split ? head_seq_step(Vp, hs.kv_layout) : v_rs;
+    const int64_t o_rs = head_seq_step(output, hs.q_layout);
     const int64_t v_head_stride = merged_v_head_stride(cfg, Dqk, Dv);
+
+    int64_t q_b, q_h, k_b, k_h, v_b, v_h, o_b, o_h;
+    int64_t kp_b = 0, kp_h = 0, vp_b = 0, vp_h = 0;
+    head_strides(Q, hs.q_layout, Dqk, q_b, q_h);
+    head_strides(K, hs.kv_layout, Dqk, k_b, k_h);
+    head_strides(V, hs.kv_layout, v_head_stride, v_b, v_h);
+    head_strides(output, hs.q_layout, Dv, o_b, o_h);
+    if (split) {
+        head_strides(Kp, hs.kv_layout, Dqk, kp_b, kp_h);
+        head_strides(Vp, hs.kv_layout, v_head_stride, vp_b, vp_h);
+    }
 
     const int64_t G = H / Hkv;
     const int64_t hb = plan.decode_heads;
@@ -147,47 +165,38 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
         // The batch's valid key run and this row's limit over it: bottom-right
         // alignment reads every valid key, a shorter run or an explicit
         // position_offset cuts it shorter, and the sliding window raises the
-        // start. A slice is a sub-range of that band.
-        const int64_t run_b = run_length(seqlens, b, Sk);
-        const int64_t n_valid = causal_limit(cfg, 0, Sq, run_b);
-        const int64_t k_lo = std::min(key_lo(cfg, 0, Sq, run_b), n_valid);
-        const int64_t span = n_valid - k_lo;
-        const int64_t lo = k_lo + (span * si) / splits;
-        const int64_t hi = k_lo + (span * (si + 1)) / splits;
+        // start. The sinks are the run's first positions, always visible; the
+        // window band starts past them so no key is counted twice. A slice is
+        // a sub-range of that band.
+        const int64_t run_b = run_length(seqlens, b, Sk, seqlens_plus_one);
+        const int64_t pos0 = batch_pos0(cfg, inputs, b);
+        const int64_t n_valid = causal_limit(cfg, pos0, 0, Sq, run_b);
+        const int64_t prefix = sink_prefix(cfg, run_b);
+        const int64_t band_lo =
+            std::max<int64_t>(std::min(key_lo(cfg, pos0, 0, Sq, run_b), n_valid), prefix);
+        const int64_t span = n_valid - band_lo;
+        const int64_t lo = band_lo + (span * si) / splits;
+        const int64_t hi = band_lo + (span * (si + 1)) / splits;
 
-        const T* k_head;
-        const T* v_head;
-        const T* q_base;
-        T* o_base;
-        int64_t q_step, o_step;
-        if (merged) {
-            q_base = q_ptr + b * q_rs + h0 * Dqk;
-            q_step = Dqk;
-            k_head = k_ptr + b * Sk_new * k_rs + hkv * Dqk;
-            v_head = v_ptr + b * hs.Sv * v_rs + hkv * v_head_stride;
-            o_base = out_ptr + b * o_rs + h0 * Dv;
-            o_step = Dv;
-        } else {
-            q_base = q_ptr + (b * H + h0) * q_rs;
-            q_step = q_rs;
-            k_head = k_ptr + (b * Hkv + hkv) * Sk_new * k_rs;
-            v_head = v_ptr + (b * Hkv + hkv) * hs.Sv * v_rs;
-            o_base = out_ptr + (b * H + h0) * o_rs;
-            o_step = o_rs;
-        }
+        const KV* k_head = k_ptr + b * k_b + hkv * k_h;
+        const KV* v_head = v_ptr + b * v_b + hkv * v_h;
+        // The head block is contiguous in the head axis only for the row-head
+        // layouts; a BHSD tensor steps by a whole head plane.
+        const T* q_base = q_ptr + b * q_b + h0 * q_h;
+        T* o_base = out_ptr + b * o_b + h0 * o_h;
+        const int64_t q_step = hs.row_heads() ? Dqk : q_rs;
+        const int64_t o_step = hs.row_heads() ? Dv : o_rs;
 
         // [past | new], the past segment empty when no past is passed.
-        const T* k_base[2] = {k_head, k_head};
-        const T* v_base[2] = {v_head, v_head};
+        const KV* k_base[2] = {k_head, k_head};
+        const KV* v_base[2] = {v_head, v_head};
         int64_t k_str[2] = {k_rs, k_rs};
         int64_t v_str[2] = {v_rs, v_rs};
         int64_t seg_lo[2] = {0, 0};
         int64_t seg_hi[2] = {0, Sk};
         if (split) {
-            k_base[0] = merged ? kp_ptr + b * Sk_past * kp_rs + hkv * Dqk :
-                                 kp_ptr + (b * Hkv + hkv) * Sk_past * kp_rs;
-            v_base[0] = merged ? vp_ptr + b * Sk_past * vp_rs + hkv * v_head_stride :
-                                 vp_ptr + (b * Hkv + hkv) * Sk_past * vp_rs;
+            k_base[0] = kp_ptr + b * kp_b + hkv * kp_h;
+            v_base[0] = vp_ptr + b * vp_b + hkv * vp_h;
             k_str[0] = kp_rs;
             v_str[0] = vp_rs;
             seg_lo[1] = Sk_past;
@@ -200,6 +209,10 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
         float* mrow = o_acc + hb * Dv;             // [nh]
         float* lrow = mrow + hb;                   // [nh]
 
+        // The cache's per-token scales, this (batch, kv head)'s rows.
+        const KvScaleRow ks_row = kscale.row(b, hkv, Hkv, Sk);
+        const KvScaleRow vs_row = vscale.row(b, hkv, Hkv, Sk);
+
         for (int64_t j = 0; j < nh; ++j) {
             mrow[j] = kNegInf;
             lrow[j] = 0.0f;
@@ -209,143 +222,185 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
             }
         }
 
-        // Walk the slice in kDecodeChunk-key blocks, keeping the running max,
+        // Walk a range in kDecodeChunk-key blocks, keeping the running max,
         // sum and unnormalized output per head: the score scratch is a fixed
         // block, not the whole run, so it stays flat as the cache grows.
-        for (int64_t t0 = lo; t0 < hi; t0 += kDecodeChunk) {
-            const int64_t t1 = std::min(hi, t0 + kDecodeChunk);
-            const int64_t nc = t1 - t0;
+        const auto process_range = [&](int64_t rlo, int64_t rhi) {
+            for (int64_t t0 = rlo; t0 < rhi; t0 += kDecodeChunk) {
+                const int64_t t1 = std::min(rhi, t0 + kDecodeChunk);
+                const int64_t nc = t1 - t0;
 
-            // ---- scores = q · K^T ------------------------------------
-            // The key block is streamed once and every head of the group dots
-            // against it: what was one full pass over the run per query head
-            // is now one per group. Without a softcap the scale rides through
-            // the softmax exponential, so this stays a pure dot product.
-            for (int64_t j = 0; j < nh; ++j) {
-                const T* q_row = q_base + j * q_step;
-                float* sj = scores + j * kDecodeChunk;
+                // ---- scores = q · K^T --------------------------------
+                // The key block is streamed once and every head of the group
+                // dots against it: what was one full pass over the run per
+                // query head is now one per group. Without a softcap the scale
+                // rides through the softmax exponential, so this stays a pure
+                // dot product.
+                for (int64_t j = 0; j < nh; ++j) {
+                    const T* q_row = q_base + j * q_step;
+                    float* sj = scores + j * kDecodeChunk;
+                    for (int s = 0; s < 2; ++s) {
+                        const int64_t a = std::max(t0, seg_lo[s]);
+                        const int64_t b1 = std::min(t1, seg_hi[s]);
+                        const KV* kb = k_base[s];
+                        const int64_t rs = k_str[s];
+                        int64_t t = a;
+                        for (; t + 4 <= b1; t += 4) {
+                            const KV* kk = kb + (t - seg_lo[s]) * rs;
+                            dot_row4(q_row, kk, kk + rs, kk + 2 * rs, kk + 3 * rs, Dqk,
+                                     sj + (t - t0));
+                        }
+                        for (; t < b1; ++t) {
+                            const KV* krow = kb + (t - seg_lo[s]) * rs;
+                            sj[t - t0] = dot_row(q_row, krow, Dqk);
+                        }
+                    }
+                    // The cache's per-token K scale multiplies the raw dot; it
+                    // has to land before the cap, which owns the scalar scale.
+                    if constexpr (kInt8) {
+                        for (int64_t t = 0; t < nc; ++t) {
+                            sj[t] *= ks_row.at(t0 + t);
+                        }
+                    }
+                }
+
+                // ---- softcap ------------------------------------------
+                // The cap owns the scale, so it runs on the raw dots before
+                // the online-softmax update reads the row.
+                if (cfg.softcap > 0.0f) {
+                    for (int64_t j = 0; j < nh; ++j) {
+                        row_softcap(scores + j * kDecodeChunk, nc, scale, cfg.softcap);
+                    }
+                }
+
+                // ---- online-softmax update ----------------------------
+                for (int64_t j = 0; j < nh; ++j) {
+                    float* sj = scores + j * kDecodeChunk;
+                    const float rowmax = kernel::softmax_row_max<float>(sj, nc);
+                    if (rowmax == kNegInf) {
+                        continue;
+                    }
+                    const float old_m = mrow[j];
+                    const float new_m = std::max(old_m, rowmax);
+                    // The running max is a raw dot, so the rescale carries the
+                    // same exponential scale the weights do. A first block
+                    // starts from zero, so it is skipped rather than evaluated
+                    // as -inf·0.
+                    const float exp_diff =
+                        (old_m == kNegInf) ? 0.0f : std::exp((old_m - new_m) * exp_scale);
+                    mrow[j] = new_m;
+                    lrow[j] = exp_diff * lrow[j] +
+                              kernel::softmax_row_exp_sum<float>(sj, sj, nc, new_m, exp_scale);
+                    if (exp_diff != 1.0f) {
+                        float* oa = o_acc + j * Dv;
+                        auto v_ed = simd::v_set1(oa, exp_diff);
+                        int64_t d = 0;
+                        for (; d + lanes <= Dv; d += lanes) {
+                            simd::v_store(oa + d, simd::v_mul(simd::v_load(oa + d), v_ed));
+                        }
+                        for (; d < Dv; ++d) {
+                            oa[d] *= exp_diff;
+                        }
+                    }
+                }
+
+                // The cache's per-token V scale rides the probabilities, not
+                // the denominator: out = Σ p·vs·v / Σ p.
+                if constexpr (kInt8) {
+                    for (int64_t j = 0; j < nh; ++j) {
+                        float* sj = scores + j * kDecodeChunk;
+                        for (int64_t t = 0; t < nc; ++t) {
+                            sj[t] *= vs_row.at(t0 + t);
+                        }
+                    }
+                }
+
+                // ---- o += P · V --------------------------------------
+                // The probabilities are the unnormalized block exponentials;
+                // the running sum normalizes once at the end. Four value rows
+                // per accumulator pass, as in the unbatched kernel.
                 for (int s = 0; s < 2; ++s) {
                     const int64_t a = std::max(t0, seg_lo[s]);
                     const int64_t b1 = std::min(t1, seg_hi[s]);
-                    const T* kb = k_base[s];
-                    const int64_t rs = k_str[s];
+                    const KV* vb = v_base[s];
+                    const int64_t rs = v_str[s];
                     int64_t t = a;
                     for (; t + 4 <= b1; t += 4) {
-                        const T* kk = kb + (t - seg_lo[s]) * rs;
-                        dot_row4(q_row, kk, kk + rs, kk + 2 * rs, kk + 3 * rs, Dqk, sj + (t - t0));
+                        const KV* r0 = vb + (t - seg_lo[s]) * rs;
+                        const KV* r1 = r0 + rs;
+                        const KV* r2 = r1 + rs;
+                        const KV* r3 = r2 + rs;
+                        const int64_t tt = t - t0;
+                        for (int64_t j = 0; j < nh; ++j) {
+                            const float* sj = scores + j * kDecodeChunk;
+                            const auto vp0 = simd::v_set1_f32x8(sj[tt + 0]);
+                            const auto vp1 = simd::v_set1_f32x8(sj[tt + 1]);
+                            const auto vp2 = simd::v_set1_f32x8(sj[tt + 2]);
+                            const auto vp3 = simd::v_set1_f32x8(sj[tt + 3]);
+                            float* oa = o_acc + j * Dv;
+                            int64_t d = 0;
+                            for (; d + lanes <= Dv; d += lanes) {
+                                auto acc = simd::v_load(oa + d);
+                                acc = simd::v_fmadd(vp0, kv_load_f32<KV>(r0 + d), acc);
+                                acc = simd::v_fmadd(vp1, kv_load_f32<KV>(r1 + d), acc);
+                                acc = simd::v_fmadd(vp2, kv_load_f32<KV>(r2 + d), acc);
+                                acc = simd::v_fmadd(vp3, kv_load_f32<KV>(r3 + d), acc);
+                                simd::v_store(oa + d, acc);
+                            }
+                            for (; d < Dv; ++d) {
+                                oa[d] += sj[tt + 0] * kv_load_scalar<KV>(&r0[d]) +
+                                         sj[tt + 1] * kv_load_scalar<KV>(&r1[d]) +
+                                         sj[tt + 2] * kv_load_scalar<KV>(&r2[d]) +
+                                         sj[tt + 3] * kv_load_scalar<KV>(&r3[d]);
+                            }
+                        }
                     }
                     for (; t < b1; ++t) {
-                        sj[t - t0] = dot_row(q_row, kb + (t - seg_lo[s]) * rs, Dqk);
+                        const KV* vrow = vb + (t - seg_lo[s]) * rs;
+                        const int64_t tt = t - t0;
+                        for (int64_t j = 0; j < nh; ++j) {
+                            const float p = scores[j * kDecodeChunk + tt];
+                            auto vp = simd::v_set1_f32x8(p);
+                            float* oa = o_acc + j * Dv;
+                            int64_t d = 0;
+                            for (; d + lanes <= Dv; d += lanes) {
+                                simd::v_store(oa + d,
+                                              simd::v_fmadd(vp, kv_load_f32<KV>(vrow + d),
+                                                            simd::v_load(oa + d)));
+                            }
+                            for (; d < Dv; ++d) {
+                                oa[d] += p * kv_load_scalar<KV>(&vrow[d]);
+                            }
+                        }
                     }
                 }
             }
+        };
 
-            // ---- softcap ----------------------------------------------
-            // The cap owns the scale, so it runs on the raw dots before the
-            // online-softmax update reads the row.
-            if (cfg.softcap > 0.0f) {
-                for (int64_t j = 0; j < nh; ++j) {
-                    row_softcap(scores + j * kDecodeChunk, nc, scale, cfg.softcap);
-                }
-            }
-
-            // ---- online-softmax update --------------------------------
-            for (int64_t j = 0; j < nh; ++j) {
-                float* sj = scores + j * kDecodeChunk;
-                const float rowmax = kernel::softmax_row_max<float>(sj, nc);
-                if (rowmax == kNegInf) {
-                    continue;
-                }
-                const float old_m = mrow[j];
-                const float new_m = std::max(old_m, rowmax);
-                // A first block starts from zero, so the rescale is skipped
-                // rather than evaluated as -inf·0.
-                const float exp_diff = (old_m == kNegInf) ? 0.0f : std::exp(old_m - new_m);
-                mrow[j] = new_m;
-                lrow[j] = exp_diff * lrow[j] +
-                          kernel::softmax_row_exp_sum<float>(sj, sj, nc, new_m, exp_scale);
-                if (exp_diff != 1.0f) {
-                    float* oa = o_acc + j * Dv;
-                    auto v_ed = simd::v_set1(oa, exp_diff);
-                    int64_t d = 0;
-                    for (; d + lanes <= Dv; d += lanes) {
-                        simd::v_store(oa + d, simd::v_mul(simd::v_load(oa + d), v_ed));
-                    }
-                    for (; d < Dv; ++d) {
-                        oa[d] *= exp_diff;
-                    }
-                }
-            }
-
-            // ---- o += P · V ------------------------------------------
-            // The probabilities are the unnormalized block exponentials; the
-            // running sum normalizes once at the end. Four value rows per
-            // accumulator pass, as in the unbatched kernel.
-            for (int s = 0; s < 2; ++s) {
-                const int64_t a = std::max(t0, seg_lo[s]);
-                const int64_t b1 = std::min(t1, seg_hi[s]);
-                const T* vb = v_base[s];
-                const int64_t rs = v_str[s];
-                int64_t t = a;
-                for (; t + 4 <= b1; t += 4) {
-                    const T* r0 = vb + (t - seg_lo[s]) * rs;
-                    const T* r1 = r0 + rs;
-                    const T* r2 = r1 + rs;
-                    const T* r3 = r2 + rs;
-                    const int64_t tt = t - t0;
-                    for (int64_t j = 0; j < nh; ++j) {
-                        const float* sj = scores + j * kDecodeChunk;
-                        const auto vp0 = simd::v_set1_f32x8(sj[tt + 0]);
-                        const auto vp1 = simd::v_set1_f32x8(sj[tt + 1]);
-                        const auto vp2 = simd::v_set1_f32x8(sj[tt + 2]);
-                        const auto vp3 = simd::v_set1_f32x8(sj[tt + 3]);
-                        float* oa = o_acc + j * Dv;
-                        int64_t d = 0;
-                        for (; d + lanes <= Dv; d += lanes) {
-                            auto acc = simd::v_load(oa + d);
-                            acc = simd::v_fmadd(vp0, simd::v_load_f32(r0 + d), acc);
-                            acc = simd::v_fmadd(vp1, simd::v_load_f32(r1 + d), acc);
-                            acc = simd::v_fmadd(vp2, simd::v_load_f32(r2 + d), acc);
-                            acc = simd::v_fmadd(vp3, simd::v_load_f32(r3 + d), acc);
-                            simd::v_store(oa + d, acc);
-                        }
-                        for (; d < Dv; ++d) {
-                            oa[d] += sj[tt + 0] * simd::s_load(&r0[d]) +
-                                     sj[tt + 1] * simd::s_load(&r1[d]) +
-                                     sj[tt + 2] * simd::s_load(&r2[d]) +
-                                     sj[tt + 3] * simd::s_load(&r3[d]);
-                        }
-                    }
-                }
-                for (; t < b1; ++t) {
-                    const T* vrow = vb + (t - seg_lo[s]) * rs;
-                    const int64_t tt = t - t0;
-                    for (int64_t j = 0; j < nh; ++j) {
-                        const float p = scores[j * kDecodeChunk + tt];
-                        auto vp = simd::v_set1_f32x8(p);
-                        float* oa = o_acc + j * Dv;
-                        int64_t d = 0;
-                        for (; d + lanes <= Dv; d += lanes) {
-                            simd::v_store(oa + d, simd::v_fmadd(vp, simd::v_load_f32(vrow + d),
-                                                                simd::v_load(oa + d)));
-                        }
-                        for (; d < Dv; ++d) {
-                            oa[d] += p * simd::s_load(&vrow[d]);
-                        }
-                    }
-                }
-            }
+        // The sink band is slice 0's; the window band is this slice's.
+        if (si == 0 && prefix > 0) {
+            process_range(0, prefix);
         }
+        process_range(lo, hi);
 
         // ---- store ---------------------------------------------------
         if (splits == 1) {
             for (int64_t j = 0; j < nh; ++j) {
                 const float l_j = lrow[j];
-                // A row every key was masked out of leaves l == 0: zeros.
-                const float inv_l = (l_j > 0.0f) ? (1.0f / l_j) : 0.0f;
+                const float m_j = mrow[j];
+                // The sink is one extra logit in the denominator (stored scores
+                // are raw, so the logit max is m * exp_scale). With no live key
+                // at all the row stays zeros: all the weight is on the sink.
+                float inv_l = 0.0f;
+                if (m_j != kNegInf) {
+                    const float sink = (sink_ptr != nullptr) ? simd::s_load(&sink_ptr[h0 + j])
+                                                             : kNegInf;
+                    const float denom = l_j + std::exp(sink - m_j * exp_scale);
+                    inv_l = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+                }
                 const float* oa = o_acc + j * Dv;
                 T* o_row = o_base + j * o_step;
-                auto v_inv = simd::v_set1(oa, inv_l);
+                auto v_inv = simd::v_set1_f32x8(inv_l);
                 int64_t d = 0;
                 for (; d + lanes <= Dv; d += lanes) {
                     simd::v_store_f32(o_row + d, simd::v_mul(simd::v_load(oa + d), v_inv));
@@ -391,7 +446,7 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
         const int64_t pstep = hb * (Dv + 2);
         const float* pj = partials + (u * splits) * pstep + j * (Dv + 2);
 
-        T* o_row = merged ? out_ptr + b * o_rs + h * Dv : out_ptr + (b * H + h) * o_rs;
+        T* o_row = out_ptr + b * o_b + h * o_h;
 
         float M = kNegInf;
         for (int64_t s = 0; s < splits; ++s) {
@@ -430,8 +485,14 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
                 acc[d] += w * p[d];
             }
         }
+        // The sink joins the merged denominator once (its value is zero, so
+        // the numerator is untouched).
+        if (sink_ptr != nullptr) {
+            const float sink = simd::s_load(&sink_ptr[h]);
+            denom += std::exp(sink - M * exp_scale);
+        }
         const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-        auto v_inv = simd::v_set1(acc, inv);
+        auto v_inv = simd::v_set1_f32x8(inv);
         int64_t d = 0;
         for (; d + lanes <= Dv; d += lanes) {
             simd::v_store_f32(o_row + d, simd::v_mul(simd::v_load(acc + d), v_inv));
@@ -451,14 +512,24 @@ void attention_decode_cpu(const AttentionConfig& cfg, TensorView& output,
 {
     NNOPS_ASSERT(inputs[0].data_type() == DataType::f16 || inputs[0].data_type() == DataType::f32 ||
                  inputs[0].data_type() == DataType::bf16);
+    const bool kv8 = kv_is_int8(inputs);
     if (inputs[0].data_type() == DataType::f16) {
-        attention_decode_impl<half>(cfg, output, inputs, ctx, plan, scratch);
+        if (kv8) {
+            attention_decode_impl<half, int8_t>(cfg, output, inputs, ctx, plan, scratch);
+        } else {
+            attention_decode_impl<half, half>(cfg, output, inputs, ctx, plan, scratch);
+        }
 #ifdef NNOPS_ARCH_AARCH64
     } else if (inputs[0].data_type() == DataType::bf16) {
-        attention_decode_impl<bfloat16>(cfg, output, inputs, ctx, plan, scratch);
+        NNOPS_ASSERT(!kv8); // bf16 queries have no int8 cache route
+        attention_decode_impl<bfloat16, bfloat16>(cfg, output, inputs, ctx, plan, scratch);
 #endif
     } else {
-        attention_decode_impl<float>(cfg, output, inputs, ctx, plan, scratch);
+        if (kv8) {
+            attention_decode_impl<float, int8_t>(cfg, output, inputs, ctx, plan, scratch);
+        } else {
+            attention_decode_impl<float, float>(cfg, output, inputs, ctx, plan, scratch);
+        }
     }
 }
 

@@ -23,9 +23,10 @@ std::vector<TensorDesc> RoPE::getOutputTensorDesc(std::span<const TensorDesc> in
 Status RoPE::validate(std::span<const TensorDesc> inputs, std::span<const TensorDesc> outputs) const
 {
     // [0] x; [1] optional RMSNorm scale, [2] its optional bias; [3]/[4] an
-    // optional precomputed cos/sin table. An omitted slot is a rank-0 desc, so
-    // the table pair does not force a dummy scale and bias.
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 5, 1));
+    // optional precomputed cos/sin table; [5] optional int64 [B]
+    // position_ids. An omitted slot is a rank-0 desc, so the table pair does
+    // not force a dummy scale and bias.
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 6, 1));
 
     const auto& x = inputs[0];
     NNOPS_TRY(detail::check_rank(x.rank, 2));
@@ -70,6 +71,18 @@ Status RoPE::validate(std::span<const TensorDesc> inputs, std::span<const Tensor
             }
         }
     }
+    // Per-batch first-row positions: int64 [B], axis 0 of x being the batch
+    // axis. A rank-2 [S, D] input (no batch axis) takes one value.
+    if (inputs.size() > 5 && inputs[5].rank != 0) {
+        const auto& p = inputs[5];
+        const bool shape_ok = p.rank == 1 &&
+                              (p.dims[0] == 1 ||
+                               (x.rank >= 3 && p.dims[0] == x.dims[0]));
+        if (p.dtype != DataType::s64 || !shape_ok) {
+            return Status::invalid_argument;
+        }
+    }
+
     if (!(attrs_.norm_epsilon > 0.0f) || !std::isfinite(attrs_.norm_epsilon)) {
         return Status::invalid_argument;
     }
@@ -114,7 +127,7 @@ Status RoPE::validate(std::span<const TensorDesc> inputs, std::span<const Tensor
 Status RoPE::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
                      const ComputeContext& ctx, void* workspace)
 {
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 5, 1));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 6, 1));
     // Only the activation is mandatory; before the table pair existed the
     // optional slots could simply be dropped, and that has to keep working.
     if (inputs[0].is_empty() || outputs[0].is_empty()) {

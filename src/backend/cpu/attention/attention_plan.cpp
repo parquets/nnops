@@ -40,34 +40,41 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
     AttentionPlan plan;
 
     const int64_t H = cfg.num_heads;
-    const bool merged = (q.rank == 3);
-    int64_t B, Sq, Sk_new, Dqk;
-    if (merged) {
-        B = q.dims[0];
-        Sq = q.dims[1];
-        Sk_new = k.dims[1];
-        Dqk = q.dims[2] / H;
-    } else {
-        B = q.dims[0];
-        Sq = q.dims[2];
-        Sk_new = k.dims[2];
-        Dqk = q.dims[3];
-    }
+    const HeadLayout q_layout = (q.rank == 3) ? HeadLayout::Merged :
+                                cfg.bshd      ? HeadLayout::BSHD :
+                                                HeadLayout::BHSD;
+    const HeadLayout kv_layout = (k.rank == 3) ? HeadLayout::Merged :
+                                 cfg.kv_bshd   ? HeadLayout::BSHD :
+                                                 HeadLayout::BHSD;
+    const int64_t sd = head_seq_dim(q_layout);
+    const int64_t ksd = head_seq_dim(kv_layout);
+    const int64_t B = q.dims[0];
+    const int64_t Sq = q.dims[static_cast<size_t>(sd)];
+    const int64_t Sk_new = k.dims[static_cast<size_t>(ksd)];
+    const int64_t Dqk = (q_layout == HeadLayout::Merged) ? q.dims[2] / H : q.dims[3];
     const int64_t Dv = cfg.v_head_dim > 0 ? cfg.v_head_dim : Dqk;
+    const bool kv8 = k.dtype == DataType::s8;
 
     // A past segment makes the run [past | new]; every route is sized by the
     // whole run, and the standard route — which packs B from one base pointer
-    // — is skipped in favour of flash.
-    const size_t pslot = past_slot(cfg);
-    const bool split = inputs.size() > pslot && inputs[pslot].rank != 0;
-    const int64_t Sk_past = split ? inputs[pslot].dims[merged ? 1 : 2] : 0;
+    // — is skipped in favour of flash. The descriptor has no data, so a
+    // past_sequence_length narrowing is not visible here: the plan sizes the
+    // past buffer's full row count, and run_length clamps the reads.
+    const bool split = cfg.past_k_slot >= 0 && inputs.size() > static_cast<size_t>(cfg.past_k_slot) &&
+                       inputs[static_cast<size_t>(cfg.past_k_slot)].rank != 0;
+    const int64_t Sk_past = split ? inputs[static_cast<size_t>(cfg.past_k_slot)]
+                                        .dims[static_cast<size_t>(ksd)] :
+                                    0;
     const int64_t Sk = Sk_new + Sk_past;
 
     // Decode — one query row and no mask: both products are GEMV, so the
-    // packing-dominated tiled routes are pure overhead. An optional mask
-    // arrives as a rank-0 descriptor and keeps the standard route.
-    const size_t mslot = mask_slot(cfg);
-    const bool has_mask = inputs.size() > mslot && inputs[mslot].rank != 0;
+    // packing-dominated tiled routes are pure overhead. A key_padding_mask
+    // that only carries lengths is not a mask and keeps the decode route.
+    const bool has_bias = cfg.bias_slot >= 0 && inputs.size() > static_cast<size_t>(cfg.bias_slot) &&
+                          inputs[static_cast<size_t>(cfg.bias_slot)].rank != 0;
+    const bool has_keep = cfg.kpm_slot >= 0 && inputs.size() > static_cast<size_t>(cfg.kpm_slot) &&
+                          inputs[static_cast<size_t>(cfg.kpm_slot)].rank >= 2;
+    const bool has_mask = has_bias || has_keep;
     plan.use_decode = (Sq == 1) && !has_mask;
     if (plan.use_decode) {
         // Head batching: a GQA/MQA group's query heads share one KV head, so
@@ -124,7 +131,7 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
         resolve_flash_tile_sizes(sizeof(T), Sq, Sk, Dqk, Dv, cfg.causal, Br, Bc);
         plan.Br = Br;
         plan.Bc = Bc;
-        const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv);
+        const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, kv8);
         const int64_t NQ = (Sq + Br - 1) / Br;
         plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H * NQ);
         plan.workspace_size =
@@ -157,7 +164,9 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
 
     const int64_t scores_elems = Sq * Sk;
     const int64_t pack_elems = static_cast<int64_t>(np_full) * ldd_b_full;
-    const int64_t per_head = scores_elems + pack_elems;
+    const int64_t i8_elems =
+        kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(std::max(Dqk, Sk))) : 0;
+    const int64_t per_head = scores_elems + pack_elems + i8_elems;
 
     plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H);
     plan.workspace_size =
@@ -175,12 +184,13 @@ AttentionPlan get_attention_plan(const AttentionConfig& cfg, std::span<const Ten
 
     const DataType dt = inputs[0].dtype;
 
-    // f32 and f16 take the tiled path; any other dtype, or a Q/K dtype
-    // mismatch, returns a zeroed plan.
-    if (inputs[1].dtype != dt) {
+    // The K/V cache may be int8 while the query stays fp; anything else must
+    // share the query's dtype, and a mismatch returns a zeroed plan.
+    const bool kv8 = inputs[1].dtype == DataType::s8;
+    if (inputs[1].dtype != dt && !(kv8 && (dt == DataType::f32 || dt == DataType::f16))) {
         return AttentionPlan{};
     }
-    if (!cfg.v_is_k && inputs.size() > 2 && inputs[2].dtype != dt) {
+    if (!cfg.v_is_k && inputs.size() > 2 && inputs[2].dtype != inputs[1].dtype) {
         return AttentionPlan{};
     }
     if (dt == DataType::f16) {

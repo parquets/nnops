@@ -83,6 +83,13 @@ struct BenchPool {
     inline static thread_local int current_thread_id_ = 0;
 };
 
+template <typename T> constexpr DataType dt_of()
+{
+    if constexpr (std::is_same_v<T, float>) { return DataType::f32; }
+    else if constexpr (std::is_same_v<T, bfloat16>) { return DataType::bf16; }
+    else { return DataType::f16; }
+}
+
 /// float -> f32, half -> f16, bfloat16 -> bf16.
 template <typename T>
 auto make_random(std::span<const int64_t> shape, uint64_t seed) {
@@ -191,12 +198,64 @@ void run_mha(const MhaCase& c, const std::vector<int>& threads, int iters) {
 
     auto op = MultiHeadAttention::create(attrs, Backend::CPU);
 
-    std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
-    std::vector<TensorView> ins   = {q, k, v};
-    if (c.mask) { descs.push_back(mask_view.desc()); ins.push_back(mask_view); }
+    // The cache form reads a [B, H, Sk, D] cache with the step's rows at the
+    // tail; the explicit form reads K/V with the bias at slot 3.
+    std::vector<T> ck_vec, cv_vec;
+    TensorView cache_k, cache_v;
+    std::vector<TensorView> ins;
+    if (c.causal) {
+        const int64_t cdims[] = {c.B, H, Sk, D};
+        ck_vec.assign(static_cast<size_t>(c.B * H * Sk * D), T{});
+        cv_vec.assign(static_cast<size_t>(c.B * H * Sk * D), T{});
+        const T* kp = k.ptr<T>();
+        const T* vp = v.ptr<T>();
+        for (int64_t b = 0; b < c.B; ++b) {
+            for (int64_t h = 0; h < H; ++h) {
+                for (int64_t s = 0; s < Sq; ++s) {
+                    for (int64_t d = 0; d < D; ++d) {
+                        const int64_t from =
+                            b * k.stride_elems(0) + s * k.stride_elems(1) + h * D + d;
+                        const int64_t to = ((b * H + h) * Sk + (Sk - Sq + s)) * D + d;
+                        ck_vec[static_cast<size_t>(to)] = kp[from];
+                        cv_vec[static_cast<size_t>(to)] = vp[from];
+                    }
+                }
+            }
+        }
+        cache_k = TensorView(cdims, dt_of<T>(), ck_vec.data());
+        cache_v = TensorView(cdims, dt_of<T>(), cv_vec.data());
+        ins = {q, cache_k, cache_v};
+    } else {
+        ins = {q, k, v};
+        if (c.mask) {
+            while (ins.size() <= 3) { ins.push_back(TensorView{}); }
+            ins[3] = mask_view;   // attention_bias
+        }
+    }
+    std::vector<TensorDesc> descs;
+    for (const auto& t : ins) { descs.push_back(t.desc()); }
     auto out_descs = op->getOutputTensorDesc(descs);
 
-    const cpu::AttentionPlan plan = cpu::get_attention_plan({H}, descs, out_descs,
+    cpu::AttentionConfig bcfg;
+    bcfg.num_heads = H;
+    bcfg.causal = c.causal;
+    if (c.causal) {
+        bcfg.seqlens_slot = 3;
+        bcfg.seqlens_is_length = true;
+        bcfg.pos_ids_slot = 4;
+        bcfg.k_scale_slot = 5;
+        bcfg.v_scale_slot = 6;
+        bcfg.sink_slot = 7;
+        bcfg.gate_slot = 8;
+    } else {
+        bcfg.bias_slot = 3;
+        bcfg.kpm_slot = 4;
+        bcfg.sink_slot = 5;
+        bcfg.cu_q_slot = 6;
+        bcfg.cu_k_slot = 7;
+        bcfg.gate_slot = 8;
+    }
+    const cpu::AttentionPlan plan = cpu::get_attention_plan(bcfg, descs, out_descs,
                                                             threads.back(),
                                                             /*use_thread_slots=*/true);
 
@@ -272,27 +331,73 @@ void run_gqa(const GqaCase& c, const std::vector<int>& threads, int iters) {
     attrs.num_heads    = c.H;
     attrs.kv_num_heads = c.Hkv;
     attrs.causal       = c.causal;
-    attrs.position_offset = Sk_past > 0 ? Sk_past : -1;
 
     auto op = GroupQueryAttention::create(attrs, Backend::CPU);
 
-    std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
-    std::vector<TensorView> ins   = {q, k, v};
-    if (Sk_past > 0) {
-        descs.push_back(TensorDesc{});
-        ins.push_back(TensorView{});
-        descs.push_back(past_k.desc());
-        ins.push_back(past_k);
-        descs.push_back(past_v.desc());
-        ins.push_back(past_v);
+    // The cache form reads a [B, H_kv, Sk, D] cache with the step's rows at
+    // the tail; the explicit form reads K/V.
+    std::vector<T> ck_vec, cv_vec;
+    TensorView cache_k, cache_v;
+    std::vector<TensorView> ins;
+    if (c.causal) {
+        const int64_t cdims[] = {c.B, c.Hkv, Sk, c.D};
+        ck_vec.assign(static_cast<size_t>(c.B * c.Hkv * Sk * c.D), T{});
+        cv_vec.assign(static_cast<size_t>(c.B * c.Hkv * Sk * c.D), T{});
+        const T* kp = k.ptr<T>();
+        const T* vp = v.ptr<T>();
+        const T* pkp = Sk_past > 0 ? past_k.ptr<T>() : nullptr;
+        const T* pvp = Sk_past > 0 ? past_v.ptr<T>() : nullptr;
+        for (int64_t b = 0; b < c.B; ++b) {
+            for (int64_t h = 0; h < c.Hkv; ++h) {
+                for (int64_t t = 0; t < Sk; ++t) {
+                    for (int64_t d = 0; d < c.D; ++d) {
+                        const int64_t to = ((b * c.Hkv + h) * Sk + t) * c.D + d;
+                        if (t < Sk_past) {
+                            const int64_t from = b * past_k.stride_elems(0) +
+                                                 t * past_k.stride_elems(1) + h * c.D + d;
+                            ck_vec[static_cast<size_t>(to)] = pkp[from];
+                            cv_vec[static_cast<size_t>(to)] = pvp[from];
+                        } else {
+                            const int64_t from = b * k.stride_elems(0) +
+                                                 (t - Sk_past) * k.stride_elems(1) +
+                                                 h * c.D + d;
+                            ck_vec[static_cast<size_t>(to)] = kp[from];
+                            cv_vec[static_cast<size_t>(to)] = vp[from];
+                        }
+                    }
+                }
+            }
+        }
+        cache_k = TensorView(cdims, dt_of<T>(), ck_vec.data());
+        cache_v = TensorView(cdims, dt_of<T>(), cv_vec.data());
+        ins = {q, cache_k, cache_v};
+    } else {
+        ins = {q, k, v};
     }
+    std::vector<TensorDesc> descs;
+    for (const auto& t : ins) { descs.push_back(t.desc()); }
     auto out_descs = op->getOutputTensorDesc(descs);
 
     cpu::AttentionConfig cfg;
     cfg.num_heads = c.H;
     cfg.num_kv_heads = c.Hkv;
     cfg.causal = c.causal;
-    cfg.position_offset = attrs.position_offset;
+    if (c.causal) {
+        cfg.seqlens_slot = 3;
+        cfg.seqlens_is_length = true;
+        cfg.pos_ids_slot = 4;
+        cfg.k_scale_slot = 5;
+        cfg.v_scale_slot = 6;
+        cfg.sink_slot = 7;
+        cfg.gate_slot = 8;
+    } else {
+        cfg.bias_slot = 3;
+        cfg.kpm_slot = 4;
+        cfg.sink_slot = 5;
+        cfg.cu_q_slot = 6;
+        cfg.cu_k_slot = 7;
+        cfg.gate_slot = 8;
+    }
     const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs,
                                                             threads.back(), true);
 
@@ -390,6 +495,13 @@ void run_mla(const MlaCase& c, const std::vector<int>& threads, int iters) {
     cfg.v_is_k = true;
     cfg.causal = c.causal;
     cfg.position_offset = attrs.position_offset;
+    cfg.bias_slot = 2;
+    cfg.past_k_slot = 3;
+    cfg.past_v_slot = 3;
+    cfg.seqlens_slot = 4;
+    cfg.pos_ids_slot = 5;
+    cfg.cu_q_slot = 6;
+    cfg.cu_k_slot = 7;
     const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs,
                                                             threads.back(), true);
 
@@ -497,9 +609,34 @@ DtypeArm make_mha_arm(const MhaCase& c, double& flops) {
     ins.push_back(adopt(q_buf, qshape, 11));
     ins.push_back(adopt(k_buf, kshape, 12));
     ins.push_back(adopt(v_buf, kshape, 13));
-    if (c.mask) {
+
+    auto ck_buf = std::make_shared<std::vector<T>>();
+    auto cv_buf = std::make_shared<std::vector<T>>();
+    if (c.causal) {
+        const int64_t cdims[] = {c.B, c.H, Sk, c.D};
+        ck_buf->assign(static_cast<size_t>(c.B * c.H * Sk * c.D), T{});
+        cv_buf->assign(static_cast<size_t>(c.B * c.H * Sk * c.D), T{});
+        const T* kp = ins[1].ptr<T>();
+        const T* vp = ins[2].ptr<T>();
+        for (int64_t b = 0; b < c.B; ++b) {
+            for (int64_t h = 0; h < c.H; ++h) {
+                for (int64_t s = 0; s < Sq; ++s) {
+                    for (int64_t d = 0; d < c.D; ++d) {
+                        const int64_t from =
+                            b * ins[1].stride_elems(0) + s * ins[1].stride_elems(1) + h * c.D + d;
+                        const int64_t to = ((b * c.H + h) * Sk + (Sk - Sq + s)) * c.D + d;
+                        (*ck_buf)[static_cast<size_t>(to)] = kp[from];
+                        (*cv_buf)[static_cast<size_t>(to)] = vp[from];
+                    }
+                }
+            }
+        }
+        ins[1] = TensorView(cdims, dt_of<T>(), ck_buf->data());
+        ins[2] = TensorView(cdims, dt_of<T>(), cv_buf->data());
+    } else if (c.mask) {
         const int64_t mshape[] = {Sq, Sk};
-        ins.push_back(adopt(m_buf, mshape, 14));
+        while (ins.size() <= 3) { ins.push_back(TensorView{}); }
+        ins[3] = adopt(m_buf, mshape, 14);   // attention_bias
     }
 
     MultiHeadAttentionAttributes attrs{};
@@ -519,12 +656,32 @@ DtypeArm make_mha_arm(const MhaCase& c, double& flops) {
 
     flops = 4.0 * static_cast<double>(c.B) * c.H * Sq * Sk * c.D;
 
+    cpu::AttentionConfig bcfg;
+    bcfg.num_heads = c.H;
+    bcfg.causal = c.causal;
+    if (c.causal) {
+        bcfg.seqlens_slot = 3;
+        bcfg.seqlens_is_length = true;
+        bcfg.pos_ids_slot = 4;
+        bcfg.k_scale_slot = 5;
+        bcfg.v_scale_slot = 6;
+        bcfg.sink_slot = 7;
+        bcfg.gate_slot = 8;
+    } else {
+        bcfg.bias_slot = 3;
+        bcfg.kpm_slot = 4;
+        bcfg.sink_slot = 5;
+        bcfg.cu_q_slot = 6;
+        bcfg.cu_k_slot = 7;
+        bcfg.gate_slot = 8;
+    }
+
     DtypeArm arm;
-    arm.note = route_note(cpu::get_attention_plan({c.H}, descs, out_descs,
+    arm.note = route_note(cpu::get_attention_plan(bcfg, descs, out_descs,
                                                   thread_list().back(),
                                                   /*use_thread_slots=*/true));
-    arm.run = [op, ins = std::move(ins), output, q_buf, k_buf, v_buf, m_buf, out_buf]
-              (const ComputeContext& ctx) mutable {
+    arm.run = [op, ins = std::move(ins), output, q_buf, k_buf, v_buf, m_buf, ck_buf,
+               cv_buf, out_buf](const ComputeContext& ctx) mutable {
         op->compute(output, ins, ctx, nullptr);
     };
     return arm;
@@ -552,17 +709,54 @@ DtypeArm make_gqa_arm(const GqaCase& c, double& flops) {
     ins.push_back(adopt(q_buf, qshape, 21));
     ins.push_back(adopt(k_buf, kvshape, 22));
     ins.push_back(adopt(v_buf, kvshape, 23));
-    if (Sk_past > 0) {
-        ins.push_back(TensorView{});
-        ins.push_back(adopt(pk_buf, pshape, 24));
-        ins.push_back(adopt(pv_buf, pshape, 25));
+
+    auto ck_buf = std::make_shared<std::vector<T>>();
+    auto cv_buf = std::make_shared<std::vector<T>>();
+    if (c.causal) {
+        const int64_t cdims[] = {c.B, c.Hkv, Sk, c.D};
+        ck_buf->assign(static_cast<size_t>(c.B * c.Hkv * Sk * c.D), T{});
+        cv_buf->assign(static_cast<size_t>(c.B * c.Hkv * Sk * c.D), T{});
+        const T* kp = ins[1].ptr<T>();
+        const T* vp = ins[2].ptr<T>();
+        const T* pkp = nullptr;
+        const T* pvp = nullptr;
+        if (Sk_past > 0) {
+            ins.push_back(adopt(pk_buf, pshape, 24));
+            ins.push_back(adopt(pv_buf, pshape, 25));
+            pkp = ins[3].ptr<T>();
+            pvp = ins[4].ptr<T>();
+        }
+        for (int64_t b = 0; b < c.B; ++b) {
+            for (int64_t h = 0; h < c.Hkv; ++h) {
+                for (int64_t t = 0; t < Sk; ++t) {
+                    for (int64_t d = 0; d < c.D; ++d) {
+                        const int64_t to = ((b * c.Hkv + h) * Sk + t) * c.D + d;
+                        if (t < Sk_past) {
+                            (*ck_buf)[static_cast<size_t>(to)] = pkp[b * ins[3].stride_elems(0) +
+                                                                    t * ins[3].stride_elems(1) +
+                                                                    h * c.D + d];
+                            (*cv_buf)[static_cast<size_t>(to)] = pvp[b * ins[4].stride_elems(0) +
+                                                                    t * ins[4].stride_elems(1) +
+                                                                    h * c.D + d];
+                        } else {
+                            const int64_t from = b * ins[1].stride_elems(0) +
+                                                 (t - Sk_past) * ins[1].stride_elems(1) +
+                                                 h * c.D + d;
+                            (*ck_buf)[static_cast<size_t>(to)] = kp[from];
+                            (*cv_buf)[static_cast<size_t>(to)] = vp[from];
+                        }
+                    }
+                }
+            }
+        }
+        ins[1] = TensorView(cdims, dt_of<T>(), ck_buf->data());
+        ins[2] = TensorView(cdims, dt_of<T>(), cv_buf->data());
     }
 
     GroupQueryAttentionAttributes attrs{};
     attrs.num_heads    = c.H;
     attrs.kv_num_heads = c.Hkv;
     attrs.causal       = c.causal;
-    attrs.position_offset = Sk_past > 0 ? Sk_past : -1;
     auto op = std::shared_ptr<GroupQueryAttention>(
         GroupQueryAttention::create(attrs, Backend::CPU));
 
@@ -580,13 +774,28 @@ DtypeArm make_gqa_arm(const GqaCase& c, double& flops) {
     cfg.num_heads = c.H;
     cfg.num_kv_heads = c.Hkv;
     cfg.causal = c.causal;
-    cfg.position_offset = attrs.position_offset;
+    if (c.causal) {
+        cfg.seqlens_slot = 3;
+        cfg.seqlens_is_length = true;
+        cfg.pos_ids_slot = 4;
+        cfg.k_scale_slot = 5;
+        cfg.v_scale_slot = 6;
+        cfg.sink_slot = 7;
+        cfg.gate_slot = 8;
+    } else {
+        cfg.bias_slot = 3;
+        cfg.kpm_slot = 4;
+        cfg.sink_slot = 5;
+        cfg.cu_q_slot = 6;
+        cfg.cu_k_slot = 7;
+        cfg.gate_slot = 8;
+    }
 
     DtypeArm arm;
     arm.note = route_note(cpu::get_attention_plan(cfg, descs, out_descs,
                                                   thread_list().back(), true));
     arm.run = [op, ins = std::move(ins), output, q_buf, k_buf, v_buf, pk_buf, pv_buf,
-               out_buf](const ComputeContext& ctx) mutable {
+               ck_buf, cv_buf, out_buf](const ComputeContext& ctx) mutable {
         op->compute(output, ins, ctx, nullptr);
     };
     return arm;
@@ -646,6 +855,13 @@ DtypeArm make_mla_arm(const MlaCase& c, double& flops) {
     cfg.v_is_k = true;
     cfg.causal = c.causal;
     cfg.position_offset = attrs.position_offset;
+    cfg.bias_slot = 2;
+    cfg.past_k_slot = 3;
+    cfg.past_v_slot = 3;
+    cfg.seqlens_slot = 4;
+    cfg.pos_ids_slot = 5;
+    cfg.cu_q_slot = 6;
+    cfg.cu_k_slot = 7;
 
     DtypeArm arm;
     arm.note = route_note(cpu::get_attention_plan(cfg, descs, out_descs,

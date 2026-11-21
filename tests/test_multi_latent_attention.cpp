@@ -62,6 +62,7 @@ struct Case {
     int64_t position_offset = -1;  // absolute position of query row 0
     int route = -1;                // 0 standard, 1 flash, 2 decode; -1 unchecked
     std::vector<int32_t> seqlens;  // per-batch key-run lengths; empty = absent
+    std::vector<int64_t> pos_ids;  // per-batch first query row; empty = derived
 };
 
 MultiLatentAttentionAttributes attrs_of(const Case& c)
@@ -107,7 +108,10 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     const auto attrs = attrs_of(c);
     auto op = MultiLatentAttention::create(attrs, Backend::CPU);
 
+    // seqlens_k is onnxruntime's convention: the last valid key index, so the
+    // run is entry + 1. The Case carries lengths.
     std::vector<int32_t> sl_vec(c.seqlens);
+    for (auto& v : sl_vec) { --v; }
     std::vector<int64_t> sl_shape;
     TensorView sl_view;
     if (!sl_vec.empty()) {
@@ -138,6 +142,19 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
         descs.push_back(sl_view.desc());
         ins.push_back(sl_view);
     }
+    // position_ids sits right after seqlens_k; absent slots stay empty views.
+    std::vector<int64_t> pos_vec(c.pos_ids);
+    TensorView pos_view;
+    if (!pos_vec.empty()) {
+        while (ins.size() < 5) {
+            descs.push_back(TensorDesc{});
+            ins.push_back(TensorView{});
+        }
+        pos_view = TensorView(std::vector<int64_t>{static_cast<int64_t>(pos_vec.size())},
+                              DataType::s64, pos_vec.data());
+        descs.push_back(pos_view.desc());
+        ins.push_back(pos_view);
+    }
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
@@ -148,6 +165,13 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     cfg.v_is_k = true;
     cfg.causal = c.causal;
     cfg.position_offset = c.position_offset;
+    cfg.bias_slot = 2;
+    cfg.past_k_slot = 3;
+    cfg.past_v_slot = 3;
+    cfg.seqlens_slot = 4;
+    cfg.pos_ids_slot = 5;
+    cfg.cu_q_slot = 6;
+    cfg.cu_k_slot = 7;
     const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs);
     used_flash = plan.use_flash;
     if (plan_out) { *plan_out = plan; }
@@ -375,6 +399,27 @@ NNOPS_TEST(mla_seqlens_matches_ref) {
         // Decode: a per-batch limit inside the GEMV route.
         {{2, 1, 4 * 24}, {2, 12, 1 * 24}, 4, 1, 16, 8, 32, 0,
          0.0f, true,  false, 0, -1, 2, {12, 5}},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        NNOPS_EXPECT_TRUE(mla_fast_vs_ref(c, flash));
+    }
+}
+
+NNOPS_TEST(mla_position_ids_matches_ref) {
+    // The per-batch int64 first-row positions override the scalar default (and
+    // the bottom-right derivation), the same input RoPE and GQA take.
+    const Case cases[] = {
+        // Equal to the derived bottom-right value.
+        {{2, 5, 4 * 24}, {2, 5, 1 * 24}, 4, 1, 16, 8, 32, 0,
+         0.0f, true, false, 0, -1, 0, {}, {0, 0}},
+        // A block that starts two rows into the run: its causal limit clamps.
+        {{2, 5, 4 * 24}, {2, 5, 1 * 24}, 4, 1, 16, 8, 32, 0,
+         0.0f, true, false, 0, -1, 0, {}, {2, 0}},
+        // Decode over a written latent run, per batch.
+        {{2, 1, 4 * 24}, {2, 1, 1 * 24}, 4, 1, 16, 8, 32, 8,
+         0.0f, true, false, 11, -1, 2, {}, {11, 10}},
     };
 
     for (const auto& c : cases) {

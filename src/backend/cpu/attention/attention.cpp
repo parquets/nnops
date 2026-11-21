@@ -34,13 +34,24 @@ Status attention_single(const AttentionConfig& cfg, TensorView& output,
     }
 
     const DataType dt = inputs[0].data_type();
-    const size_t seqlens = seqlens_slot(cfg);
+    const bool kv8 = kv_is_int8(inputs);
 
+    // An int8 cache keeps the query (and everything else on the activation
+    // side) fp: the routes dequantize on read. bf16 has no such route.
+    if (kv8 && dt != DataType::f32 && dt != DataType::f16) {
+        return Status::unsupported;
+    }
     bool dtypes_ok = is_float_dtype(dt) && output.data_type() == dt;
     for (size_t i = 1; i < inputs.size() && dtypes_ok; ++i) {
-        // Everything from seqlens_k on is int32 metadata (the run lengths, the
-        // two varlen offset vectors); the slots before it are activations.
-        if (i >= seqlens || inputs[i].is_empty()) {
+        // Only the activation slots share the input dtype: Q, K, V, the past
+        // pair, the additive bias and the gate. The rest are int32 metadata
+        // (run lengths, varlen offsets, the key-padding mask) or the f32
+        // dequantization scales; the caches themselves are the one exception.
+        if (inputs[i].is_empty() || !slot_is_activation(cfg, static_cast<int>(i))) {
+            continue;
+        }
+        if (kv8 && (i == 1 || i == 2)) {
+            dtypes_ok = inputs[i].data_type() == DataType::s8;
             continue;
         }
         dtypes_ok = inputs[i].data_type() == dt;
@@ -48,13 +59,37 @@ Status attention_single(const AttentionConfig& cfg, TensorView& output,
     if (!dtypes_ok) {
         return Status::unsupported;
     }
+    if (!cfg.v_is_k && kv8 && inputs.size() > 2 && !inputs[2].is_empty() &&
+        inputs[2].data_type() != DataType::s8) {
+        return Status::unsupported; // K and V share one quantized cache form
+    }
+    // The dequantization scales are f32, one value or H_kv·D of them.
+    for (const int slot : {cfg.k_scale_slot, cfg.v_scale_slot}) {
+        if (slot_present(cfg, slot, inputs) && inputs[static_cast<size_t>(slot)].data_type() !=
+                                                 DataType::f32) {
+            return Status::invalid_argument;
+        }
+    }
 
     // The optional per-batch run lengths are int32 [B]; the kernels index them
     // by batch, so a short tensor must not reach them.
-    if (has_seqlens_input(cfg, inputs)) {
-        const auto& s = inputs[seqlens];
+    if (slot_present(cfg, cfg.seqlens_slot, inputs)) {
+        const auto& s = inputs[static_cast<size_t>(cfg.seqlens_slot)];
         if (s.data_type() != DataType::s32 || s.rank() != 1 || s.shape(0) != inputs[0].shape(0)) {
             return Status::invalid_argument;
+        }
+    }
+    // ... and the per-batch first-row positions are int64 [B], never negative.
+    if (slot_present(cfg, cfg.pos_ids_slot, inputs)) {
+        const auto& p = inputs[static_cast<size_t>(cfg.pos_ids_slot)];
+        if (p.data_type() != DataType::s64 || p.rank() != 1 || p.shape(0) != inputs[0].shape(0)) {
+            return Status::invalid_argument;
+        }
+        const int64_t* v = p.ptr<int64_t>();
+        for (int64_t b = 0; b < p.shape(0); ++b) {
+            if (v[b] < 0) {
+                return Status::invalid_argument;
+            }
         }
     }
 
@@ -62,7 +97,12 @@ Status attention_single(const AttentionConfig& cfg, TensorView& output,
     // here, outside the parallel dispatch — no per-task allocation. Slots are
     // indexed by worker id, so the count is the workers, not the grid: an
     // over-subscribed provider would otherwise allocate 4x the scratch.
-    detail::SmallVector<TensorDesc, 16> descs;
+    //
+    // A heap vector, not a SmallVector: onnxruntime's list runs to 19 slots and
+    // SmallVector's fixed inline storage asserts (compiled out under NDEBUG) on
+    // an overflow, so a 16-wide inline buffer wrote past the stack frame.
+    std::vector<TensorDesc> descs;
+    descs.reserve(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
         descs.push_back(inputs[i].desc());
     }
@@ -103,9 +143,10 @@ Status attention_varlen(const AttentionConfig& cfg, TensorView& output,
     if (cfg.position_offset >= 0) {
         return Status::invalid_argument;
     }
-    if (inputs.size() <= cu_k_slot(cfg) || inputs[cu_k_slot(cfg)].is_empty() ||
+    if (!slot_present(cfg, cfg.cu_q_slot, inputs) || !slot_present(cfg, cfg.cu_k_slot, inputs) ||
         has_mask_input(cfg, inputs) || has_past_view(cfg, inputs) ||
-        has_seqlens_input(cfg, inputs)) {
+        slot_present(cfg, cfg.seqlens_slot, inputs) ||
+        slot_present(cfg, cfg.pos_ids_slot, inputs)) {
         return Status::invalid_argument;
     }
     const auto& Q = inputs[0];
@@ -115,8 +156,8 @@ Status attention_varlen(const AttentionConfig& cfg, TensorView& output,
         return Status::invalid_argument;
     }
 
-    const auto& cq = inputs[cu_q_slot(cfg)];
-    const auto& ck = inputs[cu_k_slot(cfg)];
+    const auto& cq = inputs[static_cast<size_t>(cfg.cu_q_slot)];
+    const auto& ck = inputs[static_cast<size_t>(cfg.cu_k_slot)];
     if (cq.data_type() != DataType::s32 || ck.data_type() != DataType::s32 || cq.rank() != 1 ||
         ck.rank() != 1 || cq.shape(0) != ck.shape(0) || cq.shape(0) < 2) {
         return Status::invalid_argument;
@@ -136,8 +177,10 @@ Status attention_varlen(const AttentionConfig& cfg, TensorView& output,
         const int64_t len_q = q1 - q0;
         const int64_t len_k = k1 - k0;
         // Bottom-right alignment needs the segment's query rows to sit inside
-        // its key rows; a shorter key run would leave queries past the end.
-        if (len_k < len_q) {
+        // its key rows; a shorter key run would leave queries past the end. A
+        // non-causal packing has no diagonal to align, so cross-attention
+        // segments are free to differ.
+        if (cfg.causal && len_k < len_q) {
             return Status::invalid_argument;
         }
         if (len_q == 0) {
@@ -172,7 +215,7 @@ template <class T>
 void output_gate_impl(const AttentionConfig& cfg, TensorView& output,
                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    const auto& g = inputs[gate_slot(cfg)];
+    const auto& g = inputs[static_cast<size_t>(cfg.gate_slot)];
     const int64_t n = output.shape(output.rank() - 1);
     if (n <= 0) {
         return;
@@ -193,11 +236,11 @@ Status apply_output_gate(const AttentionConfig& cfg, TensorView& output,
     if (cfg.output_gate == EpilogueActivateType::None) {
         return Status::ok;
     }
-    const size_t s = gate_slot(cfg);
+    const size_t s = static_cast<size_t>(cfg.gate_slot);
     // The gate rides the output, so it must be exactly its geometry; the
-    // operators check this too, but the route's dtype loop skips slot 9 (it
-    // sits past seqlens_k, where every other slot is int32 metadata).
-    if (inputs.size() <= s || inputs[s].is_empty()) {
+    // operators check this too, but the route's dtype loop only knows which
+    // slots carry activations.
+    if (!slot_present(cfg, cfg.gate_slot, inputs)) {
         return Status::invalid_argument;
     }
     const auto& g = inputs[s];
@@ -224,12 +267,18 @@ Status apply_output_gate(const AttentionConfig& cfg, TensorView& output,
 //  Public API
 // =========================================================================
 
-Status attention_cpu(const AttentionConfig& cfg, TensorView& output,
+Status attention_cpu(const AttentionConfig& cfg, std::span<TensorView> outputs,
                      std::span<const TensorView> inputs, const ComputeContext& ctx,
                      void* /*workspace*/)
 {
-    const Status st = has_varlen(cfg, inputs) ? attention_varlen(cfg, output, inputs, ctx) :
-                                                attention_single(cfg, output, inputs, ctx);
+    if (outputs.empty()) {
+        return Status::invalid_argument;
+    }
+    TensorView& output = outputs[0];
+    const bool varlen = has_varlen(cfg, inputs);
+
+    const Status st = varlen ? attention_varlen(cfg, output, inputs, ctx) :
+                               attention_single(cfg, output, inputs, ctx);
     if (st != Status::ok) {
         return st;
     }
@@ -242,40 +291,90 @@ Status attention_cpu(const AttentionConfig& cfg, TensorView& output,
 //  Operator entry points
 // =========================================================================
 
-Status multi_head_attention_cpu(const MultiHeadAttentionAttributes& attrs, TensorView& output,
-                                std::span<const TensorView> inputs, const ComputeContext& ctx,
-                                void* workspace)
+Status multi_head_attention_cpu(const MultiHeadAttentionAttributes& attrs,
+                                std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                                const ComputeContext& ctx, void* workspace)
 {
     AttentionConfig cfg;
     cfg.num_heads = attrs.num_heads;
     cfg.scale = attrs.scale;
     cfg.causal = attrs.causal;
-    cfg.position_offset = attrs.position_offset;
     cfg.softcap = attrs.softcap;
-    cfg.window = attrs.window;
+    cfg.window = attrs.local_window_size > 0 ? attrs.local_window_size : 0;
+    cfg.sink_tokens = attrs.sink_tokens;
     cfg.output_gate = attrs.output_gate;
-    return attention_cpu(cfg, output, inputs, ctx, workspace);
+    cfg.bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
+    cfg.mask_filter_value = attrs.mask_filter_value;
+
+    if (attrs.causal) {
+        // Cache form: Q, k_cache, v_cache, kv_seqlens, k_scale, v_scale,
+        // head_sink, output gate. The caches are BNSH whatever Q's layout is.
+        cfg.seqlens_slot = 3;
+        cfg.seqlens_is_length = true;
+        cfg.pos_ids_slot = 4;
+        cfg.k_scale_slot = 5;
+        cfg.v_scale_slot = 6;
+        cfg.sink_slot = 7;
+        cfg.gate_slot = 8;
+        cfg.kv_bshd = false;
+    } else {
+        // Explicit form: Q, K, V, attention_bias, key_padding_mask, head_sink,
+        // cu_seqlens_q/k, output gate. K/V follow Q's layout.
+        cfg.bias_slot = 3;
+        cfg.kpm_slot = 4;
+        cfg.sink_slot = 5;
+        cfg.cu_q_slot = 6;
+        cfg.cu_k_slot = 7;
+        cfg.gate_slot = 8;
+        cfg.kv_bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
+    }
+    return attention_cpu(cfg, outputs, inputs, ctx, workspace);
 }
 
-Status group_query_attention_cpu(const GroupQueryAttentionAttributes& attrs, TensorView& output,
-                                 std::span<const TensorView> inputs, const ComputeContext& ctx,
-                                 void* workspace)
+Status group_query_attention_cpu(const GroupQueryAttentionAttributes& attrs,
+                                 std::span<TensorView> outputs, std::span<const TensorView> inputs,
+                                 const ComputeContext& ctx, void* workspace)
 {
     AttentionConfig cfg;
     cfg.num_heads = attrs.num_heads;
     cfg.num_kv_heads = attrs.kv_num_heads;
     cfg.scale = attrs.scale;
     cfg.causal = attrs.causal;
-    cfg.position_offset = attrs.position_offset;
     cfg.softcap = attrs.softcap;
-    cfg.window = attrs.window;
+    cfg.window = attrs.local_window_size > 0 ? attrs.local_window_size : 0;
+    cfg.sink_tokens = attrs.sink_tokens;
     cfg.output_gate = attrs.output_gate;
-    return attention_cpu(cfg, output, inputs, ctx, workspace);
+    cfg.bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
+    cfg.mask_filter_value = attrs.mask_filter_value;
+
+    if (attrs.causal) {
+        // Cache form: Q, k_cache, v_cache, kv_seqlens, k_scale, v_scale,
+        // head_sink, output gate. The caches are BNSH whatever Q's layout is.
+        cfg.seqlens_slot = 3;
+        cfg.seqlens_is_length = true;
+        cfg.pos_ids_slot = 4;
+        cfg.k_scale_slot = 5;
+        cfg.v_scale_slot = 6;
+        cfg.sink_slot = 7;
+        cfg.gate_slot = 8;
+        cfg.kv_bshd = false;
+    } else {
+        // Explicit form: Q, K, V, attention_bias, key_padding_mask, head_sink,
+        // cu_seqlens_q/k, output gate. K/V follow Q's layout.
+        cfg.bias_slot = 3;
+        cfg.kpm_slot = 4;
+        cfg.sink_slot = 5;
+        cfg.cu_q_slot = 6;
+        cfg.cu_k_slot = 7;
+        cfg.gate_slot = 8;
+        cfg.kv_bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
+    }
+    return attention_cpu(cfg, outputs, inputs, ctx, workspace);
 }
 
-Status multi_latent_attention_cpu(const MultiLatentAttentionAttributes& attrs, TensorView& output,
-                                  std::span<const TensorView> inputs, const ComputeContext& ctx,
-                                  void* workspace)
+Status multi_latent_attention_cpu(const MultiLatentAttentionAttributes& attrs,
+                                  TensorView& output, std::span<const TensorView> inputs,
+                                  const ComputeContext& ctx, void* workspace)
 {
     AttentionConfig cfg;
     cfg.num_heads = attrs.num_heads;
@@ -290,7 +389,28 @@ Status multi_latent_attention_cpu(const MultiLatentAttentionAttributes& attrs, T
     // Absorbed: one latent row per token and the value is its prefix. The
     // non-absorbed form takes a separate V tensor, as GQA does.
     cfg.v_is_k = attrs.absorbed;
-    return attention_cpu(cfg, output, inputs, ctx, workspace);
+    // MLA keeps its own slot list (there is no onnxruntime operator to mirror):
+    // Q, KV, [mask], [past KV], [seqlens_k], [cu_seqlens_q], [cu_seqlens_k] —
+    // or Q, K, V, [mask], [past K], [past V], [seqlens_k], [cu_q], [cu_k].
+    if (attrs.absorbed) {
+        cfg.bias_slot = 2;
+        cfg.past_k_slot = 3;
+        cfg.past_v_slot = 3;
+        cfg.seqlens_slot = 4;
+        cfg.pos_ids_slot = 5;
+        cfg.cu_q_slot = 6;
+        cfg.cu_k_slot = 7;
+    } else {
+        cfg.bias_slot = 3;
+        cfg.past_k_slot = 4;
+        cfg.past_v_slot = 5;
+        cfg.seqlens_slot = 6;
+        cfg.pos_ids_slot = 7;
+        cfg.cu_q_slot = 8;
+        cfg.cu_k_slot = 9;
+    }
+    std::span<TensorView> outputs(&output, 1);
+    return attention_cpu(cfg, outputs, inputs, ctx, workspace);
 }
 
 } // namespace nnops::backend::cpu

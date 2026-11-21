@@ -20,8 +20,13 @@
 /// models run between the projection and RoPE. Fusing it here removes a full
 /// tensor pass and the intermediate write.
 ///
-/// Row s sits at absolute position position_offset + s, so a decode step can
-/// rotate its new token where it really belongs instead of at 0.
+/// Row s of a batch sits at absolute position pos0(batch) + s, so a decode step
+/// can rotate its new token where it really belongs instead of at 0. pos0 is
+/// the optional int64 [B] input [5] `position_ids` — the absolute position of
+/// each batch's first row, rows consecutive, which is the same tensor
+/// GroupQueryAttention / MultiHeadAttention take — and falls back to the
+/// scalar attribute `position_offset` when the input is absent. Axis 0 is the
+/// batch axis; a rank-2 [S, D] input takes a one-element vector.
 ///
 /// Precomputed cos/sin tables: inputs [3]/[4] carry a [S, rotary_dim/2] pair
 /// that replaces the angle computation outright — every table row is used
@@ -87,7 +92,8 @@ struct RoPEAttributes {
     /// Empty means every section uses `base`.
     std::vector<float> mrope_section_bases;
 
-    /// Absolute position of row 0; rows are consecutive.
+    /// Absolute position of row 0 for every batch; rows are consecutive.
+    /// Ignored when input [5] `position_ids` is present.
     int64_t position_offset = 0;
 
     /// Long-context scaling; see the file header.
