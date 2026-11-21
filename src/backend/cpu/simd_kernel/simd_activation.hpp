@@ -184,16 +184,35 @@ inline void quick_gelu(const T* in, T* out, int64_t m, int64_t n, int64_t in_pit
         [alpha](float x) { return x / (1.0f + std::exp(-alpha * x)); });
 }
 
-/// Exact GELU. erf has no vector form here (the sign select would need a blend
-/// primitive the abstraction does not have), so it runs through the scalar
-/// tail — the tanh approximation is the fast route.
+/// Exact GELU: 0.5x(1 + erf(x/√2)), in f32 lanes for every storage dtype.
 template <typename T>
 inline void gelu_exact(const T* in, T* out, int64_t m, int64_t n, int64_t in_pitch,
                        int64_t out_pitch, bool add_to = false)
 {
-    tiled_unary_scalar(in, out, m, n, in_pitch, out_pitch, add_to, [](float x) {
-        return 0.5f * x * (1.0f + std::erf(x * 0.7071067811865476f));
-    });
+    constexpr int64_t L = simd_lane_for<T>;
+    const auto vsqrt_half = v_set1_f32x8(0.7071067811865476f);
+    const auto vhalf = v_set1_f32x8(0.5f);
+    const auto vone = v_set1_f32x8(1.0f);
+    for (int64_t r = 0; r < m; ++r) {
+        const T* in_row = in + r * in_pitch;
+        T* out_row = out + r * out_pitch;
+        int64_t i = 0;
+        for (; i + L <= n; i += L) {
+            const auto x = v_load_f32(in_row + i);
+            const auto e = v_erf(v_mul(x, vsqrt_half));
+            const auto y = v_mul(v_mul(vhalf, x), v_add(vone, e));
+            if (add_to) {
+                v_store_f32(out_row + i, v_add(v_load_f32(out_row + i), y));
+            } else {
+                v_store_f32(out_row + i, y);
+            }
+        }
+        for (; i < n; ++i) {
+            const float x = s_load(&in_row[i]);
+            const float y = 0.5f * x * (1.0f + std::erf(x * 0.7071067811865476f));
+            s_store_add(&out_row[i], y, add_to);
+        }
+    }
 }
 
 } // namespace nnops::kernel

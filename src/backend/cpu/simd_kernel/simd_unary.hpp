@@ -129,12 +129,29 @@ inline void recip(const T* in, T* out, int64_t m, int64_t n, int64_t in_pitch, i
         [](float v) { return 1.0f / v; });
 }
 
+/// erf in f32 lanes for every storage dtype: the v_erf body is f32x8, so a
+/// half or bf16 row widens once on load and narrows once on store.
 template <typename T>
 inline void erf(const T* in, T* out, int64_t m, int64_t n, int64_t in_pitch, int64_t out_pitch,
                 bool add_to = false)
 {
-    tiled_unary_scalar(in, out, m, n, in_pitch, out_pitch, add_to,
-                       [](float v) { return std::erf(v); });
+    constexpr int64_t L = simd_lane_for<T>;
+    for (int64_t r = 0; r < m; ++r) {
+        const T* in_row = in + r * in_pitch;
+        T* out_row = out + r * out_pitch;
+        int64_t i = 0;
+        for (; i + L <= n; i += L) {
+            const auto y = v_erf(v_load_f32(in_row + i));
+            if (add_to) {
+                v_store_f32(out_row + i, v_add(v_load_f32(out_row + i), y));
+            } else {
+                v_store_f32(out_row + i, y);
+            }
+        }
+        for (; i < n; ++i) {
+            s_store_add(&out_row[i], std::erf(s_load(&in_row[i])), add_to);
+        }
+    }
 }
 
 template <typename T>

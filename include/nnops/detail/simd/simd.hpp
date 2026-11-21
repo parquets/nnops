@@ -176,6 +176,41 @@ inline V v_pow(V a, V b) {
     return v_exp(v_mul(b, v_log(a)));
 }
 
+// ---- error function (f32 lanes) ------------------------------------------
+//
+// erf has no vector intrinsic, so it is built here from exp/div/fma and a
+// bit-level copysign. The caller only needs v_exp, v_div, v_fmadd, v_and and
+// v_or, all of which every backend carries — no select/blend, no ldexp.
+//
+// The approximation is erfc(u) = t·exp(-u² + poly(t)) with t = 1/(1+u/2), the
+// coefficients of the Numerical Recipes erfcc fit (fractional error < 1.2e-7
+// for every u ≥ 0), then erf(x) = sign(x)·(1 - erfc(|x|)). Because the fit is
+// valid over the whole range there is no small/large branch: at u = 0 the
+// polynomial reproduces the 1.26551223 constant exactly and the result is 0,
+// and ±inf underflows exp to 1. The sign is restored by OR-ing the sign bit of
+// x into the magnitude, so NaN in gives NaN out.
+inline v_f32x8 v_erf(const v_f32x8& x)
+{
+    const v_f32x8 u = v_abs(x);
+    const v_f32x8 t = v_div(v_set1_f32x8(1.0f), v_fmadd(u, v_set1_f32x8(0.5f), v_set1_f32x8(1.0f)));
+
+    v_f32x8 p = v_set1_f32x8(0.17087277f);
+    p = v_fmadd(p, t, v_set1_f32x8(-0.82215223f));
+    p = v_fmadd(p, t, v_set1_f32x8(1.48851587f));
+    p = v_fmadd(p, t, v_set1_f32x8(-1.13520398f));
+    p = v_fmadd(p, t, v_set1_f32x8(0.27886807f));
+    p = v_fmadd(p, t, v_set1_f32x8(-0.18628806f));
+    p = v_fmadd(p, t, v_set1_f32x8(0.09678418f));
+    p = v_fmadd(p, t, v_set1_f32x8(0.37409196f));
+    p = v_fmadd(p, t, v_set1_f32x8(1.00002368f));
+    p = v_fmadd(p, t, v_set1_f32x8(-1.26551223f));
+
+    // t·exp(-u² + p), with the u² term folded in: exp(-u*u + p).
+    const v_f32x8 erfc = v_mul(t, v_exp(v_fmadd(v_neg(u), u, p)));
+    const v_f32x8 magnitude = v_sub(v_set1_f32x8(1.0f), erfc);
+    return v_or(v_and(x, v_set1_f32x8(-0.0f)), v_abs(magnitude));
+}
+
 // ---- Deinterleave (stride-2 gather); v_deinterleave returns {even, odd} ----
 
 inline v_f32x8x2_t v_deinterleave(const float* p) {

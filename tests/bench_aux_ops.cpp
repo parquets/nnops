@@ -590,6 +590,7 @@ NNOPS_BENCH(elementwise_math) {
     }
     bench_unary("tanh", UnaryType::Tanh);
     bench_unary("sqrt", UnaryType::Sqrt);
+    bench_unary("erf", UnaryType::Erf);
     bench_act("sigmoid", ActivationType::Sigmoid);
     bench_act("gelu tanh", ActivationType::Gelu);
     bench_act("gelu exact", ActivationType::GeluExact);

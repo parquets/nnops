@@ -12,6 +12,8 @@
 #include "common/test_harness.hpp"
 
 #include <cmath>
+#include <stdexcept>
+#include <string>
 #include <vector>
 #include <random>
 
@@ -158,6 +160,48 @@ NNOPS_TEST(tiled_unary_erf) {
         [](const float* in, float* out, int64_t m, int64_t n,
            int64_t ip, int64_t op, bool at) { erf<float>(in, out, m, n, ip, op, at); },
         [](float v) { return std::erf(v); });
+}
+
+NNOPS_TEST(tiled_unary_erf_accuracy) {
+    // The whole real line: erf saturates before |x| = 6, so a sweep past that
+    // is where a branch-free fit usually breaks, and the u = 0 end is where it
+    // usually loses the constant term.
+    std::vector<float> xs;
+    constexpr int64_t kSamples = 200001;
+    xs.reserve(kSamples);
+    for (int64_t i = 0; i < kSamples; ++i) {
+        xs.push_back(-12.0f + 24.0f * static_cast<float>(i) / static_cast<float>(kSamples - 1));
+    }
+    std::vector<float> out(xs.size());
+    erf<float>(xs.data(), out.data(), 1, kSamples, kSamples, kSamples, false);
+
+    double worst = 0.0;
+    double worst_at = 0.0;
+    for (int64_t i = 0; i < kSamples; ++i) {
+        const double want = std::erf(static_cast<double>(xs[static_cast<size_t>(i)]));
+        const double diff = std::fabs(static_cast<double>(out[static_cast<size_t>(i)]) - want);
+        if (diff > worst) {
+            worst = diff;
+            worst_at = static_cast<double>(xs[static_cast<size_t>(i)]);
+        }
+    }
+    // The Numerical Recipes fit is stated at < 1.2e-7; leave room for the f32
+    // rounding of both sides.
+    if (worst > 5e-7) {
+        throw std::runtime_error("erf max |error| " + std::to_string(worst) + " at x=" +
+                                 std::to_string(worst_at));
+    }
+
+    // Saturation and the special values the formula has to get right without a
+    // branch: ±inf, ±0 and NaN.
+    const float special[] = {INFINITY, -INFINITY, 0.0f, -0.0f, NAN};
+    float sout[5] = {};
+    erf<float>(special, sout, 1, 5, 5, 5, false);
+    NNOPS_EXPECT_EQ(sout[0], 1.0f);
+    NNOPS_EXPECT_EQ(sout[1], -1.0f);
+    NNOPS_EXPECT_EQ(sout[2], 0.0f);
+    NNOPS_EXPECT_EQ(sout[3], -0.0f);  // the sign bit of x is kept
+    NNOPS_EXPECT_TRUE(std::isnan(sout[4]));
 }
 
 NNOPS_TEST(tiled_unary_round) {

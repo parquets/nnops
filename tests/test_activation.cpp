@@ -409,6 +409,35 @@ NNOPS_TEST(activation_mish) {
     });
 }
 
+NNOPS_TEST(activation_gelu_exact_saturates) {
+    // Past |x| = 6 erf is ±1 to a fraction of an ulp, so the tail is exactly x
+    // or 0; the centre and NaN are the other two edges of the fit.
+    const int64_t shape[] = {6};
+    float in_data[] = {8.0f, -8.0f, 0.0f, 0.5f, -0.5f, NAN};
+    TensorView input(shape, DataType::f32, in_data);
+
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::GeluExact;
+    auto op = Activation::create(attrs, Backend::CPU);
+
+    const TensorDesc in_desc[] = {input.desc()};
+    auto out_descs = op->getOutputTensorDesc(in_desc);
+    std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = nnops::test::make_channel_first(out_descs[0], buf.data());
+    const TensorView ins[] = {input};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    NNOPS_EXPECT_NEAR(buf[0], 8.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(buf[1], 0.0f, 1e-6f);
+    NNOPS_EXPECT_EQ(buf[2], 0.0f);
+    for (int i = 3; i < 5; ++i) {
+        NNOPS_EXPECT_NEAR(buf[static_cast<size_t>(i)],
+                          0.5f * in_data[i] * (1.0f + std::erf(in_data[i] * 0.7071067811865476f)),
+                          1e-6f);
+    }
+    NNOPS_EXPECT_TRUE(std::isnan(buf[5]));
+}
+
 NNOPS_TEST(activation_gelu_exact) {
     ActivationAttributes attrs;
     attrs.type = ActivationType::GeluExact;
