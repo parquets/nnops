@@ -81,21 +81,30 @@ void slice_impl(const SliceAttributes& attrs, TensorView& output,
     // Input stride delta when innermost output dim increments by 1
     const int64_t in_inner_step = eff_step[static_cast<size_t>(rank - 1)] * in_strides[rank - 1];
 
+    // The output's own row step: its last axis is contiguous, but the axes
+    // above it step by its strides (a padded destination included).
+    int64_t out_strides[TensorDesc::kMaxRank];
+    for (int64_t d = 0; d < rank; ++d) {
+        out_strides[d] = output.stride_elems(d);
+    }
+
     auto body = [&](int64_t outer_idx) {
         // Decompose outer_idx into multi-index for dims 0..rank-2
         int64_t tmp = outer_idx;
         int64_t in_base = 0;
+        int64_t out_base = 0;
         for (int64_t d = 0; d < rank - 1; ++d) {
             int64_t coord = tmp / outer_strides[d];
             tmp %= outer_strides[d];
             int64_t in_coord =
                 eff_start[static_cast<size_t>(d)] + coord * eff_step[static_cast<size_t>(d)];
             in_base += in_coord * in_strides[d];
+            out_base += coord * out_strides[d];
         }
 
         in_base += eff_start[static_cast<size_t>(rank - 1)] * in_strides[rank - 1];
 
-        T* out_row = out_ptr + outer_idx * inner_dim;
+        T* out_row = out_ptr + out_base;
 
         if (in_inner_step == 1) {
             // Contiguous in both input and output: memcpy

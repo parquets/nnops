@@ -88,6 +88,10 @@ Status check_quant_linear_dtypes(const Backend be, std::span<const TensorDesc> i
     if (inputs[2].dtype != DataType::s8 && inputs[2].dtype != DataType::u8) {
         return Status::invalid_argument;
     }
+    // The arch kernels walk flat rows with a single stride.
+    if (!detail::desc_rows_compact(inputs[0]) || !detail::desc_rows_compact(outputs[0])) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

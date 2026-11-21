@@ -53,7 +53,13 @@ void grid_sample_impl(const GridSampleAttributes& attrs, TensorView& output,
     const int64_t out_d_stride = OH * out_row_stride;
 
     const int64_t coord_dim = srank;
-    const int64_t grid_row_stride = OW * coord_dim;
+    // The step from one output row to the next is the stride of the grid's OH
+    // axis — the grid is a dense tensor whose last axis is the coordinate, so
+    // this is not its row pitch (which steps one pixel).
+    const int64_t grid_row_stride = grid.stride_elems(grid.rank() - 3);
+    // ... and one pixel's coordinates to the next: the grid's rank-2 axis, which
+    // is coord_dim on a compact view and the row pitch on a padded one.
+    const int64_t grid_pix_stride = grid.stride_elems(grid.rank() - 2);
     const int64_t grid_n_stride = grid.stride_elems(0);
 
     const auto mode = attrs.mode;
@@ -89,12 +95,13 @@ void grid_sample_impl(const GridSampleAttributes& attrs, TensorView& output,
             if (nearest) {
                 k::gridsample_nearest_last_3d<T>(out_d, in_base, grid_d, C, ID, IH, IW, pn, OH,
                                                  OW, in_d_stride, in_row_stride, out_d_stride,
-                                                 out_row_stride, grid_row_stride, align,
-                                                 padding_mode, add_to);
+                                                 out_row_stride, grid_row_stride,
+                                                 grid_pix_stride, align, padding_mode, add_to);
             } else {
                 k::gridsample_last_3d<T>(out_d, in_base, grid_d, C, ID, IH, IW, pn, OH, OW,
-                                         in_d_stride, in_row_stride, out_d_stride, out_row_stride,
-                                         grid_row_stride, align, padding_mode, add_to);
+                                         in_d_stride, in_row_stride, out_d_stride,
+                                         out_row_stride, grid_row_stride, grid_pix_stride, align,
+                                         padding_mode, add_to);
             }
         } else {
             T* out_row = out_base + p0 * out_row_stride;
@@ -102,11 +109,11 @@ void grid_sample_impl(const GridSampleAttributes& attrs, TensorView& output,
             if (nearest) {
                 k::gridsample_nearest_last_2d<T>(out_row, in_base, grid_row, C, IH, IW, pn, OW,
                                                  in_row_stride, out_row_stride, grid_row_stride,
-                                                 align, padding_mode, add_to);
+                                                 grid_pix_stride, align, padding_mode, add_to);
             } else {
                 k::gridsample_last_2d<T>(out_row, in_base, grid_row, C, IH, IW, pn, OW,
-                                         in_row_stride, out_row_stride, grid_row_stride, align,
-                                         padding_mode, add_to);
+                                         in_row_stride, out_row_stride, grid_row_stride,
+                                         grid_pix_stride, align, padding_mode, add_to);
             }
         }
     };

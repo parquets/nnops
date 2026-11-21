@@ -69,6 +69,7 @@ set(TEST_SOURCES
     test_pixel_shuffle.cpp
     test_parallel_paths.cpp
     test_dtype_contract.cpp
+    test_row_pitch.cpp
 )
 
 # Reference kernels that only the tests need, as ground truth for the fast paths.

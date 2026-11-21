@@ -169,15 +169,18 @@ void reduce_contiguous_simd(const ReduceAttributes& attrs, TensorView& output,
     }();
     const int64_t norm_size = input.shape(axis);
     const int64_t row_stride = input.row_stride_elems();
+    const int64_t rank_out = output.rank();
 
     const T* x_ptr = input.ptr<T>();
     T* y_ptr = output.ptr<T>();
 
+    // Row r's result is logical element r of the output — flat only when the
+    // output is compact, so the address comes from its own strides.
     auto process_row = [&](int64_t row) {
         float result = 0.0f;
         kernel::reduce_process_contiguous_row<T>(x_ptr + row * row_stride, &result, norm_size,
                                                  attrs.type);
-        s_store(&y_ptr[row], result);
+        s_store(&y_ptr[decompose_flat_offset(row, output, 0, rank_out - 1)], result);
     };
 
     ctx.cpu.run(0, num_rows, process_row);

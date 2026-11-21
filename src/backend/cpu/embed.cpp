@@ -52,7 +52,9 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/, TensorView& output,
     const int64_t num_indices = indices.numel();
 
     const T* weight_ptr = weight.ptr<T>();
-    const int64_t w_row_stride = (weight.rank() == 2) ? dim : weight.row_stride_elems();
+    // The row step is the pitch, whatever the rank: a rank-2 [V][dim] table is
+    // the same model, and its rows may be padded like any other.
+    const int64_t w_row_stride = weight.row_stride_elems();
 
     T* out_ptr = output.ptr<T>();
     const int64_t out_row_stride = output.row_stride_elems();

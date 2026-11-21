@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace nnops::backend::cpu {
@@ -129,11 +130,11 @@ void topk_impl(const TopKAttributes& attrs, TensorView& values_out, TensorView& 
     auto* idx_ptr = indices_out.ptr<int64_t>();
 
     const int64_t axis_stride = in.stride_elems(ax);
-    const int64_t v_outer_stride = k * inner_size;
-    const int64_t v_inner_stride = k;
 
     // The dims on either side of the axis, so a pitched input addresses its
-    // rows and its inner tail instead of flattening them.
+    // rows and its inner tail instead of flattening them. The two outputs get
+    // the same treatment: a caller may hand either one a row pad, and the k
+    // entries along the axis are contiguous within the row.
     detail::AxisGroup pre;
     detail::AxisGroup post;
     if (ax > 0) {
@@ -143,13 +144,34 @@ void topk_impl(const TopKAttributes& attrs, TensorView& values_out, TensorView& 
     }
     detail::axis_fill_group_unit(post, in, ax + 1, rank);
 
-    const auto write_out = [&](int64_t v_base, Pair* best) {
+    detail::AxisGroup vpre, vpost, ipre, ipost;
+    if (ax > 0) {
+        detail::axis_fill_group(vpre, values_out, 0, ax, values_out.stride_elems(ax - 1));
+        detail::axis_fill_group(ipre, indices_out, 0, ax, indices_out.stride_elems(ax - 1));
+    } else {
+        detail::axis_fill_group(vpre, values_out, 0, 0, 0);
+        detail::axis_fill_group(ipre, indices_out, 0, 0, 0);
+    }
+    detail::axis_fill_group_unit(vpost, values_out, ax + 1, rank);
+    detail::axis_fill_group_unit(ipost, indices_out, ax + 1, rank);
+    // The k entries are consecutive only when the axis is the last one; else
+    // they step by the output's stride on that axis.
+    const int64_t v_k_stride = values_out.stride_elems(ax);
+    const int64_t i_k_stride = indices_out.stride_elems(ax);
+
+    const auto out_base = [&](int64_t outer, int64_t inner) {
+        return std::pair<int64_t, int64_t>{
+            detail::axis_group_offset(outer, vpre) + detail::axis_group_offset(inner, vpost),
+            detail::axis_group_offset(outer, ipre) + detail::axis_group_offset(inner, ipost)};
+    };
+
+    const auto write_out = [&](int64_t v_base, int64_t i_base, Pair* best) {
         if (sorted_opt) {
             std::sort(best, best + k, better);
         }
         for (int64_t j = 0; j < k; ++j) {
-            s_store(v_ptr + v_base + j, best[j].value);
-            idx_ptr[v_base + j] = best[j].index;
+            s_store(v_ptr + v_base + j * v_k_stride, best[j].value);
+            idx_ptr[i_base + j * i_k_stride] = best[j].index;
         }
     };
 
@@ -205,9 +227,8 @@ void topk_impl(const TopKAttributes& attrs, TensorView& values_out, TensorView& 
                     }
                 }
             }
-            const int64_t v_base =
-                (unit / inner_size) * v_outer_stride + (unit % inner_size) * v_inner_stride;
-            write_out(v_base, heap);
+            const auto [v_base, i_base] = out_base(unit / inner_size, unit % inner_size);
+            write_out(v_base, i_base, heap);
         });
         return;
     }
@@ -217,13 +238,13 @@ void topk_impl(const TopKAttributes& attrs, TensorView& values_out, TensorView& 
         PoolArray<Pair> heap(static_cast<size_t>(k));
 
         for (int64_t inner = 0; inner < inner_size; ++inner) {
-            const int64_t i_base = (outer > 0 ? detail::axis_group_offset(outer, pre) : 0) +
-                                   (inner > 0 ? detail::axis_group_offset(inner, post) : 0);
+            const int64_t in_base = (outer > 0 ? detail::axis_group_offset(outer, pre) : 0) +
+                                    (inner > 0 ? detail::axis_group_offset(inner, post) : 0);
 
-            select_best<T>(i_ptr + i_base, axis_stride, axis_dim, k, 0, better, heap.data());
+            select_best<T>(i_ptr + in_base, axis_stride, axis_dim, k, 0, better, heap.data());
 
-            const int64_t v_base = outer * v_outer_stride + inner * v_inner_stride;
-            write_out(v_base, heap.data());
+            const auto [v_base, i_base] = out_base(outer, inner);
+            write_out(v_base, i_base, heap.data());
         }
     };
 

@@ -124,7 +124,8 @@ template <typename T> inline void gridsample_zero_pixel(T* dst, int64_t C, bool 
 template <typename T>
 void gridsample_last_2d(T* output, const T* input, const float* grid_n, int64_t C, int64_t IH,
                         int64_t IW, int64_t OH, int64_t OW, int64_t in_row_stride,
-                        int64_t out_row_stride, int64_t grid_row_stride, bool align_corners,
+                        int64_t out_row_stride, int64_t grid_row_stride,
+                        int64_t grid_pix_stride, bool align_corners,
                         GridSamplePaddingMode padding, bool add_to)
 {
     constexpr int L = simd_lane_for<T>;
@@ -135,7 +136,7 @@ void gridsample_last_2d(T* output, const T* input, const float* grid_n, int64_t 
         T* orow = output + oh * out_row_stride;
 
         for (int64_t ow = 0; ow < OW; ++ow) {
-            const float* g_pos = g_row + ow * 2;
+            const float* g_pos = g_row + ow * grid_pix_stride;
             float py = gridsample_grid_to_pixel(g_pos[0], IH, align_corners);
             float pz = gridsample_grid_to_pixel(g_pos[1], IW, align_corners);
             T* dst = orow + ow * C;
@@ -187,8 +188,9 @@ template <typename T>
 void gridsample_nearest_last_2d(T* output, const T* input, const float* grid_n, int64_t C,
                                 int64_t IH, int64_t IW, int64_t OH, int64_t OW,
                                 int64_t in_row_stride, int64_t out_row_stride,
-                                int64_t grid_row_stride, bool align_corners,
-                                GridSamplePaddingMode padding, bool add_to)
+                                int64_t grid_row_stride, int64_t grid_pix_stride,
+                                bool align_corners, GridSamplePaddingMode padding,
+                                bool add_to)
 {
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
 
@@ -197,7 +199,7 @@ void gridsample_nearest_last_2d(T* output, const T* input, const float* grid_n, 
         T* orow = output + oh * out_row_stride;
 
         for (int64_t ow = 0; ow < OW; ++ow) {
-            const float* g_pos = g_row + ow * 2;
+            const float* g_pos = g_row + ow * grid_pix_stride;
             float py = gridsample_grid_to_pixel(g_pos[0], IH, align_corners);
             float pz = gridsample_grid_to_pixel(g_pos[1], IW, align_corners);
             const float py_r = std::round(py);
@@ -223,7 +225,8 @@ template <typename T>
 void gridsample_last_3d(T* output, const T* input, const float* grid_n, int64_t C, int64_t ID,
                         int64_t IH, int64_t IW, int64_t OD, int64_t OH, int64_t OW,
                         int64_t in_d_stride, int64_t in_row_stride, int64_t out_d_stride,
-                        int64_t out_row_stride, int64_t grid_row_stride, bool align_corners,
+                        int64_t out_row_stride, int64_t grid_row_stride,
+                        int64_t grid_pix_stride, bool align_corners,
                         GridSamplePaddingMode padding, bool add_to)
 {
     constexpr int L = simd_lane_for<T>;
@@ -315,8 +318,9 @@ void gridsample_nearest_last_3d(T* output, const T* input, const float* grid_n, 
                                 int64_t ID, int64_t IH, int64_t IW, int64_t OD, int64_t OH,
                                 int64_t OW, int64_t in_d_stride, int64_t in_row_stride,
                                 int64_t out_d_stride, int64_t out_row_stride,
-                                int64_t grid_row_stride, bool align_corners,
-                                GridSamplePaddingMode padding, bool add_to)
+                                int64_t grid_row_stride, int64_t grid_pix_stride,
+                                bool align_corners, GridSamplePaddingMode padding,
+                                bool add_to)
 {
     const bool zeros_pad = (padding == GridSamplePaddingMode::Zeros);
 

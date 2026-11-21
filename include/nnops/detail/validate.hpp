@@ -110,6 +110,21 @@ constexpr bool dtype_in(Backend be, DataType d) noexcept
     return ((d == Ds) || ...);
 }
 
+/// True when the descriptor's rows are packed (row stride == one row's logical
+/// size, or unstated). A kernel that walks flat rows — one stride for the whole
+/// matrix — needs this; it is the descriptor-side twin of is_compact_view.
+inline bool desc_rows_compact(const TensorDesc& d) noexcept
+{
+    if (d.rank < 2 || d.row_stride_elems == 0) {
+        return true;
+    }
+    const int64_t row_elems = (is_channel_last(d.layout) && d.rank >= 3) ?
+                                  d.dims[static_cast<size_t>(d.rank - 2)] *
+                                      d.dims[static_cast<size_t>(d.rank - 1)] :
+                                  d.dims[static_cast<size_t>(d.rank - 1)];
+    return d.row_stride_elems == row_elems;
+}
+
 /// True for the element types that have a whole-element storage unit, i.e. the
 /// set the data-movement kernels instantiate (`for_each_data_type` on the CPU).
 /// The packed formats (f8, s4/u4, q4_1) have no per-element copy and are

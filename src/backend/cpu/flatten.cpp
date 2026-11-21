@@ -25,9 +25,9 @@ void flatten_impl(const FlattenAttributes& /*attrs*/, TensorView& output,
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
 
-    // Output is always dense row-major
     const int64_t oW = output.shape(rank - 1);
-    const int64_t o_row_stride = oW;
+    // The output's row step is its pitch: a padded destination is a legal view.
+    const int64_t o_row_stride = output.row_stride_elems();
 
     auto* o_ptr = output.ptr<T>();
     const auto* i_ptr = input.ptr<T>();

@@ -106,16 +106,23 @@ void permute_impl(const PermuteAttributes& attrs, TensorView& output,
     const int64_t last_perm_dim = perm[static_cast<size_t>(rank - 1)];
     const int64_t in_inner_step = in_strides[static_cast<size_t>(last_perm_dim)];
 
+    int64_t out_strides[TensorDesc::kMaxRank];
+    for (int64_t d = 0; d < rank; ++d) {
+        out_strides[d] = output.stride_elems(d);
+    }
+
     auto body = [&](int64_t outer_idx) {
         int64_t tmp = outer_idx;
         int64_t in_base = 0;
+        int64_t out_base = 0;
         for (int64_t d = 0; d < rank - 1; ++d) {
             int64_t coord = tmp / outer_strides[d];
             tmp %= outer_strides[d];
             in_base += coord * in_strides[perm[static_cast<size_t>(d)]];
+            out_base += coord * out_strides[d];
         }
 
-        T* out_row = out_ptr + outer_idx * inner_dim;
+        T* out_row = out_ptr + out_base;
 
         if (in_inner_step == 1) {
             std::memcpy(out_row, in_ptr + in_base, static_cast<size_t>(inner_dim) * sizeof(T));

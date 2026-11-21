@@ -226,15 +226,16 @@ NNOPS_TEST(topk_2d_axis0) {
     const TensorView ins[] = {in};
     op->compute(outs, ins);
 
+    // The output is a dense [k][inner] tensor, so it is read in row-major
+    // order: rank j of every column first, then the next rank.
     // Col 0: values [5, 3, 7] → top-2: 7 at idx 2, 5 at idx 0
+    // Col 1: values [1, 8, 2] → top-2: 8 at idx 1, 2 at idx 2
     NNOPS_EXPECT_NEAR(val_buf[0], 7.0f, 1e-6f);
     NNOPS_EXPECT_EQ(idx_buf[0], 2);
-    NNOPS_EXPECT_NEAR(val_buf[1], 5.0f, 1e-6f);
-    NNOPS_EXPECT_EQ(idx_buf[1], 0);
-
-    // Col 1: values [1, 8, 2] → top-2: 8 at idx 1, 2 at idx 2
-    NNOPS_EXPECT_NEAR(val_buf[2], 8.0f, 1e-6f);
-    NNOPS_EXPECT_EQ(idx_buf[2], 1);
+    NNOPS_EXPECT_NEAR(val_buf[1], 8.0f, 1e-6f);
+    NNOPS_EXPECT_EQ(idx_buf[1], 1);
+    NNOPS_EXPECT_NEAR(val_buf[2], 5.0f, 1e-6f);
+    NNOPS_EXPECT_EQ(idx_buf[2], 0);
     NNOPS_EXPECT_NEAR(val_buf[3], 2.0f, 1e-6f);
     NNOPS_EXPECT_EQ(idx_buf[3], 2);
 }
@@ -520,14 +521,15 @@ NNOPS_TEST(topk_negative_axis) {
     const TensorView ins[] = {in};
     op->compute(outs, ins);
 
-    // Position (n=0, h=0, w=0): C values [5, 2, 3] → top-2: 5(idx 0), 3(idx 2)
+    // The output is dense [1][k][1][2], so the two ranks come one after the
+    // other: (j=0, w=0), (j=0, w=1), (j=1, w=0), (j=1, w=1).
+    // w=0: C values [5, 2, 3] → top-2: 5(idx 0), 3(idx 2)
+    // w=1: C values [1, 4, 6] → top-2: 6(idx 2), 4(idx 1)
     NNOPS_EXPECT_NEAR(val_buf[0], 5.0f, 1e-6f);
     NNOPS_EXPECT_EQ(idx_buf[0], 0);
-    NNOPS_EXPECT_NEAR(val_buf[1], 3.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(val_buf[1], 6.0f, 1e-6f);
     NNOPS_EXPECT_EQ(idx_buf[1], 2);
-
-    // Position (n=0, h=0, w=1): C values [1, 4, 6] → top-2: 6(idx 2), 4(idx 1)
-    NNOPS_EXPECT_NEAR(val_buf[2], 6.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(val_buf[2], 3.0f, 1e-6f);
     NNOPS_EXPECT_EQ(idx_buf[2], 2);
     NNOPS_EXPECT_NEAR(val_buf[3], 4.0f, 1e-6f);
     NNOPS_EXPECT_EQ(idx_buf[3], 1);
