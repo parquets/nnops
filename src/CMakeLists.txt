@@ -51,6 +51,9 @@ set(NNOPS_CPU_SOURCES
     ops/tile.cpp
     ops/where.cpp
     ops/compare.cpp
+    ops/roi_align.cpp
+    ops/non_max_suppression.cpp
+    ops/pixel_shuffle.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -85,6 +88,9 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/tile.cpp
     backend/cpu/where.cpp
     backend/cpu/compare.cpp
+    backend/cpu/roi_align.cpp
+    backend/cpu/non_max_suppression.cpp
+    backend/cpu/pixel_shuffle.cpp
 
     # CPU tiled matmul kernel (NKM loop with pack + MMA), split one file per
     # arithmetic family — the float routes with the classifier, the quantized

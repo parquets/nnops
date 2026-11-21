@@ -136,6 +136,144 @@ inline void rms_norm_apply_gated(EpilogueActivateType act, const T* x, const T* 
 #undef NNOPS_NORM_GATE_CASE
 }
 
+// ============================================================
+// Adaptive normalization (AdaLN / AdaLN-Zero / FiLM)
+// ============================================================
+
+/// The row kernel has already applied the norm's own scale/bias; this folds the
+/// conditioning in before the store:
+///   y = gate? · ((mod_scale + offset) · y + mod_shift)
+/// so DiT's re-scaling, FiLM's shift and AdaLN-Zero's gate cost no extra pass
+/// over the hidden — the unfused form stored the row, read it back, and stored
+/// it again once per conditioning term.
+template <typename T, bool WithGate> struct ModulationPost {
+    const T* scale;
+    const T* shift;
+    const T* gate;  ///< WithGate only
+    float offset;
+
+    template <class V> V vec(const V& v, int64_t i) const
+    {
+        const auto vs = v_add(v_load(scale + i), v_set1(scale, offset));
+        auto rv = v_fmadd(v, vs, v_load(shift + i));
+        if constexpr (WithGate) {
+            rv = v_mul(rv, v_load(gate + i));
+        }
+        return rv;
+    }
+    float scalar(float v, int64_t i) const
+    {
+        float rv = v * (s_load(&scale[i]) + offset) + s_load(&shift[i]);
+        if constexpr (WithGate) {
+            rv *= s_load(&gate[i]);
+        }
+        return rv;
+    }
+};
+
+/// One modulated row. HasMean is the norm type; scale and bias are runtime
+/// (AdaLN's LayerNorm has neither), the residual and the gate compile-time.
+template <typename T, bool HasMean, bool WithResidual, bool WithGate>
+inline void norm_apply_modulated_gate(const T* x, const T* r, T* y, int64_t n, float mean_val,
+                                      float inv, const T* scale, const T* bias, bool has_scale,
+                                      bool has_bias, bool scale_is_scalar, bool add_to,
+                                      bool one_plus, const T* mod_scale, const T* mod_shift,
+                                      const T* gate, float offset)
+{
+    ModulationPost<T, WithGate> post{mod_scale, mod_shift, gate, offset};
+    if (has_scale) {
+        if (has_bias) {
+            if constexpr (WithResidual) {
+                kernel::norm_apply_row_add_post_dispatch<T, HasMean, true, true>(
+                    x, r, y, n, mean_val, inv, scale, bias, scale_is_scalar, add_to, one_plus,
+                    post);
+            } else {
+                kernel::norm_apply_row_post_dispatch<T, HasMean, true, true>(
+                    x, y, n, mean_val, inv, scale, bias, scale_is_scalar, add_to, one_plus, post);
+            }
+        } else {
+            if constexpr (WithResidual) {
+                kernel::norm_apply_row_add_post_dispatch<T, HasMean, true, false>(
+                    x, r, y, n, mean_val, inv, scale, nullptr, scale_is_scalar, add_to, one_plus,
+                    post);
+            } else {
+                kernel::norm_apply_row_post_dispatch<T, HasMean, true, false>(
+                    x, y, n, mean_val, inv, scale, nullptr, scale_is_scalar, add_to, one_plus,
+                    post);
+            }
+        }
+        return;
+    }
+    if constexpr (WithResidual) {
+        kernel::norm_apply_row_add_post_dispatch<T, HasMean, false, false>(
+            x, r, y, n, mean_val, inv, nullptr, nullptr, false, add_to, false, post);
+    } else {
+        kernel::norm_apply_row_post_dispatch<T, HasMean, false, false>(
+            x, y, n, mean_val, inv, nullptr, nullptr, false, add_to, false, post);
+    }
+}
+
+/// Runtime dispatch over the residual / gate shape.
+template <typename T, bool HasMean>
+inline void norm_apply_modulated_row(const T* x, const T* r, T* y, int64_t n, float mean_val,
+                                     float inv, const T* scale, const T* bias, bool has_scale,
+                                     bool has_bias, bool scale_is_scalar, bool add_to,
+                                     bool one_plus, const T* mod_scale, const T* mod_shift,
+                                     const T* gate, float offset, bool with_gate,
+                                     bool with_residual)
+{
+    if (with_residual) {
+        if (with_gate) {
+            norm_apply_modulated_gate<T, HasMean, true, true>(
+                x, r, y, n, mean_val, inv, scale, bias, has_scale, has_bias, scale_is_scalar,
+                add_to, one_plus, mod_scale, mod_shift, gate, offset);
+        } else {
+            norm_apply_modulated_gate<T, HasMean, true, false>(
+                x, r, y, n, mean_val, inv, scale, bias, has_scale, has_bias, scale_is_scalar,
+                add_to, one_plus, mod_scale, mod_shift, nullptr, offset);
+        }
+    } else {
+        if (with_gate) {
+            norm_apply_modulated_gate<T, HasMean, false, true>(
+                x, nullptr, y, n, mean_val, inv, scale, bias, has_scale, has_bias, scale_is_scalar,
+                add_to, one_plus, mod_scale, mod_shift, gate, offset);
+        } else {
+            norm_apply_modulated_gate<T, HasMean, false, false>(
+                x, nullptr, y, n, mean_val, inv, scale, bias, has_scale, has_bias, scale_is_scalar,
+                add_to, one_plus, mod_scale, mod_shift, nullptr, offset);
+        }
+    }
+}
+
+/// Base offset of row `row` in a modulation tensor that broadcasts NumPy-style
+/// against X's leading dims: a missing or size-1 axis contributes nothing, and
+/// the shared last axis (the normalized width) is addressed per element.
+inline int64_t modulation_row_offset(const TensorView& mod, const TensorView& x, int64_t row,
+                                     int64_t axis)
+{
+    const int64_t xr = x.rank();
+    const int64_t mr = mod.rank();
+    int64_t off = 0;
+    int64_t rem = row;
+    for (int64_t d = axis - 1; d >= 0; --d) {
+        const int64_t dim = x.shape(d);
+        if (dim <= 0) {
+            continue;
+        }
+        const int64_t coord = rem % dim;
+        rem /= dim;
+        if (coord == 0) {
+            continue;
+        }
+        const int64_t md = d - (xr - mr);
+        if (md < 0 || mod.shape(md) == 1) {
+            continue;
+        }
+        off += coord * mod.stride_elems(md);
+    }
+    return off;
+}
+
 /// Normalized axis dimensions for row-wise norm dispatch.
 struct NormDims {
     int64_t axis;            ///< Normalized axis (0 <= axis < rank)
@@ -289,19 +427,32 @@ void layer_norm_impl(const NormAttributes& attrs, TensorView& output,
                      std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& X = inputs[0];
-    const auto& scale = inputs[1];
-    const bool has_bias = (inputs.size() >= 3 && !inputs[2].is_empty());
+
+    // The modulation pair (then AdaLN-Zero's gate) is the last group of slots,
+    // so the type's own slots keep their indices.
+    const bool modulate = attrs.modulate;
+    const bool mod_gate = modulate && attrs.modulation_gate;
+    const int64_t n_trail = modulate ? (mod_gate ? 3 : 2) : 0;
+    const int64_t base_n = static_cast<int64_t>(inputs.size()) - n_trail;
+
+    // AdaLN's LayerNorm has no learned affine; an empty scale slot says so.
+    const bool has_scale = modulate ? (base_n >= 2 && inputs[1].rank() > 0) : true;
+    const bool has_bias = base_n >= 3 && !inputs[2].is_empty();
 
     const float epsilon = attrs.epsilon;
 
     const auto* x_ptr = X.ptr<T>();
-    const auto* s_ptr = scale.ptr<T>();
-    const auto* b_ptr = (has_bias && !inputs[2].is_empty()) ? inputs[2].ptr<T>() : nullptr;
+    const auto* s_ptr = has_scale ? inputs[1].ptr<T>() : nullptr;
+    const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     auto* y_ptr = output.ptr<T>();
 
     // The pre-add residual is the trailing slot, after the optional bias.
-    const bool has_res = attrs.add_residual && inputs.size() >= 4 && !inputs[3].is_empty();
+    const bool has_res = attrs.add_residual && base_n >= 4 && !inputs[3].is_empty();
     const auto* r_ptr = has_res ? inputs[3].ptr<T>() : nullptr;
+
+    const TensorView* mod_scale = modulate ? &inputs[static_cast<size_t>(base_n)] : nullptr;
+    const TensorView* mod_shift = modulate ? &inputs[static_cast<size_t>(base_n + 1)] : nullptr;
+    const TensorView* mod_gate_v = mod_gate ? &inputs[static_cast<size_t>(base_n + 2)] : nullptr;
 
     const bool add_to = attrs.add_to;
     const auto dims = compute_norm_dims(X, attrs.axis);
@@ -309,7 +460,7 @@ void layer_norm_impl(const NormAttributes& attrs, TensorView& output,
     if (!dims.is_contiguous_tail) {
         NNOPS_ASSERT(!has_res && "norm residual needs the contiguous tail");
         layer_norm_general_scalar<T>(x_ptr, s_ptr, b_ptr, y_ptr, dims.num_rows, dims.norm_size,
-                                     dims.axis, X, output, scale, epsilon, add_to, has_bias,
+                                     dims.axis, X, output, inputs[1], epsilon, add_to, has_bias,
                                      attrs.one_plus_weight, ctx);
         return;
     }
@@ -317,8 +468,9 @@ void layer_norm_impl(const NormAttributes& attrs, TensorView& output,
     const int64_t x_row_stride = X.row_stride_elems();
     const int64_t y_row_stride = output.row_stride_elems();
     const int64_t r_row_stride = has_res ? inputs[3].row_stride_elems() : 0;
-    const bool scale_is_scalar = (scale.numel() == 1);
+    const bool scale_is_scalar = has_scale && (inputs[1].numel() == 1);
     const bool one_plus = attrs.one_plus_weight;
+    const float offset = attrs.modulation_scale_offset;
 
     const auto process_row = [&](int64_t row) {
         const int64_t x_off = row * x_row_stride;
@@ -336,6 +488,19 @@ void layer_norm_impl(const NormAttributes& attrs, TensorView& output,
             var_val = 0.0f;
         }
         const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
+
+        if (modulate) {
+            const int64_t ms_off = modulation_row_offset(*mod_scale, X, row, dims.axis);
+            const int64_t mt_off = modulation_row_offset(*mod_shift, X, row, dims.axis);
+            const int64_t mg_off =
+                mod_gate ? modulation_row_offset(*mod_gate_v, X, row, dims.axis) : 0;
+            norm_apply_modulated_row<T, true>(
+                x_ptr + x_off, has_res ? r_ptr + r_off : nullptr, y_ptr + y_off, dims.norm_size,
+                mean_val, inv_std, s_ptr, b_ptr, has_scale, has_bias, scale_is_scalar, add_to,
+                one_plus, mod_scale->ptr<T>() + ms_off, mod_shift->ptr<T>() + mt_off,
+                mod_gate ? mod_gate_v->ptr<T>() + mg_off : nullptr, offset, mod_gate, has_res);
+            return;
+        }
 
         if (has_res) {
             if (b_ptr) {
@@ -406,23 +571,33 @@ void rms_norm_impl(const NormAttributes& attrs, TensorView& output,
                    std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& X = inputs[0];
-    const auto& scale = inputs[1];
+
+    const bool modulate = attrs.modulate;
+    const bool mod_gate = modulate && attrs.modulation_gate;
+    const int64_t n_trail = modulate ? (mod_gate ? 3 : 2) : 0;
+    const int64_t base_n = static_cast<int64_t>(inputs.size()) - n_trail;
+    const bool has_scale = modulate ? (base_n >= 2 && inputs[1].rank() > 0) : true;
 
     const float epsilon = attrs.epsilon;
 
     const auto* x_ptr = X.ptr<T>();
-    const auto* s_ptr = scale.ptr<T>();
+    const auto* s_ptr = has_scale ? inputs[1].ptr<T>() : nullptr;
     auto* y_ptr = output.ptr<T>();
 
     // The gate is the trailing slot; the residual, when present, sits before
     // it. With neither, the third input would be the gate, not a residual —
     // so the residual slot is counted back from the end rather than assumed.
     const bool has_gate = attrs.gate_activation != EpilogueActivateType::None;
-    const int64_t res_idx = static_cast<int64_t>(inputs.size()) - 1 - (has_gate ? 1 : 0);
+    const int64_t trailing = (has_gate ? 1 : 0) + n_trail;
+    const int64_t res_idx = static_cast<int64_t>(inputs.size()) - 1 - trailing;
     const bool has_res =
         attrs.add_residual && res_idx >= 2 && !inputs[static_cast<size_t>(res_idx)].is_empty();
     const auto* r_ptr = has_res ? inputs[static_cast<size_t>(res_idx)].ptr<T>() : nullptr;
     const auto* g_ptr = has_gate ? inputs.back().ptr<T>() : nullptr;
+
+    const TensorView* mod_scale = modulate ? &inputs[static_cast<size_t>(base_n)] : nullptr;
+    const TensorView* mod_shift = modulate ? &inputs[static_cast<size_t>(base_n + 1)] : nullptr;
+    const TensorView* mod_gate_v = mod_gate ? &inputs[static_cast<size_t>(base_n + 2)] : nullptr;
 
     const bool add_to = attrs.add_to;
     const auto dims = compute_norm_dims(X, attrs.axis);
@@ -430,7 +605,7 @@ void rms_norm_impl(const NormAttributes& attrs, TensorView& output,
     if (!dims.is_contiguous_tail) {
         NNOPS_ASSERT(!has_res && "norm residual needs the contiguous tail");
         rms_norm_general_scalar<T>(x_ptr, s_ptr, y_ptr, dims.num_rows, dims.norm_size, dims.axis, X,
-                                   output, scale, epsilon, add_to, attrs.one_plus_weight, ctx);
+                                   output, inputs[1], epsilon, add_to, attrs.one_plus_weight, ctx);
         return;
     }
 
@@ -439,9 +614,10 @@ void rms_norm_impl(const NormAttributes& attrs, TensorView& output,
     const int64_t r_row_stride =
         has_res ? inputs[static_cast<size_t>(res_idx)].row_stride_elems() : 0;
     const int64_t g_row_stride = has_gate ? inputs.back().row_stride_elems() : 0;
-    const bool scale_is_scalar = (scale.numel() == 1);
+    const bool scale_is_scalar = has_scale && (inputs[1].numel() == 1);
     const bool one_plus = attrs.one_plus_weight;
     const EpilogueActivateType gate_act = attrs.gate_activation;
+    const float offset = attrs.modulation_scale_offset;
 
     const auto process_row = [&](int64_t row) {
         const int64_t x_off = row * x_row_stride;
@@ -454,6 +630,18 @@ void rms_norm_impl(const NormAttributes& attrs, TensorView& output,
         (void)sum;
         const float inv_rms =
             1.0f / std::sqrt(sum_sq / static_cast<float>(dims.norm_size) + epsilon);
+        if (modulate) {
+            const int64_t ms_off = modulation_row_offset(*mod_scale, X, row, dims.axis);
+            const int64_t mt_off = modulation_row_offset(*mod_shift, X, row, dims.axis);
+            const int64_t mg_off =
+                mod_gate ? modulation_row_offset(*mod_gate_v, X, row, dims.axis) : 0;
+            norm_apply_modulated_row<T, false>(
+                x_ptr + x_off, has_res ? r_ptr + r_off : nullptr, y_ptr + y_off, dims.norm_size,
+                0.0f, inv_rms, s_ptr, nullptr, has_scale, false, scale_is_scalar, add_to, one_plus,
+                mod_scale->ptr<T>() + ms_off, mod_shift->ptr<T>() + mt_off,
+                mod_gate ? mod_gate_v->ptr<T>() + mg_off : nullptr, offset, mod_gate, has_res);
+            return;
+        }
         if (has_gate) {
             // act(gate) multiplies the normalized value inside the row kernel.
             const T* g_row = g_ptr + row * g_row_stride;
@@ -524,14 +712,23 @@ void l2_norm_impl(const NormAttributes& attrs, TensorView& output,
 {
     const auto& X = inputs[0];
 
+    const bool modulate = attrs.modulate;
+    const bool mod_gate = modulate && attrs.modulation_gate;
+    const int64_t n_trail = modulate ? (mod_gate ? 3 : 2) : 0;
+    const int64_t base_n = static_cast<int64_t>(inputs.size()) - n_trail;
+
     const float epsilon = attrs.epsilon;
 
     const auto* x_ptr = X.ptr<T>();
     auto* y_ptr = output.ptr<T>();
 
     // L2Norm has no scale, so the residual is the second input.
-    const bool has_res = attrs.add_residual && inputs.size() >= 2 && !inputs[1].is_empty();
+    const bool has_res = attrs.add_residual && base_n >= 2 && !inputs[1].is_empty();
     const auto* r_ptr = has_res ? inputs[1].ptr<T>() : nullptr;
+
+    const TensorView* mod_scale = modulate ? &inputs[static_cast<size_t>(base_n)] : nullptr;
+    const TensorView* mod_shift = modulate ? &inputs[static_cast<size_t>(base_n + 1)] : nullptr;
+    const TensorView* mod_gate_v = mod_gate ? &inputs[static_cast<size_t>(base_n + 2)] : nullptr;
 
     const bool add_to = attrs.add_to;
     const auto dims = compute_norm_dims(X, attrs.axis);
@@ -557,6 +754,19 @@ void l2_norm_impl(const NormAttributes& attrs, TensorView& output,
                 kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
         (void)sum;
         const float inv_norm = 1.0f / std::sqrt(sum_sq + epsilon);
+        if (modulate) {
+            const int64_t ms_off = modulation_row_offset(*mod_scale, X, row, dims.axis);
+            const int64_t mt_off = modulation_row_offset(*mod_shift, X, row, dims.axis);
+            const int64_t mg_off =
+                mod_gate ? modulation_row_offset(*mod_gate_v, X, row, dims.axis) : 0;
+            norm_apply_modulated_row<T, false>(
+                x_ptr + x_off, has_res ? r_ptr + r_off : nullptr, y_ptr + y_off, dims.norm_size,
+                0.0f, inv_norm, nullptr, nullptr, false, false, false, add_to, false,
+                mod_scale->ptr<T>() + ms_off, mod_shift->ptr<T>() + mt_off,
+                mod_gate ? mod_gate_v->ptr<T>() + mg_off : nullptr, attrs.modulation_scale_offset,
+                mod_gate, has_res);
+            return;
+        }
         if (has_res) {
             kernel::norm_apply_row_add<T, false, false, false>(
                 x_ptr + x_off, r_ptr + r_off, y_ptr + y_off, dims.norm_size, 0.0f, inv_norm,
@@ -581,7 +791,12 @@ void group_norm_impl(const NormAttributes& attrs, TensorView& output,
 {
     const auto& X = inputs[0];
     const auto& scale = inputs[1];
-    const bool has_bias = (inputs.size() >= 3 && !inputs[2].is_empty());
+
+    const bool modulate = attrs.modulate;
+    const bool mod_gate = modulate && attrs.modulation_gate;
+    const int64_t n_trail = modulate ? (mod_gate ? 3 : 2) : 0;
+    const int64_t base_n = static_cast<int64_t>(inputs.size()) - n_trail;
+    const bool has_bias = base_n >= 3 && !inputs[2].is_empty();
 
     const int64_t rank = X.rank();
     NNOPS_ASSERT(rank >= 2);
@@ -609,6 +824,22 @@ void group_norm_impl(const NormAttributes& attrs, TensorView& output,
     const auto* b_ptr = (has_bias && !inputs[2].is_empty()) ? inputs[2].ptr<T>() : nullptr;
     auto* y_ptr = output.ptr<T>();
     const bool add_to = attrs.add_to;
+
+    // FiLM: one conditioning pair per channel, optionally one per sample.
+    const TensorView* mod_scale_v = modulate ? &inputs[static_cast<size_t>(base_n)] : nullptr;
+    const TensorView* mod_shift_v = modulate ? &inputs[static_cast<size_t>(base_n + 1)] : nullptr;
+    const TensorView* mod_gate_v = mod_gate ? &inputs[static_cast<size_t>(base_n + 2)] : nullptr;
+    const auto* ms_ptr = modulate ? mod_scale_v->ptr<T>() : nullptr;
+    const auto* mt_ptr = modulate ? mod_shift_v->ptr<T>() : nullptr;
+    const auto* mg_ptr = mod_gate ? mod_gate_v->ptr<T>() : nullptr;
+    // [N, C] steps by a sample; a size-1 leading axis (or [C]) does not.
+    const auto mod_n_stride = [](const TensorView* v) {
+        return (v != nullptr && v->rank() == 2 && v->shape(0) != 1) ? v->stride_elems(0) : 0;
+    };
+    const int64_t ms_n = mod_n_stride(mod_scale_v);
+    const int64_t mt_n = mod_n_stride(mod_shift_v);
+    const int64_t mg_n = mod_n_stride(mod_gate_v);
+    const float mod_offset = attrs.modulation_scale_offset;
 
     // Channels are contiguous inside each pixel, so a group is
     // channels_per_group consecutive elements at every spatial offset.
@@ -647,7 +878,16 @@ void group_norm_impl(const NormAttributes& attrs, TensorView& output,
                 const int64_t c_global = c_start + k;
                 const float s = s_load(&s_ptr[c_global]);
                 const float b = (has_bias && b_ptr) ? s_load(&b_ptr[c_global]) : 0.0f;
-                const float val = (s_load(&x_ptr[xo + k]) - mean_val) * inv_std * s + b;
+                float val = (s_load(&x_ptr[xo + k]) - mean_val) * inv_std * s + b;
+                if (modulate) {
+                    // The last axis is the channel, so its stride is 1.
+                    const int64_t mo = c_global;
+                    val = val * (s_load(&ms_ptr[ms_n * n + mo]) + mod_offset) +
+                          s_load(&mt_ptr[mt_n * n + mo]);
+                    if (mod_gate) {
+                        val *= s_load(&mg_ptr[mg_n * n + mo]);
+                    }
+                }
                 s_store_add(&y_ptr[yo + k], val, add_to);
             }
         }

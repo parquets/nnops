@@ -1803,3 +1803,417 @@ NNOPS_TEST(norm_default_attrs) {
     NNOPS_EXPECT_EQ(attrs.add_to, false);
     NNOPS_EXPECT_EQ(static_cast<int>(attrs.output_dtype), static_cast<int>(DataType::f32));
 }
+
+// ============================================================
+// Adaptive normalization — AdaLN / AdaLN-Zero / FiLM
+// ============================================================
+
+namespace {
+
+/// Run the operator and the f32 reference on the same call and compare.
+void expect_norm_matches_reference(const NormAttributes& attrs,
+                                   std::span<const TensorView> ins,
+                                   std::span<const TensorDesc> descs,
+                                   float tol = 2e-4f)
+{
+    auto op = Norm::create(attrs, Backend::CPU);
+    auto outs = op->getOutputTensorDesc(descs);
+
+    std::vector<float> got(static_cast<size_t>(outs[0].numel()));
+    auto out = test::make_channel_first(outs[0], got.data());
+
+    std::vector<float> want(static_cast<size_t>(outs[0].numel()));
+    auto ref_out = test::make_channel_first(outs[0], want.data());
+    {
+        ComputeContext ctx;
+        backend::cpu::reference::norm_ref(attrs, ref_out, ins, ctx, nullptr);
+    }
+
+    TensorView outs_v[] = {out};
+    NNOPS_EXPECT_TRUE(op->compute(outs_v, ins) == Status::ok);
+    for (size_t i = 0; i < got.size(); ++i) {
+        NNOPS_EXPECT_NEAR(got[i], want[i], tol);
+    }
+}
+
+} // anonymous namespace
+
+NNOPS_TEST(norm_layernorm_adaln_per_sample) {
+    // DiT's AdaLN: no learned affine, one (scale, shift) per sample broadcast
+    // over the token axis.
+    auto [x_buf, x] = test::make_random_tensor({2, 3, 4}, -1.0f, 1.0f, 900);
+    auto [ms_buf, ms] = test::make_random_tensor({2, 1, 4}, -0.5f, 0.5f, 901);
+    auto [mt_buf, mt] = test::make_random_tensor({2, 1, 4}, -0.5f, 0.5f, 902);
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    attrs.modulate = true;
+
+    TensorView empty;
+    const TensorView ins[] = {x, empty, ms, mt};
+    const TensorDesc descs[] = {x.desc(), empty.desc(), ms.desc(), mt.desc()};
+
+    expect_norm_matches_reference(attrs, ins, descs);
+    (void)x_buf; (void)ms_buf; (void)mt_buf;
+}
+
+NNOPS_TEST(norm_layernorm_adaln_zero) {
+    // AdaLN-Zero: the gate input multiplies the modulated row.
+    auto [x_buf, x] = test::make_random_tensor({2, 3, 4}, -1.0f, 1.0f, 910);
+    auto [ms_buf, ms] = test::make_random_tensor({2, 1, 4}, -0.5f, 0.5f, 911);
+    auto [mt_buf, mt] = test::make_random_tensor({2, 1, 4}, -0.5f, 0.5f, 912);
+    auto [g_buf, g] = test::make_random_tensor({2, 3, 4}, -0.5f, 0.5f, 913);
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    attrs.modulate = true;
+    attrs.modulation_gate = true;
+
+    TensorView empty;
+    const TensorView ins[] = {x, empty, ms, mt, g};
+    const TensorDesc descs[] = {x.desc(), empty.desc(), ms.desc(), mt.desc(), g.desc()};
+
+    expect_norm_matches_reference(attrs, ins, descs);
+    (void)x_buf; (void)ms_buf; (void)mt_buf; (void)g_buf;
+}
+
+NNOPS_TEST(norm_layernorm_adaln_with_affine) {
+    // AdaLN on a LayerNorm that still carries its learned affine.
+    auto [x_buf, x] = test::make_random_tensor({2, 3, 4}, -1.0f, 1.0f, 920);
+    auto [s_buf, s] = test::make_random_tensor({4}, 0.5f, 1.5f, 921);
+    auto [b_buf, b] = test::make_random_tensor({4}, -0.2f, 0.2f, 922);
+    auto [ms_buf, ms] = test::make_random_tensor({4}, -0.5f, 0.5f, 923);
+    auto [mt_buf, mt] = test::make_random_tensor({4}, -0.5f, 0.5f, 924);
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    attrs.modulate = true;
+
+    const TensorView ins[] = {x, s, b, ms, mt};
+    const TensorDesc descs[] = {x.desc(), s.desc(), b.desc(), ms.desc(), mt.desc()};
+
+    expect_norm_matches_reference(attrs, ins, descs);
+    (void)x_buf; (void)s_buf; (void)b_buf; (void)ms_buf; (void)mt_buf;
+}
+
+NNOPS_TEST(norm_layernorm_adaln_plain_scale) {
+    // modulation_scale_offset = 0: `scale * norm(x) + shift`, no `(1 + scale)`.
+    auto [x_buf, x] = test::make_random_tensor({3, 5}, -1.0f, 1.0f, 930);
+    auto [ms_buf, ms] = test::make_random_tensor({3, 5}, -0.5f, 0.5f, 931);
+    auto [mt_buf, mt] = test::make_random_tensor({3, 5}, -0.5f, 0.5f, 932);
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    attrs.modulate = true;
+    attrs.modulation_scale_offset = 0.0f;
+
+    TensorView empty;
+    const TensorView ins[] = {x, empty, ms, mt};
+    const TensorDesc descs[] = {x.desc(), empty.desc(), ms.desc(), mt.desc()};
+
+    expect_norm_matches_reference(attrs, ins, descs);
+    (void)x_buf; (void)ms_buf; (void)mt_buf;
+}
+
+NNOPS_TEST(norm_rmsnorm_ada_per_token) {
+    // adaRMSNorm: per-token conditioning, learned scale still present.
+    auto [x_buf, x] = test::make_random_tensor({2, 3, 4}, -1.0f, 1.0f, 940);
+    auto [s_buf, s] = test::make_random_tensor({4}, 0.5f, 1.5f, 941);
+    auto [ms_buf, ms] = test::make_random_tensor({2, 3, 4}, -0.5f, 0.5f, 942);
+    auto [mt_buf, mt] = test::make_random_tensor({2, 3, 4}, -0.5f, 0.5f, 943);
+    auto [g_buf, g] = test::make_random_tensor({2, 3, 4}, -0.5f, 0.5f, 944);
+
+    NormAttributes attrs;
+    attrs.type = NormType::RMSNorm;
+    attrs.modulate = true;
+    attrs.modulation_gate = true;
+
+    const TensorView ins[] = {x, s, ms, mt, g};
+    const TensorDesc descs[] = {x.desc(), s.desc(), ms.desc(), mt.desc(), g.desc()};
+
+    expect_norm_matches_reference(attrs, ins, descs);
+    (void)x_buf; (void)s_buf; (void)ms_buf; (void)mt_buf; (void)g_buf;
+}
+
+NNOPS_TEST(norm_l2norm_modulation) {
+    auto [x_buf, x] = test::make_random_tensor({2, 4}, -1.0f, 1.0f, 950);
+    auto [ms_buf, ms] = test::make_random_tensor({2, 4}, -0.5f, 0.5f, 951);
+    auto [mt_buf, mt] = test::make_random_tensor({2, 4}, -0.5f, 0.5f, 952);
+
+    NormAttributes attrs;
+    attrs.type = NormType::L2Norm;
+    attrs.modulate = true;
+
+    const TensorView ins[] = {x, ms, mt};
+    const TensorDesc descs[] = {x.desc(), ms.desc(), mt.desc()};
+
+    expect_norm_matches_reference(attrs, ins, descs);
+    (void)x_buf; (void)ms_buf; (void)mt_buf;
+}
+
+NNOPS_TEST(norm_groupnorm_film_per_channel) {
+    // Diffusion Policy's FiLM: GroupNorm followed by a per-channel scale/shift.
+    const int64_t N = 2, C = 8, H = 2, W = 3;
+    auto [x_vec, x_dense] = test::make_random_tensor({N, C, H, W}, -1.0f, 1.0f, 960);
+    auto [s_buf, s] = test::make_random_tensor({C}, 0.5f, 1.5f, 961);
+    auto [b_buf, b] = test::make_random_tensor({C}, -0.2f, 0.2f, 962);
+    auto [ms_buf, ms] = test::make_random_tensor({C}, -0.5f, 0.5f, 963);
+    auto [mt_buf, mt] = test::make_random_tensor({C}, -0.5f, 0.5f, 964);
+
+    NormAttributes attrs;
+    attrs.type = NormType::GroupNorm;
+    attrs.num_groups = 2;
+    attrs.modulate = true;
+
+    // Reference reads the dense [N, C, H, W] copy.
+    const TensorView ref_ins[] = {x_dense, s, b, ms, mt};
+    const TensorDesc ref_descs[] = {x_dense.desc(), s.desc(), b.desc(), ms.desc(), mt.desc()};
+    auto op = Norm::create(attrs, Backend::CPU);
+    auto outs = op->getOutputTensorDesc(ref_descs);
+
+    std::vector<float> want(static_cast<size_t>(outs[0].numel()));
+    auto ref_out = test::make_channel_first(outs[0], want.data());
+    {
+        ComputeContext ctx;
+        backend::cpu::reference::norm_ref(attrs, ref_out, ref_ins, ctx, nullptr);
+    }
+
+    // The operator reads NHWC.
+    std::vector<float> cl_buf = test::to_channel_last(
+        std::span<const float>(x_vec.data(), x_vec.size()), N, C, H * W);
+    const int64_t shp[] = {N, H, W, C};
+    TensorView x_cl(shp, DataType::f32, cl_buf.data(), TensorLayout::NHWC);
+
+    const TensorDesc op_descs[] = {x_cl.desc(), s.desc(), b.desc(), ms.desc(), mt.desc()};
+    auto op_outs = op->getOutputTensorDesc(op_descs);
+    NNOPS_EXPECT_EQ(op_outs[0].layout, TensorLayout::NHWC);
+
+    std::vector<float> got(static_cast<size_t>(op_outs[0].numel()));
+    TensorView out_cl(std::span<const int64_t>(op_outs[0].dims.data(),
+                                               static_cast<size_t>(op_outs[0].rank)),
+                      DataType::f32, got.data(), TensorLayout::NHWC);
+
+    const TensorView ins[] = {x_cl, s, b, ms, mt};
+    TensorView outs_v[] = {out_cl};
+    NNOPS_EXPECT_TRUE(op->compute(outs_v, ins) == Status::ok);
+
+    std::vector<float> got_dense = test::to_channel_first(
+        std::span<const float>(got.data(), got.size()), N, C, H * W);
+    for (size_t i = 0; i < got_dense.size(); ++i) {
+        NNOPS_EXPECT_NEAR(got_dense[i], want[i], 2e-4f);
+    }
+    (void)s_buf; (void)b_buf; (void)ms_buf; (void)mt_buf;
+}
+
+NNOPS_TEST(norm_groupnorm_film_per_sample) {
+    // FiLM with a per-sample conditioning table [N, C].
+    const int64_t N = 2, C = 4, H = 2, W = 2;
+    auto [x_vec, x_dense] = test::make_random_tensor({N, C, H, W}, -1.0f, 1.0f, 970);
+    auto [s_buf, s] = test::make_random_tensor({C}, 0.5f, 1.5f, 971);
+    auto [ms_buf, ms] = test::make_random_tensor({N, C}, -0.5f, 0.5f, 972);
+    auto [mt_buf, mt] = test::make_random_tensor({N, C}, -0.5f, 0.5f, 973);
+
+    NormAttributes attrs;
+    attrs.type = NormType::GroupNorm;
+    attrs.num_groups = 1;
+    attrs.modulate = true;
+
+    const TensorView ref_ins[] = {x_dense, s, ms, mt};
+    const TensorDesc ref_descs[] = {x_dense.desc(), s.desc(), ms.desc(), mt.desc()};
+    auto op = Norm::create(attrs, Backend::CPU);
+    auto outs = op->getOutputTensorDesc(ref_descs);
+
+    std::vector<float> want(static_cast<size_t>(outs[0].numel()));
+    auto ref_out = test::make_channel_first(outs[0], want.data());
+    {
+        ComputeContext ctx;
+        backend::cpu::reference::norm_ref(attrs, ref_out, ref_ins, ctx, nullptr);
+    }
+
+    std::vector<float> cl_buf = test::to_channel_last(
+        std::span<const float>(x_vec.data(), x_vec.size()), N, C, H * W);
+    const int64_t shp[] = {N, H, W, C};
+    TensorView x_cl(shp, DataType::f32, cl_buf.data(), TensorLayout::NHWC);
+
+    const TensorDesc op_descs[] = {x_cl.desc(), s.desc(), ms.desc(), mt.desc()};
+    auto op_outs = op->getOutputTensorDesc(op_descs);
+    NNOPS_EXPECT_EQ(op_outs[0].layout, TensorLayout::NHWC);
+
+    std::vector<float> got(static_cast<size_t>(op_outs[0].numel()));
+    TensorView out_cl(std::span<const int64_t>(op_outs[0].dims.data(),
+                                               static_cast<size_t>(op_outs[0].rank)),
+                      DataType::f32, got.data(), TensorLayout::NHWC);
+
+    const TensorView ins[] = {x_cl, s, ms, mt};
+    TensorView outs_v[] = {out_cl};
+    NNOPS_EXPECT_TRUE(op->compute(outs_v, ins) == Status::ok);
+
+    std::vector<float> got_dense = test::to_channel_first(
+        std::span<const float>(got.data(), got.size()), N, C, H * W);
+    for (size_t i = 0; i < got_dense.size(); ++i) {
+        NNOPS_EXPECT_NEAR(got_dense[i], want[i], 2e-4f);
+    }
+    (void)s_buf; (void)ms_buf; (void)mt_buf;
+}
+
+NNOPS_TEST(norm_layernorm_adaln_f16) {
+    // The f16 route runs the same row kernels; compare with the f32 reference
+    // computed on the same (rounded) values.
+    auto [x_f32, _x] = test::make_random_tensor({2, 3, 8}, -1.0f, 1.0f, 980);
+    auto [ms_f32, _ms] = test::make_random_tensor({2, 1, 8}, -0.5f, 0.5f, 981);
+    auto [mt_f32, _mt] = test::make_random_tensor({2, 1, 8}, -0.5f, 0.5f, 982);
+
+    auto x_h = test::f32_to_f16(x_f32);
+    auto ms_h = test::f32_to_f16(ms_f32);
+    auto mt_h = test::f32_to_f16(mt_f32);
+
+    const int64_t xs[] = {2, 3, 8};
+    const int64_t ms_shape[] = {2, 1, 8};
+    TensorView x(xs, DataType::f16, x_h.data());
+    TensorView ms(ms_shape, DataType::f16, ms_h.data());
+    TensorView mt(ms_shape, DataType::f16, mt_h.data());
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    attrs.modulate = true;
+
+    TensorView empty;
+    const TensorView ins[] = {x, empty, ms, mt};
+    const TensorDesc descs[] = {x.desc(), empty.desc(), ms.desc(), mt.desc()};
+
+    auto op = Norm::create(attrs, Backend::CPU);
+    auto outs = op->getOutputTensorDesc(descs);
+    std::vector<nnops::backend::cpu::half> got(static_cast<size_t>(outs[0].numel()));
+    TensorView out(std::span<const int64_t>(outs[0].dims.data(),
+                                            static_cast<size_t>(outs[0].rank)),
+                   DataType::f16, got.data());
+    TensorView outs_v[] = {out};
+    NNOPS_EXPECT_TRUE(op->compute(outs_v, ins) == Status::ok);
+
+    // Reference on the values as f16 stored them.
+    auto x_back = test::f16_to_f32(x_h);
+    auto ms_back = test::f16_to_f32(ms_h);
+    auto mt_back = test::f16_to_f32(mt_h);
+    TensorView xf(xs, DataType::f32, x_back.data());
+    TensorView msf(ms_shape, DataType::f32, ms_back.data());
+    TensorView mtf(ms_shape, DataType::f32, mt_back.data());
+    const TensorView ref_ins[] = {xf, empty, msf, mtf};
+    const TensorDesc ref_descs[] = {xf.desc(), empty.desc(), msf.desc(), mtf.desc()};
+    auto ref_outs = op->getOutputTensorDesc(ref_descs);
+    std::vector<float> want(static_cast<size_t>(ref_outs[0].numel()));
+    auto ref_out = test::make_channel_first(ref_outs[0], want.data());
+    {
+        ComputeContext ctx;
+        backend::cpu::reference::norm_ref(attrs, ref_out, ref_ins, ctx, nullptr);
+    }
+    auto got_f32 = test::f16_to_f32(got);
+    for (size_t i = 0; i < got_f32.size(); ++i) {
+        NNOPS_EXPECT_NEAR(got_f32[i], want[i], 2e-2f);
+    }
+}
+
+NNOPS_TEST(norm_modulation_rejects) {
+    const int64_t shape[] = {2, 4};
+    std::vector<float> x_buf(8, 1.0f);
+    TensorView x(shape, DataType::f32, x_buf.data());
+    TensorView empty;
+
+    auto [m_buf, m] = test::make_random_tensor({2, 4}, -0.5f, 0.5f, 990);
+    (void)m_buf;
+
+    const TensorDesc out_desc[] = {x.desc()};
+    const auto check = [&](const NormAttributes& attrs, std::span<const TensorDesc> ins) {
+        auto op = Norm::create(attrs, Backend::CPU);
+        return op->validate(ins, std::span<const TensorDesc>(out_desc, 1));
+    };
+
+    // BatchNorm has no row to modulate.
+    {
+        NormAttributes a;
+        a.type = NormType::BatchNorm;
+        a.modulate = true;
+        const TensorDesc ins[] = {x.desc(), x.desc(), x.desc(), x.desc(), x.desc(),
+                                  m.desc(), m.desc()};
+        NNOPS_EXPECT_TRUE(check(a, std::span<const TensorDesc>(ins, 7)) ==
+                          Status::unsupported);
+    }
+    // RMSNormGated and AdaLN-Zero both want the trailing gate slot.
+    {
+        NormAttributes a;
+        a.type = NormType::RMSNorm;
+        a.modulate = true;
+        a.gate_activation = EpilogueActivateType::Silu;
+        const TensorDesc ins[] = {x.desc(), x.desc(), x.desc(), m.desc(), m.desc()};
+        NNOPS_EXPECT_TRUE(check(a, std::span<const TensorDesc>(ins, 5)) ==
+                          Status::unsupported);
+    }
+    // A modulation gate without modulation.
+    {
+        NormAttributes a;
+        a.type = NormType::LayerNorm;
+        a.modulation_gate = true;
+        const TensorDesc ins[] = {x.desc(), x.desc()};
+        NNOPS_EXPECT_TRUE(check(a, std::span<const TensorDesc>(ins, 2)) ==
+                          Status::invalid_argument);
+    }
+    // Width mismatch.
+    {
+        NormAttributes a;
+        a.type = NormType::LayerNorm;
+        a.modulate = true;
+        auto [bad_buf, bad] = test::make_random_tensor({2, 3}, -0.5f, 0.5f, 991);
+        (void)bad_buf;
+        const TensorDesc ins[] = {x.desc(), empty.desc(), bad.desc(), bad.desc()};
+        NNOPS_EXPECT_TRUE(check(a, std::span<const TensorDesc>(ins, 4)) ==
+                          Status::invalid_argument);
+    }
+    // A non-tail normalized axis has no row-kernel route.
+    {
+        const int64_t s3[] = {2, 3, 4};
+        std::vector<float> buf(24, 1.0f);
+        TensorView x3(s3, DataType::f32, buf.data());
+        NormAttributes a;
+        a.type = NormType::LayerNorm;
+        a.axis = 1;
+        a.modulate = true;
+        std::vector<float> mb(24, 0.5f);
+        TensorView mm(s3, DataType::f32, mb.data());
+        const TensorDesc ins[] = {x3.desc(), empty.desc(), mm.desc(), mm.desc()};
+        NNOPS_EXPECT_TRUE(check(a, std::span<const TensorDesc>(ins, 4)) ==
+                          Status::unsupported);
+    }
+    // CPU only.
+    {
+        NormAttributes a;
+        a.type = NormType::LayerNorm;
+        a.modulate = true;
+        auto op = Norm::create(a, Backend::CUDA);
+        const TensorDesc ins[] = {x.desc(), empty.desc(), m.desc(), m.desc()};
+        NNOPS_EXPECT_TRUE(op->validate(std::span<const TensorDesc>(ins, 4),
+                                       std::span<const TensorDesc>(out_desc, 1)) ==
+                          Status::unsupported);
+    }
+    // FiLM's AdaLN-Zero gate is per channel like the other two slots.
+    {
+        const int64_t xg[] = {1, 2, 2, 4};
+        std::vector<float> buf(16, 1.0f);
+        TensorView x4(xg, DataType::f32, buf.data(), TensorLayout::NHWC);
+        const int64_t cs[] = {4};
+        std::vector<float> cbuf(4, 1.0f);
+        TensorView c(cs, DataType::f32, cbuf.data());
+        std::vector<float> badbuf(3, 1.0f);
+        const int64_t bads[] = {3};
+        TensorView badc(bads, DataType::f32, badbuf.data());
+
+        NormAttributes a;
+        a.type = NormType::GroupNorm;
+        a.modulate = true;
+        a.modulation_gate = true;
+        auto op = Norm::create(a, Backend::CPU);
+        const TensorDesc ins[] = {x4.desc(), c.desc(), c.desc(), c.desc(), badc.desc()};
+        const TensorDesc out_g[] = {x4.desc()};
+        NNOPS_EXPECT_TRUE(op->validate(std::span<const TensorDesc>(ins, 5),
+                                       std::span<const TensorDesc>(out_g, 1)) ==
+                          Status::invalid_argument);
+    }
+}

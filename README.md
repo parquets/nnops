@@ -103,12 +103,13 @@ Two patterns worth knowing:
 | Convolution | `Conv2D`, `Conv3D`, `DepthwiseConv2D`, `TransposeConv2D` |
 | Matrix / linear | `MatMul` (f32 / f16 / s8×s8), `Linear`, `QuantLinear` |
 | Attention | `MultiHeadAttention`, `GroupQueryAttention`, `MultiLatentAttention`, `LinearAttention` |
-| Normalization | `LayerNorm`, `RMSNorm`, `BatchNorm`, `Softmax` (softmax & log-softmax) |
+| Normalization | `Norm` (`LayerNorm`, `RMSNorm`, `BatchNorm`, `GroupNorm`, `L2Norm`), with AdaLN / AdaLN-Zero / FiLM modulation, `Softmax` (softmax & log-softmax) |
 | Element-wise | `Eltwise` (add/sub/mul/div, NumPy broadcast), `Unary` (exp/log family, trig, hyperbolic, erfc, …), `Activation` (relu/leaky_relu/sigmoid/tanh/gelu variants/silu/hard_swish/hard_sigmoid/elu/selu/softplus/mish/prelu/quick_gelu), `Clamp` |
 | Selection / predicate | `Where`, `Compare` (equal/greater/less/…), `Logical` (and/or/xor/not) |
 | Indexing | `Gather`, `GatherElements`, `GatherND`, `ScatterElements`, `ScatterND`, `Pad`, `Split`, `Tile`, `Expand` |
 | Reduction | `Reduce` (sum/mean/max/min), `ArgMinMax`, `TopK`, `CumSum` |
-| Shape / layout | `Concat`, `Slice`, `Permute`, `Flatten`, `Embed`, `Resize`, `GridSample` |
+| Shape / layout | `Concat`, `Slice`, `Permute`, `Flatten`, `Embed`, `Resize`, `GridSample`, `SpaceToDepth`, `PixelShuffle` (DepthToSpace, DCR/CRD) |
+| Detection / ROI | `RoiAlign` (bilinear, 2D), `NonMaxSuppression` (greedy IoU with fused TopK) |
 | Positional | `RoPE` (rotary position embeddings) |
 
 ### Fusion and accumulation

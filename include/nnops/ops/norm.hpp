@@ -20,6 +20,13 @@
 /// RMSNormGated of the linear-attention blocks: `y = rms_norm(x) · act(g)` with
 /// the gate as a trailing input. See the attribute for the slot order.
 ///
+/// `modulate` turns the normalized row into DiT's adaptive LayerNorm (AdaLN /
+/// AdaLN-Zero) and Diffusion Policy's FiLM:
+///   y = gate? · ((mod_scale + modulation_scale_offset) ⊙ norm(x) + mod_shift)
+/// The modulation tensors are appended after the type's existing inputs and
+/// broadcast against X under NumPy rules, so one fused pass covers a per-sample
+/// [B, D] condition, a per-token [B, S, D] one, or a single [D] vector.
+///
 /// Quantized input (CPU): an s8/u8 X with PerTensor or PerToken params, for
 /// LayerNorm / RMSNorm / L2Norm with axis == rank-1 only — one normalization
 /// row is then exactly one quantization row. Y is f32/f16 (dequantized) or
@@ -102,6 +109,36 @@ struct NormAttributes {
     /// hidden. None disables; RMSNorm only (the other types' scale/group
     /// geometry has no gated consumer, and the quantized path rejects it).
     EpilogueActivateType gate_activation = EpilogueActivateType::None;
+
+    /// Adaptive normalization (DiT's AdaLN / AdaLN-Zero, Diffusion Policy's
+    /// FiLM): the normalized row is re-scaled and re-shifted by conditioning
+    /// tensors supplied as inputs, in the same row pass:
+    ///   y = gate? · ((mod_scale + modulation_scale_offset) · norm(x) + mod_shift)
+    /// The modulation pair is appended after the type's existing inputs, and a
+    /// gate (AdaLN-Zero) is one slot past that:
+    ///   LayerNorm  [X, scale?, bias?, residual?, mod_scale, mod_shift, gate?]
+    ///   RMSNorm    [X, scale?, residual?, mod_scale, mod_shift, gate?]
+    ///   GroupNorm  [X, scale, bias?, mod_scale, mod_shift, gate?]
+    ///   L2Norm     [X, residual?, mod_scale, mod_shift, gate?]
+    /// `scale` may be an empty view — AdaLN's LayerNorm usually has no learned
+    /// affine — and `bias`/`residual` follow their own attributes (a bias can
+    /// also be an empty view). The modulation tensors broadcast against X under
+    /// NumPy rules with the normalized width as the shared last axis, so
+    /// [B, D] applies one condition per sample, [B, S, D] one per token and [D]
+    /// one to every row. GroupNorm's modulation is per channel: [C] or [N, C].
+    /// The normalized axis must be the rank-1 dense tail (the row kernel's
+    /// fast path); the quantized route, BatchNorm, and the RMSNormGated form
+    /// (`gate_activation`) reject modulation. CPU only.
+    bool modulate = false;
+
+    /// The effective modulation scale is `mod_scale + this`. 1.0 is DiT's
+    /// `(1 + scale)` and Diffusion Policy's FiLM, 0.0 a plain
+    /// `scale · norm(x) + shift`.
+    float modulation_scale_offset = 1.0f;
+
+    /// AdaLN-Zero: one extra trailing input multiplies the modulated result.
+    /// Requires `modulate`.
+    bool modulation_gate = false;
 };
 
 class Norm : public OpBase {

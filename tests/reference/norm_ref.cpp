@@ -34,6 +34,26 @@ int64_t outer_base(const TensorView& t, int64_t row, int64_t axis) {
     return flat_offset(t, 0, axis, row);
 }
 
+/// Base offset of row `row` in an AdaLN/FiLM conditioning tensor that
+/// broadcasts NumPy-style against X's leading dims.
+int64_t mod_row_base(const TensorView& mod, const TensorView& x, int64_t row, int64_t axis) {
+    const int64_t xr = x.rank();
+    const int64_t mr = mod.rank();
+    int64_t off = 0;
+    int64_t rem = row;
+    for (int64_t d = axis - 1; d >= 0; --d) {
+        const int64_t dim = x.shape(d);
+        if (dim <= 0) { continue; }
+        const int64_t coord = rem % dim;
+        rem /= dim;
+        if (coord == 0) { continue; }
+        const int64_t md = d - (xr - mr);
+        if (md < 0 || mod.shape(md) == 1) { continue; }
+        off += coord * mod.stride_elems(md);
+    }
+    return off;
+}
+
 /// Scalar activation for the gated form (RMSNormGated): act(gate).
 float ref_gate_act(EpilogueActivateType a, float g) {
     constexpr float kSqrt2OverPi = 0.7978845608028654f;
@@ -124,9 +144,19 @@ void layer_norm_ref_impl(const NormAttributes& attrs,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx)
 {
-    const auto& X     = inputs[0];
-    const auto& scale = inputs[1];
-    const bool has_bias = (inputs.size() >= 3 && !inputs[2].is_empty());
+    const auto& X = inputs[0];
+
+    // Modulation (AdaLN / FiLM) owns the last 2 or 3 slots, after the type's.
+    const bool modulate = attrs.modulate;
+    const bool mod_gate = modulate && attrs.modulation_gate;
+    const int64_t n_trail = modulate ? (mod_gate ? 3 : 2) : 0;
+    const int64_t base_n = static_cast<int64_t>(inputs.size()) - n_trail;
+    const bool has_scale = modulate ? (base_n >= 2 && inputs[1].rank() > 0) : true;
+    const bool has_bias = base_n >= 3 && !inputs[2].is_empty();
+    const TensorView* mod_scale = modulate ? &inputs[static_cast<size_t>(base_n)] : nullptr;
+    const TensorView* mod_shift = modulate ? &inputs[static_cast<size_t>(base_n + 1)] : nullptr;
+    const TensorView* mod_gate_v = mod_gate ? &inputs[static_cast<size_t>(base_n + 2)] : nullptr;
+    const float mod_offset = attrs.modulation_scale_offset;
 
     const int64_t rank = X.rank();
     const float epsilon = attrs.epsilon;
@@ -145,7 +175,7 @@ void layer_norm_ref_impl(const NormAttributes& attrs,
     }
 
     const auto* x_ptr  = X.ptr<float>();
-    const auto* s_ptr  = scale.ptr<float>();
+    const auto* s_ptr  = has_scale ? inputs[1].ptr<float>() : nullptr;
     const auto* b_ptr  = has_bias ? inputs[2].ptr<float>() : nullptr;
     auto* y_ptr = output.ptr<float>();
 
@@ -173,12 +203,23 @@ void layer_norm_ref_impl(const NormAttributes& attrs,
         float var_val = M2 / static_cast<float>(norm_size);
         float inv_std = 1.0f / std::sqrt(var_val + epsilon);
 
+        const int64_t ms_base = modulate ? mod_row_base(*mod_scale, X, row, axis) : 0;
+        const int64_t mt_base = modulate ? mod_row_base(*mod_shift, X, row, axis) : 0;
+        const int64_t mg_base = mod_gate ? mod_row_base(*mod_gate_v, X, row, axis) : 0;
+        const auto* ms_ptr = modulate ? mod_scale->ptr<float>() + ms_base : nullptr;
+        const auto* mt_ptr = modulate ? mod_shift->ptr<float>() + mt_base : nullptr;
+        const auto* mg_ptr = mod_gate ? mod_gate_v->ptr<float>() + mg_base : nullptr;
+
         for (int64_t i = 0; i < norm_size; ++i) {
             const int64_t xi = x_base + x_inner[static_cast<size_t>(i)];
             const int64_t yi = y_base + y_inner[static_cast<size_t>(i)];
-            float s = s_ptr[i] + (attrs.one_plus_weight ? 1.0f : 0.0f);
+            float s = has_scale ? s_ptr[i] + (attrs.one_plus_weight ? 1.0f : 0.0f) : 1.0f;
             float b = b_ptr ? b_ptr[i] : 0.0f;
             float val = (x_ptr[xi] - mean_val) * inv_std * s + b;
+            if (modulate) {
+                val = val * (ms_ptr[i] + mod_offset) + mt_ptr[i];
+                if (mod_gate) { val *= mg_ptr[i]; }
+            }
             y_ptr[yi] = attrs.add_to ? y_ptr[yi] + val : val;
         }
     };
@@ -195,8 +236,17 @@ void rms_norm_ref_impl(const NormAttributes& attrs,
                        std::span<const TensorView> inputs,
                        const ComputeContext& ctx)
 {
-    const auto& X     = inputs[0];
-    const auto& scale = inputs[1];
+    const auto& X = inputs[0];
+
+    const bool modulate = attrs.modulate;
+    const bool mod_gate = modulate && attrs.modulation_gate;
+    const int64_t n_trail = modulate ? (mod_gate ? 3 : 2) : 0;
+    const int64_t base_n = static_cast<int64_t>(inputs.size()) - n_trail;
+    const bool has_scale = modulate ? (base_n >= 2 && inputs[1].rank() > 0) : true;
+    const TensorView* mod_scale = modulate ? &inputs[static_cast<size_t>(base_n)] : nullptr;
+    const TensorView* mod_shift = modulate ? &inputs[static_cast<size_t>(base_n + 1)] : nullptr;
+    const TensorView* mod_gate_v = mod_gate ? &inputs[static_cast<size_t>(base_n + 2)] : nullptr;
+    const float mod_offset = attrs.modulation_scale_offset;
 
     const int64_t rank = X.rank();
     const float epsilon = attrs.epsilon;
@@ -215,7 +265,7 @@ void rms_norm_ref_impl(const NormAttributes& attrs,
     }
 
     const auto* x_ptr = X.ptr<float>();
-    const auto* s_ptr = scale.ptr<float>();
+    const auto* s_ptr = has_scale ? inputs[1].ptr<float>() : nullptr;
     auto* y_ptr = output.ptr<float>();
 
     // The gate is the trailing input (RMSNormGated); a residual, when present,
@@ -235,7 +285,7 @@ void rms_norm_ref_impl(const NormAttributes& attrs,
         }
     }
 
-    const bool scale_is_scalar = (scale.numel() == 1);
+    const bool scale_is_scalar = has_scale && (inputs[1].numel() == 1);
 
     const auto process_row = [&](int64_t row) {
         const int64_t x_base = outer_base(X, row, axis);
@@ -250,16 +300,27 @@ void rms_norm_ref_impl(const NormAttributes& attrs,
         float rms = std::sqrt(sum_sq / static_cast<float>(norm_size) + epsilon);
         float inv_rms = 1.0f / rms;
 
+        const int64_t ms_base = modulate ? mod_row_base(*mod_scale, X, row, axis) : 0;
+        const int64_t mt_base = modulate ? mod_row_base(*mod_shift, X, row, axis) : 0;
+        const int64_t mg_base = mod_gate ? mod_row_base(*mod_gate_v, X, row, axis) : 0;
+        const auto* ms_ptr = modulate ? mod_scale->ptr<float>() + ms_base : nullptr;
+        const auto* mt_ptr = modulate ? mod_shift->ptr<float>() + mt_base : nullptr;
+        const auto* mg_ptr = mod_gate ? mod_gate_v->ptr<float>() + mg_base : nullptr;
+
         for (int64_t i = 0; i < norm_size; ++i) {
             const int64_t xi = x_base + x_inner[static_cast<size_t>(i)];
             const int64_t yi = y_base + y_inner[static_cast<size_t>(i)];
-            float s = scale_is_scalar ? s_ptr[0] : s_ptr[i];
-            if (attrs.one_plus_weight) { s += 1.0f; }
+            float s = has_scale ? (scale_is_scalar ? s_ptr[0] : s_ptr[i]) : 1.0f;
+            if (has_scale && attrs.one_plus_weight) { s += 1.0f; }
             float val = x_ptr[xi] * inv_rms * s;
             if (gated) {
                 val *= ref_gate_act(
                     attrs.gate_activation,
                     g_ptr[g_base + g_inner[static_cast<size_t>(i)]]);
+            }
+            if (modulate) {
+                val = val * (ms_ptr[i] + mod_offset) + mt_ptr[i];
+                if (mod_gate) { val *= mg_ptr[i]; }
             }
             y_ptr[yi] = attrs.add_to ? y_ptr[yi] + val : val;
         }
@@ -278,6 +339,15 @@ void l2_norm_ref_impl(const NormAttributes& attrs,
                       const ComputeContext& ctx)
 {
     const auto& X = inputs[0];
+
+    const bool modulate = attrs.modulate;
+    const bool mod_gate = modulate && attrs.modulation_gate;
+    const int64_t n_trail = modulate ? (mod_gate ? 3 : 2) : 0;
+    const int64_t base_n = static_cast<int64_t>(inputs.size()) - n_trail;
+    const TensorView* mod_scale = modulate ? &inputs[static_cast<size_t>(base_n)] : nullptr;
+    const TensorView* mod_shift = modulate ? &inputs[static_cast<size_t>(base_n + 1)] : nullptr;
+    const TensorView* mod_gate_v = mod_gate ? &inputs[static_cast<size_t>(base_n + 2)] : nullptr;
+    const float mod_offset = attrs.modulation_scale_offset;
 
     const int64_t rank = X.rank();
     const float epsilon = attrs.epsilon;
@@ -316,10 +386,21 @@ void l2_norm_ref_impl(const NormAttributes& attrs,
         }
         float inv_norm = 1.0f / std::sqrt(sum_sq + epsilon);
 
+        const int64_t ms_base = modulate ? mod_row_base(*mod_scale, X, row, axis) : 0;
+        const int64_t mt_base = modulate ? mod_row_base(*mod_shift, X, row, axis) : 0;
+        const int64_t mg_base = mod_gate ? mod_row_base(*mod_gate_v, X, row, axis) : 0;
+        const auto* ms_ptr = modulate ? mod_scale->ptr<float>() + ms_base : nullptr;
+        const auto* mt_ptr = modulate ? mod_shift->ptr<float>() + mt_base : nullptr;
+        const auto* mg_ptr = mod_gate ? mod_gate_v->ptr<float>() + mg_base : nullptr;
+
         for (int64_t i = 0; i < norm_size; ++i) {
             const int64_t xi = x_base + x_inner[static_cast<size_t>(i)];
             const int64_t yi = y_base + y_inner[static_cast<size_t>(i)];
             float val = x_ptr[xi] * inv_norm;
+            if (modulate) {
+                val = val * (ms_ptr[i] + mod_offset) + mt_ptr[i];
+                if (mod_gate) { val *= mg_ptr[i]; }
+            }
             y_ptr[yi] = attrs.add_to ? y_ptr[yi] + val : val;
         }
     };
@@ -337,8 +418,15 @@ void group_norm_ref_impl(const NormAttributes& attrs,
                          const ComputeContext& ctx)
 {
     const auto& X = inputs[0];
-    const auto& scale = inputs[1];
-    const bool has_bias = (inputs.size() >= 3 && !inputs[2].is_empty());
+
+    const bool modulate = attrs.modulate;
+    const bool mod_gate = modulate && attrs.modulation_gate;
+    const int64_t n_trail = modulate ? (mod_gate ? 3 : 2) : 0;
+    const int64_t base_n = static_cast<int64_t>(inputs.size()) - n_trail;
+    const bool has_bias = base_n >= 3 && !inputs[2].is_empty();
+    const TensorView* mod_scale_v = modulate ? &inputs[static_cast<size_t>(base_n)] : nullptr;
+    const TensorView* mod_shift_v = modulate ? &inputs[static_cast<size_t>(base_n + 1)] : nullptr;
+    const TensorView* mod_gate_v = mod_gate ? &inputs[static_cast<size_t>(base_n + 2)] : nullptr;
 
     const int64_t rank = X.rank();
     const int64_t N = X.shape(0);
@@ -360,9 +448,20 @@ void group_norm_ref_impl(const NormAttributes& attrs,
     const float inv_norm = 1.0f / static_cast<float>(norm_size);
 
     const auto* x_ptr  = X.ptr<float>();
-    const auto* s_ptr  = scale.ptr<float>();
+    const auto* s_ptr  = inputs[1].ptr<float>();
     const auto* b_ptr  = has_bias ? inputs[2].ptr<float>() : nullptr;
     auto* y_ptr = output.ptr<float>();
+
+    const auto* ms_ptr = modulate ? mod_scale_v->ptr<float>() : nullptr;
+    const auto* mt_ptr = modulate ? mod_shift_v->ptr<float>() : nullptr;
+    const auto* mg_ptr = mod_gate ? mod_gate_v->ptr<float>() : nullptr;
+    const auto mod_n_stride = [](const TensorView* v) {
+        return (v != nullptr && v->rank() == 2 && v->shape(0) != 1) ? v->stride_elems(0) : 0;
+    };
+    const int64_t ms_n = mod_n_stride(mod_scale_v);
+    const int64_t mt_n = mod_n_stride(mod_shift_v);
+    const int64_t mg_n = mod_n_stride(mod_gate_v);
+    const float mod_offset = attrs.modulation_scale_offset;
 
     const int64_t stride_C = X.stride_elems(1);
     const int64_t stride_N = X.stride_elems(0);
@@ -416,6 +515,11 @@ void group_norm_ref_impl(const NormAttributes& attrs,
                 const int64_t xi = x_offset + c_off + x_spatial[static_cast<size_t>(sp)];
                 const int64_t yi = y_offset + yc_off + y_spatial[static_cast<size_t>(sp)];
                 float val = (x_ptr[xi] - mean_val) * inv_std * s + b;
+                if (modulate) {
+                    val = val * (ms_ptr[ms_n * n + c_global] + mod_offset) +
+                          mt_ptr[mt_n * n + c_global];
+                    if (mod_gate) { val *= mg_ptr[mg_n * n + c_global]; }
+                }
                 if (attrs.add_to) {
                     y_ptr[yi] += val;
                 } else {

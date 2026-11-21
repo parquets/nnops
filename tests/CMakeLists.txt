@@ -64,6 +64,9 @@ set(TEST_SOURCES
     test_split.cpp
     test_tile.cpp
     test_where.cpp
+    test_roi_align.cpp
+    test_nms.cpp
+    test_pixel_shuffle.cpp
 )
 
 # Reference kernels that only the tests need, as ground truth for the fast paths.
