@@ -14,6 +14,7 @@
 /// zero_point), and requantize_store rounds to nearest even through the arch
 /// `requantize_8`. `quant_kernel` resolves to the active arch's primitives.
 
+#include "nnops/core/data_type.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/simd/cpu_features.hpp"
 #include "nnops/detail/half.hpp"
