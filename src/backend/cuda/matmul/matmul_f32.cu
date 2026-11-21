@@ -377,6 +377,10 @@ struct TileDesc {
 };
 
 constexpr int kTileCount = 10;
+/// One row per index `f32_dense_call` dispatches: there is no Tile5, index 6
+/// and index 9 both land on Tile9 (the switch's default), and the table has to
+/// say so — a named row is the only thing that reads it, and a missing row is a
+/// zero descriptor the grid gate would divide by.
 constexpr TileDesc kTileTable[kTileCount] = {
     {Tile0::BM, Tile0::BN, Tile0::BK, Tile0::threads, Tile0::kSmemBytes},
     {Tile1::BM, Tile1::BN, Tile1::BK, Tile1::threads, Tile1::kSmemBytes},
@@ -384,6 +388,7 @@ constexpr TileDesc kTileTable[kTileCount] = {
     {Tile3::BM, Tile3::BN, Tile3::BK, Tile3::threads, Tile3::kSmemBytes},
     {Tile4::BM, Tile4::BN, Tile4::BK, Tile4::threads, Tile4::kSmemBytes},
     {Tile6::BM, Tile6::BN, Tile6::BK, Tile6::threads, Tile6::kSmemBytes},
+    {Tile9::BM, Tile9::BN, Tile9::BK, Tile9::threads, Tile9::kSmemBytes},
     {Tile7::BM, Tile7::BN, Tile7::BK, Tile7::threads, Tile7::kSmemBytes},
     {Tile8::BM, Tile8::BN, Tile8::BK, Tile8::threads, Tile8::kSmemBytes},
     {Tile9::BM, Tile9::BN, Tile9::BK, Tile9::threads, Tile9::kSmemBytes},
@@ -681,6 +686,15 @@ bool f32_dense_call(const F32Call& call_in, cudaStream_t stream, bool force)
         // three-block 64x128 tile and the four-warp 128x128 one. Deeper cp.async
         // rings (three stages on 128x128, four on 64x128) both lost -- the ring
         // is not what limits this kernel now.
+        // A short reduction never amortises a 128-wide tile's fill and
+        // epilogue, and the 64x64 four-block tile is the row that does: it wins
+        // from 128^3 up through 1024^3 in both poses, where the last is a tie
+        // (256^3 1.66 against 0.80 TFLOPS, 512^3 5.39 against 3.95, a short-K
+        // 50176x256 product 7.95 against 6.54), so it takes the call before the
+        // block-count regimes.
+        if (call.k <= 1024) {
+            return f32_run<Tile9>(call, stream);
+        }
         if (blocks < 32) {
             return f32_run<Tile2>(call, stream);
         }

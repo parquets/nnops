@@ -164,12 +164,8 @@ inline F32Call make_f32_call(const GemmParams& p, bool trans_a, bool trans_b)
 /// fill gate bypassed. The last step is what makes every pose reachable: a
 /// shape the gate declines still runs, just at the rate its grid allows.
 ///
-/// `tile` names a row of the f16/f32 candidate table and skips the pose's own
-/// pick; -1 (every operator caller) leaves that pick alone. A caller that knows
-/// its shape better than the table does — Conv2D's 1x1 route, whose products are
-/// short-K and narrow-N — is what the argument is for.
 inline Status dense_gemm_status(const GemmParams& p, DataType dtype, bool transpose_a,
-                                bool transpose_b, cudaStream_t stream, int tile = -1)
+                                bool transpose_b, cudaStream_t stream)
 {
     const GemmElem elem = dtype == DataType::f32  ? GemmElem::F32 :
                           dtype == DataType::f16  ? GemmElem::F16 :
@@ -193,17 +189,12 @@ inline Status dense_gemm_status(const GemmParams& p, DataType dtype, bool transp
 
     // The tiled kernel, while its grid fills the machine.
     if (dtype == DataType::f32) {
-        F32Call call = make_f32_call(p, transpose_a, transpose_b);
-        call.tile = tile;
-        if (f32_dense_call(call, stream)) {
+        if (f32_dense_call(make_f32_call(p, transpose_a, transpose_b), stream)) {
             return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
         }
-    } else {
-        F16Call call = make_f16_call(p, transpose_a, transpose_b, dtype == DataType::bf16);
-        call.tile = tile;
-        if (f16_dense_call(call, stream)) {
-            return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
-        }
+    } else if (f16_dense_call(
+                   make_f16_call(p, transpose_a, transpose_b, dtype == DataType::bf16), stream)) {
+        return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
     }
 
     // A product of at most sixteen rows is a bandwidth problem; the narrow-m
@@ -226,17 +217,13 @@ inline Status dense_gemm_status(const GemmParams& p, DataType dtype, bool transp
 
     // The tiled kernel again, with the fill gate bypassed.
     if (dtype == DataType::f32) {
-        F32Call call = make_f32_call(p, transpose_a, transpose_b);
-        call.tile = tile;
-        if (f32_dense_call(call, stream, true)) {
+        if (f32_dense_call(make_f32_call(p, transpose_a, transpose_b), stream, true)) {
             return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
         }
-    } else {
-        F16Call call = make_f16_call(p, transpose_a, transpose_b, dtype == DataType::bf16);
-        call.tile = tile;
-        if (f16_dense_call(call, stream, true)) {
-            return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
-        }
+    } else if (f16_dense_call(
+                   make_f16_call(p, transpose_a, transpose_b, dtype == DataType::bf16), stream,
+                   true)) {
+        return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
     }
     return Status::unsupported;
 }

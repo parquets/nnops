@@ -36,15 +36,17 @@ bool f16_dense_call(const F16Call& call_in, cudaStream_t stream, bool force)
                    : 0;
 
     // An explicit tile skips the gate -- that is how a sweep reaches every
-    // shape -- but it does not pick one: an unnamed tile still means the
-    // default row.
+    // shape -- but it does not pick one: an unnamed tile still means the row
+    // below.
     const bool named = call.tile >= 0 && call.tile < kTileCount;
     const bool forced = named || force;
-    // The k-major pose wants the epilogue that writes straight out of the
-    // accumulators: 4096^3 4.38 against 5.00 ms for the staged one. The n-major
-    // pose is the other way round (3.96 against 4.05), so the pose picks.
-    const int pick = (!call.trans_b) ? kDefaultTile : 4;
-    const int tile = named ? call.tile : pick;
+    // The shallow 32x32 row, in both B poses. The rest of the table was ranked
+    // on square products with a deep reduction, and on the shapes an operator
+    // actually poses it loses from 512^3 down -- 512^3 4.2 against 12.6, 1024^3
+    // 17.2 against 24.6 -- and by 3.5x on a short-K n-major product
+    // (50176x256x256: 5.7 against 20.1 TFLOPS). Only 4096^3 with B k-major puts
+    // another row first, by 1.2%, which is inside this host's run-to-run spread.
+    const int tile = named ? call.tile : kF16TileShallow;
     if (!forced && !f16_grid_fills(call, kTileTable[tile])) {
         return false;
     }

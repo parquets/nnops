@@ -426,7 +426,11 @@ constexpr TileDesc kTileTable[kTileCount] = {
     {Tile5::BM, Tile5::BN, Tile5::BK, Tile5::threads, Tile5::kSmemBytes},
 };
 
-constexpr int kDefaultTile = 0;
+/// The shallow-grid row: a 32x32 warp tile on four warps, which lives four
+/// blocks to an SM instead of two. It is the row a short-K product wants — the
+/// 128x128 tiles spend a three-stage prologue on a k loop that only has a few
+/// steps to amortise it — and it is what `f16_dense_call` picks for both poses.
+constexpr int kF16TileShallow = 5;
 
 /// Queried once per process; 0 when unavailable.
 inline int f16_sm_count()
