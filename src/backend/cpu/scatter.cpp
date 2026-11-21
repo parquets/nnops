@@ -13,6 +13,9 @@
 #include "common/dtype_dispatch.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
+#include <algorithm>
+#include <cstring>
+
 #include <cstdint>
 #include <type_traits>
 #include <utility>
@@ -37,9 +40,39 @@ template <typename T> inline void apply_reduction(T* dst, const T* src, ScatterR
     }
 }
 
+/// True when axes [from_dim, rank) are one physically contiguous run.
+inline bool tail_dense(const TensorView& v, int64_t from_dim)
+{
+    int64_t want = 1;
+    for (int64_t d = v.rank() - 1; d >= from_dim; --d) {
+        if (v.shape(d) != 1 && v.stride_elems(d) != want) {
+            return false;
+        }
+        want *= v.shape(d);
+    }
+    return true;
+}
+
 template <typename T>
 void copy_logical(const TensorView& src, TensorView& dst, const ComputeContext& ctx)
 {
+    // The output starts as a copy of `data`, and both are usually plain dense
+    // tensors: that is one memcpy, not a per-element stride walk. It is split
+    // across the pool — a KV-cache scatter first copies the whole cache.
+    if (shared_dense_tail(src, dst).run == src.numel()) {
+        constexpr int64_t kChunk = int64_t{1} << 16;
+        const int64_t total = src.numel();
+        const int64_t chunks = (total + kChunk - 1) / kChunk;
+        const T* sp = src.ptr<T>();
+        T* dp = dst.ptr<T>();
+        ctx.cpu.run(0, chunks, [&](int64_t c) {
+            const int64_t off = c * kChunk;
+            const int64_t n = std::min(kChunk, total - off);
+            std::memcpy(dp + off, sp + off, static_cast<size_t>(n) * sizeof(T));
+        });
+        return;
+    }
+
     int64_t dims[8], sstr[8], dstr[8];
     for (int64_t d = 0; d < src.rank(); ++d) {
         dims[d] = src.shape(d);
@@ -199,11 +232,18 @@ void scatter_nd_impl(const ScatterNDAttributes& attrs, TensorView& output, const
     const T* uptr = updates.ptr<T>();
     T* optr = output.ptr<T>();
 
+    // A plain scatter writes whole contiguous slices, so the inner block moves
+    // as one copy (a KV-cache row write); a reduction still visits elements.
+    const int64_t tuple_rank = qr - 1;
+    const bool copy_inner = (attrs.reduction == ScatterReduction::None) &&
+                            tail_dense(data, k) && tail_dense(updates, tuple_rank) &&
+                            tail_dense(output, k) && inner > 0;
+    const size_t inner_bytes = static_cast<size_t>(inner) * sizeof(T);
+
     int64_t dims[8];
     for (int64_t d = 0; d < qr - 1; ++d) {
         dims[d] = indices.shape(d);
     }
-    const int64_t tuple_rank = qr - 1;
 
     int64_t idx[8] = {};
     int64_t base = 0;
@@ -218,20 +258,24 @@ void scatter_nd_impl(const ScatterNDAttributes& attrs, TensorView& output, const
         }
         const int64_t us = flat_offset(idx, inner_ustr, tuple_rank);
 
-        int64_t inner_idx[8] = {};
-        int64_t io = 0, uo = 0;
-        for (int64_t m = 0; m < inner; ++m) {
-            apply_reduction(&optr[ds + io], &uptr[us + uo], attrs.reduction);
-            for (int64_t d = inner_rank - 1; d >= 0; --d) {
-                ++inner_idx[d];
-                io += inner_dstr[d];
-                uo += inner_ustr[tuple_rank + d];
-                if (inner_idx[d] < trailing_dims[d]) {
-                    break;
+        if (copy_inner) {
+            std::memcpy(optr + ds, uptr + us, inner_bytes);
+        } else {
+            int64_t inner_idx[8] = {};
+            int64_t io = 0, uo = 0;
+            for (int64_t m = 0; m < inner; ++m) {
+                apply_reduction(&optr[ds + io], &uptr[us + uo], attrs.reduction);
+                for (int64_t d = inner_rank - 1; d >= 0; --d) {
+                    ++inner_idx[d];
+                    io += inner_dstr[d];
+                    uo += inner_ustr[tuple_rank + d];
+                    if (inner_idx[d] < trailing_dims[d]) {
+                        break;
+                    }
+                    inner_idx[d] = 0;
+                    io -= inner_dstr[d] * trailing_dims[d];
+                    uo -= inner_ustr[tuple_rank + d] * trailing_dims[d];
                 }
-                inner_idx[d] = 0;
-                io -= inner_dstr[d] * trailing_dims[d];
-                uo -= inner_ustr[tuple_rank + d] * trailing_dims[d];
             }
         }
 

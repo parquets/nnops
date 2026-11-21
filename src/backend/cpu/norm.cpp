@@ -356,12 +356,28 @@ void batch_norm_impl(const NormAttributes& attrs, TensorView& output,
         const int64_t x_rs = X.row_stride_elems();
         const int64_t y_rs = output.row_stride_elems();
 
+        // A pixel is C contiguous channels, so the per-channel factors are one
+        // vector load each and the whole pixel normalizes 8 lanes at a time.
+        // The math stays f32 for every storage dtype (v_load_f32 widens, and
+        // rounds once on the store), as the scalar form did.
         const auto process_row = [&](int64_t r) {
             const T* xr = x_ptr + r * x_rs;
             T* yr = y_ptr + r * y_rs;
             for (int64_t p = 0; p < pixels; ++p) {
-                for (int64_t c = 0; c < C; ++c) {
-                    const int64_t idx = p * C + c;
+                const int64_t base = p * C;
+                int64_t c = 0;
+                for (; c + 8 <= C; c += 8) {
+                    const auto ns = v_load(ns_f.data() + c);
+                    const auto nb = v_load(nb_f.data() + c);
+                    const auto rv = v_add(v_mul(simd::v_load_f32(xr + base + c), ns), nb);
+                    if (attrs.add_to) {
+                        v_store_f32(yr + base + c, v_add(simd::v_load_f32(yr + base + c), rv));
+                    } else {
+                        v_store_f32(yr + base + c, rv);
+                    }
+                }
+                for (; c < C; ++c) {
+                    const int64_t idx = base + c;
                     const float v = s_load(&xr[idx]) * ns_f[static_cast<size_t>(c)] +
                                     nb_f[static_cast<size_t>(c)];
                     s_store_add(&yr[idx], v, attrs.add_to);

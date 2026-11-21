@@ -17,6 +17,7 @@
 #include "simd_kernel/simd_resize.hpp"
 #include "common/dtype_dispatch.hpp"
 
+#include <algorithm>
 #include <vector>
 
 namespace nnops::backend::cpu {
@@ -149,26 +150,42 @@ void resize_impl(const ResizeAttributes& attrs, TensorView& output,
     const int64_t in_n_stride = input.stride_elems(0);
     const int64_t out_n_stride = output.stride_elems(0);
 
-    const auto process = [&](int64_t n) {
+    // One task per output plane (2D) or output row block: every output row is
+    // independent, so a single-image resize — the usual case — still fills the
+    // pool. The tables are indexed by the absolute row, so a slice is handed the
+    // matching sub-table and a row-offset destination.
+    constexpr int64_t kRowsPerTask = 16;
+    const int64_t planes = (srank == 3) ? OD : OH;
+    const int64_t rows_per_task = std::max<int64_t>(1, std::min(kRowsPerTask, planes));
+    const int64_t plane_tiles = (planes + rows_per_task - 1) / rows_per_task;
+
+    const auto process = [&](int64_t task) {
+        const int64_t n = task / plane_tiles;
+        const int64_t p0 = (task % plane_tiles) * rows_per_task;
+        const int64_t pn = std::min(rows_per_task, planes - p0);
+
         const T* in_base = in_ptr + n * in_n_stride + crop_off;
         T* out_base = out_ptr + n * out_n_stride;
 
         if (cubic) {
-            k::resize_2d_cubic<T>(out_base, in_base, C, OH, OW, ky.taps.data(),
-                                       kx.taps.data(), in_row_stride, out_row_stride, add_to);
+            k::resize_2d_cubic<T>(out_base + p0 * out_row_stride, in_base, C, pn, OW,
+                                  ky.taps.data() + p0, kx.taps.data(), in_row_stride,
+                                  out_row_stride, add_to);
         } else if (srank == 3) {
-            k::resize_3d<T>(out_base, in_base, C, OD, OH, OW, cz.i0.data(), cz.i1.data(),
-                                 cz.w.data(), cy.i0.data(), cy.i1.data(), cy.w.data(),
-                                 cx.i0.data(), cx.i1.data(), cx.w.data(), in_d_stride,
-                                 in_row_stride, out_d_stride, out_row_stride, linear, add_to);
+            k::resize_3d<T>(out_base + p0 * out_d_stride, in_base, C, pn, OH, OW,
+                            cz.i0.data() + p0, cz.i1.data() + p0, cz.w.data() + p0, cy.i0.data(),
+                            cy.i1.data(), cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
+                            in_d_stride, in_row_stride, out_d_stride, out_row_stride, linear,
+                            add_to);
         } else {
-            k::resize_2d<T>(out_base, in_base, C, OH, OW, cy.i0.data(), cy.i1.data(),
-                                 cy.w.data(), cx.i0.data(), cx.i1.data(), cx.w.data(),
-                                 in_row_stride, out_row_stride, linear, add_to);
+            k::resize_2d<T>(out_base + p0 * out_row_stride, in_base, C, pn, OW,
+                            cy.i0.data() + p0, cy.i1.data() + p0, cy.w.data() + p0, cx.i0.data(),
+                            cx.i1.data(), cx.w.data(), in_row_stride, out_row_stride, linear,
+                            add_to);
         }
     };
 
-    ctx.cpu.run(0, N, process);
+    ctx.cpu.run(0, N * plane_tiles, process);
 }
 
 Status resize_cpu(const ResizeAttributes& attrs, TensorView& output,

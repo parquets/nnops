@@ -12,10 +12,12 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/core/compute_context.hpp"
+#include "common/strided_walk.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include <vector>
@@ -108,29 +110,43 @@ void pad_impl(const PadAttributes& attrs, TensorView& output, std::span<const Te
     const T* src = input.ptr<T>();
     T* dst = output.ptr<T>();
 
-    constexpr int64_t kChunk = 1 << 16;
-    const int64_t chunks = (numel + kChunk - 1) / kChunk;
+    // A run is the trailing set of axes whose output extent equals the input's
+    // and which are contiguous on both sides — with no padding there the axis
+    // map is the identity, so the run is one copy source and one fill unit.
+    // A row that lands entirely in the pad is then one fill instead of a
+    // per-element branch.
+    const DenseTail tail = shared_dense_tail(input, output);
+    const int64_t run = tail.run;
+    const int64_t odim_end = tail.from_dim;
+    const int64_t steps = (run > 0) ? numel / run : 0;
+    if (steps <= 0) {
+        return;
+    }
+    const size_t run_bytes = static_cast<size_t>(run) * sizeof(T);
 
-    ctx.cpu.run(0, chunks, [&](int64_t ci) {
-        const int64_t begin = ci * kChunk;
-        const int64_t end = std::min(begin + kChunk, numel);
+    const int64_t steps_per_task = std::max<int64_t>(1, std::min<int64_t>(256, (int64_t{1} << 16) / run));
+    const int64_t tasks = (steps + steps_per_task - 1) / steps_per_task;
+
+    ctx.cpu.run(0, tasks, [&](int64_t ci) {
+        const int64_t begin = ci * steps_per_task;
+        const int64_t end = std::min(begin + steps_per_task, steps);
 
         int64_t idx[8] = {};
         int64_t rem = begin;
-        for (int64_t d = rank - 1; d >= 0; --d) {
+        for (int64_t d = odim_end - 1; d >= 0; --d) {
             idx[d] = (odims[d] > 0) ? rem % odims[d] : 0;
             rem = (odims[d] > 0) ? rem / odims[d] : 0;
         }
 
         int64_t oo = 0;
-        for (int64_t d = 0; d < rank; ++d) {
+        for (int64_t d = 0; d < odim_end; ++d) {
             oo += idx[d] * ostr[d];
         }
 
         for (int64_t n = begin; n < end; ++n) {
             int64_t so = 0;
             bool padded = false;
-            for (int64_t d = 0; d < rank; ++d) {
+            for (int64_t d = 0; d < odim_end; ++d) {
                 const int64_t si = maps[static_cast<size_t>(map_off[d] + idx[d])];
                 if (si < 0) {
                     padded = true;
@@ -138,9 +154,13 @@ void pad_impl(const PadAttributes& attrs, TensorView& output, std::span<const Te
                 }
                 so += si * istr[d];
             }
-            dst[oo] = padded ? cval : src[so];
+            if (padded) {
+                std::fill_n(dst + oo, static_cast<size_t>(run), cval);
+            } else {
+                std::memcpy(dst + oo, src + so, run_bytes);
+            }
 
-            for (int64_t d = rank - 1; d >= 0; --d) {
+            for (int64_t d = odim_end - 1; d >= 0; --d) {
                 ++idx[d];
                 oo += ostr[d];
                 if (idx[d] < odims[d]) {

@@ -67,6 +67,7 @@ set(TEST_SOURCES
     test_roi_align.cpp
     test_nms.cpp
     test_pixel_shuffle.cpp
+    test_parallel_paths.cpp
 )
 
 # Reference kernels that only the tests need, as ground truth for the fast paths.
@@ -190,6 +191,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_norm.cpp
         bench_linear_attention.cpp
         bench_cast.cpp
+        bench_aux_ops.cpp
     )
 
     if(NNOPS_BUILD_CUDA)

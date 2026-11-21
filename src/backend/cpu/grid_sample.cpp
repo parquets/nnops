@@ -3,15 +3,17 @@
 ///
 /// The image tensor is NHWC/NDHWC; the grid is always dense f32
 /// ([N, (OD,) OH, OW, 2|3]), because its last axis is a coordinate pair/triple,
-/// not a channel. The dispatch is one task per n and keeps the SIMD lane on C,
-/// so a pixel interpolates all its channels at once. The grid coordinate is per
-/// output position, so zeros padding is all-or-nothing across the channel
-/// vector.
+/// not a channel. The dispatch is one task per output row block and keeps the
+/// SIMD lane on C, so a pixel interpolates all its channels at once. The grid
+/// coordinate is per output position, so zeros padding is all-or-nothing across
+/// the channel vector.
 
 #include "nnops/ops/grid_sample.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "simd_kernel/simd_grid_sample.hpp"
 #include "common/dtype_dispatch.hpp"
+
+#include <algorithm>
 
 namespace nnops::backend::cpu {
 
@@ -63,36 +65,53 @@ void grid_sample_impl(const GridSampleAttributes& attrs, TensorView& output,
     const int64_t in_n_stride = input.stride_elems(0);
     const int64_t out_n_stride = output.stride_elems(0);
 
-    const auto process = [&](int64_t n) {
+    // One task per output plane (3D) or output row block, not per image: every
+    // output row is independent, and a single-image grid (the usual case) would
+    // otherwise run the whole sampling loop on one thread. The kernel reads the
+    // grid at the row's absolute offset, so a slice takes the matching sub-grid.
+    constexpr int64_t kRowsPerTask = 16;
+    const int64_t planes = (srank == 3) ? OD : OH;
+    const int64_t rows_per_task = std::max<int64_t>(1, std::min(kRowsPerTask, planes));
+    const int64_t plane_tiles = (planes + rows_per_task - 1) / rows_per_task;
+
+    const auto process = [&](int64_t task) {
+        const int64_t n = task / plane_tiles;
+        const int64_t p0 = (task % plane_tiles) * rows_per_task;
+        const int64_t pn = std::min(rows_per_task, planes - p0);
+
         const T* in_base = in_ptr + n * in_n_stride;
         T* out_base = out_ptr + n * out_n_stride;
         const float* grid_n = grid_ptr + n * grid_n_stride;
 
         if (srank == 3) {
+            T* out_d = out_base + p0 * out_d_stride;
+            const float* grid_d = grid_n + p0 * OH * grid_row_stride;
             if (nearest) {
-                k::gridsample_nearest_last_3d<T>(out_base, in_base, grid_n, C, ID, IH, IW, OD, OH,
+                k::gridsample_nearest_last_3d<T>(out_d, in_base, grid_d, C, ID, IH, IW, pn, OH,
                                                  OW, in_d_stride, in_row_stride, out_d_stride,
                                                  out_row_stride, grid_row_stride, align,
                                                  padding_mode, add_to);
             } else {
-                k::gridsample_last_3d<T>(out_base, in_base, grid_n, C, ID, IH, IW, OD, OH, OW,
+                k::gridsample_last_3d<T>(out_d, in_base, grid_d, C, ID, IH, IW, pn, OH, OW,
                                          in_d_stride, in_row_stride, out_d_stride, out_row_stride,
                                          grid_row_stride, align, padding_mode, add_to);
             }
         } else {
+            T* out_row = out_base + p0 * out_row_stride;
+            const float* grid_row = grid_n + p0 * grid_row_stride;
             if (nearest) {
-                k::gridsample_nearest_last_2d<T>(out_base, in_base, grid_n, C, IH, IW, OH, OW,
+                k::gridsample_nearest_last_2d<T>(out_row, in_base, grid_row, C, IH, IW, pn, OW,
                                                  in_row_stride, out_row_stride, grid_row_stride,
                                                  align, padding_mode, add_to);
             } else {
-                k::gridsample_last_2d<T>(out_base, in_base, grid_n, C, IH, IW, OH, OW,
+                k::gridsample_last_2d<T>(out_row, in_base, grid_row, C, IH, IW, pn, OW,
                                          in_row_stride, out_row_stride, grid_row_stride, align,
                                          padding_mode, add_to);
             }
         }
     };
 
-    ctx.cpu.run(0, N, process);
+    ctx.cpu.run(0, N * plane_tiles, process);
 }
 
 Status grid_sample_cpu(const GridSampleAttributes& attrs, TensorView& output,

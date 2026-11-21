@@ -21,7 +21,7 @@ using detail::axis_group_offset;
 
 template <typename T>
 void argminmax_impl(const ArgMinMaxAttributes& attrs, TensorView& output,
-                    std::span<const TensorView> inputs)
+                    std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& in = inputs[0];
     const int64_t rank = in.rank();
@@ -36,36 +36,37 @@ void argminmax_impl(const ArgMinMaxAttributes& attrs, TensorView& output,
     const auto* i_ptr = in.ptr<T>();
     auto* o_ptr = output.ptr<int64_t>();
 
-    for (int64_t outer = 0; outer < w.outer; ++outer) {
-        const int64_t i_base = axis_group_offset(outer, w.pre);
-        const int64_t o_base = axis_group_offset(outer, w.out_pre);
-        for (int64_t inner = 0; inner < w.inner; ++inner) {
-            const int64_t base = i_base + axis_group_offset(inner, w.post);
+    // One task per (outer, inner) position: an arg-max over the channel axis of
+    // a feature map has inner == 1 and one position per pixel, which used to run
+    // on a single thread.
+    ctx.cpu.run(0, w.outer * w.inner, [&](int64_t t) {
+        const int64_t outer = t / w.inner;
+        const int64_t inner = t % w.inner;
+        const int64_t base = axis_group_offset(outer, w.pre) + axis_group_offset(inner, w.post);
 
-            int64_t best_idx = 0;
-            float best_val = s_load(i_ptr + base);
+        int64_t best_idx = 0;
+        float best_val = s_load(i_ptr + base);
 
-            for (int64_t k = 1; k < w.axis_dim; ++k) {
-                float val = s_load(i_ptr + base + k * w.axis_stride);
-                bool better = is_max ? (val > best_val) : (val < best_val);
-                if (better) {
-                    best_val = val;
-                    best_idx = k;
-                }
+        for (int64_t k = 1; k < w.axis_dim; ++k) {
+            float val = s_load(i_ptr + base + k * w.axis_stride);
+            if (is_max ? (val > best_val) : (val < best_val)) {
+                best_val = val;
+                best_idx = k;
             }
-
-            o_ptr[o_base + axis_group_offset(inner, w.out_post)] = best_idx;
         }
-    }
+
+        o_ptr[axis_group_offset(outer, w.out_pre) + axis_group_offset(inner, w.out_post)] =
+            best_idx;
+    });
 }
 
 Status argmax_cpu(const ArgMinMaxAttributes& attrs, TensorView& output,
-                  std::span<const TensorView> inputs, const ComputeContext& /*ctx*/,
+                  std::span<const TensorView> inputs, const ComputeContext& ctx,
                   void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "argmax_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
-        argminmax_impl<T>(attrs, output, inputs);
+        argminmax_impl<T>(attrs, output, inputs, ctx);
     });
     return Status::ok;
 }

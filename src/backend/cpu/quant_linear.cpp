@@ -32,6 +32,7 @@
 #error "quant_linear: unsupported architecture"
 #endif
 
+#include <algorithm>
 #include <cstdint>
 #include <type_traits>
 #include <vector>
@@ -136,21 +137,38 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs, TensorView& output
         src_ptr = X.ptr<float>();
     }
 
+    // The arch kernels are single-call; the pool splits the work by elements
+    // (per-tensor: one long row), by rows (per-token) or by outer group
+    // (per-channel), so a boundary QDQ pass is no longer one core's job.
+    constexpr int64_t kElemsPerTask = int64_t{1} << 16;
+
     const auto run = [&](auto u_tag) {
         using U = typename decltype(u_tag)::type;
         U* dst = static_cast<U*>(output.ptr<void>());
 
         if (g == QuantGranularity::PerTensor) {
-            quant_kernel::quantization<U>(1, static_cast<int>(numel), dst, static_cast<int>(numel),
-                                          src_ptr, static_cast<int>(numel), s_f32.data(),
-                                          z_f32.data());
+            const int64_t chunks = (numel + kElemsPerTask - 1) / kElemsPerTask;
+            ctx.cpu.run(0, chunks, [&](int64_t c) {
+                const int64_t off = c * kElemsPerTask;
+                const int n = static_cast<int>(std::min<int64_t>(kElemsPerTask, numel - off));
+                quant_kernel::quantization<U>(1, n, dst + off, n, src_ptr + off, n, s_f32.data(),
+                                              z_f32.data());
+            });
             return;
         }
 
         if (g == QuantGranularity::PerToken) {
-            quant_kernel::quantization<U>(static_cast<int>(M), static_cast<int>(N), dst,
-                                          static_cast<int>(N), src_ptr, static_cast<int>(N),
-                                          s_f32.data(), z_f32.data());
+            const int64_t rows_per_task =
+                std::max<int64_t>(1, std::min<int64_t>(64, kElemsPerTask / std::max<int64_t>(1, N)));
+            const int64_t tasks = (M + rows_per_task - 1) / rows_per_task;
+            ctx.cpu.run(0, tasks, [&](int64_t t) {
+                const int64_t r0 = t * rows_per_task;
+                const int64_t rn = std::min(rows_per_task, M - r0);
+                quant_kernel::quantization<U>(static_cast<int>(rn), static_cast<int>(N),
+                                              dst + r0 * N, static_cast<int>(N), src_ptr + r0 * N,
+                                              static_cast<int>(N), s_f32.data() + r0,
+                                              z_f32.data() + r0);
+            });
             return;
         }
 
@@ -231,21 +249,35 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs, TensorView& outp
         dst_f32 = output.ptr<float>();
     }
 
+    constexpr int64_t kElemsPerTask = int64_t{1} << 16;
+
     const auto run = [&](auto u_tag) {
         using U = typename decltype(u_tag)::type;
         const U* src = static_cast<const U*>(X.ptr<void>());
 
         if (g == QuantGranularity::PerTensor) {
-            quant_kernel::dequantization<U>(1, static_cast<int>(numel), dst_f32,
-                                            static_cast<int>(numel), src, static_cast<int>(numel),
-                                            s_f32.data(), z_f32.data());
+            const int64_t chunks = (numel + kElemsPerTask - 1) / kElemsPerTask;
+            ctx.cpu.run(0, chunks, [&](int64_t c) {
+                const int64_t off = c * kElemsPerTask;
+                const int n = static_cast<int>(std::min<int64_t>(kElemsPerTask, numel - off));
+                quant_kernel::dequantization<U>(1, n, dst_f32 + off, n, src + off, n,
+                                                s_f32.data(), z_f32.data());
+            });
             return;
         }
 
         if (g == QuantGranularity::PerToken) {
-            quant_kernel::dequantization<U>(static_cast<int>(M), static_cast<int>(N), dst_f32,
-                                            static_cast<int>(N), src, static_cast<int>(N),
-                                            s_f32.data(), z_f32.data());
+            const int64_t rows_per_task =
+                std::max<int64_t>(1, std::min<int64_t>(64, kElemsPerTask / std::max<int64_t>(1, N)));
+            const int64_t tasks = (M + rows_per_task - 1) / rows_per_task;
+            ctx.cpu.run(0, tasks, [&](int64_t t) {
+                const int64_t r0 = t * rows_per_task;
+                const int64_t rn = std::min(rows_per_task, M - r0);
+                quant_kernel::dequantization<U>(static_cast<int>(rn), static_cast<int>(N),
+                                                dst_f32 + r0 * N, static_cast<int>(N),
+                                                src + r0 * N, static_cast<int>(N),
+                                                s_f32.data() + r0, z_f32.data() + r0);
+            });
             return;
         }
 

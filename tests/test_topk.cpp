@@ -11,9 +11,11 @@
 #include "common/compare.hpp"
 #include "common/test_helpers.hpp"
 
-#include <vector>
 #include <algorithm>
 #include <cstring>
+#include <memory>
+#include <thread>
+#include <vector>
 
 using namespace nnops;
 
@@ -567,6 +569,117 @@ NNOPS_TEST(topk_class_api) {
     NNOPS_EXPECT_EQ(idx_buf[1], 4);
     NNOPS_EXPECT_NEAR(val_buf[2], 4.0f, 1e-6f);
     NNOPS_EXPECT_EQ(idx_buf[2], 2);
+}
+
+// ============================================================
+// The axis-split route: fewer outer positions than workers
+// ============================================================
+
+/// A tiny thread pool: split [begin, end) over the calling thread plus three,
+/// which is what makes the axis split (a single long row) reachable in a test.
+static ComputeContext make_parallel_context(int nthreads) {
+    ComputeContext ctx;
+    auto slots = std::make_shared<int>(nthreads);
+    ctx.cpu.num_threads = [slots]() { return *slots; };
+    ctx.cpu.parallel_for = [slots](int64_t begin, int64_t end, const ParallelForBody& body) {
+        const int nt = *slots;
+        const int64_t n = end - begin;
+        if (n <= 1 || nt <= 1) {
+            for (int64_t i = begin; i < end; ++i) {
+                body(i);
+            }
+            return;
+        }
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nt - 1));
+        const int64_t per = (n + nt - 1) / nt;
+        for (int t = 1; t < nt; ++t) {
+            const int64_t lo = begin + t * per;
+            const int64_t hi = std::min(lo + per, end);
+            if (lo >= hi) {
+                break;
+            }
+            workers.emplace_back([&body, lo, hi] {
+                for (int64_t i = lo; i < hi; ++i) {
+                    body(i);
+                }
+            });
+        }
+        const int64_t hi0 = std::min(begin + per, end);
+        for (int64_t i = begin; i < hi0; ++i) {
+            body(i);
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+    };
+    return ctx;
+}
+
+NNOPS_TEST(topk_axis_split_matches_serial) {
+    constexpr int64_t V = 20000;
+    constexpr int64_t K = 7;
+    std::vector<float> data(static_cast<size_t>(V));
+    uint32_t seed = 12345u;
+    for (int64_t i = 0; i < V; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        data[static_cast<size_t>(i)] =
+            static_cast<float>(seed >> 8) * 1e-6f - 2.0f; // distinct values
+    }
+
+    const int64_t shape[] = {V};
+    TensorView in(shape, DataType::f32, data.data());
+
+    TopKAttributes attrs;
+    attrs.type = TopKType::Max;
+    attrs.axis = 0;
+    attrs.k = K;
+    attrs.sorted = true;
+    auto op = TopK::create(attrs, Backend::CPU);
+
+    auto d_in = in.desc();
+    const TensorDesc desc_arr[] = {d_in};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    std::vector<float> v_serial(static_cast<size_t>(K));
+    std::vector<int64_t> i_serial(static_cast<size_t>(K));
+    std::vector<float> v_par(static_cast<size_t>(K));
+    std::vector<int64_t> i_par(static_cast<size_t>(K));
+
+    {
+        auto vo = test::make_channel_first(descs[0], v_serial.data());
+        auto io = test::make_channel_first(descs[1], i_serial.data());
+        TensorView outs[] = {vo, io};
+        const TensorView ins[] = {in};
+        op->compute(outs, ins);
+    }
+    {
+        auto vo = test::make_channel_first(descs[0], v_par.data());
+        auto io = test::make_channel_first(descs[1], i_par.data());
+        TensorView outs[] = {vo, io};
+        const TensorView ins[] = {in};
+        op->compute(outs, ins, make_parallel_context(4));
+    }
+
+    for (int64_t j = 0; j < K; ++j) {
+        NNOPS_EXPECT_NEAR(v_par[static_cast<size_t>(j)], v_serial[static_cast<size_t>(j)], 1e-6f);
+        NNOPS_EXPECT_EQ(i_par[static_cast<size_t>(j)], i_serial[static_cast<size_t>(j)]);
+    }
+
+    // ... and the split answer is the brute-force one.
+    std::vector<int64_t> order(static_cast<size_t>(V));
+    for (int64_t i = 0; i < V; ++i) {
+        order[static_cast<size_t>(i)] = i;
+    }
+    std::partial_sort(order.begin(), order.begin() + K, order.end(),
+                      [&data](int64_t a, int64_t b) {
+                          return data[static_cast<size_t>(a)] > data[static_cast<size_t>(b)];
+                      });
+    for (int64_t j = 0; j < K; ++j) {
+        NNOPS_EXPECT_EQ(i_par[static_cast<size_t>(j)], order[static_cast<size_t>(j)]);
+        NNOPS_EXPECT_NEAR(v_par[static_cast<size_t>(j)],
+                          data[static_cast<size_t>(order[static_cast<size_t>(j)])], 1e-6f);
+    }
 }
 
 NNOPS_TEST(topk_op_type) {

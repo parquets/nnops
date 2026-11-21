@@ -11,6 +11,7 @@
 #include "nnops/detail/simd/simd.hpp"
 #include "common/dtype_dispatch.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace nnops::backend::cpu {
@@ -19,7 +20,7 @@ using namespace nnops::simd;
 
 template <typename T>
 void flatten_impl(const FlattenAttributes& /*attrs*/, TensorView& output,
-                  std::span<const TensorView> inputs)
+                  std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
@@ -33,10 +34,33 @@ void flatten_impl(const FlattenAttributes& /*attrs*/, TensorView& output,
     const auto* i_ptr = input.ptr<T>();
     const int64_t i_w_stride = input.stride_elems(rank - 1);
 
-    if (input.row_stride_elems() == oW) {
-        size_t total_bytes = static_cast<size_t>(output.numel()) * sizeof(T);
-        std::memcpy(o_ptr, i_ptr, total_bytes);
-        return;
+    // Already in output order: the input's axes are the storage order with no
+    // row pitch between them, and the output's rows are unpadded too — the whole
+    // op is one memcpy. A channel-last [N,H,W,C] read as dense is this case even
+    // though its own row stride is only W*C.
+    if (output.row_stride_elems() == oW) {
+        bool compact = true;
+        int64_t want = 1;
+        for (int64_t d = rank - 1; d >= 0; --d) {
+            if (input.shape(d) != 1 && input.stride_elems(d) != want) {
+                compact = false;
+                break;
+            }
+            want *= input.shape(d);
+        }
+        if (compact) {
+            // One copy, split across the pool: a 12 MB feature map is a
+            // bandwidth-bound memcpy and one core reaches a fraction of it.
+            constexpr int64_t kChunk = int64_t{1} << 16;
+            const int64_t total = output.numel();
+            const int64_t chunks = (total + kChunk - 1) / kChunk;
+            ctx.cpu.run(0, chunks, [&](int64_t c) {
+                const int64_t off = c * kChunk;
+                const int64_t n = std::min(kChunk, total - off);
+                std::memcpy(o_ptr + off, i_ptr + off, static_cast<size_t>(n) * sizeof(T));
+            });
+            return;
+        }
     }
 
     int64_t num_logical_rows = 1;
@@ -81,12 +105,12 @@ void flatten_impl(const FlattenAttributes& /*attrs*/, TensorView& output,
 }
 
 Status flatten_cpu(const FlattenAttributes& attrs, TensorView& output,
-                   std::span<const TensorView> inputs, const ComputeContext& /*ctx*/,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx,
                    void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "flatten_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
-        flatten_impl<T>(attrs, output, inputs);
+        flatten_impl<T>(attrs, output, inputs, ctx);
     });
     return Status::ok;
 }

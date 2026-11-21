@@ -138,21 +138,28 @@ float yarn_attention_scale(const RoPEAttributes& attrs)
     return attrs.scaling_factor > 1.0f ? 1.0f + 0.1f * std::log(attrs.scaling_factor) : 1.0f;
 }
 
-void compute_cos_sin_tables(PoolArray<float>& cos_table, PoolArray<float>& sin_table,
-                            int64_t seq_len, int64_t rotary_dim,
-                            const std::vector<RoPESection>& sections, const RoPEAttributes& attrs)
-{
-    const int64_t half = rotary_dim / 2;
-    const size_t total = static_cast<size_t>(seq_len) * static_cast<size_t>(half);
-    cos_table.reset(total);
-    sin_table.reset(total);
+/// What one (pair index) costs per position, split into the part that does not
+/// depend on the position: the wavelength `ratio` and the scaling blend.
+///
+/// Every scaling mode ends up as a pair of blends of `extrap` and `interp`, and
+/// both ramps depend only on the pair — so the `pow` and the two clamps move out
+/// of the position loop. The table used to re-evaluate `base^(2p/dim)` for every
+/// (position, pair), which at S=2048, half=64 was 131k `pow` calls per RoPE call
+/// and dominated the op once the rotation pass was parallel.
+struct PairPlan {
+    float ratio;    ///< base^(2p/section_dim): the angle is pos / ratio
+    float ramp;     ///< YaRN: 0 keeps the extrapolated angle, 1 the interpolated one
+    float smooth;   ///< Llama3 band blend, -1 when the pair sits outside the band
+    bool long_wl;   ///< Llama3: wavelength past the short end, so it is divided
+};
 
-    const auto plans = plan_sections(attrs, sections, seq_len);
-    const bool linear = attrs.scaling_type == RoPEScalingType::Linear;
+void build_pair_plans(PoolArray<PairPlan>& pairs, const std::vector<SectionPlan>& plans,
+                      const RoPEAttributes& attrs, int64_t half)
+{
+    pairs.reset(static_cast<size_t>(half));
+
     const bool yarn = attrs.scaling_type == RoPEScalingType::YaRN;
     const bool llama3 = attrs.scaling_type == RoPEScalingType::Llama3;
-    const float factor = attrs.scaling_factor;
-    const float magnitude = yarn ? yarn_attention_scale(attrs) : 1.0f;
 
     // Llama3's two wavelength bands, both divisors of the pretraining window.
     const float orig = static_cast<float>(attrs.original_max_position);
@@ -160,49 +167,83 @@ void compute_cos_sin_tables(PoolArray<float>& cos_table, PoolArray<float>& sin_t
     const float high_wavelen = orig / attrs.llama3_high_freq_factor;
     const float band = attrs.llama3_high_freq_factor - attrs.llama3_low_freq_factor;
 
-    for (int64_t i = 0; i < seq_len; ++i) {
+    size_t pair_idx = 0;
+    for (const auto& plan : plans) {
+        const float sec_dim_f = static_cast<float>(plan.dim);
+
+        for (int64_t p = 0; p < plan.pairs; ++p) {
+            const float ratio = std::pow(plan.base, 2.0f * static_cast<float>(p) / sec_dim_f);
+            PairPlan pp{ratio, 0.0f, 0.0f, false};
+            if (yarn) {
+                pp.ramp = std::clamp((static_cast<float>(p) - plan.low) /
+                                         std::max(0.001f, plan.high - plan.low),
+                                     0.0f, 1.0f);
+            } else if (llama3) {
+                const float wavelen = kTwoPi * ratio;
+                pp.long_wl = wavelen > low_wavelen;
+                if (!pp.long_wl && wavelen >= high_wavelen) {
+                    pp.smooth = std::clamp(
+                        (orig / wavelen - attrs.llama3_low_freq_factor) / band, 0.0f, 1.0f);
+                } else {
+                    pp.smooth = -1.0f;
+                }
+            }
+            pairs[pair_idx++] = pp;
+        }
+    }
+}
+
+void compute_cos_sin_tables(PoolArray<float>& cos_table, PoolArray<float>& sin_table,
+                            int64_t seq_len, int64_t rotary_dim,
+                            const std::vector<RoPESection>& sections, const RoPEAttributes& attrs,
+                            const ComputeContext& ctx)
+{
+    const int64_t half = rotary_dim / 2;
+    const size_t total = static_cast<size_t>(seq_len) * static_cast<size_t>(half);
+    cos_table.reset(total);
+    sin_table.reset(total);
+
+    const auto plans = plan_sections(attrs, sections, seq_len);
+    PoolArray<PairPlan> pairs;
+    build_pair_plans(pairs, plans, attrs, half);
+
+    const bool linear = attrs.scaling_type == RoPEScalingType::Linear;
+    const bool yarn = attrs.scaling_type == RoPEScalingType::YaRN;
+    const bool llama3 = attrs.scaling_type == RoPEScalingType::Llama3;
+    const float factor = attrs.scaling_factor;
+    const float magnitude = yarn ? yarn_attention_scale(attrs) : 1.0f;
+
+    // One row per position, and each row is independent — so the table builds
+    // across the pool like the rotation pass does.
+    ctx.cpu.run(0, seq_len, [&](int64_t i) {
         const float pos_f = static_cast<float>(attrs.position_offset + i);
         float* cos_row = cos_table.data() + i * half;
         float* sin_row = sin_table.data() + i * half;
 
-        int64_t pair_idx = 0;
-        for (const auto& plan : plans) {
-            const float sec_dim_f = static_cast<float>(plan.dim);
+        for (int64_t p = 0; p < half; ++p) {
+            const PairPlan& pp = pairs[static_cast<size_t>(p)];
+            const float extrap = pos_f / pp.ratio;
 
-            for (int64_t p = 0; p < plan.pairs; ++p) {
-                const float ratio = std::pow(plan.base, 2.0f * static_cast<float>(p) / sec_dim_f);
-                const float extrap = pos_f / ratio;
-
-                float theta = extrap;
-                if (linear) {
+            float theta = extrap;
+            if (linear) {
+                theta = extrap / factor;
+            } else if (yarn) {
+                const float interp = extrap / factor;
+                theta = interp * pp.ramp + extrap * (1.0f - pp.ramp);
+            } else if (llama3) {
+                // Short wavelengths are untouched, long ones divide by the
+                // factor, the band between them blends the two.
+                if (pp.long_wl) {
                     theta = extrap / factor;
-                } else if (yarn) {
-                    // Ramp 0 keeps the extrapolated angle at the fast-rotating
-                    // dims, 1 takes the interpolated one at the slow dims.
-                    const float interp = extrap / factor;
-                    const float ramp = std::clamp((static_cast<float>(p) - plan.low) /
-                                                      std::max(0.001f, plan.high - plan.low),
-                                                  0.0f, 1.0f);
-                    theta = interp * ramp + extrap * (1.0f - ramp);
-                } else if (llama3) {
-                    // Short wavelengths are untouched, long ones divide by
-                    // the factor, the band between them blends the two.
-                    const float wavelen = kTwoPi * ratio;
-                    if (wavelen > low_wavelen) {
-                        theta = extrap / factor;
-                    } else if (wavelen >= high_wavelen) {
-                        const float smooth = std::clamp(
-                            (orig / wavelen - attrs.llama3_low_freq_factor) / band, 0.0f, 1.0f);
-                        theta = extrap * ((1.0f - smooth) / factor + smooth);
-                    }
+                } else if (pp.smooth >= 0.0f) {
+                    theta = extrap * ((1.0f - pp.smooth) / factor + pp.smooth);
                 }
-
-                cos_row[pair_idx] = std::cos(theta) * magnitude;
-                sin_row[pair_idx] = std::sin(theta) * magnitude;
-                ++pair_idx;
             }
+
+            cos_row[p] = std::cos(theta) * magnitude;
+            sin_row[p] = std::sin(theta) * magnitude;
         }
-    }
+    });
 }
 
 } // anonymous namespace
@@ -269,7 +310,7 @@ void rope_impl(const RoPEAttributes& attrs, TensorView& output, std::span<const 
         }
     } else {
         auto sections = build_sections(attrs, rotary_dim);
-        compute_cos_sin_tables(cos_table, sin_table, seq_len, rotary_dim, sections, attrs);
+        compute_cos_sin_tables(cos_table, sin_table, seq_len, rotary_dim, sections, attrs, ctx);
         cos_src = cos_table.data();
         sin_src = sin_table.data();
     }
@@ -284,11 +325,21 @@ void rope_impl(const RoPEAttributes& attrs, TensorView& output, std::span<const 
     const T* beta = inputs.size() > 2 && !inputs[2].is_empty() ? inputs[2].ptr<T>() : nullptr;
     const float norm_eps = attrs.norm_epsilon;
 
-    const auto process_outer = [&](int64_t outer) {
+    // Rows are independent, so the pool is filled across (head, row tile):
+    // a [1, 8, S, D] tensor has only 8 heads, which left 12 of 20 threads idle
+    // when one task was a whole head.
+    constexpr int64_t kRowsPerTask = 32;
+    const int64_t pos_tiles = (seq_len + kRowsPerTask - 1) / kRowsPerTask;
+
+    const auto process_tile = [&](int64_t task) {
+        const int64_t outer = task / pos_tiles;
+        const int64_t pos0 = (task % pos_tiles) * kRowsPerTask;
+        const int64_t pos1 = std::min(pos0 + kRowsPerTask, seq_len);
+
         const T* x_outer = x_ptr + outer * seq_len * row_stride;
         T* y_outer = y_ptr + outer * seq_len * out_row_stride;
 
-        for (int64_t pos = 0; pos < seq_len; ++pos) {
+        for (int64_t pos = pos0; pos < pos1; ++pos) {
             const T* x_row = x_outer + pos * row_stride;
             T* y_row = y_outer + pos * out_row_stride;
             const float* cos_row = cos_src + pos * tbl_stride;
@@ -317,7 +368,7 @@ void rope_impl(const RoPEAttributes& attrs, TensorView& output, std::span<const 
         }
     };
 
-    ctx.cpu.run(0, outer_count, process_outer);
+    ctx.cpu.run(0, outer_count * pos_tiles, process_tile);
 }
 
 Status rope_cpu(const RoPEAttributes& attrs, TensorView& output, std::span<const TensorView> inputs,

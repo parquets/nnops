@@ -16,7 +16,9 @@
 #include "common/dtype_dispatch.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 #include <utility>
 
@@ -93,6 +95,19 @@ bool gather_nd_indices_valid(const TensorView& indices, const TensorView& data, 
     return true;
 }
 
+/// True when axes [from_dim, rank) are one physically contiguous run.
+inline bool tail_dense(const TensorView& v, int64_t from_dim)
+{
+    int64_t want = 1;
+    for (int64_t d = v.rank() - 1; d >= from_dim; --d) {
+        if (v.shape(d) != 1 && v.stride_elems(d) != want) {
+            return false;
+        }
+        want *= v.shape(d);
+    }
+    return true;
+}
+
 template <typename T, typename I>
 void gather_impl(const GatherAttributes& attrs, TensorView& output, const TensorView& data,
                  const TensorView& indices, const ComputeContext& ctx)
@@ -113,6 +128,95 @@ void gather_impl(const GatherAttributes& attrs, TensorView& output, const Tensor
     const T* dptr = data.ptr<T>();
     const I* iptr = indices.ptr<I>();
     T* optr = output.ptr<T>();
+
+    // The block after the gathered axis is copied whole when it is one
+    // contiguous run on both sides — the embedding-lookup shape (a [V, D] table
+    // and a block of D per index), and onnxruntime's GatherCopyData. One run per
+    // index instead of one element per (index, channel).
+    const int64_t block = [&] {
+        int64_t b = 1;
+        for (int64_t d = axis + 1; d < rank; ++d) {
+            b *= data.shape(d);
+        }
+        return b;
+    }();
+
+    if (block > 0 && tail_dense(data, axis + 1) && tail_dense(output, axis + 1)) {
+        int64_t outer = 1;
+        for (int64_t d = 0; d < axis; ++d) {
+            outer *= data.shape(d);
+        }
+        const int64_t n_idx = indices.numel();
+        const int64_t space = outer * n_idx;
+
+        // The walked index space is the data's leading axes followed by the
+        // index axes: the data offset advances only with the former, the output
+        // and index offsets with both.
+        int64_t wdims[16], wdstr[16], wostr[16], wistr[16];
+        int64_t wnd = 0;
+        for (int64_t d = 0; d < axis; ++d) {
+            wdims[wnd] = data.shape(d);
+            wdstr[wnd] = data.stride_elems(d);
+            wostr[wnd] = output.stride_elems(d);
+            wistr[wnd] = 0;
+            ++wnd;
+        }
+        for (int64_t j = 0; j < ir; ++j) {
+            wdims[wnd] = indices.shape(j);
+            wdstr[wnd] = 0;
+            wostr[wnd] = output.stride_elems(axis + j);
+            wistr[wnd] = indices.stride_elems(j);
+            ++wnd;
+        }
+
+        const int64_t runs_per_task = std::max<int64_t>(1, (int64_t{1} << 16) / block);
+        const int64_t tasks = (space + runs_per_task - 1) / runs_per_task;
+        const int64_t k_stride = data.stride_elems(axis);
+        const int64_t dim = data.shape(axis);
+        const size_t block_bytes = static_cast<size_t>(block) * sizeof(T);
+
+        ctx.cpu.run(0, tasks, [&](int64_t ti) {
+            const int64_t begin = ti * runs_per_task;
+            const int64_t end = std::min(begin + runs_per_task, space);
+
+            int64_t idx[16] = {};
+            int64_t rem = begin;
+            for (int64_t d = wnd - 1; d >= 0; --d) {
+                idx[d] = (wdims[d] > 0) ? rem % wdims[d] : 0;
+                rem = (wdims[d] > 0) ? rem / wdims[d] : 0;
+            }
+
+            int64_t doff = 0, ooff = 0, ioff = 0;
+            for (int64_t d = 0; d < wnd; ++d) {
+                doff += idx[d] * wdstr[d];
+                ooff += idx[d] * wostr[d];
+                ioff += idx[d] * wistr[d];
+            }
+
+            for (int64_t n = begin; n < end; ++n) {
+                int64_t k = static_cast<int64_t>(iptr[ioff]);
+                if (k < 0) {
+                    k += dim;
+                }
+                std::memcpy(optr + ooff, dptr + doff + k * k_stride, block_bytes);
+
+                for (int64_t d = wnd - 1; d >= 0; --d) {
+                    ++idx[d];
+                    doff += wdstr[d];
+                    ooff += wostr[d];
+                    ioff += wistr[d];
+                    if (idx[d] < wdims[d]) {
+                        break;
+                    }
+                    idx[d] = 0;
+                    doff -= wdstr[d] * wdims[d];
+                    ooff -= wostr[d] * wdims[d];
+                    ioff -= wistr[d] * wdims[d];
+                }
+            }
+        });
+        return;
+    }
 
     walk_logical(odims, orank, output.numel(), ctx, [&](const int64_t* o) {
         int64_t ds = 0;

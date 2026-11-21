@@ -73,4 +73,45 @@ inline int64_t flat_offset(const int64_t* idx, const int64_t* strides, int64_t n
     return off;
 }
 
+/// The densest trailing run two views can move with one memcpy: the axes from
+/// `from_dim` to rank-1 agree in extent and are physically contiguous in both,
+/// so a run moves as `run` adjacent elements. Everything before `from_dim` is
+/// walked by an odometer.
+struct DenseTail {
+    int64_t run = 1;      ///< elements in one run
+    int64_t from_dim = 0; ///< first axis of the run (== rank when run is 1)
+};
+
+inline DenseTail shared_dense_tail(const TensorView& a, const TensorView& b)
+{
+    const int64_t ra = a.rank();
+    const int64_t rb = b.rank();
+    const int64_t rank = (ra > rb) ? ra : rb;
+    DenseTail t{1, rank};
+    for (int64_t d = rank - 1; d >= 0; --d) {
+        // Right-aligned: an axis the view does not have is a size-1 axis, so it
+        // contributes one element and no address step.
+        const int64_t ia = d - (rank - ra);
+        const int64_t ib = d - (rank - rb);
+        const int64_t dim_a = (ia < 0) ? 1 : a.shape(ia);
+        const int64_t dim_b = (ib < 0) ? 1 : b.shape(ib);
+        if (dim_a != dim_b) {
+            break;
+        }
+        if (dim_a == 1) {
+            continue;
+        }
+        // Both sides step by exactly the run length: contiguous, and with no
+        // row pitch between them.
+        const int64_t str_a = (ia < 0) ? 0 : a.stride_elems(ia);
+        const int64_t str_b = (ib < 0) ? 0 : b.stride_elems(ib);
+        if (str_a != t.run || str_b != t.run) {
+            break;
+        }
+        t.run *= dim_a;
+        t.from_dim = d;
+    }
+    return t;
+}
+
 } // namespace nnops::backend::cpu

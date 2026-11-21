@@ -12,6 +12,7 @@
 #include "common/dtype_dispatch.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <type_traits>
 #include <utility>
@@ -46,62 +47,102 @@ template <class F> void for_each_int_type(DataType t, F&& f)
 template <typename T> inline T value_at(const T* p, int64_t off) { return p[off]; }
 inline float value_at(const half* p, int64_t off) { return simd::s_load(p + off); }
 
-template <typename T> inline bool relation(CompareType type, T a, T b)
-{
-    switch (type) {
-    case CompareType::Equal:
-        return a == b;
-    case CompareType::Greater:
-        return a > b;
-    case CompareType::Less:
-        return a < b;
-    case CompareType::GreaterOrEqual:
-        return a >= b;
-    case CompareType::LessOrEqual:
-        return a <= b;
+/// The relation as a functor: picked once per call rather than switched on for
+/// every element. `f16` is read through s_load so the test is on the value, and
+/// the operands keep their own type so an s64 compare stays exact.
+struct Relation {
+    CompareType type;
+    template <typename V> bool operator()(V a, V b) const
+    {
+        switch (type) {
+        case CompareType::Equal:
+            return a == b;
+        case CompareType::Greater:
+            return a > b;
+        case CompareType::Less:
+            return a < b;
+        case CompareType::GreaterOrEqual:
+            return a >= b;
+        case CompareType::LessOrEqual:
+            return a <= b;
+        }
+        return false;
     }
-    return false;
+};
+
+/// `dst = op(a, b)` over contiguous output runs.
+template <typename T, typename Op>
+void compare_loop(TensorView& out, const TensorView* ins, const ComputeContext& ctx, Op&& op)
+{
+    const auto* ap = ins[0].template ptr<T>();
+    const auto* bp = ins[1].template ptr<T>();
+    auto* dst = out.ptr<uint8_t>();
+
+    broadcast_walk_run<2>(out, ins, ctx,
+                          [&](int64_t oo, const int64_t* off, const int64_t* step, int64_t run) {
+                              const T* a_row = ap + off[0];
+                              const T* b_row = bp + off[1];
+                              uint8_t* o_row = dst + oo;
+                              for (int64_t i = 0; i < run; ++i) {
+                                  o_row[i] = op(value_at(a_row, i * step[0]),
+                                                value_at(b_row, i * step[1])) ? 1 : 0;
+                              }
+                          });
 }
 
 template <typename T>
 void compare_impl(TensorView& out, std::span<const TensorView> inputs, CompareType type,
                   const ComputeContext& ctx)
 {
-    const auto* ap = inputs[0].ptr<T>();
-    const auto* bp = inputs[1].ptr<T>();
+    compare_loop<T>(out, inputs.data(), ctx, Relation{type});
+}
+
+template <typename T, typename Op>
+void logical_loop(TensorView& out, const TensorView* ins, const ComputeContext& ctx, Op&& op)
+{
+    const auto* ap = ins[0].template ptr<T>();
+    const auto* bp = ins[1].template ptr<T>();
     auto* dst = out.ptr<uint8_t>();
 
-    broadcast_walk<2>(out, inputs.data(), ctx, [&](int64_t oo, const int64_t* off) {
-        dst[oo] = relation(type, value_at(ap, off[0]), value_at(bp, off[1])) ? 1 : 0;
-    });
+    broadcast_walk_run<2>(out, ins, ctx,
+                          [&](int64_t oo, const int64_t* off, const int64_t* step, int64_t run) {
+                              const T* a_row = ap + off[0];
+                              const T* b_row = bp + off[1];
+                              uint8_t* o_row = dst + oo;
+                              for (int64_t i = 0; i < run; ++i) {
+                                  o_row[i] = op(a_row[i * step[0]], b_row[i * step[1]]) ? 1 : 0;
+                              }
+                          });
 }
+
+struct LogicalAnd {
+    bool operator()(auto a, auto b) const { return a != 0 && b != 0; }
+};
+struct LogicalOr {
+    bool operator()(auto a, auto b) const { return a != 0 || b != 0; }
+};
+struct LogicalXor {
+    bool operator()(auto a, auto b) const { return (a != 0) != (b != 0); }
+};
 
 template <typename T>
 void logical_binary_impl(TensorView& out, std::span<const TensorView> inputs, LogicalType type,
                          const ComputeContext& ctx)
 {
-    const auto* ap = inputs[0].ptr<T>();
-    const auto* bp = inputs[1].ptr<T>();
-    auto* dst = out.ptr<uint8_t>();
-
-    broadcast_walk<2>(out, inputs.data(), ctx, [&](int64_t oo, const int64_t* off) {
-        const bool a = ap[off[0]] != 0;
-        const bool b = bp[off[1]] != 0;
-        switch (type) {
-        case LogicalType::And:
-            dst[oo] = (a && b) ? 1 : 0;
-            break;
-        case LogicalType::Or:
-            dst[oo] = (a || b) ? 1 : 0;
-            break;
-        case LogicalType::Xor:
-            dst[oo] = (a != b) ? 1 : 0;
-            break;
-        default:
-            dst[oo] = 0;
-            break;
-        }
-    });
+    switch (type) {
+    case LogicalType::And:
+        logical_loop<T>(out, inputs.data(), ctx, LogicalAnd{});
+        return;
+    case LogicalType::Or:
+        logical_loop<T>(out, inputs.data(), ctx, LogicalOr{});
+        return;
+    case LogicalType::Xor:
+        logical_loop<T>(out, inputs.data(), ctx, LogicalXor{});
+        return;
+    default:
+        std::fill_n(out.ptr<uint8_t>(), static_cast<size_t>(out.numel()), uint8_t{0});
+        return;
+    }
 }
 
 template <typename T>
@@ -111,8 +152,14 @@ void logical_not_impl(TensorView& out, std::span<const TensorView> inputs,
     const auto* ap = inputs[0].ptr<T>();
     auto* dst = out.ptr<uint8_t>();
 
-    broadcast_walk<1>(out, inputs.data(), ctx,
-                      [&](int64_t oo, const int64_t* off) { dst[oo] = (ap[off[0]] == 0) ? 1 : 0; });
+    broadcast_walk_run<1>(out, inputs.data(), ctx,
+                          [&](int64_t oo, const int64_t* off, const int64_t* step, int64_t run) {
+                              const T* a_row = ap + off[0];
+                              uint8_t* o_row = dst + oo;
+                              for (int64_t i = 0; i < run; ++i) {
+                                  o_row[i] = (a_row[i * step[0]] == 0) ? 1 : 0;
+                              }
+                          });
 }
 
 } // anonymous namespace
