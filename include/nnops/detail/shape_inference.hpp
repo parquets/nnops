@@ -15,10 +15,12 @@
 ///  - `auto_pad` mirrors Conv2DAttributes::AutoPad, Conv3DAttributes::AutoPad
 ///    and PoolingAttributes::AutoPad: 0=NOTSET (explicit symmetric `padding`),
 ///    1=SAME_UPPER, 2=SAME_LOWER, 3=VALID.
-///  - Conv2D weights are OIHW [OC, IC/G, KH, KW] (Conv3D adds KD). The
-///    Spatial reading `weight_hwio` instead expects TensorLayout::HWIO,
-///    TensorFlow's [KH, KW, IC/G, OC], so OC is the last axis. TransposeConv
-///    mirrors it: weight [IC, OC/G, KH, KW] and OC = dims[1] * groups.
+///  - Conv2D weights are OIHW [OC, IC/G, KH, KW]. The Spatial reading
+///    `weight_hwio` instead expects TensorLayout::HWIO, TensorFlow's
+///    [KH, KW, IC/G, OC], so OC is the last axis; Conv3D is always read that
+///    way, at rank 5 ([KD, KH, KW, IC/G, OC], DHWIO). A packed filter leads
+///    with OC instead. TransposeConv mirrors OIHW: weight [IC, OC/G, KH, KW]
+///    and OC = dims[1] * groups.
 ///  - DepthwiseConv, Pooling and Resize take their spatial rank from the input
 ///    (rank - 2 is 2 or 3) and, for a 2D input, skip the leading D entry of the
 ///    per-axis attribute span. GridSample reads the same spatial dims from the
@@ -228,8 +230,8 @@ inline std::vector<TensorDesc> pool1d_output_shape(
     return {out};
 }
 
-/// Returns [N, OD, OH, OW, OC] from an OIHW weight; the activation is
-/// [N, ID, IH, IW, IC].
+/// Returns [N, OD, OH, OW, OC] from a DHWIO weight, or from a prepacked blob
+/// leading with OC (@p weight_dhwio false); the activation is [N, ID, IH, IW, IC].
 inline std::vector<TensorDesc> conv3d_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
@@ -237,7 +239,8 @@ inline std::vector<TensorDesc> conv3d_output_shape(
     std::span<const int64_t> padding,
     int auto_pad,
     int64_t groups,
-    std::span<const TensorDesc> inputs)
+    std::span<const TensorDesc> inputs,
+    bool weight_dhwio = true)
 {
     const auto& in = inputs[0];
     const auto& wt = inputs[1];
@@ -249,7 +252,7 @@ inline std::vector<TensorDesc> conv3d_output_shape(
 
     out.dims.resize(5);
     out.dims[0] = in.dims[0];
-    out.dims[4] = wt.dims[0];
+    out.dims[4] = weight_dhwio ? wt.dims[4] : wt.dims[0];
 
     out.dims[1] = compute_spatial_output_size(
         in.dims[1], kernel_size[0], stride[0], dilation[0], padding[0], auto_pad);

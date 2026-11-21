@@ -122,25 +122,25 @@ std::vector<Case> make_cases()
         cs.push_back(std::move(c));
     };
 
-    add("stem 1x3x16x64x64 -> 32 k3", {1, 3, 16, 64, 64}, {32, 3, 3, 3, 3},
+    add("stem 1x3x16x64x64 -> 32 k3", {1, 3, 16, 64, 64}, {3, 3, 3, 3, 32},
         {3, 3, 3}, {2, 2, 2}, {1, 1, 1}, {1, 1, 1});
-    add("refine 1x64x8x16x16 -> 64 k3", {1, 64, 8, 16, 16}, {64, 64, 3, 3, 3},
+    add("refine 1x64x8x16x16 -> 64 k3", {1, 64, 8, 16, 16}, {3, 3, 3, 64, 64},
         {3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1});
-    add("down 1x64x8x32x32 -> 128 k3s2", {1, 64, 8, 32, 32}, {128, 64, 3, 3, 3},
+    add("down 1x64x8x32x32 -> 128 k3s2", {1, 64, 8, 32, 32}, {3, 3, 3, 64, 128},
         {3, 3, 3}, {2, 2, 2}, {1, 1, 1}, {1, 1, 1});
-    add("temporal 1x64x16x14x14 -> 64 k3x1", {1, 64, 16, 14, 14}, {64, 64, 3, 1, 1},
+    add("temporal 1x64x16x14x14 -> 64 k3x1", {1, 64, 16, 14, 14}, {3, 1, 1, 64, 64},
         {3, 1, 1}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1});
-    add("pointwise 1x128x8x14x14 -> 64", {1, 128, 8, 14, 14}, {64, 128, 1, 1, 1},
+    add("pointwise 1x128x8x14x14 -> 64", {1, 128, 8, 14, 14}, {1, 1, 1, 128, 64},
         {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0});
-    add("grouped 1x64x4x8x8 -> 64 g8", {1, 64, 4, 8, 8}, {64, 8, 3, 3, 3},
+    add("grouped 1x64x4x8x8 -> 64 g8", {1, 64, 4, 8, 8}, {3, 3, 3, 8, 64},
         {3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, 8);
-    add("depthwise 1x32x4x8x8 -> 32 g32", {1, 32, 4, 8, 8}, {32, 1, 3, 3, 3},
+    add("depthwise 1x32x4x8x8 -> 32 g32", {1, 32, 4, 8, 8}, {3, 3, 3, 1, 32},
         {3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, 32);
-    add("batch 4 4x32x4x8x8 -> 32 k3", {4, 32, 4, 8, 8}, {32, 32, 3, 3, 3},
+    add("batch 4 4x32x4x8x8 -> 32 k3", {4, 32, 4, 8, 8}, {3, 3, 3, 32, 32},
         {3, 3, 3}, {2, 2, 2}, {1, 1, 1}, {1, 1, 1});
-    add("large k 1x32x8x8x8 -> 32 k5", {1, 32, 8, 8, 8}, {32, 32, 5, 5, 5},
+    add("large k 1x32x8x8x8 -> 32 k5", {1, 32, 8, 8, 8}, {5, 5, 5, 32, 32},
         {5, 5, 5}, {1, 1, 1}, {1, 1, 1}, {2, 2, 2});
-    add("dilated 1x32x4x8x8 -> 32 k3d2", {1, 32, 4, 8, 8}, {32, 32, 3, 3, 3},
+    add("dilated 1x32x4x8x8 -> 32 k3d2", {1, 32, 4, 8, 8}, {3, 3, 3, 32, 32},
         {3, 3, 3}, {1, 1, 1}, {2, 2, 2}, {2, 2, 2});
 
     return cs;
@@ -150,11 +150,13 @@ void run_one(const Case& c, int nt, int rounds)
 {
     const int64_t N = c.in_shape[0];
     const int64_t G = c.attrs.groups;
-    const int64_t OC = c.w_shape[0];
-    const int64_t IC_per_G = c.w_shape[1];
+    const int64_t OC = c.w_shape[4];
+    const int64_t IC_per_G = c.w_shape[3];
 
     auto [in_vec, in_view] = test::make_random_tensor(c.in_shape);
-    auto [w_vec, w_view] = test::make_random_tensor(c.w_shape);
+    auto [w_vec, w_dense] = test::make_random_tensor(c.w_shape);
+    TensorView w_view(c.w_shape, DataType::f32, w_vec.data(), TensorLayout::DHWIO);
+    (void)w_dense;
 
     // The operator reads a channel-last [N, ID, IH, IW, IC] activation; the
     // scalar reference keeps the dense [N, IC, ID, IH, IW] one.
@@ -171,7 +173,7 @@ void run_one(const Case& c, int nt, int rounds)
     const auto numel = static_cast<size_t>(descs[0].numel());
 
     // Channel-last output for the operator, dense for the reference.
-    const int64_t ref_dims[] = {c.in_shape[0], c.w_shape[0], descs[0].dims[1],
+    const int64_t ref_dims[] = {c.in_shape[0], OC, descs[0].dims[1],
                                 descs[0].dims[2], descs[0].dims[3]};
     std::vector<float> out_buf(numel, 0.0f);
     auto out = test::make_channel_first(descs[0], out_buf.data());
@@ -234,8 +236,8 @@ void run_one(const Case& c, int nt, int rounds)
 void run_one_i8(const Case& c, int nt, int rounds)
 {
     const int64_t N = c.in_shape[0];
-    const int64_t OC = c.w_shape[0];
-    const int64_t IC_per_G = c.w_shape[1];
+    const int64_t OC = c.w_shape[4];
+    const int64_t IC_per_G = c.w_shape[3];
     const int64_t IC = c.in_shape[1];
     const int64_t karea = c.attrs.kernel_size[0] * c.attrs.kernel_size[1] *
                           c.attrs.kernel_size[2];
@@ -265,11 +267,12 @@ void run_one_i8(const Case& c, int nt, int rounds)
 
     const int64_t in_dims[] = {c.in_shape[0], c.in_shape[2], c.in_shape[3], c.in_shape[4],
                                c.in_shape[1]};
-    const int64_t w_dims[] = {OC, IC_per_G, c.attrs.kernel_size[0], c.attrs.kernel_size[1],
-                              c.attrs.kernel_size[2]};
+    const int64_t w_dims[] = {c.attrs.kernel_size[0], c.attrs.kernel_size[1],
+                              c.attrs.kernel_size[2], IC_per_G, OC};
     TensorView in(std::span<const int64_t>(in_dims, 5), DataType::u8, act.data(),
                   TensorLayout::NDHWC, qa);
-    TensorView wt(std::span<const int64_t>(w_dims, 5), DataType::s8, w.data());
+    TensorView wt(std::span<const int64_t>(w_dims, 5), DataType::s8, w.data(),
+                  TensorLayout::DHWIO);
     auto op = Conv3D::create(attrs, Backend::CPU);
     const TensorDesc d[] = {in.desc(), wt.desc()};
     const auto descs = op->getOutputTensorDesc(d);
@@ -296,7 +299,91 @@ void run_one_i8(const Case& c, int nt, int rounds)
     std::printf("    %-36s | %8.3f %9.1f\n", c.name, t, gops / (t * 1e-3));
 }
 
+/// The prepacked filter against the raw one on the same values — what
+/// Conv3D::prepackWeights buys, since the raw route re-packs B inside MatMul on
+/// every call.
+void run_one_prepack(const Case& c, int nt, int rounds)
+{
+    const int64_t N = c.in_shape[0];
+
+    auto [in_vec, in_dense] = test::make_random_tensor(c.in_shape);
+    auto [w_vec, w_dense] = test::make_random_tensor(c.w_shape);
+    TensorView w(c.w_shape, DataType::f32, w_vec.data(), TensorLayout::DHWIO);
+    (void)in_dense;
+    (void)w_dense;
+
+    const int64_t S_in = c.in_shape[2] * c.in_shape[3] * c.in_shape[4];
+    const auto in_cl_vec = test::to_channel_last<float>(in_vec, N, c.in_shape[1], S_in);
+    const int64_t in_cl_dims[] = {c.in_shape[0], c.in_shape[2], c.in_shape[3],
+                                  c.in_shape[4], c.in_shape[1]};
+    TensorView in_cl(std::span<const int64_t>(in_cl_dims, 5), DataType::f32,
+                     const_cast<float*>(in_cl_vec.data()), TensorLayout::NDHWC);
+
+    auto op = Conv3D::create(c.attrs, Backend::CPU);
+    std::vector<uint8_t> blob;
+    TensorView wpacked;
+    {
+        TensorView q;
+        const TensorView wi[] = {w};
+        TensorView wq[] = {q};
+        op->prepackWeights(wi, wq);
+        q = wq[0];
+        if (q.rank() == 0) {
+            std::printf("    %-36s | no packed form\n", c.name);
+            return;
+        }
+        blob.assign(q.storage_bytes(), 0);
+        wpacked = TensorView(q.shape_span(), q.data_type(), blob.data(), q.pitch(), q.layout(),
+                             q.quant_params());
+        TensorView wf[] = {wpacked};
+        op->prepackWeights(wi, wf);
+    }
+
+    const TensorDesc d[] = {in_cl.desc(), w.desc()};
+    const auto descs = op->getOutputTensorDesc(d);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
+    auto out = test::make_channel_first(descs[0], out_buf.data());
+    TensorView outs[] = {out};
+
+    BenchPool pool(nt);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+    const TensorView raw_ins[] = {in_cl, w};
+    const TensorView packed_ins[] = {in_cl, wpacked};
+    auto arm_raw = [&]() { op->compute(outs, raw_ins, use_ctx); };
+    auto arm_packed = [&]() { op->compute(outs, packed_ins, use_ctx); };
+    arm_raw();
+    arm_packed();
+
+    std::vector<double> raw_ms, packed_ms;
+    for (int r = 0; r < rounds; ++r) {
+        const double a1 = time_ms(arm_raw, 10);
+        const double b1 = time_ms(arm_packed, 10);
+        const double a2 = time_ms(arm_raw, 10); // null control
+        raw_ms.push_back(std::min(a1, a2));
+        packed_ms.push_back(b1);
+    }
+    const double raw_t = median_of(raw_ms);
+    const double packed_t = median_of(packed_ms);
+    std::printf("    %-36s | %8.3f %9.3f | %6.2f\n", c.name, raw_t, packed_t,
+                raw_t / packed_t);
+}
+
 }  // namespace
+
+NNOPS_BENCH(conv3d_prepack) {
+    const auto cases = make_cases();
+    int nth = 1;
+    if (const char* env = std::getenv("NNOPS_BENCH_THREADS")) {
+        nth = std::atoi(env);
+        if (nth <= 0) { nth = 1; }
+    }
+    std::printf("\n=== Conv3D fp32, %dT — raw filter vs prepacked blob ===\n", nth);
+    std::printf("    %-36s | %8s %9s | %6s\n", "case", "raw ms", "pack ms", "raw/pack");
+    for (const auto& c : cases) { run_one_prepack(c, nth, 3); }
+}
 
 NNOPS_BENCH(conv3d) {
     const auto cases = make_cases();

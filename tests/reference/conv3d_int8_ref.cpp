@@ -61,9 +61,9 @@ void conv3d_int8_ref_impl(const Conv3DAttributes& attrs, TensorView& output,
     const int64_t IC = input.shape(4);
     const int64_t in_row_stride = input.row_stride_elems();
 
-    // Weight: [OC, IC/G, KD, KH, KW].
-    const int64_t OC = weight.shape(0);
-    const int64_t KC = weight.shape(1);
+    // Weight: DHWIO [KD, KH, KW, IC/G, OC].
+    const int64_t OC = weight.shape(4);
+    const int64_t KC = weight.shape(3);
     const int64_t KD = attrs.kernel_size[0];
     const int64_t KH = attrs.kernel_size[1];
     const int64_t KW = attrs.kernel_size[2];
@@ -139,11 +139,10 @@ void conv3d_int8_ref_impl(const Conv3DAttributes& attrs, TensorView& output,
                                                     reinterpret_cast<const TDst*>(in_ptr)[in_idx]);
                                             }
                                             const int64_t w_idx =
-                                                (((oc_global * KC + (ic - ic_start)) * KD + kd) *
-                                                     KH +
-                                                 kh) *
-                                                    KW +
-                                                kw;
+                                                ((((kd * KH + kh) * KW + kw) * KC +
+                                                  (ic - ic_start)) *
+                                                     OC +
+                                                 oc_global);
                                             const int32_t w_val = static_cast<int32_t>(w_ptr[w_idx]);
                                             acc += (w_val - zp_w) * (qa_val - zp_x);
                                         }

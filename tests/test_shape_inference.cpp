@@ -116,7 +116,7 @@ NNOPS_TEST(shape_conv3d_basic) {
     attrs.padding = {0, 0, 0};
 
     TensorDesc in_desc = td({1, 16, 224, 224, 3}, DataType::f32, TensorLayout::Dense);
-    TensorDesc wt_desc = td({64, 3, 3, 3, 3});
+    TensorDesc wt_desc = td({3, 3, 3, 3, 64}, DataType::f32, TensorLayout::DHWIO);
     const TensorDesc desc_arr[] = {in_desc, wt_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
@@ -132,7 +132,7 @@ NNOPS_TEST(shape_conv3d_ncdhwc8) {
     attrs.padding = {1, 1, 1};
 
     TensorDesc in_desc = td({1, 8, 56, 56, 32}, DataType::f16, TensorLayout::NDHWC);
-    TensorDesc wt_desc = td({48, 32, 3, 3, 3});
+    TensorDesc wt_desc = td({3, 3, 3, 32, 48}, DataType::f16, TensorLayout::DHWIO);
     const TensorDesc desc_arr[] = {in_desc, wt_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
@@ -150,7 +150,7 @@ NNOPS_TEST(shape_conv3d_stride2) {
     attrs.padding = {0, 0, 0};
 
     TensorDesc in_desc = td({1, 16, 224, 224, 3});
-    TensorDesc wt_desc = td({64, 3, 3, 3, 3});
+    TensorDesc wt_desc = td({3, 3, 3, 3, 64}, DataType::f32, TensorLayout::DHWIO);
     const TensorDesc desc_arr[] = {in_desc, wt_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 

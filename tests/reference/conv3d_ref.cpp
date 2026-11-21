@@ -7,7 +7,8 @@
 /// divides the numerator. So the two derivations share no index arithmetic, and
 /// a stride or padding sign error in one cannot cancel in the other.
 ///
-/// Weight layout: dense [OC, IC/G, KD, KH, KW].
+/// Weight layout: DHWIO [KD, KH, KW, IC/G, OC] — TensorFlow's conv3d filter,
+/// which is also the operator's own order.
 /// Input:  [N, IC, ID, IH, IW]
 /// Output: [N, OC, OD, OH, OW]
 
@@ -39,8 +40,8 @@ void conv3d_channel_first_ref(const Conv3DAttributes& attrs,
     const int64_t in_d_stride = input.stride_elems(2);
     const int64_t in_row_stride = input.row_stride_elems();
 
-    const int64_t OC = weight.shape(0);
-    const int64_t IC_per_G = weight.shape(1);
+    const int64_t OC = weight.shape(4);
+    const int64_t IC_per_G = weight.shape(3);
     const int64_t KD = attrs.kernel_size[0];
     const int64_t KH = attrs.kernel_size[1];
     const int64_t KW = attrs.kernel_size[2];
@@ -70,8 +71,6 @@ void conv3d_channel_first_ref(const Conv3DAttributes& attrs,
     const auto* in_ptr = input.ptr<float>();
     const auto* w_ptr  = weight.ptr<float>();
     const auto* b_ptr  = has_bias ? inputs[2].ptr<float>() : nullptr;
-
-    const int64_t kdim = IC_per_G * KD * KH * KW;
 
     const auto out_idx = [&](int64_t oc, int64_t od, int64_t oh, int64_t ow) {
         return oc * out_c_stride + od * out_d_stride + oh * out_row_stride + ow;
@@ -111,7 +110,8 @@ void conv3d_channel_first_ref(const Conv3DAttributes& attrs,
                 const int64_t oc = g * OC_per_G + oc_l;
                 for (int64_t ic_l = 0; ic_l < IC_per_G; ++ic_l) {
                     const int64_t ic = g * IC_per_G + ic_l;
-                    const float* w_ic = w_ptr + oc * kdim + ic_l * (KD * KH * KW);
+                    // DHWIO: taps are outer, then the input channel, then oc.
+                    const float* w_ic = w_ptr + ic_l * OC + oc;
                     const float* in_c = in_ptr + n * in_n_stride + ic * in_c_stride;
 
                     for (int64_t id = 0; id < ID; ++id) {
@@ -136,7 +136,8 @@ void conv3d_channel_first_ref(const Conv3DAttributes& attrs,
                                             const int64_t ow = nw / SW;
                                             if (ow >= OW) { continue; }
                                             o[out_idx(oc, od, oh, ow)] +=
-                                                v * w_ic[(kd * KH + kh) * KW + kw];
+                                                v * w_ic[((kd * KH + kh) * KW + kw) * IC_per_G *
+                                                         OC];
                                         }
                                     }
                                 }

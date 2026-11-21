@@ -33,6 +33,9 @@ enum class TensorLayout : uint8_t {
     HWIO      = 5,  ///< [KH][KW][IC/G][OC] — TF filter order for spatial
                     ///< activations: the shape *is* H×W×I×O, OC contiguous.
 
+    DHWIO = 16,     ///< [KD][KH][KW][IC/G][OC] — the 3-D twin of HWIO, TF's
+                    ///< conv3d filter: the shape *is* D×H×W×I×O, OC contiguous.
+
     // ---- Winograd-transformed weight, spatial ----
     PackedWinoWeightLast = 6,  ///< the U for a spatial activation, as the
                                ///< GEMM's B panels [16][⌈IC/G ÷ KC⌉][G·⌈OC/G ÷ nr⌉][ldd],
@@ -66,6 +69,14 @@ enum class TensorLayout : uint8_t {
     // needs. Whole-K and whole-OC, so compute() gathers nothing. Opaque, like
     // PackedHWIO, and refused by every route but that one.
     PackedHWIOCuda = 14,
+
+    // PackedDHWIO — the 3-D filter for Conv3D::prepackWeights: one sub-blob per
+    // group, each that group's [IC/G·KD·KH·KW][OC/G] B matrix. An fp filter is
+    // stored as MatMul's whole-K PackedB panels; an s8 one as the group's dense
+    // k-major matrix (a u8 or fp activation reads it too, which MatMul's
+    // segmented s8 panels — packed for one activation convention — cannot).
+    // Opaque outside the Conv3D kernel; 17 because 15 and 16 are taken.
+    PackedDHWIO = 17,
 
     // ---- Prepacked matmul RHS (MatMul / Linear ::prepackWeights) ----
     //
@@ -129,6 +140,8 @@ constexpr TensorLayout kAllTensorLayouts[] = {
     TensorLayout::PackedHWIO,
     TensorLayout::PackedHWIOSme,
     TensorLayout::PackedHWIOCuda,
+    TensorLayout::DHWIO,
+    TensorLayout::PackedDHWIO,
     TensorLayout::PackedB,
     TensorLayout::PackedBSme,
     TensorLayout::PackedRecurrent,
@@ -163,6 +176,11 @@ constexpr bool is_channel_last_weight(TensorLayout layout) noexcept {
     return layout == TensorLayout::HWIO;
 }
 
+/// True for DHWIO, the 3-D conv weight order of an NDHWC activation.
+constexpr bool is_channel_last_weight_3d(TensorLayout layout) noexcept {
+    return layout == TensorLayout::DHWIO;
+}
+
 /// True for HWCM, the depthwise filter with the channel innermost.
 constexpr bool is_depthwise_weight_last(TensorLayout layout) noexcept {
     return layout == TensorLayout::HWCM;
@@ -188,6 +206,11 @@ constexpr bool is_sme_conv_weight(TensorLayout layout) noexcept {
 /// and this blob's bytes are a CUDA tile's, not that route's panels.
 constexpr bool is_cuda_conv_weight(TensorLayout layout) noexcept {
     return layout == TensorLayout::PackedHWIOCuda;
+}
+
+/// True for Conv3D's prepacked filter; an opaque blob.
+constexpr bool is_packed_conv3d_weight(TensorLayout layout) noexcept {
+    return layout == TensorLayout::PackedDHWIO;
 }
 
 /// True for the prepacked matmul RHS; opaque, addressed by matmul_packed_b_geom.

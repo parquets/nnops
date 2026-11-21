@@ -5,7 +5,7 @@
 ///        conv3d_implicit_gemm_internal.h.
 ///
 /// Forward convolution is the easy direction for a col matrix: the gathered
-/// activation is the GEMM's A and the filter, repacked once per group into
+/// activation is the GEMM's A and the filter, read per group as
 /// [tap·ic + ic][oc], is B,
 ///
 ///   A = the activation, [pixels][IC/G·KD·KH·KW], tap-major,
@@ -34,16 +34,20 @@
 /// GEMM: a single (batch, group) with enough pixels fills it, and the GEMM then
 /// splits on its own larger dimension. A plane with many (batch, group) pairs
 /// and little per-group work cannot fill it that way, so those calls run one
-/// task per (batch, group, pixel block) with a serial GEMM each — the filter is
-/// then repacked once per group instead of once per (batch, group). The switch
-/// is N*G against the worker count (`NNOPS_CONV3D_GRID=0/1` pins it for A/B).
+/// task per (batch, group, pixel block) with a serial GEMM each. The switch is
+/// the GEMM's own block grid against the worker count
+/// (`NNOPS_CONV3D_GRID=0/1` pins it for A/B).
 ///
 /// Anything the flat operand views cannot describe falls back to the plain
 /// output-driven gather, which is correct for every shape.
 ///
-/// The weight stays [OC, IC/G, KD, KH, KW]; both the input and the output are
-/// channel-last NDHWC ([N, D, H, W, C] as both the logical dims and the memory
-/// order).
+/// The filter is DHWIO, [KD, KH, KW, IC/G, OC] — TensorFlow's conv3d order.
+/// That is the GEMM's B already: one tap is one contiguous OC run per input
+/// channel, and two taps are one IC/G·OC step apart, so the raw filter is read
+/// in place (a group is a pitched column slice) and the prepacked blob is only
+/// the pack MatMul would otherwise repeat per call. Both the input and the
+/// output are channel-last NDHWC ([N, D, H, W, C] as both the logical dims and
+/// the memory order).
 
 #include "backend/cpu/conv/conv3d_implicit_gemm_internal.h"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
@@ -51,9 +55,11 @@
 #include "backend/cpu/common/dtype_dispatch.hpp"
 #include "backend/cpu/common/memory_pool.hpp"
 #include "backend/cpu/matmul/matmul.h"
+#include "backend/cpu/matmul/matmul_helper.h"
 #include "nnops/core/parallel_for.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <span>
 
@@ -66,8 +72,6 @@ namespace {
 /// Largest col one GEMM call may materialise in the serial arm; past it the
 /// pixel block splits. The task-grid arm gives each concurrent task a slice.
 constexpr int64_t kColCapBytes = 8 << 20;
-/// Cap on the shared filter repack in the task-grid arm (all groups at once).
-constexpr int64_t kWeightPackCap = 8 << 20;
 /// Smallest per-task column budget the task grid will use.
 constexpr int64_t kMinTaskColBytes = int64_t{64} << 10;
 /// Largest staged output tile; only caps the oc chunk when the GEMM cannot
@@ -86,25 +90,25 @@ inline int conv3d_grid_override()
     return v;
 }
 
-/// im2col → GEMM. Returns false when the operands cannot be read as flat
-/// matrices, leaving the caller its gather.
+/// im2col → GEMM. Status::unsupported (or out_of_memory) when the operands
+/// cannot be read as flat matrices, leaving the caller its gather; ok, or the
+/// GEMM's own error, otherwise.
 template <typename T>
-bool conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
-                        std::span<const TensorView> inputs, const ComputeContext& ctx)
+Status conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
+                          std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    const int64_t karea = gm.karea();
-    const int64_t kdim = gm.IC_per_G * karea;
+    const int64_t kdim = gm.IC_per_G * gm.karea();
     const int64_t npix = gm.npix();
     if (kdim <= 0 || npix <= 0 || gm.OC_per_G <= 0) {
-        return false;
+        return Status::unsupported;
     }
-    // The filter must be one dense [OC/G][IC/G·KD·KH·KW] matrix.
-    if (weight.stride_elems(4) != 1 || weight.stride_elems(1) != karea) {
-        return false;
+    // The filter must read as one dense [IC/G·KD·KH·KW][OC/G] matrix per group.
+    if (!conv3d_filter_is_matrix(weight, gm)) {
+        return Status::unsupported;
     }
 
     const int64_t in_n_stride = input.stride_elems(0);
@@ -123,7 +127,6 @@ bool conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
     const bool pointwise = gm.KD == 1 && gm.KH == 1 && gm.KW == 1 && gm.SD == 1 && gm.SH == 1 &&
                            gm.SW == 1 && gm.PD == 0 && gm.PH == 0 && gm.PW == 0 && in_dense;
 
-    const int64_t wper = kdim * gm.OC_per_G;
     // The GEMM writes into the destination unless a residual has to survive it
     // or the destination's rows are not back to back.
     const bool dense_row = (out_row_stride == gm.OW * gm.OC);
@@ -131,18 +134,18 @@ bool conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
     const bool write_pass = !direct || has_bias || epilogue_is_active(gm.epilogue);
 
     const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr = weight.ptr<T>();
     const auto* b_ptr = has_bias ? inputs[2].ptr<T>() : nullptr;
     auto* out_ptr = output.ptr<T>();
     const DataType vdt = input.data_type();
     const MatMulAttributes mm{};
+    std::atomic<int> fail{0};
 
     // One pixel block: gather A, GEMM into C, scatter the rows C cannot hold.
     // @p ictx is the context the GEMM and the scatter run on — the real one in
     // the serial arm (the pool lives inside them), an empty one in the grid arm
-    // (the pool lives over the tasks).
+    // (the pool lives over the tasks). @p wg is the group's B, shared read-only.
     const auto run_block = [&](int64_t n, int64_t g, int64_t od0, int64_t oh0, int64_t od_chunk,
-                               int64_t roi_h, T* col, T* stage, const T* wpacked,
+                               int64_t roi_h, T* col, T* stage, const TensorView& wg,
                                const ComputeContext& ictx) {
         const int64_t nd = std::min(od_chunk, gm.OD - od0);
         const int64_t nh = std::min(roi_h, gm.OH - oh0);
@@ -178,9 +181,6 @@ bool conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
         TensorView am(std::span<const int64_t>(ashape, 2), vdt, const_cast<T*>(a_src),
                       (pointwise ? in_pix : kdim) * static_cast<int64_t>(sizeof(T)),
                       TensorLayout::Dense);
-        const int64_t bshape[] = {kdim, gm.OC_per_G};
-        TensorView bm(std::span<const int64_t>(bshape, 2), vdt, const_cast<T*>(wpacked),
-                      gm.OC_per_G * static_cast<int64_t>(sizeof(T)), TensorLayout::Dense);
 
         T* ctile = direct ? out_g + p0 * gm.OC : stage;
         const int64_t cshape[] = {nblk, gm.OC_per_G};
@@ -188,9 +188,12 @@ bool conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
                       (direct ? gm.OC : gm.OC_per_G) * static_cast<int64_t>(sizeof(T)),
                       TensorLayout::Dense);
 
-        const TensorView mins[] = {am, bm};
-        matmul_cpu(mm, cm, mins, ictx, nullptr);
-
+        const TensorView mins[] = {am, wg};
+        const Status st = matmul_cpu(mm, cm, mins, ictx, nullptr);
+        if (!is_ok(st)) {
+            fail.store(static_cast<int>(st), std::memory_order_relaxed);
+            return;
+        }
         if (direct && !write_pass) {
             return;
         }
@@ -226,24 +229,22 @@ bool conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
             conv3d_choose_block(gm, kdim, static_cast<int64_t>(sizeof(T)), kColCapBytes);
         const int64_t nblk_max = blk.od_chunk * blk.roi_h * gm.OW;
         PoolArray<T> col(pointwise ? 0 : static_cast<size_t>(nblk_max * kdim));
-        PoolArray<T> wpack(static_cast<size_t>(wper));
         PoolArray<T> stage(direct ? 0 : static_cast<size_t>(nblk_max * gm.OC_per_G));
-        if ((!pointwise && !col) || !wpack || (!direct && !stage)) {
-            return false;
+        if ((!pointwise && !col) || (!direct && !stage)) {
+            return Status::out_of_memory;
         }
         for (int64_t n = 0; n < gm.N; ++n) {
             for (int64_t g = 0; g < gm.G; ++g) {
-                conv3d_pack_weight(w_ptr + g * gm.OC_per_G * kdim, gm.OC_per_G, gm.IC_per_G,
-                                   karea, wpack.data(), ctx);
+                const TensorView wg = conv3d_weight_group(weight, gm, g);
                 for (int64_t od0 = 0; od0 < gm.OD; od0 += blk.od_chunk) {
                     for (int64_t oh0 = 0; oh0 < gm.OH; oh0 += blk.roi_h) {
                         run_block(n, g, od0, oh0, blk.od_chunk, blk.roi_h, col.data(),
-                                  stage.data(), wpack.data(), ctx);
+                                  stage.data(), wg, ctx);
                     }
                 }
             }
         }
-        return true;
+        return is_ok(Status(fail.load())) ? Status::ok : Status(fail.load());
     }
 
     // One task per (batch, group, pixel block): a plane with many groups but few
@@ -262,26 +263,12 @@ bool conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
     PoolArray<T> col(pointwise ? 0 : static_cast<size_t>(nblk_max * kdim * slots));
     PoolArray<T> stage(direct ? 0 : static_cast<size_t>(nblk_max * gm.OC_per_G * slots));
     if ((!pointwise && !col) || (!direct && !stage)) {
-        return false;
+        return Status::out_of_memory;
     }
 
-    // The filter is the same for every batch item, so it is packed once per
-    // group when all groups fit the cap; otherwise each worker packs its own
-    // group into its slot.
-    const bool share_w = gm.G * wper * static_cast<int64_t>(sizeof(T)) <= kWeightPackCap;
-    PoolArray<T> wshare(share_w ? static_cast<size_t>(gm.G * wper) : 0);
-    PoolArray<T> wslot(share_w ? 0 : static_cast<size_t>(wper * slots));
-    if ((share_w && !wshare) || (!share_w && !wslot)) {
-        return false;
-    }
+    // The group's B is read-only, so every task shares it; the raw filter is
+    // addressed in place and a prepacked blob is fixed at load time.
     const ComputeContext serial_ctx{};
-    if (share_w) {
-        ctx.cpu.run(0, gm.G, [&](int64_t g) {
-            conv3d_pack_weight(w_ptr + g * gm.OC_per_G * kdim, gm.OC_per_G, gm.IC_per_G, karea,
-                               wshare.data() + g * wper, serial_ctx);
-        });
-    }
-
     ctx.cpu.run(0, tasks, [&](int64_t t) {
         const int64_t slot = (slots < tasks) ? ctx.cpu.current_thread_id() : t;
         const int64_t bi = t % blocks;
@@ -291,17 +278,12 @@ bool conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
         const int64_t od0 = (bi / blocks_h) * blk.od_chunk;
         const int64_t oh0 = (bi % blocks_h) * blk.roi_h;
 
-        T* const wbuf = share_w ? wshare.data() + g * wper : wslot.data() + slot * wper;
-        if (!share_w) {
-            conv3d_pack_weight(w_ptr + g * gm.OC_per_G * kdim, gm.OC_per_G, gm.IC_per_G, karea,
-                               wbuf, serial_ctx);
-        }
         run_block(n, g, od0, oh0, blk.od_chunk, blk.roi_h,
                   pointwise ? nullptr : col.data() + slot * nblk_max * kdim,
-                  direct ? nullptr : stage.data() + slot * nblk_max * gm.OC_per_G, wbuf,
-                  serial_ctx);
+                  direct ? nullptr : stage.data() + slot * nblk_max * gm.OC_per_G,
+                  conv3d_weight_group(weight, gm, g), serial_ctx);
     });
-    return true;
+    return is_ok(Status(fail.load())) ? Status::ok : Status(fail.load());
 }
 
 /// The output-driven gather: every output voxel walks its own taps. Correct for
@@ -322,11 +304,13 @@ void conv3d_gather(const Conv3DGeom& gm, TensorView& output, std::span<const Ten
     const int64_t out_d_stride = output.stride_elems(1);
     const int64_t out_row_stride = output.row_stride_elems();
 
-    // The filter is walked by its own strides rather than as one k block.
-    const int64_t w_oc_stride = weight.stride_elems(0);
-    const int64_t w_ic_stride = weight.stride_elems(1);
-    const int64_t w_d_stride = weight.stride_elems(2);
-    const int64_t w_h_stride = weight.stride_elems(3);
+    // DHWIO [KD][KH][KW][IC/G][OC]: the filter is walked by its own strides
+    // rather than as one k block, so a pitched one is still readable.
+    const int64_t w_oc_stride = weight.stride_elems(4);
+    const int64_t w_ic_stride = weight.stride_elems(3);
+    const int64_t w_kw_stride = weight.stride_elems(2);
+    const int64_t w_kh_stride = weight.stride_elems(1);
+    const int64_t w_kd_stride = weight.stride_elems(0);
 
     const auto* in_ptr = input.ptr<T>();
     const auto* w_ptr = weight.ptr<T>();
@@ -361,14 +345,14 @@ void conv3d_gather(const Conv3DGeom& gm, TensorView& output, std::span<const Ten
                                         const T* in_row = in_ptr + n * in_n_stride +
                                                           id * in_d_stride + ih * in_row_stride +
                                                           ic_global;
-                                        const T* w_row = w_ic + kd * w_d_stride + kh * w_h_stride;
+                                        const T* w_row = w_ic + kd * w_kd_stride + kh * w_kh_stride;
                                         for (int64_t kw = 0; kw < gm.KW; ++kw) {
                                             const int64_t iw = ow * gm.SW + kw * gm.DW - gm.PW;
                                             if (iw < 0 || iw >= gm.IW) {
                                                 continue;
                                             }
                                             sum += s_load(&in_row[iw * in_pix]) *
-                                                   s_load(&w_row[kw]);
+                                                   s_load(&w_row[kw * w_kw_stride]);
                                         }
                                     }
                                 }
@@ -383,20 +367,171 @@ void conv3d_gather(const Conv3DGeom& gm, TensorView& output, std::span<const Ten
     });
 }
 
+/// True when a blob was handed in place of the raw filter — the filter is then
+/// addressable only through the blob, and there is nothing to gather.
+inline bool prepacked_filter(std::span<const TensorView> inputs) noexcept
+{
+    return inputs.size() > 1 && is_packed_conv3d_weight(inputs[1].layout());
+}
+
 template <typename T>
-void conv3d_impl(const Conv3DGeom& gm, TensorView& output, std::span<const TensorView> inputs,
-                 const ComputeContext& ctx)
+Status conv3d_impl(const Conv3DGeom& gm, TensorView& output, std::span<const TensorView> inputs,
+                   const ComputeContext& ctx)
 {
     if (gm.N == 0 || gm.OC == 0 || gm.OD == 0 || gm.OH == 0 || gm.OW == 0) {
-        return;
+        return Status::ok;
     }
-    if (conv3d_im2col_gemm<T>(gm, output, inputs, ctx)) {
-        return;
+    const Status st = conv3d_im2col_gemm<T>(gm, output, inputs, ctx);
+    if (is_ok(st)) {
+        return Status::ok;
+    }
+    // A prepacked filter is a B matrix and nothing else, so there is no raw
+    // matrix left for the gather; anything else gets the scalar route, which is
+    // correct for every geometry (an unreadable pitch and an allocation
+    // failure alike).
+    if (prepacked_filter(inputs)) {
+        return st;
     }
     conv3d_gather<T>(gm, output, inputs, ctx);
+    return Status::ok;
 }
 
 } // anonymous namespace
+
+// =========================================================================
+//  The prepacked filter (Conv3D::prepackWeights)
+// =========================================================================
+//
+// DHWIO already stores each group's filter in the GEMM's k-major order, so the
+// blob is not a transpose — it is the pack MatMul would otherwise rebuild on
+// every call: the whole-K B panels for an fp filter, the group's compact
+// matrix for an s8 one. The geometry is a function of the attributes and the
+// filter's own dims, never the activation, so prepackWeights can answer the
+// query without one.
+
+Conv3DPackedWeight conv3d_packed_weight_geom(int64_t karea, int64_t ic_per_group,
+                                             int64_t oc_per_group, int64_t groups,
+                                             DataType weight_dtype) noexcept
+{
+    Conv3DPackedWeight g;
+    if (karea <= 0 || ic_per_group <= 0 || oc_per_group <= 0 || groups <= 0) {
+        return g;
+    }
+    const int64_t kdim = ic_per_group * karea;
+    if (weight_dtype == DataType::s8) {
+        g.group_elems = kdim * oc_per_group;
+    } else {
+        const MatMulPackedB mb = matmul_packed_b_geom(oc_per_group, kdim, weight_dtype);
+        if (!mb.ok()) {
+            return g;
+        }
+        // Each group's sub-blob is a whole numel on its own, so the next group
+        // starts at a descriptor boundary.
+        g.group_elems = ((mb.total + oc_per_group - 1) / oc_per_group) * oc_per_group;
+    }
+    g.groups = groups;
+    g.total = g.group_elems * groups;
+    return g;
+}
+
+TensorDesc conv3d_packed_weight_desc(const Conv3DAttributes& attrs, const TensorDesc& weight)
+{
+    // DHWIO is [KD][KH][KW][IC/G][OC]: the channel counts are the last two.
+    if (weight.rank != 5 || !is_channel_last_weight_3d(weight.layout)) {
+        return TensorDesc{};
+    }
+    const int64_t OC = weight.dims[4];
+    const int64_t ICG = weight.dims[3];
+    const int64_t G = attrs.groups;
+    if (G <= 0 || OC % G != 0 || ICG <= 0) {
+        return TensorDesc{};
+    }
+    const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1] * attrs.kernel_size[2];
+    const Conv3DPackedWeight g = conv3d_packed_weight_geom(karea, ICG, OC / G, G, weight.dtype);
+    if (g.total <= 0) {
+        return TensorDesc{};
+    }
+
+    TensorDesc d;
+    d.rank = 2;
+    d.dtype = weight.dtype;
+    d.layout = TensorLayout::PackedDHWIO;
+    d.dims.resize(2);
+    // OC first, the axis every consumer of a padded conv blob reads for shape
+    // inference; group_elems is a multiple of OC/G, so OC divides the total.
+    d.dims[0] = OC;
+    d.dims[1] = g.total / OC;
+    d.row_stride_elems = d.dims[1];
+    return d;
+}
+
+void conv3d_packed_weight_pack(const Conv3DAttributes& attrs, const TensorView& weight,
+                               TensorView& packed, const ComputeContext& ctx)
+{
+    const int64_t OC = weight.shape(4);
+    const int64_t ICG = weight.shape(3);
+    const int64_t G = attrs.groups;
+    const int64_t OCG = OC / G;
+    const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1] * attrs.kernel_size[2];
+    const int64_t kdim = ICG * karea;
+    NNOPS_ASSERT(weight.stride_elems(4) == 1 && weight.stride_elems(3) == OC &&
+                 weight.stride_elems(2) == ICG * OC &&
+                 "conv3d_packed_weight_pack: the filter has no matrix reading");
+
+    if (weight.data_type() == DataType::s8) {
+        conv3d_packed_weight_pack_i8(attrs, weight, packed, ctx);
+        return;
+    }
+
+    const DataType dt = weight.data_type();
+    const int64_t esz = static_cast<int64_t>(data_type_size(dt));
+    const Conv3DPackedWeight g = conv3d_packed_weight_geom(karea, ICG, OCG, G, dt);
+    NNOPS_ASSERT(g.total > 0 && packed.numel() >= g.total &&
+                 "conv3d_packed_weight_pack: the buffer does not match the geometry");
+
+    // Row k = tap·IC/G + ic of a group's B is the filter's (tap, ic) row, of
+    // which this group owns one OC/G run. matmul's pack splits its panels over
+    // the pool, so the groups go one after another rather than nested inside a
+    // group-parallel run.
+    char* const blob = static_cast<char*>(packed.ptr<void>());
+    const char* const src = static_cast<const char*>(weight.ptr<void>());
+    for (int64_t gi = 0; gi < G; ++gi) {
+        const int64_t raw_shape[] = {kdim, OCG};
+        const TensorView raw(std::span<const int64_t>(raw_shape, 2), dt,
+                             const_cast<char*>(src) + gi * OCG * esz, OC * esz,
+                             TensorLayout::Dense);
+        const int64_t dst_shape[] = {OCG, g.group_elems / OCG};
+        TensorView dst(std::span<const int64_t>(dst_shape, 2), dt,
+                       blob + gi * g.group_elems * esz, (g.group_elems / OCG) * esz,
+                       TensorLayout::PackedB);
+        matmul_packed_b_pack(raw, dst, /*transpose_b=*/false, ctx);
+    }
+}
+
+TensorView conv3d_weight_group(const TensorView& weight, const Conv3DGeom& gm, int64_t g)
+{
+    const DataType dt = weight.data_type();
+    const int64_t esz = static_cast<int64_t>(data_type_size(dt));
+    const int64_t kdim = gm.IC_per_G * gm.karea();
+    const int64_t shape[] = {kdim, gm.OC_per_G};
+    char* const base = const_cast<char*>(static_cast<const char*>(weight.ptr<void>()));
+
+    if (is_packed_conv3d_weight(weight.layout())) {
+        const Conv3DPackedWeight pg =
+            conv3d_packed_weight_geom(gm.karea(), gm.IC_per_G, gm.OC_per_G, gm.G, dt);
+        char* const at = base + g * pg.group_elems * esz;
+        if (dt == DataType::s8) {
+            return TensorView(std::span<const int64_t>(shape, 2), dt, at,
+                              gm.OC_per_G * esz, TensorLayout::Dense, weight.quant_params());
+        }
+        const int64_t pshape[] = {gm.OC_per_G, pg.group_elems / gm.OC_per_G};
+        return TensorView(std::span<const int64_t>(pshape, 2), dt, at,
+                          (pg.group_elems / gm.OC_per_G) * esz, TensorLayout::PackedB,
+                          weight.quant_params());
+    }
+    return TensorView(std::span<const int64_t>(shape, 2), dt, base + g * gm.OC_per_G * esz,
+                      weight.stride_elems(3) * esz, TensorLayout::Dense);
+}
 
 Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
                   std::span<const TensorView> inputs, const ComputeContext& ctx,
@@ -404,24 +539,43 @@ Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
 {
     const auto& input = inputs[0];
     const auto& weight = inputs[1];
+    const bool packed = is_packed_conv3d_weight(weight.layout());
 
     Conv3DGeom gm{};
     fill_conv_axes<3>(gm, attrs, input, output);
     gm.N = input.shape(0);
     gm.IC = input.shape(4);
-    gm.OC = weight.shape(0);
-    gm.IC_per_G = weight.shape(1);
     gm.G = attrs.groups;
-    gm.OC_per_G = gm.OC / gm.G;
+    if (packed) {
+        // A blob leads with OC and has no channel axis left; IC/G is the
+        // activation's split (the blob's own K is checked against it below).
+        gm.OC = weight.shape(0);
+        gm.IC_per_G = gm.IC / gm.G;
+    } else {
+        gm.OC = weight.shape(4);
+        gm.IC_per_G = weight.shape(3);
+    }
+    gm.OC_per_G = gm.G > 0 ? gm.OC / gm.G : 0;
+    if (packed) {
+        // The blob must describe this call's K, or MatMul would read a panel
+        // packed for another depth.
+        const Conv3DPackedWeight pg =
+            conv3d_packed_weight_geom(gm.karea(), gm.IC_per_G, gm.OC_per_G, gm.G,
+                                      weight.data_type());
+        if (pg.total <= 0 || weight.numel() != pg.total) {
+            return Status::invalid_argument;
+        }
+    }
 
     if (weight.data_type() == DataType::s8) {
         return conv3d_i8_cpu(attrs, output, inputs, ctx);
     }
+    Status st = Status::ok;
     dispatch_f32_f16(input.data_type(), "conv3d_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
-        conv3d_impl<T>(gm, output, inputs, ctx);
+        st = conv3d_impl<T>(gm, output, inputs, ctx);
     });
-    return Status::ok;
+    return st;
 }
 
 } // namespace nnops::backend::cpu

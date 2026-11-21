@@ -9,8 +9,8 @@
 /// row stride wider than its row, which is what selects the staged write pass
 /// and the gather fallback respectively.
 ///
-/// Input:   [N, ID, IH, IW, IC] (channel-last)
-/// Weight:  [OC, IC/G, KD, KH, KW]
+/// Input:   [N, ID, IH, IW, IC] (channel-last, NDHWC)
+/// Weight:  [KD, KH, KW, IC/G, OC] (DHWIO — TensorFlow's conv3d filter)
 /// Output:  [N, OD, OH, OW, OC]
 
 #include "nnops/ops/conv3d.hpp"
@@ -26,12 +26,38 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <thread>
 #include <vector>
 #include <cstdint>
 
 using namespace nnops;
+
+/// Pool sizes the threaded cases run under. `NNOPS_TEST_THREADS` (a comma list,
+/// e.g. "1,2,3,4,5,6") overrides the defaults — the test-side twin of the
+/// benches' NNOPS_BENCH_THREADS.
+static std::vector<int> test_thread_counts(std::initializer_list<int> defaults)
+{
+    const char* s = std::getenv("NNOPS_TEST_THREADS");
+    if (s == nullptr) {
+        return std::vector<int>(defaults);
+    }
+    std::vector<int> out;
+    for (const char* p = s; *p != '\0';) {
+        char* end = nullptr;
+        const long v = std::strtol(p, &end, 10);
+        if (end == p) { // a separator, not a number
+            ++p;
+            continue;
+        }
+        if (v > 0 && v <= 1024) {
+            out.push_back(static_cast<int>(v));
+        }
+        p = end;
+    }
+    return out.empty() ? std::vector<int>(defaults) : out;
+}
 
 // Defined in tests/reference/; the dense-order scalar golden.
 namespace nnops::backend::cpu::reference {
@@ -76,25 +102,49 @@ static void init_rows(TensorView& v, const std::vector<float>& seed, int64_t row
     }
 }
 
+/// Query (empty outputs), allocate, pack — the two-step prepack contract,
+/// returning the blob view.
+static TensorView prepack_filter(Conv3D& op, const TensorView& weight,
+                                 std::vector<uint8_t>& blob)
+{
+    TensorView q;
+    const TensorView wi[] = {weight};
+    TensorView wq[] = {q};
+    op.prepackWeights(wi, wq);
+    q = wq[0];
+    NNOPS_EXPECT_TRUE(q.rank() > 0);
+    blob.assign(q.storage_bytes(), 0);
+    TensorView pv(q.shape_span(), q.data_type(), blob.data(), q.pitch(), q.layout(),
+                  q.quant_params());
+    TensorView pf[] = {pv};
+    op.prepackWeights(wi, pf);
+    return pv;
+}
+
 /// One case against the scalar golden. `residual` fills the destination with a
 /// mixed-sign tensor first, so add_to's two orders cannot agree by accident.
 /// `pitch_w` gives the filter rows a wider stride (the gather fallback) and
 /// `pitch_out` does the same to the output rows (the staged write pass).
+/// `packed` hands the operator the prepacked blob instead of the raw filter.
 static void test_vs_ref(const std::vector<int64_t>& in_shape,
                         const std::vector<int64_t>& w_shape,
                         const Conv3DAttributes& attrs,
                         bool has_bias = false,
                         bool residual = false,
                         bool pitch_w = false,
-                        bool pitch_out = false)
+                        bool pitch_out = false,
+                        bool packed = false)
 {
     const int64_t N = in_shape[0];
     const int64_t IC = in_shape[1];
     const int64_t in_spatial = in_shape[2] * in_shape[3] * in_shape[4];
-    const int64_t OC = w_shape[0];
+    const int64_t OC = w_shape[4];
 
     auto [in_vec, in_cf] = test::make_random_tensor(in_shape);
     auto [w_vec,  w_view]  = test::make_random_tensor(w_shape);
+    // The operator takes the filter tagged DHWIO; the reference reads the same
+    // element order densely.
+    TensorView w_dhwio(w_shape, DataType::f32, w_vec.data(), TensorLayout::DHWIO);
     std::vector<float> b_vec;
     TensorView b_view;
     if (has_bias) {
@@ -111,10 +161,10 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
     // A pitched filter: same values, rows pushed apart. The operator has to notice
     // it cannot read the filter as one flat matrix.
     std::vector<float> w_pad;
-    TensorView w_op = w_view;
+    TensorView w_op = w_dhwio;
     if (pitch_w) {
-        const int64_t row_len = w_view.row_stride_elems();
-        const int64_t rows = w_view.numel() / row_len;
+        const int64_t row_len = w_dhwio.row_stride_elems();
+        const int64_t rows = w_dhwio.numel() / row_len;
         const int64_t pitch =
             ((row_len * static_cast<int64_t>(sizeof(float)) + 31) / 32) * 32 + 32;
         w_pad.assign(static_cast<size_t>(rows * (pitch / 4)), 0.0f);
@@ -123,17 +173,23 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
                         w_pad.data() + r * (pitch / 4));
         }
         w_op = TensorView(std::span<const int64_t>(w_shape), DataType::f32,
-                          w_pad.data(), pitch);
+                          w_pad.data(), pitch, TensorLayout::DHWIO);
     }
 
     auto op = Conv3D::create(attrs, Backend::CPU);
 
+    std::vector<uint8_t> blob;
+    TensorView w_use = w_op;
+    if (packed) {
+        w_use = prepack_filter(*op, w_op, blob);
+    }
+
     std::vector<TensorDesc> out_descs;
     if (has_bias) {
-        const TensorDesc d[] = {in_view.desc(), w_view.desc(), b_view.desc()};
+        const TensorDesc d[] = {in_view.desc(), w_use.desc(), b_view.desc()};
         out_descs = op->getOutputTensorDesc(d);
     } else {
-        const TensorDesc d[] = {in_view.desc(), w_view.desc()};
+        const TensorDesc d[] = {in_view.desc(), w_use.desc()};
         out_descs = op->getOutputTensorDesc(d);
     }
 
@@ -172,10 +228,10 @@ static void test_vs_ref(const std::vector<int64_t>& in_shape,
         TensorView outs[] = {out};
         ComputeContext ctx;
         if (has_bias) {
-            const TensorView ins[] = {in_view, w_op, b_view};
+            const TensorView ins[] = {in_view, w_use, b_view};
             NNOPS_EXPECT_EQ(op->compute(outs, ins, ctx), Status::ok);
         } else {
-            const TensorView ins[] = {in_view, w_op};
+            const TensorView ins[] = {in_view, w_use};
             NNOPS_EXPECT_EQ(op->compute(outs, ins, ctx), Status::ok);
         }
     }
@@ -206,14 +262,14 @@ NNOPS_TEST(conv3d_kernel1x1_exact) {
     // Input [1, 2, 2, 2, 2] all 3.0; weight [OC=1, IC=2, 1, 1, 1] = {2.0, 3.0},
     // bias 1.0, so every output voxel is 3·2 + 3·3 + 1 = 16.
     const int64_t ishape[] = {1, 2, 2, 2, 2};
-    const int64_t wshape[] = {1, 2, 1, 1, 1};
+    const int64_t wshape[] = {1, 1, 1, 2, 1}; // DHWIO: one tap, two channels
     const int64_t bshape[] = {1};
 
     std::vector<float> in_data(16, 3.0f);
     std::vector<float> w_data = {2.0f, 3.0f};
     std::vector<float> b_data = {1.0f};
     TensorView in_view(ishape, DataType::f32, in_data.data(), TensorLayout::NDHWC);
-    TensorView w_view(wshape, DataType::f32, w_data.data());
+    TensorView w_view(wshape, DataType::f32, w_data.data(), TensorLayout::DHWIO);
     TensorView b_view(bshape, DataType::f32, b_data.data());
 
     Conv3DAttributes attrs;
@@ -248,7 +304,8 @@ NNOPS_TEST(conv3d_output_shape_formula) {
 
     auto op = Conv3D::create(attrs, Backend::CPU);
     auto [in_vec, in_dense] = test::make_random_tensor({1, 4, 5, 6, 7});
-    auto [w_vec,  w_view]   = test::make_random_tensor({3, 4, 3, 4, 2});
+    auto [w_vec,  w_dense]  = test::make_random_tensor({3, 4, 2, 4, 3}); // DHWIO
+    TensorView w_view(w_dense.shape_span(), DataType::f32, w_vec.data(), TensorLayout::DHWIO);
     // Channel-last: [N, ID, IH, IW, IC].
     const int64_t ishape[] = {1, 5, 6, 7, 4};
     TensorView in_view(ishape, DataType::f32, in_vec.data(), TensorLayout::NDHWC);
@@ -271,7 +328,7 @@ NNOPS_TEST(conv3d_k3_pad1) {
     attrs.kernel_size = {3, 3, 3};
     attrs.padding     = {1, 1, 1};
 
-    test_vs_ref({1, 8, 4, 5, 6}, {16, 8, 3, 3, 3}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 8, 4, 5, 6}, {3, 3, 3, 8, 16}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(conv3d_k2_stride2) {
@@ -280,7 +337,7 @@ NNOPS_TEST(conv3d_k2_stride2) {
     attrs.stride      = {2, 2, 2};
     attrs.padding     = {0, 0, 0};
 
-    test_vs_ref({2, 8, 4, 6, 6}, {8, 8, 2, 2, 2}, attrs);
+    test_vs_ref({2, 8, 4, 6, 6}, {2, 2, 2, 8, 8}, attrs);
 }
 
 NNOPS_TEST(conv3d_grouped) {
@@ -290,7 +347,7 @@ NNOPS_TEST(conv3d_grouped) {
     attrs.padding     = {0, 1, 0};
     attrs.groups      = 4;
 
-    test_vs_ref({1, 12, 3, 4, 3}, {20, 3, 2, 3, 2}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 12, 3, 4, 3}, {2, 3, 2, 3, 20}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(conv3d_depthwise) {
@@ -300,7 +357,7 @@ NNOPS_TEST(conv3d_depthwise) {
     attrs.padding     = {1, 1, 1};
     attrs.groups      = 8;
 
-    test_vs_ref({1, 8, 3, 4, 4}, {8, 1, 3, 3, 3}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 8, 3, 4, 4}, {3, 3, 3, 1, 8}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(conv3d_dilated) {
@@ -309,21 +366,21 @@ NNOPS_TEST(conv3d_dilated) {
     attrs.dilation    = {2, 2, 2};
     attrs.padding     = {1, 1, 1};
 
-    test_vs_ref({1, 4, 4, 4, 4}, {6, 4, 2, 3, 2}, attrs);
+    test_vs_ref({1, 4, 4, 4, 4}, {2, 3, 2, 4, 6}, attrs);
 }
 
 NNOPS_TEST(conv3d_pointwise) {
     // 1x1x1 stride 1: the input plane is A, with no gather at all.
     Conv3DAttributes attrs;
 
-    test_vs_ref({1, 16, 2, 3, 5}, {8, 16, 1, 1, 1}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 16, 2, 3, 5}, {1, 1, 1, 16, 8}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(conv3d_pointwise_blocked) {
     // The same shortcut with the pixel blocks split across the depth axis.
     Conv3DAttributes attrs;
 
-    test_vs_ref({2, 32, 5, 3, 3}, {16, 32, 1, 1, 1}, attrs);
+    test_vs_ref({2, 32, 5, 3, 3}, {1, 1, 1, 32, 16}, attrs);
 }
 
 NNOPS_TEST(conv3d_residual_post_act) {
@@ -334,7 +391,7 @@ NNOPS_TEST(conv3d_residual_post_act) {
     attrs.epilogue    = {EpilogueActivateType::Relu6};
     attrs.add_to      = true;
 
-    test_vs_ref({1, 8, 3, 4, 4}, {8, 8, 3, 3, 3}, attrs, /*has_bias=*/true,
+    test_vs_ref({1, 8, 3, 4, 4}, {3, 3, 3, 8, 8}, attrs, /*has_bias=*/true,
                 /*residual=*/true);
 }
 
@@ -344,7 +401,7 @@ NNOPS_TEST(conv3d_multiblock) {
     attrs.kernel_size = {3, 3, 3};
     attrs.padding     = {1, 1, 1};
 
-    test_vs_ref({1, 16, 4, 10, 10}, {16, 16, 3, 3, 3}, attrs, /*has_bias=*/true);
+    test_vs_ref({1, 16, 4, 10, 10}, {3, 3, 3, 16, 16}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(conv3d_row_split) {
@@ -354,7 +411,7 @@ NNOPS_TEST(conv3d_row_split) {
     attrs.kernel_size = {5, 5, 5};
     attrs.padding     = {2, 2, 2};
 
-    test_vs_ref({1, 256, 2, 2, 40}, {8, 256, 5, 5, 5}, attrs);
+    test_vs_ref({1, 256, 2, 2, 40}, {5, 5, 5, 256, 8}, attrs);
 }
 
 NNOPS_TEST(conv3d_pitched_output) {
@@ -363,7 +420,7 @@ NNOPS_TEST(conv3d_pitched_output) {
     attrs.kernel_size = {3, 3, 3};
     attrs.padding     = {1, 1, 1};
 
-    test_vs_ref({1, 8, 3, 4, 5}, {8, 8, 3, 3, 3}, attrs, /*has_bias=*/true,
+    test_vs_ref({1, 8, 3, 4, 5}, {3, 3, 3, 8, 8}, attrs, /*has_bias=*/true,
                 /*residual=*/true, /*pitch_w=*/false, /*pitch_out=*/true);
 }
 
@@ -373,8 +430,42 @@ NNOPS_TEST(conv3d_pitched_weight) {
     attrs.kernel_size = {3, 3, 3};
     attrs.padding     = {1, 1, 1};
 
-    test_vs_ref({1, 8, 3, 4, 5}, {8, 8, 3, 3, 3}, attrs, /*has_bias=*/true,
+    test_vs_ref({1, 8, 3, 4, 5}, {3, 3, 3, 8, 8}, attrs, /*has_bias=*/true,
                 /*residual=*/false, /*pitch_w=*/true);
+}
+
+NNOPS_TEST(conv3d_prepacked_filter) {
+    // The blob is the same arithmetic in another arrangement, so every shape
+    // family the raw path takes has to agree with the scalar golden: a k3, the
+    // pointwise 1x1x1, a grouped case (one group's B is a column slice) and a
+    // depthwise one (OC/G = 1, i.e. one 1-wide panel), plus the staged write.
+    Conv3DAttributes k3;
+    k3.kernel_size = {3, 3, 3};
+    k3.padding = {1, 1, 1};
+    test_vs_ref({1, 8, 3, 4, 5}, {3, 3, 3, 8, 8}, k3, /*has_bias=*/true, false, false,
+                false, /*packed=*/true);
+
+    Conv3DAttributes pointwise;
+    test_vs_ref({1, 16, 2, 3, 5}, {1, 1, 1, 16, 8}, pointwise, /*has_bias=*/true, false,
+                false, false, /*packed=*/true);
+
+    Conv3DAttributes grouped;
+    grouped.kernel_size = {2, 3, 2};
+    grouped.stride = {1, 2, 1};
+    grouped.padding = {0, 1, 0};
+    grouped.groups = 4;
+    test_vs_ref({1, 12, 3, 4, 3}, {2, 3, 2, 3, 20}, grouped, /*has_bias=*/true, false,
+                false, false, /*packed=*/true);
+
+    Conv3DAttributes depthwise;
+    depthwise.kernel_size = {3, 3, 3};
+    depthwise.padding = {1, 1, 1};
+    depthwise.groups = 8;
+    test_vs_ref({1, 8, 3, 4, 4}, {3, 3, 3, 1, 8}, depthwise, /*has_bias=*/true, false,
+                false, false, /*packed=*/true);
+
+    test_vs_ref({1, 8, 3, 4, 5}, {3, 3, 3, 8, 8}, k3, /*has_bias=*/true,
+                /*residual=*/true, false, /*pitch_out=*/true, /*packed=*/true);
 }
 
 NNOPS_TEST(conv3d_f16) {
@@ -385,7 +476,7 @@ NNOPS_TEST(conv3d_f16) {
     attrs.padding     = {1, 1, 1};
 
     const std::vector<int64_t> in_shape = {1, 8, 3, 4, 4};
-    const std::vector<int64_t> w_shape  = {16, 8, 3, 3, 3};
+    const std::vector<int64_t> w_shape  = {3, 3, 3, 8, 16}; // DHWIO
     const int64_t in_spatial = in_shape[2] * in_shape[3] * in_shape[4];
 
     auto [in_vec, in_f32] = test::make_random_tensor(in_shape);
@@ -401,12 +492,14 @@ NNOPS_TEST(conv3d_f16) {
     // Dense dims for the reference [N, IC, ID, IH, IW].
     const int64_t in_dims_cf[] = {in_shape[0], in_shape[1], in_shape[2], in_shape[3], in_shape[4]};
     auto op = Conv3D::create(attrs, Backend::CPU);
-    const TensorDesc d[] = {in_f32.desc(), w_f32.desc()};
+    TensorView w_f32_dhwio(w_f32.shape_span(), DataType::f32, w_vec.data(),
+                           TensorLayout::DHWIO);
+    const TensorDesc d[] = {in_f32.desc(), w_f32_dhwio.desc()};
     const auto descs = op->getOutputTensorDesc(d);
     const auto numel = static_cast<size_t>(descs[0].numel());
     const int64_t N = in_shape[0];
     const int64_t IC = in_shape[1];
-    const int64_t OC = w_shape[0];
+    const int64_t OC = w_shape[4];
     // [N, OD, OH, OW, OC]
     const int64_t out_spatial = descs[0].dims[1] * descs[0].dims[2] * descs[0].dims[3];
     const int64_t ref_dims5[] = {N, OC, descs[0].dims[1], descs[0].dims[2], descs[0].dims[3]};
@@ -424,7 +517,8 @@ NNOPS_TEST(conv3d_f16) {
 
     auto in16_cl = test::to_channel_last<half>(in16, N, IC, in_spatial);
     TensorView in16_view(in_dims, DataType::f16, in16_cl.data(), TensorLayout::NDHWC);
-    TensorView w16_view(w_shape, DataType::f16, const_cast<half*>(w16.data()));
+    TensorView w16_view(w_shape, DataType::f16, const_cast<half*>(w16.data()),
+                        TensorLayout::DHWIO);
     std::vector<half> out16(numel);
     TensorView out16_view(descs[0].dims, DataType::f16, out16.data(),
                           TensorLayout::NDHWC);
@@ -488,14 +582,16 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
     // writes rows of its own, so a thread count may only change accumulation
     // order. The residual puts the staged write pass under the comparison.
     const std::vector<int64_t> in_shape = {2, 16, 4, 8, 8};
-    const std::vector<int64_t> w_shape  = {32, 16, 3, 3, 3};
+    const std::vector<int64_t> w_shape  = {3, 3, 3, 16, 32}; // DHWIO
     const int64_t N = in_shape[0];
     const int64_t IC = in_shape[1];
     const int64_t in_spatial = in_shape[2] * in_shape[3] * in_shape[4];
 
     auto [in_vec, in_dense] = test::make_random_tensor(in_shape);
-    auto [w_vec,  w_view]   = test::make_random_tensor(w_shape);
+    auto [w_vec,  w_dense]  = test::make_random_tensor(w_shape);
+    TensorView w_view(w_shape, DataType::f32, w_vec.data(), TensorLayout::DHWIO);
     (void)in_dense;
+    (void)w_dense;
 
     auto in_cl = test::to_channel_last<float>(in_vec, N, IC, in_spatial);
     // Channel-last dims: [N, ID, IH, IW, IC].
@@ -531,7 +627,7 @@ NNOPS_TEST(conv3d_threaded_matches_serial) {
         NNOPS_EXPECT_EQ(op->compute(outs, ins, ComputeContext{}), Status::ok);
     }
 
-    for (int nt : {2, 4, 20}) {
+    for (int nt : test_thread_counts({2, 4, 20})) {
         std::vector<float> out_buf = seed;
         TensorView out = test::make_channel_first(out_descs[0], out_buf.data());
         init_rows(out, seed, out_row);
@@ -614,8 +710,9 @@ struct QCase3 {
 
 /// Run one quantized case through the kernel and the NDHWC reference on the
 /// same stored values; an integer destination must agree bit for bit, an fp one
-/// within a small relative tolerance.
-std::string run_q_case(const QCase3& c, const ComputeContext& ctx = {})
+/// within a small relative tolerance. @p packed hands the kernel the prepacked
+/// blob instead of the raw filter.
+std::string run_q_case(const QCase3& c, const ComputeContext& ctx = {}, bool packed = false)
 {
     const int64_t in_n = c.n * c.id * c.ih * c.iw * c.ic;
     const int64_t icg = c.icg;
@@ -697,16 +794,22 @@ std::string run_q_case(const QCase3& c, const ComputeContext& ctx = {})
     auto op = Conv3D::create(attrs, Backend::CPU);
 
     const int64_t ish[] = {c.n, c.id, c.ih, c.iw, c.ic};
-    const int64_t wsh[] = {OC, icg, c.k[0], c.k[1], c.k[2]};
+    const int64_t wsh[] = {c.k[0], c.k[1], c.k[2], icg, OC}; // DHWIO
     const int64_t bsh[] = {OC};
     TensorView in(ish, c.act, act_buf.data(), TensorLayout::NDHWC, qa);
-    TensorView wt(wsh, DataType::s8, w_buf.data(), TensorLayout::Dense, qw);
+    TensorView wt(wsh, DataType::s8, w_buf.data(), TensorLayout::DHWIO, qw);
     const DataType bdt = int_out ? DataType::s32 : c.out;
     TensorView bv(bsh, bdt, bias_buf.empty() ? nullptr : bias_buf.data());
 
     std::vector<TensorView> ins = {in, wt};
     if (c.bias) {
         ins.push_back(bv);
+    }
+    // The oracle always reads the raw filter; the kernel may get the blob.
+    const std::vector<TensorView> ref_ins = ins;
+    std::vector<uint8_t> blob;
+    if (packed) {
+        ins[1] = prepack_filter(*op, wt, blob);
     }
     std::vector<TensorDesc> descs;
     for (const auto& v : ins) {
@@ -720,7 +823,7 @@ std::string run_q_case(const QCase3& c, const ComputeContext& ctx = {})
     {
         TensorView ref_out(std::span<const int64_t>(od[0].dims.data(), 5), odt, ref_buf.data(),
                            TensorLayout::NDHWC, qo);
-        nnops::backend::cpu::reference::conv3d_int8_ref(attrs, ref_out, ins, ctx, nullptr);
+        nnops::backend::cpu::reference::conv3d_int8_ref(attrs, ref_out, ref_ins, ctx, nullptr);
     }
 
     std::vector<uint8_t> op_buf(od[0].nbytes(), 0);
@@ -795,7 +898,7 @@ NNOPS_TEST(conv3d_int8_threaded_matches_serial) {
     if (!serial.empty()) {
         throw std::runtime_error("conv3d int8 serial: " + serial);
     }
-    for (int nt : {2, 4}) {
+    for (int nt : test_thread_counts({2, 4})) {
         SimplePool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
@@ -807,15 +910,42 @@ NNOPS_TEST(conv3d_int8_threaded_matches_serial) {
     }
 }
 
+NNOPS_TEST(conv3d_int8_prepacked) {
+    // The s8 blob keeps each group's dense matrix, so every activation dtype
+    // reads it: u8 (the QLinearConv pair), s8 against an fp destination, and a
+    // grouped filter whose groups are column slices.
+    QCase3 base;
+    base.bias = true;
+    base.ep = EpilogueActivateType::Relu;
+
+    for (int variant = 0; variant < 3; ++variant) {
+        QCase3 c = base;
+        if (variant == 1) {
+            c.act = DataType::s8;
+            c.zp_x = -3;
+            c.out = DataType::f32;
+        } else if (variant == 2) {
+            c.groups = 2;
+            c.icg = c.ic / 2;
+            c.asym_w = true;
+        }
+        const std::string diff = run_q_case(c, ComputeContext{}, /*packed=*/true);
+        if (!diff.empty()) {
+            throw std::runtime_error("conv3d int8 prepacked (variant " +
+                                     std::to_string(variant) + "): " + diff);
+        }
+    }
+}
+
 NNOPS_TEST(conv3d_int8_refusals) {
     std::vector<uint8_t> a(1 * 2 * 2 * 2 * 4, 0);
     std::vector<int8_t> w(4 * 4 * 1 * 1 * 1, 1);
     std::vector<uint8_t> o(1 * 2 * 2 * 2 * 4, 0);
 
     const int64_t ish[] = {1, 2, 2, 2, 4};
-    const int64_t wsh[] = {4, 4, 1, 1, 1};
+    const int64_t wsh[] = {1, 1, 1, 4, 4}; // DHWIO
     TensorView in(ish, DataType::u8, a.data(), TensorLayout::NDHWC);
-    TensorView wt(wsh, DataType::s8, w.data(), TensorLayout::Dense);
+    TensorView wt(wsh, DataType::s8, w.data(), TensorLayout::DHWIO);
 
     // add_to has no residual stage on the integer path.
     {
@@ -841,6 +971,25 @@ NNOPS_TEST(conv3d_int8_refusals) {
         TensorView out(ish, DataType::f32, of.data(), TensorLayout::NDHWC);
         TensorView outs[] = {out};
         const TensorView ins[] = {in_fp, wt};
+        NNOPS_EXPECT_EQ(op->compute(outs, ins, ComputeContext{}, nullptr),
+                        Status::invalid_argument);
+    }
+
+    // A blob packed for another K is refused rather than misread as panels.
+    {
+        Conv3DAttributes attrs;
+        attrs.kernel_size = {1, 1, 1};
+        auto op = Conv3D::create(attrs, Backend::CPU);
+        std::vector<uint8_t> blob;
+        const TensorView packed = prepack_filter(*op, wt, blob);
+
+        std::vector<uint8_t> a8(1 * 2 * 2 * 2 * 8, 0);
+        std::vector<uint8_t> o8(1 * 2 * 2 * 2 * 4, 0);
+        const int64_t ish8[] = {1, 2, 2, 2, 8};
+        TensorView in8(ish8, DataType::u8, a8.data(), TensorLayout::NDHWC);
+        TensorView out(ish, DataType::u8, o8.data(), TensorLayout::NDHWC);
+        TensorView outs[] = {out};
+        const TensorView ins[] = {in8, packed};
         NNOPS_EXPECT_EQ(op->compute(outs, ins, ComputeContext{}, nullptr),
                         Status::invalid_argument);
     }

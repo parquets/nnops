@@ -2,9 +2,16 @@
 /// @file conv3d.hpp
 /// @brief 3D convolution over NDHWC activations.
 ///
-/// Input [N, ID, IH, IW, IC] (channel-last), weight [OC, IC/G, KD, KH, KW]
-/// (ONNX-style, also when grouped), output [N, OD, OH, OW, OC], optional
-/// bias [OC]. Grouped and dilated.
+/// Input [N, ID, IH, IW, IC] (channel-last), weight [KD, KH, KW, IC/G, OC] —
+/// TensorFlow's conv3d filter, the shape *is* the filter and the output
+/// channel is contiguous — output [N, OD, OH, OW, OC], optional bias [OC].
+/// Grouped and dilated. The activation and the filter order must pair (see
+/// validate()).
+///
+/// compute() takes the raw filter, or the blob prepackWeights() built for it
+/// (PackedDHWIO). The prepack is the caller's decision because it allocates
+/// the buffer; it is what lets a repeated call skip the per-call B pack, and a
+/// prepacked filter is refused by every input it was not packed for.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -86,12 +93,24 @@ public:
     Status validate(std::span<const TensorDesc> inputs,
                     std::span<const TensorDesc> outputs) const override;
 
+    /// inputs: [0] input, [1] weight (raw DHWIO filter, or the blob
+    /// prepackWeights() produced), [2] optional bias [OC].
     using OpBase::compute;
 
     Status compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
+
+    /// Pack the filter into the GEMM's B once, for compute() to read in place
+    /// (layout PackedDHWIO): an empty outputs[0] queries the descriptor, a
+    /// populated one receives the pack. inputs[0] is the raw filter; the query
+    /// needs no activation, since the geometry follows from the attributes and
+    /// the filter's own dims. f32/f16 and s8 filters only — any other dtype
+    /// queries an empty view.
+    void prepackWeights(std::span<const TensorView> inputs,
+                        std::span<TensorView> outputs,
+                        const ComputeContext& ctx = {}) override;
 
     OpType  getOpType()  const override { return OpType::Conv3D; }
     Backend getBackend() const override { return backend_; }
