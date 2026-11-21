@@ -473,6 +473,50 @@ NNOPS_BENCH(cuda_conv2d_splitk_sweep) {
     }
 }
 
+/// The 1x1 route against the conv kernel it replaces: the pixel axis as the
+/// GEMM's M, the channels as K, the HWIO filter's rows as B. Both arms are the
+/// same call with `detail::cuda_conv_pw` flipped, order-flipped per repetition.
+NNOPS_BENCH(cuda_conv2d_pointwise) {
+    print_cuda_header("CUDA Conv2D 1x1: implicit-GEMM conv kernel vs the dense GEMM");
+    struct Pw { int64_t n, ic, oc, side; DataType dt; };
+    const Pw cases[] = {
+        // One plane, the channel depth as the variable: K is the reduction and
+        // N the output width, and the two engines cross over somewhere in here.
+        {1, 64, 256, 112, DataType::f16},
+        {1, 128, 128, 112, DataType::f16},
+        {1, 256, 256, 112, DataType::f16},
+        {1, 512, 512, 112, DataType::f16},
+        // The plane as the variable at K = N = 256.
+        {1, 256, 256, 56, DataType::f16},
+        {1, 256, 256, 28, DataType::f16},
+        {1, 256, 256, 224, DataType::f16},
+        // f32 twins, and the tail plane.
+        {1, 64, 256, 112, DataType::f32},
+        {1, 256, 256, 112, DataType::f32},
+        {1, 256, 256, 224, DataType::f32},
+        {1, 512, 512, 7, DataType::f16},
+        {1, 512, 512, 7, DataType::f32},
+    };
+    for (const Pw& w : cases) {
+        ConvBenchCase c;
+        c.n = w.n; c.ic = w.ic; c.oc = w.oc; c.ih = c.iw = w.side;
+        c.kh = c.kw = 1; c.ph = c.pw = 0; c.dtype = w.dt;
+        const char* label = w.dt == DataType::f32 ? "f32" : "f16";
+        double best[2] = {0.0, 0.0};
+        for (int rep = 0; rep < 4; ++rep) {
+            for (int arm = 0; arm < 2; ++arm) {
+                const int a = (rep & 1) ? 1 - arm : arm;
+                nnops::detail::cuda_conv_pw.store(a == 0 ? 0 : 1, std::memory_order_relaxed);
+                best[a] = std::max(best[a], run_conv(c, label, false, 8));
+            }
+        }
+        nnops::detail::cuda_conv_pw.store(-1, std::memory_order_relaxed);
+        std::printf("  %-4s %-34s conv %8.0f gemm %8.0f GFLOPS  %.2fx\n", label,
+                    conv_geometry(c, "nhwc").c_str(), best[0], best[1],
+                    best[1] / best[0]);
+    }
+}
+
 NNOPS_BENCH(cuda_conv2d_f16) {
     print_cuda_header("CUDA Conv2D f16 (tensor core)");
     run_table(DataType::f16, "f16");

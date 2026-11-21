@@ -180,6 +180,24 @@ NNOPS_TEST(cuda_conv2d_f16_add_to) {
     c.ic = 8; c.oc = 16; c.dtype = DataType::f16;
     c.use_bias = true; c.add_to = true; c.epilogue = ep;
     run_case(c, "cuda_conv2d_f16_add_to");
+
+    // The same write-back where the 1x1 route lands: on the dense GEMM add_to
+    // is the epilogue's residual pointer, and the clip bounds are its own.
+    Epilogue pe;
+    pe.type = EpilogueActivateType::LeakyRelu;
+    pe.alpha = 0.1f;
+    pe.min_clip = -1.0f;
+    pe.max_clip = 1.0f;
+
+    ConvCase p;
+    p.ic = 32; p.oc = 48; p.kh = p.kw = 1; p.ph = p.pw = 0;
+    p.dtype = DataType::f16;
+    p.use_bias = true; p.add_to = true; p.epilogue = pe;
+    run_case(p, "cuda_conv2d_f16_add_to");
+
+    ConvCase q = p;
+    q.dtype = DataType::f32;
+    run_case(q, "cuda_conv2d_f16_add_to");
 }
 
 NNOPS_TEST(cuda_conv2d_wide_channels) {
