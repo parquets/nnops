@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 using namespace nnops;
@@ -60,8 +61,13 @@ std::vector<float> roi_align_ref(const std::vector<float>& x, int64_t N, int64_t
         if (a.coordinate_mode == RoiAlignCoordinateMode::HalfPixel) {
             sw -= 0.5f; sh -= 0.5f; ew -= 0.5f; eh -= 0.5f;
         }
-        const float rw = ew - sw;
-        const float rh = eh - sh;
+        float rw = ew - sw;
+        float rh = eh - sh;
+        if (a.coordinate_mode == RoiAlignCoordinateMode::OutputHalfPixel) {
+            // The ONNX reference's 1x1 floor for legacy coordinates.
+            rw = std::max(rw, 1.0f);
+            rh = std::max(rh, 1.0f);
+        }
         const float bw = rw / static_cast<float>(OW);
         const float bh = rh / static_cast<float>(OH);
         const int64_t gh = a.sampling_ratio > 0
@@ -158,6 +164,33 @@ NNOPS_TEST(roi_align_hand_2x2_to_1x1) {
         // samples (1.0, 1.0), clamped to the bottom-right pixel.
         NNOPS_EXPECT_NEAR(out_data[0], mode == 0 ? 2.5f : 4.0f, 1e-6f);
     }
+}
+
+NNOPS_TEST(roi_align_legacy_clamps_degenerate_roi) {
+    // A 0.2-wide ROI in legacy coordinates is forced to 1x1, so the single
+    // sample sits at (0.5, 0.5) — the 2x2 image mean (the ONNX reference's rule).
+    const int64_t xs[] = {1, 2, 2, 1};
+    float x_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    TensorView x(xs, DataType::f32, x_data, TensorLayout::NHWC);
+    float rois_data[] = {0.0f, 0.0f, 0.2f, 0.2f};
+    const int64_t rs[] = {1, 4};
+    TensorView rois(rs, DataType::f32, rois_data);
+
+    RoiAlignAttributes attrs;
+    attrs.output_height = 1;
+    attrs.output_width = 1;
+    attrs.sampling_ratio = 1;
+    attrs.coordinate_mode = RoiAlignCoordinateMode::OutputHalfPixel;
+    auto op = RoiAlign::create(attrs, Backend::CPU);
+
+    const TensorDesc descs[] = {x.desc(), rois.desc()};
+    auto desc = op->getOutputTensorDesc(descs);
+    float out_data[1] = {};
+    TensorView out(std::span<const int64_t>(desc[0].dims.data(), 4), DataType::f32, out_data,
+                   TensorLayout::NHWC);
+    const TensorView ins[] = {x, rois};
+    NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::ok);
+    NNOPS_EXPECT_NEAR(out_data[0], 2.5f, 1e-6f);
 }
 
 NNOPS_TEST(roi_align_hand_2x2_to_2x2) {
@@ -272,6 +305,35 @@ NNOPS_TEST(roi_align_bad_batch_index_is_zero) {
     const TensorView ins[] = {x, rois, batch};
     NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::ok);
     NNOPS_EXPECT_NEAR(out_data[0], 0.0f, 1e-6f);
+}
+
+NNOPS_TEST(roi_align_non_finite_roi_is_zero) {
+    // A NaN coordinate cannot index the image: its taps are all outside, so the
+    // ROI comes back as zeros rather than an out-of-range load.
+    const int64_t xs[] = {1, 2, 2, 1};
+    float x_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    TensorView x(xs, DataType::f32, x_data, TensorLayout::NHWC);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    float rois_data[] = {nan, 0.0f, 2.0f, 2.0f};
+    const int64_t rs[] = {1, 4};
+    TensorView rois(rs, DataType::f32, rois_data);
+
+    RoiAlignAttributes attrs;
+    attrs.output_height = 2;
+    attrs.output_width = 2;
+    attrs.sampling_ratio = 2;
+    auto op = RoiAlign::create(attrs, Backend::CPU);
+
+    const TensorDesc descs[] = {x.desc(), rois.desc()};
+    auto desc = op->getOutputTensorDesc(descs);
+    std::vector<float> out_data(static_cast<size_t>(desc[0].numel()), 9.0f);
+    TensorView out(std::span<const int64_t>(desc[0].dims.data(), 4), DataType::f32,
+                   out_data.data(), TensorLayout::NHWC);
+    const TensorView ins[] = {x, rois};
+    NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::ok);
+    for (float v : out_data) {
+        NNOPS_EXPECT_NEAR(v, 0.0f, 1e-6f);
+    }
 }
 
 NNOPS_TEST(roi_align_f16_matches_f32) {

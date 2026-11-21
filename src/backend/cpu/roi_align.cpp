@@ -105,8 +105,13 @@ void roi_align_impl(const RoiAlignAttributes& attrs, TensorView& output,
             end_h -= 0.5f;
         }
 
-        const float roi_w = end_w - start_w;
-        const float roi_h = end_h - start_h;
+        float roi_w = end_w - start_w;
+        float roi_h = end_h - start_h;
+        if (!half_pixel) {
+            // Force malformed (degenerate) ROIs to 1x1, as the ONNX reference does.
+            roi_w = std::max(roi_w, 1.0f);
+            roi_h = std::max(roi_h, 1.0f);
+        }
         const float bin_w = roi_w / static_cast<float>(OW);
         const float bin_h = roi_h / static_cast<float>(OH);
 
@@ -140,8 +145,11 @@ void roi_align_impl(const RoiAlignAttributes& attrs, TensorView& output,
                                 static_cast<float>(grid_w);
 
                         // Outside the padded image the bilinear tap is zero.
-                        if (y < -1.0f || y > static_cast<float>(H) || x < -1.0f ||
-                            x > static_cast<float>(W)) {
+                        // Written as a positive test so a NaN coordinate (a
+                        // malformed ROI) also lands here instead of reaching
+                        // floor() and an out-of-range index.
+                        if (!(y >= -1.0f && y <= static_cast<float>(H) && x >= -1.0f &&
+                              x <= static_cast<float>(W))) {
                             if (max_mode) {
                                 for (int64_t c = 0; c < C; ++c) {
                                     acc[c] = std::max(acc[c], 0.0f);

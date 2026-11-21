@@ -16,13 +16,18 @@
 ///   pulled in by 0.5 (the aligned form of torchvision's roi_align); the bin
 ///   size is (end - start) / outputs, and bin (ph, pw) samples
 ///   grid_h × grid_w points, with grid = sampling_ratio when it is positive
-///   and ceil(roi size / output size) when it is 0.
+///   and ceil(roi size / output size) when it is 0. OutputHalfPixel keeps the
+///   corners as given and clamps a degenerate ROI to at least 1×1, as the
+///   ONNX reference, onnxruntime and torchvision's aligned=False all do.
 ///
 /// The bilinear tap is the ONNX one: a sample outside `[-1, H] × [-1, W]` is
 /// zero, a sample clamped to the far border takes the border pixel, and the
-/// four weights are the usual separable products. Rois may overlap, and a
-/// batch index outside [0, N) writes zeros for that ROI rather than aborting
-/// the call — batch indices live in data, which validate() cannot see.
+/// four weights are the usual separable products. `Max` takes the maximum of
+/// the interpolated sample values (torchvision's reading); onnxruntime's CPU
+/// kernel instead maxes a sample's four weighted taps, which is not an
+/// interpolated value, and that outlier is not copied here. Rois may overlap,
+/// and a batch index outside [0, N) writes zeros for that ROI rather than
+/// aborting the call — batch indices live in data, which validate() cannot see.
 ///
 /// This is the detection / crop head a 3D-perception or VLA pipeline needs
 /// between the backbone and the policy: crop boxes out of a feature pyramid,
