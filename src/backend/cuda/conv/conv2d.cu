@@ -26,6 +26,12 @@
 /// the epilogue once. That is what takes 14x14x256 k3 from 0.21 to 0.066 ms and
 /// the 7x7x512 tail from 0.059 to 0.023 ms.
 ///
+/// A 1x1 filter at unit stride is never gathered at all: it is the dense GEMM's
+/// `[pixels][IC] x [IC][OC]` with the activation row as A, so
+/// conv_pointwise_gemm hands that pose to the matmul engine — its shallow tile,
+/// which is the shape a short-K product wants — once the reduction is deep
+/// enough to beat this kernel. Everything below that threshold stays here.
+///
 /// f32, f16 and bf16 in the dense kernels; a Winograd weight never reaches them
 /// (the dispatch refuses it) and a prepacked filter is opaque to them. The
 /// quantized family (an s8 filter against a pre-quantized u8/s8 activation) is
@@ -37,6 +43,7 @@
 #include "conv2d_common.cuh" // params, A-tile row walk, tap decode, split-K planner
 #include "conv2d_i8.cuh"      // the quantized route's entry
 #include "../matmul/gemm_common.cuh"
+#include "../matmul/matmul_op.cuh" // the dense GEMM the 1x1 route borrows
 #include "../matmul/matmul_f16.cuh"
 #include "../matmul/matmul_f32.cuh"
 #include "conv_panel.cuh"
@@ -704,6 +711,110 @@ inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
     }
 }
 
+/// Where the two engines cross, measured on the pointwise shapes (f16 and f32,
+/// `bench_cuda_conv2d pointwise`): the dense GEMM wins once the reduction is
+/// deep enough to amortise its pipeline and the plane is wide enough to fill its
+/// grid. 112x112x512 is 1.19x and 224x224x256 1.11x; 112x112x128, the 28x28 and
+/// 56x56 planes and the 7x7 tail all lose, because the conv kernel's split-K
+/// covers a starved grid with work the GEMM's own cut does not.
+constexpr int kConvPointwiseMinIc = 256;
+constexpr int64_t kConvPointwiseMinPixels = 4096;
+
+/// A 1x1 filter at unit stride, no padding and one group is a plain GEMM, the
+/// same reduction the CPU route takes as its pointwise plan: the pixel axis is
+/// M, the channels are K, and the HWIO filter's `[IC][OC]` rows are B n-major.
+///
+/// The conv kernel would still gather that A row tap by tap through a
+/// shared-memory panel and carry the split-K planner; the dense engine reads the
+/// activation row itself, with its own tile and its own k cut. Only a dense NHWC
+/// activation and output can be posed as one matrix, which is what the strides
+/// below test — an NHWC view is dense by contract, but a caller can still hand a
+/// sliced one.
+///
+/// Returns false when the call is outside the pose; the conv kernel runs then.
+bool conv_pointwise_gemm(const Conv2DAttributes& attrs, const TensorView& act,
+                         const TensorView& wgt, TensorView& output,
+                         const TensorView* bias, cudaStream_t stream)
+{
+    if (attrs.kernel_size[0] != 1 || attrs.kernel_size[1] != 1 ||
+        attrs.stride[0] != 1 || attrs.stride[1] != 1 ||
+        attrs.dilation[0] != 1 || attrs.dilation[1] != 1 ||
+        attrs.padding[0] != 0 || attrs.padding[1] != 0 || attrs.groups != 1) {
+        return false;
+    }
+    const int knob = ::nnops::detail::cuda_conv_pw.load(std::memory_order_relaxed);
+    if (knob == 0) {
+        return false;
+    }
+
+    const int64_t ic = act.shape(3);
+    const int64_t oc = output.shape(3);
+    const int64_t iw = act.shape(2);
+    const int64_t ih = act.shape(1);
+    const int64_t ow = output.shape(2);
+    const int64_t oh = output.shape(1);
+    // A: pixels x channels, one row per pixel; C: the same rows of the output.
+    if (act.stride_elems(3) != 1 || act.stride_elems(2) != ic ||
+        act.stride_elems(1) != iw * ic || act.stride_elems(0) != ih * iw * ic) {
+        return false;
+    }
+    if (output.stride_elems(3) != 1 || output.stride_elems(2) != oc ||
+        output.stride_elems(1) != ow * oc || output.stride_elems(0) != oh * ow * oc) {
+        return false;
+    }
+    // B n-major: HWIO's oc axis contiguous and its ic row OC long.
+    if (wgt.stride_elems(3) != 1 || wgt.stride_elems(2) != oc) {
+        return false;
+    }
+
+    const int64_t m = act.shape(0) * ih * iw;
+    if (m <= 0 || m > (int64_t(1) << 30) || ic <= 0 || oc <= 0) {
+        return false;
+    }
+    // The knob's 1 forces the arm through this gate so a bench can price both
+    // engines on a shape the rule declines; the automatic route stops here.
+    if (knob < 0 && (ic < kConvPointwiseMinIc || m < kConvPointwiseMinPixels)) {
+        return false;
+    }
+
+    GemmParams p;
+    p.a = act.ptr<void>();
+    p.b = wgt.ptr<void>();
+    p.c = output.ptr<void>();
+    p.m = static_cast<int>(m);
+    p.n = static_cast<int>(oc);
+    p.k = static_cast<int>(ic);
+    p.lda = ic;
+    p.ldb = oc;
+    p.ldc = oc;
+    p.alpha = 1.0f;
+    p.beta = 0.0f;
+    p.bias = bias != nullptr ? bias->ptr<void>() : nullptr;
+    p.bias_row = false;
+    p.epilogue = attrs.epilogue.type;
+    p.ep_alpha = attrs.epilogue.alpha;
+    p.ep_beta = attrs.epilogue.beta;
+    p.min_clip = attrs.epilogue.min_clip;
+    p.max_clip = attrs.epilogue.max_clip;
+    // add_to reads the destination back after the activation, which is exactly
+    // what the dense epilogue's residual pointer does (CUDA refuses the
+    // pre-activation form, so there is no other order to honour).
+    if (attrs.add_to) {
+        p.residual = output.ptr<void>();
+        p.ldr = oc;
+    }
+
+    // A pointwise product is short-K and narrow-N, and the f16 table's default
+    // 128x128 tile is the wrong shape for it: on 50176x256x256 the shallow
+    // 32x32 row reaches 20.3 TFLOPS where the default reaches 5.3 (cuBLAS 32.8),
+    // because the big tile spends a three-stage prologue on a k loop with a
+    // handful of steps. The f32 table numbers its rows differently, so that
+    // route keeps its own pick.
+    const int tile = act.data_type() == DataType::f32 ? -1 : kF16TileShallow;
+    return dense_gemm_status(p, act.data_type(), /*transpose_a=*/false,
+                             /*transpose_b=*/false, stream, tile) == Status::ok;
+}
+
 } // namespace
 
 Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
@@ -738,6 +849,11 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
     if (is_packed_conv_weight(wgt.layout()) || is_wino_weight(wgt.layout()) ||
         is_cuda_conv_weight(wgt.layout())) {
         return Status::unsupported;
+    }
+
+    const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
+    if (conv_pointwise_gemm(attrs, act, wgt, output, bias, stream)) {
+        return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
     }
 
     ConvParams p;
@@ -819,7 +935,6 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
         return Status::unsupported;
     }
 
-    const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     if (dt == DataType::bf16) {
         launch_conv_h<__nv_bfloat16>(p, stream);
     } else if (esz == 2) {

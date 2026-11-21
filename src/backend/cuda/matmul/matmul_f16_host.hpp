@@ -12,6 +12,13 @@
 
 namespace nnops::backend::cuda {
 
+/// The shallow-grid row of the f16 tile table: a 32x32 warp tile on four warps,
+/// which lives four blocks to an SM instead of two. It is the row a short-K,
+/// narrow-N product wants — the 128x128 default spends a three-stage prologue
+/// on a k loop that only has a few steps to amortise it — and it is named here
+/// because the table itself is private to the kernel translation units.
+inline constexpr int kF16TileShallow = 5;
+
 /// The poses the hand-written kernel covers today: A `[M, K]` row-major, B
 /// k-major `[N, K]` or n-major `[K, N]`, alpha 1, no bias, no epilogue, f16 or
 /// bf16 in and out.

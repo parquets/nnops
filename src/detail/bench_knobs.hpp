@@ -24,6 +24,10 @@ inline std::atomic<int> pooling_3x3_roll{0};
 /// the same rules as the auto choice).
 inline std::atomic<int> cuda_splitk{-1};
 
+/// CUDA Conv2D's 1x1 route: -1 automatic, 0 keep the implicit-GEMM conv kernel,
+/// 1 hand the unit-stride 1x1 to the dense GEMM.
+inline std::atomic<int> cuda_conv_pw{-1};
+
 /// CPU int8: 1 hides NEON i8mm (SMMLA) so the SDOT route is taken. The feature
 /// scan runs once, so set this before the first CpuFeatures::get().
 inline std::atomic<int> disable_i8mm{0};
