@@ -14,7 +14,7 @@
 /// The geometry is one struct for both: the routes read the same numbers and
 /// only disagree on what an element is.
 
-#include "backend/cpu/conv/conv_geom.h"
+#include "backend/cpu/conv/conv_util.h"
 #include "backend/cpu/conv/transpose_conv_common.h"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -25,15 +25,9 @@
 
 namespace nnops::backend::cpu {
 
-/// One transposed convolution's geometry, read off the tensors once. The axes
-/// and the epilogue flags are conv_geom.h's; the channels are this operator's.
-struct Geom : ConvAxes {
-    int64_t N, IC, IC_per_G, OC_per_G, OC, G;
-};
-
 /// The quantized family's entry (transpose_conv2d_i8.cpp): s8 weights only; the
 /// activation ladder and the output ladder are the route's own.
-Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs, const Geom& gm,
+Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs, const ConvChannels& gm,
                                  TensorView& output, std::span<const TensorView> inputs,
                                  const ComputeContext& ctx);
 

@@ -50,11 +50,6 @@ namespace {
 using nnops::kernel::tiled_im2col_3d;
 using nnops::kernel::tiled_im2col_3d_i8;
 
-/// Largest col one GEMM call may materialise in the serial arm; the task-grid
-/// arm gives each concurrent task a slice (mirrors the float route).
-constexpr int64_t kColCapBytes = 8 << 20;
-constexpr int64_t kMinTaskColBytes = int64_t{64} << 10;
-
 /// A conv activation is per-tensor: the arrays collapse to element 0, which is
 /// what the gather and the compensation read (Conv2D does the same).
 QuantParams per_tensor(const QuantParams& q)
@@ -82,7 +77,7 @@ QuantParams group_params(const QuantParams& q, int64_t off, int64_t n)
 
 /// The quantized im2col → MatMulInteger route. False when the operands have no
 /// flat form (the caller refuses).
-bool conv3d_i8_col_gemm(const Conv3DAttributes& attrs, const Conv3DGeom& gm, TensorView& output,
+bool conv3d_i8_col_gemm(const Conv3DAttributes& attrs, const ConvChannels& gm, TensorView& output,
                         std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& act = inputs[0];
@@ -270,13 +265,7 @@ bool conv3d_i8_col_gemm(const Conv3DAttributes& attrs, const Conv3DGeom& gm, Ten
 
     const int64_t workers = std::max<int64_t>(ctx.cpu.worker_count(), 1);
     const int64_t ng = gm.N * gm.G;
-    const int grant = [&] {
-        static const int v = [] {
-            const char* s = std::getenv("NNOPS_CONV3D_GRID");
-            return s != nullptr ? std::atoi(s) : -1;
-        }();
-        return v;
-    }();
+    const int grant = conv3d_grid_override();
     // The GEMM's own block grid, roughly (see the float route): a per-group
     // GEMM narrower than the pool runs as a task instead.
     const int64_t gemm_blocks =
@@ -286,7 +275,8 @@ bool conv3d_i8_col_gemm(const Conv3DAttributes& attrs, const Conv3DGeom& gm, Ten
 
     const Conv3DBlock blk = conv3d_choose_block(
         gm, kdim, esz_blk,
-        task_grid ? std::max<int64_t>(kColCapBytes / workers, kMinTaskColBytes) : kColCapBytes);
+        task_grid ? std::max<int64_t>(kConv3dColCapBytes / workers, kConv3dMinTaskColBytes)
+                  : kConv3dColCapBytes);
 
     if (!task_grid) {
         const int64_t nblk_max = blk.od_chunk * blk.roi_h * gm.OW;
@@ -393,32 +383,16 @@ Status conv3d_i8_cpu(const Conv3DAttributes& attrs, TensorView& output,
         }
     }
 
-    Conv3DGeom gm{};
+    ConvChannels gm{};
     fill_conv_axes<3>(gm, attrs, act, output);
-    gm.N = act.shape(0);
-    gm.IC = act.shape(4);
     gm.G = attrs.groups;
-    const bool packed = is_packed_conv3d_weight(wgt.layout());
-    if (packed) {
-        gm.OC = wgt.shape(0);
-        gm.IC_per_G = gm.IC / gm.G;
-    } else {
-        gm.OC = wgt.shape(4); // DHWIO: [KD][KH][KW][IC/G][OC]
-        gm.IC_per_G = wgt.shape(3);
-    }
-    gm.OC_per_G = gm.G > 0 ? gm.OC / gm.G : 0;
-    if (gm.G <= 0 || gm.OC_per_G <= 0 || gm.IC_per_G <= 0) {
+    if (!conv3d_fill_channels(gm, act, wgt)) {
         return Status::unsupported;
     }
-    if (packed) {
-        // The blob must describe this call's K, or MatMul would read a group
-        // packed for another depth.
-        const Conv3DPackedWeight pg =
-            conv3d_packed_weight_geom(gm.karea(), gm.IC_per_G, gm.OC_per_G, gm.G,
-                                      DataType::s8);
-        if (pg.total <= 0 || wgt.numel() != pg.total) {
-            return Status::invalid_argument;
-        }
+    // The blob must describe this call's K, or MatMul would read a group packed
+    // for another depth.
+    if (is_packed_conv3d_weight(wgt.layout()) && !conv3d_packed_blob_matches(wgt, gm)) {
+        return Status::invalid_argument;
     }
 
     if (!conv3d_i8_col_gemm(attrs, gm, output, inputs, ctx)) {

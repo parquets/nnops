@@ -61,7 +61,7 @@ namespace {
 /// scatter reads is the input plane. The skeleton — the repack to [KH·KW][C],
 /// the row scratch, the merge — is transpose_conv_common.h's; only the walk is 2-D.
 template <typename T>
-bool tconv2d_depthwise(const Geom& gm, TensorView& output,
+bool tconv2d_depthwise(const ConvChannels& gm, TensorView& output,
                                     std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     if (gm.IC_per_G != 1 || gm.OC_per_G != 1) {
@@ -99,7 +99,7 @@ bool tconv2d_depthwise(const Geom& gm, TensorView& output,
 /// The chunk skeleton is transpose_conv_common.h's; only the walk is 2-D.
 /// Returns false when the operands cannot be read as flat matrices.
 template <typename T>
-bool tconv2d_gemm(const Geom& gm, TensorView& output,
+bool tconv2d_gemm(const ConvChannels& gm, TensorView& output,
                                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -136,7 +136,7 @@ bool tconv2d_gemm(const Geom& gm, TensorView& output,
 }
 
 template <typename T>
-void tconv2d_impl(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
+void tconv2d_impl(const ConvChannels& gm, TensorView& output, std::span<const TensorView> inputs,
                   const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -441,7 +441,7 @@ Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs, TensorView& 
     const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
-    Geom gm{};
+    ConvChannels gm{};
     fill_conv_axes<2>(gm, attrs, input, output);
     gm.N = input.shape(0);
     // Channel-last [N, IH, IW, IC]; the filter is [IC, OC/G, KH, KW].

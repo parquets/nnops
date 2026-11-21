@@ -30,7 +30,7 @@
 #include "nnops/ops/conv1d.hpp"
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "backend/cpu/conv/conv1d_common.h"
+#include "backend/cpu/conv/conv_util.h"
 #include "common/bench_harness.hpp"
 #include "common/channel_last.hpp"
 #include "common/cpu_pool.hpp"

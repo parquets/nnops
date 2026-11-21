@@ -18,6 +18,7 @@
 ///     s8/u8              -> depthwise_conv_i8.cpp (dwconv_quant_run)
 
 #include "depthwise_conv_internal.h"
+#include "conv_util.h"
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -47,42 +48,14 @@ void dwconv_fp_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
     const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
     const bool add_to = attrs.add_to && !pre_act;
 
-    const int64_t rank = input.rank();
-    const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
-
+    const int64_t srank = DepthwiseConvAttributes::spatial_rank(input.rank());
     const int64_t N = input.shape(0);
     const int64_t C = input.shape(input.rank() - 1);
-
-    const int64_t ID = (srank == 3) ? input.shape(1) : 1;
-    const int64_t IH = input.shape(srank - 1);
-    const int64_t IW = input.shape(srank);
     const int64_t OD = (srank == 3) ? output.shape(1) : 1;
     const int64_t OH = output.shape(srank - 1);
     const int64_t OW = output.shape(srank);
 
-    k::DwConvParams p{};
-    p.ID = ID;
-    p.IH = IH;
-    p.IW = IW;
-    p.OH = OH;
-    p.OW = OW;
-    p.KD = attrs.kernel_size[0];
-    p.KH = attrs.kernel_size[1];
-    p.KW = attrs.kernel_size[2];
-    p.SD = attrs.stride[0];
-    p.SH = attrs.stride[1];
-    p.SW = attrs.stride[2];
-    p.DD = attrs.dilation[0];
-    p.DH = attrs.dilation[1];
-    p.DW = attrs.dilation[2];
-    p.PD = attrs.padding[0];
-    p.PH = attrs.padding[1];
-    p.PW = attrs.padding[2];
-    p.out_row_stride = output.row_stride_elems();
-    p.in_row_stride = input.row_stride_elems();
-    p.in_d_stride = IH * p.in_row_stride;
-    p.pix_stride = C;   // a pixel holds all C channels, and so does a tap
-    p.w_tap_stride = C; // the raw HWCM filter is [tap][C]
+    const k::DwConvParams p = dwconv_params(attrs, input, output);
 
     // Sixteen channels a chunk: a pixel's sixteen f32 are one 64-byte line, so
     // the block sweep touches every line exactly once. An eight-channel chunk
@@ -107,61 +80,33 @@ void dwconv_fp_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
     // L2 stays resident across the sweep.
     const int64_t hgroups = (OH + 3) / 4;
     const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH; // rows a group reads
-    constexpr int64_t kStripBytes = 128 * 1024;
-    int64_t strip = OW;
-    {
-        const int64_t per_col = in_rows * C * static_cast<int64_t>(sizeof(T));
-        const int64_t cols = (per_col > 0) ? kStripBytes / per_col : OW;
-        if (cols < p.SW * OW) {
-            const int64_t w = (cols - (p.KW - 1) * p.DW) / p.SW;
-            strip = std::clamp<int64_t>(w & ~int64_t{15}, 16, OW);
-        }
-    }
+    const int64_t strip = conv_strip_cols(in_rows, C, static_cast<int64_t>(sizeof(T)), OW,
+                                          p.KW, p.DW, p.SW);
     const int64_t strips = (OW + strip - 1) / strip;
     const int64_t groups = N * OD * hgroups * strips;
-    const int64_t nt = ctx.cpu.thread_count();
     // The filter axis splits a group only when the grid cannot fill the pool;
-    // one chunk keeps the block loop inside the task and the strip in cache. The
-    // split is picked by makespan, not pool width: a count the pool cannot
-    // divide evenly costs a whole extra wave (21 tasks on 20 workers run in two).
-    int64_t chunks = 1;
-    if (groups < nt && nblocks > 1) {
-        int64_t best_cost = 0;
-        for (int64_t c = 1; c <= nblocks; ++c) {
-            const int64_t blocks_per = (nblocks + c - 1) / c;
-            const int64_t waves = (groups * c + nt - 1) / nt;
-            const int64_t cost = waves * blocks_per;
-            if (best_cost == 0 || cost < best_cost) {
-                best_cost = cost;
-                chunks = c;
-            }
-        }
-    }
+    // one chunk keeps the block loop inside the task and the strip in cache.
+    const int64_t chunks = conv_channel_chunks(groups, nblocks, ctx.cpu.thread_count());
     const int64_t blocks_per = (nblocks + chunks - 1) / chunks;
 
     ctx.cpu.run(0, groups * chunks, [&](int64_t tid) {
-        const int64_t cc = tid % chunks;
-        const int64_t g = tid / chunks;
-        const int64_t st = g % strips;
-        const int64_t hg = (g / strips) % hgroups;
-        const int64_t od = (g / (strips * hgroups)) % OD;
-        const int64_t n = g / (strips * hgroups * OD);
+        const ConvGridPos gp = conv_grid_pos(tid, strips, hgroups, OD, chunks);
 
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
         k::DwConvParams pc = p;
-        pc.od = od;
-        pc.oh = hg * 4;
-        pc.ow0 = st * strip;
+        pc.od = gp.od;
+        pc.oh = gp.hg * 4;
+        pc.ow0 = gp.st * strip;
         pc.ow_end = std::min(pc.ow0 + strip, OW);
 
-        const T* in_img = in_ptr + n * ID * p.in_d_stride;
+        const T* in_img = in_ptr + gp.n * p.ID * p.in_d_stride;
         // The kernel indexes the store by the absolute column, so the base stays
         // at the row start even though the loop covers only this strip.
-        T* out_rows =
-            out_ptr + n * OD * out_d_stride + od * out_d_stride + pc.oh * p.out_row_stride;
+        T* out_rows = out_ptr + gp.n * OD * out_d_stride + gp.od * out_d_stride +
+                      pc.oh * p.out_row_stride;
 
         const int64_t rows_here = std::min<int64_t>(4, OH - pc.oh);
-        const int64_t blk0 = cc * blocks_per;
+        const int64_t blk0 = gp.cc * blocks_per;
         const int64_t blk1 = std::min(blk0 + blocks_per, nblocks);
         for (int64_t blk = blk0; blk < blk1; ++blk) {
             const int64_t c0 = blk * chunk;

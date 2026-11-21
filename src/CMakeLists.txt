@@ -126,7 +126,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/conv/conv3d_implicit_gemm.cpp
     backend/cpu/conv/conv3d_implicit_gemm_i8.cpp
 
-    # Conv1D is the 2D GEMM kernel on a rank-4 lift (conv1d_common.h), so this
+    # Conv1D is the 2D GEMM kernel on a rank-4 lift (conv_util.h), so this
     # file only translates attributes; Pool1D lives with pooling.cpp.
     backend/cpu/conv/conv1d.cpp
 

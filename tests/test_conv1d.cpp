@@ -4,7 +4,7 @@
 /// Conv1D takes an NHWC activation [N, L, C] and an HWIO filter
 /// [K, IC/G, OC]. The oracle here is conv2d_ref handed a rank-4 dense
 /// view of the same logical values, with the lift written out locally rather
-/// than taken from conv1d_common.h — so a lift the operator got wrong cannot
+/// than taken from conv_util.h — so a lift the operator got wrong cannot
 /// hide behind the same mistake in the expectation.
 ///
 /// Covered: stride/dilation/padding and groups (including the depthwise

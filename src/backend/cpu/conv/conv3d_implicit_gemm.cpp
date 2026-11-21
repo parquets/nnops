@@ -69,32 +69,11 @@ using namespace nnops::simd;
 
 namespace {
 
-/// Largest col one GEMM call may materialise in the serial arm; past it the
-/// pixel block splits. The task-grid arm gives each concurrent task a slice.
-constexpr int64_t kColCapBytes = 8 << 20;
-/// Smallest per-task column budget the task grid will use.
-constexpr int64_t kMinTaskColBytes = int64_t{64} << 10;
-/// Largest staged output tile; only caps the oc chunk when the GEMM cannot
-/// write into the destination (a padded pitch, or add_to's live residual).
-constexpr int64_t kTileCapBytes = 4 << 20;
-
-/// `NNOPS_CONV3D_GRID=0/1` pins the dispatch for A/B: 0 the serial arm (the
-/// pool runs inside each GEMM), 1 the task grid (the pool runs over
-/// batch·group·blocks and each GEMM is serial). Read once.
-inline int conv3d_grid_override()
-{
-    static const int v = [] {
-        const char* s = std::getenv("NNOPS_CONV3D_GRID");
-        return s != nullptr ? std::atoi(s) : -1;
-    }();
-    return v;
-}
-
 /// im2col → GEMM. Status::unsupported (or out_of_memory) when the operands
 /// cannot be read as flat matrices, leaving the caller its gather; ok, or the
 /// GEMM's own error, otherwise.
 template <typename T>
-Status conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
+Status conv3d_im2col_gemm(const ConvChannels& gm, TensorView& output,
                           std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -226,7 +205,7 @@ Status conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
 
     if (!task_grid) {
         const Conv3DBlock blk =
-            conv3d_choose_block(gm, kdim, static_cast<int64_t>(sizeof(T)), kColCapBytes);
+            conv3d_choose_block(gm, kdim, static_cast<int64_t>(sizeof(T)), kConv3dColCapBytes);
         const int64_t nblk_max = blk.od_chunk * blk.roi_h * gm.OW;
         PoolArray<T> col(pointwise ? 0 : static_cast<size_t>(nblk_max * kdim));
         PoolArray<T> stage(direct ? 0 : static_cast<size_t>(nblk_max * gm.OC_per_G));
@@ -250,7 +229,7 @@ Status conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
     // One task per (batch, group, pixel block): a plane with many groups but few
     // pixels per group still fills the pool. Each task's GEMM is serial, so the
     // per-task column budget is a slice of the serial arm's cap.
-    const int64_t budget = std::max<int64_t>(kColCapBytes / workers, kMinTaskColBytes);
+    const int64_t budget = std::max<int64_t>(kConv3dColCapBytes / workers, kConv3dMinTaskColBytes);
     const Conv3DBlock blk =
         conv3d_choose_block(gm, kdim, static_cast<int64_t>(sizeof(T)), budget);
     const int64_t blocks_d = (gm.OD + blk.od_chunk - 1) / blk.od_chunk;
@@ -289,7 +268,7 @@ Status conv3d_im2col_gemm(const Conv3DGeom& gm, TensorView& output,
 /// The output-driven gather: every output voxel walks its own taps. Correct for
 /// every geometry, and the route a shape too odd for the col takes.
 template <typename T>
-void conv3d_gather(const Conv3DGeom& gm, TensorView& output, std::span<const TensorView> inputs,
+void conv3d_gather(const ConvChannels& gm, TensorView& output, std::span<const TensorView> inputs,
                    const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -375,7 +354,7 @@ inline bool prepacked_filter(std::span<const TensorView> inputs) noexcept
 }
 
 template <typename T>
-Status conv3d_impl(const Conv3DGeom& gm, TensorView& output, std::span<const TensorView> inputs,
+Status conv3d_impl(const ConvChannels& gm, TensorView& output, std::span<const TensorView> inputs,
                    const ComputeContext& ctx)
 {
     if (gm.N == 0 || gm.OC == 0 || gm.OD == 0 || gm.OH == 0 || gm.OW == 0) {
@@ -432,6 +411,13 @@ Conv3DPackedWeight conv3d_packed_weight_geom(int64_t karea, int64_t ic_per_group
     g.groups = groups;
     g.total = g.group_elems * groups;
     return g;
+}
+
+bool conv3d_packed_blob_matches(const TensorView& wgt, const ConvChannels& gm)
+{
+    const Conv3DPackedWeight pg = conv3d_packed_weight_geom(
+        gm.karea(), gm.IC_per_G, gm.OC_per_G, gm.G, wgt.data_type());
+    return pg.total > 0 && wgt.numel() == pg.total;
 }
 
 TensorDesc conv3d_packed_weight_desc(const Conv3DAttributes& attrs, const TensorDesc& weight)
@@ -508,7 +494,7 @@ void conv3d_packed_weight_pack(const Conv3DAttributes& attrs, const TensorView& 
     }
 }
 
-TensorView conv3d_weight_group(const TensorView& weight, const Conv3DGeom& gm, int64_t g)
+TensorView conv3d_weight_group(const TensorView& weight, const ConvChannels& gm, int64_t g)
 {
     const DataType dt = weight.data_type();
     const int64_t esz = static_cast<int64_t>(data_type_size(dt));
@@ -539,32 +525,17 @@ Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
 {
     const auto& input = inputs[0];
     const auto& weight = inputs[1];
-    const bool packed = is_packed_conv3d_weight(weight.layout());
 
-    Conv3DGeom gm{};
+    ConvChannels gm{};
     fill_conv_axes<3>(gm, attrs, input, output);
-    gm.N = input.shape(0);
-    gm.IC = input.shape(4);
     gm.G = attrs.groups;
-    if (packed) {
-        // A blob leads with OC and has no channel axis left; IC/G is the
-        // activation's split (the blob's own K is checked against it below).
-        gm.OC = weight.shape(0);
-        gm.IC_per_G = gm.IC / gm.G;
-    } else {
-        gm.OC = weight.shape(4);
-        gm.IC_per_G = weight.shape(3);
+    if (!conv3d_fill_channels(gm, input, weight)) {
+        return Status::unsupported;
     }
-    gm.OC_per_G = gm.G > 0 ? gm.OC / gm.G : 0;
-    if (packed) {
-        // The blob must describe this call's K, or MatMul would read a panel
-        // packed for another depth.
-        const Conv3DPackedWeight pg =
-            conv3d_packed_weight_geom(gm.karea(), gm.IC_per_G, gm.OC_per_G, gm.G,
-                                      weight.data_type());
-        if (pg.total <= 0 || weight.numel() != pg.total) {
-            return Status::invalid_argument;
-        }
+    // The blob must describe this call's K, or MatMul would read a panel packed
+    // for another depth.
+    if (is_packed_conv3d_weight(weight.layout()) && !conv3d_packed_blob_matches(weight, gm)) {
+        return Status::invalid_argument;
     }
 
     if (weight.data_type() == DataType::s8) {

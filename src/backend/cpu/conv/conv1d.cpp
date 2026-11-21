@@ -18,7 +18,7 @@
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/shape_inference.hpp"
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"
-#include "conv1d_common.h"
+#include "conv_util.h"
 
 #include <span>
 

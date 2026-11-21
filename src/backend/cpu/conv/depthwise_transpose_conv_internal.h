@@ -16,7 +16,7 @@
 /// (kw, shift) taps land on one output-column residue — are tap lists, not
 /// arithmetic, and both families walk them unchanged. They live here.
 
-#include "backend/cpu/conv/conv_geom.h"
+#include "backend/cpu/conv/conv_util.h"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/ops/depthwise_transpose_conv.hpp"
@@ -26,7 +26,7 @@
 
 namespace nnops::backend::cpu {
 
-/// The axes are conv_geom.h's; depthwise means one channel per group, so the
+/// The axes are conv_util.h's; depthwise means one channel per group, so the
 /// only extra member is that channel count.
 struct DwtConvGeom : ConvAxes {
     int64_t N = 0, C = 0;

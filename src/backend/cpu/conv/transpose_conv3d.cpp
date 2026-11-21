@@ -24,7 +24,7 @@
 /// The weight stays [IC, OC/G, KD, KH, KW].
 
 #include "nnops/ops/transpose_conv3d.hpp"
-#include "backend/cpu/conv/conv_geom.h"
+#include "backend/cpu/conv/conv_util.h"
 #include "backend/cpu/conv/transpose_conv_common.h"
 #include "nnops/core/parallel_for.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
@@ -40,13 +40,6 @@ using namespace nnops::simd;
 using namespace nnops::kernel;
 
 namespace {
-
-/// One transposed convolution's geometry, read off the tensors once. The axes
-/// and the epilogue flags are conv_geom.h's; the channels are this operator's.
-/// `col3_geom()` is the base's 3-D col2im view.
-struct Geom3 : ConvAxes {
-    int64_t N, IC, IC_per_G, OC_per_G, OC, G;
-};
 
 // =========================================================================
 //  NDHWC
@@ -70,7 +63,7 @@ struct Geom3 : ConvAxes {
 /// only the walk is 3-D. Returns false when the operands cannot be read as flat
 /// matrices.
 template <typename T>
-bool tconv3d_gemm(const Geom3& gm, TensorView& output,
+bool tconv3d_gemm(const ConvChannels& gm, TensorView& output,
                                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -118,7 +111,7 @@ bool tconv3d_gemm(const Geom3& gm, TensorView& output,
 /// input volume. The skeleton — the repack to [KD·KH·KW][C], the row scratch,
 /// the merge — is transpose_conv_common.h's; only the walk is 3-D.
 template <typename T>
-bool tconv3d_depthwise(const Geom3& gm, TensorView& output,
+bool tconv3d_depthwise(const ConvChannels& gm, TensorView& output,
                                     std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     if (gm.IC_per_G != 1 || gm.OC_per_G != 1) {
@@ -154,7 +147,7 @@ bool tconv3d_depthwise(const Geom3& gm, TensorView& output,
 /// The output-driven gather: every output voxel walks its own taps. Correct for
 /// every geometry and layout, and the route a shape too odd for the col takes.
 template <typename T>
-void tconv3d_gather(const Geom3& gm, TensorView& output, std::span<const TensorView> inputs,
+void tconv3d_gather(const ConvChannels& gm, TensorView& output, std::span<const TensorView> inputs,
                     const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
@@ -253,7 +246,7 @@ void tconv3d_gather(const Geom3& gm, TensorView& output, std::span<const TensorV
 }
 
 template <typename T>
-void tconv3d_impl(const Geom3& gm, TensorView& output, std::span<const TensorView> inputs,
+void tconv3d_impl(const ConvChannels& gm, TensorView& output, std::span<const TensorView> inputs,
                   const ComputeContext& ctx)
 {
     if (gm.N == 0 || gm.OC == 0 || gm.OD == 0 || gm.OH == 0 || gm.OW == 0) {
@@ -277,7 +270,7 @@ Status transpose_conv3d_cpu(const TransposeConv3DAttributes& attrs, TensorView& 
     const auto& input = inputs[0];
     const auto& weight = inputs[1];
 
-    Geom3 gm{};
+    ConvChannels gm{};
     fill_conv_axes<3>(gm, attrs, input, output);
     gm.N = input.shape(0);
     gm.IC = input.shape(4);

@@ -346,7 +346,7 @@ void dequant_oc_row_f32(float* dp, const Src* rp, int64_t nc, const float* w_sx,
 /// therefore held as (q_x − zp_x) and the encode stage is one row pass, no col
 /// and no GEMM.
 template <typename TOut>
-bool tconv2d_int8_depthwise(const Geom& gm, TensorView& output,
+bool tconv2d_int8_depthwise(const ConvChannels& gm, TensorView& output,
                                          std::span<const TensorView> inputs, const ActPlane& act,
                                          const ComputeContext& ctx)
 {
@@ -475,7 +475,7 @@ bool tconv2d_int8_depthwise(const Geom& gm, TensorView& output,
 /// the fp route's in-place orientation: its columns carry the per-channel
 /// parameters, which the raw [oc][tap] order does not line up with.
 template <typename TOut>
-bool tconv2d_int8(const Geom& gm, TensorView& output,
+bool tconv2d_int8(const ConvChannels& gm, TensorView& output,
                                std::span<const TensorView> inputs, const ActPlane& act,
                                const ComputeContext& ctx)
 {
@@ -644,7 +644,7 @@ bool tconv2d_int8(const Geom& gm, TensorView& output,
 /// operands cannot be read as flat matrices or the kernel is too tall for the
 /// per-row tap list.
 template <typename TOut>
-void tconv2d_int8_scalar(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
+void tconv2d_int8_scalar(const ConvChannels& gm, TensorView& output, std::span<const TensorView> inputs,
                          const ActPlane& act, const ComputeContext& ctx)
 {
     const auto& weight = inputs[1];
@@ -737,7 +737,7 @@ void tconv2d_int8_scalar(const Geom& gm, TensorView& output, std::span<const Ten
 }
 
 template <typename TOut>
-void tconv2d_int8_layout(const Geom& gm, TensorView& output, std::span<const TensorView> inputs,
+void tconv2d_int8_layout(const ConvChannels& gm, TensorView& output, std::span<const TensorView> inputs,
                          const ActPlane& act, const ComputeContext& ctx)
 {
     if (tconv2d_int8_depthwise<TOut>(gm, output, inputs, act, ctx)) {
@@ -752,7 +752,7 @@ void tconv2d_int8_layout(const Geom& gm, TensorView& output, std::span<const Ten
 /// One activation storage type of the quantized route: build the plane, then
 /// dispatch the output dtype.
 template <class TAct>
-Status tconv2d_int8_act(const TransposeConv2DAttributes& attrs, const Geom& gm, TensorView& output,
+Status tconv2d_int8_act(const TransposeConv2DAttributes& attrs, const ConvChannels& gm, TensorView& output,
                         std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
@@ -810,7 +810,7 @@ Status tconv2d_int8_act(const TransposeConv2DAttributes& attrs, const Geom& gm, 
 } // anonymous namespace
 
 /// dtype gate of the quantized route, then the activation dispatch.
-Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs, const Geom& gm,
+Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs, const ConvChannels& gm,
                                  TensorView& output, std::span<const TensorView> inputs,
                                  const ComputeContext& ctx)
 {

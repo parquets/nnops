@@ -18,23 +18,57 @@
 /// with the shared epilogue, the quantized one hands the whole
 /// dequantize/requantize to MatMul's output pass.
 
-#include "backend/cpu/conv/conv_geom.h"
+#include "backend/cpu/conv/conv_util.h"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/ops/conv3d.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 
 namespace nnops::backend::cpu {
 
-/// One convolution's geometry, read off the tensors once. The axes, the
-/// epilogue flags and karea()/npix() are conv_geom.h's; the channels are this
-/// operator's.
-struct Conv3DGeom : ConvAxes {
-    int64_t N = 0, IC = 0, IC_per_G = 0, OC_per_G = 0, OC = 0, G = 1;
-};
+/// Largest col one GEMM call may materialise in the serial arm; past it the
+/// pixel block splits. The task-grid arm gives each concurrent task a slice.
+inline constexpr int64_t kConv3dColCapBytes = 8 << 20;
+/// Smallest per-task column budget the task grid will use.
+inline constexpr int64_t kConv3dMinTaskColBytes = int64_t{64} << 10;
+
+/// `NNOPS_CONV3D_GRID=0/1` pins the dispatch for A/B: 0 the serial arm (the
+/// pool runs inside each GEMM), 1 the task grid (the pool runs over
+/// batch·group·blocks and each GEMM is serial). Read once.
+inline int conv3d_grid_override()
+{
+    static const int v = [] {
+        const char* s = std::getenv("NNOPS_CONV3D_GRID");
+        return s != nullptr ? std::atoi(s) : -1;
+    }();
+    return v;
+}
+
+/// The channel counts of one call. A raw DHWIO filter carries them at dims[3]
+/// (IC/G) and dims[4] (OC); a blob leads with OC and has no channel axis left,
+/// so IC/G is the activation's split. False when the counts cannot split.
+inline bool conv3d_fill_channels(ConvChannels& gm, const TensorView& act,
+                                 const TensorView& wgt) noexcept
+{
+    if (gm.G <= 0) {
+        return false;
+    }
+    gm.N = act.shape(0);
+    gm.IC = act.shape(4);
+    if (is_packed_conv3d_weight(wgt.layout())) {
+        gm.OC = wgt.shape(0);
+        gm.IC_per_G = gm.IC / gm.G;
+    } else {
+        gm.OC = wgt.shape(4);
+        gm.IC_per_G = wgt.shape(3);
+    }
+    gm.OC_per_G = gm.OC / gm.G;
+    return gm.IC_per_G > 0 && gm.OC_per_G > 0;
+}
 
 /// True when the filter reads as one dense [IC/G·KD·KH·KW][OC/G] matrix per
 /// group — the GEMM's B. DHWIO already stores a tap's channels-in/outputs as
@@ -42,7 +76,7 @@ struct Conv3DGeom : ConvAxes {
 /// (tap, ic, oc) is at (tap·IC/G + ic)·OC + oc, which is exactly row
 /// tap·IC/G + ic with a pitch of OC. A filter that departs from that (a padded
 /// pitch, a foreign layout) has no B reading and takes the scalar gather.
-inline bool conv3d_filter_is_matrix(const TensorView& w, const Conv3DGeom& gm) noexcept
+inline bool conv3d_filter_is_matrix(const TensorView& w, const ConvChannels& gm) noexcept
 {
     if (is_packed_conv3d_weight(w.layout())) {
         return true;
@@ -85,7 +119,11 @@ void conv3d_packed_weight_pack_i8(const Conv3DAttributes& attrs, const TensorVie
 
 /// Group @p g's B, [kdim][OC/G], from either the raw filter (a pitched view
 /// into the caller's tensor — no copy) or the prepacked blob.
-TensorView conv3d_weight_group(const TensorView& weight, const Conv3DGeom& gm, int64_t g);
+TensorView conv3d_weight_group(const TensorView& weight, const ConvChannels& gm, int64_t g);
+
+/// True when a prepacked blob's numel is the one this call's K needs — what
+/// keeps a blob packed for another depth from being read as panels.
+bool conv3d_packed_blob_matches(const TensorView& wgt, const ConvChannels& gm);
 
 /// The pixel block a col budget allows: whole depth slices while they fit,
 /// otherwise a run of rows inside one slice (the col's row stride is the
@@ -95,7 +133,7 @@ struct Conv3DBlock {
     int64_t roi_h = 1;
 };
 
-inline Conv3DBlock conv3d_choose_block(const Conv3DGeom& g, int64_t kdim, int64_t esz,
+inline Conv3DBlock conv3d_choose_block(const ConvChannels& g, int64_t kdim, int64_t esz,
                                        int64_t budget_bytes) noexcept
 {
     const int64_t cap = std::max<int64_t>(1, budget_bytes / std::max<int64_t>(esz, 1));

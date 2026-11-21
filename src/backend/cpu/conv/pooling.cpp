@@ -29,11 +29,12 @@
 ///       otherwise        -> pooling_impl       (lane on C)
 
 #include "pooling_internal.h"
+#include "conv_util.h"
 #include "nnops/ops/pooling.hpp"
 #include "nnops/ops/pool1d.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
-#include "conv1d_common.h"
+#include "conv_util.h"
 #include "nnops/core/parallel_for.hpp"
 #include "backend/cpu/simd_kernel/simd_pooling.hpp"
 
@@ -59,46 +60,14 @@ void pooling_impl(const PoolingAttributes& attrs, TensorView& output,
                                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
-    const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
-
-    const int64_t N = input.shape(0);
-    const int64_t C = input.shape(input.rank() - 1);
+    const PoolShape s = pool_shape(input, output);
+    const int64_t N = s.N, C = s.C, OD = s.OD, OH = s.OH, OW = s.OW;
     // Sixteen channels a chunk, not eight: a pixel's 16 f32 are one 64-byte
     // line, and a chunk spanning a whole line touches it once rather than
     // leaving the other half for the next chunk to fetch again.
     const int64_t nblocks = (C + 15) / 16;
 
-    const int64_t ID = (srank == 3) ? input.shape(1) : 1;
-    const int64_t IH = input.shape(srank - 1);
-    const int64_t IW = input.shape(srank);
-    const int64_t OD = (srank == 3) ? output.shape(1) : 1;
-    const int64_t OH = output.shape(srank - 1);
-    const int64_t OW = output.shape(srank);
-
-    k::PoolingKernelParams p{};
-    p.ID = ID;
-    p.IH = IH;
-    p.IW = IW;
-    p.OH = OH;
-    p.OW = OW;
-    p.KD = (srank == 3) ? attrs.kernel_shape[0] : 1;
-    p.KH = attrs.kernel_shape[1];
-    p.KW = attrs.kernel_shape[2];
-    p.SD = (srank == 3) ? attrs.stride[0] : 1;
-    p.SH = attrs.stride[1];
-    p.SW = attrs.stride[2];
-    p.DD = (srank == 3) ? attrs.dilation[0] : 1;
-    p.DH = attrs.dilation[1];
-    p.DW = attrs.dilation[2];
-    p.PD = (srank == 3) ? attrs.padding[0] : 0;
-    p.PH = attrs.padding[1];
-    p.PW = attrs.padding[2];
-    p.out_row_stride = output.row_stride_elems();
-    p.in_row_stride = input.row_stride_elems();
-    p.in_d_stride = IH * p.in_row_stride;
-    p.pix_stride = C; // a pixel is C channels wide
-    p.exclude_pad = attrs.exclude_pad;
-
+    const k::PoolingKernelParams p = pooling_params(attrs, s, input, output);
     const float avg_scale = 1.0f / static_cast<float>(p.KD * p.KH * p.KW);
 
     auto* out_ptr = output.ptr<T>();
@@ -109,56 +78,30 @@ void pooling_impl(const PoolingAttributes& attrs, TensorView& output,
     // it again, so the width is cut to fit L2 and stay resident across the sweep.
     const int64_t hgroups = (OH + 3) / 4; // four output rows per task
     const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH;
-    constexpr int64_t kStripBytes = 128 * 1024;
-    int64_t strip = OW;
-    {
-        const int64_t per_col = in_rows * C * static_cast<int64_t>(sizeof(T));
-        const int64_t cols = (per_col > 0) ? kStripBytes / per_col : OW;
-        if (cols < p.SW * OW) {
-            const int64_t w = (cols - (p.KW - 1) * p.DW) / p.SW;
-            strip = std::clamp<int64_t>(w & ~int64_t{15}, 16, OW);
-        }
-    }
+    const int64_t strip = conv_strip_cols(in_rows, C, static_cast<int64_t>(sizeof(T)), OW,
+                                          p.KW, p.DW, p.SW);
     const int64_t strips = (OW + strip - 1) / strip;
     const int64_t groups = N * OD * hgroups * strips;
-    const int64_t nt = ctx.cpu.thread_count();
-    int64_t cchunks = 1;
-    if (groups < nt && nblocks > 1) {
-        int64_t best_cost = 0;
-        for (int64_t c = 1; c <= nblocks; ++c) {
-            const int64_t blocks_per = (nblocks + c - 1) / c;
-            const int64_t waves = (groups * c + nt - 1) / nt;
-            const int64_t cost = waves * blocks_per;
-            if (best_cost == 0 || cost < best_cost) {
-                best_cost = cost;
-                cchunks = c;
-            }
-        }
-    }
+    const int64_t cchunks = conv_channel_chunks(groups, nblocks, ctx.cpu.thread_count());
     const int64_t blocks_per = (nblocks + cchunks - 1) / cchunks;
 
     ctx.cpu.run(0, groups * cchunks, [&](int64_t tid) {
-        const int64_t cc = tid % cchunks;
-        const int64_t g = tid / cchunks;
-        const int64_t st = g % strips;
-        const int64_t hg = (g / strips) % hgroups;
-        const int64_t od = (g / (strips * hgroups)) % OD;
-        const int64_t n = g / (strips * hgroups * OD);
+        const ConvGridPos gp = conv_grid_pos(tid, strips, hgroups, OD, cchunks);
 
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
         k::PoolingKernelParams pc = p;
-        pc.od = od;
-        pc.oh = hg * 4;
-        pc.ow0 = st * strip;
+        pc.od = gp.od;
+        pc.oh = gp.hg * 4;
+        pc.ow0 = gp.st * strip;
         pc.ow_end = std::min(pc.ow0 + strip, OW);
 
-        const T* in_img = in_ptr + n * ID * p.in_d_stride;
+        const T* in_img = in_ptr + gp.n * s.ID * p.in_d_stride;
         // The kernel indexes the store by the absolute column, so the base stays
         // at the row start even though the loop covers only this strip.
-        T* out_row = out_ptr + n * OD * OH * p.out_row_stride + od * OH * p.out_row_stride +
-                     pc.oh * p.out_row_stride;
+        T* out_row = out_ptr + gp.n * OD * OH * p.out_row_stride +
+                     gp.od * OH * p.out_row_stride + pc.oh * p.out_row_stride;
 
-        const int64_t blk0 = cc * blocks_per;
+        const int64_t blk0 = gp.cc * blocks_per;
         const int64_t blk1 = std::min(blk0 + blocks_per, nblocks);
         for (int64_t blk = blk0; blk < blk1; ++blk) {
             const int64_t c0 = blk * 16;
@@ -198,21 +141,19 @@ void pooling_global_impl(const PoolingAttributes& attrs, TensorView& output,
                          std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
-    const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
-    const int64_t N = input.shape(0);
-    const int64_t C = input.shape(input.rank() - 1);
+    const PoolShape s = pool_shape(input, output);
+    const int64_t N = s.N, C = s.C;
     // A task reads sixteen channels — one 64-byte line of f32 — per pixel, so
     // the plane is fetched once and still splits across the pool.
     constexpr int64_t kGlobalCh = 16;
     const int64_t blocks = (C + kGlobalCh - 1) / kGlobalCh;
 
     k::PoolingKernelParams p{};
-    // Channel-last dims: [N, (D,) H, W, C].
-    p.ID = (srank == 3) ? input.shape(1) : 1;
-    p.IH = input.shape(srank - 1);
-    p.IW = input.shape(srank);
-    p.in_d_stride = p.IH * input.row_stride_elems();
+    p.ID = s.ID;
+    p.IH = s.IH;
+    p.IW = s.IW;
     p.in_row_stride = input.row_stride_elems();
+    p.in_d_stride = s.IH * p.in_row_stride;
     p.pix_stride = C;
 
     const double count = static_cast<double>(p.ID) * p.IH * p.IW;
@@ -280,16 +221,10 @@ void pooling_adaptive_impl(const PoolingAttributes& attrs, TensorView& output,
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
-    const int64_t srank = PoolingAttributes::spatial_rank(rank);
-
-    const int64_t N = input.shape(0);
-    const int64_t C = input.shape(input.rank() - 1);
-    const int64_t ID = (srank == 3) ? input.shape(1) : 1;
-    const int64_t IH = input.shape(srank - 1);
-    const int64_t IW = input.shape(srank);
-    const int64_t OD = (srank == 3) ? output.shape(1) : 1;
-    const int64_t OH = output.shape(srank - 1);
-    const int64_t OW = output.shape(srank);
+    const PoolShape s = pool_shape(input, output);
+    const int64_t srank = s.srank;
+    const int64_t N = s.N, C = s.C, ID = s.ID, IH = s.IH, IW = s.IW;
+    const int64_t OD = s.OD, OH = s.OH, OW = s.OW;
 
     const int64_t in_n = input.stride_elems(0);
     const int64_t out_n = output.stride_elems(0);
