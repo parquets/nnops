@@ -711,14 +711,16 @@ inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
     }
 }
 
-/// Where the two engines cross, measured on the pointwise shapes (f16 and f32,
-/// `bench_cuda_conv2d pointwise`): the dense GEMM wins once the reduction is
-/// deep enough to amortise its pipeline and the plane is wide enough to fill its
-/// grid. 112x112x512 is 1.19x and 224x224x256 1.11x; 112x112x128, the 28x28 and
-/// 56x56 planes and the 7x7 tail all lose, because the conv kernel's split-K
-/// covers a starved grid with work the GEMM's own cut does not.
-constexpr int kConvPointwiseMinIc = 256;
+/// Where the two engines cross, measured on the pointwise shapes in both
+/// dtypes (`bench_cuda_conv2d pointwise`). The dense GEMM wants a plane wide
+/// enough to fill its grid in either dtype; past that f32 is a win at any
+/// reduction depth (112x112x64 1.69x, 112x112x256 1.39x, 224x224x256 1.27x),
+/// while f16 still needs a deep one — 112x112x256 is 0.92x and only 112x112x512
+/// (1.21x) and 224x224x256 (1.11x) pay. Below 4096 pixels the conv kernel's
+/// split-K covers a starved grid with work the GEMM's own cut does not.
 constexpr int64_t kConvPointwiseMinPixels = 4096;
+constexpr int64_t kConvPointwiseF16DeepIc = 512;
+constexpr int64_t kConvPointwiseF16WidePixels = 16384;
 
 /// A 1x1 filter at unit stride, no padding and one group is a plain GEMM, the
 /// same reduction the CPU route takes as its pointwise plan: the pixel axis is
@@ -773,8 +775,14 @@ bool conv_pointwise_gemm(const Conv2DAttributes& attrs, const TensorView& act,
     }
     // The knob's 1 forces the arm through this gate so a bench can price both
     // engines on a shape the rule declines; the automatic route stops here.
-    if (knob < 0 && (ic < kConvPointwiseMinIc || m < kConvPointwiseMinPixels)) {
-        return false;
+    if (knob < 0) {
+        const bool fp32 = act.data_type() == DataType::f32;
+        const bool take = m >= kConvPointwiseMinPixels &&
+                          (fp32 || ic >= kConvPointwiseF16DeepIc ||
+                           (ic >= 256 && m >= kConvPointwiseF16WidePixels));
+        if (!take) {
+            return false;
+        }
     }
 
     GemmParams p;
@@ -804,15 +812,8 @@ bool conv_pointwise_gemm(const Conv2DAttributes& attrs, const TensorView& act,
         p.ldr = oc;
     }
 
-    // A pointwise product is short-K and narrow-N, and the f16 table's default
-    // 128x128 tile is the wrong shape for it: on 50176x256x256 the shallow
-    // 32x32 row reaches 20.3 TFLOPS where the default reaches 5.3 (cuBLAS 32.8),
-    // because the big tile spends a three-stage prologue on a k loop with a
-    // handful of steps. The f32 table numbers its rows differently, so that
-    // route keeps its own pick.
-    const int tile = act.data_type() == DataType::f32 ? -1 : kF16TileShallow;
     return dense_gemm_status(p, act.data_type(), /*transpose_a=*/false,
-                             /*transpose_b=*/false, stream, tile) == Status::ok;
+                             /*transpose_b=*/false, stream) == Status::ok;
 }
 
 } // namespace
