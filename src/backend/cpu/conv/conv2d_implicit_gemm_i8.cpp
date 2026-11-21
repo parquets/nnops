@@ -601,8 +601,10 @@ void init_i8_ctx(I8ConvCtx<TAct, TOut>& c, const Conv2DAttributes& attrs, Tensor
                                                weight.data_type()) :
                         conv_packed_weight(attrs, c.ic_per_group, c.oc_per_group,
                                            weight.data_type());
+    // The SMOPA blob's n block is the ZA tile width (64), not the NEON panel's
+    // NR_MAX_I8; only a panel blob has to match the micro-kernel's nr.
     NNOPS_ASSERT(c.pg.icn_block == c.icn_block && c.pg.ocn_block == c.ocn_block &&
-                 c.pg.nr == NR_MAX_I8);
+                 (c.sme_blob || c.pg.nr == NR_MAX_I8));
     c.kdim_max = c.pg.kdim_max;
     c.a_biased = arch::mma_i8_folds_a_bias;
 
