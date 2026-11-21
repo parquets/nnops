@@ -76,6 +76,12 @@ inline RowGeometry rowwise_geometry(const TensorView& input, const TensorView& o
     return {last_dim, num_rows, input.row_stride_elems(), output.row_stride_elems()};
 }
 
+/// Elements per task along a row. A task is `tile_m` rows by `kColTile`
+/// columns, so a tensor that is *one* row — a 1-D activation, a bias vector, a
+/// flattened head — still fills the pool: 1M elements used to be one task and
+/// ran at single-core speed however many threads the caller installed.
+constexpr int64_t kColTile = 4096;
+
 /// Row-tiled unary float transform: `apply` gets a tile's base pointers and row
 /// strides, and runs the op over it.
 template <typename T, typename ApplyFn>
@@ -92,14 +98,19 @@ void tiled_float_transform(const TensorView& input, TensorView& output, const Co
     const T* in = input.ptr<T>();
     T* out = output.ptr<T>();
 
-    const int64_t num_tiles = (g.num_rows + tile_m - 1) / tile_m;
-    auto body = [&](int64_t ti) {
+    const int64_t row_tiles = (g.num_rows + tile_m - 1) / tile_m;
+    const int64_t col_tiles = (g.last_dim + kColTile - 1) / kColTile;
+    auto body = [&](int64_t t) {
+        const int64_t ti = t / col_tiles;
+        const int64_t tj = t % col_tiles;
         const int64_t r = ti * tile_m;
+        const int64_t c = tj * kColTile;
         const int64_t m = std::min(tile_m, g.num_rows - r);
-        apply(in + r * g.in_stride, out + r * g.out_stride, m, g.last_dim, g.in_stride,
+        const int64_t n = std::min(kColTile, g.last_dim - c);
+        apply(in + r * g.in_stride + c, out + r * g.out_stride + c, m, n, g.in_stride,
               g.out_stride);
     };
-    run_parallel(ctx, num_tiles, body);
+    run_parallel(ctx, row_tiles * col_tiles, body);
 }
 
 /// Row-tiled binary float transform (two inputs, independent strides).
@@ -120,14 +131,19 @@ void tiled_float_transform2(const TensorView& a, const TensorView& b, TensorView
     const T* bp = b.ptr<T>();
     T* op = out.ptr<T>();
 
-    const int64_t num_tiles = (g.num_rows + tile_m - 1) / tile_m;
-    auto body = [&](int64_t ti) {
+    const int64_t row_tiles = (g.num_rows + tile_m - 1) / tile_m;
+    const int64_t col_tiles = (g.last_dim + kColTile - 1) / kColTile;
+    auto body = [&](int64_t t) {
+        const int64_t ti = t / col_tiles;
+        const int64_t tj = t % col_tiles;
         const int64_t r = ti * tile_m;
+        const int64_t c = tj * kColTile;
         const int64_t m = std::min(tile_m, g.num_rows - r);
-        apply(ap + r * g.in_stride, bp + r * b_stride, op + r * g.out_stride, m, g.last_dim,
+        const int64_t n = std::min(kColTile, g.last_dim - c);
+        apply(ap + r * g.in_stride + c, bp + r * b_stride + c, op + r * g.out_stride + c, m, n,
               g.in_stride, b_stride, g.out_stride);
     };
-    run_parallel(ctx, num_tiles, body);
+    run_parallel(ctx, row_tiles * col_tiles, body);
 }
 
 /// Fill per-row scale/zero arrays for a ≤TILE_H-row tile of a quantized tensor.
@@ -200,11 +216,18 @@ void quantized_unary_transform(const TensorView& input, TensorView& output,
 
     constexpr int TILE_H = 8;
     constexpr int TILE_W = 256;
-    const int64_t num_tiles = (M + TILE_H - 1) / TILE_H;
+    // A task is one (row block, column block): a per-tensor quantization is a
+    // single row, so the column blocks are what fill the pool.
+    const int64_t h_tiles = (M + TILE_H - 1) / TILE_H;
+    const int64_t w_tiles = (N + TILE_W - 1) / TILE_W;
 
-    auto body = [&](int64_t ti) {
+    auto body = [&](int64_t t) {
+        const int64_t ti = t / w_tiles;
+        const int64_t tj = t % w_tiles;
         const int64_t h0 = ti * TILE_H;
+        const int64_t w0 = tj * TILE_W;
         const int cur_h = static_cast<int>(std::min<int64_t>(TILE_H, M - h0));
+        const int cur_w = static_cast<int>(std::min<int64_t>(TILE_W, N - w0));
 
         float scratch[TILE_H * TILE_W];
         float in_scale[TILE_H], in_zero[TILE_H];
@@ -213,20 +236,17 @@ void quantized_unary_transform(const TensorView& input, TensorView& output,
         fill_quant_row_params(in_qp, per_token, h0, cur_h, in_scale, in_zero);
         fill_quant_row_params(out_qp, per_token, h0, cur_h, out_scale, out_zero);
 
-        for (int64_t w0 = 0; w0 < N; w0 += TILE_W) {
-            const int cur_w = static_cast<int>(std::min<int64_t>(TILE_W, N - w0));
-            const uint8_t* in_tile = in_base + (h0 * N + w0);
-            uint8_t* out_tile = out_base + (h0 * N + w0);
+        const uint8_t* in_tile = in_base + (h0 * N + w0);
+        uint8_t* out_tile = out_base + (h0 * N + w0);
 
-            dequantize_tile(in_dtype, cur_h, cur_w, scratch, cur_w, in_tile, static_cast<int>(N),
-                            in_scale, in_zero);
-            apply(scratch, cur_h, cur_w);
-            quantize_tile(out_dtype, cur_h, cur_w, out_tile, static_cast<int>(N), scratch, cur_w,
-                          out_scale, out_zero);
-        }
+        dequantize_tile(in_dtype, cur_h, cur_w, scratch, cur_w, in_tile, static_cast<int>(N),
+                        in_scale, in_zero);
+        apply(scratch, cur_h, cur_w);
+        quantize_tile(out_dtype, cur_h, cur_w, out_tile, static_cast<int>(N), scratch, cur_w,
+                      out_scale, out_zero);
     };
 
-    run_parallel(ctx, num_tiles, body);
+    run_parallel(ctx, h_tiles * w_tiles, body);
 }
 
 /// Fused quantized binary: dequantize A and B → apply op (f32) → quantize.
@@ -265,11 +285,17 @@ void quantized_binary_transform(const TensorView& a_in, const TensorView& b_in, 
 
     constexpr int TILE_H = 8;
     constexpr int TILE_W = 256;
-    const int64_t num_tiles = (M + TILE_H - 1) / TILE_H;
+    // One task per (row block, column block), as in the unary twin.
+    const int64_t h_tiles = (M + TILE_H - 1) / TILE_H;
+    const int64_t w_tiles = (N + TILE_W - 1) / TILE_W;
 
-    auto body = [&](int64_t ti) {
+    auto body = [&](int64_t t) {
+        const int64_t ti = t / w_tiles;
+        const int64_t tj = t % w_tiles;
         const int64_t h0 = ti * TILE_H;
+        const int64_t w0 = tj * TILE_W;
         const int cur_h = static_cast<int>(std::min<int64_t>(TILE_H, M - h0));
+        const int cur_w = static_cast<int>(std::min<int64_t>(TILE_W, N - w0));
 
         float a_scratch[TILE_H * TILE_W];
         float b_scratch[TILE_H * TILE_W];
@@ -281,25 +307,22 @@ void quantized_binary_transform(const TensorView& a_in, const TensorView& b_in, 
         fill_quant_row_params(b_qp, per_token, h0, cur_h, b_scale, b_zero);
         fill_quant_row_params(o_qp, per_token, h0, cur_h, o_scale, o_zero);
 
-        for (int64_t w0 = 0; w0 < N; w0 += TILE_W) {
-            const int cur_w = static_cast<int>(std::min<int64_t>(TILE_W, N - w0));
-            const uint8_t* a_tile = a_base + (h0 * N + w0);
-            const uint8_t* b_tile = b_base + (h0 * N + w0);
-            uint8_t* o_tile = o_base + (h0 * N + w0);
+        const uint8_t* a_tile = a_base + (h0 * N + w0);
+        const uint8_t* b_tile = b_base + (h0 * N + w0);
+        uint8_t* o_tile = o_base + (h0 * N + w0);
 
-            dequantize_tile(a_dtype, cur_h, cur_w, a_scratch, cur_w, a_tile, static_cast<int>(N),
-                            a_scale, a_zero);
-            dequantize_tile(b_dtype, cur_h, cur_w, b_scratch, cur_w, b_tile, static_cast<int>(N),
-                            b_scale, b_zero);
+        dequantize_tile(a_dtype, cur_h, cur_w, a_scratch, cur_w, a_tile, static_cast<int>(N),
+                        a_scale, a_zero);
+        dequantize_tile(b_dtype, cur_h, cur_w, b_scratch, cur_w, b_tile, static_cast<int>(N),
+                        b_scale, b_zero);
 
-            apply(a_scratch, b_scratch, cur_h, cur_w);
+        apply(a_scratch, b_scratch, cur_h, cur_w);
 
-            quantize_tile(o_dtype, cur_h, cur_w, o_tile, static_cast<int>(N), a_scratch, cur_w,
-                          o_scale, o_zero);
-        }
+        quantize_tile(o_dtype, cur_h, cur_w, o_tile, static_cast<int>(N), a_scratch, cur_w,
+                      o_scale, o_zero);
     };
 
-    run_parallel(ctx, num_tiles, body);
+    run_parallel(ctx, h_tiles * w_tiles, body);
 }
 
 } // namespace nnops::backend::cpu

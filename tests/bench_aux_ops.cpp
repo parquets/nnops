@@ -537,3 +537,109 @@ NNOPS_BENCH(select_tail) {
         row_all_arms(row, threads, [&](const ComputeContext& ctx) { op->compute(vo, ins, ctx); });
     }
 }
+
+// ============================================================
+// Long-tail: the element-wise math and the row reductions
+// ============================================================
+
+#include "nnops/ops/activation.hpp"
+#include "nnops/ops/clamp.hpp"
+#include "nnops/ops/cumsum.hpp"
+#include "nnops/ops/reduce.hpp"
+#include "nnops/ops/softmax.hpp"
+#include "nnops/ops/unary.hpp"
+
+NNOPS_BENCH(elementwise_math) {
+    std::printf("--- element-wise math, [1M] f32 (memory-bound floor ~2 bytes flop) ---\n");
+    const std::vector<int> threads = bench_threads();
+    constexpr int64_t N = int64_t{1} << 20;
+    std::vector<float> a = random_f32(N, 21);
+    std::vector<float> o(static_cast<size_t>(N));
+    const int64_t shape[] = {N};
+    TensorView va(std::span<const int64_t>(shape, 1), DataType::f32, a.data());
+    TensorView vo(std::span<const int64_t>(shape, 1), DataType::f32, o.data());
+    const TensorView ins[] = {va};
+
+    struct Case { const char* name; UnaryType u; ActivationType a; };
+    auto bench_unary = [&](const char* name, UnaryType t) {
+        UnaryAttributes attrs;
+        attrs.type = t;
+        auto op = Unary::create(attrs, Backend::CPU);
+        const Row row{name, N * 4 * 2, 10};
+        row_all_arms(row, threads, [&](const ComputeContext& ctx) { op->compute(vo, ins, ctx); });
+    };
+    auto bench_act = [&](const char* name, ActivationType t) {
+        ActivationAttributes attrs;
+        attrs.type = t;
+        auto op = Activation::create(attrs, Backend::CPU);
+        const Row row{name, N * 4 * 2, 10};
+        row_all_arms(row, threads, [&](const ComputeContext& ctx) { op->compute(vo, ins, ctx); });
+    };
+    bench_unary("exp", UnaryType::Exp);
+    {
+        // same element count, 2-D: 512 rows x 2048 -> many row tiles
+        const int64_t sh2[] = {512, 2048};
+        TensorView v2(std::span<const int64_t>(sh2, 2), DataType::f32, a.data());
+        TensorView o2(std::span<const int64_t>(sh2, 2), DataType::f32, o.data());
+        const TensorView in2[] = {v2};
+        UnaryAttributes ua;
+        ua.type = UnaryType::Exp;
+        auto op2 = Unary::create(ua, Backend::CPU);
+        const Row row2{"exp (2-D 512x2048)", N * 4 * 2, 10};
+        row_all_arms(row2, threads, [&](const ComputeContext& ctx) { op2->compute(o2, in2, ctx); });
+    }
+    bench_unary("tanh", UnaryType::Tanh);
+    bench_unary("sqrt", UnaryType::Sqrt);
+    bench_act("sigmoid", ActivationType::Sigmoid);
+    bench_act("gelu tanh", ActivationType::Gelu);
+    bench_act("gelu exact", ActivationType::GeluExact);
+    bench_act("silu", ActivationType::Silu);
+    {
+        ClampAttributes attrs;
+        attrs.min_val = -0.5f;
+        attrs.max_val = 0.5f;
+        auto op = Clamp::create(attrs, Backend::CPU);
+        const Row row{"clamp", N * 4 * 2, 10};
+        row_all_arms(row, threads, [&](const ComputeContext& ctx) { op->compute(vo, ins, ctx); });
+    }
+}
+
+NNOPS_BENCH(reduce_scan_softmax) {
+    std::printf("--- row reductions / scan / softmax, [2048,4096] f32 ---\n");
+    const std::vector<int> threads = bench_threads();
+    constexpr int64_t M = 2048, Nn = 4096;
+    std::vector<float> a = random_f32(M * Nn, 22);
+    std::vector<float> o(static_cast<size_t>(M * Nn));
+    std::vector<float> orow(static_cast<size_t>(M));
+    const int64_t shape[] = {M, Nn};
+    const int64_t rowshape[] = {M, 1};
+    TensorView va(std::span<const int64_t>(shape, 2), DataType::f32, a.data());
+    TensorView vo(std::span<const int64_t>(shape, 2), DataType::f32, o.data());
+    TensorView vr(std::span<const int64_t>(rowshape, 2), DataType::f32, orow.data());
+    const TensorView ins[] = {va};
+
+    for (ReduceType t : {ReduceType::Sum, ReduceType::Max}) {
+        ReduceAttributes attrs;
+        attrs.axes = {-1};
+        attrs.type = t;
+        attrs.keepdims = true;
+        auto op = Reduce::create(attrs, Backend::CPU);
+        const Row row{t == ReduceType::Sum ? "reduce sum axis -1" : "reduce max axis -1",
+                      M * Nn * 4 + M * 4, 10};
+        row_all_arms(row, threads, [&](const ComputeContext& ctx) { op->compute(vr, ins, ctx); });
+    }
+    {
+        CumSumAttributes attrs;
+        attrs.axis = -1;
+        auto op = CumSum::create(attrs, Backend::CPU);
+        const Row row{"cumsum axis -1", M * Nn * 4 * 2, 10};
+        row_all_arms(row, threads, [&](const ComputeContext& ctx) { op->compute(vo, ins, ctx); });
+    }
+    {
+        SoftmaxAttributes attrs;
+        attrs.axis = -1;
+        auto op = Softmax::create(attrs, Backend::CPU);
+        const Row row{"softmax axis -1", M * Nn * 4 * 2, 10};
+        row_all_arms(row, threads, [&](const ComputeContext& ctx) { op->compute(vo, ins, ctx); });
+    }
+}
