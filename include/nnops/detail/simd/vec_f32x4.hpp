@@ -56,6 +56,7 @@
   using arch::sse::v_load_odd_f32x4;
   using arch::sse::v_load_stride2_even_f32x4;
   using arch::sse::v_load_stride2_odd_f32x4;
+  using arch::sse::v_transpose_4x4_f32x4;
   }} // namespace nnops::simd
 
 #elif defined(NNOPS_ARCH_AARCH64)
@@ -99,6 +100,7 @@
   using arch::neon::v_load_odd_f32x4;
   using arch::neon::v_load_stride2_even_f32x4;
   using arch::neon::v_load_stride2_odd_f32x4;
+  using arch::neon::v_transpose_4x4_f32x4;
   }} // namespace nnops::simd
 
 #else
@@ -139,5 +141,6 @@
   using arch::scalar::v_load_odd_f32x4;
   using arch::scalar::v_load_stride2_even_f32x4;
   using arch::scalar::v_load_stride2_odd_f32x4;
+  using arch::scalar::v_transpose_4x4_f32x4;
   }} // namespace nnops::simd
 #endif

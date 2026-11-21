@@ -545,6 +545,14 @@ inline void transpose_4x4_f32(float32x4_t& r0, float32x4_t& r1,
 
 }  // anonymous namespace
 
+/// 4x4 f32 transpose in registers: four row vectors become four column
+/// vectors. The block primitive the pair-permutation kernels build on
+/// (SpaceToDepth / PixelShuffle's 2x2 case turns 4 channel lanes into 4
+/// spatial lanes with one of these).
+inline void v_transpose_4x4_f32x4(v_f32x4& r0, v_f32x4& r1, v_f32x4& r2, v_f32x4& r3) {
+    transpose_4x4_f32(r0.val, r1.val, r2.val, r3.val);
+}
+
 inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
                              v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
     // Bottom-left must be saved: the next block writes it from the top-right,

@@ -72,6 +72,18 @@ inline void v_store(float* p, const v_f32x4& a) {
 inline v_f32x4 v_set1_f32x4(float s)  { return v_f32x4(s); }
 inline v_f32x4 v_zero_f32x4()         { return v_f32x4(0.0f); }
 
+/// 4x4 f32 transpose in registers: four row vectors become four column vectors.
+inline void v_transpose_4x4_f32x4(v_f32x4& r0, v_f32x4& r1, v_f32x4& r2, v_f32x4& r3) {
+    const float a0 = r0.v[0], a1 = r0.v[1], a2 = r0.v[2], a3 = r0.v[3];
+    const float b0 = r1.v[0], b1 = r1.v[1], b2 = r1.v[2], b3 = r1.v[3];
+    const float c0 = r2.v[0], c1 = r2.v[1], c2 = r2.v[2], c3 = r2.v[3];
+    const float d0 = r3.v[0], d1 = r3.v[1], d2 = r3.v[2], d3 = r3.v[3];
+    r0 = v_f32x4(a0, b0, c0, d0);
+    r1 = v_f32x4(a1, b1, c1, d1);
+    r2 = v_f32x4(a2, b2, c2, d2);
+    r3 = v_f32x4(a3, b3, c3, d3);
+}
+
 inline v_f32x4 v_add(const v_f32x4& a, const v_f32x4& b) {
     return v_f32x4(a[0]+b[0], a[1]+b[1], a[2]+b[2], a[3]+b[3]);
 }

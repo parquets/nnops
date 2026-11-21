@@ -86,6 +86,14 @@ inline v_f32x4 v_load_f32x4(const float* p) {
 inline void v_store(float* p, const v_f32x4& a) {
     _mm_storeu_ps(p, a.val);
 }
+
+/// 4x4 f32 transpose in registers: four row vectors become four column
+/// vectors. The block primitive the pair-permutation kernels build on
+/// (SpaceToDepth / PixelShuffle's 2x2 case turns 4 channel lanes into 4
+/// spatial lanes with one of these).
+inline void v_transpose_4x4_f32x4(v_f32x4& r0, v_f32x4& r1, v_f32x4& r2, v_f32x4& r3) {
+    _MM_TRANSPOSE4_PS(r0.val, r1.val, r2.val, r3.val);
+}
 inline v_f32x4 v_set1_f32x4(float s)  { return v_f32x4(_mm_set1_ps(s)); }
 inline v_f32x4 v_zero_f32x4()         { return v_f32x4(_mm_setzero_ps()); }
 
