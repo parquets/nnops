@@ -126,10 +126,12 @@ void split_impl(const TensorView& input, std::span<TensorView> outputs,
 Status split_cpu(const SplitAttributes& attrs, std::span<TensorView> outputs,
                  std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
-    for_each_data_type(inputs[0].data_type(), [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        split_impl<T>(inputs[0], outputs, attrs, ctx);
-    });
+    if (!for_each_data_type(inputs[0].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            split_impl<T>(inputs[0], outputs, attrs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

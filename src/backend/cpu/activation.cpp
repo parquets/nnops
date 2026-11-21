@@ -198,14 +198,16 @@ Status activation_cpu(const ActivationAttributes& attrs, TensorView& output,
     const bool out_is_int = is_quantized_dtype(output.data_type());
 
     if (!in_is_int && !out_is_int) {
-        dispatch_f32_f16(dtype, "activation_cpu", [&](auto tag) {
-            using T = typename decltype(tag)::type;
-            if (attrs.type == ActivationType::PRelu) {
-                prelu_impl<T>(attrs, output, inputs, ctx);
-            } else {
-                activation_impl<T>(attrs, output, inputs, ctx);
-            }
-        });
+        if (!dispatch_f32_f16(dtype, "activation_cpu", [&](auto tag) {
+                using T = typename decltype(tag)::type;
+                if (attrs.type == ActivationType::PRelu) {
+                    prelu_impl<T>(attrs, output, inputs, ctx);
+                } else {
+                    activation_impl<T>(attrs, output, inputs, ctx);
+                }
+            })) {
+            return Status::unsupported;
+        }
         return Status::ok;
     }
 

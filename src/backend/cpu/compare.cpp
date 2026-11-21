@@ -168,10 +168,12 @@ Status compare_cpu(const CompareAttributes& attrs, TensorView& output,
                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                    void* /*workspace*/)
 {
-    for_each_data_type(inputs[0].data_type(), [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        compare_impl<T>(output, inputs, attrs.type, ctx);
-    });
+    if (!for_each_data_type(inputs[0].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            compare_impl<T>(output, inputs, attrs.type, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

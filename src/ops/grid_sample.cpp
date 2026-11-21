@@ -22,6 +22,16 @@ Status GridSample::validate(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 2, 1));
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, inputs[0].dtype)) {
+        return Status::unsupported;
+    }
+    if (outputs[0].dtype != inputs[0].dtype) {
+        return Status::invalid_argument;
+    }
+    // The grid is always read as f32 coordinates.
+    if (inputs[1].dtype != DataType::f32) {
+        return Status::invalid_argument;
+    }
     return detail::require(
         is_layout_supported(inputs[0].layout, LayoutSupport::ChannelLastOnly));
 }

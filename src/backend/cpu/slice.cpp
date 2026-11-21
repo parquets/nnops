@@ -115,10 +115,14 @@ void slice_impl(const SliceAttributes& attrs, TensorView& output,
 Status slice_cpu(const SliceAttributes& attrs, TensorView& output,
                  std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
-    dispatch_f32_f16(inputs[0].data_type(), "slice_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        slice_impl<T>(attrs, output, inputs, ctx);
-    });
+    // A strided copy of whole elements: every movement dtype, not just the
+    // floats — slicing an int64 index tensor is the same walk.
+    if (!for_each_data_type(inputs[0].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            slice_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

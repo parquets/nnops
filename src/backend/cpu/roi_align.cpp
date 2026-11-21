@@ -221,10 +221,12 @@ Status roi_align_cpu(const RoiAlignAttributes& attrs, TensorView& output,
                      std::span<const TensorView> inputs, const ComputeContext& ctx,
                      void* /*workspace*/)
 {
-    dispatch_f32_f16(inputs[0].data_type(), "roi_align_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        roi_align_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(inputs[0].data_type(), "roi_align_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            roi_align_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

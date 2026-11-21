@@ -24,6 +24,9 @@ Status Reduce::validate(std::span<const TensorDesc> inputs,
                         std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, inputs[0].dtype)) {
+        return Status::unsupported;
+    }
 
     const int64_t rank = inputs[0].rank;
     if (rank > TensorDesc::kMaxRank) {

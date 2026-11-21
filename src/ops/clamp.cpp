@@ -20,7 +20,15 @@ std::vector<TensorDesc> Clamp::getOutputTensorDesc(std::span<const TensorDesc> i
 Status Clamp::validate(std::span<const TensorDesc> inputs,
                        std::span<const TensorDesc> outputs) const
 {
-    return detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1);
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, inputs[0].dtype)) {
+        return Status::unsupported;
+    }
+    // The kernel visits the output through the input's element type.
+    if (outputs[0].dtype != inputs[0].dtype) {
+        return Status::invalid_argument;
+    }
+    return Status::ok;
 }
 
 Status Clamp::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

@@ -73,6 +73,22 @@ inline int64_t flat_offset(const int64_t* idx, const int64_t* strides, int64_t n
     return off;
 }
 
+/// True when the view's axes are the storage order with no padding between
+/// them, i.e. one flat index reaches every element by stride alone. A kernel
+/// that assumes "the next group is `group_size` elements further on" needs this
+/// — a pitched row breaks that, and the pitch is only visible here.
+inline bool is_compact_view(const TensorView& v)
+{
+    int64_t want = 1;
+    for (int64_t d = v.rank() - 1; d >= 0; --d) {
+        if (v.shape(d) != 1 && v.stride_elems(d) != want) {
+            return false;
+        }
+        want *= v.shape(d);
+    }
+    return true;
+}
+
 /// The densest trailing run two views can move with one memcpy: the axes from
 /// `from_dim` to rank-1 agree in extent and are physically contiguous in both,
 /// so a run moves as `run` adjacent elements. Everything before `from_dim` is

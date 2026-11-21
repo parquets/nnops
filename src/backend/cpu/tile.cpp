@@ -132,10 +132,12 @@ void expand_impl(const ExpandAttributes& /*attrs*/, TensorView& output, const Te
 Status tile_cpu(const TileAttributes& attrs, TensorView& output, std::span<const TensorView> inputs,
                 const ComputeContext& ctx, void* /*workspace*/)
 {
-    for_each_data_type(inputs[0].data_type(), [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        tile_impl<T>(attrs, output, inputs[0], ctx);
-    });
+    if (!for_each_data_type(inputs[0].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            tile_impl<T>(attrs, output, inputs[0], ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 
@@ -143,10 +145,12 @@ Status expand_cpu(const ExpandAttributes& attrs, TensorView& output,
                   std::span<const TensorView> inputs, const ComputeContext& ctx,
                   void* /*workspace*/)
 {
-    for_each_data_type(inputs[0].data_type(), [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        expand_impl<T>(attrs, output, inputs[0], ctx);
-    });
+    if (!for_each_data_type(inputs[0].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            expand_impl<T>(attrs, output, inputs[0], ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

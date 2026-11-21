@@ -29,7 +29,14 @@ std::vector<TensorDesc> Flatten::getOutputTensorDesc(std::span<const TensorDesc>
 Status Flatten::validate(std::span<const TensorDesc> inputs,
                          std::span<const TensorDesc> outputs) const
 {
-    return detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1);
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
+    if (!detail::is_movement_dtype(inputs[0].dtype)) {
+        return Status::unsupported;
+    }
+    if (outputs[0].dtype != inputs[0].dtype) {
+        return Status::invalid_argument;
+    }
+    return Status::ok;
 }
 
 Status Flatten::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

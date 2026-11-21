@@ -33,6 +33,12 @@ Status Eltwise::validate(std::span<const TensorDesc> inputs,
     if (a.dtype != b.dtype || outputs[0].dtype != a.dtype) {
         return Status::invalid_argument;
     }
+    // Float, or the int8 pair the fused quantized path carries (it needs the
+    // per-tensor scale/zero_point, which only compute() can see).
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, a.dtype) &&
+        a.dtype != DataType::s8 && a.dtype != DataType::u8) {
+        return Status::unsupported;
+    }
     // A packed or prepacked tag describes a filter, never an activation.
     const auto is_activation = [](TensorLayout l) {
         return l == TensorLayout::Dense || is_channel_last(l);

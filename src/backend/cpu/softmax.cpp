@@ -1,16 +1,18 @@
 /// @file softmax.cpp
 /// @brief SIMD-optimized CPU implementation of softmax / log-softmax on NHWC.
 ///
-/// One templated implementation covers f32 and f16; the operator refuses
-/// packed layouts (Softmax::validate). Two dispatch paths, chosen by
+/// One templated implementation covers f32 and f16; the operator refuses the
+/// packed weight layouts (Softmax::validate). Two dispatch paths, chosen by
 /// where the normalization axis sits in memory:
 ///   - The axis is the innermost axis of the storage — NHWC's C (or the
-///     last dim when C == 1). Every group is then `D` contiguous elements and
-///     the groups are a constant stride apart, so each one is one
-///     kernel::softmax_process_standard_row call (horizontal reduction).
-///   - Every other axis: each group is `D` elements strided by the axis' element
-///     stride, so kernel::softmax_per_lane runs L groups at a time, the lanes
-///     being the channels of the tensor.
+///     last dim when C == 1) — *and* the view is compact, so every group is
+///     `D` contiguous elements and the next group is exactly D further on. Each
+///     group is one kernel::softmax_process_standard_row call (horizontal
+///     reduction).
+///   - Every other case, including an innermost axis in a row-pitched view:
+///     each group is `D` elements strided by the axis' element stride, so
+///     kernel::softmax_per_lane runs L groups at a time, the lanes being the
+///     channels of the tensor.
 ///
 /// Pitch-aware via stride_elems() / row_stride_elems(). Patterned on
 /// onnxruntime's MlasComputeSoftmax / MlasReduceMaximumF32Kernel /
@@ -21,6 +23,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "common/dtype_dispatch.hpp"
+#include "common/strided_walk.hpp"
 #include "simd_kernel/simd_softmax.hpp"
 
 #include <cmath>
@@ -213,7 +216,12 @@ void softmax_impl(const SoftmaxAttributes& attrs, TensorView& output,
     auto* y_ptr = output.ptr<T>();
 
     int64_t unit_stride = 0;
-    if (axis_is_innermost(X, axis, unit_stride)) {
+    // The contiguous kernel steps from one group to the next by the group width,
+    // which is only the group's true distance when the view carries no row pitch
+    // — a padded row jumps further along. A pitched view therefore takes the
+    // strided walk (correct at any stride, one scalar group at a time).
+    if (axis_is_innermost(X, axis, unit_stride) && is_compact_view(X) &&
+        is_compact_view(output)) {
         // Same shape on both sides, so the output answers the same question over
         // its own pitch — which a caller is free to give it differently.
         int64_t unit_stride_y = 0;
@@ -230,10 +238,12 @@ Status softmax_cpu(const SoftmaxAttributes& attrs, TensorView& output,
                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                    void* /*workspace*/)
 {
-    dispatch_f32_f16(inputs[0].data_type(), "softmax_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        softmax_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(inputs[0].data_type(), "softmax_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            softmax_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

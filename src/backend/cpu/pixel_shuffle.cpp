@@ -252,10 +252,12 @@ Status space_to_depth_cpu(const SpaceToDepthAttributes& attrs, TensorView& outpu
                           std::span<const TensorView> inputs, const ComputeContext& ctx,
                           void* /*workspace*/)
 {
-    for_each_data_type(inputs[0].data_type(), [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        space_to_depth_impl<T>(attrs, output, inputs[0], ctx);
-    });
+    if (!for_each_data_type(inputs[0].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            space_to_depth_impl<T>(attrs, output, inputs[0], ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 
@@ -263,10 +265,12 @@ Status pixel_shuffle_cpu(const PixelShuffleAttributes& attrs, TensorView& output
                          std::span<const TensorView> inputs, const ComputeContext& ctx,
                          void* /*workspace*/)
 {
-    for_each_data_type(inputs[0].data_type(), [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        pixel_shuffle_impl<T>(attrs, output, inputs[0], ctx);
-    });
+    if (!for_each_data_type(inputs[0].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            pixel_shuffle_impl<T>(attrs, output, inputs[0], ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

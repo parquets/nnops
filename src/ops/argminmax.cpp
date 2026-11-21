@@ -24,10 +24,28 @@ std::vector<TensorDesc> ArgMax::getOutputTensorDesc(std::span<const TensorDesc> 
     return argminmax_output_shape(attrs_.axis, attrs_.keepdims, inputs);
 }
 
+namespace {
+
+/// Both arg reductions read one float row and write an s64 index per position.
+Status check_argminmax(const Backend be, std::span<const TensorDesc> inputs,
+                       std::span<const TensorDesc> outputs)
+{
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(be, inputs[0].dtype)) {
+        return Status::unsupported;
+    }
+    if (outputs[0].dtype != DataType::s64) {
+        return Status::invalid_argument;
+    }
+    return Status::ok;
+}
+
+} // namespace
+
 Status ArgMax::validate(std::span<const TensorDesc> inputs,
                         std::span<const TensorDesc> outputs) const
 {
-    return detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1);
+    return check_argminmax(backend_, inputs, outputs);
 }
 
 Status ArgMax::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
@@ -49,7 +67,7 @@ std::vector<TensorDesc> ArgMin::getOutputTensorDesc(std::span<const TensorDesc> 
 Status ArgMin::validate(std::span<const TensorDesc> inputs,
                         std::span<const TensorDesc> outputs) const
 {
-    return detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1);
+    return check_argminmax(backend_, inputs, outputs);
 }
 
 Status ArgMin::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

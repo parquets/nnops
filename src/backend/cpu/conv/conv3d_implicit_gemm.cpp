@@ -541,7 +541,7 @@ Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
     if (weight.data_type() == DataType::s8) {
         return conv3d_i8_cpu(attrs, output, inputs, ctx);
     }
-    Status st = Status::ok;
+    Status st = Status::unsupported;
     dispatch_f32_f16(input.data_type(), "conv3d_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
         st = conv3d_impl<T>(gm, output, inputs, ctx);

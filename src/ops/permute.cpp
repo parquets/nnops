@@ -32,8 +32,10 @@ Status Permute::validate(std::span<const TensorDesc> inputs,
         return Status::invalid_argument;
     }
     NNOPS_TRY(detail::check_rank(rank, 1, TensorDesc::kMaxRank));
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) ||
-        out.dtype != in.dtype) {
+    if (!detail::is_movement_dtype(in.dtype)) {
+        return Status::unsupported;
+    }
+    if (out.dtype != in.dtype) {
         return Status::invalid_argument;
     }
     if (!is_layout_supported(in.layout, LayoutSupport::DenseOnly) ||

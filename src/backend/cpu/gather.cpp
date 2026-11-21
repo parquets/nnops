@@ -340,6 +340,7 @@ Status gather_cpu(const GatherAttributes& attrs, TensorView& output,
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
     const int64_t axis = resolve_axis(attrs.axis, data.rank());
+    bool dispatched = false;
     if (indices.data_type() == DataType::s64) {
         if (!index_in_range<int64_t>(indices, data.shape(axis))) {
             return Status::invalid_argument;
@@ -351,17 +352,17 @@ Status gather_cpu(const GatherAttributes& attrs, TensorView& output,
     }
 
     if (indices.data_type() == DataType::s64) {
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             gather_impl<T, int64_t>(attrs, output, data, indices, ctx);
         });
     } else {
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             gather_impl<T, int32_t>(attrs, output, data, indices, ctx);
         });
     }
-    return Status::ok;
+    return dispatched ? Status::ok : Status::unsupported;
 }
 
 Status gather_elements_cpu(const GatherElementsAttributes& attrs, TensorView& output,
@@ -371,11 +372,12 @@ Status gather_elements_cpu(const GatherElementsAttributes& attrs, TensorView& ou
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
     const int64_t axis = resolve_axis(attrs.axis, data.rank());
+    bool dispatched = false;
     if (indices.data_type() == DataType::s64) {
         if (!index_in_range<int64_t>(indices, data.shape(axis))) {
             return Status::invalid_argument;
         }
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             gather_elements_impl<T, int64_t>(attrs, output, data, indices, ctx);
         });
@@ -383,12 +385,12 @@ Status gather_elements_cpu(const GatherElementsAttributes& attrs, TensorView& ou
         if (!index_in_range<int32_t>(indices, data.shape(axis))) {
             return Status::invalid_argument;
         }
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             gather_elements_impl<T, int32_t>(attrs, output, data, indices, ctx);
         });
     }
-    return Status::ok;
+    return dispatched ? Status::ok : Status::unsupported;
 }
 
 Status gather_nd_cpu(const GatherNDAttributes& attrs, TensorView& output,
@@ -398,11 +400,12 @@ Status gather_nd_cpu(const GatherNDAttributes& attrs, TensorView& output,
     const auto& data = inputs[0];
     const auto& indices = inputs[1];
     const int64_t k = indices.shape(indices.rank() - 1);
+    bool dispatched = false;
     if (indices.data_type() == DataType::s64) {
         if (!gather_nd_indices_valid<int64_t>(indices, data, attrs.batch_dims, k)) {
             return Status::invalid_argument;
         }
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             gather_nd_impl<T, int64_t>(attrs, output, data, indices, ctx);
         });
@@ -410,12 +413,12 @@ Status gather_nd_cpu(const GatherNDAttributes& attrs, TensorView& output,
         if (!gather_nd_indices_valid<int32_t>(indices, data, attrs.batch_dims, k)) {
             return Status::invalid_argument;
         }
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             gather_nd_impl<T, int32_t>(attrs, output, data, indices, ctx);
         });
     }
-    return Status::ok;
+    return dispatched ? Status::ok : Status::unsupported;
 }
 
 } // namespace nnops::backend::cpu

@@ -691,10 +691,12 @@ Status reduce_cpu(const ReduceAttributes& attrs, TensorView& output,
                   std::span<const TensorView> inputs, const ComputeContext& ctx,
                   void* /*workspace*/)
 {
-    dispatch_f32_f16(inputs[0].data_type(), "reduce_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        reduce_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(inputs[0].data_type(), "reduce_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            reduce_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

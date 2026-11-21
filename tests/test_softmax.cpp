@@ -558,3 +558,102 @@ NNOPS_TEST(softmax_random_f16) {
         NNOPS_EXPECT_NEAR(row_sum, 1.0f, 1e-2f);  // f16 has lower precision
     }
 }
+
+// ============================================================
+// Layout and pitch: the contiguous fast path needs a compact view
+// ============================================================
+
+namespace {
+
+/// Row-wise softmax reference over the physical C run of every pixel, read
+/// through the view's own strides (so a pitched row is addressed correctly).
+/// `storage_elems` is the buffer's element span, which exceeds numel() for a
+/// pitched view; untouched entries stay NaN.
+void softmax_last_axis_ref(const TensorView& x, size_t storage_elems, std::vector<double>& want)
+{
+    const int64_t rank = x.rank();
+    const int64_t C = x.shape(rank - 1);
+    const int64_t pixels = x.numel() / C;
+    want.assign(storage_elems, std::numeric_limits<double>::quiet_NaN());
+    for (int64_t p = 0; p < pixels; ++p) {
+        // Position p in the storage order minus the C axis: decompose over the
+        // leading axes, innermost first.
+        int64_t rem = p;
+        int64_t base = 0;
+        for (int64_t d = rank - 2; d >= 0; --d) {
+            const int64_t n = x.shape(d);
+            base += (rem % n) * x.stride_elems(d);
+            rem /= n;
+        }
+        const float* row = x.ptr<float>() + base;
+        double mx = -1e30;
+        for (int64_t c = 0; c < C; ++c) { mx = std::max(mx, static_cast<double>(row[c])); }
+        double sum = 0.0;
+        for (int64_t c = 0; c < C; ++c) { sum += std::exp(row[c] - mx); }
+        for (int64_t c = 0; c < C; ++c) {
+            want[static_cast<size_t>(base + c)] = std::exp(row[c] - mx) / sum;
+        }
+    }
+}
+
+} // namespace
+
+NNOPS_TEST(softmax_last_axis_pitched_row) {
+    // [1,2,3,3] with the default 32-byte row pitch: a row is 36 bytes of data
+    // and 64 bytes of storage, so consecutive pixels are *not* C elements apart
+    // and the contiguous fast path must not be taken.
+    const int64_t H = 2, W = 3, C = 3;
+    const int64_t pitch_bytes = 64;
+    const int64_t pitch_elems = pitch_bytes / 4;
+    std::vector<float> x(static_cast<size_t>(H * pitch_elems), 0.0f);
+    std::vector<float> y(static_cast<size_t>(H * pitch_elems), -7.0f);
+    for (int64_t h = 0; h < H; ++h) {
+        for (int64_t i = 0; i < W * C; ++i) {
+            x[static_cast<size_t>(h * pitch_elems + i)] =
+                0.1f * static_cast<float>((h * 5 + i) % 7) - 0.3f;
+        }
+    }
+    const int64_t shape[] = {1, H, W, C};
+    TensorView in(std::span<const int64_t>(shape, 4), DataType::f32, x.data(), pitch_bytes,
+                  TensorLayout::NHWC);
+    TensorView out(std::span<const int64_t>(shape, 4), DataType::f32, y.data(), pitch_bytes,
+                   TensorLayout::NHWC);
+
+    SoftmaxAttributes attrs;
+    attrs.axis = -1;
+    auto op = Softmax::create(attrs, Backend::CPU);
+    const TensorView ins[] = {in};
+    NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::ok);
+
+    std::vector<double> want;
+    softmax_last_axis_ref(in, y.size(), want);
+    for (size_t i = 0; i < want.size(); ++i) {
+        if (std::isnan(want[i])) { continue; }  // padding lanes carry no data
+        NNOPS_EXPECT_NEAR(y[i], want[i], 1e-6);
+    }
+}
+
+NNOPS_TEST(softmax_dense_layout) {
+    // Rank-2 Dense [4, 8] over the last axis: the same walk, no channel claim.
+    const int64_t shape[] = {4, 8};
+    std::vector<float> x(32), y(32, -7.0f);
+    for (int64_t r = 0; r < 4; ++r) {
+        for (int64_t c = 0; c < 8; ++c) {
+            x[static_cast<size_t>(r * 8 + c)] = 0.2f * static_cast<float>((r + c) % 5) - 0.4f;
+        }
+    }
+    TensorView in(std::span<const int64_t>(shape, 2), DataType::f32, x.data());
+    TensorView out(std::span<const int64_t>(shape, 2), DataType::f32, y.data());
+
+    SoftmaxAttributes attrs;
+    attrs.axis = -1;
+    auto op = Softmax::create(attrs, Backend::CPU);
+    const TensorView ins[] = {in};
+    NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::ok);
+
+    std::vector<double> want;
+    softmax_last_axis_ref(in, y.size(), want);
+    for (size_t i = 0; i < want.size(); ++i) {
+        NNOPS_EXPECT_NEAR(y[i], want[i], 1e-6);
+    }
+}

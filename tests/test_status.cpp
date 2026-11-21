@@ -214,16 +214,21 @@ NNOPS_TEST(status_validate_descriptors_only) {
         NNOPS_EXPECT_TRUE(op->validate(odd_w, out) == Status::unsupported);
     }
 
-    // Softmax runs on NHWC only, and quantized input has no route at all.
+    // Softmax runs on either regular layout — the walk is stride-driven — but
+    // not on a weight tag, and a quantized input has no route at all.
     {
         auto op = Softmax::create(SoftmaxAttributes{}, Backend::CPU);
-        const TensorDesc cf[] = {desc_of({2, 8}, DataType::f32)};
-        const TensorDesc cf_out[] = {desc_of({2, 8}, DataType::f32)};
-        NNOPS_EXPECT_TRUE(op->validate(cf, cf_out) == Status::unsupported);
+        const TensorDesc dense[] = {desc_of({2, 8}, DataType::f32)};
+        const TensorDesc dense_out[] = {desc_of({2, 8}, DataType::f32)};
+        NNOPS_EXPECT_TRUE(op->validate(dense, dense_out) == Status::ok);
 
         const TensorDesc cl[] = {desc_of({2, 8}, DataType::f32, TensorLayout::NHWC)};
         const TensorDesc cl_out[] = {desc_of({2, 8}, DataType::f32, TensorLayout::NHWC)};
         NNOPS_EXPECT_TRUE(op->validate(cl, cl_out) == Status::ok);
+
+        const TensorDesc wt[] = {desc_of({2, 8}, DataType::f32, TensorLayout::HWIO)};
+        const TensorDesc wt_out[] = {desc_of({2, 8}, DataType::f32, TensorLayout::HWIO)};
+        NNOPS_EXPECT_TRUE(op->validate(wt, wt_out) == Status::unsupported);
 
         // Note that a descriptor has no quant parameters — they live on the
         // view — so this rule keys off the dtype alone.
@@ -353,7 +358,8 @@ NNOPS_TEST(status_topk_rules) {
 
     attrs.axis = -1;   // wraps to axis 1
     attrs.k = 3;
-    const TensorDesc out3[] = {desc_of({2, 3}), desc_of({2, 3})};
+    // The indices output is always s64: the kernel writes int64 slots.
+    const TensorDesc out3[] = {desc_of({2, 3}), desc_of({2, 3}, DataType::s64)};
     NNOPS_EXPECT_TRUE(TopK::create(attrs, Backend::CPU)->validate(in, out3) ==
                       Status::ok);
 }

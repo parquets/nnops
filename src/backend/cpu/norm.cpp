@@ -1178,10 +1178,12 @@ Status norm_cpu(const NormAttributes& attrs, TensorView& output, std::span<const
         return norm_quant_impl(attrs, output, inputs, ctx);
     }
 
-    dispatch_f32_f16(x_dtype, "norm_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        norm_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(x_dtype, "norm_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            norm_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

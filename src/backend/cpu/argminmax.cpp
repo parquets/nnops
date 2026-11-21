@@ -64,10 +64,12 @@ Status argmax_cpu(const ArgMinMaxAttributes& attrs, TensorView& output,
                   std::span<const TensorView> inputs, const ComputeContext& ctx,
                   void* /*workspace*/)
 {
-    dispatch_f32_f16(inputs[0].data_type(), "argmax_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        argminmax_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(inputs[0].data_type(), "argmax_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            argminmax_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

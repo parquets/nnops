@@ -233,10 +233,12 @@ void topk_impl(const TopKAttributes& attrs, TensorView& values_out, TensorView& 
 Status topk_cpu(const TopKAttributes& attrs, TensorView& values, TensorView& indices,
                 std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
-    dispatch_f32_f16(inputs[0].data_type(), "topk_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        topk_impl<T>(attrs, values, indices, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(inputs[0].data_type(), "topk_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            topk_impl<T>(attrs, values, indices, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

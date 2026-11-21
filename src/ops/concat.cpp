@@ -22,7 +22,20 @@ std::vector<TensorDesc> Concat::getOutputTensorDesc(std::span<const TensorDesc> 
 Status Concat::validate(std::span<const TensorDesc> inputs,
                         std::span<const TensorDesc> outputs) const
 {
-    return detail::check_counts(inputs.size(), outputs.size(), 2, size_t(-1), 1);
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, size_t(-1), 1));
+    // A line copy: any whole-element dtype, all inputs in the same one.
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (!detail::is_movement_dtype(inputs[i].dtype)) {
+            return Status::unsupported;
+        }
+        if (inputs[i].dtype != inputs[0].dtype) {
+            return Status::invalid_argument;
+        }
+    }
+    if (outputs[0].dtype != inputs[0].dtype) {
+        return Status::invalid_argument;
+    }
+    return Status::ok;
 }
 
 Status Concat::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

@@ -306,10 +306,12 @@ Status quantize_linear_cpu(const QuantLinearAttributes& attrs, TensorView& outpu
                            std::span<const TensorView> inputs, const ComputeContext& ctx,
                            void* /*workspace*/)
 {
-    dispatch_f32_f16(inputs[0].data_type(), "quantize_linear_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        quantize_linear_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(inputs[0].data_type(), "quantize_linear_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            quantize_linear_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 
@@ -317,10 +319,12 @@ Status dequantize_linear_cpu(const QuantLinearAttributes& attrs, TensorView& out
                              std::span<const TensorView> inputs, const ComputeContext& ctx,
                              void* /*workspace*/)
 {
-    dispatch_f32_f16(output.data_type(), "dequantize_linear_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        dequantize_linear_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(output.data_type(), "dequantize_linear_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            dequantize_linear_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

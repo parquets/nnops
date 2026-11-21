@@ -51,10 +51,12 @@ void where_impl(TensorView& out, std::span<const TensorView> inputs, const Compu
 Status where_cpu(const WhereAttributes&, TensorView& output, std::span<const TensorView> inputs,
                  const ComputeContext& ctx, void* /*workspace*/)
 {
-    for_each_data_type(inputs[1].data_type(), [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        where_impl<T>(output, inputs, ctx);
-    });
+    if (!for_each_data_type(inputs[1].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            where_impl<T>(output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

@@ -209,10 +209,12 @@ Status apply_output_gate(const AttentionConfig& cfg, TensorView& output,
             return Status::invalid_argument;
         }
     }
-    dispatch_f32_f16(output.data_type(), "attention_output_gate", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        output_gate_impl<T>(cfg, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(output.data_type(), "attention_output_gate", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            output_gate_impl<T>(cfg, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

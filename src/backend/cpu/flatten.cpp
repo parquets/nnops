@@ -1,11 +1,11 @@
 /// @file flatten.cpp
-/// @brief SIMD-optimized CPU implementation of Flatten.
+/// @brief CPU Flatten — a storage copy into dense row-major order.
 ///
-/// Row-by-row SIMD copy from any input layout to dense row-major output.
-/// Uses the generic SIMD API (v_load/v_store) to handle both f32 and f16.
-///
-/// The key optimization: detect when the input is already dense in the
-/// output's row order (row_stride == oW) → single memcpy of the entire buffer.
+/// The input is read through its own strides, so a channel-last tensor
+/// [N,H,W,C] flattens onto dense [N,H,W,C] storage as one memcpy of the whole
+/// buffer; a strided view copies row by row (memcpy when the row is dense,
+/// element by element when it is not). Both are byte copies, so every
+/// whole-element dtype is carried — f16 bits and int64 indices included.
 
 #include "nnops/ops/flatten.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -24,7 +24,6 @@ void flatten_impl(const FlattenAttributes& /*attrs*/, TensorView& output,
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
-    constexpr int L = simd_lane_for<T>;
 
     // Output is always dense row-major
     const int64_t oW = output.shape(rank - 1);
@@ -81,25 +80,14 @@ void flatten_impl(const FlattenAttributes& /*attrs*/, TensorView& output,
             i_off += idx * input.stride_elems(d);
         }
 
-        int64_t w = 0;
+        // A dense row is one memcpy whatever the element type is (this is a
+        // storage copy, not arithmetic); a strided row walks elements.
         if (i_w_stride == 1) {
-            // Dense input: contiguous row → SIMD vector copy
-            for (; w + L <= oW; w += L) {
-                v_store(o_row + w, v_load(i_ptr + i_off + w));
-            }
+            std::memcpy(o_row, i_ptr + i_off, static_cast<size_t>(oW) * sizeof(T));
         } else {
-            // Spatial input: strided element access
-            for (; w + L <= oW; w += L) {
-                T tmp[16]; // max simd lane width
-                for (int k = 0; k < L; ++k) {
-                    s_store(&tmp[k], s_load(&i_ptr[i_off + (w + k) * i_w_stride]));
-                }
-                v_store(o_row + w, v_load(tmp));
+            for (int64_t w = 0; w < oW; ++w) {
+                o_row[w] = i_ptr[i_off + w * i_w_stride];
             }
-        }
-        // Scalar tail
-        for (; w < oW; ++w) {
-            s_store(&o_row[w], s_load(&i_ptr[i_off + w * i_w_stride]));
         }
     }
 }
@@ -108,10 +96,12 @@ Status flatten_cpu(const FlattenAttributes& attrs, TensorView& output,
                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                    void* /*workspace*/)
 {
-    dispatch_f32_f16(inputs[0].data_type(), "flatten_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        flatten_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!for_each_data_type(inputs[0].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            flatten_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

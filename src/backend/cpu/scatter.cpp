@@ -303,11 +303,12 @@ Status scatter_elements_cpu(const ScatterElementsAttributes& attrs, TensorView& 
     const int64_t axis = resolve_axis(attrs.axis, data.rank());
     const int64_t limit = data.shape(axis);
 
+    bool dispatched = false;
     if (indices.data_type() == DataType::s64) {
         if (!scatter_elements_indices_valid<int64_t>(indices, limit)) {
             return Status::invalid_argument;
         }
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             scatter_elements_impl<T, int64_t>(attrs, output, data, indices, updates, ctx);
         });
@@ -315,12 +316,12 @@ Status scatter_elements_cpu(const ScatterElementsAttributes& attrs, TensorView& 
         if (!scatter_elements_indices_valid<int32_t>(indices, limit)) {
             return Status::invalid_argument;
         }
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             scatter_elements_impl<T, int32_t>(attrs, output, data, indices, updates, ctx);
         });
     }
-    return Status::ok;
+    return dispatched ? Status::ok : Status::unsupported;
 }
 
 Status scatter_nd_cpu(const ScatterNDAttributes& attrs, TensorView& output,
@@ -331,11 +332,12 @@ Status scatter_nd_cpu(const ScatterNDAttributes& attrs, TensorView& output,
     const auto& indices = inputs[1];
     const auto& updates = inputs[2];
 
+    bool dispatched = false;
     if (indices.data_type() == DataType::s64) {
         if (!scatter_nd_indices_valid<int64_t>(indices, data)) {
             return Status::invalid_argument;
         }
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             scatter_nd_impl<T, int64_t>(attrs, output, data, indices, updates, ctx);
         });
@@ -343,12 +345,12 @@ Status scatter_nd_cpu(const ScatterNDAttributes& attrs, TensorView& output,
         if (!scatter_nd_indices_valid<int32_t>(indices, data)) {
             return Status::invalid_argument;
         }
-        for_each_data_type(data.data_type(), [&](auto tag) {
+        dispatched = for_each_data_type(data.data_type(), [&](auto tag) {
             using T = typename decltype(tag)::type;
             scatter_nd_impl<T, int32_t>(attrs, output, data, indices, updates, ctx);
         });
     }
-    return Status::ok;
+    return dispatched ? Status::ok : Status::unsupported;
 }
 
 } // namespace nnops::backend::cpu

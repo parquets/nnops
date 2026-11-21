@@ -196,10 +196,12 @@ Status resize_cpu(const ResizeAttributes& attrs, TensorView& output,
     if (attrs.mode == ResizeMode::Cubic && ResizeAttributes::spatial_rank(inputs[0].rank()) != 2) {
         return Status::unsupported;
     }
-    dispatch_f32_f16(inputs[0].data_type(), "resize_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        resize_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(inputs[0].data_type(), "resize_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            resize_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

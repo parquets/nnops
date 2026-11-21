@@ -110,6 +110,17 @@ constexpr bool dtype_in(Backend be, DataType d) noexcept
     return ((d == Ds) || ...);
 }
 
+/// True for the element types that have a whole-element storage unit, i.e. the
+/// set the data-movement kernels instantiate (`for_each_data_type` on the CPU).
+/// The packed formats (f8, s4/u4, q4_1) have no per-element copy and are
+/// rejected by the operators that move elements.
+constexpr bool is_movement_dtype(DataType d) noexcept
+{
+    return d == DataType::f32 || d == DataType::f16 || d == DataType::bf16 ||
+           d == DataType::s8 || d == DataType::u8 || d == DataType::s32 ||
+           d == DataType::s64;
+}
+
 /// Rank must lie in [lo, hi]; hi < 0 means unbounded.
 constexpr Status check_rank(int64_t rank, int64_t lo, int64_t hi = -1) noexcept
 {

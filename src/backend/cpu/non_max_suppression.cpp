@@ -258,10 +258,12 @@ Status nms_cpu(const NonMaxSuppressionAttributes& attrs, TensorView& indices,
                const ComputeContext& ctx, void* /*workspace*/)
 {
     (void)ctx;  // one (batch, class) at a time; see the file comment
-    dispatch_f32_f16(inputs[0].data_type(), "nms_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        nms_impl<T>(attrs, indices, num_selected, inputs);
-    });
+    if (!dispatch_f32_f16(inputs[0].data_type(), "nms_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            nms_impl<T>(attrs, indices, num_selected, inputs);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

@@ -76,6 +76,12 @@ Status TopK::validate(std::span<const TensorDesc> inputs, std::span<const Tensor
         return Status::invalid_argument;
     }
 
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype)) {
+        return Status::unsupported;
+    }
+    if (outputs[0].dtype != in.dtype || outputs[1].dtype != DataType::s64) {
+        return Status::invalid_argument;
+    }
     return detail::require(is_layout_supported(in.layout, LayoutSupport::Any));
 }
 

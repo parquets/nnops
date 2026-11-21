@@ -279,10 +279,12 @@ Status transpose_conv3d_cpu(const TransposeConv3DAttributes& attrs, TensorView& 
     gm.OC = gm.OC_per_G * gm.G;
     gm.IC_per_G = gm.IC / gm.G;
 
-    dispatch_f32_f16(input.data_type(), "transpose_conv3d_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        tconv3d_impl<T>(gm, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(input.data_type(), "transpose_conv3d_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            tconv3d_impl<T>(gm, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

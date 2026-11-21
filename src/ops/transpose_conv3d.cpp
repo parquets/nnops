@@ -27,6 +27,12 @@ Status TransposeConv3D::validate(std::span<const TensorDesc> inputs,
 {
     // input, weight [, bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, inputs[0].dtype)) {
+        return Status::unsupported;
+    }
+    if (outputs[0].dtype != inputs[0].dtype) {
+        return Status::invalid_argument;
+    }
     return detail::require(is_channel_last(inputs[0].layout));
 }
 

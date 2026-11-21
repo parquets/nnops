@@ -26,7 +26,18 @@ std::vector<TensorDesc> Unary::getOutputTensorDesc(std::span<const TensorDesc> i
 Status Unary::validate(std::span<const TensorDesc> inputs,
                        std::span<const TensorDesc> outputs) const
 {
-    return detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1);
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
+    const DataType d = inputs[0].dtype;
+    // Float, or the int8 pair the fused quantized path carries (it needs the
+    // per-tensor scale/zero_point, which only compute() can see).
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, d) && d != DataType::s8 &&
+        d != DataType::u8) {
+        return Status::unsupported;
+    }
+    if (outputs[0].dtype != d) {
+        return Status::invalid_argument;
+    }
+    return Status::ok;
 }
 
 Status Unary::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,

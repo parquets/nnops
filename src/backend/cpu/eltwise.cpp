@@ -207,15 +207,21 @@ Status eltwise_cpu(const EltwiseAttributes& attrs, TensorView& output,
     const bool out_is_int = is_quantized_dtype(output.data_type());
 
     if (!in_is_int && !out_is_int) {
-        dispatch_f32_f16(dtype, "eltwise_cpu", [&](auto tag) {
-            using T = typename decltype(tag)::type;
-            eltwise_impl<T>(attrs, output, inputs, ctx);
-        });
+        if (!dispatch_f32_f16(dtype, "eltwise_cpu", [&](auto tag) {
+                using T = typename decltype(tag)::type;
+                eltwise_impl<T>(attrs, output, inputs, ctx);
+            })) {
+            return Status::unsupported;
+        }
         return Status::ok;
     }
 
-    // Quantized path: both inputs and the output must be s8/u8 (no float↔int mixing).
-    NNOPS_ASSERT(in_is_int && out_is_int);
+    // Quantized path: both inputs and the output must be s8/u8 (no float↔int
+    // mixing). The parameters themselves may be the identity (scale 1, zero
+    // point 0), which is a well-formed call, so only the dtype pair is checked.
+    if (!in_is_int || !out_is_int) {
+        return Status::invalid_argument;
+    }
 
     // The fused tile path dequantizes one element per side; a broadcast would
     // need the index arithmetic re-derived per scale row, so it stays float.

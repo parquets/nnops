@@ -165,10 +165,14 @@ Status concat_cpu(const ConcatAttributes& attrs, TensorView& output,
                   std::span<const TensorView> inputs, const ComputeContext& ctx,
                   void* /*workspace*/)
 {
-    dispatch_f32_f16(inputs[0].data_type(), "concat_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        concat_impl<T>(attrs, output, inputs, ctx);
-    });
+    // A line copy carries every whole-element dtype, f16 bits and int64 indices
+    // included.
+    if (!for_each_data_type(inputs[0].data_type(), [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            concat_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

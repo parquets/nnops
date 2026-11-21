@@ -18,6 +18,7 @@
 #include "nnops/ops/permute.hpp"
 #include "simd_kernel/simd_permute.hpp"
 #include "common/dtype_dispatch.hpp"
+#include "common/strided_walk.hpp"
 
 #include <cstring>
 
@@ -25,19 +26,9 @@ namespace nnops::backend::cpu {
 
 namespace {
 
-/// Dense storage (no row pitch padding): the tiled transpose indexes a slice as
-/// `m * k`, which only holds when the rows sit back to back.
-bool is_compact(const TensorView& v)
-{
-    int64_t want = 1;
-    for (int64_t d = v.rank() - 1; d >= 0; --d) {
-        if (v.shape(d) != 1 && v.stride_elems(d) != want) {
-            return false;
-        }
-        want *= v.shape(d);
-    }
-    return true;
-}
+/// The tiled transpose indexes a slice as `m * k`, which only holds when the
+/// rows sit back to back.
+bool is_compact(const TensorView& v) { return is_compact_view(v); }
 
 } // anonymous namespace
 
@@ -160,7 +151,12 @@ Status permute_cpu(const PermuteAttributes& attrs, TensorView& output,
         }
     }
 
-    if (is_last_two_swap) {
+    // The tiled 8x8 transpose is an fp kernel; every other dtype (and every
+    // other permutation) is the stride-driven element copy, which is
+    // dtype-generic.
+    const bool fp = dtype == DataType::f32 || dtype == DataType::f16 ||
+                    (dtype == DataType::bf16 && nnops::detail::bf16_cpu_enabled);
+    if (is_last_two_swap && fp) {
         dispatch_f32_f16(dtype, "permute_cpu", [&](auto tag) {
             using T = typename decltype(tag)::type;
             permute_last_two_swap_impl<T>(output, inputs, ctx);
@@ -168,10 +164,12 @@ Status permute_cpu(const PermuteAttributes& attrs, TensorView& output,
         return Status::ok;
     }
 
-    dispatch_f32_f16(dtype, "permute_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        permute_impl<T>(attrs, output, inputs, ctx);
-    });
+    if (!for_each_data_type(dtype, [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            permute_impl<T>(attrs, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

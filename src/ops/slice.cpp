@@ -28,8 +28,10 @@ Status Slice::validate(std::span<const TensorDesc> inputs,
     const auto& out = outputs[0];
 
     NNOPS_TRY(detail::check_rank(in.rank, 1, TensorDesc::kMaxRank));
-    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, in.dtype) ||
-        out.dtype != in.dtype) {
+    if (!detail::is_movement_dtype(in.dtype)) {
+        return Status::unsupported;
+    }
+    if (out.dtype != in.dtype) {
         return Status::invalid_argument;
     }
     if (!is_layout_supported(in.layout, LayoutSupport::Any) ||

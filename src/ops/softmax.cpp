@@ -28,14 +28,17 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
         return Status::invalid_argument;
     }
 
-    // The axis walk reads the tensor through stride_elems(), which describes the
-    // regular image layouts; the opaque weight tags have no axis semantics here.
-    if (!is_channel_last(inputs[0].layout)) {
+    // The walk is stride-driven, so Dense and channel-last both work; only a
+    // weight tag has no axis semantics for an activation.
+    if (inputs[0].layout != TensorLayout::Dense && !is_channel_last(inputs[0].layout)) {
         return Status::unsupported;
     }
     // A quantized input would need a dequantizing walk that no longer exists.
-    if (is_quantized_dtype(inputs[0].dtype)) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, inputs[0].dtype)) {
         return Status::unsupported;
+    }
+    if (outputs[0].dtype != inputs[0].dtype) {
+        return Status::invalid_argument;
     }
     return Status::ok;
 }

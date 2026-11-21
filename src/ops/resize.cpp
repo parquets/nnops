@@ -24,6 +24,12 @@ Status Resize::validate(std::span<const TensorDesc> inputs,
                         std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(backend_, inputs[0].dtype)) {
+        return Status::unsupported;
+    }
+    if (outputs[0].dtype != inputs[0].dtype) {
+        return Status::invalid_argument;
+    }
     return detail::require(
         is_layout_supported(inputs[0].layout, LayoutSupport::ChannelLastOnly));
 }

@@ -455,10 +455,12 @@ Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs, TensorView& 
         return transpose_conv2d_int8_cpu(attrs, gm, output, inputs, ctx);
     }
 
-    dispatch_f32_f16(input.data_type(), "transpose_conv2d_cpu", [&](auto tag) {
-        using T = typename decltype(tag)::type;
-        tconv2d_impl<T>(gm, output, inputs, ctx);
-    });
+    if (!dispatch_f32_f16(input.data_type(), "transpose_conv2d_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            tconv2d_impl<T>(gm, output, inputs, ctx);
+        })) {
+        return Status::unsupported;
+    }
     return Status::ok;
 }
 

@@ -149,15 +149,21 @@ Status unary_cpu(const UnaryAttributes& attrs, TensorView& output,
     const bool out_is_int = is_quantized_dtype(output.data_type());
 
     if (!in_is_int && !out_is_int) {
-        dispatch_f32_f16(dtype, "unary_cpu", [&](auto tag) {
-            using T = typename decltype(tag)::type;
-            unary_impl<T>(attrs, output, inputs, ctx);
-        });
+        if (!dispatch_f32_f16(dtype, "unary_cpu", [&](auto tag) {
+                using T = typename decltype(tag)::type;
+                unary_impl<T>(attrs, output, inputs, ctx);
+            })) {
+            return Status::unsupported;
+        }
         return Status::ok;
     }
 
     // Quantized path: both input and output must be s8/u8 (no float↔int mixing).
-    NNOPS_ASSERT(in_is_int && out_is_int);
+    // The parameters themselves may be the identity (scale 1, zero point 0),
+    // which is a well-formed call, so only the dtype pair is checked here.
+    if (!in_is_int || !out_is_int) {
+        return Status::invalid_argument;
+    }
 
     // Round/Ceil/Floor have no quantized meaning; refuse rather than fall through.
     if (attrs.type == UnaryType::Round || attrs.type == UnaryType::Ceil ||

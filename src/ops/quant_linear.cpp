@@ -65,10 +65,38 @@ QuantizeLinear::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
     return quantize_linear_output_shape(inputs, attrs_.output_dtype);
 }
 
+namespace {
+
+/// The two directions share a shape: a float side, an s8/u8 side, an f32 scale
+/// and an s8/u8 zero point. The kernel reads the scale as f32 and the zero point
+/// through its own storage tag, so a mismatch misreads the bytes.
+Status check_quant_linear_dtypes(const Backend be, std::span<const TensorDesc> inputs,
+                                 std::span<const TensorDesc> outputs, bool quantize)
+{
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 3, 1));
+    const DataType flt = quantize ? inputs[0].dtype : outputs[0].dtype;
+    const DataType qnt = quantize ? outputs[0].dtype : inputs[0].dtype;
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(be, flt)) {
+        return Status::unsupported;
+    }
+    if (qnt != DataType::s8 && qnt != DataType::u8) {
+        return Status::invalid_argument;
+    }
+    if (inputs[1].dtype != DataType::f32) {
+        return Status::invalid_argument;
+    }
+    if (inputs[2].dtype != DataType::s8 && inputs[2].dtype != DataType::u8) {
+        return Status::invalid_argument;
+    }
+    return Status::ok;
+}
+
+} // namespace
+
 Status QuantizeLinear::validate(std::span<const TensorDesc> inputs,
                                 std::span<const TensorDesc> outputs) const
 {
-    return detail::check_counts(inputs.size(), outputs.size(), 3, 3, 1);
+    return check_quant_linear_dtypes(backend_, inputs, outputs, true);
 }
 
 Status QuantizeLinear::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
@@ -128,7 +156,7 @@ DequantizeLinear::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 Status DequantizeLinear::validate(std::span<const TensorDesc> inputs,
                                   std::span<const TensorDesc> outputs) const
 {
-    return detail::check_counts(inputs.size(), outputs.size(), 3, 3, 1);
+    return check_quant_linear_dtypes(backend_, inputs, outputs, false);
 }
 
 Status DequantizeLinear::compute(std::span<TensorView> outputs, std::span<const TensorView> inputs,
