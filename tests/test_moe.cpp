@@ -1142,6 +1142,12 @@ NNOPS_TEST(moe_q4_1_swiglu)
 
 // Enough routes per expert that the GEMM leaves the fused small-M decode and
 // packs Q4_1 panels instead: 128 routes over 2 experts is ~64 rows per expert.
+//
+// The tolerance's absolute term is the f32 dot reordering, not the kernel: the
+// packed route may run on the NEON panels or on the ZA tiles, and the two sum
+// the same 128/256 products in different orders. Where a routed sum cancels to
+// ~1e-2, that reordering is ~1e-5 — compare moe_q4_1_weights, whose small
+// products stay on the fused decode and match to 1e-5.
 NNOPS_TEST(moe_q4_1_packed_route)
 {
     MoEProblem p;
@@ -1153,7 +1159,7 @@ NNOPS_TEST(moe_q4_1_packed_route)
     attrs.k = 2;
     attrs.activation = MoEActivation::Relu;
 
-    expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe q4_1 packed");
+    expect_matches_ref(p, attrs, {}, 1e-4f, 2e-5f, "moe q4_1 packed");
 }
 
 }  // anonymous namespace

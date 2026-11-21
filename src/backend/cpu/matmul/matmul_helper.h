@@ -799,6 +799,13 @@ void tile_pack_lhs_sme(bool trans, int mc, int kc, half* dst, const half* src, i
 void tile_pack_rhs_sme(bool trans, int nc, int kc, float* dst, const float* src,
                        int lds) noexcept;
 void tile_pack_rhs_sme(bool trans, int nc, int kc, half* dst, const half* src, int lds) noexcept;
+// A Q4_1 B decoded into the same panels — the ZA route's counterpart to
+// tile_pack_rhs_q4_1. The tile origin is in elements, @p src_row_blocks is the
+// B row pitch in 20-byte blocks, and @p scale (MatMul's alpha) rides the decode.
+void tile_pack_rhs_q4_1_sme(bool trans, int n_start, int nc, int k_start, int kc, float* dst,
+                            const void* src, int64_t src_row_blocks, float scale) noexcept;
+void tile_pack_rhs_q4_1_sme(bool trans, int n_start, int nc, int k_start, int kc, half* dst,
+                            const void* src, int64_t src_row_blocks, float scale) noexcept;
 void tile_mma_pack_sme(int mc, int nc, int kc, float* c, int ldc, const float* packed_a,
                        const float* b, int64_t block_stride, float clamp_min, float clamp_max,
                        bool zero_mode, const float* col_bias = nullptr);
@@ -979,8 +986,10 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs, const TensorDesc& a_de
 /// The same plan for the SME tiles: mc 64, nc in 64-column blocks (up to 1024,
 /// enough to fill the pool), kc per dtype, A always packed. The packed-A region
 /// is ceil(mc/16) blocks — the ZA kernel's own row geometry, not the NEON MR
-/// ladder — and B's stride is the 64-column block. An all-zero plan means the
-/// operand pair is not one the SME tiles serve (non-f32/f16/i8, or a Q4_1 B).
+/// ladder — and B's stride is the 64-column block. A Q4_1 B is served too: its
+/// panels are T-sized once decoded, so they are sized by A's dtype. An all-zero
+/// plan means the operand pair is not one the SME tiles serve (non-f32/f16/i8,
+/// or a bf16 activation).
 MatMulPlan get_matmul_plan_sme(const MatMulAttributes& attrs, const TensorDesc& a_desc,
                                const TensorDesc& b_desc, int num_threads = 1,
                                bool use_thread_slots = false);
