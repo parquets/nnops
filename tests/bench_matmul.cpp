@@ -440,9 +440,13 @@ GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int i
     sme_route = sme_dtype && cpu::aarch64::available_sme() && c.M > 4 && c.N >= 16 && c.K > 0 &&
                 c.M > fused_max && attrs.alpha == 1.0f;
 #endif
+#if defined(NNOPS_ARCH_SME)
     const cpu::MatMulPlan plan = sme_route ?
                                      cpu::get_matmul_plan_sme(attrs, a_desc, b_desc, 1) :
                                      cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
+#else
+    const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
+#endif
 
     std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = test::make_channel_first(descs[0], out_buf.data());
