@@ -20,6 +20,9 @@
 /// per-row pass before the mask.
 
 #include "attention_internal.h"
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme — the ZA fp route gate
+#endif
 
 namespace nnops::backend::cpu {
 
@@ -81,19 +84,28 @@ void attention_standard_impl(const AttentionConfig& cfg, TensorView& output,
     const int mc2 = plan.mc2;
     const int nc2 = plan.nc2;
 
-    // Scratch bounds: longest k-block and widest n-block either GEMM sees.
-    const int ldd_b_full = static_cast<int>(
-        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(std::max(Dqk, Sk))) *
-                       static_cast<int>(sizeof(T))) /
-        static_cast<int>(sizeof(T)));
-    const int np_full =
-        std::max(panels_for_pack<T>(nc1), panels_for_pack<T>(std::min<int64_t>(Dv, nc2)));
-
+    // Scratch bounds: the packed-B slot both GEMMs share, plus the ZA engine's
+    // packed query block and probability tile. The plan sizes the slot with the
+    // same helpers, so the two cannot disagree.
     const int64_t scores_elems = Sq * Sk;
-    const int64_t pack_elems = static_cast<int64_t>(np_full) * ldd_b_full;
+    const int64_t pack_elems = standard_b_pack_elems<T>(nc1, nc2, Dqk, Dv, Sk);
     const int64_t i8_elems =
         kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(std::max(Dqk, Sk))) : 0;
-    const int64_t per_head = scores_elems + pack_elems + i8_elems;
+    const int64_t sme_q_elems = standard_sme_q_elems<T>(Sq, Dqk);
+    const int64_t sme_p_elems = standard_sme_p_elems<T>(mc2, Sk);
+    const int64_t per_head = scores_elems + pack_elems + i8_elems + sme_q_elems + sme_p_elems;
+
+    // The ZA fp engine: f32/f16, a dense cache, and a head dim that fits one ZA
+    // k block (the packed query block is one slab). The prob tile's k blocks are
+    // the engine's own, independent of the NEON plan's kc.
+    constexpr DataType sme_dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    bool sme = false;
+#if defined(NNOPS_ARCH_SME)
+    if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+        sme = !kv8 && aarch64::available_sme() && Dqk <= sme_kc_for(sme_dt);
+    }
+#endif
+    const int64_t sme_kc = sme_kc_for(sme_dt);
 
     const int64_t NG = B * H;
     T* ws_base = static_cast<T*>(workspace);
@@ -116,6 +128,8 @@ void attention_standard_impl(const AttentionConfig& cfg, TensorView& output,
         T* scores = ws_base + slot * per_head;
         T* pack_b = scores + scores_elems;
         T* i8_temp = pack_b + pack_elems;
+        T* sme_q = i8_temp + i8_elems; // the ZA route's packed query block
+        T* sme_p = sme_q + sme_q_elems;
         const float sink = sink_ptr != nullptr ? simd::s_load(&sink_ptr[h]) : kNegInf;
 
         // The batch's valid key run: its prefix of the [past | new] rows, and
@@ -125,6 +139,31 @@ void attention_standard_impl(const AttentionConfig& cfg, TensorView& output,
 
         // ---- GEMM1: scores = Q @ K^T * scale --------------------------
         // k0 == 0 runs zero_mode (overwrite) — no pre-zeroing pass.
+        if (sme) {
+            if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+                // The query block is packed once per head, scale folded in; the
+                // ZA pack has no alpha and GEMM1's B is K as stored. The A slab
+                // is block-major, so the M loop stays on 32-row boundaries.
+                tile_pack_lhs_sme(false, static_cast<int>(Sq), static_cast<int>(Dqk), sme_q,
+                                  q_head, static_cast<int>(q_rs));
+                scale_packed_a(sme_q, sme_q_elems, scale);
+                constexpr int kSmeMc = 64;
+                for (int64_t n = 0; n < Sk; n += nc1) {
+                    const int actual_nc = static_cast<int>(std::min<int64_t>(nc1, Sk - n));
+                    tile_pack_rhs_sme(true, actual_nc, static_cast<int>(Dqk), pack_b,
+                                      k_head + n * k_rs, static_cast<int>(k_rs));
+                    for (int64_t m = 0; m < Sq; m += kSmeMc) {
+                        const int actual_mc =
+                            static_cast<int>(std::min<int64_t>(kSmeMc, Sq - m));
+                        tile_mma_pack_sme(
+                            actual_mc, actual_nc, static_cast<int>(Dqk), scores + m * Sk + n,
+                            static_cast<int>(Sk),
+                            sme_q + fp_sme_a_row_offset(sme_dt, Dqk, m), pack_b,
+                            /*block_stride=*/0, kNegInf, kPosInf, /*zero_mode=*/true);
+                    }
+                }
+            }
+        } else {
         for (int64_t k0 = 0; k0 < Dqk; k0 += kc) {
             const int actual_kc = static_cast<int>(std::min<int64_t>(kc, Dqk - k0));
             const int ldd_b =
@@ -148,6 +187,7 @@ void attention_standard_impl(const AttentionConfig& cfg, TensorView& output,
                                     kNegInf, kPosInf, k0 == 0);
                 }
             }
+        }
         }
 
         // ---- softcap + mask + softmax over the last dim, per row ------
@@ -196,6 +236,30 @@ void attention_standard_impl(const AttentionConfig& cfg, TensorView& output,
         }
 
         // ---- GEMM2: output = attn @ V ---------------------------------
+        if (sme) {
+            if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+                // V packed per (k-block, n-block); the probability tile packed
+                // per (m-block, k-block) and reused across the n blocks.
+                for (int64_t k0 = 0; k0 < Sk; k0 += sme_kc) {
+                    const int actual_kc = static_cast<int>(std::min(sme_kc, Sk - k0));
+                    for (int64_t n = 0; n < Dv; n += nc2) {
+                        const int actual_nc = static_cast<int>(std::min<int64_t>(nc2, Dv - n));
+                        tile_pack_rhs_sme(false, actual_nc, actual_kc, pack_b,
+                                          v_head + k0 * v_rs + n, static_cast<int>(v_rs));
+                        for (int64_t m = 0; m < Sq; m += mc2) {
+                            const int actual_mc =
+                                static_cast<int>(std::min<int64_t>(mc2, Sq - m));
+                            tile_pack_lhs_sme(false, actual_mc, actual_kc, sme_p,
+                                              scores + m * Sk + k0, static_cast<int>(Sk));
+                            tile_mma_pack_sme(actual_mc, actual_nc, actual_kc,
+                                              o_head + m * o_rs + n, static_cast<int>(o_rs),
+                                              sme_p, pack_b, /*block_stride=*/0, kNegInf, kPosInf,
+                                              k0 == 0);
+                        }
+                    }
+                }
+            }
+        } else {
         for (int64_t k0 = 0; k0 < Sk; k0 += kc) {
             const int actual_kc = static_cast<int>(std::min<int64_t>(kc, Sk - k0));
             const int ldd_b =
@@ -221,6 +285,7 @@ void attention_standard_impl(const AttentionConfig& cfg, TensorView& output,
                                     kNegInf, kPosInf, k0 == 0);
                 }
             }
+        }
         }
     };
 

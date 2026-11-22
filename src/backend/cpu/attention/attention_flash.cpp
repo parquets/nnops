@@ -23,6 +23,12 @@
 /// Both GEMMs drive tile_mma_direct with a packed B. The first k-block of the
 /// whole task runs zero_mode, which is what lets o_acc skip a pre-zeroing pass.
 ///
+/// On an SME machine a dense f32/f16 run takes the ZA engine instead: both
+/// GEMMs go through tile_pack_*_sme + tile_mma_pack_sme. The query block is
+/// packed once per task, with the softmax scale folded into the packed A (the
+/// ZA pack has no alpha), and the probability tile is packed per KV tile. The
+/// int8 switches and a bf16 run keep the NEON path.
+///
 /// Over an s8 cache with cfg.quantize_q set, GEMM1 instead runs on the integer
 /// MMA: the task's query rows are quantized once (one symmetric scale per row)
 /// into a signed byte block, the cache's keys are packed as stored, and the
@@ -36,6 +42,10 @@
 /// Both switches are independent; either or both may be off.
 
 #include "attention_internal.h"
+#include "backend/cpu/simd_kernel/simd_quant.hpp" // quantization — the ZA query staging block
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme — the ZA route gate
+#endif
 
 namespace nnops::backend::cpu {
 
@@ -127,6 +137,31 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
     const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8, qk8, pv8);
     const int64_t pack_elems = flash_pack_elems<T>(Bc, Dqk, Dv);
     const FlashI8Layout i8_layout = flash_i8_layout(Br, Bc, Dqk, Dv, hb, qk8, pv8);
+    // The ZA fp engine, when this build and CPU carry it: f32/f16 only, a
+    // dense cache only (an s8 cache keeps the dequantizing NEON pack), and a
+    // head dim the packed A slab can hold as one ZA k block.
+    constexpr DataType sme_dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    bool sme = false;
+    bool sme_i8 = false;
+#if defined(NNOPS_ARCH_SME)
+    if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+        sme = !kv8 && aarch64::available_sme() &&
+              Dqk <= sme_kc_for(sme_dt);
+    }
+    if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+        sme_i8 = kv8 && aarch64::available_sme();
+    }
+#endif
+    // The integer products each decide their engine; either may be off while
+    // the other is on, and an s8 cache keeps the fp path out entirely.
+    const bool sme_qk = sme_i8 && qk8;
+    const bool sme_pv = sme_i8 && pv8;
+    // A 16-row query chunk is one ZA block and the packs dominate; a couple of
+    // row blocks is where the integer ZA route starts to pay.
+    constexpr int kSmeI8MinRows = 32;
+    const FlashSmeLayout sme_layout = flash_sme_layout<T>(Br, Bc, Dqk, hb);
+    const int64_t sme_q_head = static_cast<int64_t>(sme_layout.q_head) /
+                               static_cast<int64_t>(sizeof(T));
 
     const int64_t NQ = (Sq + Br - 1) / Br; // number of Br-row query blocks
     const int64_t units = B * Hkv * nb * NQ;
@@ -160,6 +195,8 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
         const int nh = static_cast<int>(std::min<int64_t>(hb, G - c * hb));
         const int64_t i0 = qi * Br;
         const int actual_br = static_cast<int>(std::min<int64_t>(Br, Sq - i0));
+        const bool use_sme_qk = sme_qk && actual_br >= kSmeI8MinRows;
+        const bool use_sme_pv = sme_pv && actual_br >= kSmeI8MinRows;
         // The batch's valid key run: its prefix of the [past | new] rows, and
         // where this batch's query rows sit (vector > scalar > bottom-right).
         const int64_t run_len = run_length(seqlens, b, Sk, seqlens_plus_one);
@@ -206,18 +243,33 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
         // probability block (P·V), and the int32 accumulator tile both use.
         int8_t* qpack = nullptr;
         float* q_scale = nullptr;
+        int8_t* qraw = nullptr;
         int8_t* ppack = nullptr;
         int32_t* s32 = nullptr;
+        float* rowmax_buf = nullptr;
         if (qk8 || pv8) {
             char* tail = reinterpret_cast<char*>(pack_b + pack_elems);
             if (qk8) {
                 qpack = reinterpret_cast<int8_t*>(tail);
                 q_scale = reinterpret_cast<float*>(tail + i8_layout.qscale);
+                qraw = reinterpret_cast<int8_t*>(tail + i8_layout.qraw);
             }
             if (pv8) {
                 ppack = reinterpret_cast<int8_t*>(tail + i8_layout.ppack);
             }
             s32 = reinterpret_cast<int32_t*>(tail + i8_layout.s32);
+            if (qk8) {
+                rowmax_buf = reinterpret_cast<float*>(tail + i8_layout.rowmax);
+            }
+        }
+        // The ZA fp route's two packed A blocks share the same trailing
+        // region (the integer route and this one never run together).
+        T* sme_q = nullptr;
+        T* sme_p = nullptr;
+        if (sme) {
+            char* tail = reinterpret_cast<char*>(pack_b + pack_elems);
+            sme_q = reinterpret_cast<T*>(tail);
+            sme_p = reinterpret_cast<T*>(tail + sme_layout.ppack);
         }
 
         // Reset the running online-softmax state through the scalar simd
@@ -265,6 +317,31 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
             const int64_t k_step = k_str[seg];
             const int64_t v_step = v_str[seg];
 
+            // ---- online-softmax update + accumulate into o_acc -----
+            // On the int8 P·V path the exp step writes the probabilities
+            // straight onto the u8 grid — folded with the V scale and placed
+            // over the scores they came from — so the fp probabilities never
+            // reach memory and the pack that follows is a pure byte shuffle.
+            float sc_tile = 1.0f;
+            float col_fold[kFlashBcMax];
+            const float* fold = nullptr;
+            if (pv8) {
+                NNOPS_ASSERT(actual_bc <= kFlashBcMax);
+                const bool v_col = vs_head.ptr != nullptr && vs_head.step != 0;
+                sc_tile = vs_head.at(0);
+                if (v_col) {
+                    sc_tile = 0.0f;
+                    for (int t = 0; t < actual_bc; ++t) {
+                        sc_tile = std::max(sc_tile, vs_head.at(j0 + t));
+                    }
+                    NNOPS_ASSERT(sc_tile > 0.0f);
+                    const float inv = sc_tile > 0.0f ? 1.0f / sc_tile : 1.0f;
+                    for (int t = 0; t < actual_bc; ++t) {
+                        col_fold[t] = vs_head.at(j0 + t) * inv;
+                    }
+                    fold = col_fold;
+                }
+            }
             // ---- S = Q[i0:i0+Br] @ K[j0:j0+Bc]^T * scale ----------
             // k0 == 0 overwrites (zero_mode) — each KV block owns its S tile.
             if (qk8) {
@@ -276,27 +353,91 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                 const float* kcol = k_col ? ks_head.ptr + j0 : nullptr;
                 // One packed K tile serves every batched head (the gate keeps
                 // the head dim inside one integer k block).
-                tile_pack_rhs_i8(true, actual_bc, static_cast<int>(Dqk),
-                                 reinterpret_cast<int8_t*>(pack_b),
-                                 static_cast<int>(int8_panel_stride(Dqk)),
-                                 k8_head + koff * k_step, static_cast<int>(k_step),
-                                 kQkI8ABiased);
+                if (use_sme_qk) {
+#if defined(NNOPS_ARCH_SME)
+                    if constexpr (fp_sme_capable<T>) {
+                        tile_pack_rhs_i8_sme(true, actual_bc, static_cast<int>(Dqk),
+                                             reinterpret_cast<int8_t*>(pack_b),
+                                             k8_head + koff * k_step, static_cast<int>(k_step));
+                    }
+#endif
+                } else {
+                    tile_pack_rhs_i8(true, actual_bc, static_cast<int>(Dqk),
+                                     reinterpret_cast<int8_t*>(pack_b),
+                                     static_cast<int>(int8_panel_stride(Dqk)),
+                                     k8_head + koff * k_step, static_cast<int>(k_step),
+                                     kQkI8ABiased);
+                }
+                // s32 is one shared tile and the MMA overwrites it, so each
+                // head's scores must be finalized before the next head's
+                // product lands on it. Dequantization, softcap, the mask and
+                // the row maximum are one pass: the scores are int32, so the fp
+                // passes the other routes run would re-read this output.
                 const int8_t* b8 = reinterpret_cast<const int8_t*>(pack_b);
                 for (int j = 0; j < nh; ++j) {
-                    tile_mma_pack_i8(actual_br, actual_bc, static_cast<int>(Dqk), s32, actual_bc,
-                                     qpack + static_cast<int64_t>(j) *
-                                                 static_cast<int64_t>(i8_layout.q_head),
-                                     b8, /*ldb=*/0, INT32_MIN, INT32_MAX, /*zero_mode=*/true);
+                    int8_t* qp = qpack + static_cast<int64_t>(j) *
+                                              static_cast<int64_t>(i8_layout.q_head);
+                    if (use_sme_qk) {
+#if defined(NNOPS_ARCH_SME)
+                        if constexpr (fp_sme_capable<T>) {
+                            tile_mma_pack_i8_sme(actual_br, actual_bc, static_cast<int>(Dqk),
+                                                 s32, actual_bc, qp, b8,
+                                                 /*block_stride=*/0, INT32_MIN, INT32_MAX,
+                                                 /*zero_mode=*/true);
+                        }
+#endif
+                    } else {
+                        tile_mma_pack_i8(actual_br, actual_bc, static_cast<int>(Dqk), s32,
+                                         actual_bc, qp, b8, /*ldb=*/0, INT32_MIN, INT32_MAX,
+                                         /*zero_mode=*/true);
+                    }
+                    const int64_t h = h0 + j;
                     const float* qs_j = q_scale + static_cast<int64_t>(j) * Br;
                     for (int i = 0; i < actual_br; ++i) {
+                        const int64_t row_i = i0 + i;
+                        const int64_t lo_i =
+                            sink_band ? 0
+                                      : std::max<int64_t>(key_lo(cfg, pos0, row_i, Sq, run_len),
+                                                          lo_floor);
+                        const int64_t lim = causal_limit(cfg, pos0, row_i, Sq, run_len);
+                        int64_t n0 = std::min<int64_t>(std::max<int64_t>(lo_i - j0, 0), actual_bc);
+                        int64_t n1 = std::min<int64_t>(std::max<int64_t>(lim - j0, n0), actual_bc);
+                        const T* bias_row = nullptr;
+                        const int32_t* keep_row = nullptr;
+                        if (mask.keep != nullptr) {
+                            const int64_t off =
+                                mask_offset(b, h, row_i, mask.keep_b, mask.keep_h, mask.keep_row);
+                            keep_row = mask.keep + off + j0;
+                        }
+                        if (mask_ptr != nullptr) {
+                            const int64_t off =
+                                mask_offset(b, h, row_i, mask.bias_b, mask.bias_h, mask.bias_row);
+                            bias_row = mask_ptr + off + j0;
+                        }
                         T* srow = s + (static_cast<int64_t>(j) * Br + i) * actual_bc;
                         const float row_mult = scale * qs_j[i] * k_all;
-                        qk_i8_dequant_row<T>(srow, s32 + static_cast<int64_t>(i) * actual_bc,
-                                             kcol, actual_bc, row_mult);
+                        rowmax_buf[static_cast<int64_t>(j) * Br + i] = qk_i8_finish_row<T>(
+                            srow, s32 + static_cast<int64_t>(i) * actual_bc, kcol, actual_bc,
+                            row_mult, cfg.softcap, bias_row, keep_row, mask.filter, n0, n1);
                     }
                 }
             }
-            if (!qk8) {
+            if (!qk8 && sme) {
+                if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+                    // K as one ZA B block sequence; the query block was packed
+                    // once per task, with the scale already in it.
+                    tile_pack_rhs_sme(true, actual_bc, static_cast<int>(Dqk), pack_b,
+                                      kb + koff * k_step, static_cast<int>(k_step));
+                    for (int j = 0; j < nh; ++j) {
+                        tile_mma_pack_sme(
+                            actual_br, actual_bc, static_cast<int>(Dqk),
+                            s + static_cast<int64_t>(j) * Br * actual_bc, actual_bc,
+                            sme_q + static_cast<int64_t>(j) * sme_q_head, pack_b,
+                            /*block_stride=*/0, kNegInf, kPosInf, /*zero_mode=*/true);
+                    }
+                }
+            }
+            if (!qk8 && !sme) {
                 for (int64_t k0 = 0; k0 < Dqk; k0 += kc) {
                     const int actual_kc = static_cast<int>(std::min<int64_t>(kc, Dqk - k0));
                     const int ldd_b = static_cast<int>(
@@ -326,7 +467,7 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
             // mask, the causal tail and the window prefix are all per-row, so
             // one pass covers them: add the mask over the row's valid range
             // [n0, n1), then fill the rest of the tile with -inf.
-            if (cfg.softcap > 0.0f) {
+            if (!qk8 && cfg.softcap > 0.0f) {
                 for (int j = 0; j < nh; ++j) {
                     for (int i = 0; i < actual_br; ++i) {
                         row_softcap(s + (static_cast<int64_t>(j) * Br + i) * actual_bc, actual_bc,
@@ -334,7 +475,7 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                     }
                 }
             }
-            if (mask.any() || cfg.causal || cfg.window > 0) {
+            if (!qk8 && (mask.any() || cfg.causal || cfg.window > 0)) {
                 for (int j = 0; j < nh; ++j) {
                     const int64_t h = h0 + j;
                     for (int i = 0; i < actual_br; ++i) {
@@ -387,36 +528,13 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                 }
             }
 
-            // ---- online-softmax update + accumulate into o_acc -----
-            // On the int8 P·V path the exp step writes the probabilities
-            // straight onto the u8 grid — folded with the V scale and placed
-            // over the scores they came from — so the fp probabilities never
-            // reach memory and the pack that follows is a pure byte shuffle.
-            float sc_tile = 1.0f;
-            float col_fold[kFlashBcMax];
-            const float* fold = nullptr;
-            if (pv8) {
-                NNOPS_ASSERT(actual_bc <= kFlashBcMax);
-                const bool v_col = vs_head.ptr != nullptr && vs_head.step != 0;
-                sc_tile = vs_head.at(0);
-                if (v_col) {
-                    sc_tile = 0.0f;
-                    for (int t = 0; t < actual_bc; ++t) {
-                        sc_tile = std::max(sc_tile, vs_head.at(j0 + t));
-                    }
-                    NNOPS_ASSERT(sc_tile > 0.0f);
-                    const float inv = sc_tile > 0.0f ? 1.0f / sc_tile : 1.0f;
-                    for (int t = 0; t < actual_bc; ++t) {
-                        col_fold[t] = vs_head.at(j0 + t) * inv;
-                    }
-                    fold = col_fold;
-                }
-            }
             for (int j = 0; j < nh; ++j) {
                 const int64_t head_row = static_cast<int64_t>(j) * Br;
                 for (int i = 0; i < actual_br; ++i) {
                     T* srow = s + (head_row + i) * actual_bc;
-                    const float rowmax = kernel::softmax_row_max<T>(srow, actual_bc);
+                    const float rowmax = qk8 ?
+                                             rowmax_buf[head_row + i] :
+                                             kernel::softmax_row_max<T>(srow, actual_bc);
                     if (rowmax == kNegInf) {
                         // The whole tile is out of range for this row (a causal
                         // row above the diagonal): S must be zero or the AV GEMM
@@ -462,12 +580,6 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                 // V as stored — its scale already rode on P through the exp
                 // pass, and sc_tile (below the softmax update) brings the
                 // tile's factor back.
-                tile_pack_rhs_i8(false, static_cast<int>(Dv), actual_bc,
-                                 reinterpret_cast<int8_t*>(pack_b),
-                                 static_cast<int>(int8_panel_stride(actual_bc)),
-                                 v8_head + koff * v_step, static_cast<int>(v_step),
-                                 /*a_biased=*/false);
-                const int8_t* b8v = reinterpret_cast<const int8_t*>(pack_b);
                 // The biased P (aarch64 only) is off by +128·Σv per column.
                 float col_sum[kFlashBcMax];
                 if constexpr (kPvI8ColCorrection != 0) {
@@ -476,25 +588,78 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                 }
                 const float deq = sc_tile / static_cast<float>(kPvI8Levels);
                 // The probabilities are already bytes, packed at the head of
-                // the rows they replaced: only the panel layout is left.
+                // the rows they replaced: only the layout is left.
                 const int p_row_bytes = static_cast<int>(actual_bc * sizeof(T));
-                for (int j = 0; j < nh; ++j) {
-                    tile_pack_lhs_i8(
-                        /*trans=*/false, actual_br, actual_bc, ppack,
-                        static_cast<int>(geom_ldd_i8_a(actual_bc)),
-                        reinterpret_cast<const int8_t*>(s + static_cast<int64_t>(j) * Br * actual_bc),
-                        p_row_bytes, kPvI8BiasA);
-                    tile_mma_pack_i8(actual_br, static_cast<int>(Dv), actual_bc, s32,
-                                     static_cast<int>(Dv), ppack, b8v, /*ldb=*/0, INT32_MIN,
-                                     INT32_MAX, /*zero_mode=*/true);
+                const auto head_p8 = [&](int j) {
+                    return reinterpret_cast<const int8_t*>(
+                        s + static_cast<int64_t>(j) * Br * actual_bc);
+                };
+                const auto accum_tile = [&](int j) {
                     for (int i = 0; i < actual_br; ++i) {
                         pv_i8_accum_row<T, kPvI8ColCorrection>(
                             o_acc + (static_cast<int64_t>(j) * Br + i) * Dv,
                             s32 + static_cast<int64_t>(i) * Dv, col_sum, Dv, deq, !first_tile);
                     }
+                };
+                if (use_sme_pv) {
+#if defined(NNOPS_ARCH_SME)
+                    if constexpr (fp_sme_capable<T>) {
+                        tile_pack_rhs_i8_sme(false, static_cast<int>(Dv), actual_bc,
+                                             reinterpret_cast<int8_t*>(pack_b),
+                                             v8_head + koff * v_step, static_cast<int>(v_step));
+                        for (int j = 0; j < nh; ++j) {
+                            tile_pack_lhs_i8_sme(
+                                /*trans=*/false, actual_br, actual_bc, ppack,
+                                head_p8(j), p_row_bytes, kPvI8BiasA);
+                            tile_mma_pack_i8_sme(
+                                actual_br, static_cast<int>(Dv), actual_bc, s32,
+                                static_cast<int>(Dv), ppack,
+                                reinterpret_cast<const int8_t*>(pack_b), /*block_stride=*/0,
+                                INT32_MIN, INT32_MAX, /*zero_mode=*/true);
+                            accum_tile(j);
+                        }
+                    }
+#endif
+                } else {
+                    tile_pack_rhs_i8(false, static_cast<int>(Dv), actual_bc,
+                                     reinterpret_cast<int8_t*>(pack_b),
+                                     static_cast<int>(int8_panel_stride(actual_bc)),
+                                     v8_head + koff * v_step, static_cast<int>(v_step),
+                                     /*a_biased=*/false);
+                    const int8_t* b8v = reinterpret_cast<const int8_t*>(pack_b);
+                    for (int j = 0; j < nh; ++j) {
+                        tile_pack_lhs_i8(
+                            /*trans=*/false, actual_br, actual_bc, ppack,
+                            static_cast<int>(geom_ldd_i8_a(actual_bc)),
+                            head_p8(j), p_row_bytes, kPvI8BiasA);
+                        tile_mma_pack_i8(actual_br, static_cast<int>(Dv), actual_bc, s32,
+                                         static_cast<int>(Dv), ppack, b8v, /*ldb=*/0, INT32_MIN,
+                                         INT32_MAX, /*zero_mode=*/true);
+                        accum_tile(j);
+                    }
                 }
                 first_tile = false;
                 return j0 + actual_bc;
+            }
+            if (sme) {
+                if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+                    // V is one ZA B block sequence, so the whole key tile is one
+                    // k block. P is packed per tile per head; o_acc takes the
+                    // result with zero_mode on the task's first tile.
+                    tile_pack_rhs_sme(false, static_cast<int>(Dv), actual_bc, pack_b,
+                                      vb + koff * v_step, static_cast<int>(v_step));
+                    for (int j = 0; j < nh; ++j) {
+                        tile_pack_lhs_sme(false, actual_br, actual_bc, sme_p,
+                                          s + static_cast<int64_t>(j) * Br * actual_bc,
+                                          actual_bc);
+                        tile_mma_pack_sme(actual_br, static_cast<int>(Dv), actual_bc,
+                                          o_acc + static_cast<int64_t>(j) * Br * Dv,
+                                          static_cast<int>(Dv), sme_p, pack_b,
+                                          /*block_stride=*/0, kNegInf, kPosInf, first_tile);
+                    }
+                    first_tile = false;
+                    return j0 + actual_bc;
+                }
             }
             for (int64_t k0 = 0; k0 < actual_bc; k0 += kc) {
                 const int actual_kc = static_cast<int>(std::min<int64_t>(kc, actual_bc - k0));
@@ -538,11 +703,48 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                     const float amax = row_absmax<T>(qsrc + static_cast<int64_t>(i) * q_rs, Dqk);
                     qs_j[i] = amax > 0.0f ? amax / 127.0f : 1.0f;
                 }
-                tile_pack_quant_lhs_i8(
-                    actual_br, static_cast<int>(Dqk),
-                    qpack + static_cast<int64_t>(j) * static_cast<int64_t>(i8_layout.q_head),
-                    static_cast<int>(geom_ldd_i8_a(Dqk)), qsrc, static_cast<int>(q_rs), qs_j,
-                    nullptr, 1.0f, 0, /*u8=*/false, kQkI8ABiased);
+                if (use_sme_qk) {
+#if defined(NNOPS_ARCH_SME)
+                    if constexpr (fp_sme_capable<T>) {
+                        // The ZA packer owns its layout, so quantize into the
+                        // row-major staging block and pack from it. This runs
+                        // once per task and head, like the NEON fused pack.
+                        for (int i = 0; i < actual_br; ++i) {
+                            kernel::quant_kernel::quantization<int8_t>(
+                                1, static_cast<int>(Dqk),
+                                qraw + static_cast<int64_t>(i) * Dqk, static_cast<int>(Dqk),
+                                qsrc + static_cast<int64_t>(i) * q_rs, static_cast<int>(q_rs),
+                                &qs_j[i], nullptr);
+                        }
+                        tile_pack_lhs_i8_sme(
+                            /*trans=*/false, actual_br, static_cast<int>(Dqk),
+                            qpack + static_cast<int64_t>(j) *
+                                        static_cast<int64_t>(i8_layout.q_head),
+                            qraw, static_cast<int>(Dqk), kQkI8ABiased);
+                    }
+#endif
+                } else {
+                    tile_pack_quant_lhs_i8(
+                        actual_br, static_cast<int>(Dqk),
+                        qpack + static_cast<int64_t>(j) * static_cast<int64_t>(i8_layout.q_head),
+                        static_cast<int>(geom_ldd_i8_a(Dqk)), qsrc, static_cast<int>(q_rs), qs_j,
+                        nullptr, 1.0f, 0, /*u8=*/false, kQkI8ABiased);
+                }
+            }
+        }
+
+        // The ZA fp route's A: the query block, packed once per task and head
+        // and reused by every KV tile. The softmax scale rides the pack — the
+        // ZA pack has no alpha, and GEMM1's B is the cache row as stored.
+        if (sme) {
+            if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+                for (int j = 0; j < nh; ++j) {
+                    T* qp = sme_q + static_cast<int64_t>(j) * sme_q_head;
+                    const T* qsrc = q_base + j * q_h + i0 * q_rs;
+                    tile_pack_lhs_sme(false, actual_br, static_cast<int>(Dqk), qp, qsrc,
+                                      static_cast<int>(q_rs));
+                    scale_packed_a(qp, fp_sme_a_elems(sme_dt, actual_br, Dqk), scale);
+                }
             }
         }
 

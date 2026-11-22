@@ -578,6 +578,124 @@ inline void pv_i8_accum_row(T* o, const int32_t* acc, const float* col_sum, int6
     }
 }
 
+/// True when this build carries the ZA kernels at all.
+#if defined(NNOPS_ARCH_SME)
+inline constexpr bool kSmeBuilt = true;
+#else
+inline constexpr bool kSmeBuilt = false;
+#endif
+
+/// The ZA fp route serves f32 and f16 only; bf16 keeps the NEON engine.
+template <class T> constexpr bool fp_sme_capable = std::is_same_v<T, float> ||
+                                                  std::is_same_v<T, half>;
+
+/// Elements one SME packed A slab of @p mc rows × @p kc K occupies. The fp
+/// block is 32 rows (the 2x2 ZA tile), so this is the ZA pack's own geometry.
+inline int64_t fp_sme_a_elems(DataType dt, int64_t mc, int64_t kc)
+{
+    if (dt != DataType::f32 && dt != DataType::f16) {
+        return 0;
+    }
+    constexpr int64_t kBlock = 32;
+    return ((mc + kBlock - 1) / kBlock) * sme_a_panel_stride(dt, kc);
+}
+
+/// Elements one SME packed B slab of @p nc columns × @p kc K occupies.
+inline int64_t fp_sme_b_elems(DataType dt, int64_t nc, int64_t kc)
+{
+    if (dt != DataType::f32 && dt != DataType::f16) {
+        return 0;
+    }
+    constexpr int64_t kNr = 32;
+    return ((nc + kNr - 1) / kNr) * sme_b_panel_stride(dt, kc);
+}
+
+/// Bytes one SME packed int8 A slab of @p mc rows × @p kc K occupies; the
+/// SMOPA A block is 16 rows and groups K in fours.
+inline int64_t sme_i8_a_bytes(int64_t mc, int64_t kc)
+{
+    constexpr int64_t kMr = 16;
+    return ((mc + kMr - 1) / kMr) * sme_a_panel_stride(DataType::s8, kc);
+}
+
+/// Bytes one SME packed int8 B slab of @p nc columns × @p kc K occupies; the
+/// SMOPA B block is 64 columns.
+inline int64_t sme_i8_b_bytes(int64_t nc, int64_t kc)
+{
+    constexpr int64_t kNr = 64;
+    return ((nc + kNr - 1) / kNr) * sme_b_panel_stride(DataType::s8, kc);
+}
+
+/// Element offset of row @p row inside a packed fp A slab. The ZA A layout is
+/// block-major in 32-row groups, so a tile's start is addressable only on a
+/// 32-row boundary; the standard route tiles its M loop that way.
+inline int64_t fp_sme_a_row_offset(DataType dt, int64_t kc, int64_t row)
+{
+    return dt == DataType::f32 ? row * kc : row * (((kc + 1) / 2) * 2);
+}
+
+/// Multiply every element of a packed A slab by @p scale. The ZA pack has no
+/// scale parameter (MatMul's SME route requires alpha 1), so the attention
+/// scale rides GEMM1's A, packed once per task; the padding entries are zero.
+template <class T> inline void scale_packed_a(T* p, int64_t elems, float scale)
+{
+    if (scale == 1.0f) {
+        return;
+    }
+    for (int64_t i = 0; i < elems; ++i) {
+        simd::s_store(&p[i], simd::s_load(&p[i]) * scale);
+    }
+}
+
+/// The standard route's whole-head packed query block.
+template <class T> inline int64_t standard_sme_q_elems(int64_t Sq, int64_t Dqk)
+{
+    if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+        constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        return fp_sme_a_elems(dt, Sq, Dqk);
+    } else {
+        return 0;
+    }
+}
+
+/// The standard route's one packed probability tile, at its GEMM2 k-block.
+template <class T> inline int64_t standard_sme_p_elems(int mc2, int64_t Sk)
+{
+    if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+        constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        const int64_t kc2 = std::min<int64_t>(sme_kc_for(dt), std::max<int64_t>(Sk, 1));
+        return fp_sme_a_elems(dt, mc2, kc2);
+    } else {
+        return 0;
+    }
+}
+
+/// The standard route's packed-B slot: the NEON fp panels, or the wider ZA
+/// blocks. GEMM1's B is K^T (N <= nc1, K = Dqk); GEMM2's is V (N <= Dv,
+/// K <= the ZA k-block the kernel loops on).
+template <class T>
+inline int64_t standard_b_pack_elems(int nc1, int nc2, int64_t Dqk, int64_t Dv, int64_t Sk)
+{
+    constexpr int nr_max = nr_max_flt<T>();
+    const int ldd_b_full = static_cast<int>(
+        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(std::max(Dqk, Sk))) *
+                       static_cast<int>(sizeof(T))) /
+        static_cast<int>(sizeof(T)));
+    const int np_full =
+        std::max(panels_for_pack<T>(nc1), panels_for_pack<T>(std::min<int64_t>(Dv, nc2)));
+    const int64_t fp_elems = static_cast<int64_t>(np_full) * ldd_b_full;
+    if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+        constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        const int64_t kc2 = std::min<int64_t>(sme_kc_for(dt), std::max<int64_t>(Sk, 1));
+        const int64_t sme_elems =
+            std::max(fp_sme_b_elems(dt, nc1, Dqk),
+                     fp_sme_b_elems(dt, std::min<int64_t>(Dv, nc2), kc2));
+        return std::max(fp_elems, sme_elems);
+    } else {
+        return fp_elems;
+    }
+}
+
 /// Byte layout of a flash slot's int8 scratch, after the packed-B area:
 ///   [packed Q, heads × q_head]   dynamic-query Q·Kᵀ only
 ///   [Q row scales, heads × Br]   "
@@ -590,30 +708,43 @@ struct FlashI8Layout {
     size_t q_head = 0; ///< bytes one head's packed Br-row query block takes
     size_t qscale = 0; ///< the row scales, after every head's block
     size_t ppack = 0;  ///< one packed Br-row probability block
+    size_t qraw = 0;   ///< SME only: one Br×Dqk row-major int8 query block
     size_t s32 = 0;    ///< the int32 accumulator tile
+    size_t rowmax = 0; ///< per (head, row) tile maximum, Q·Kᵀ only
     size_t bytes = 0;  ///< the whole region
 };
 
+/// The packed Q/P blocks are sized for whichever engine packs them: the NEON
+/// panel layout and the ZA block layout differ, and the kernel picks one at run
+/// time. The raw query block is the SME path's quantize-then-pack staging area.
 inline FlashI8Layout flash_i8_layout(int Br, int Bc, int64_t Dqk, int64_t Dv, int heads,
                                      bool qk8, bool pv8)
 {
     const size_t br = static_cast<size_t>(Br);
     FlashI8Layout o;
-    o.q_head = qk8 ? static_cast<size_t>(i8_m_panels_max(Br)) *
-                         static_cast<size_t>(geom_ldd_i8_a(Dqk)) :
-                     0;
+    const size_t neon_q = qk8 ? static_cast<size_t>(i8_m_panels_max(Br)) *
+                                    static_cast<size_t>(geom_ldd_i8_a(Dqk)) :
+                                0;
+    const size_t sme_q = (kSmeBuilt && qk8) ? static_cast<size_t>(sme_i8_a_bytes(Br, Dqk)) : 0;
+    o.q_head = std::max(neon_q, sme_q);
     size_t at = static_cast<size_t>(heads) * o.q_head;
     o.qscale = align_up_bytes(at, 16);
     at = o.qscale + (qk8 ? align_up_bytes(static_cast<size_t>(heads) * br * sizeof(float), 16) : 0);
+    const size_t neon_p = pv8 ? static_cast<size_t>(i8_m_panels_max(Br)) *
+                                    static_cast<size_t>(geom_ldd_i8_a(Bc)) :
+                                0;
+    const size_t sme_p = (kSmeBuilt && pv8) ? static_cast<size_t>(sme_i8_a_bytes(Br, Bc)) : 0;
     o.ppack = align_up_bytes(at, 16);
-    at = o.ppack + (pv8 ? static_cast<size_t>(i8_m_panels_max(Br)) *
-                              static_cast<size_t>(geom_ldd_i8_a(Bc)) :
-                          0);
+    at = o.ppack + std::max(neon_p, sme_p);
+    o.qraw = align_up_bytes(at, 16);
+    at = o.qraw + ((kSmeBuilt && qk8) ? align_up_bytes(br * static_cast<size_t>(Dqk), 16) : 0);
     o.s32 = align_up_bytes(at, 16);
     const int64_t tile_n = (pv8 && Dv > Bc) ? Dv : Bc;
     at = o.s32 + ((qk8 || pv8) ?
                       align_up_bytes(br * static_cast<size_t>(tile_n) * sizeof(int32_t), 16) :
                       0);
+    o.rowmax = align_up_bytes(at, 16);
+    at = o.rowmax + (qk8 ? align_up_bytes(static_cast<size_t>(heads) * br * sizeof(float), 16) : 0);
     o.bytes = at;
     return o;
 }
@@ -782,6 +913,100 @@ template <class T> inline void row_softcap(T* row, int64_t n, float scale, float
     }
 }
 
+/// One int32 score lane: dequantize it, apply the softcap, then the keep and
+/// additive masks — the same sequence the fp routes run as separate passes.
+template <class T>
+inline float qk_i8_lane(const int32_t* acc, const float* col_scale, int64_t i, float row_mult,
+                        float softcap, const T* bias, const int32_t* keep, float filter)
+{
+    float v = static_cast<float>(acc[i]) * row_mult;
+    if (col_scale != nullptr) {
+        v *= col_scale[i];
+    }
+    if (softcap > 0.0f) {
+        v = softcap * std::tanh(v / softcap);
+    }
+    if (bias != nullptr) {
+        v += simd::s_load(&bias[i]);
+    }
+    if (keep != nullptr && keep[i] == 0) {
+        v = filter;
+    }
+    return v;
+}
+
+/// One pass over an int32 score row's visible range [n0, n1). kWrite stores the
+/// dequantized fp scores (the single-pass finalize); kWrite=false only returns
+/// the row maximum (the two-pass max). Writing fills the out-of-range lanes
+/// with -inf, which is what the separate mask pass leaves behind.
+template <bool kWrite, class T>
+inline float qk_i8_score_row(T* dst, const int32_t* acc, const float* col_scale, int64_t n,
+                             float row_mult, float softcap, const T* bias, const int32_t* keep,
+                             float filter, int64_t n0, int64_t n1)
+{
+    if constexpr (kWrite) {
+        row_fill(dst, n0, kNegInf);
+        row_fill(dst + n1, n - n1, kNegInf);
+    }
+    if (n1 <= n0) {
+        return kNegInf;
+    }
+    float mx = kNegInf;
+    if (keep != nullptr) {
+        // The keep mask filters lanes individually; the rare path stays scalar.
+        for (int64_t i = n0; i < n1; ++i) {
+            const float v = qk_i8_lane(acc, col_scale, i, row_mult, softcap, bias, keep, filter);
+            if constexpr (kWrite) {
+                simd::s_store(&dst[i], v);
+            }
+            mx = std::max(mx, v);
+        }
+        return mx;
+    }
+    constexpr int64_t L = simd::simd_default_lane_f32;
+    const simd::v_f32x8 vm = simd::v_set1_f32x8(row_mult);
+    const simd::v_f32x8 vcap = simd::v_set1_f32x8(softcap > 0.0f ? softcap : 1.0f);
+    const simd::v_f32x8 vinv = simd::v_set1_f32x8(softcap > 0.0f ? 1.0f / softcap : 1.0f);
+    simd::v_f32x8 vmax = simd::v_set1_f32x8(kNegInf);
+    int64_t i = n0;
+    for (; i + L <= n1; i += L) {
+        simd::v_f32x8 v = simd::v_mul(kernel::v_cvt_i32_to_f32(acc + i), vm);
+        if (col_scale != nullptr) {
+            v = simd::v_mul(v, simd::v_load(col_scale + i));
+        }
+        if (softcap > 0.0f) {
+            v = simd::v_mul(vcap, kernel::v_tanh(simd::v_mul(v, vinv)));
+        }
+        if (bias != nullptr) {
+            v = simd::v_add(v, simd::v_load_f32(bias + i));
+        }
+        if constexpr (kWrite) {
+            simd::v_store_f32<T>(dst + i, v);
+        }
+        vmax = simd::v_max(vmax, v);
+    }
+    mx = simd::v_reduce_max(vmax);
+    for (; i < n1; ++i) {
+        const float v = qk_i8_lane(acc, col_scale, i, row_mult, softcap, bias, nullptr, filter);
+        if constexpr (kWrite) {
+            simd::s_store(&dst[i], v);
+        }
+        mx = std::max(mx, v);
+    }
+    return mx;
+}
+
+/// Dequantize one int32 row, apply softcap and the mask, and return its
+/// maximum over the visible lanes (the single-pass finalize's max half).
+template <class T>
+inline float qk_i8_finish_row(T* dst, const int32_t* acc, const float* col_scale, int64_t n,
+                              float row_mult, float softcap, const T* bias, const int32_t* keep,
+                              float filter, int64_t n0, int64_t n1)
+{
+    return qk_i8_score_row<true, T>(dst, acc, col_scale, n, row_mult, softcap, bias, keep, filter,
+                                    n0, n1);
+}
+
 // ---- flash route geometry ------------------------------------------------
 //
 // The flash path is chosen once the per-head scores matrix is large enough
@@ -854,8 +1079,10 @@ constexpr int panels_for_pack_i8(int64_t n_max)
 
 /// The packed-B slot, in T elements: the fp panels of both GEMMs, or the int8
 /// panels of either integer GEMM when those are wider (they never are today,
-/// but the slot is one region and every route must fit it). The int8 K panels
-/// are Bc keys × Dqk, the int8 V panels Dv values × Bc keys.
+/// but the slot is one region and every route must fit it), or the ZA fp
+/// blocks. The int8 K panels are Bc keys × Dqk, the int8 V panels Dv values ×
+/// Bc keys; the ZA K block is Bc keys × Dqk and its V block Dv values × Bc
+/// keys.
 template <class T> inline int64_t flash_pack_elems(int Bc, int64_t Dqk, int64_t Dv)
 {
     constexpr int nr_max = nr_max_flt<T>();
@@ -872,7 +1099,41 @@ template <class T> inline int64_t flash_pack_elems(int Bc, int64_t Dqk, int64_t 
                  static_cast<int64_t>(panels_for_pack_i8(Dv)) * int8_panel_stride(kc8));
     const int64_t i8_elems = (i8_bytes + static_cast<int64_t>(sizeof(T)) - 1) /
                              static_cast<int64_t>(sizeof(T));
-    return std::max(fp_elems, i8_elems);
+    constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    constexpr bool sme_ok = kSmeBuilt && fp_sme_capable<T>;
+    const int64_t sme_elems =
+        sme_ok ? std::max(fp_sme_b_elems(dt, Bc, Dqk), fp_sme_b_elems(dt, Dv, Bc)) : 0;
+    const int64_t sme_i8_bytes =
+        kSmeBuilt ? std::max(sme_i8_b_bytes(Bc, Dqk), sme_i8_b_bytes(Dv, Bc)) : 0;
+    const int64_t sme_i8_elems = (sme_i8_bytes + static_cast<int64_t>(sizeof(T)) - 1) /
+                                 static_cast<int64_t>(sizeof(T));
+    return std::max({fp_elems, i8_elems, sme_elems, sme_i8_elems});
+}
+
+/// Byte layout of a flash slot's ZA fp scratch, after the packed-B area:
+///   [packed Q, heads × q_head]   the scaled query block, packed once per task
+///   [packed P, one Br-row block] the probability tile, repacked per KV tile
+/// Only the fp flash route uses it; the int8 route has its own layout, and the
+/// two never run together.
+struct FlashSmeLayout {
+    size_t q_head = 0; ///< bytes one head's packed Br-row query block takes
+    size_t ppack = 0;  ///< one packed Br-row probability block
+    size_t bytes = 0;  ///< the whole region
+};
+
+template <class T>
+inline FlashSmeLayout flash_sme_layout(int Br, int Bc, int64_t Dqk, int heads)
+{
+    FlashSmeLayout o;
+    if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+        constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        o.q_head = static_cast<size_t>(fp_sme_a_elems(dt, Br, Dqk)) * sizeof(T);
+        size_t at = static_cast<size_t>(heads) * o.q_head;
+        o.ppack = align_up_bytes(at, 16);
+        at = o.ppack + static_cast<size_t>(fp_sme_a_elems(dt, Br, Bc)) * sizeof(T);
+        o.bytes = align_up_bytes(at, 16);
+    }
+    return o;
 }
 
 template <class T>
@@ -881,14 +1142,19 @@ inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv, int
 {
     const int64_t i8_elems =
         kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(std::max<int64_t>(Dqk, Bc))) : 0;
-    const int64_t int8_elems =
-        (qk8 || pv8) ? static_cast<int64_t>((flash_i8_layout(Br, Bc, Dqk, Dv, heads, qk8, pv8).bytes +
-                                             sizeof(T) - 1) /
-                                            sizeof(T)) :
+    // The packed query/probability blocks of the integer route and the ZA fp
+    // route occupy the same trailing region; a slot's layout shares one base,
+    // so it must hold the wider of the two.
+    const int64_t i8_layout_bytes =
+        (qk8 || pv8) ? static_cast<int64_t>(flash_i8_layout(Br, Bc, Dqk, Dv, heads, qk8, pv8).bytes) :
                        0;
+    const int64_t sme_layout_bytes =
+        static_cast<int64_t>(flash_sme_layout<T>(Br, Bc, Dqk, heads).bytes);
+    const int64_t tail_elems = (std::max(i8_layout_bytes, sme_layout_bytes) + sizeof(T) - 1) /
+                               sizeof(T);
     const int64_t per_head = static_cast<int64_t>(Br) * 2 + static_cast<int64_t>(Br) * Bc +
                              static_cast<int64_t>(Br) * Dv;
-    return per_head * heads + flash_pack_elems<T>(Bc, Dqk, Dv) + i8_elems + int8_elems;
+    return per_head * heads + flash_pack_elems<T>(Bc, Dqk, Dv) + i8_elems + tail_elems;
 }
 
 /// Flash GQA head batching: the most query heads one task serves. Past four

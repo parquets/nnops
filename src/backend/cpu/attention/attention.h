@@ -19,7 +19,9 @@
 ///     independent slices when the batched grid would leave workers idle;
 ///     a slice's partial output, max and sum are merged afterwards.
 ///   - standard (Sq*Sk < kFlashMinScores): materialize scores = Q·K^T·scale,
-///     softmax each row in place, then output = attn·V.
+///     softmax each row in place, then output = attn·V. On an SME machine a
+///     dense f32/f16 run packs the query block once per head and drives both
+///     GEMMs on the ZA tiles; an s8 cache and bf16 keep NEON.
 ///   - flash (Sq*Sk >= kFlashMinScores): FlashAttention-1 online softmax,
 ///     streaming KV in Br×Bc tiles so scores is never materialized. The task
 ///     grid is batch × KV head × head-block × query-block × KV-slice, so
@@ -28,7 +30,9 @@
 ///     per group), and an underfilled grid splits the run into slices whose
 ///     online-softmax states are merged. A causal query block stops its KV
 ///     stream at the block's causal limit, so prefill never walks the masked
-///     upper triangle.
+///     upper triangle. On an SME machine a dense f32/f16 run drives both GEMMs
+///     on the ZA tiles (the packed-A/B route matmul and conv use); the int8
+///     switches and bf16 keep the NEON kernels.
 ///
 /// Query head h reads kv head h / (H / H_kv), so one K/V slice serves a whole
 /// group under grouped-query attention, and H_kv == H is ordinary MHA.

@@ -243,17 +243,15 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
     plan.nc2 = nc2;
 
     // One packed-B slot for both GEMMs: stride from the longer k-block, panels
-    // from the wider n-block.
-    const int ldd_b_full = static_cast<int>(
-        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(std::max(Dqk, Sk))) * esz) / esz);
-    const int np_full =
-        std::max(panels_for_pack<T>(nc1), panels_for_pack<T>(std::min<int64_t>(Dv, nc2)));
-
+    // from the wider n-block. The ZA engine adds its packed query block and one
+    // probability tile, both sized by the same helpers the kernel carves with.
     const int64_t scores_elems = Sq * Sk;
-    const int64_t pack_elems = static_cast<int64_t>(np_full) * ldd_b_full;
+    const int64_t pack_elems = standard_b_pack_elems<T>(nc1, nc2, Dqk, Dv, Sk);
     const int64_t i8_elems =
         kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(std::max(Dqk, Sk))) : 0;
-    const int64_t per_head = scores_elems + pack_elems + i8_elems;
+    const int64_t sme_elems = standard_sme_q_elems<T>(Sq, Dqk) +
+                              standard_sme_p_elems<T>(mc2, Sk);
+    const int64_t per_head = scores_elems + pack_elems + i8_elems + sme_elems;
 
     plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H);
     plan.workspace_size =
