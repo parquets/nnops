@@ -199,6 +199,11 @@ NNOPS_TEST(sme_mma_matches_reference) {
     run_i8(40, 70, 17);   // tails on every axis, K not a multiple of four
     run_i8(16, 12, 1);    // one K group, one panel
     run_i8(1, 13, 5);     // one row
+    // The last 64-column block is 16 columns into a second group but short in
+    // the third/fourth: the one shape where a 64-wide store would write past
+    // nc into the next row.
+    run_i8(8, 56, 12);
+    run_i8(8, 120, 12);
     run_f16(64, 64, 32);
     run_f16(40, 70, 17); // odd kc pads the last K pair
     run_f16(1, 13, 5);

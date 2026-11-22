@@ -135,7 +135,10 @@ inline void mma_i8_sme(int mc, int nc, int kc, int32_t* c, int ldc, const int8_t
 
             // Full 64-column block: four ZA rows per MOVA and a 128-byte pair
             // store per two column groups, as in the float kernels.
-            const bool wide = t3 && live0 == sme_za_n;
+            // The wide store writes all 64 columns unconditionally, so it is
+            // only safe when all four groups are fully live; a block whose tail
+            // group is short takes the predicated per-group path below.
+            const bool wide = full;
             const svbool_t pg = svptrue_b32();
             if (wide) {
                 int i = 0;
