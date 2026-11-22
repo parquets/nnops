@@ -204,6 +204,27 @@ inline void pack_b_f16_sme(int nc, int kc, half* dst, const half* src, int64_t l
         const int n0 = nb * sme_fp_nr;
         const int cols = std::min(sme_fp_nr, nc - n0);
         half* blk = dst + static_cast<int64_t>(nb) * k_pairs * (2 * sme_fp_nr);
+        const half* const rows = src + static_cast<int64_t>(n0) * ldb;
+        if (trans) {
+            // B's physical layout is N×K, so its 32 columns are 32 rows of
+            // contiguous K — the A pack's transpose, pair interleave included.
+            // The word view needs an even K and an even stride; an odd one
+            // falls through to the scalar walk below.
+#if defined(NNOPS_ARCH_SME)
+            if (available_sme() && (kc & 1) == 0 && (ldb & 1) == 0 &&
+                (reinterpret_cast<uintptr_t>(rows) & 3) == 0) {
+                pack_a_f16_sme_za(cols, kc, blk, rows, ldb);
+                for (int kp = 0; kp < k_pairs; ++kp) {
+                    half* out = blk + static_cast<int64_t>(kp) * 2 * sme_fp_nr;
+                    for (int j = cols; j < sme_fp_nr; ++j) {
+                        out[2 * j] = half{};
+                        out[2 * j + 1] = half{};
+                    }
+                }
+                continue;
+            }
+#endif
+        }
         for (int kp = 0; kp < k_pairs; ++kp) {
             const int k = 2 * kp;
             half* out = blk + static_cast<int64_t>(kp) * 2 * sme_fp_nr;

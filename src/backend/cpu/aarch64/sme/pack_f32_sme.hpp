@@ -158,18 +158,40 @@ inline void pack_b_f32_sme(int nc, int kc, float* dst, const float* src, int64_t
         const int n0 = nb * sme_fp_nr;
         const int cols = std::min(sme_fp_nr, nc - n0);
         float* blk = dst + static_cast<int64_t>(nb) * kc * sme_fp_nr;
-        for (int k = 0; k < kc; ++k) {
-            float* out = blk + static_cast<int64_t>(k) * sme_fp_nr;
-            if (trans) {
-                // B's physical layout is N×K: row n, column k.
+        if (trans) {
+            // B's physical layout is N×K, so its 32 columns are 32 rows of
+            // contiguous K — exactly the A pack's transpose. ZA turns the
+            // block around with one load and one store per 16×16 half instead
+            // of 32 strided scalar gathers per k.
+#if defined(NNOPS_ARCH_SME)
+            if (available_sme()) {
+                pack_a_f32_sme_za(cols, kc, blk, src + static_cast<int64_t>(n0) * ldb, ldb);
+                for (int k = 0; k < kc; ++k) {
+                    float* out = blk + static_cast<int64_t>(k) * sme_fp_nr;
+                    for (int j = cols; j < sme_fp_nr; ++j) {
+                        out[j] = 0.0f;
+                    }
+                }
+                continue;
+            }
+#endif
+            // B's physical layout is N×K: row n, column k.
+            for (int k = 0; k < kc; ++k) {
+                float* out = blk + static_cast<int64_t>(k) * sme_fp_nr;
                 for (int j = 0; j < cols; ++j) {
                     out[j] = src[static_cast<int64_t>(n0 + j) * ldb + k];
                 }
-            } else {
-                const float* in = src + static_cast<int64_t>(k) * ldb + n0;
-                for (int j = 0; j < cols; ++j) {
-                    out[j] = in[j];
+                for (int j = cols; j < sme_fp_nr; ++j) {
+                    out[j] = 0.0f;
                 }
+            }
+            continue;
+        }
+        for (int k = 0; k < kc; ++k) {
+            float* out = blk + static_cast<int64_t>(k) * sme_fp_nr;
+            const float* in = src + static_cast<int64_t>(k) * ldb + n0;
+            for (int j = 0; j < cols; ++j) {
+                out[j] = in[j];
             }
             for (int j = cols; j < sme_fp_nr; ++j) {
                 out[j] = 0.0f;
