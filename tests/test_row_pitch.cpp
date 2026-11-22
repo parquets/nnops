@@ -706,11 +706,13 @@ NNOPS_TEST(pitched_quant_linear_topk) {
 
         const auto qdesc = desc_of({M, N}, DataType::s8);
         const auto sdesc = desc_of({M});
+        // Per-token zero point: one entry per innermost row, like the scale.
+        const auto zdesc = desc_of({M}, DataType::s8);
         const auto odesc = desc_of({M, N});
         QuantLinearAttributes attrs;
         attrs.axis = -1;
         auto op = DequantizeLinear::create(attrs, Backend::CPU);
-        expect_pitched_same("dequantize per-token", {qdesc, sdesc, qdesc}, {odesc},
+        expect_pitched_same("dequantize per-token", {qdesc, sdesc, zdesc}, {odesc},
                             {qb, scale, zpb}, [&](auto i, auto o) { return op->compute(o[0], i); });
     }
     // TopK over the last axis of a padded Dense tensor.

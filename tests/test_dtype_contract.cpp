@@ -184,7 +184,8 @@ NNOPS_TEST(dtype_contract_spatial_reject_int32) {
         // A float grid is required: an f16 one would be read as f32 bytes.
         ResizeAttributes attrs;
         auto op = GridSample::create(GridSampleAttributes{}, Backend::CPU);
-        std::vector<nnops::backend::cpu::half> grid(static_cast<size_t>(4), {});
+        std::vector<nnops::backend::cpu::half> grid(static_cast<size_t>(4),
+                                                    nnops::backend::cpu::half{});
         const int64_t gshape[] = {1, 2, 2, 2};
         TensorView g(std::span<const int64_t>(gshape, 4), DataType::f16, grid.data());
         std::vector<float> fdata(8, 0.0f);
