@@ -137,6 +137,10 @@ public:
     Status validate(std::span<const TensorDesc> inputs,
                     std::span<const TensorDesc> outputs) const override;
 
+    /// In-place: outputs[0] may reuse an input buffer of the same geometry.
+    bool supports_inplace(std::span<const TensorDesc> inputs,
+                          std::span<const TensorDesc> outputs) const override;
+
     using OpBase::compute;
 
     Status compute(std::span<TensorView> outputs,

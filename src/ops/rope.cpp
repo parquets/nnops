@@ -2,6 +2,7 @@
 /// @brief RoPE operator dispatch.
 
 #include "nnops/ops/rope.hpp"
+#include "nnops/detail/aliasing.hpp"
 #include "nnops/detail/assert.hpp"
 #include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
@@ -139,5 +140,7 @@ Status RoPE::compute(std::span<TensorView> outputs, std::span<const TensorView> 
     }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
+
+NNOPS_INPLACE_ELEMENTWISE(RoPE)
 
 } // namespace nnops

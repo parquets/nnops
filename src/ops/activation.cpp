@@ -2,6 +2,7 @@
 /// @brief Activation operator dispatch.
 
 #include "nnops/ops/activation.hpp"
+#include "nnops/detail/aliasing.hpp"
 #include "nnops/detail/assert.hpp"
 #include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
@@ -61,5 +62,7 @@ Status Activation::compute(std::span<TensorView> outputs, std::span<const Tensor
     }
     return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
+
+NNOPS_INPLACE_ELEMENTWISE(Activation)
 
 } // namespace nnops

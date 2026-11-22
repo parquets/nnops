@@ -53,6 +53,28 @@ public:
         return Status::ok;
     }
 
+    /// True when outputs[0] may occupy the same storage as an input, for this
+    /// operator instance — its backend included — provided that input describes
+    /// the same element geometry (rank, extents, dtype, layout): the kernel's
+    /// index mapping is then the identity and it reads each element before
+    /// storing it, so the aliased call is the in-place form of the same
+    /// computation.
+    ///
+    /// This is the plan-time half of an in-place call: a graph may reuse an
+    /// input's buffer for this operator's output when it answers true. It is
+    /// not a runtime check — a descriptor carries no address — so the caller
+    /// must also give both views the same pitch, and must never alias an input
+    /// whose descriptor differs (a partial overlap is not covered). Default
+    /// false: an operator opts in only after its kernel's read-before-write
+    /// order has been verified for that backend.
+    virtual bool supports_inplace(std::span<const TensorDesc> inputs,
+                                  std::span<const TensorDesc> outputs) const
+    {
+        (void)inputs;
+        (void)outputs;
+        return false;
+    }
+
     /// Execute the operator; on error nothing is written to the outputs.
     virtual Status compute(std::span<TensorView> outputs,
                            std::span<const TensorView> inputs,

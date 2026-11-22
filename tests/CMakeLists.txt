@@ -68,6 +68,7 @@ set(TEST_SOURCES
     test_nms.cpp
     test_pixel_shuffle.cpp
     test_parallel_paths.cpp
+    test_inplace.cpp
     test_dtype_contract.cpp
     test_row_pitch.cpp
 )
