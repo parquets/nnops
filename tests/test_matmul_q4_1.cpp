@@ -113,6 +113,14 @@ void encode_block(const int q[q4_1_block_elems], float d, float m, uint8_t* out,
     const uint16_t d_bits = backend::cpu::half_to_bits(float_to_half(d));
     const uint16_t m_bits = backend::cpu::half_to_bits(float_to_half(m));
 
+    if (fmt == DataType::q8_0) {
+        std::memcpy(out + 0, &d_bits, 2);
+        for (int j = 0; j < q8_0_block_elems; ++j) {
+            out[2 + j] = static_cast<uint8_t>(static_cast<int8_t>(q[j]));
+        }
+        return;
+    }
+
     uint8_t qs[16];
     for (int j = 0; j < 16; ++j) {
         const int q0 = q[j];
@@ -144,11 +152,14 @@ Q4Matrix build_q4_matrix(int64_t rows, int64_t cols, uint32_t seed, DataType fmt
     const float d_choices[4] = {0.25f, 0.5f, 0.75f, 1.0f};
     const float m_choices[5] = {-2.0f, -1.5f, -1.0f, -0.5f, 0.0f};
 
+    const bool wide = (fmt == DataType::q8_0); // int8 quants, not 4-bit
+
     for (int64_t r = 0; r < rows; ++r) {
         for (int64_t b = 0; b < m.blocks_per_row; ++b) {
             int q[q4_1_block_elems];
             for (int j = 0; j < q4_1_block_elems; ++j) {
-                q[j] = static_cast<int>((seed + r * 13 + b * 7 + j * 5) & 0x0F);
+                q[j] = wide ? static_cast<int>((seed + r * 13 + b * 7 + j * 5) % 255) - 127
+                            : static_cast<int>((seed + r * 13 + b * 7 + j * 5) & 0x0F);
             }
             const float d = d_choices[(seed + r + b) % 4];
             const float mn = m_choices[(seed + r + 2 * b) % 5];
@@ -163,8 +174,9 @@ Q4Matrix build_q4_matrix(int64_t rows, int64_t cols, uint32_t seed, DataType fmt
             const int n =
                 static_cast<int>(std::min<int64_t>(q4_1_block_elems, cols - b * q4_1_block_elems));
             for (int j = 0; j < n; ++j) {
-                const float qv =
-                    q4_has_min(fmt) ? static_cast<float>(q[j]) : static_cast<float>(q[j] - 8);
+                const float qv = wide ? static_cast<float>(q[j]) :
+                                 q4_has_min(fmt) ? static_cast<float>(q[j]) :
+                                                   static_cast<float>(q[j] - 8);
                 m.decoded[static_cast<size_t>(base + j)] =
                     half_to_float(dh) * qv + (q4_has_min(fmt) ? half_to_float(mh) : 0.0f);
             }
@@ -1006,3 +1018,102 @@ NNOPS_TEST(matmul_q4_hoisted_b_neon)
     run_case(c);
 }
 #endif // NNOPS_ARCH_SME
+
+// ============================================================
+// Q8_0 — 32 signed bytes per block, d·q
+// ============================================================
+//
+// Q8_0 rides every route the Q4 formats do (same 32-value block, same packers,
+// same fused kernels); only the decode differs and the quants are signed.
+
+NNOPS_TEST(matmul_q8_0)
+{
+    auto q8 = [](int64_t M, int64_t N, int64_t K, bool tb, bool f16 = false) {
+        Case c{M, N, K, tb, f16, false};
+        c.fmt = DataType::q8_0;
+        return c;
+    };
+
+    run_case(q8(5, 37, 70, /*tb=*/false));   // copy, N tail
+    run_case(q8(37, 5, 70, /*tb=*/true));    // trans, non-panel N
+    run_case(q8(2, 64, 33, /*tb=*/false));   // K tail, fused route
+    run_case(q8(17, 23, 70, /*tb=*/false));  // packed route
+    run_case(q8(20, 130, 160, /*tb=*/true)); // N/K tails
+    run_case(q8(8, 130, 70, /*tb=*/true));   // panel tails
+    run_case(q8(5, 37, 70, /*tb=*/false, /*f16=*/true));
+    Case scaled = q8(24, 71, 160, /*tb=*/true);
+    scaled.alpha = 0.5f;
+    scaled.beta = 0.5f;
+    scaled.ep = EpilogueActivateType::Relu;
+    run_case(scaled);
+}
+
+/// The fused small-M route (M above it falls through to the packed plan).
+NNOPS_TEST(matmul_q8_0_small_m)
+{
+    run_case({1, 37, 70, /*transpose_b=*/false, false, false, 0.0f, 1.0f,
+              EpilogueActivateType::None, false, false, DataType::q8_0});
+    run_case({8, 37, 70, /*transpose_b=*/false, false, false, 0.0f, 1.0f,
+              EpilogueActivateType::None, false, false, DataType::q8_0});
+    run_case({16, 71, 95, /*transpose_b=*/true, false, false, 0.0f, 1.0f,
+              EpilogueActivateType::None, false, false, DataType::q8_0});
+    run_case({17, 71, 95, /*transpose_b=*/true, false, false, 0.0f, 1.0f,
+              EpilogueActivateType::None, false, false, DataType::q8_0}); // past it
+    run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.5f, 1.0f,
+              EpilogueActivateType::Relu6, true, false, DataType::q8_0});
+}
+
+/// Batched A [2, M, K] × B [2, N, K]: the per-batch offset is counted in Q8_0
+/// blocks (34 bytes each), not elements.
+NNOPS_TEST(matmul_q8_0_batched)
+{
+    constexpr int64_t B = 2, N = 40, K = 70;
+    constexpr int64_t M_values[] = {4, 40};
+    constexpr bool transpose_b = true;
+
+    std::vector<uint8_t> bbytes;
+    Q4Matrix b0 = build_q4_matrix(N, K, 0x77u, DataType::q8_0);
+    Q4Matrix b1 = build_q4_matrix(N, K, 0x99u, DataType::q8_0);
+    append_q4_matrix(bbytes, b0);
+    append_q4_matrix(bbytes, b1);
+
+    for (const int64_t M : M_values) {
+        const std::vector<float> a0 = gen_floats(M * K, 0x100u);
+        const std::vector<float> a1 = gen_floats(M * K, 0x200u);
+        std::vector<float> adata = a0;
+        adata.insert(adata.end(), a1.begin(), a1.end());
+
+        const int64_t ashape[] = {B, M, K};
+        const int64_t bshape[] = {B, N, K};
+        TensorView a(ashape, DataType::f32, adata.data());
+        TensorView bv(bshape, DataType::q8_0, bbytes.data());
+
+        MatMulAttributes attrs{};
+        attrs.transpose_b = transpose_b;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc arr[] = {a.desc(), bv.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        NNOPS_EXPECT_EQ(descs[0].rank, int64_t(3));
+        NNOPS_EXPECT_EQ(descs[0].dims[0], B);
+        NNOPS_EXPECT_EQ(descs[0].dims[1], M);
+        NNOPS_EXPECT_EQ(descs[0].dims[2], N);
+
+        std::vector<float> out(static_cast<size_t>(B * M * N));
+        auto output = nnops::test::make_channel_first(descs[0], out.data());
+
+        const TensorView ins[] = {a, bv};
+        op->compute(output, ins);
+
+        for (int64_t bi = 0; bi < B; ++bi) {
+            const Q4Matrix& bm = bi == 0 ? b0 : b1;
+            const std::vector<float> want = reference_matmul<float>(
+                adata.data() + bi * M * K, bm, M, N, K, transpose_b);
+            for (int64_t i = 0; i < M * N; ++i) {
+                const float got = out[static_cast<size_t>(bi * M * N + i)];
+                NNOPS_EXPECT_TRUE(std::abs(got - want[static_cast<size_t>(i)]) <=
+                                  1e-3f + 1e-4f * std::abs(want[static_cast<size_t>(i)]));
+            }
+        }
+    }
+}

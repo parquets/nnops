@@ -655,10 +655,11 @@ void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* s
 void tile_pack_rhs(bool trans, int nc, int kc, bfloat16* dst, int ldd, const bfloat16* src, int lds,
                    float scale);
 
-// ---- Q4_0 / Q4_1 (llama.cpp block formats) RHS ---------------------------
+// ---- Q4_0 / Q4_1 / Q8_0 (llama.cpp block formats) RHS --------------------
 //
-// A Q4 B is a 32-value block stream (18 bytes for Q4_0, 20 for Q4_1, selected by
-// `fmt`); the pack fuses unpack + dequantize into the uniform panels above (or,
+// A block-packed B is a 32-value stream (18 bytes for Q4_0, 20 for Q4_1, 34 for
+// Q8_0, selected by `fmt`); the pack fuses unpack + dequantize into the uniform
+// panels above (or,
 // on aarch64, bf16's BFMMLA layout), so the MMA side is unchanged. Tile origin
 // and `src_row_blocks` (row pitch) are in blocks — a panel can start mid-block —
 // and `scale` (alpha) multiplies every decoded weight. data_type_stride_unit()

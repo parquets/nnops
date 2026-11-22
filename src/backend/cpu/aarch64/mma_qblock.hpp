@@ -91,6 +91,20 @@ template <DataType FMT> struct Q4Block {
 
         const float32x4_t vd = vdupq_n_f32(half_to_float(half_from_bits(d_bits)));
         const float32x4_t vm = vdupq_n_f32(with_min ? half_to_float(half_from_bits(m_bits)) : 0.0f);
+
+        if constexpr (FMT == DataType::q8_0) {
+            const auto conv8 = [&](int8x8_t q, float32x4_t& r0, float32x4_t& r1) {
+                const int16x8_t s = vmovl_s8(q);
+                r0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s))), vd);
+                r1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s))), vd);
+            };
+            conv8(vld1_s8(reinterpret_cast<const int8_t*>(p + 2)), v[0], v[1]);
+            conv8(vld1_s8(reinterpret_cast<const int8_t*>(p + 10)), v[2], v[3]);
+            conv8(vld1_s8(reinterpret_cast<const int8_t*>(p + 18)), v[4], v[5]);
+            conv8(vld1_s8(reinterpret_cast<const int8_t*>(p + 26)), v[6], v[7]);
+            return;
+        }
+
         const int16x8_t vbias = vdupq_n_s16(with_min ? 0 : -8);
 
         const uint8x16_t qs = vld1q_u8(p + (with_min ? 4 : 2));
@@ -131,6 +145,7 @@ template <DataType FMT> struct Q4Block {
 
 using Q4_1Block = Q4Block<DataType::q4_1>;
 using Q4_0Block = Q4Block<DataType::q4_0>;
+using Q8_0Block = Q4Block<DataType::q8_0>;
 
 static_assert(Q4Block<DataType::q4_1>::block_elems == 32,
               "the fused kernels assume one 32-value block per k step in the "
@@ -316,23 +331,38 @@ void mma_qblock_trans_f16(int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
                 BQ::dtype == DataType::q4_1 ?
                     vdupq_n_f16(half_to_float(half_from_bits(m_bits))) :
                     zero;
-            const int16x8_t vbias = vdupq_n_s16(BQ::dtype == DataType::q4_1 ? 0 : -8);
-            const uint8x16_t qs = vld1q_u8(p + (BQ::dtype == DataType::q4_1 ? 4 : 2));
-            const uint8x16_t lo = vandq_u8(qs, vdupq_n_u8(0x0F));
-            const uint8x16_t hi = vshrq_n_u8(qs, 4);
 
-            auto vec = [&](uint8x8_t nib) {
-                const int16x8_t q =
-                    vaddq_s16(vreinterpretq_s16_u16(vmovl_u8(nib)), vbias);
-                const float16x8_t qf =
-                    vcombine_f16(vcvt_f16_s16(vget_low_s16(q)),
-                                 vcvt_f16_s16(vget_high_s16(q)));
-                return vfmaq_f16(vm, qf, vd);
-            };
-            const float16x8_t b0 = vec(vget_low_u8(lo));   // values 0..7
-            const float16x8_t b1 = vec(vget_high_u8(lo));  // values 8..15
-            const float16x8_t b2 = vec(vget_low_u8(hi));   // values 16..23
-            const float16x8_t b3 = vec(vget_high_u8(hi));  // values 24..31
+            float16x8_t b0, b1, b2, b3;
+            if constexpr (BQ::dtype == DataType::q8_0) {
+                auto vec8 = [&](int8x8_t q) {
+                    const int16x8_t s = vmovl_s8(q);
+                    const float16x8_t qf =
+                        vcombine_f16(vcvt_f16_s16(vget_low_s16(s)),
+                                     vcvt_f16_s16(vget_high_s16(s)));
+                    return vfmaq_f16(vm, qf, vd);
+                };
+                b0 = vec8(vld1_s8(reinterpret_cast<const int8_t*>(p + 2)));  // values 0..7
+                b1 = vec8(vld1_s8(reinterpret_cast<const int8_t*>(p + 10))); // values 8..15
+                b2 = vec8(vld1_s8(reinterpret_cast<const int8_t*>(p + 18))); // values 16..23
+                b3 = vec8(vld1_s8(reinterpret_cast<const int8_t*>(p + 26))); // values 24..31
+            } else {
+                const int16x8_t vbias = vdupq_n_s16(BQ::dtype == DataType::q4_1 ? 0 : -8);
+                const uint8x16_t qs = vld1q_u8(p + (BQ::dtype == DataType::q4_1 ? 4 : 2));
+                const uint8x16_t lo = vandq_u8(qs, vdupq_n_u8(0x0F));
+                const uint8x16_t hi = vshrq_n_u8(qs, 4);
+                auto vec = [&](uint8x8_t nib) {
+                    const int16x8_t q =
+                        vaddq_s16(vreinterpretq_s16_u16(vmovl_u8(nib)), vbias);
+                    const float16x8_t qf =
+                        vcombine_f16(vcvt_f16_s16(vget_low_s16(q)),
+                                     vcvt_f16_s16(vget_high_s16(q)));
+                    return vfmaq_f16(vm, qf, vd);
+                };
+                b0 = vec(vget_low_u8(lo));   // values 0..7
+                b1 = vec(vget_high_u8(lo));  // values 8..15
+                b2 = vec(vget_low_u8(hi));   // values 16..23
+                b3 = vec(vget_high_u8(hi));  // values 24..31
+            }
 
             if constexpr (MR <= 4) {
                 NNOPS_QBLOCK_F16_DOT4(q00, q01, q02, q03, 0);

@@ -183,8 +183,8 @@ std::pair<std::vector<int8_t>, TensorView> make_tensor_i8(int64_t rows, int64_t 
     return {std::move(buf), tv};
 }
 
-/// Compact Q4_0/Q4_1 [rows, cols] block stream (32 four-bit quants per block);
-/// realistic d/m so no lane is denormal or inf.
+/// Compact Q4_0/Q4_1/Q8_0 [rows, cols] block stream; realistic d (and m) so no
+/// lane is denormal or inf.
 std::pair<std::vector<uint8_t>, TensorView>
 make_tensor_q4(int64_t rows, int64_t cols, uint64_t seed, DataType fmt = DataType::q4_1)
 {
@@ -196,9 +196,20 @@ make_tensor_q4(int64_t rows, int64_t cols, uint64_t seed, DataType fmt = DataTyp
     for (int64_t r = 0; r < rows; ++r) {
         for (int64_t b = 0; b < blocks_per_row; ++b) {
             uint8_t* blk = buf.data() + static_cast<size_t>((r * blocks_per_row + b) * bb);
-            const uint16_t d = cpu::half_to_bits(cpu::float_to_half(rng.next_float(0.002f, 0.02f)));
+            // Q8_0 spans +-127 instead of 0..15, so its d is ~8x smaller for
+            // the same decoded magnitudes.
+            const float dscale = fmt == DataType::q8_0 ? 0.125f : 1.0f;
+            const uint16_t d = cpu::half_to_bits(
+                cpu::float_to_half(rng.next_float(0.002f, 0.02f) * dscale));
             const uint16_t m = cpu::half_to_bits(cpu::float_to_half(rng.next_float(-0.1f, 0.1f)));
             std::memcpy(blk + 0, &d, 2);
+            if (fmt == DataType::q8_0) {
+                for (int j = 0; j < 32; ++j) {
+                    const int q = static_cast<int>(rng.next_u64() % 255) - 127;
+                    blk[2 + j] = static_cast<uint8_t>(static_cast<int8_t>(q));
+                }
+                continue;
+            }
             const int qoff = q4_has_min(fmt) ? 4 : 2;
             if (q4_has_min(fmt)) {
                 std::memcpy(blk + 2, &m, 2);
@@ -214,6 +225,29 @@ make_tensor_q4(int64_t rows, int64_t cols, uint64_t seed, DataType fmt = DataTyp
     const int64_t shape[] = {rows, cols};
     TensorView tv(shape, fmt, buf.data());
     return {std::move(buf), tv};
+}
+
+/// Format tag for the bench labels.
+inline const char* q4_fmt_name(DataType fmt) noexcept
+{
+    switch (fmt) {
+    case DataType::q4_0: return "q4_0";
+    case DataType::q8_0: return "q8_0";
+    default:             return "q4_1";
+    }
+}
+
+/// The route a block-packed B takes, as printed in the report.
+inline const char* q4_route_name(DataType fmt, bool sme, bool split_n) noexcept
+{
+    const bool q8 = fmt == DataType::q8_0;
+    if (sme) {
+        return q8 ? "q8_0-SME" : (fmt == DataType::q4_0 ? "q4_0-SME" : "q4-SME");
+    }
+    if (split_n) {
+        return q8 ? "q8_0-NKM" : (fmt == DataType::q4_0 ? "q4_0-NKM" : "q4-NKM");
+    }
+    return q8 ? "q8_0-MKN" : (fmt == DataType::q4_0 ? "q4_0-MKN" : "q4-MKN");
 }
 
 struct GeMMCase {
@@ -459,9 +493,7 @@ GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int i
 
     GeMMReport rep;
     rep.name = c.name;
-    rep.route = sme_route ? (fmt == DataType::q4_0 ? "q4_0-SME" : "q4-SME") :
-                            (plan.split_n ? (fmt == DataType::q4_0 ? "q4_0-NKM" : "q4-NKM") :
-                                            (fmt == DataType::q4_0 ? "q4_0-MKN" : "q4-MKN"));
+    rep.route = q4_route_name(fmt, sme_route, plan.split_n);
     rep.unit = "GFLOPS";
     rep.pack_a = plan.pack_a;
     rep.pack_b = true;
@@ -1876,6 +1908,35 @@ NNOPS_BENCH(matmul_q4_0_decode)
                          DataType::q4_0);
 }
 
+NNOPS_BENCH(matmul_q8_0_f32_nn_large)
+{
+    bench_q4_case<float>({"q8_0/f32 nn 1024x512x1024", 1024, 512, 1024}, DataType::q8_0);
+}
+
+NNOPS_BENCH(matmul_q8_0_f32_tb_large)
+{
+    bench_q4_case<float>({"q8_0/f32 tb 1024x512x1024", 1024, 512, 1024,
+                          /*ta=*/false, /*tb=*/true},
+                         DataType::q8_0);
+}
+
+NNOPS_BENCH(matmul_q8_0_f16_nn)
+{
+    bench_q4_case<half>({"q8_0/f16 nn 1024x512x1024", 1024, 512, 1024,
+                         /*ta=*/false, /*tb=*/false, /*pad_a=*/0, /*pad_b=*/0,
+                         /*f16=*/true},
+                        DataType::q8_0);
+}
+
+NNOPS_BENCH(matmul_q8_0_decode)
+{
+    // Decode is Q8_0's home shape: 34-byte blocks against Q4_1's 20, but no
+    // nibble unpack, so the weight stream is the limit rather than the decode.
+    bench_q4_case<float>({"q8_0/f32 decode 1x4096x4096", 1, 4096, 4096,
+                          /*ta=*/false, /*tb=*/true},
+                         DataType::q8_0);
+}
+
 NNOPS_BENCH(matmul_q4_sme_ab)
 {
     // The ZA tiles against the generic engine on the same block stream, both
@@ -2907,7 +2968,7 @@ NNOPS_BENCH(matmul_q4_decode_sweep)
 
 void bench_q4_decode_rate(DataType fmt)
 {
-    const char* q4name = fmt == DataType::q4_0 ? "q4_0" : "q4_1";
+    const char* q4name = q4_fmt_name(fmt);
 #if defined(NNOPS_ARCH_X86_64)
     // Raw block-decode throughput: no A, no panel, no output traffic. This is
     // the floor the fused route can reach — the packed route additionally
@@ -2972,6 +3033,8 @@ void bench_q4_decode_rate(DataType fmt)
 NNOPS_BENCH(matmul_q4_decode_rate) { bench_q4_decode_rate(DataType::q4_1); }
 
 NNOPS_BENCH(matmul_q4_0_decode_rate) { bench_q4_decode_rate(DataType::q4_0); }
+
+NNOPS_BENCH(matmul_q8_0_decode_rate) { bench_q4_decode_rate(DataType::q8_0); }
 
 // ---- bias A/B --------------------------------------------------------------
 //

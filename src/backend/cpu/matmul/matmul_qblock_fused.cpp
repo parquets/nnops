@@ -208,9 +208,14 @@ bool matmul_qblock_fused(const MatMulAttributes& attrs, TensorView& output,
     if (!is_block_packed_dtype(bdt)) {
         return false;
     }
-    return bdt == DataType::q4_0 ?
-               qblock_fused_format<DataType::q4_0>(attrs, output, inputs, ctx, M, N, K) :
-               qblock_fused_format<DataType::q4_1>(attrs, output, inputs, ctx, M, N, K);
+    switch (bdt) {
+    case DataType::q4_0:
+        return qblock_fused_format<DataType::q4_0>(attrs, output, inputs, ctx, M, N, K);
+    case DataType::q8_0:
+        return qblock_fused_format<DataType::q8_0>(attrs, output, inputs, ctx, M, N, K);
+    default:
+        return qblock_fused_format<DataType::q4_1>(attrs, output, inputs, ctx, M, N, K);
+    }
 }
 
 #endif // NNOPS_ARCH_X86_64 || NNOPS_ARCH_AARCH64

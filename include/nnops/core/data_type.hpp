@@ -2,20 +2,22 @@
 /// @file data_type.hpp
 /// @brief DataType enum and compile-time traits for the nnops library.
 ///
-/// q4_0 and q4_1 are block-packed: 32 values per block, sharing the same 16
-/// nibble bytes (value j in the low nibble of byte j, value j + 16 in the high).
+/// q4_0, q4_1 and q8_0 are llama.cpp block formats covering 32 values per block.
+/// q4_0/q4_1 share 16 nibble bytes (value j in the low nibble of byte j, value
+/// j + 16 in the high); q8_0 stores 32 signed bytes.
 /// q4_0 is 18 bytes (fp16 d only) and decodes to d·(q − 8); q4_1 is 20 bytes
-/// (fp16 d and m) and decodes to d·q + m. Neither has a per-element storage
+/// (fp16 d and m) and decodes to d·q + m; q8_0 is 34 bytes (fp16 d, 32 int8)
+/// and decodes to d·q. None has a per-element storage
 /// unit, so data_type_size() returns 0 — like the 4-bit types — and every
 /// row/stride computation must go through data_type_row_bytes() /
-/// data_type_stride_unit() rather than multiplying by the element size. Both are
+/// data_type_stride_unit() rather than multiplying by the element size. All are
 /// self-describing, so QuantParams is not used for them; decode with pack_q4()
 /// in <nnops/detail/q4.hpp> (vectorized pack kernels in
 /// src/backend/cpu/x86_64/pack_q4.hpp and aarch64/pack_q4.hpp).
 ///
 /// is_quantized_dtype() covers s8/u8/s4/u4 only: fp8 (f8_e4m3/f8_e5m2) are float
-/// formats with no integer zero_point, and q4_0/q4_1 carry their own per-block
-/// scale (and offset).
+/// formats with no integer zero_point, and the block formats carry their own
+/// per-block scale (and offset).
 
 #include <cstdint>
 #include <cstddef>
@@ -37,6 +39,7 @@ enum class DataType : uint8_t {
     u4      = 10, ///< unsigned 4-bit integer (2 values packed per byte, low nibble first)
     q4_1    = 11, ///< llama.cpp Q4_1 block format (see file header)
     q4_0    = 12, ///< llama.cpp Q4_0 block format (see file header)
+    q8_0    = 13, ///< llama.cpp Q8_0 block format (see file header)
 };
 
 /// Compile-time traits for each DataType.
@@ -134,10 +137,17 @@ struct DataTypeTraits<DataType::q4_0> {
     static constexpr const char* name = "q4_0";
 };
 
+template <>
+struct DataTypeTraits<DataType::q8_0> {
+    using ctype = uint8_t;   ///< block storage; 32 values per 34-byte block
+    static constexpr size_t size = 0;  ///< block-packed — use data_type_block_bytes
+    static constexpr const char* name = "q8_0";
+};
+
 // ---- Block-packed formats ----
 // No per-element storage unit: use data_type_row_bytes()/stride_unit(), not size.
 
-/// Elements covered by one Q4_0/Q4_1 block.
+/// Elements covered by one Q4_0/Q4_1/Q8_0 block.
 inline constexpr int64_t q4_block_elems = 32;
 
 /// Bytes of one Q4_1 block: fp16 d, fp16 m, 16 nibbles.
@@ -146,13 +156,17 @@ inline constexpr size_t q4_1_block_bytes = 20;
 /// Bytes of one Q4_0 block: fp16 d, 16 nibbles.
 inline constexpr size_t q4_0_block_bytes = 18;
 
-/// Back-compat aliases; the two formats share the 32-value block.
+/// Bytes of one Q8_0 block: fp16 d, 32 signed bytes.
+inline constexpr size_t q8_0_block_bytes = 34;
+
+/// Back-compat aliases; every block format shares the 32-value block.
 inline constexpr int64_t q4_1_block_elems = q4_block_elems;
 inline constexpr int64_t q4_0_block_elems = q4_block_elems;
+inline constexpr int64_t q8_0_block_elems = q4_block_elems;
 
 /// True for types stored in fixed-size blocks rather than whole bytes per element.
 constexpr bool is_block_packed_dtype(DataType dt) noexcept {
-    return dt == DataType::q4_0 || dt == DataType::q4_1;
+    return dt == DataType::q4_0 || dt == DataType::q4_1 || dt == DataType::q8_0;
 }
 
 /// Bytes of one block of a block-packed dtype; 0 for every other type.
@@ -160,6 +174,7 @@ constexpr size_t data_type_block_bytes(DataType dt) noexcept {
     switch (dt) {
     case DataType::q4_0: return q4_0_block_bytes;
     case DataType::q4_1: return q4_1_block_bytes;
+    case DataType::q8_0: return q8_0_block_bytes;
     default:             return 0;
     }
 }
@@ -168,7 +183,8 @@ constexpr size_t data_type_block_bytes(DataType dt) noexcept {
 constexpr int64_t data_type_block_elems(DataType dt) noexcept {
     switch (dt) {
     case DataType::q4_0:
-    case DataType::q4_1: return q4_block_elems;
+    case DataType::q4_1:
+    case DataType::q8_0: return q4_block_elems;
     default:             return 0;
     }
 }
@@ -189,12 +205,14 @@ constexpr size_t data_type_size(DataType dt) noexcept {
     case DataType::u4:   return 0;  // sub-byte: 2 elems/byte (use packed helpers)
     case DataType::q4_0: return 0;  // block-packed: 32 elems / 18-byte block
     case DataType::q4_1: return 0;  // block-packed: 32 elems / 20-byte block
+    case DataType::q8_0: return 0;  // block-packed: 32 elems / 34-byte block
     }
     return 0;
 }
 
 /// Storage unit of one row step: element size, or block size for block-packed
-/// (q4_1 → 20 bytes); 0 for nibble types, which have no single-unit storage.
+/// (q4_0 → 18, q4_1 → 20, q8_0 → 34 bytes); 0 for nibble types, which have no
+/// single-unit storage.
 constexpr size_t data_type_stride_unit(DataType dt) noexcept {
     return is_block_packed_dtype(dt) ? data_type_block_bytes(dt) : data_type_size(dt);
 }
@@ -235,6 +253,7 @@ constexpr int data_type_bits(DataType dt) noexcept {
     case DataType::u4:  return 4;
     case DataType::q4_0: return 4;
     case DataType::q4_1: return 4;
+    case DataType::q8_0: return 8;
     case DataType::s8:  return 8;
     case DataType::u8:  return 8;
     case DataType::f8_e4m3: return 8;

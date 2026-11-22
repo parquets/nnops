@@ -2,12 +2,13 @@
 /// @file pack_q4.hpp
 /// @brief x86_64 AVX2/F16C Q4_0/Q4_1 decode and packed-B kernels.
 ///
-/// Both are llama.cpp 4-bit block formats covering 32 values in 16 shared nibble
-/// bytes (byte j's low nibble is value j, its high nibble value j + 16). Q4_0 is
-/// 18 bytes — an fp16 delta `d`, and value j is `d * (q - 8)`; Q4_1 is 20 bytes —
-/// `d`, an fp16 minimum `m`, and value j is `d * q + m`. The layout and the
-/// portable scalar reference live in <nnops/detail/q4.hpp>; the dense `pack_q4`
-/// here is its vectorized twin, and `fmt` selects the codec.
+/// Three llama.cpp block formats covering 32 values each. Q4_0 and Q4_1 share
+/// 16 nibble bytes (byte j's low nibble is value j, its high nibble value j +
+/// 16): Q4_0 is 18 bytes — an fp16 delta `d`, and value j is `d * (q - 8)`;
+/// Q4_1 is 20 bytes — `d`, an fp16 minimum `m`, and value j is `d * q + m`.
+/// Q8_0 is 34 bytes — `d` and 32 signed bytes, value j is `d * q`. The layout
+/// and the portable scalar reference live in <nnops/detail/q4.hpp>; the dense
+/// `pack_q4` here is its vectorized twin, and `fmt` selects the codec.
 ///
 /// `pack_q4_rhs` is the GEMM-side entry point: it fuses the decode (and, for
 /// f16, the narrowing) into the RHS panel pack, so a quantized weight never
@@ -49,6 +50,24 @@ using nnops::backend::cpu::half_to_float;
 inline void decode_q4_block_ps(const uint8_t* p, __m256& v0, __m256& v1, __m256& v2, __m256& v3,
                                float scale, DataType fmt) noexcept
 {
+    if (fmt == DataType::q8_0) {
+        uint16_t d_bits = 0;
+        std::memcpy(&d_bits, p + 0, sizeof(d_bits));
+        __m256 md = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(d_bits)));
+        if (scale != 1.0f) {
+            md = _mm256_mul_ps(md, _mm256_set1_ps(scale));
+        }
+        auto load8 = [md](const uint8_t* q) {
+            const __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q));
+            return _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b)), md);
+        };
+        v0 = load8(p + 2);
+        v1 = load8(p + 10);
+        v2 = load8(p + 18);
+        v3 = load8(p + 26);
+        return;
+    }
+
     const bool with_min = q4_has_min(fmt);
     uint16_t d_bits = 0, m_bits = 0;
     std::memcpy(&d_bits, p + 0, sizeof(d_bits));

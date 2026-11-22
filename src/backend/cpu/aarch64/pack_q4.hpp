@@ -2,12 +2,13 @@
 /// @file pack_q4.hpp
 /// @brief AArch64 NEON Q4_0/Q4_1 decode and packed-B kernels.
 ///
-/// Both are llama.cpp 4-bit block formats covering 32 values in 16 shared nibble
-/// bytes (byte j's low nibble is value j, its high nibble value j + 16). Q4_0 is
-/// 18 bytes — an fp16 delta `d`, and value j is `d * (q - 8)`; Q4_1 is 20 bytes —
-/// `d`, an fp16 minimum `m`, and value j is `d * q + m`. The layout and the
-/// portable scalar reference live in <nnops/detail/q4.hpp>; `fmt` selects the
-/// codec everywhere below.
+/// Three llama.cpp block formats covering 32 values each. Q4_0 and Q4_1 share
+/// 16 nibble bytes (byte j's low nibble is value j, its high nibble value j +
+/// 16): Q4_0 is 18 bytes — an fp16 delta `d`, and value j is `d * (q - 8)`;
+/// Q4_1 is 20 bytes — `d`, an fp16 minimum `m`, and value j is `d * q + m`.
+/// Q8_0 is 34 bytes — `d` and 32 signed bytes, value j is `d * q`. The layout
+/// and the portable scalar reference live in <nnops/detail/q4.hpp>; `fmt`
+/// selects the codec everywhere below.
 ///
 /// `pack_q4_rhs` is the GEMM-side entry point: it fuses decode + the narrowing
 /// into the RHS panel pack, so a quantized weight never passes through an
@@ -51,7 +52,8 @@ using nnops::backend::cpu::half_from_bits;
 using nnops::backend::cpu::half_to_float;
 
 /// Decode one block into 32 f32, f16 or bf16 values; an f16/bf16 destination
-/// rounds once per element. `fmt` selects Q4_0 (no min, nibbles − 8) or Q4_1.
+/// rounds once per element. `fmt` selects Q4_0 (no min, nibbles − 8), Q4_1, or
+/// Q8_0 (signed bytes, no min).
 template <class T>
 inline void decode_q4_block(const uint8_t* p, T* out, float scale, DataType fmt) noexcept
 {
@@ -74,16 +76,8 @@ inline void decode_q4_block(const uint8_t* p, T* out, float scale, DataType fmt)
     }
     const float32x4_t vd = vdupq_n_f32(d);
     const float32x4_t vm = vdupq_n_f32(m);
-    const int16x8_t vbias = vdupq_n_s16(with_min ? 0 : -8);
 
-    const uint8x16_t qs = vld1q_u8(p + (with_min ? 4 : 2));
-    const uint8x16_t lo = vandq_u8(qs, vdupq_n_u8(0x0F));
-    const uint8x16_t hi = vshrq_n_u8(qs, 4);
-
-    auto emit = [&](int g, uint8x8_t nib) {
-        const int16x8_t q = vaddq_s16(vreinterpretq_s16_u16(vmovl_u8(nib)), vbias);
-        const float32x4_t v0 = vfmaq_f32(vm, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q))), vd);
-        const float32x4_t v1 = vfmaq_f32(vm, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q))), vd);
+    auto store = [&](int g, float32x4_t v0, float32x4_t v1) {
         if constexpr (std::is_same_v<T, float>) {
             vst1q_f32(out + 8 * g, v0);
             vst1q_f32(out + 8 * g + 4, v1);
@@ -94,6 +88,30 @@ inline void decode_q4_block(const uint8_t* p, T* out, float scale, DataType fmt)
             vst1q_u16(reinterpret_cast<uint16_t*>(out + 8 * g),
                       bf16_narrow(::nnops::simd::v_f32x8(v0, v1)));
         }
+    };
+
+    if (fmt == DataType::q8_0) {
+        auto emit8 = [&](int g, int8x8_t q) {
+            const int16x8_t s = vmovl_s8(q);
+            store(g, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s))), vd),
+                  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s))), vd));
+        };
+        emit8(0, vld1_s8(reinterpret_cast<const int8_t*>(p + 2)));  // values 0..7
+        emit8(1, vld1_s8(reinterpret_cast<const int8_t*>(p + 10))); // values 8..15
+        emit8(2, vld1_s8(reinterpret_cast<const int8_t*>(p + 18))); // values 16..23
+        emit8(3, vld1_s8(reinterpret_cast<const int8_t*>(p + 26))); // values 24..31
+        return;
+    }
+
+    const int16x8_t vbias = vdupq_n_s16(with_min ? 0 : -8);
+    const uint8x16_t qs = vld1q_u8(p + (with_min ? 4 : 2));
+    const uint8x16_t lo = vandq_u8(qs, vdupq_n_u8(0x0F));
+    const uint8x16_t hi = vshrq_n_u8(qs, 4);
+
+    auto emit = [&](int g, uint8x8_t nib) {
+        const int16x8_t q = vaddq_s16(vreinterpretq_s16_u16(vmovl_u8(nib)), vbias);
+        store(g, vfmaq_f32(vm, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q))), vd),
+              vfmaq_f32(vm, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q))), vd));
     };
 
     emit(0, vget_low_u8(lo));  // values  0..7

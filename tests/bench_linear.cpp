@@ -665,7 +665,8 @@ void bench_q4_vs_dense(const char* tag, const std::vector<Shape>& shapes,
                        const std::vector<int>& threads, double target_ms, int rounds,
                        DataType fmt = DataType::q4_1)
 {
-    const char* q4name = fmt == DataType::q4_0 ? "q4_0" : "q4_1";
+    const char* q4name = fmt == DataType::q4_0 ? "q4_0" :
+                         fmt == DataType::q8_0 ? "q8_0" : "q4_1";
     std::printf("  %s Linear %s weight: raw vs decoded+dense-packed  "
                 "budget=%.0f ms/cell  rounds=%d\n",
                 tag, q4name, target_ms, rounds);
@@ -755,6 +756,8 @@ void bench_linear_q4(DataType fmt)
 NNOPS_BENCH(linear_q4_1) { bench_linear_q4(DataType::q4_1); }
 
 NNOPS_BENCH(linear_q4_0) { bench_linear_q4(DataType::q4_0); }
+
+NNOPS_BENCH(linear_q8_0) { bench_linear_q4(DataType::q8_0); }
 
 // ============================================================
 // f16 — the same pairing

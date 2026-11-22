@@ -83,6 +83,7 @@ template <DataType FMT> struct Q4Block {
 
 using Q4_1Block = Q4Block<DataType::q4_1>;
 using Q4_0Block = Q4Block<DataType::q4_0>;
+using Q8_0Block = Q4Block<DataType::q8_0>;
 
 static_assert(Q4Block<DataType::q4_1>::block_elems == 32,
               "the fused kernels assume one 32-value block per k step in the "
