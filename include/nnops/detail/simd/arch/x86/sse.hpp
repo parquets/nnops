@@ -339,6 +339,16 @@ inline v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
     return v_f16x8(_mm256_cvtps_ph(f32, 0));
 }
 
+/// Round 8 f32 lanes onto the u8 grid (round-to-nearest-even, saturated at
+/// [0,255]) and store the eight bytes; see avx2.hpp's twin.
+inline void v_store_f32_to_u8(const v_f32x8& a, uint8_t* p) {
+    const __m128i i32_lo = _mm_cvtps_epi32(a.lo);
+    const __m128i i32_hi = _mm_cvtps_epi32(a.hi);
+    const __m128i u16 = _mm_packus_epi32(i32_lo, i32_hi);
+    const __m128i u8 = _mm_packus_epi16(u16, u16);
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(p), u8);
+}
+
 #define NNOPS_F16X8_BINOP(name, op) \
 inline v_f16x8 name(const v_f16x8& a, const v_f16x8& b) { \
     __m256 fa = _mm256_cvtph_ps(a.val); \

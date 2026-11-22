@@ -330,6 +330,16 @@ inline v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
     return v_f16x8(vcombine_f16(lo, hi));
 }
 
+/// Round 8 f32 lanes onto the u8 grid — round-to-nearest-even, saturated at
+/// [0,255] (FCVTNU already maps negatives to zero) — and store the eight
+/// bytes; see avx2.hpp's twin.
+inline void v_store_f32_to_u8(const v_f32x8& a, uint8_t* p) {
+    const uint32x4_t lo = vcvtnq_u32_f32(a.lo);
+    const uint32x4_t hi = vcvtnq_u32_f32(a.hi);
+    const uint16x8_t u16 = vcombine_u16(vqmovn_u32(lo), vqmovn_u32(hi));
+    vst1_u8(p, vqmovn_u16(u16));
+}
+
 inline v_f16x8 v_add(const v_f16x8& a, const v_f16x8& b) {
     return v_f16x8(vaddq_f16(a.val, b.val));
 }

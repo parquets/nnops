@@ -308,6 +308,7 @@ Status group_query_attention_cpu(const GroupQueryAttentionAttributes& attrs,
     cfg.bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
     cfg.mask_filter_value = attrs.mask_filter_value;
     cfg.quantize_q = attrs.quantize_query;
+    cfg.quantize_pv = attrs.quantize_pv;
 
     if (attrs.causal) {
         // Cache form: Q, k_cache, v_cache, kv_seqlens, k_scale, v_scale,

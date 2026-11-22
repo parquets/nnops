@@ -173,6 +173,15 @@ struct GroupQueryAttentionAttributes {
     /// Sq == 1 GEMV route, an fp cache — runs unchanged on the fp path, so the
     /// attribute is a hint, not a contract. Off by default.
     bool quantize_query = false;
+
+    /// int8 probabilities for P·V. The flash route's probability tile has
+    /// already had its row maximum subtracted, so it lies in [0,1] and a static
+    /// 255-level grid covers it exactly — no per-row scale and no extra pass.
+    /// This rounds the attention weights themselves, which makes it the
+    /// lossiest of the integer steps, so it is independent of `quantize_query`
+    /// (that one is nearly free numerically). Same eligibility minus the head
+    /// width: an s8 cache on the flash route. Off by default.
+    bool quantize_pv = false;
 };
 
 class GroupQueryAttention : public OpBase {

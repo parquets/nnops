@@ -121,6 +121,13 @@
 /// k group divides and packs in one k block (see qk_i8_enabled); every other
 /// route and shape runs fp.
 ///
+/// cfg.quantize_pv does the same for the second product, with a static grid
+/// instead of a dynamic one: after the online-softmax subtraction the tile is
+/// a probability in [0, 1], so 255 levels cover it exactly, and the cache's
+/// per-key V scale — which sits on the reduction axis and cannot wait for the
+/// output — is folded into those probabilities first. The int32 result is
+/// dequantized onto the fp accumulator, so the exp(Δm) rescaling stays exact.
+///
 /// Varlen (cu_seqlens_q / cu_seqlens_k): the two int32 [segments + 1] offsets of
 /// HuggingFace's packed batches. Q is [1, total_q, H*D] and K/V are
 /// [1, total_kv, ...], segment s owning query rows [cu_q[s], cu_q[s+1]) and key
@@ -212,6 +219,14 @@ struct AttentionConfig {
     /// width divides the integer pack's k group; everywhere else the fp route
     /// runs unchanged.
     bool quantize_q = false;
+    /// int8 probabilities in P·V: the flash route rounds the (already
+    /// max-subtracted, so [0,1]) probability tile onto a static 255-level
+    /// grid and runs the second product on the integer MMA too, folding the
+    /// cache's per-key V scale into the probabilities. This is the lossiest of
+    /// the integer steps — it rounds the weights themselves — so it is a
+    /// separate switch from quantize_q. Same eligibility as quantize_q apart
+    /// from the head width: an s8 cache on the flash route.
+    bool quantize_pv = false;
 
     int64_t kv_heads() const noexcept { return num_kv_heads > 0 ? num_kv_heads : num_heads; }
 };
@@ -236,6 +251,11 @@ struct AttentionPlan {
     /// query block and the int32 score tile. See cfg.quantize_q for when the
     /// path is eligible.
     bool flash_qk_i8 = false;
+    /// Flash route runs P·V on the integer MMA as well: the [0,1] probability
+    /// tile is rounded onto a static 255-level grid (with the cache's per-key
+    /// V scale folded in) and the int32 result is dequantized onto the output
+    /// accumulator. See cfg.quantize_pv.
+    bool flash_pv_i8 = false;
     /// Decode head batching: query heads one task serves. Under GQA/MQA the
     /// group's heads share a KV head, so one pass over K/V feeds all of them
     /// instead of each head re-reading the run.

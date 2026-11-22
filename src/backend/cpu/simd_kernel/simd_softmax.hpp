@@ -236,4 +236,43 @@ inline float softmax_row_exp_sum(const T* x, T* y, int64_t n, float ref_max, flo
     return sum;
 }
 
+/// y[t] = round(levels · exp((x[t] − ref)·inv_T) · fold[t]), written as bytes,
+/// and returns Σ exp((x[t] − ref)·inv_T) — the fp denominator. One pass over
+/// the row: the int8 P·V path's exp step, which would otherwise materialize the
+/// fp probabilities only to read them back for quantization. @p fold folds a
+/// per-key factor (the KV cache's V scale) into the same multiply and may be
+/// null.
+///
+/// The bytes may be written over the row they come from: the store of lane
+/// block i lands in bytes [L·i, L·i+L) and the loads of later blocks reach
+/// L·i·sizeof(T) and beyond, so the head of a row is always consumed memory by
+/// the time its bytes overwrite it.
+template <typename T>
+inline float softmax_row_exp_quant(const T* x, uint8_t* y, int64_t n, float ref, float inv_T,
+                                   float levels, const float* fold)
+{
+    constexpr int64_t L = simd_default_lane_f32;
+    int64_t i = 0;
+    v_f32x8 v_sum = v_set1_f32x8(0.0f);
+    const v_f32x8 v_neg_ref = v_set1_f32x8(-ref);
+    const v_f32x8 v_inv_T = v_set1_f32x8(inv_T);
+    const v_f32x8 v_levels = v_set1_f32x8(levels);
+    for (; i + L <= n; i += L) {
+        v_f32x8 e = v_exp(v_mul(v_add(v_load_f32(x + i), v_neg_ref), v_inv_T));
+        v_sum = v_add(v_sum, e);
+        if (fold != nullptr) {
+            e = v_mul(e, v_load(fold + i));
+        }
+        v_store_f32_to_u8(v_mul(e, v_levels), y + i);
+    }
+    float sum = v_reduce_sum(v_sum);
+    for (; i < n; ++i) {
+        const float e = std::exp((s_load(&x[i]) - ref) * inv_T);
+        sum += e;
+        const float q = e * (fold != nullptr ? fold[i] : 1.0f) * levels;
+        y[i] = static_cast<uint8_t>(q < 0.0f ? 0.0f : (q > 255.0f ? 255.0f : std::nearbyintf(q)));
+    }
+    return sum;
+}
+
 } // namespace nnops::kernel

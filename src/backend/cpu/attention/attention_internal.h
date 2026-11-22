@@ -438,6 +438,13 @@ void kv_pack_i8(bool trans, int nc, int kc, T* dst, int ldd, const int8_t* src, 
 // `scale · s_q[row] · s_k[key]` — the k scale can only ride the score, because
 // it varies along the reduction's *output* axis (per key), not along K.
 
+/// Whether the int8 P·V path can run: asked for, over an s8 cache, and with a
+/// key tile the probability pack takes as one k block.
+inline bool pv_i8_enabled(const AttentionConfig& cfg, bool kv8, int Bc)
+{
+    return cfg.quantize_pv && kv8 && Bc > 0 && Bc <= KC_CAP_I8;
+}
+
 /// Whether the int8 Q·Kᵀ path can run: asked for, over an s8 cache, with a
 /// query-key width that divides the integer pack's k group (4, eight on the
 /// runtime i8mm route) and inside the pack's one-k-block cap. Everything else
@@ -495,30 +502,119 @@ template <class T> inline float row_absmax(const T* x, int64_t n)
     return best;
 }
 
-/// Byte layout of the int8 Q·Kᵀ scratch after a flash slot's packed-B area:
-/// one packed query block per batched head (from the region's base), their row
-/// scales, and the one int32 score tile the MMA accumulates into — each region
-/// 16-byte aligned. The plan sizes the slot from this and the kernel carves it
-/// the same way, so the two can never disagree.
-struct FlashQkI8Layout {
-    size_t q_head = 0;  ///< bytes one head's packed Br-row query block takes
-    size_t qscale = 0;  ///< the row scales, after every head's block
-    size_t s32 = 0;     ///< the int32 score tile
-    size_t bytes = 0;   ///< the whole region
+// ---- int8 P·V -----------------------------------------------------------
+//
+// After the online-softmax subtraction the tile holds p = exp(s − m) ∈ [0,1],
+// so the grid is static: 255 levels, no per-row scale and no extra maximum
+// pass. The cache's per-key V scale is the one thing that cannot wait for the
+// output — it sits on the reduction axis — so it rides on P instead:
+// p·s_v[t]/max_t(s_v), still inside [0,1], with the tile's factor applied once
+// on the way out. The denominator l stays the fp row sum taken before the
+// quantization, so only the numerator's weights are rounded.
+
+/// P's grid. u8 on both arches: P's domain is [0,1], so the unsigned range is
+/// exactly that (IntAttention measured 0.9991 cos against 0.9966 for a signed
+/// grid, and half the RMSE). x86's vpdpbusd takes the byte as it is; SDOT is
+/// s8×s8, so aarch64 biases the pack by 0x80 — p̂ → p̂−128, the shift
+/// int8_a_pack_bias applies to any unsigned A — and the product comes back off
+/// by exactly +128·Σ_t v[t][d], which the dequantization folds out.
+constexpr int kPvI8Levels = 255;
+constexpr bool kPvI8BiasA = int8_a_pack_bias(DataType::u8) != 0;
+constexpr int kPvI8ColCorrection = -int8_a_pack_bias(DataType::u8); // 0 / +128
+static_assert(kPvI8BiasA == (kPvI8ColCorrection == 128),
+              "the biased-P correction is exactly the pack shift the MMA does not fold");
+
+/// Per-column sums of a tile of signed byte rows (src[t*lds + d]) — the exact
+/// correction a biased-A product needs on an s8-only MMA. f32 holds them
+/// exactly: at most Bc ≤ 256 rows of |v| ≤ 127.
+inline void i8_col_sums(const int8_t* src, int64_t lds, int rows, int cols, float* sums)
+{
+    constexpr int L = 8; // int8 -> f32 conversion width
+    int d = 0;
+    for (; d + L <= cols; d += L) {
+        simd::v_f32x8 acc = simd::v_set1_f32x8(0.0f);
+        for (int t = 0; t < rows; ++t) {
+            acc = simd::v_add(acc, simd::v_cvt_s8_to_f32(src + static_cast<int64_t>(t) * lds + d));
+        }
+        simd::v_store(sums + d, acc);
+    }
+    for (; d < cols; ++d) {
+        int32_t s = 0;
+        for (int t = 0; t < rows; ++t) {
+            s += src[static_cast<int64_t>(t) * lds + d];
+        }
+        sums[d] = static_cast<float>(s);
+    }
+}
+
+/// o[d] = (acc[d] + Corr·col_sum[d]) · f, added onto @p o unless @p add_to is
+/// false (the very first tile of a task writes it).
+template <class T, int Corr>
+inline void pv_i8_accum_row(T* o, const int32_t* acc, const float* col_sum, int64_t n, float f,
+                            bool add_to)
+{
+    constexpr int64_t L = simd::simd_default_lane_f32;
+    const simd::v_f32x8 vf = simd::v_set1_f32x8(f);
+    int64_t d = 0;
+    for (; d + L <= n; d += L) {
+        simd::v_f32x8 v = kernel::v_cvt_i32_to_f32(acc + d);
+        if constexpr (Corr != 0) {
+            v = simd::v_add(v, simd::v_mul(simd::v_set1_f32x8(static_cast<float>(Corr)),
+                                           simd::v_load(col_sum + d)));
+        }
+        v = simd::v_mul(v, vf);
+        if (add_to) {
+            v = simd::v_add(v, simd::v_load_f32(o + d));
+        }
+        simd::v_store_f32<T>(o + d, v);
+    }
+    for (; d < n; ++d) {
+        float v = static_cast<float>(acc[d]);
+        if constexpr (Corr != 0) {
+            v += static_cast<float>(Corr) * col_sum[d];
+        }
+        v *= f;
+        simd::s_store(&o[d], add_to ? simd::s_load(&o[d]) + v : v);
+    }
+}
+
+/// Byte layout of a flash slot's int8 scratch, after the packed-B area:
+///   [packed Q, heads × q_head]   dynamic-query Q·Kᵀ only
+///   [Q row scales, heads × Br]   "
+///   [packed P, one Br-row block] int8 P·V only
+///   [int32 tile, Br × max(Bc, Dv)] either, sized for the wider side
+/// Each region starts 16-byte aligned; a route that does not use one leaves it
+/// empty. The plan sizes the slot from this and the kernel carves it the same
+/// way, so the two can never disagree.
+struct FlashI8Layout {
+    size_t q_head = 0; ///< bytes one head's packed Br-row query block takes
+    size_t qscale = 0; ///< the row scales, after every head's block
+    size_t ppack = 0;  ///< one packed Br-row probability block
+    size_t s32 = 0;    ///< the int32 accumulator tile
+    size_t bytes = 0;  ///< the whole region
 };
 
-inline FlashQkI8Layout flash_qk_i8_layout(int Br, int Bc, int64_t Dqk, int heads)
+inline FlashI8Layout flash_i8_layout(int Br, int Bc, int64_t Dqk, int64_t Dv, int heads,
+                                     bool qk8, bool pv8)
 {
-    FlashQkI8Layout o;
-    o.q_head = static_cast<size_t>(i8_m_panels_max(Br)) *
-               static_cast<size_t>(geom_ldd_i8_a(Dqk));
-    const size_t q_bytes = static_cast<size_t>(heads) * o.q_head;
-    o.qscale = align_up_bytes(q_bytes, 16);
-    o.s32 = o.qscale + align_up_bytes(static_cast<size_t>(heads) * static_cast<size_t>(Br) *
-                                          sizeof(float),
-                                      16);
-    o.bytes = o.s32 + align_up_bytes(
-                           static_cast<size_t>(Br) * static_cast<size_t>(Bc) * sizeof(int32_t), 16);
+    const size_t br = static_cast<size_t>(Br);
+    FlashI8Layout o;
+    o.q_head = qk8 ? static_cast<size_t>(i8_m_panels_max(Br)) *
+                         static_cast<size_t>(geom_ldd_i8_a(Dqk)) :
+                     0;
+    size_t at = static_cast<size_t>(heads) * o.q_head;
+    o.qscale = align_up_bytes(at, 16);
+    at = o.qscale + (qk8 ? align_up_bytes(static_cast<size_t>(heads) * br * sizeof(float), 16) : 0);
+    o.ppack = align_up_bytes(at, 16);
+    at = o.ppack + (pv8 ? static_cast<size_t>(i8_m_panels_max(Br)) *
+                              static_cast<size_t>(geom_ldd_i8_a(Bc)) :
+                          0);
+    o.s32 = align_up_bytes(at, 16);
+    const int64_t tile_n = (pv8 && Dv > Bc) ? Dv : Bc;
+    at = o.s32 + ((qk8 || pv8) ?
+                      align_up_bytes(br * static_cast<size_t>(tile_n) * sizeof(int32_t), 16) :
+                      0);
+    o.bytes = at;
     return o;
 }
 
@@ -757,8 +853,9 @@ constexpr int panels_for_pack_i8(int64_t n_max)
 }
 
 /// The packed-B slot, in T elements: the fp panels of both GEMMs, or the int8
-/// Q·Kᵀ panels when those are wider (they never are today, but the slot is one
-/// region and the two routes must both fit it).
+/// panels of either integer GEMM when those are wider (they never are today,
+/// but the slot is one region and every route must fit it). The int8 K panels
+/// are Bc keys × Dqk, the int8 V panels Dv values × Bc keys.
 template <class T> inline int64_t flash_pack_elems(int Bc, int64_t Dqk, int64_t Dv)
 {
     constexpr int nr_max = nr_max_flt<T>();
@@ -768,8 +865,11 @@ template <class T> inline int64_t flash_pack_elems(int Bc, int64_t Dqk, int64_t 
         static_cast<int>(sizeof(T)));
     const int np_full = std::max(panels_for_pack<T>(Bc), panels_for_pack<T>(Dv));
     const int64_t fp_elems = static_cast<int64_t>(np_full) * ldd_b_full;
-    const int64_t i8_bytes = static_cast<int64_t>(panels_for_pack_i8(Bc)) *
-                             int8_panel_stride(std::min<int64_t>(Dqk, KC_CAP_I8));
+    const int64_t kc8 = std::min<int64_t>(Bc, KC_CAP_I8);
+    const int64_t i8_bytes =
+        std::max(static_cast<int64_t>(panels_for_pack_i8(Bc)) *
+                     int8_panel_stride(std::min<int64_t>(Dqk, KC_CAP_I8)),
+                 static_cast<int64_t>(panels_for_pack_i8(Dv)) * int8_panel_stride(kc8));
     const int64_t i8_elems = (i8_bytes + static_cast<int64_t>(sizeof(T)) - 1) /
                              static_cast<int64_t>(sizeof(T));
     return std::max(fp_elems, i8_elems);
@@ -777,18 +877,18 @@ template <class T> inline int64_t flash_pack_elems(int Bc, int64_t Dqk, int64_t 
 
 template <class T>
 inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv, int heads,
-                                    bool kv8 = false, bool qk8 = false)
+                                    bool kv8 = false, bool qk8 = false, bool pv8 = false)
 {
     const int64_t i8_elems =
         kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(std::max<int64_t>(Dqk, Bc))) : 0;
-    const int64_t qk_elems =
-        qk8 ? static_cast<int64_t>((flash_qk_i8_layout(Br, Bc, Dqk, heads).bytes +
-                                    sizeof(T) - 1) /
-                                   sizeof(T)) :
-              0;
+    const int64_t int8_elems =
+        (qk8 || pv8) ? static_cast<int64_t>((flash_i8_layout(Br, Bc, Dqk, Dv, heads, qk8, pv8).bytes +
+                                             sizeof(T) - 1) /
+                                            sizeof(T)) :
+                       0;
     const int64_t per_head = static_cast<int64_t>(Br) * 2 + static_cast<int64_t>(Br) * Bc +
                              static_cast<int64_t>(Br) * Dv;
-    return per_head * heads + flash_pack_elems<T>(Bc, Dqk, Dv) + i8_elems + qk_elems;
+    return per_head * heads + flash_pack_elems<T>(Bc, Dqk, Dv) + i8_elems + int8_elems;
 }
 
 /// Flash GQA head batching: the most query heads one task serves. Past four

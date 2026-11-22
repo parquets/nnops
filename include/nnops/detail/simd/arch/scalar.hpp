@@ -438,6 +438,15 @@ inline v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
         f32_to_f16(a[6]), f32_to_f16(a[7]));
 }
 
+/// Round 8 f32 lanes onto the u8 grid (round-to-nearest-even, saturated at
+/// [0,255]) and store the eight bytes; see x86/avx2.hpp's twin.
+inline void v_store_f32_to_u8(const v_f32x8& a, uint8_t* p) {
+    for (int i = 0; i < 8; ++i) {
+        const float q = std::nearbyintf(a[i]);
+        p[i] = static_cast<uint8_t>(q < 0.0f ? 0.0f : (q > 255.0f ? 255.0f : q));
+    }
+}
+
 inline v_f16x8 v_add(const v_f16x8& a, const v_f16x8& b) {
     v_f16x8 r;
     for (int i = 0; i < 8; ++i) {

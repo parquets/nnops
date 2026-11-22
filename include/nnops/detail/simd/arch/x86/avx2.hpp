@@ -254,6 +254,17 @@ inline sse::v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
 
 #endif  // defined(__F16C__)
 
+/// Round 8 f32 lanes onto the u8 grid — round-to-nearest-even, saturated at
+/// [0,255] — and store the eight bytes. The fused exp→probability path writes
+/// its result with this, so the fp probabilities never reach memory.
+inline void v_store_f32_to_u8(const v_f32x8& a, uint8_t* p) {
+    const __m256i i32 = _mm256_cvtps_epi32(a.val);
+    const __m128i u16 = _mm_packus_epi32(_mm256_castsi256_si128(i32),
+                                         _mm256_extracti128_si256(i32, 1));
+    const __m128i u8 = _mm_packus_epi16(u16, u16);
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(p), u8);
+}
+
 // ============================================================
 // Stride-2 gather — three spellings of one load. v_deinterleave_* reads 2N
 // elements and returns the {even, odd} pair; v_load_even_* / v_load_odd_*

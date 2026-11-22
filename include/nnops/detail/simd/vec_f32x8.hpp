@@ -49,6 +49,8 @@
     using arch::avx2::v_reduce_sum;
     using arch::avx2::v_reduce_max;
     using arch::avx2::v_reduce_min;
+    // f32 lanes onto the u8 grid (fused exp→probability store)
+    using arch::avx2::v_store_f32_to_u8;
     // f32 → f16 conversion (returns arch::sse::v_f16x8)
     using arch::avx2::v_cvt_f32_to_f16;
     using arch::avx2::v_f32x8x2_t;
@@ -92,6 +94,7 @@
     using arch::sse::v_reduce_sum;
     using arch::sse::v_reduce_max;
     using arch::sse::v_reduce_min;
+    using arch::sse::v_store_f32_to_u8;
     using arch::sse::v_f32x8x2_t;
     using arch::sse::v_deinterleave_f32x8;
     using arch::sse::v_load_even_f32x8;
@@ -134,6 +137,7 @@
   using arch::neon::v_reduce_sum;
   using arch::neon::v_reduce_max;
   using arch::neon::v_reduce_min;
+  using arch::neon::v_store_f32_to_u8;
   using arch::neon::v_f32x8x2_t;
   using arch::neon::v_deinterleave_f32x8;
   using arch::neon::v_load_even_f32x8;
@@ -173,6 +177,7 @@
   using arch::scalar::v_reduce_sum;
   using arch::scalar::v_reduce_max;
   using arch::scalar::v_reduce_min;
+  using arch::scalar::v_store_f32_to_u8;
   using arch::scalar::v_f32x8x2_t;
   using arch::scalar::v_deinterleave_f32x8;
   using arch::scalar::v_load_even_f32x8;

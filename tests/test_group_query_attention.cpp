@@ -19,6 +19,7 @@
 
 #include "nnops/ops/group_query_attention.hpp"
 #include "backend/cpu/attention/attention.h"   // AttentionConfig / get_attention_plan
+#include "backend/cpu/attention/attention_internal.h" // int8 column sums
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"
@@ -87,6 +88,7 @@ struct Case {
     std::vector<int64_t> pos_ids;  // per-batch first query row; empty = derived
     bool head_sink = false;        // the [H] virtual-key input
     bool quantize_q = false;       // dynamic int8 query over an int8 cache
+    bool quantize_pv = false;      // int8 probabilities for P·V
     /// Snap Q onto the int8 grid the dynamic path will quantize it to, so that
     /// path's product is exact and the comparison can keep the fp tolerance.
     bool q_on_grid = false;
@@ -214,6 +216,7 @@ Built build(const Case& c, uint64_t seed)
     b.attrs.output_gate = c.gate;
     b.attrs.head_layout = c.layout;
     b.attrs.quantize_query = c.quantize_q;
+    b.attrs.quantize_pv = c.quantize_pv;
 
     const bool bshd = c.layout == AttentionHeadLayout::BSHD;
     const bool merged = c.kshape.size() == 3;
@@ -422,6 +425,7 @@ bool fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_out =
     pcfg.window = c.window;
     pcfg.bshd = c.layout == AttentionHeadLayout::BSHD;
     pcfg.quantize_q = c.quantize_q;
+    pcfg.quantize_pv = c.quantize_pv;
     if (c.causal) {
         pcfg.seqlens_slot = 3;
         pcfg.seqlens_is_length = true;
@@ -755,7 +759,7 @@ namespace {
 
 /// An int8-cache flash case with the dynamic query on, filled in by hand: the
 /// positional Case aggregate has grown too long for the trailing fields.
-Case qk8_case(std::vector<int64_t> qshape, std::vector<int64_t> kshape, int64_t heads,
+Case i8_case(std::vector<int64_t> qshape, std::vector<int64_t> kshape, int64_t heads,
               int64_t kv_heads)
 {
     Case c;
@@ -766,8 +770,6 @@ Case qk8_case(std::vector<int64_t> qshape, std::vector<int64_t> kshape, int64_t 
     c.causal = true;
     c.int8 = true;
     c.route = 1; // flash
-    c.quantize_q = true;
-    c.q_on_grid = true;
     return c;
 }
 
@@ -778,32 +780,38 @@ NNOPS_TEST(gqa_qk_int8_exact_matches_ref) {
     // product is exact: the comparison keeps the fp threshold, which is what
     // makes this a correctness check of the pack, the scale picks and the score
     // dequantization rather than an accuracy check.
+    const auto qk = [](std::vector<int64_t> qs, std::vector<int64_t> ks, int64_t h, int64_t kv) {
+        Case c = i8_case(std::move(qs), std::move(ks), h, kv);
+        c.quantize_q = true;
+        c.q_on_grid = true;
+        return c;
+    };
     std::vector<Case> cases;
     // Per-token K scale, GQA with head batching (G = 4), the plain path.
-    cases.push_back(qk8_case({1, 512, 8 * 128}, {1, 512, 2 * 128}, 8, 2));
+    cases.push_back(qk({1, 512, 8 * 128}, {1, 512, 2 * 128}, 8, 2));
     // Per-tensor K scale: the per-key factor folds into the row multiplier.
-    cases.push_back(qk8_case({2, 512, 4 * 64}, {2, 512, 2 * 64}, 4, 2));
+    cases.push_back(qk({2, 512, 4 * 64}, {2, 512, 2 * 64}, 4, 2));
     cases.back().per_tensor = true;
     // The virtual sink key joins the denominator after the dequantized logits.
-    cases.push_back(qk8_case({1, 256, 4 * 96}, {1, 256, 2 * 96}, 4, 2));
+    cases.push_back(qk({1, 256, 4 * 96}, {1, 256, 2 * 96}, 4, 2));
     cases.back().head_sink = true;
     // A sliding window: the band split and the out-of-range -inf fill run on
     // dequantized scores.
-    cases.push_back(qk8_case({1, 512, 4 * 128}, {1, 512, 2 * 128}, 4, 2));
+    cases.push_back(qk({1, 512, 4 * 128}, {1, 512, 2 * 128}, 4, 2));
     cases.back().window = 96;
     cases.back().sink = 8;
     // Per-batch run lengths: one batch's prefix is shorter than the cache, so
     // its causal diagonal sits further left than the other's.
-    cases.push_back(qk8_case({2, 256, 4 * 64}, {2, 320, 2 * 64}, 4, 2));
+    cases.push_back(qk({2, 256, 4 * 64}, {2, 320, 2 * 64}, 4, 2));
     cases.back().past = 64;
     cases.back().seqlens = {384, 350};
     // A query-key width the integer pack's 4-wide k group does not divide: the
     // fp path runs (the plan says so) and still matches.
-    cases.push_back(qk8_case({1, 256, 4 * 102}, {1, 256, 2 * 102}, 4, 2));
+    cases.push_back(qk({1, 256, 4 * 102}, {1, 256, 2 * 102}, 4, 2));
     // A last query block three rows short of a full Br tile. The int8 M-panel
     // count is not monotonic in the row count (63 rows is 12 panels, 64 is 11),
     // so this is the shape that overruns a slot sized from the tile width.
-    cases.push_back(qk8_case({1, 319, 4 * 64}, {1, 319, 2 * 64}, 4, 2));
+    cases.push_back(qk({1, 319, 4 * 64}, {1, 319, 2 * 64}, 4, 2));
 
     for (const auto& c : cases) {
         const bool want_i8 = (c.kshape[2] / c.kv_heads) % 4 == 0;
@@ -818,7 +826,8 @@ NNOPS_TEST(gqa_qk_int8_exact_matches_ref) {
 NNOPS_TEST(gqa_qk_int8_accuracy) {
     // Random Q over an int8 cache: the logits carry the dynamic quantization
     // error on purpose, so this is an accuracy bound, not an exactness one.
-    Case c = qk8_case({1, 1024, 8 * 128}, {1, 1024, 4 * 128}, 8, 4);
+    Case c = i8_case({1, 1024, 8 * 128}, {1, 1024, 4 * 128}, 8, 4);
+    c.quantize_q = true;
     c.q_on_grid = false;
     bool flash = false;
     cpu::AttentionPlan plan;
@@ -834,8 +843,7 @@ NNOPS_TEST(gqa_qk_int8_accuracy) {
 NNOPS_TEST(gqa_qk_int8_off_without_the_attribute) {
     // Same shape, attribute off: the fp path, bit-identical to before this
     // feature existed. An fp cache with the attribute on is the same story.
-    Case c = qk8_case({1, 512, 8 * 128}, {1, 512, 2 * 128}, 8, 2);
-    c.quantize_q = false;
+    Case c = i8_case({1, 512, 8 * 128}, {1, 512, 2 * 128}, 8, 2);
     bool flash = false;
     cpu::AttentionPlan plan;
     NNOPS_EXPECT_TRUE(fast_vs_ref(c, flash, &plan));
@@ -847,6 +855,114 @@ NNOPS_TEST(gqa_qk_int8_off_without_the_attribute) {
     fp.quantize_q = true;
     NNOPS_EXPECT_TRUE(fast_vs_ref(fp, flash, &plan));
     NNOPS_EXPECT_TRUE(!plan.flash_qk_i8);
+}
+
+NNOPS_TEST(gqa_pv_int8_col_sums) {
+    // The biased-P correction an s8-only MMA (aarch64) needs sums the V tile by
+    // column; the helper is arch-neutral, so pin its convention here where the
+    // rest of that route can only be cross-compiled.
+    const int rows = 37;
+    const int cols = 23;
+    std::vector<int8_t> v(static_cast<size_t>(rows * cols));
+    uint32_t rng = 12345u;
+    for (auto& x : v) {
+        rng = rng * 1664525u + 1013904223u;
+        x = static_cast<int8_t>(static_cast<int>(rng >> 24) - 128);
+    }
+    float sums[23];
+    cpu::i8_col_sums(v.data(), cols, rows, cols, sums);
+    for (int d = 0; d < cols; ++d) {
+        int32_t want = 0;
+        for (int t = 0; t < rows; ++t) {
+            want += v[static_cast<size_t>(t * cols + d)];
+        }
+        NNOPS_EXPECT_TRUE(sums[d] == static_cast<float>(want));
+    }
+}
+
+NNOPS_TEST(gqa_pv_int8_matches_ref) {
+    // int8 P·V with Q·Kᵀ still fp, so the only error is the probability grid:
+    // the V scale fold (per token), its absence (per tensor), a head-batched
+    // group, the virtual sink key and a sliding window.
+    const auto pv = [](std::vector<int64_t> qs, std::vector<int64_t> ks, int64_t h, int64_t kv) {
+        Case c = i8_case(std::move(qs), std::move(ks), h, kv);
+        c.quantize_pv = true;
+        return c;
+    };
+    std::vector<Case> cases;
+    cases.push_back(pv({1, 512, 8 * 128}, {1, 512, 2 * 128}, 8, 2));
+    cases.push_back(pv({2, 384, 4 * 64}, {2, 384, 2 * 64}, 4, 2));
+    cases.back().per_tensor = true;
+    cases.push_back(pv({1, 256, 4 * 96}, {1, 256, 2 * 96}, 4, 2));
+    cases.back().head_sink = true;
+    cases.push_back(pv({1, 512, 4 * 128}, {1, 512, 2 * 128}, 4, 2));
+    cases.back().window = 96;
+    cases.back().sink = 8;
+    cases.push_back(pv({1, 64, 4 * 32}, {1, 64, 2 * 32}, 4, 2));
+    cases.back().route = -1; // short enough for the materialized route: fp P·V
+    // Key tiles that are not a multiple of the vector width: the fused exp pass
+    // and the pack both run their scalar tails (a 63-row and a 2-row tile).
+    cases.push_back(pv({1, 319, 4 * 64}, {1, 319, 2 * 64}, 4, 2));
+    cases.push_back(pv({1, 258, 4 * 64}, {1, 258, 2 * 64}, 4, 2));
+
+    for (const auto& c : cases) {
+        const bool want_pv = c.route == 1;
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        float worst = 0.0f;
+        NNOPS_EXPECT_TRUE(
+            fast_vs_ref(c, flash, &plan, nullptr, /*rel=*/2e-2f, /*abs=*/2e-3f, &worst));
+        NNOPS_EXPECT_TRUE(plan.flash_pv_i8 == want_pv);
+        NNOPS_EXPECT_TRUE(!plan.flash_qk_i8);
+    }
+}
+
+NNOPS_TEST(gqa_pv_int8_accuracy) {
+    // Random P over the int8 grid: the bound is the weight rounding itself
+    // (±1/510 per weight), not the logits.
+    Case c = i8_case({1, 1024, 8 * 128}, {1, 1024, 4 * 128}, 8, 4);
+    c.quantize_pv = true;
+    bool flash = false;
+    cpu::AttentionPlan plan;
+    float worst = 0.0f;
+    NNOPS_EXPECT_TRUE(fast_vs_ref(c, flash, &plan, nullptr, /*rel=*/5e-2f, /*abs=*/5e-3f, &worst));
+    NNOPS_EXPECT_TRUE(flash);
+    NNOPS_EXPECT_TRUE(plan.flash_pv_i8);
+    std::printf("        int8 P·V worst deviation %.5f of the output's largest component\n",
+                (double)worst);
+    NNOPS_EXPECT_TRUE(worst <= 1e-2f);
+}
+
+NNOPS_TEST(gqa_qk_pv_int8_accuracy) {
+    // Both products integer: the whole attention block on the 8-bit grid, the
+    // configuration the papers report end-to-end.
+    Case c = i8_case({1, 1024, 8 * 128}, {1, 1024, 4 * 128}, 8, 4);
+    c.quantize_q = true;
+    c.quantize_pv = true;
+    bool flash = false;
+    cpu::AttentionPlan plan;
+    float worst = 0.0f;
+    NNOPS_EXPECT_TRUE(fast_vs_ref(c, flash, &plan, nullptr, /*rel=*/5e-2f, /*abs=*/5e-3f, &worst));
+    NNOPS_EXPECT_TRUE(flash);
+    NNOPS_EXPECT_TRUE(plan.flash_qk_i8);
+    NNOPS_EXPECT_TRUE(plan.flash_pv_i8);
+    std::printf("        int8 Q·Kᵀ + P·V worst deviation %.5f\n", (double)worst);
+    NNOPS_EXPECT_TRUE(worst <= 1e-2f);
+}
+
+NNOPS_TEST(gqa_pv_int8_off_without_the_attribute) {
+    // An fp cache with the attribute on is the same story as the fp route.
+    Case c = i8_case({1, 512, 8 * 128}, {1, 512, 2 * 128}, 8, 2);
+    bool flash = false;
+    cpu::AttentionPlan plan;
+    NNOPS_EXPECT_TRUE(fast_vs_ref(c, flash, &plan));
+    NNOPS_EXPECT_TRUE(!plan.flash_pv_i8);
+
+    Case fp = c;
+    fp.int8 = false;
+    fp.quantize_pv = true;
+    NNOPS_EXPECT_TRUE(fast_vs_ref(fp, flash, &plan));
+    NNOPS_EXPECT_TRUE(!plan.flash_pv_i8);
 }
 
 // ============================================================

@@ -1133,6 +1133,8 @@ void bench_gqa_qk8_ab(const char* tag, int64_t B, int64_t Sq, int64_t Sk, int64_
     auto op_fp = GroupQueryAttention::create(attrs, Backend::CPU);
     attrs.quantize_query = true;
     auto op_q8 = GroupQueryAttention::create(attrs, Backend::CPU);
+    attrs.quantize_pv = true;
+    auto op_qp8 = GroupQueryAttention::create(attrs, Backend::CPU);
 
     std::vector<TensorDesc> descs;
     for (const auto& t : ins) { descs.push_back(t.desc()); }
@@ -1152,6 +1154,7 @@ void bench_gqa_qk8_ab(const char* tag, int64_t B, int64_t Sq, int64_t Sk, int64_
     cfg.sink_slot = 7;
     cfg.gate_slot = 8;
     cfg.quantize_q = true;
+    cfg.quantize_pv = true;
     const auto plan = cpu::get_attention_plan(cfg, descs, out_descs, 1, true);
 
     const double flops = 4.0 * static_cast<double>(B) * H * Sq * Sk * D;
@@ -1170,23 +1173,25 @@ void bench_gqa_qk8_ab(const char* tag, int64_t B, int64_t Sq, int64_t Sk, int64_
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
-        std::vector<double> ns_fp, ns_q8;
+        std::vector<double> ns_fp, ns_q8, ns_qp8;
         for (int r = 0; r < 3; ++r) {
-            for (auto* arm : {op_fp.get(), op_q8.get()}) {
+            for (auto* arm : {op_fp.get(), op_q8.get(), op_qp8.get()}) {
                 for (int i = 0; i < 2; ++i) { arm->compute(output, ins, use_ctx, nullptr); }
                 const auto t0 = std::chrono::high_resolution_clock::now();
                 for (int i = 0; i < iters; ++i) { arm->compute(output, ins, use_ctx, nullptr); }
                 const auto t1 = std::chrono::high_resolution_clock::now();
                 const double per_call =
                     std::chrono::duration<double, std::nano>(t1 - t0).count() / iters;
-                (arm == op_fp.get() ? ns_fp : ns_q8).push_back(per_call);
+                auto& v = (arm == op_fp.get()) ? ns_fp : (arm == op_q8.get()) ? ns_q8 : ns_qp8;
+                v.push_back(per_call);
             }
         }
         std::sort(ns_fp.begin(), ns_fp.end());
         std::sort(ns_q8.begin(), ns_q8.end());
-        const double fp = ns_fp[1], q8 = ns_q8[1];
-        std::printf(" %2dT fp %7.1f int8q %7.1f GFLOPS (%.2fx) |", nt, flops / fp, flops / q8,
-                    fp / q8);
+        std::sort(ns_qp8.begin(), ns_qp8.end());
+        const double fp = ns_fp[1], q8 = ns_q8[1], qp8 = ns_qp8[1];
+        std::printf(" %2dT fp %7.1f qk8 %7.1f qk+pv %7.1f GFLOPS (%.2fx / %.2fx) |", nt,
+                    flops / fp, flops / q8, flops / qp8, fp / q8, fp / qp8);
     }
     std::printf("\n");
 }
