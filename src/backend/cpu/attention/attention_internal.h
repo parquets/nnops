@@ -1063,7 +1063,7 @@ inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk, i
 }
 
 // Per-task scratch for one Br-row query block, matching the layout inside
-// attention_flash_impl: per head [m:Br][l:Br][s:Br*Bc][o_acc:Br*Dv], then one
+// attention_flash.cpp's FlashAttention: per head [m:Br][l:Br][s:Br*Bc][o_acc:Br*Dv], then one
 // shared [pack_b][i8 temp], then — on the dynamic-query int8 path — the
 // quantized query block, its row scales and the int32 score tile. The packed-B
 // slot serves GEMM1 (K = Dqk, N <= Bc) and GEMM2 (K <= Bc, N = Dv) for every
