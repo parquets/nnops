@@ -39,7 +39,6 @@
 #include "nnops/ops/lstm.hpp"
 #include "nnops/ops/matmul.hpp"
 #include "nnops/ops/moe.hpp"
-#include "nnops/ops/multi_head_attention.hpp"
 #include "nnops/ops/multi_latent_attention.hpp"
 #include "nnops/ops/non_max_suppression.hpp"
 #include "nnops/ops/permute.hpp"

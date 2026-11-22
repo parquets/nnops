@@ -17,7 +17,6 @@ enum class OpType : uint8_t {
     Pooling     = 2,
     Linear      = 3,
     MatMul      = 4,
-    MultiHeadAttention = 5,
     Softmax     = 6,
     CumSum      = 7,
     BatchNorm   = 8,
@@ -63,6 +62,10 @@ enum class OpType : uint8_t {
     Compare         = 49,
     Logical         = 50,
     GroupQueryAttention = 51,
+    /// Deprecated alias: MHA is GroupQueryAttention with H_kv == H, so the
+    /// former operator and this one are the same class. Kept so existing
+    /// comparisons still compile; getOpType() returns GroupQueryAttention.
+    MultiHeadAttention = GroupQueryAttention,
     MultiLatentAttention = 52,
     DepthwiseTransposeConv2D = 53,
     Conv1D          = 54,

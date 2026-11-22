@@ -2,9 +2,10 @@
 /// @file attention_common.hpp
 /// @brief Types the attention operators share.
 ///
-/// The three attention operators (MultiHeadAttention, GroupQueryAttention,
-/// MultiLatentAttention) differ in what they project and how many key/value
-/// heads they carry, not in how a head is laid out. This header carries the one
+/// GroupQueryAttention — which covers ordinary MHA as its H_kv == H case — and
+/// MultiLatentAttention differ in what they project and how many key/value
+/// heads they carry, not in how a head is laid out. Ordinary MHA is not a
+/// separate operator: it is the degenerate grouped-query case. This header carries the one
 /// choice that has to be made the same way by all of them.
 
 #include <cstdint>

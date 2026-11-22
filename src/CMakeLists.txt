@@ -12,7 +12,6 @@ set(NNOPS_CPU_SOURCES
     ops/pooling.cpp
     ops/linear.cpp
     ops/matmul.cpp
-    ops/multi_head_attention.cpp
     ops/softmax.cpp
     ops/cumsum.cpp
     ops/norm.cpp
@@ -137,9 +136,10 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/conv/conv1d.cpp
 
     # CPU tiled attention kernels (fused QK^T + softmax + AV) — one core shared
-    # by MultiHeadAttention, GroupQueryAttention and MultiLatentAttention, split
-    # one file per route (standard / flash / decode), with the plan that picks
-    # between them in attention_plan.cpp; linear attention lives alongside it.
+    # by GroupQueryAttention (which covers ordinary MHA at H_kv == H) and
+    # MultiLatentAttention, split one file per route (standard / flash /
+    # decode), with the plan that picks between them in attention_plan.cpp;
+    # linear attention lives alongside it.
     backend/cpu/attention/attention.cpp
     backend/cpu/attention/attention_plan.cpp
     backend/cpu/attention/attention_standard.cpp

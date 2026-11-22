@@ -2,9 +2,11 @@
 /// @file group_query_attention.hpp
 /// @brief Grouped-query scaled dot-product attention.
 ///
-/// Multi-head attention with fewer key/value heads than query heads: query head
-/// h reads kv head h / (H / H_kv), so consecutive query heads share one K/V
-/// pair. H_kv == H is ordinary MHA; H_kv == 1 is multi-query attention.
+/// Multi-head attention with at most as many key/value heads as query heads:
+/// query head h reads kv head h / (H / H_kv), so consecutive query heads share
+/// one K/V pair. **H_kv == H is ordinary multi-head attention** — there is no
+/// separate MHA operator; this class is the general case and `kv_num_heads`
+/// selects the degenerate one. H_kv == 1 is multi-query attention.
 ///
 ///   scores = Q·Kᵀ·scale (+ bias);  output = softmax(scores, -1)·V
 ///

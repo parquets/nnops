@@ -1,7 +1,7 @@
 /// @file bench_attention.cpp
 /// @brief Attention-family micro-benchmark — route (standard vs flash) and
-///        thread scaling for MultiHeadAttention, GroupQueryAttention and
-///        MultiLatentAttention.
+///        thread scaling for GroupQueryAttention (including ordinary MHA, its
+///        H_kv == H case) and MultiLatentAttention.
 ///
 /// Every case runs the plan-driven fused fast path and reports GFLOPS at 1, 2,
 /// 4, 8 and hardware threads. QK^T (transpose-B GEMM) then softmax then
@@ -19,7 +19,6 @@
 /// scheduler.
 
 #include "nnops/ops/group_query_attention.hpp"
-#include "nnops/ops/multi_head_attention.hpp"
 #include "nnops/ops/multi_latent_attention.hpp"
 #include "backend/cpu/attention/attention.h"        // get_attention_plan, AttentionConfig
 #include "common/bench_harness.hpp"
@@ -157,7 +156,7 @@ void print_row(const std::vector<int>& threads, const std::vector<double>& gflop
     std::printf("\n");
 }
 
-// ---- MultiHeadAttention ---------------------------------------------------
+// ---- MHA shapes (GroupQueryAttention, H_kv == H) --------------------------
 
 struct MhaCase {
     const char* name;
@@ -191,12 +190,12 @@ void run_mha(const MhaCase& c, const std::vector<int>& threads, int iters) {
         mask_view = m;
     }
 
-    MultiHeadAttentionAttributes attrs{};
+    GroupQueryAttentionAttributes attrs{};
     attrs.num_heads = H;
     attrs.scale = 0.0f;   // auto 1/sqrt(D)
     attrs.causal = c.causal;
 
-    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
 
     // The cache form reads a [B, H, Sk, D] cache with the step's rows at the
     // tail; the explicit form reads K/V with the bias at slot 3.
@@ -639,12 +638,12 @@ DtypeArm make_mha_arm(const MhaCase& c, double& flops) {
         ins[3] = adopt(m_buf, mshape, 14);   // attention_bias
     }
 
-    MultiHeadAttentionAttributes attrs{};
+    GroupQueryAttentionAttributes attrs{};
     attrs.num_heads = c.H;
     attrs.scale = 0.0f;   // auto 1/sqrt(D)
     attrs.causal = c.causal;
-    auto op = std::shared_ptr<MultiHeadAttention>(
-        MultiHeadAttention::create(attrs, Backend::CPU));
+    auto op = std::shared_ptr<GroupQueryAttention>(
+        GroupQueryAttention::create(attrs, Backend::CPU));
 
     std::vector<TensorDesc> descs;
     descs.reserve(ins.size());
@@ -935,7 +934,7 @@ void bench_mla_ab(const MlaCase& c) {
 }  // anonymous namespace
 
 // ============================================================
-// MultiHeadAttention — standard vs flash routing sweep
+// MHA shapes (GroupQueryAttention with H_kv == H) — standard vs flash sweep
 // ============================================================
 
 NNOPS_BENCH(attention_f32_standard) {

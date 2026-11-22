@@ -9,14 +9,13 @@
 /// scratch once, and dispatches.
 ///
 /// The only per-operator code here is the attribute → AttentionConfig mapping
-/// at the bottom: MultiHeadAttention, GroupQueryAttention and
-/// MultiLatentAttention all run the kernels above.
+/// at the bottom: GroupQueryAttention (which also covers ordinary MHA, its
+/// H_kv == H case) and MultiLatentAttention both run the kernels above.
 
 #include "attention_internal.h"
 #include "backend/cpu/common/dtype_dispatch.hpp"
 #include "backend/cpu/common/memory_pool.hpp" // internal scratch-memory pool
 #include "nnops/ops/group_query_attention.hpp"
-#include "nnops/ops/multi_head_attention.hpp"
 #include "nnops/ops/multi_latent_attention.hpp"
 
 namespace nnops::backend::cpu {
@@ -290,46 +289,6 @@ Status attention_cpu(const AttentionConfig& cfg, std::span<TensorView> outputs,
 // =========================================================================
 //  Operator entry points
 // =========================================================================
-
-Status multi_head_attention_cpu(const MultiHeadAttentionAttributes& attrs,
-                                std::span<TensorView> outputs, std::span<const TensorView> inputs,
-                                const ComputeContext& ctx, void* workspace)
-{
-    AttentionConfig cfg;
-    cfg.num_heads = attrs.num_heads;
-    cfg.scale = attrs.scale;
-    cfg.causal = attrs.causal;
-    cfg.softcap = attrs.softcap;
-    cfg.window = attrs.local_window_size > 0 ? attrs.local_window_size : 0;
-    cfg.sink_tokens = attrs.sink_tokens;
-    cfg.output_gate = attrs.output_gate;
-    cfg.bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
-    cfg.mask_filter_value = attrs.mask_filter_value;
-
-    if (attrs.causal) {
-        // Cache form: Q, k_cache, v_cache, kv_seqlens, k_scale, v_scale,
-        // head_sink, output gate. The caches are BNSH whatever Q's layout is.
-        cfg.seqlens_slot = 3;
-        cfg.seqlens_is_length = true;
-        cfg.pos_ids_slot = 4;
-        cfg.k_scale_slot = 5;
-        cfg.v_scale_slot = 6;
-        cfg.sink_slot = 7;
-        cfg.gate_slot = 8;
-        cfg.kv_bshd = false;
-    } else {
-        // Explicit form: Q, K, V, attention_bias, key_padding_mask, head_sink,
-        // cu_seqlens_q/k, output gate. K/V follow Q's layout.
-        cfg.bias_slot = 3;
-        cfg.kpm_slot = 4;
-        cfg.sink_slot = 5;
-        cfg.cu_q_slot = 6;
-        cfg.cu_k_slot = 7;
-        cfg.gate_slot = 8;
-        cfg.kv_bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
-    }
-    return attention_cpu(cfg, outputs, inputs, ctx, workspace);
-}
 
 Status group_query_attention_cpu(const GroupQueryAttentionAttributes& attrs,
                                  std::span<TensorView> outputs, std::span<const TensorView> inputs,

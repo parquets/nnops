@@ -39,7 +39,6 @@
 #include "nnops/ops/group_query_attention.hpp"
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/linear_attention.hpp"
-#include "nnops/ops/multi_head_attention.hpp"
 #include "nnops/ops/multi_latent_attention.hpp"
 #include "nnops/ops/moe.hpp"
 #include "nnops/ops/norm.hpp"
@@ -479,10 +478,11 @@ void run_attention()
 {
     {
         // [B, S, H·D] merged layout, H = Hkv = 4, no mask, no causal.
-        MultiHeadAttentionAttributes a;
+        GroupQueryAttentionAttributes a;
         a.num_heads = 4;
-        check_case("multi_head_attention",
-                   [a] { return MultiHeadAttention::create(a, Backend::CPU); },
+        a.causal = false;
+        check_case("group_query_attention_mha",
+                   [a] { return GroupQueryAttention::create(a, Backend::CPU); },
                    {{{2, 4, 32}}, {{2, 6, 32}}, {{2, 6, 32}}}, 1e-1f);
     }
     {
@@ -498,19 +498,21 @@ void run_attention()
     }
     {
         // Decode route: one query row and no mask, so both products are GEMV.
-        MultiHeadAttentionAttributes a;
+        GroupQueryAttentionAttributes a;
         a.num_heads = 4;
-        check_case("multi_head_attention_decode",
-                   [a] { return MultiHeadAttention::create(a, Backend::CPU); },
+        a.causal = false;
+        check_case("group_query_attention_mha_decode",
+                   [a] { return GroupQueryAttention::create(a, Backend::CPU); },
                    {{{2, 1, 32}}, {{2, 32, 32}}, {{2, 32, 32}}}, 1e-1f);
     }
     {
         // Flash route: Sq·Sk past kFlashMinScores (1 << 16), so the streaming
         // kernel replaces the standard one.
-        MultiHeadAttentionAttributes a;
+        GroupQueryAttentionAttributes a;
         a.num_heads = 2;
-        check_case("multi_head_attention_flash",
-                   [a] { return MultiHeadAttention::create(a, Backend::CPU); },
+        a.causal = false;
+        check_case("group_query_attention_mha_flash",
+                   [a] { return GroupQueryAttention::create(a, Backend::CPU); },
                    {{{1, 300, 16}}, {{1, 384, 16}}, {{1, 384, 16}}}, 1e-1f);
     }
     {

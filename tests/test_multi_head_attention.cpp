@@ -1,18 +1,21 @@
 /// @file test_multi_head_attention.cpp
-/// @brief MultiHeadAttention operator tests — the class API against the CPU
-///        reference.
+/// @brief The H_kv == H case of GroupQueryAttention (ordinary multi-head
+///        attention) — the class API against the CPU reference.
 ///
-/// The operator shares GroupQueryAttention's two input contracts (H_kv == H
-/// here): `causal = false` is explicit attention with an external mask, and
-/// `causal = true` is KV-cache attention over a [B, H, S, D] cache the caller
-/// wrote. The reference is f32 only, so f16 is compared against the f32
-/// reference on the same values with the arch-aware kF16AccumTol.
+/// There is no separate MHA operator: `kv_num_heads = 0` (or `num_heads`)
+/// makes GroupQueryAttention degenerate to MHA. This file keeps the MHA-shaped
+/// cases together; the grouped and multi-query cases live in
+/// test_group_query_attention.cpp. `causal = false` is explicit attention with
+/// an external mask, and `causal = true` is KV-cache attention over a
+/// [B, H, S, D] cache the caller wrote. The reference is f32 only, so f16 is
+/// compared against the f32 reference on the same values with the arch-aware
+/// kF16AccumTol.
 ///
 /// The pack-scratch test calls get_attention_plan directly: the scratch is
 /// sized from uniform nr_max-wide panels while the loops pack a last block
 /// narrower than a full tile.
 
-#include "nnops/ops/multi_head_attention.hpp"
+#include "nnops/ops/group_query_attention.hpp"
 #include "backend/cpu/attention/attention.h"   // get_attention_plan
 #include "backend/cpu/matmul/matmul_helper.h"  // nr_max_flt / KC_* / mma_pack_align
 #include "common/test_harness.hpp"
@@ -35,11 +38,11 @@ using namespace nnops;
 namespace cpu = nnops::backend::cpu;
 
 namespace nnops::backend::cpu::reference {
-void multi_head_attention_ref(const MultiHeadAttentionAttributes& attrs,
-                              TensorView& output,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx,
-                              void* workspace);
+void group_query_attention_ref(const GroupQueryAttentionAttributes& attrs,
+                               TensorView& output,
+                               std::span<const TensorView> inputs,
+                               const ComputeContext& ctx,
+                               void* workspace);
 }
 
 namespace {
@@ -131,7 +134,7 @@ struct SimplePool {
 };
 
 struct Built {
-    MultiHeadAttentionAttributes attrs;
+    GroupQueryAttentionAttributes attrs;
     std::vector<std::vector<float>> keep_f32;
     std::vector<std::vector<int8_t>> keep_i8;
     std::vector<int32_t> sl;
@@ -331,7 +334,7 @@ bool fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_out =
         std::printf("        case could not be assembled\n");
         return false;
     }
-    auto op = MultiHeadAttention::create(b.attrs, Backend::CPU);
+    auto op = GroupQueryAttention::create(b.attrs, Backend::CPU);
     const auto out_descs = op->getOutputTensorDesc(b.descs);
     if (out_descs.size() != 1) {
         std::printf("        expected one output, got %zu\n", out_descs.size());
@@ -386,8 +389,8 @@ bool fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_out =
 
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
     auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
-    nnops::backend::cpu::reference::multi_head_attention_ref(b.attrs, ref_out, b.ins, {},
-                                                             nullptr);
+    nnops::backend::cpu::reference::group_query_attention_ref(b.attrs, ref_out, b.ins, {},
+                                                              nullptr);
 
     for (int64_t i = 0; i < out_numel; ++i) {
         const float diff = std::abs(fast_buf[static_cast<size_t>(i)] -
@@ -421,10 +424,11 @@ NNOPS_TEST(attention_basic_single_head) {
     TensorView k(kshape, DataType::f32, k_data);
     TensorView v(kshape, DataType::f32, v_data);
 
-    MultiHeadAttentionAttributes attrs;
-    attrs.num_heads = 1;   // explicit form by default
+    GroupQueryAttentionAttributes attrs;
+    attrs.num_heads = 1;   // H_kv defaults to H: ordinary MHA
+    attrs.causal = false;  // explicit form
 
-    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
     const TensorDesc desc_arr[] = {q.desc(), k.desc(), v.desc()};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
@@ -464,9 +468,10 @@ NNOPS_TEST(attention_multi_head) {
     auto [v_vec, v] = test::make_random_tensor(shape, -1.0f, 1.0f, 102);
     (void)q_vec; (void)k_vec; (void)v_vec;
 
-    MultiHeadAttentionAttributes attrs;
+    GroupQueryAttentionAttributes attrs;
     attrs.num_heads = 2;
-    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
+    attrs.causal = false;
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
     const TensorDesc desc_arr[] = {q.desc(), k.desc(), v.desc()};
     auto descs = op->getOutputTensorDesc(desc_arr);
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(4));
@@ -557,9 +562,10 @@ NNOPS_TEST(attention_keep_mask_matches_ref) {
     // The int32 keep-mask forms: [B, Sk] and [B, Sq, Sk].
     const int64_t B = 2, H = 4, Sq = 3, Sk = 5, D = 8;
 
-    MultiHeadAttentionAttributes attrs;
+    GroupQueryAttentionAttributes attrs;
     attrs.num_heads = H;
-    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
+    attrs.causal = false;
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
 
     for (int form = 0; form < 2; ++form) {
         auto [qv, q] = test::make_random_tensor({B, Sq, H * D}, -1.0f, 1.0f, 330);
@@ -605,7 +611,7 @@ NNOPS_TEST(attention_keep_mask_matches_ref) {
 
         std::vector<float> want(got.size());
         auto want_out = test::make_channel_first(out_descs[0], want.data());
-        nnops::backend::cpu::reference::multi_head_attention_ref(attrs, want_out, ins, {},
+        nnops::backend::cpu::reference::group_query_attention_ref(attrs, want_out, ins, {},
                                                                 nullptr);
         for (size_t i = 0; i < got.size(); ++i) { NNOPS_EXPECT_NEAR(got[i], want[i], 1e-4f); }
     }
@@ -748,14 +754,14 @@ NNOPS_TEST(attention_f16_matches_ref) {
     for (const auto& c : cases) {
         Built b = build(c, 300);
         NNOPS_EXPECT_TRUE(b.ok);
-        auto op = MultiHeadAttention::create(b.attrs, Backend::CPU);
+        auto op = GroupQueryAttention::create(b.attrs, Backend::CPU);
 
         const auto out_descs = op->getOutputTensorDesc(b.descs);
         const int64_t n = out_descs[0].numel();
 
         std::vector<float> ref_buf(static_cast<size_t>(n));
         auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
-        nnops::backend::cpu::reference::multi_head_attention_ref(b.attrs, ref_out, b.ins, {},
+        nnops::backend::cpu::reference::group_query_attention_ref(b.attrs, ref_out, b.ins, {},
                                                                  nullptr);
 
         std::vector<std::vector<cpu::half>> half_bufs;
@@ -856,14 +862,14 @@ NNOPS_TEST(attention_output_gate_hand) {
     Built gate_b = build(gate_case, 200);
     NNOPS_EXPECT_TRUE(gate_b.ok);
 
-    auto op = MultiHeadAttention::create(plain_b.attrs, Backend::CPU);
+    auto op = GroupQueryAttention::create(plain_b.attrs, Backend::CPU);
     const auto out_descs = op->getOutputTensorDesc(plain_b.descs);
     const int64_t n = out_descs[0].numel();
     std::vector<float> plain(static_cast<size_t>(n));
     auto plain_out = test::make_channel_first(out_descs[0], plain.data());
     NNOPS_EXPECT_TRUE(op->compute(plain_out, plain_b.ins) == Status::ok);
 
-    auto gop = MultiHeadAttention::create(gate_b.attrs, Backend::CPU);
+    auto gop = GroupQueryAttention::create(gate_b.attrs, Backend::CPU);
     std::vector<float> got(static_cast<size_t>(n));
     auto got_out = test::make_channel_first(out_descs[0], got.data());
     NNOPS_EXPECT_TRUE(gop->compute(got_out, gate_b.ins) == Status::ok);
@@ -904,9 +910,10 @@ NNOPS_TEST(attention_bshd_matches_ref) {
 }
 
 NNOPS_TEST(attention_slot_contract) {
-    MultiHeadAttentionAttributes attrs;
+    GroupQueryAttentionAttributes attrs;
     attrs.num_heads = 4;
-    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
+    attrs.causal = false;
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
 
     const TensorDesc q = td({2, 3, 4 * 8});
     const TensorDesc k = td({2, 5, 4 * 8});
@@ -930,10 +937,10 @@ NNOPS_TEST(attention_slot_contract) {
     }
     {
         // The cache form wants a [B, H, S, D] pair.
-        MultiHeadAttentionAttributes cached;
+        GroupQueryAttentionAttributes cached;
         cached.num_heads = 4;
         cached.causal = true;
-        auto cop = MultiHeadAttention::create(cached, Backend::CPU);
+        auto cop = GroupQueryAttention::create(cached, Backend::CPU);
         SlotDescs s;
         s.put(0, q).put(1, k).put(2, k);
         NNOPS_EXPECT_TRUE(cop->validate(s.d, outs) == Status::invalid_argument);

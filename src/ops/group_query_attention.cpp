@@ -1,5 +1,6 @@
 /// @file group_query_attention.cpp
-/// @brief GroupQueryAttention operator dispatch.
+/// @brief GroupQueryAttention operator dispatch — the one attention operator
+///        with a fused softmax core (MHA is kv_num_heads = num_heads).
 ///
 /// `causal` picks the input contract, not just the mask. causal = false is the
 /// explicit ViT/encoder form — Q, K, V and an optional external mask; causal =

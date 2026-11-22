@@ -24,7 +24,7 @@
 /// can rotate its new token where it really belongs instead of at 0. pos0 is
 /// the optional int64 [B] input [5] `position_ids` — the absolute position of
 /// each batch's first row, rows consecutive, which is the same tensor
-/// GroupQueryAttention / MultiHeadAttention take — and falls back to the
+/// GroupQueryAttention takes — and falls back to the
 /// scalar attribute `position_offset` when the input is absent. Axis 0 is the
 /// batch axis; a rank-2 [S, D] input takes a one-element vector.
 ///

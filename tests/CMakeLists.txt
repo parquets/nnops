@@ -74,7 +74,6 @@ set(TEST_SOURCES
 
 # Reference kernels that only the tests need, as ground truth for the fast paths.
 add_library(nnops_test_reference STATIC
-    reference/multi_head_attention_ref.cpp
     reference/group_query_attention_ref.cpp
     reference/multi_latent_attention_ref.cpp
     reference/concat_ref.cpp

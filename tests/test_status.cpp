@@ -12,7 +12,7 @@
 #include "nnops/detail/validate.hpp"
 
 #include "nnops/ops/activation.hpp"
-#include "nnops/ops/multi_head_attention.hpp"
+#include "nnops/ops/group_query_attention.hpp"
 #include "nnops/ops/concat.hpp"
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/eltwise.hpp"
@@ -294,8 +294,8 @@ NNOPS_TEST(status_input_count) {
                           Status::invalid_argument);
     }
     {
-        // MultiHeadAttention: Q, K, V [, mask].
-        auto op = MultiHeadAttention::create(MultiHeadAttentionAttributes{}, Backend::CPU);
+        // GroupQueryAttention: Q, K, V [, mask].
+        auto op = GroupQueryAttention::create(GroupQueryAttentionAttributes{}, Backend::CPU);
         NNOPS_EXPECT_TRUE(op->compute(one_out, std::span<const TensorView>(in2)) ==
                           Status::invalid_argument);
     }

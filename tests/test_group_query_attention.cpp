@@ -18,7 +18,6 @@
 /// long run so the plan splits it into KV slices.
 
 #include "nnops/ops/group_query_attention.hpp"
-#include "nnops/ops/multi_head_attention.hpp"
 #include "backend/cpu/attention/attention.h"   // AttentionConfig / get_attention_plan
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
@@ -1513,15 +1512,16 @@ NNOPS_TEST(gqa_cache_validation) {
 }
 
 // ============================================================
-// H_kv == H must agree with MultiHeadAttention
+// H_kv == H is ordinary MHA: the degenerate spellings must agree
 // ============================================================
 
-NNOPS_TEST(gqa_degenerate_equals_mha) {
+NNOPS_TEST(gqa_degenerate_kv_zero_equals_h) {
     auto [q_vec, q] = test::make_random_tensor({1, 6, 4 * 8}, -1.0f, 1.0f, 200);
     auto [k_vec, k] = test::make_random_tensor({1, 6, 4 * 8}, -1.0f, 1.0f, 201);
     auto [v_vec, v] = test::make_random_tensor({1, 6, 4 * 8}, -1.0f, 1.0f, 202);
 
-    MultiHeadAttentionAttributes mha_attrs;
+    // kv_num_heads = 0 means H (the MHA spelling).
+    GroupQueryAttentionAttributes mha_attrs;
     mha_attrs.num_heads = 4;
     mha_attrs.causal = false;
 
@@ -1533,7 +1533,7 @@ NNOPS_TEST(gqa_degenerate_equals_mha) {
     const TensorDesc descs[] = {q.desc(), k.desc(), v.desc()};
     const TensorView ins[] = {q, k, v};
 
-    auto mha = MultiHeadAttention::create(mha_attrs, Backend::CPU);
+    auto mha = GroupQueryAttention::create(mha_attrs, Backend::CPU);
     auto gqa = GroupQueryAttention::create(gqa_attrs, Backend::CPU);
 
     auto mha_desc = mha->getOutputTensorDesc(descs)[0];

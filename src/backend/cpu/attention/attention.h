@@ -1,14 +1,15 @@
 #pragma once
 /// @file attention.h
-/// @brief The shared CPU attention core — Q·Kᵀ + softmax + attn·V — behind all
-///        three attention operators.
+/// @brief The shared CPU attention core — Q·Kᵀ + softmax + attn·V — behind both
+///        attention operators.
 ///
-/// MultiHeadAttention, GroupQueryAttention and MultiLatentAttention differ only
-/// in how their attributes and inputs describe a head geometry; the fused
-/// kernel is one. AttentionConfig is that description: query/kv head counts,
-/// the query-key width, the value width, the scale, causal masking, and whether
-/// the value is the leading slice of the key row (MLA's latent). Each operator
-/// builds a config and calls attention_cpu; nothing below knows which one did.
+/// GroupQueryAttention (which covers ordinary MHA as its H_kv == H case) and
+/// MultiLatentAttention differ only in how their attributes and inputs describe
+/// a head geometry; the fused kernel is one. AttentionConfig is that
+/// description: query/kv head counts, the query-key width, the value width, the
+/// scale, causal masking, and whether the value is the leading slice of the key
+/// row (MLA's latent). Each operator builds a config and calls attention_cpu;
+/// nothing below knows which one did.
 ///
 /// Three routes, picked by the shape:
 ///   - decode (Sq == 1, no mask): both products are matrix-vector, so K and V
