@@ -17,7 +17,7 @@
 ///   - matmul_small.cpp         — the naive SIMD kernel below
 ///                                GEMM_FAST_PATH_THRESHOLD MACs, and the direct
 ///                                GEMV at M <= GEMV_M_MAX;
-///   - matmul_qblock_fused.cpp  — the fused Q4_1 decode route (x86_64 and
+///   - matmul_qblock_fused.cpp  — the fused Q4_0/Q4_1 decode route (x86_64 and
 ///                                aarch64; M <= 16 trans, 8 copy by default).
 ///
 /// The AArch64 SME tiles are not a separate driver: they are a route variant
@@ -214,7 +214,7 @@ bool matmul_small_fp(const MatMulAttributes& attrs, TensorView& output,
                      std::span<const TensorView> inputs, const ComputeContext& ctx);
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
-/// Whole product through the fused Q4_1 kernels; false if not applicable.
+/// Whole product through the fused Q4 kernels; false if not applicable.
 bool matmul_qblock_fused(const MatMulAttributes& attrs, TensorView& output,
                          std::span<const TensorView> inputs, const ComputeContext& ctx, int M,
                          int N, int K);

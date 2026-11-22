@@ -37,7 +37,7 @@
 #ifdef NNOPS_ARCH_X86_64
 #include "backend/cpu/x86_64/pack_f16.hpp"
 #include "backend/cpu/x86_64/pack_f32.hpp"
-#include "backend/cpu/x86_64/pack_q4_1.hpp"
+#include "backend/cpu/x86_64/pack_q4.hpp"
 #include "backend/cpu/x86_64/mma_f16.hpp"
 #include "backend/cpu/x86_64/mma_f32.hpp"
 #include "backend/cpu/x86_64/mma_qblock.hpp"
@@ -47,7 +47,7 @@
 #elif defined(NNOPS_ARCH_AARCH64)
 #include "backend/cpu/aarch64/pack_f16.hpp"
 #include "backend/cpu/aarch64/pack_f32.hpp"
-#include "backend/cpu/aarch64/pack_q4_1.hpp"
+#include "backend/cpu/aarch64/pack_q4.hpp"
 #include "backend/cpu/aarch64/mma_f16.hpp"
 #include "backend/cpu/aarch64/mma_f32.hpp"
 #include "backend/cpu/aarch64/mma_qblock.hpp"
@@ -97,14 +97,14 @@ static_assert(arch::bf16_nr_max == NR_MAX_BF16, "the bf16 B panel is the pack's"
 #endif
 
 #ifdef NNOPS_ARCH_X86_64
-// The Q4_1 RHS writes the float packers' uniform panels, so its hard-coded
+// The Q4 RHS writes the float packers' uniform panels, so its hard-coded
 // width must track both NR tables — 16 for f32 and f16 here.
-static_assert(arch::q4_1_nr_max == NR_MAX_F32 && arch::q4_1_nr_max == NR_MAX_F16,
-              "Q4_1 RHS panel width must match the float RHS panel width");
+static_assert(arch::q4_nr_max == NR_MAX_F32 && arch::q4_nr_max == NR_MAX_F16,
+              "Q4 RHS panel width must match the float RHS panel width");
 #elif defined(NNOPS_ARCH_AARCH64)
 // Same contract; here the two widths differ (f32 12, f16 16).
-static_assert(arch::q4_1_nr_max<float> == NR_MAX_F32 && arch::q4_1_nr_max<half> == NR_MAX_F16,
-              "Q4_1 RHS panel width must match the float RHS panel width");
+static_assert(arch::q4_nr_max<float> == NR_MAX_F32 && arch::q4_nr_max<half> == NR_MAX_F16,
+              "Q4 RHS panel width must match the float RHS panel width");
 #endif
 
 // int8 panels: A keeps the arch's MR cascade; B and the MMA are uniform.
@@ -655,22 +655,22 @@ void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* s
 void tile_pack_rhs(bool trans, int nc, int kc, bfloat16* dst, int ldd, const bfloat16* src, int lds,
                    float scale);
 
-// ---- Q4_1 (llama.cpp block format) RHS ----------------------------------
+// ---- Q4_0 / Q4_1 (llama.cpp block formats) RHS ---------------------------
 //
-// A Q4_1 B is a 20-byte-block stream; the pack fuses unpack + dequantize into
-// the uniform panels above (or, on aarch64, bf16's BFMMLA layout), so the MMA
-// side is unchanged. Tile origin and
-// `src_row_blocks` (row pitch) are in blocks — a panel can start mid-block —
+// A Q4 B is a 32-value block stream (18 bytes for Q4_0, 20 for Q4_1, selected by
+// `fmt`); the pack fuses unpack + dequantize into the uniform panels above (or,
+// on aarch64, bf16's BFMMLA layout), so the MMA side is unchanged. Tile origin
+// and `src_row_blocks` (row pitch) are in blocks — a panel can start mid-block —
 // and `scale` (alpha) multiplies every decoded weight. data_type_stride_unit()
 // names the block unit, so batch offsets are blocks too.
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, float* dst, int ldd,
-                        const void* src, int64_t src_row_blocks, float scale);
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, half* dst, int ldd,
-                        const void* src, int64_t src_row_blocks, float scale);
+void tile_pack_rhs_q4(bool trans, int n_start, int nc, int k_start, int kc, float* dst, int ldd,
+                      const void* src, int64_t src_row_blocks, float scale, DataType fmt);
+void tile_pack_rhs_q4(bool trans, int n_start, int nc, int k_start, int kc, half* dst, int ldd,
+                      const void* src, int64_t src_row_blocks, float scale, DataType fmt);
 #ifdef NNOPS_ARCH_AARCH64
 // bf16's panels are the BFMMLA operand layout, not the [k][nr] rectangle.
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, bfloat16* dst,
-                        int ldd, const void* src, int64_t src_row_blocks, float scale);
+void tile_pack_rhs_q4(bool trans, int n_start, int nc, int k_start, int kc, bfloat16* dst, int ldd,
+                      const void* src, int64_t src_row_blocks, float scale, DataType fmt);
 #endif
 
 // Two axes. `pack` / `direct` describe A: `pack` takes an already-packed A
@@ -793,19 +793,19 @@ void tile_mma_direct_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_
 // 64-column blocks: 0 for the layout the per-call pack writes, a whole-K blob's
 // stride otherwise. The MMA signatures mirror `tile_mma_pack`, but the SME pack
 // functions own their layout, so `ldd` is not needed on the pack side.
-void tile_pack_lhs_sme(bool trans, int mc, int kc, float* dst, const float* src,
-                       int lds) noexcept;
+void tile_pack_lhs_sme(bool trans, int mc, int kc, float* dst, const float* src, int lds) noexcept;
 void tile_pack_lhs_sme(bool trans, int mc, int kc, half* dst, const half* src, int lds) noexcept;
-void tile_pack_rhs_sme(bool trans, int nc, int kc, float* dst, const float* src,
-                       int lds) noexcept;
+void tile_pack_rhs_sme(bool trans, int nc, int kc, float* dst, const float* src, int lds) noexcept;
 void tile_pack_rhs_sme(bool trans, int nc, int kc, half* dst, const half* src, int lds) noexcept;
 // A Q4_1 B decoded into the same panels — the ZA route's counterpart to
-// tile_pack_rhs_q4_1. The tile origin is in elements, @p src_row_blocks is the
+// tile_pack_rhs_q4. The tile origin is in elements, @p src_row_blocks is the
 // B row pitch in 20-byte blocks, and @p scale (MatMul's alpha) rides the decode.
-void tile_pack_rhs_q4_1_sme(bool trans, int n_start, int nc, int k_start, int kc, float* dst,
-                            const void* src, int64_t src_row_blocks, float scale) noexcept;
-void tile_pack_rhs_q4_1_sme(bool trans, int n_start, int nc, int k_start, int kc, half* dst,
-                            const void* src, int64_t src_row_blocks, float scale) noexcept;
+void tile_pack_rhs_q4_sme(bool trans, int n_start, int nc, int k_start, int kc, float* dst,
+                          const void* src, int64_t src_row_blocks, float scale,
+                          DataType fmt) noexcept;
+void tile_pack_rhs_q4_sme(bool trans, int n_start, int nc, int k_start, int kc, half* dst,
+                          const void* src, int64_t src_row_blocks, float scale,
+                          DataType fmt) noexcept;
 void tile_mma_pack_sme(int mc, int nc, int kc, float* c, int ldc, const float* packed_a,
                        const float* b, int64_t block_stride, float clamp_min, float clamp_max,
                        bool zero_mode, const float* col_bias = nullptr);

@@ -39,7 +39,7 @@
 
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
-#include "nnops/detail/q4_1.hpp"
+#include "nnops/detail/q4.hpp"
 #include "nnops/detail/simd.hpp"
 #include "backend/cpu/aarch64/sme/mma_sme.hpp"
 #if defined(NNOPS_ARCH_SME)
@@ -47,7 +47,7 @@
 #include "backend/cpu/aarch64/sme/mma_f32_sme.hpp"
 #include "backend/cpu/aarch64/sme/pack_f16_sme.hpp"
 #include "backend/cpu/aarch64/sme/pack_f32_sme.hpp"
-#include "backend/cpu/aarch64/sme/pack_q4_1_sme.hpp"
+#include "backend/cpu/aarch64/sme/pack_q4_sme.hpp"
 #endif
 
 #ifdef NNOPS_ARCH_X86_64
@@ -397,33 +397,33 @@ void tile_pack_rhs(bool trans, int nc, int kc, bfloat16* dst, int ldd, const bfl
 }
 #endif
 
-// ---- Block-packed RHS (q4_1) --------------------------------------------
+// ---- Block-packed RHS (q4_0 / q4_1) --------------------------------------
 // The f32/f16 panel layout matches tile_pack_rhs; bf16 uses the BFMMLA layout
 // pack_bf16.hpp defines. The MMA route never sees the blocks either way.
 
-static_assert(q4_1_block_elems == 32, "the block RHS packers assume 32-value blocks");
+static_assert(q4_block_elems == 32, "the block RHS packers assume 32-value blocks");
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, float* dst, int ldd,
-                        const void* src, int64_t src_row_blocks, float scale)
+void tile_pack_rhs_q4(bool trans, int n_start, int nc, int k_start, int kc, float* dst, int ldd,
+                      const void* src, int64_t src_row_blocks, float scale, DataType fmt)
 {
-    arch::pack_q4_1_rhs<float>(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks,
-                               scale);
+    arch::pack_q4_rhs<float>(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks, scale,
+                             fmt);
 }
 
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, half* dst, int ldd,
-                        const void* src, int64_t src_row_blocks, float scale)
+void tile_pack_rhs_q4(bool trans, int n_start, int nc, int k_start, int kc, half* dst, int ldd,
+                      const void* src, int64_t src_row_blocks, float scale, DataType fmt)
 {
-    arch::pack_q4_1_rhs<half>(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks,
-                              scale);
+    arch::pack_q4_rhs<half>(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks, scale,
+                            fmt);
 }
 
 #ifdef NNOPS_ARCH_AARCH64
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, bfloat16* dst,
-                        int ldd, const void* src, int64_t src_row_blocks, float scale)
+void tile_pack_rhs_q4(bool trans, int n_start, int nc, int k_start, int kc, bfloat16* dst, int ldd,
+                      const void* src, int64_t src_row_blocks, float scale, DataType fmt)
 {
-    arch::pack_q4_1_rhs(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks, scale);
+    arch::pack_q4_rhs(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks, scale, fmt);
 }
 #endif
 
@@ -443,16 +443,17 @@ template <class T> constexpr int block_panel_nr() noexcept
     }
 }
 
-/// Values per block, for the indexing below; must equal q4_1_block_elems.
+/// Values per block, for the indexing below; must equal q4_block_elems.
 constexpr int kBlockElems = 32;
 
-/// One block-packed format's row decoder: unpack(block_ptr, float out[]).
-template <class T, class Unpack>
+/// One block-packed format's row decoder, selected by @p fmt.
+template <class T>
 void tile_pack_rhs_block_scalar(bool trans, int n_start, int nc, int k_start, int kc, T* dst,
                                 int ldd, const void* src, int64_t row_blocks, float scale,
-                                size_t block_bytes, Unpack unpack)
+                                DataType fmt)
 {
     constexpr int NR = block_panel_nr<T>();
+    const size_t block_bytes = data_type_block_bytes(fmt);
     const uint8_t* base = static_cast<const uint8_t*>(src);
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(block_bytes);
 
@@ -473,9 +474,9 @@ void tile_pack_rhs_block_scalar(bool trans, int n_start, int nc, int k_start, in
                 const int row = trans ? (n_start + n + j) : (k_start + k);
                 const int col = trans ? (k_start + k) : (n_start + n + j);
                 float vals[kBlockElems];
-                unpack(base + static_cast<int64_t>(row) * row_bytes +
-                           static_cast<int64_t>(col / kBlockElems) * block_bytes,
-                       vals);
+                q4_unpack_block(base + static_cast<int64_t>(row) * row_bytes +
+                                    static_cast<int64_t>(col / kBlockElems) * block_bytes,
+                                vals, fmt);
                 store(&o[j], vals[col % kBlockElems] * scale);
             }
             for (int j = nr; j < NR; ++j) {
@@ -487,18 +488,18 @@ void tile_pack_rhs_block_scalar(bool trans, int n_start, int nc, int k_start, in
     }
 }
 
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, float* dst, int ldd,
-                        const void* src, int64_t src_row_blocks, float scale)
+void tile_pack_rhs_q4(bool trans, int n_start, int nc, int k_start, int kc, float* dst, int ldd,
+                      const void* src, int64_t src_row_blocks, float scale, DataType fmt)
 {
     tile_pack_rhs_block_scalar<float>(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                                      src_row_blocks, scale, q4_1_block_bytes, q4_1_unpack_block);
+                                      src_row_blocks, scale, fmt);
 }
 
-void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc, half* dst, int ldd,
-                        const void* src, int64_t src_row_blocks, float scale)
+void tile_pack_rhs_q4(bool trans, int n_start, int nc, int k_start, int kc, half* dst, int ldd,
+                      const void* src, int64_t src_row_blocks, float scale, DataType fmt)
 {
     tile_pack_rhs_block_scalar<half>(trans, n_start, nc, k_start, kc, dst, ldd, src, src_row_blocks,
-                                     scale, q4_1_block_bytes, q4_1_unpack_block);
+                                     scale, fmt);
 }
 
 #endif
@@ -851,32 +852,34 @@ void tile_pack_rhs_sme(bool trans, int nc, int kc, half* dst, const half* src, i
     aarch64::pack_b_f16_sme(nc, kc, dst, src, lds, trans);
 }
 
-void tile_pack_rhs_q4_1_sme(bool trans, int n_start, int nc, int k_start, int kc, float* dst,
-                            const void* src, int64_t src_row_blocks, float scale) noexcept
+void tile_pack_rhs_q4_sme(bool trans, int n_start, int nc, int k_start, int kc, float* dst,
+                          const void* src, int64_t src_row_blocks, float scale,
+                          DataType fmt) noexcept
 {
-    aarch64::pack_q4_1_b_sme(trans, n_start, nc, k_start, kc, dst, src, src_row_blocks, scale);
+    aarch64::pack_q4_b_sme(trans, n_start, nc, k_start, kc, dst, src, src_row_blocks, scale, fmt);
 }
 
-void tile_pack_rhs_q4_1_sme(bool trans, int n_start, int nc, int k_start, int kc, half* dst,
-                            const void* src, int64_t src_row_blocks, float scale) noexcept
+void tile_pack_rhs_q4_sme(bool trans, int n_start, int nc, int k_start, int kc, half* dst,
+                          const void* src, int64_t src_row_blocks, float scale,
+                          DataType fmt) noexcept
 {
-    aarch64::pack_q4_1_b_sme(trans, n_start, nc, k_start, kc, dst, src, src_row_blocks, scale);
+    aarch64::pack_q4_b_sme(trans, n_start, nc, k_start, kc, dst, src, src_row_blocks, scale, fmt);
 }
 
 void tile_mma_pack_sme(int mc, int nc, int kc, float* c, int ldc, const float* packed_a,
                        const float* b, int64_t block_stride, float clamp_min, float clamp_max,
                        bool zero_mode, const float* col_bias)
 {
-    aarch64::mma_f32_sme(mc, nc, kc, c, ldc, packed_a, b, zero_mode, clamp_min, clamp_max,
-                         col_bias, block_stride > 0 ? block_stride : 0);
+    aarch64::mma_f32_sme(mc, nc, kc, c, ldc, packed_a, b, zero_mode, clamp_min, clamp_max, col_bias,
+                         block_stride > 0 ? block_stride : 0);
 }
 
 void tile_mma_pack_sme(int mc, int nc, int kc, half* c, int ldc, const half* packed_a,
                        const half* b, int64_t block_stride, float clamp_min, float clamp_max,
                        bool zero_mode, const half* col_bias)
 {
-    aarch64::mma_f16_sme(mc, nc, kc, c, ldc, packed_a, b, zero_mode, clamp_min, clamp_max,
-                         col_bias, block_stride > 0 ? block_stride : 0);
+    aarch64::mma_f16_sme(mc, nc, kc, c, ldc, packed_a, b, zero_mode, clamp_min, clamp_max, col_bias,
+                         block_stride > 0 ? block_stride : 0);
 }
 
 #endif
@@ -1069,7 +1072,9 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs, const TensorDesc& a_de
         plan.np_slice = 0;
         plan.workspace_size = 0;
     } else if (split_m) {
-        if (geom->hoists_b_m_split) {
+        // int8 always hoists; fp hoists a block-packed B (its pack is a decode,
+        // not a copy), so one full-N slice serves every m-block.
+        if (geom->hoists_b_m_split || is_block_packed_dtype(dt_b)) {
             plan.num_slots = 1;
         } else {
             const int64_t nt = std::max<int64_t>(num_threads, 1);

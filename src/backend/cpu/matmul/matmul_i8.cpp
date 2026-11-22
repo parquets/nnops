@@ -63,6 +63,7 @@ struct I8Route {
     static constexpr bool fused_a = false;
     static constexpr bool has_direct_a = false;
     static constexpr bool hoists_b_m_split = true; // one B pack per k-block
+    static constexpr bool hoists_block_b = false;  // int8's B is already hoisted
 
     using EpilogueParams = Int8EpilogueParams;
 

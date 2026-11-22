@@ -1,7 +1,7 @@
 /// @file matmul_qblock_fused.cpp
 /// @brief Fused block-quant small-M MatMul — decode straight into the product.
 ///
-/// The packed route re-decodes every Q4_1 block into uniform panels, writes
+/// The packed route re-decodes every Q4 block into uniform panels, writes
 /// them to scratch and reads them back. At small M there are too few
 /// output rows to amortise that round trip, so this route skips it: no packed
 /// B, no workspace, no k-blocking — each kernel sweeps K once and decodes B in
@@ -14,7 +14,8 @@
 /// width the arch's policy names (fused_max_m_* / panel_* in its Q4Block).
 ///
 /// Admission is the block policy's measured per-layout M limit
-/// (arch::Q4Block::fused_max_m_trans / _trans_f16 / _copy in mma_qblock.hpp);
+/// (arch::Q4_1Block::fused_max_m_trans / _trans_f16 / _copy in mma_qblock.hpp;
+/// Q4_0 shares the same limits);
 /// past it the driver falls through to the packed route. qblock_fused_max_m_override is
 /// the benchmark-only cap on that test: negative keeps the policy's limits, 0
 /// disables the route (how a ladder pins itself to the packed arm), > 0 caps M.
@@ -37,7 +38,7 @@ int qblock_fused_max_m_override = -1;
 
 namespace {
 
-constexpr int QBLOCK_FUSED_NTILE = 2 * arch::Q4Block::block_elems;
+constexpr int QBLOCK_FUSED_NTILE = 2 * arch::Q4_1Block::block_elems;
 
 template <class BQ, class AC, bool ZERO, bool TRANS, int MR>
 inline void qblock_fused_rows(int mr, int nc, int K, AC* c, int ldc, const AC* a, int lda,
@@ -171,6 +172,31 @@ inline bool qblock_fused_try(const MatMulAttributes& attrs, TensorView& output,
 
 } // namespace
 
+namespace {
+
+/// The activation dtype picks the operand/output type; @p FMT is the block
+/// format the B policy decodes.
+template <DataType FMT>
+bool qblock_fused_format(const MatMulAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs, const ComputeContext& ctx, int M,
+                         int N, int K)
+{
+    switch (inputs[0].data_type()) {
+    case DataType::f32:
+        return qblock_fused_try<arch::Q4Block<FMT>, float>(attrs, output, inputs, ctx, M, N, K);
+    case DataType::f16:
+        return qblock_fused_try<arch::Q4Block<FMT>, half>(attrs, output, inputs, ctx, M, N, K);
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16:
+        return qblock_fused_try<arch::Q4Block<FMT>, bfloat16>(attrs, output, inputs, ctx, M, N, K);
+#endif
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
 bool matmul_qblock_fused(const MatMulAttributes& attrs, TensorView& output,
                          std::span<const TensorView> inputs, const ComputeContext& ctx, int M,
                          int N, int K)
@@ -178,22 +204,13 @@ bool matmul_qblock_fused(const MatMulAttributes& attrs, TensorView& output,
     if (K <= 0 || N <= 0) {
         return false;
     }
-    if (inputs[1].data_type() != DataType::q4_1) {
+    const DataType bdt = inputs[1].data_type();
+    if (!is_block_packed_dtype(bdt)) {
         return false;
     }
-    // The activation and the output share a dtype in an fp product.
-    switch (inputs[0].data_type()) {
-    case DataType::f32:
-        return qblock_fused_try<arch::Q4Block, float>(attrs, output, inputs, ctx, M, N, K);
-    case DataType::f16:
-        return qblock_fused_try<arch::Q4Block, half>(attrs, output, inputs, ctx, M, N, K);
-#ifdef NNOPS_ARCH_AARCH64
-    case DataType::bf16:
-        return qblock_fused_try<arch::Q4Block, bfloat16>(attrs, output, inputs, ctx, M, N, K);
-#endif
-    default:
-        return false;
-    }
+    return bdt == DataType::q4_0 ?
+               qblock_fused_format<DataType::q4_0>(attrs, output, inputs, ctx, M, N, K) :
+               qblock_fused_format<DataType::q4_1>(attrs, output, inputs, ctx, M, N, K);
 }
 
 #endif // NNOPS_ARCH_X86_64 || NNOPS_ARCH_AARCH64

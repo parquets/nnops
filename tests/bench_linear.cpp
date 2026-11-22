@@ -37,7 +37,7 @@
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/core/quant_params.hpp"
 #include "nnops/detail/half.hpp"
-#include "nnops/detail/q4_1.hpp"
+#include "nnops/detail/q4.hpp"
 #include "common/bench_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"
@@ -662,10 +662,13 @@ NNOPS_BENCH(linear_prepacked_weight) {
 
 template <typename T>
 void bench_q4_vs_dense(const char* tag, const std::vector<Shape>& shapes,
-                       const std::vector<int>& threads, double target_ms,
-                       int rounds) {
-    std::printf("  %s Linear q4_1 weight: raw vs decoded+dense-packed  "
-                "budget=%.0f ms/cell  rounds=%d\n", tag, target_ms, rounds);
+                       const std::vector<int>& threads, double target_ms, int rounds,
+                       DataType fmt = DataType::q4_1)
+{
+    const char* q4name = fmt == DataType::q4_0 ? "q4_0" : "q4_1";
+    std::printf("  %s Linear %s weight: raw vs decoded+dense-packed  "
+                "budget=%.0f ms/cell  rounds=%d\n",
+                tag, q4name, target_ms, rounds);
     std::printf("   %5s %5s %5s |", "M", "K", "N");
     for (int nt : threads) {
         std::printf("  %2dT:     raw   dense   R/D |", nt);
@@ -678,17 +681,14 @@ void bench_q4_vs_dense(const char* tag, const std::vector<Shape>& shapes,
 
         // Quantize the raw arm's own weight, then decode those blocks into the
         // dense arm's buffer: both arms multiply the same values.
-        const int64_t row_bytes =
-            static_cast<int64_t>(data_type_row_bytes(DataType::q4_1, s.K));
+        const int64_t row_bytes = static_cast<int64_t>(data_type_row_bytes(fmt, s.K));
         std::vector<uint8_t> blocks(static_cast<size_t>(s.N * row_bytes), 0);
         for (int64_t n = 0; n < s.N; ++n) {
-            quantize_q4<T>(raw.w_buf.data() + n * s.K, s.K,
-                           blocks.data() + n * row_bytes);
-            pack_q4<T>(blocks.data() + n * row_bytes, s.K,
-                       den.w_buf.data() + n * s.K);
+            quantize_q4<T>(raw.w_buf.data() + n * s.K, s.K, blocks.data() + n * row_bytes, fmt);
+            pack_q4<T>(blocks.data() + n * row_bytes, s.K, den.w_buf.data() + n * s.K, fmt);
         }
         const int64_t wshape[] = {s.N, s.K};
-        raw.ins[1] = TensorView(wshape, DataType::q4_1, blocks.data());
+        raw.ins[1] = TensorView(wshape, fmt, blocks.data());
 
         // What a q4 -> dense prepack would produce, built by the existing fp path.
         auto op = Linear::create(LinearAttributes{}, Backend::CPU);
@@ -726,7 +726,8 @@ void bench_q4_vs_dense(const char* tag, const std::vector<Shape>& shapes,
     }
 }
 
-NNOPS_BENCH(linear_q4_1) {
+void bench_linear_q4(DataType fmt)
+{
     // The M ladder straddles both fused ceilings (16 f32 / 32 f16 trans, 8
     // copy): below them the raw arm is a decode straight into the accumulator,
     // above them it packs panels per call and the blob gets its chance.
@@ -739,25 +740,28 @@ NNOPS_BENCH(linear_q4_1) {
     // weight rather than a win over the decode. 1024^3 f32 even favors raw by
     // 13% at 1T: 1 MB of blocks against 4 MB of panels.
     const std::vector<Shape> shapes{
-        {1, 4096, 4096},     // decode: the fused kernel's home, no pack at all
-        {8, 4096, 4096},
-        {64, 4096, 4096},    // past both trans ceilings: packed per call
-        {128, 4096, 4096},   // prefill
-        {1, 1280, 1000},     // MobileNetV2's logits
-        {512, 512, 512},
-        {1024, 1024, 1024},  // square, FLOP bound
+        {1, 4096, 4096},                       // decode: the fused kernel's home, no pack at all
+        {8, 4096, 4096},   {64, 4096, 4096},   // past both trans ceilings: packed per call
+        {128, 4096, 4096},                     // prefill
+        {1, 1280, 1000},                       // MobileNetV2's logits
+        {512, 512, 512},   {1024, 1024, 1024}, // square, FLOP bound
     };
     bench_q4_vs_dense<float>("f32", shapes, {1, 4}, /*target_ms=*/100.0,
-                             /*rounds=*/3);
+                             /*rounds=*/3, fmt);
     bench_q4_vs_dense<half>("f16", shapes, {1, 4}, /*target_ms=*/100.0,
-                            /*rounds=*/3);
+                            /*rounds=*/3, fmt);
 }
+
+NNOPS_BENCH(linear_q4_1) { bench_linear_q4(DataType::q4_1); }
+
+NNOPS_BENCH(linear_q4_0) { bench_linear_q4(DataType::q4_0); }
 
 // ============================================================
 // f16 — the same pairing
 // ============================================================
 
-NNOPS_BENCH(linear_f16_vs_matmul) {
+NNOPS_BENCH(linear_f16_vs_matmul)
+{
     const std::vector<Shape> shapes{
         {1, 4096, 4096},
         {128, 4096, 4096},

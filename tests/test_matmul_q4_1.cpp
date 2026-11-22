@@ -18,7 +18,7 @@
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/core/compute_context.hpp"
-#include "nnops/detail/q4_1.hpp"
+#include "nnops/detail/q4.hpp"
 #include "backend/cpu/matmul/matmul_helper.h"
 #if defined(NNOPS_ARCH_SME)
 #include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme — the ZA route's gate
@@ -100,20 +100,18 @@ struct SmePin {
 /// Row-major Q4_1 matrix (whole-block row padding) plus its logical values.
 struct Q4Matrix {
     std::vector<uint8_t> bytes;
-    std::vector<float>   decoded;  ///< rows × cols, row-major
+    std::vector<float> decoded; ///< rows × cols, row-major
     int64_t rows = 0;
     int64_t cols = 0;
     int64_t blocks_per_row = 0;
-    size_t  block_offset = 0;      ///< position of this matrix in @c bytes
+    size_t block_offset = 0; ///< position of this matrix in @c bytes
 };
 
 /// Encode 32 quants into one block exactly as llama.cpp does.
-void encode_block(const int q[q4_1_block_elems], float d, float m,
-                  uint8_t out[q4_1_block_bytes]) {
-    const half dh = float_to_half(d);
-    const half mh = float_to_half(m);
-    const uint16_t d_bits = backend::cpu::half_to_bits(dh);
-    const uint16_t m_bits = backend::cpu::half_to_bits(mh);
+void encode_block(const int q[q4_1_block_elems], float d, float m, uint8_t* out, DataType fmt)
+{
+    const uint16_t d_bits = backend::cpu::half_to_bits(float_to_half(d));
+    const uint16_t m_bits = backend::cpu::half_to_bits(float_to_half(m));
 
     uint8_t qs[16];
     for (int j = 0; j < 16; ++j) {
@@ -123,19 +121,24 @@ void encode_block(const int q[q4_1_block_elems], float d, float m,
     }
 
     std::memcpy(out + 0, &d_bits, 2);
-    std::memcpy(out + 2, &m_bits, 2);
-    std::memcpy(out + 4, qs, 16);
+    if (q4_has_min(fmt)) {
+        std::memcpy(out + 2, &m_bits, 2);
+        std::memcpy(out + 4, qs, 16);
+    } else {
+        std::memcpy(out + 2, qs, 16);
+    }
 }
 
-/// Build one [rows, cols] Q4_1 matrix with f16-exact d/m, so the decoded values
-/// are exact too.
-Q4Matrix build_q4_matrix(int64_t rows, int64_t cols, uint32_t seed) {
+/// Build one [rows, cols] Q4 matrix with f16-exact d/m, so the decoded values
+/// are exact too. `fmt` selects Q4_0 (18-byte, nibbles − 8) or Q4_1.
+Q4Matrix build_q4_matrix(int64_t rows, int64_t cols, uint32_t seed, DataType fmt = DataType::q4_1)
+{
     Q4Matrix m;
     m.rows = rows;
     m.cols = cols;
     m.blocks_per_row = (cols + q4_1_block_elems - 1) / q4_1_block_elems;
-    m.bytes.assign(static_cast<size_t>(rows * m.blocks_per_row
-                                       * static_cast<int64_t>(q4_1_block_bytes)), 0);
+    const int64_t bb = static_cast<int64_t>(data_type_block_bytes(fmt));
+    m.bytes.assign(static_cast<size_t>(rows * m.blocks_per_row * bb), 0);
     m.decoded.assign(static_cast<size_t>(rows * cols), 0.0f);
 
     const float d_choices[4] = {0.25f, 0.5f, 0.75f, 1.0f};
@@ -151,18 +154,19 @@ Q4Matrix build_q4_matrix(int64_t rows, int64_t cols, uint32_t seed) {
             const float mn = m_choices[(seed + r + 2 * b) % 5];
 
             encode_block(q, d, mn,
-                         m.bytes.data() + static_cast<size_t>(
-                             (r * m.blocks_per_row + b)
-                             * static_cast<int64_t>(q4_1_block_bytes)));
+                         m.bytes.data() + static_cast<size_t>((r * m.blocks_per_row + b) * bb),
+                         fmt);
 
             const half dh = float_to_half(d);
             const half mh = float_to_half(mn);
             const int64_t base = r * cols + b * q4_1_block_elems;
-            const int n = static_cast<int>(
-                std::min<int64_t>(q4_1_block_elems, cols - b * q4_1_block_elems));
+            const int n =
+                static_cast<int>(std::min<int64_t>(q4_1_block_elems, cols - b * q4_1_block_elems));
             for (int j = 0; j < n; ++j) {
+                const float qv =
+                    q4_has_min(fmt) ? static_cast<float>(q[j]) : static_cast<float>(q[j] - 8);
                 m.decoded[static_cast<size_t>(base + j)] =
-                    half_to_float(dh) * static_cast<float>(q[j]) + half_to_float(mh);
+                    half_to_float(dh) * qv + (q4_has_min(fmt) ? half_to_float(mh) : 0.0f);
             }
         }
     }
@@ -240,27 +244,31 @@ struct Case {
     bool transpose_b;
     bool f16;
     bool transpose_a;
-    float beta = 0.0f;                         ///< 0/1/other: overwrite / accumulate / scale
-    float alpha = 1.0f;                        ///< scales the product only
+    float beta = 0.0f;  ///< 0/1/other: overwrite / accumulate / scale
+    float alpha = 1.0f; ///< scales the product only
     EpilogueActivateType ep = EpilogueActivateType::None;
-    bool bias = false;                         ///< adds a per-column [N] input
-    bool bf16 = false;                         ///< aarch64 only; excludes f16
+    bool bias = false;             ///< adds a per-column [N] input
+    bool bf16 = false;             ///< aarch64 only; excludes f16
+    DataType fmt = DataType::q4_1; ///< B block format
 };
 
 /// Deterministic prior C contents, so beta != 0 has something to act on.
-float ramp_value(int64_t i) {
-    return 0.25f * static_cast<float>(i % 11) - 1.0f;
-}
+float ramp_value(int64_t i) { return 0.25f * static_cast<float>(i % 11) - 1.0f; }
 
-float apply_expected_epilogue(float v, EpilogueActivateType ep) {
+float apply_expected_epilogue(float v, EpilogueActivateType ep)
+{
     switch (ep) {
-    case EpilogueActivateType::Relu:  return std::max(v, 0.0f);
-    case EpilogueActivateType::Relu6: return std::min(std::max(v, 0.0f), 6.0f);
-    default:                          return v;
+    case EpilogueActivateType::Relu:
+        return std::max(v, 0.0f);
+    case EpilogueActivateType::Relu6:
+        return std::min(std::max(v, 0.0f), 6.0f);
+    default:
+        return v;
     }
 }
 
-void run_case(const Case& c) {
+void run_case(const Case& c)
+{
     const int64_t M = c.M, N = c.N, K = c.K;
 
     const std::vector<float> a_f32 = gen_floats(M * K, 0x51u + static_cast<uint32_t>(M + N + K));
@@ -272,42 +280,39 @@ void run_case(const Case& c) {
         }
     }
     std::vector<bfloat16> a_bf16_logical;
-    if (c.bf16) { a_bf16_logical = f32_to_bf16(a_f32); }
+    if (c.bf16) {
+        a_bf16_logical = f32_to_bf16(a_f32);
+    }
 
-    std::vector<float> a_f32_phys = c.transpose_a ? transpose_a_storage(a_f32, M, K)
-                                                  : a_f32;
+    std::vector<float> a_f32_phys = c.transpose_a ? transpose_a_storage(a_f32, M, K) : a_f32;
     std::vector<half> a_f16_phys;
     if (c.f16) {
-        a_f16_phys = c.transpose_a ? transpose_a_storage(a_f16_logical, M, K)
-                                   : a_f16_logical;
+        a_f16_phys = c.transpose_a ? transpose_a_storage(a_f16_logical, M, K) : a_f16_logical;
     }
     std::vector<bfloat16> a_bf16_phys;
     if (c.bf16) {
-        a_bf16_phys = c.transpose_a ? transpose_a_storage(a_bf16_logical, M, K)
-                                    : a_bf16_logical;
+        a_bf16_phys = c.transpose_a ? transpose_a_storage(a_bf16_logical, M, K) : a_bf16_logical;
     }
 
     // Physical B: [N][K] when transposed, [K][N] otherwise.
-    const Q4Matrix b = c.transpose_b ? build_q4_matrix(N, K, 0x1234u)
-                                     : build_q4_matrix(K, N, 0x1234u);
+    const Q4Matrix b = c.transpose_b ? build_q4_matrix(N, K, 0x1234u, c.fmt) :
+                                       build_q4_matrix(K, N, 0x1234u, c.fmt);
     const int64_t brows = c.transpose_b ? N : K;
     const int64_t bcols = c.transpose_b ? K : N;
 
     const int64_t ashape_mk[] = {M, K};
     const int64_t ashape_km[] = {K, M};
-    const std::span<const int64_t> ashape = c.transpose_a
-        ? std::span<const int64_t>(ashape_km, 2)
-        : std::span<const int64_t>(ashape_mk, 2);
+    const std::span<const int64_t> ashape = c.transpose_a ? std::span<const int64_t>(ashape_km, 2) :
+                                                            std::span<const int64_t>(ashape_mk, 2);
     const int64_t bshape[] = {brows, bcols};
 
     const bool a16 = c.f16 || c.bf16;
-    const DataType a_dt = c.bf16 ? DataType::bf16
-                                 : (c.f16 ? DataType::f16 : DataType::f32);
-    void* const a_ptr = c.bf16 ? static_cast<void*>(a_bf16_phys.data())
-                       : c.f16 ? static_cast<void*>(a_f16_phys.data())
-                               : static_cast<void*>(a_f32_phys.data());
+    const DataType a_dt = c.bf16 ? DataType::bf16 : (c.f16 ? DataType::f16 : DataType::f32);
+    void* const a_ptr = c.bf16 ? static_cast<void*>(a_bf16_phys.data()) :
+                        c.f16  ? static_cast<void*>(a_f16_phys.data()) :
+                                 static_cast<void*>(a_f32_phys.data());
     TensorView a(ashape, a_dt, a_ptr);
-    TensorView bv(bshape, DataType::q4_1, const_cast<uint8_t*>(b.bytes.data()));
+    TensorView bv(bshape, c.fmt, const_cast<uint8_t*>(b.bytes.data()));
 
     MatMulAttributes attrs{};
     attrs.transpose_b = c.transpose_b;
@@ -498,52 +503,87 @@ NNOPS_TEST(matmul_q4_1_batched) {
     }
 }
 
-}  // namespace
+} // namespace
 
-NNOPS_TEST(matmul_q4_1_f32) {
+NNOPS_TEST(matmul_q4_1_f32)
+{
     // N > M (split on N), N off the RHS panel, K off-block.
     run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false});
     // M >= N (split on M), Linear-style [N][K] weight.
-    run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/false});
+    run_case({37, 5, 70, /*transpose_b=*/true, /*f16=*/false, /*transpose_a=*/false});
     // Block-aligned N and K, wider than one panel.
     run_case({24, 71, 160, /*transpose_b=*/true, /*f16=*/false, /*transpose_a=*/false});
     // Small square with K below one block.
     run_case({9, 9, 33, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false});
     // Transposed A: physically [K][M], so the pack-A route runs as well.
     run_case({17, 23, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/true});
-    run_case({17, 23, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/true});
+    run_case({17, 23, 70, /*transpose_b=*/true, /*f16=*/false, /*transpose_a=*/true});
     // alpha rides the Q4_1 RHS pack (every decoded weight scaled), so the
     // packed route needs no post-pass.
-    run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false,
-              0.0f, 2.5f});
-    run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/false,
-              0.0f, -1.5f});
-    run_case({24, 71, 160, /*transpose_b=*/true, /*f16=*/false, /*transpose_a=*/false,
-              0.5f, 0.5f});
+    run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false, 0.0f, 2.5f});
+    run_case({37, 5, 70, /*transpose_b=*/true, /*f16=*/false, /*transpose_a=*/false, 0.0f, -1.5f});
+    run_case({24, 71, 160, /*transpose_b=*/true, /*f16=*/false, /*transpose_a=*/false, 0.5f, 0.5f});
     // A bias enters the accumulator as beta·C_old + bias before the first
     // k-block, so the overwriting (beta = 0) case must still keep it; the bias
     // is added unscaled by alpha.
-    run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false,
-              0.0f, 1.0f, EpilogueActivateType::None, /*bias=*/true});
-    run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/false,
-              0.5f, 2.0f, EpilogueActivateType::None, /*bias=*/true});
+    run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false, 0.0f, 1.0f,
+              EpilogueActivateType::None, /*bias=*/true});
+    run_case({37, 5, 70, /*transpose_b=*/true, /*f16=*/false, /*transpose_a=*/false, 0.5f, 2.0f,
+              EpilogueActivateType::None, /*bias=*/true});
+}
+
+/// Q4_0 shares the block layout and every route; only the decode differs
+/// (d·(q − 8), no min). Cover the packed route, the fused small-M route and the
+/// SME tile (M > 4, N >= 16), with both B layouts and the N/K tails.
+NNOPS_TEST(matmul_q4_0)
+{
+    auto q0 = [](int64_t M, int64_t N, int64_t K, bool tb, bool f16 = false) {
+        Case c{M, N, K, tb, f16, false};
+        c.fmt = DataType::q4_0;
+        return c;
+    };
+
+    run_case(q0(5, 37, 70, /*tb=*/false));   // copy, N tail
+    run_case(q0(37, 5, 70, /*tb=*/true));    // trans, non-panel N
+    run_case(q0(2, 64, 33, /*tb=*/false));   // K tail, fused route
+    run_case(q0(17, 23, 70, /*tb=*/false));  // packed route
+    run_case(q0(20, 130, 160, /*tb=*/true)); // SME tile, N/K tails
+    run_case(q0(8, 130, 70, /*tb=*/true));   // fused limit, panel tails
+    run_case(q0(5, 37, 70, /*tb=*/false, /*f16=*/true));
+    Case scaled = q0(24, 71, 160, /*tb=*/true);
+    scaled.alpha = 0.5f;
+    scaled.beta = 0.5f;
+    scaled.ep = EpilogueActivateType::Relu;
+    run_case(scaled);
+}
+
+/// M split with a Q4 B: N is narrow, so the plan splits M and the full-N B
+/// pack is hoisted — both m-blocks share one decode. On an SME build this runs
+/// the ZA path; the NEON twin below pins ZA off.
+NNOPS_TEST(matmul_q4_hoisted_b)
+{
+    run_case({1000, 64, 128, /*transpose_b=*/false, false, false});
+    Case c{1000, 64, 128, /*transpose_b=*/false, false, false};
+    c.fmt = DataType::q4_0;
+    run_case(c);
 }
 
 /// Decode-sized M, at or below the fused route's limits.
-NNOPS_TEST(matmul_q4_1_small_m) {
+NNOPS_TEST(matmul_q4_1_small_m)
+{
     run_case({1, 37, 70, /*transpose_b=*/false, false, false});
     run_case({2, 37, 70, /*transpose_b=*/false, false, false});
-    run_case({2, 64, 33, /*transpose_b=*/false, false, false});   // K tail
+    run_case({2, 64, 33, /*transpose_b=*/false, false, false}); // K tail
     run_case({1, 71, 160, /*transpose_b=*/true, false, false});
     run_case({4, 71, 160, /*transpose_b=*/true, false, false});
-    run_case({3, 41, 33, /*transpose_b=*/true, false, false});    // partial m rows
-    run_case({8, 130, 70, /*transpose_b=*/true, false, false});   // panel tails
+    run_case({3, 41, 33, /*transpose_b=*/true, false, false});  // partial m rows
+    run_case({8, 130, 70, /*transpose_b=*/true, false, false}); // panel tails
     run_case({4, 37, 70, /*transpose_b=*/true, false, false, 1.0f});
     run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.5f});
-    run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.0f, 1.0f,
-              EpilogueActivateType::Relu6});
-    run_case({7, 37, 70, /*transpose_b=*/true, false, false, 0.0f, 2.0f,
-              EpilogueActivateType::Relu});
+    run_case(
+        {2, 37, 70, /*transpose_b=*/false, false, false, 0.0f, 1.0f, EpilogueActivateType::Relu6});
+    run_case(
+        {7, 37, 70, /*transpose_b=*/true, false, false, 0.0f, 2.0f, EpilogueActivateType::Relu});
     run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.0f, 1.0f,
               EpilogueActivateType::None, /*bias=*/true});
     run_case({8, 71, 160, /*transpose_b=*/true, false, false, 0.5f, 1.5f,
@@ -650,33 +690,31 @@ NNOPS_TEST(pack_q4_1_bf16_matches_dense_pack) {
     for (bool trans : {false, true}) {
         for (int k_start : {0, 70}) {
             const int64_t k_total = k_start + kc;
-            const Q4Matrix b = trans ? build_q4_matrix(N, k_total, 0x77u)
-                                     : build_q4_matrix(k_total, N, 0x77u);
+            const Q4Matrix b =
+                trans ? build_q4_matrix(N, k_total, 0x77u) : build_q4_matrix(k_total, N, 0x77u);
             const int64_t rows = trans ? N : k_total;
             const int64_t cols = trans ? k_total : N;
 
             std::vector<bfloat16> dense(static_cast<size_t>(rows * cols));
             for (int64_t r = 0; r < rows; ++r) {
                 for (int64_t c = 0; c < cols; ++c) {
-                    dense[static_cast<size_t>(r * cols + c)] =
-                        backend::cpu::float_to_bfloat16(
-                            b.decoded[static_cast<size_t>(r * cols + c)]);
+                    dense[static_cast<size_t>(r * cols + c)] = backend::cpu::float_to_bfloat16(
+                        b.decoded[static_cast<size_t>(r * cols + c)]);
                 }
             }
 
             // The dense pack has no k_start: shift its source to the window.
-            const bfloat16* dense_base = trans
-                ? dense.data() + k_start
-                : dense.data() + static_cast<int64_t>(k_start) * cols;
+            const bfloat16* dense_base = trans ?
+                                             dense.data() + k_start :
+                                             dense.data() + static_cast<int64_t>(k_start) * cols;
 
             std::vector<bfloat16> want(static_cast<size_t>(panels * ldd), bfloat16{});
             std::vector<bfloat16> got(static_cast<size_t>(panels * ldd), bfloat16{});
-            backend::cpu::tile_pack_rhs(trans, static_cast<int>(N), kc,
-                                        want.data(), ldd, dense_base,
-                                        static_cast<int>(cols), 1.0f);
-            backend::cpu::tile_pack_rhs_q4_1(
-                trans, 0, static_cast<int>(N), k_start, kc, got.data(), ldd,
-                b.bytes.data(), b.blocks_per_row, 1.0f);
+            backend::cpu::tile_pack_rhs(trans, static_cast<int>(N), kc, want.data(), ldd,
+                                        dense_base, static_cast<int>(cols), 1.0f);
+            backend::cpu::tile_pack_rhs_q4(trans, 0, static_cast<int>(N), k_start, kc, got.data(),
+                                           ldd, b.bytes.data(), b.blocks_per_row, 1.0f,
+                                           DataType::q4_1);
 
             for (size_t i = 0; i < want.size(); ++i) {
                 if (want[i].bits != got[i].bits) {
@@ -863,9 +901,8 @@ template <class T> uint32_t pack_bits(T v)
     }
 }
 
-/// The ZA Q4_1 pack against decode-then-dense-pack, bit for bit.
-template <class T>
-void check_sme_pack(DataType dt)
+/// The ZA Q4 pack against decode-then-dense-pack, bit for bit.
+template <class T> void check_sme_pack(DataType dt, DataType fmt = DataType::q4_1)
 {
     constexpr int64_t N = 37; // a full 32-column panel plus a 5-column tail
     constexpr int kc = 70;    // off a 32-value block, and an odd f16 pair count
@@ -877,21 +914,20 @@ void check_sme_pack(DataType dt)
         // fallback there, so both paths are held to the same answer.
         for (int k_start : {0, 32, 70}) {
             const int64_t k_total = k_start + kc;
-            const Q4Matrix b = trans ? build_q4_matrix(N, k_total, 0x77u) :
-                                       build_q4_matrix(k_total, N, 0x77u);
+            const Q4Matrix b = trans ? build_q4_matrix(N, k_total, 0x77u, fmt) :
+                                       build_q4_matrix(k_total, N, 0x77u, fmt);
             const std::vector<T> dense = dense_from_q4<T>(b);
-            const T* const dense_base = trans ?
-                                            dense.data() + k_start :
-                                            dense.data() + static_cast<int64_t>(k_start) * N;
+            const T* const dense_base =
+                trans ? dense.data() + k_start : dense.data() + static_cast<int64_t>(k_start) * N;
             const int lds = static_cast<int>(trans ? k_total : N);
 
             std::vector<T> want(static_cast<size_t>(panels) * ldd, T{});
             std::vector<T> got(static_cast<size_t>(panels) * ldd, T{});
-            backend::cpu::tile_pack_rhs_sme(trans, static_cast<int>(N), kc, want.data(),
-                                            dense_base, lds);
-            backend::cpu::tile_pack_rhs_q4_1_sme(trans, 0, static_cast<int>(N), k_start, kc,
-                                                 got.data(), b.bytes.data(), b.blocks_per_row,
-                                                 1.0f);
+            backend::cpu::tile_pack_rhs_sme(trans, static_cast<int>(N), kc, want.data(), dense_base,
+                                            lds);
+            backend::cpu::tile_pack_rhs_q4_sme(trans, 0, static_cast<int>(N), k_start, kc,
+                                               got.data(), b.bytes.data(), b.blocks_per_row, 1.0f,
+                                               fmt);
 
             for (size_t i = 0; i < want.size(); ++i) {
                 const uint32_t w = pack_bits(want[i]);
@@ -913,8 +949,60 @@ void check_sme_pack(DataType dt)
 /// The ZA panel pack must be byte-identical to decoding into a dense matrix and
 /// running the ordinary SME RHS pack: the kernels only know the layout, so a
 /// difference is a layout bug no tolerance should hide.
-NNOPS_TEST(pack_q4_1_sme_matches_dense_pack) {
-    check_sme_pack<float>(DataType::f32);
-    check_sme_pack<half>(DataType::f16);
+NNOPS_TEST(pack_q4_sme_matches_dense_pack)
+{
+    check_sme_pack<float>(DataType::f32, DataType::q4_1);
+    check_sme_pack<half>(DataType::f16, DataType::q4_1);
+    check_sme_pack<float>(DataType::f32, DataType::q4_0);
+    check_sme_pack<half>(DataType::f16, DataType::q4_0);
+}
+
+/// The ZA route over a Q4_0 B — same shapes as the Q4_1 route test, so the
+/// format's only difference is the decode.
+NNOPS_TEST(matmul_q4_0_sme_route)
+{
+    const SmePin sme_on(true);
+    auto q0 = [](int64_t M, int64_t N, int64_t K, bool tb, bool f16 = false) {
+        Case c{M, N, K, tb, f16, false};
+        c.fmt = DataType::q4_0;
+        return c;
+    };
+    run_case(q0(40, 40, 1050, /*tb=*/true));
+    run_case(q0(40, 72, 1100, /*tb=*/false));
+    run_case(q0(17, 40, 70, /*tb=*/false));
+    Case scaled = q0(40, 40, 160, /*tb=*/true);
+    scaled.alpha = -1.5f;
+    run_case(scaled);
+    run_case(q0(40, 72, 2100, /*tb=*/false, /*f16=*/true));
+}
+
+/// The same Q4_0 calls with the ZA route pinned off: the NEON packed plan owns
+/// them, so both engines answer to one reference at the same shapes.
+NNOPS_TEST(matmul_q4_0_neon_route)
+{
+    const SmePin sme_off(false);
+    auto q0 = [](int64_t M, int64_t N, int64_t K, bool tb, bool f16 = false) {
+        Case c{M, N, K, tb, f16, false};
+        c.fmt = DataType::q4_0;
+        return c;
+    };
+    run_case(q0(40, 40, 1050, /*tb=*/true));
+    run_case(q0(40, 72, 1100, /*tb=*/false));
+    run_case(q0(17, 40, 70, /*tb=*/false));
+    Case scaled = q0(40, 40, 160, /*tb=*/true);
+    scaled.alpha = -1.5f;
+    run_case(scaled);
+    run_case(q0(40, 72, 160, /*tb=*/false, /*f16=*/true));
+}
+
+/// The M-split hoist on the NEON plan: ZA pinned off, N narrow so the plan
+/// splits M and one full-N B pack serves both m-blocks.
+NNOPS_TEST(matmul_q4_hoisted_b_neon)
+{
+    const SmePin sme_off(false);
+    run_case({1000, 64, 128, /*transpose_b=*/false, false, false});
+    Case c{1000, 64, 128, /*transpose_b=*/false, false, false};
+    c.fmt = DataType::q4_0;
+    run_case(c);
 }
 #endif // NNOPS_ARCH_SME

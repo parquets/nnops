@@ -16,7 +16,7 @@
 #include "nnops/ops/moe.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/detail/half.hpp"
-#include "nnops/detail/q4_1.hpp"
+#include "nnops/detail/q4.hpp"
 
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"

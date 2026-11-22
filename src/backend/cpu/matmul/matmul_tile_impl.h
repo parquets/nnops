@@ -480,6 +480,14 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs, TensorView& output,
             }
         }
 
+        // A block-packed B is decoded, not copied, so one full-N pack per
+        // k-block can serve every m-block. int8 always hoists; fp does it only
+        // for a block-packed B (dense B's copy is cheap and its full-N slice is
+        // large). The ZA route opts out: its kc makes that slice tens of MB.
+        const bool hoist_b =
+            R::hoists_b_m_split ||
+            (R::is_fp && R::hoists_block_b && is_block_packed_dtype(b_block_dt));
+
         if (split_n) {
             // NKM: one n-block per parallel task, every block over all of M.
             ctx.cpu.run(0, num_blocks, [&](int64_t blk) {
@@ -490,7 +498,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs, TensorView& output,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base), plan.pack_a,
                                 a_biased, ip_or_null, bias, col_bias, prepacked);
             });
-        } else if constexpr (R::hoists_b_m_split) {
+        } else if (hoist_b) {
             // MKN, hoisted: pack the full-N B once per k-block, then split the
             // rows. The one packed-B slice serves every m-block.
             for (int k = 0; k < Ki; k += kc) {

@@ -6,8 +6,8 @@
 /// nibble halves, f32 and f16 destinations, a partial trailing block, multiple
 /// blocks with different d/m, and an unaligned source pointer.
 
-#include "nnops/detail/q4_1.hpp"
-#include "nnops/detail/simd/cpu_features.hpp"  // NNOPS_ARCH_X86_64 / _AARCH64
+#include "nnops/detail/q4.hpp"
+#include "nnops/detail/simd/cpu_features.hpp" // NNOPS_ARCH_X86_64 / _AARCH64
 #include "common/test_harness.hpp"
 
 #include <algorithm>
@@ -17,7 +17,9 @@
 #include <vector>
 
 #if defined(NNOPS_ARCH_X86_64)
-  #include "backend/cpu/x86_64/pack_q4_1.hpp"
+#include "backend/cpu/x86_64/pack_q4.hpp"
+#elif defined(NNOPS_ARCH_AARCH64)
+#include "backend/cpu/aarch64/pack_q4.hpp"
 #endif
 
 using namespace nnops;
@@ -416,16 +418,19 @@ NNOPS_TEST(q4_1_quantize_unaligned_dest) {
     quantize_q4(x.data(), count, shifted.data() + 1);
 
     NNOPS_EXPECT_EQ(std::memcmp(shifted.data() + 1, aligned.data(), aligned.size()), 0);
-    NNOPS_EXPECT_EQ(static_cast<int>(shifted[0]), 0x5A);  // the pad byte is untouched
+    NNOPS_EXPECT_EQ(static_cast<int>(shifted[0]), 0x5A); // the pad byte is untouched
 }
 
-NNOPS_TEST(q4_1_unpack_block_helper) {
+NNOPS_TEST(q4_1_unpack_block_helper)
+{
     int q[q4_1_block_elems];
-    for (int j = 0; j < q4_1_block_elems; ++j) { q[j] = 15 - (j & 0x0F); }
+    for (int j = 0; j < q4_1_block_elems; ++j) {
+        q[j] = 15 - (j & 0x0F);
+    }
     const BuiltBlock bb = make_block(q, 0.5f, 2.0f);
 
     float via_helper[q4_1_block_elems];
-    q4_1_unpack_block(&bb.blk, via_helper);
+    q4_unpack_block(&bb.blk, via_helper, DataType::q4_1);
 
     float via_pack[q4_1_block_elems];
     pack_q4(&bb.blk, q4_1_block_elems, via_pack);
@@ -441,22 +446,21 @@ NNOPS_TEST(q4_1_unpack_block_helper) {
 // ============================================================
 #if defined(NNOPS_ARCH_X86_64)
 
-using nnops::backend::cpu::x86_64::pack_q4_1_rhs;
-using nnops::backend::cpu::x86_64::q4_1_nr_max;
+using nnops::backend::cpu::x86_64::pack_q4_rhs;
+using nnops::backend::cpu::x86_64::q4_nr_max;
 
-NNOPS_TEST(q4_1_x86_pack_matches_scalar) {
+NNOPS_TEST(q4_1_x86_pack_matches_scalar)
+{
     std::vector<float> expected;
     const std::vector<uint8_t> bytes = build_blocks(3, expected);
 
-    for (int64_t count : {int64_t{1}, int64_t{7}, int64_t{31}, int64_t{32},
-                          int64_t{33}, int64_t{63}, int64_t{64}, int64_t{71},
-                          int64_t{96}}) {
+    for (int64_t count : {int64_t{1}, int64_t{7}, int64_t{31}, int64_t{32}, int64_t{33},
+                          int64_t{63}, int64_t{64}, int64_t{71}, int64_t{96}}) {
         std::vector<float> simd(static_cast<size_t>(count), -999.0f);
         nnops::backend::cpu::x86_64::pack_q4(bytes.data(), count, simd.data());
 
         for (int64_t i = 0; i < count; ++i) {
-            NNOPS_EXPECT_EQ(simd[static_cast<size_t>(i)],
-                            expected[static_cast<size_t>(i)]);
+            NNOPS_EXPECT_EQ(simd[static_cast<size_t>(i)], expected[static_cast<size_t>(i)]);
         }
     }
 
@@ -472,27 +476,26 @@ NNOPS_TEST(q4_1_x86_pack_matches_scalar) {
 /// Verify one packed-B tile: every panel lane for every k, including the
 /// zero-filled lanes past a tail panel's live width.
 template <class T>
-void check_q4_1_panels(const Q4Matrix& m, bool trans,
-                       int n_start, int nc, int k_start, int kc) {
-    const int npanels = (nc + q4_1_nr_max - 1) / q4_1_nr_max;
-    const int ldd = q4_1_nr_max * kc;  // contiguous panels are enough here
+void check_q4_1_panels(const Q4Matrix& m, bool trans, int n_start, int nc, int k_start, int kc)
+{
+    const int npanels = (nc + q4_nr_max - 1) / q4_nr_max;
+    const int ldd = q4_nr_max * kc; // contiguous panels are enough here
     std::vector<T> dst(static_cast<size_t>(npanels * ldd), T{});
 
-    pack_q4_1_rhs<T>(trans, n_start, nc, k_start, kc,
-                     dst.data(), ldd, m.bytes.data(), m.blocks_per_row, 1.0f);
+    pack_q4_rhs<T>(trans, n_start, nc, k_start, kc, dst.data(), ldd, m.bytes.data(),
+                   m.blocks_per_row, 1.0f, DataType::q4_1);
 
     for (int p = 0; p < npanels; ++p) {
-        const int n0 = n_start + p * q4_1_nr_max;
-        const int width = std::min(q4_1_nr_max, nc - p * q4_1_nr_max);
+        const int n0 = n_start + p * q4_nr_max;
+        const int width = std::min(q4_nr_max, nc - p * q4_nr_max);
         for (int k = 0; k < kc; ++k) {
-            const T* row = dst.data() + static_cast<int64_t>(p * ldd + k * q4_1_nr_max);
-            for (int j = 0; j < q4_1_nr_max; ++j) {
+            const T* row = dst.data() + static_cast<int64_t>(p * ldd + k * q4_nr_max);
+            for (int j = 0; j < q4_nr_max; ++j) {
                 float want = 0.0f;
                 if (j < width) {
                     const int64_t kk = k_start + k;
                     const int64_t nn = n0 + j;
-                    const int64_t idx = trans ? (nn * m.cols + kk)
-                                              : (kk * m.cols + nn);
+                    const int64_t idx = trans ? (nn * m.cols + kk) : (kk * m.cols + nn);
                     want = m.decoded[static_cast<size_t>(idx)];
                 }
                 if constexpr (std::is_same_v<T, float>) {
@@ -528,10 +531,176 @@ NNOPS_TEST(q4_1_x86_rhs_panels) {
 
     for (const Case& c : cases) {
         check_q4_1_panels<float>(b_kn, false, c.n_start, c.nc, c.k_start, c.kc);
-        check_q4_1_panels<float>(b_nk, true,  c.n_start, c.nc, c.k_start, c.kc);
+        check_q4_1_panels<float>(b_nk, true, c.n_start, c.nc, c.k_start, c.kc);
         check_q4_1_panels<half>(b_kn, false, c.n_start, c.nc, c.k_start, c.kc);
-        check_q4_1_panels<half>(b_nk, true,  c.n_start, c.nc, c.k_start, c.kc);
+        check_q4_1_panels<half>(b_nk, true, c.n_start, c.nc, c.k_start, c.kc);
     }
 }
 
-#endif  // NNOPS_ARCH_X86_64
+#endif // NNOPS_ARCH_X86_64
+
+// ============================================================
+// Q4_0 — same nibble layout, d·(q − 8) and no min
+// ============================================================
+
+namespace {
+
+/// A Q4_0 block whose logical 4-bit quants are known.
+struct BuiltBlock0 {
+    q4_0_block blk{};
+    float d = 0.0f; ///< d after its f16 round-trip
+};
+
+BuiltBlock0 make_block0(const int q[q4_block_elems], float d)
+{
+    BuiltBlock0 b;
+    b.d = half_to_float(float_to_half(d));
+    b.blk.d = backend::cpu::half_to_bits(float_to_half(d));
+    for (int j = 0; j < 16; ++j) {
+        b.blk.qs[j] = static_cast<uint8_t>((q[j] & 0x0F) | ((q[j + 16] & 0x0F) << 4));
+    }
+    return b;
+}
+
+/// llama.cpp's dequantize_row_q4_0, transliterated.
+void reference_decode0(const q4_0_block& blk, float* y)
+{
+    const float d = half_to_float(backend::cpu::half_from_bits(blk.d));
+    for (int j = 0; j < 16; ++j) {
+        y[j] = static_cast<float>(static_cast<int>(blk.qs[j] & 0x0F) - 8) * d;
+        y[j + 16] = static_cast<float>(static_cast<int>(blk.qs[j] >> 4) - 8) * d;
+    }
+}
+
+/// llama.cpp's quantize_row_q4_0_ref, transliterated, for whole blocks only.
+std::vector<uint8_t> reference_quantize0(const float* x, int64_t k)
+{
+    const int nb = static_cast<int>(k / q4_block_elems);
+    std::vector<uint8_t> out(static_cast<size_t>(nb) * q4_0_block_bytes);
+
+    for (int i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        float peak = 0.0f;
+        for (int j = 0; j < q4_block_elems; ++j) {
+            const float v = x[i * q4_block_elems + j];
+            if (amax < std::fabs(v)) {
+                amax = std::fabs(v);
+                peak = v;
+            }
+        }
+        const float d = peak / -8.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        uint8_t* blk = out.data() + static_cast<size_t>(i) * q4_0_block_bytes;
+        const uint16_t d16 = backend::cpu::half_to_bits(float_to_half(d));
+        std::memcpy(blk + 0, &d16, sizeof(d16));
+
+        for (int j = 0; j < q4_block_elems / 2; ++j) {
+            const float x0 = x[i * q4_block_elems + j] * id;
+            const float x1 = x[i * q4_block_elems + q4_block_elems / 2 + j] * id;
+            const int q0 = std::min(15, static_cast<int>(static_cast<int8_t>(x0 + 8.5f)));
+            const int q1 = std::min(15, static_cast<int>(static_cast<int8_t>(x1 + 8.5f)));
+            blk[2 + j] = static_cast<uint8_t>(q0 | (q1 << 4));
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+NNOPS_TEST(q4_0_block_layout)
+{
+    static_assert(sizeof(q4_0_block) == 18, "Q4_0 block is fp16 d + 16 nibbles");
+    NNOPS_EXPECT_EQ(static_cast<int>(q4_0_block_bytes), 18);
+    NNOPS_EXPECT_EQ(static_cast<int>(q4_1_block_bytes), 20);
+    NNOPS_EXPECT_EQ(static_cast<int>(q4_block_elems), 32);
+}
+
+NNOPS_TEST(q4_0_unpack_matches_llama_reference)
+{
+    int q[q4_block_elems];
+    for (int j = 0; j < q4_block_elems; ++j) {
+        q[j] = (j * 3) & 0x0F;
+    }
+    q[0] = 0;
+    q[1] = 15;
+    const BuiltBlock0 bb = make_block0(q, 0.25f);
+
+    float want[q4_block_elems];
+    reference_decode0(bb.blk, want);
+
+    float got[q4_block_elems];
+    q4_unpack_block(&bb.blk, got, DataType::q4_0);
+    for (int j = 0; j < q4_block_elems; ++j) {
+        NNOPS_EXPECT_EQ(got[j], want[j]);
+    }
+}
+
+NNOPS_TEST(q4_0_quantize_matches_llama_reference)
+{
+    std::vector<float> x(3 * q4_block_elems);
+    for (size_t i = 0; i < x.size(); ++i) {
+        x[i] = std::sin(static_cast<float>(i) * 0.37f) * (1.0f + static_cast<float>(i % 5));
+    }
+    const std::vector<uint8_t> want = reference_quantize0(x.data(), static_cast<int64_t>(x.size()));
+    std::vector<uint8_t> got(want.size());
+    quantize_q4(x.data(), static_cast<int64_t>(x.size()), got.data(), DataType::q4_0);
+    NNOPS_EXPECT_TRUE(want == got);
+}
+
+NNOPS_TEST(q4_0_pack_matches_unpack)
+{
+    std::vector<float> x(2 * q4_block_elems + 7);
+    for (size_t i = 0; i < x.size(); ++i) {
+        x[i] = std::cos(static_cast<float>(i) * 0.21f);
+    }
+    std::vector<uint8_t> blocks((x.size() + q4_block_elems - 1) / q4_block_elems *
+                                q4_0_block_bytes);
+    quantize_q4(x.data(), static_cast<int64_t>(x.size()), blocks.data(), DataType::q4_0);
+
+    std::vector<float> got(x.size());
+    pack_q4(blocks.data(), static_cast<int64_t>(x.size()), got.data(), DataType::q4_0);
+    std::vector<float> want(x.size());
+    for (size_t b = 0; b < (x.size() + q4_block_elems - 1) / q4_block_elems; ++b) {
+        float vals[q4_block_elems];
+        q4_unpack_block(blocks.data() + b * q4_0_block_bytes, vals, DataType::q4_0);
+        for (int j = 0; j < q4_block_elems && b * q4_block_elems + j < x.size(); ++j) {
+            want[b * q4_block_elems + j] = vals[j];
+        }
+    }
+    NNOPS_EXPECT_TRUE(got == want);
+}
+
+#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
+NNOPS_TEST(q4_0_simd_decode_matches_scalar)
+{
+    int q[q4_block_elems];
+    for (int j = 0; j < q4_block_elems; ++j) {
+        q[j] = (j * 7 + 3) & 0x0F;
+    }
+    const BuiltBlock0 bb = make_block0(q, 0.5f);
+
+    float want[q4_block_elems];
+    reference_decode0(bb.blk, want);
+    const auto* p = reinterpret_cast<const uint8_t*>(&bb.blk);
+
+    float got_f32[q4_block_elems];
+#if defined(NNOPS_ARCH_X86_64)
+    backend::cpu::x86_64::decode_q4_block<float>(p, got_f32, 1.0f, DataType::q4_0);
+#else
+    backend::cpu::aarch64::decode_q4_block<float>(p, got_f32, 1.0f, DataType::q4_0);
+#endif
+    for (int j = 0; j < q4_block_elems; ++j) {
+        NNOPS_EXPECT_EQ(got_f32[j], want[j]);
+    }
+
+    half got_f16[q4_block_elems];
+#if defined(NNOPS_ARCH_X86_64)
+    backend::cpu::x86_64::decode_q4_block<half>(p, got_f16, 1.0f, DataType::q4_0);
+#else
+    backend::cpu::aarch64::decode_q4_block<half>(p, got_f16, 1.0f, DataType::q4_0);
+#endif
+    for (int j = 0; j < q4_block_elems; ++j) {
+        NNOPS_EXPECT_EQ(half_to_float(got_f16[j]), half_to_float(float_to_half(want[j])));
+    }
+}
+#endif

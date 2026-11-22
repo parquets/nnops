@@ -66,6 +66,9 @@ template <class T> struct FpRoute {
     // A may be read through lda — except for bf16, whose GEOM packs it always.
     static constexpr bool has_direct_a = !std::is_same_v<T, bfloat16>;
     static constexpr bool hoists_b_m_split = false; // B packs inside each block
+    // A block-packed B is decoded, not copied, so a full-N pack per k-block is
+    // hoisted above the M split: one decode serves every m-block.
+    static constexpr bool hoists_block_b = true;
 
     using EpilogueParams = NoEpilogueParams;
 
@@ -142,9 +145,9 @@ template <class T> struct FpRoute {
         if (b.blocked()) {
             // The destination type picks the panel layout: f32/f16 the uniform
             // [k][nr] rectangle, bf16 the BFMMLA operand layout (see
-            // pack_q4_1_rhs).
-            tile_pack_rhs_q4_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd, b.ptr, b.row_blocks,
-                               attrs.alpha);
+            // pack_q4_rhs); b.block_dt picks Q4_0 or Q4_1.
+            tile_pack_rhs_q4(attrs.transpose_b, n_start, nc, k, kc, dst, ldd, b.ptr, b.row_blocks,
+                             attrs.alpha, b.block_dt);
             return;
         }
         const Elem* base = static_cast<const Elem*>(b.ptr);
@@ -215,6 +218,9 @@ template <class T> struct SmeFpRoute : FpRoute<T> {
     using B = typename FpRoute<T>::B;
 
     static constexpr bool has_direct_a = false;
+    // kc is 1024 here, so the full-N B slice is tens of MB; the ZA plan keeps
+    // packing per m-block instead.
+    static constexpr bool hoists_block_b = false;
 
     static int ldd_b(int kc)
     {
@@ -247,27 +253,25 @@ template <class T> struct SmeFpRoute : FpRoute<T> {
     static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc, int n_start,
                        int nc, T* dst, int /*ldd*/, bool /*a_biased*/)
     {
-        // A Q4_1 B is a block stream: the decode fuses into the panel pack, so
+        // A Q4 B is a block stream: the decode fuses into the panel pack, so
         // the kernels still read rows of T.
         if (b.blocked()) {
-            tile_pack_rhs_q4_1_sme(attrs.transpose_b, n_start, nc, k, kc, dst, b.ptr,
-                                   b.row_blocks, attrs.alpha);
+            tile_pack_rhs_q4_sme(attrs.transpose_b, n_start, nc, k, kc, dst, b.ptr, b.row_blocks,
+                                 attrs.alpha, b.block_dt);
             return;
         }
         const T* base = static_cast<const T*>(b.ptr);
-        const T* src = attrs.transpose_b ? base + n_start * b.ldb + k
-                                         : base + k * b.ldb + n_start;
+        const T* src = attrs.transpose_b ? base + n_start * b.ldb + k : base + k * b.ldb + n_start;
         tile_pack_rhs_sme(attrs.transpose_b, nc, kc, dst, src, b.ldb);
     }
 
-    static void mma_pack(int mc, int nc, int kc, T* c, int ldc, const T* pa, const T* pb,
-                         float lo, float hi, bool zero_mode, int64_t ldb = 0,
-                         const T* col_bias = nullptr)
+    static void mma_pack(int mc, int nc, int kc, T* c, int ldc, const T* pa, const T* pb, float lo,
+                         float hi, bool zero_mode, int64_t ldb = 0, const T* col_bias = nullptr)
     {
         tile_mma_pack_sme(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi, zero_mode, col_bias);
     }
 };
-#endif  // NNOPS_ARCH_SME
+#endif // NNOPS_ARCH_SME
 
 } // anonymous namespace
 
@@ -359,22 +363,10 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
     const bool block_b = is_block_packed_dtype(dt_b);
     const bool same_type = dt_b == dt_a;
     // A bf16 B has one packed form, but a Q4_1 B decodes into bf16 on aarch64
-    // (tile_pack_rhs_q4_1's bf16 overload); anything else is not a pair.
+    // (tile_pack_rhs_q4's bf16 overload); anything else is not a pair.
     if (dt_a == DataType::bf16 && !same_type && !block_b) {
         return Status::unsupported;
     }
-
-#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
-    // Small-M block quant (Q4_1): decode straight into the product, before the
-    // plan and the scratch. Only a transposed A is out of reach.
-    if (float_a && block_b && !attrs.transpose_a) {
-        const auto [M, N, K] = matmul_dims(attrs, a, b);
-        if (matmul_qblock_fused(attrs, output, inputs, ctx, static_cast<int>(M),
-                                static_cast<int>(N), static_cast<int>(K))) {
-            return Status::ok;
-        }
-    }
-#endif
 
     // A dense f32/f16 product that is small enough (or narrow enough) skips the
     // plan: no pack, no tiles, no scratch. The thresholds live with the kernels,
@@ -390,12 +382,13 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
     }
 
 #if defined(NNOPS_ARCH_SME)
-    // Dense f32/f16 on the ZA tiles, before the plan, plus a Q4_1 B decoded
-    // straight into those panels. The route packs A, so a transposed A is
-    // fine; alpha rides the generic RHS pack, which this route does not have —
-    // except for a Q4_1 decode, which folds it into every weight as the NEON
-    // route does. A raw B keeps the small-shape gate, but a prepacked blob has
-    // no other reader.
+    // Dense f32/f16 on the ZA tiles, before the plan, plus a Q4_0/Q4_1 B
+    // decoded straight into those panels. The route packs A, so a transposed A
+    // is fine; alpha rides the generic RHS pack, which this route does not
+    // have — except for a Q4 decode, which folds it into every weight as the
+    // NEON route does. A raw B keeps the small-shape gate, but a prepacked blob
+    // has no other reader. This runs before the fused qblock route so the ZA
+    // tiles own the Q4 shapes they admit.
     const bool sme_blob = b.layout() == TensorLayout::PackedBSme;
     const bool sme_pair = (dt_a == DataType::f32 || dt_a == DataType::f16) &&
                           (same_type || block_b);
@@ -418,6 +411,21 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
     if (b.layout() == TensorLayout::PackedBSme) {
         return Status::unsupported;
     }
+
+#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
+    // Small-M block quant: decode straight into the product, before the plan
+    // and the scratch. On aarch64 the ZA route above owns the shapes it admits
+    // (M > 4, N >= 16), where it is several times faster than this one; the
+    // fused kernel is the M <= 4 route and the fallback for shapes ZA declines.
+    // Only a transposed A is out of reach.
+    if (float_a && block_b && !attrs.transpose_a) {
+        const auto [M, N, K] = matmul_dims(attrs, a, b);
+        if (matmul_qblock_fused(attrs, output, inputs, ctx, static_cast<int>(M),
+                                static_cast<int>(N), static_cast<int>(K))) {
+            return Status::ok;
+        }
+    }
+#endif
 
     const auto plan = make_plan(attrs, a, b, ctx);
     if (dt_a == DataType::f32) {

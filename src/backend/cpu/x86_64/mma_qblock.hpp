@@ -38,7 +38,7 @@
 
 #include "backend/cpu/common/common_utils.hpp"
 #include "nnops/core/data_type.hpp"
-#include "pack_q4_1.hpp"
+#include "pack_q4.hpp"
 
 namespace nnops::backend::cpu::x86_64 {
 
@@ -49,10 +49,10 @@ namespace nnops::backend::cpu::x86_64 {
 /// One 32-value quant block: its width and byte size, the dtype it names, and
 /// the decode pair.
 
-struct Q4Block {
-    static constexpr int block_elems = q4_1_block_elems;
-    static constexpr int block_bytes = q4_1_block_bytes;
-    static constexpr DataType dtype = DataType::q4_1;
+template <DataType FMT> struct Q4Block {
+    static constexpr int block_elems = static_cast<int>(q4_block_elems);
+    static constexpr int block_bytes = static_cast<int>(data_type_block_bytes(FMT));
+    static constexpr DataType dtype = FMT;
 
     /// Per-layout M ceilings at K=N=4096. The dot kernel amortizes one decode
     /// over MR = 8 rows and the outer product over 2, so copy is capped at half
@@ -72,16 +72,19 @@ struct Q4Block {
     static inline void decode_ps(const uint8_t* p, __m256& v0, __m256& v1, __m256& v2,
                                  __m256& v3) noexcept
     {
-        decode_q4_1_block_ps(p, v0, v1, v2, v3);
+        decode_q4_block_ps(p, v0, v1, v2, v3, 1.0f, FMT);
     }
 
     template <class T> static inline void decode(const uint8_t* p, T* out) noexcept
     {
-        decode_q4_1_block<T>(p, out);
+        decode_q4_block<T>(p, out, 1.0f, FMT);
     }
 };
 
-static_assert(Q4Block::block_elems == 32,
+using Q4_1Block = Q4Block<DataType::q4_1>;
+using Q4_0Block = Q4Block<DataType::q4_0>;
+
+static_assert(Q4Block<DataType::q4_1>::block_elems == 32,
               "the fused kernels assume one 32-value block per k step in the "
               "copy layout");
 

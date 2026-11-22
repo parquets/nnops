@@ -67,11 +67,11 @@
 /// is worth +13% at 256^3, one thread.
 
 #include "nnops/ops/matmul.hpp"
-#include "nnops/detail/q4_1.hpp"         // q4_1_block, float_to_half, half_to_bits
-#include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
-#include "backend/cpu/aarch64/sme/mma_sme.hpp"      // cpu::aarch64::available_sme — the SME A/B gate
-#include "detail/bench_knobs.hpp"               // disable_sme — the A/B pin
-#include "backend/cpu/simd_kernel/simd_quant.hpp"  // quant_kernel::quantization (the dq quantize pass)
+#include "nnops/detail/q4.hpp"                // q4_1_block, float_to_half, half_to_bits
+#include "backend/cpu/matmul/matmul_helper.h" // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"    // cpu::aarch64::available_sme — the SME A/B gate
+#include "detail/bench_knobs.hpp"                 // disable_sme — the A/B pin
+#include "backend/cpu/simd_kernel/simd_quant.hpp" // quant_kernel::quantization (the dq quantize pass)
 #include "common/bench_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
@@ -154,60 +154,65 @@ make_tensor(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) {
             simd::s_store(&buf[i], f32[i]);
         }
     }
-    constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32
-                          : std::is_same_v<T, half>  ? DataType::f16
-                                                     : DataType::bf16;
+    constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 :
+                            std::is_same_v<T, half>  ? DataType::f16 :
+                                                       DataType::bf16;
     const int64_t shape[] = {rows, cols};
-    TensorView tv(shape, dt, buf.data(),
-                  pitch_elems * static_cast<int64_t>(sizeof(T)));
+    TensorView tv(shape, dt, buf.data(), pitch_elems * static_cast<int64_t>(sizeof(T)));
     return {std::move(buf), tv};
 }
 
 /// Compact i8 tensor (s8 by default, u8 on request) with identity quant params,
 /// so the kernel accumulates the raw dot — the qgemm / MatMulInteger analog.
-std::pair<std::vector<int8_t>, TensorView>
-make_tensor_i8(int64_t rows, int64_t cols, uint64_t seed,
-               DataType dt = DataType::s8) {
+std::pair<std::vector<int8_t>, TensorView> make_tensor_i8(int64_t rows, int64_t cols, uint64_t seed,
+                                                          DataType dt = DataType::s8)
+{
     std::vector<int8_t> buf(static_cast<size_t>(rows * cols));
     nnops::test::XorShift128 rng(seed);
     if (dt == DataType::u8) {
-        for (auto& v : buf) { v = static_cast<int8_t>(rng.next_u64() % 256); }
+        for (auto& v : buf) {
+            v = static_cast<int8_t>(rng.next_u64() % 256);
+        }
     } else {
-        for (auto& v : buf) { v = static_cast<int8_t>(rng.next_u64() % 255 - 127); }
+        for (auto& v : buf) {
+            v = static_cast<int8_t>(rng.next_u64() % 255 - 127);
+        }
     }
     const int64_t shape[] = {rows, cols};
     TensorView tv(shape, dt, buf.data());
     return {std::move(buf), tv};
 }
 
-/// Compact Q4_1 [rows, cols] block stream (32 four-bit quants per 20-byte block);
+/// Compact Q4_0/Q4_1 [rows, cols] block stream (32 four-bit quants per block);
 /// realistic d/m so no lane is denormal or inf.
 std::pair<std::vector<uint8_t>, TensorView>
-make_tensor_q4(int64_t rows, int64_t cols, uint64_t seed) {
-    const int64_t blocks_per_row = (cols + q4_1_block_elems - 1) / q4_1_block_elems;
-    std::vector<uint8_t> buf(static_cast<size_t>(
-        rows * blocks_per_row * static_cast<int64_t>(q4_1_block_bytes)));
+make_tensor_q4(int64_t rows, int64_t cols, uint64_t seed, DataType fmt = DataType::q4_1)
+{
+    const int64_t blocks_per_row = (cols + q4_block_elems - 1) / q4_block_elems;
+    const int64_t bb = static_cast<int64_t>(data_type_block_bytes(fmt));
+    std::vector<uint8_t> buf(static_cast<size_t>(rows * blocks_per_row * bb));
 
     nnops::test::XorShift128 rng(seed);
     for (int64_t r = 0; r < rows; ++r) {
         for (int64_t b = 0; b < blocks_per_row; ++b) {
-            q4_1_block blk{};
-            blk.d = cpu::half_to_bits(cpu::float_to_half(rng.next_float(0.002f, 0.02f)));
-            blk.m = cpu::half_to_bits(cpu::float_to_half(rng.next_float(-0.1f, 0.1f)));
+            uint8_t* blk = buf.data() + static_cast<size_t>((r * blocks_per_row + b) * bb);
+            const uint16_t d = cpu::half_to_bits(cpu::float_to_half(rng.next_float(0.002f, 0.02f)));
+            const uint16_t m = cpu::half_to_bits(cpu::float_to_half(rng.next_float(-0.1f, 0.1f)));
+            std::memcpy(blk + 0, &d, 2);
+            const int qoff = q4_has_min(fmt) ? 4 : 2;
+            if (q4_has_min(fmt)) {
+                std::memcpy(blk + 2, &m, 2);
+            }
             for (int j = 0; j < 16; ++j) {
                 const uint32_t q0 = static_cast<uint32_t>(rng.next_u64() & 0x0F);
                 const uint32_t q1 = static_cast<uint32_t>(rng.next_u64() & 0x0F);
-                blk.qs[j] = static_cast<uint8_t>(q0 | (q1 << 4));
+                blk[qoff + j] = static_cast<uint8_t>(q0 | (q1 << 4));
             }
-            std::memcpy(buf.data() + static_cast<size_t>(
-                            (r * blocks_per_row + b)
-                            * static_cast<int64_t>(q4_1_block_bytes)),
-                        &blk, q4_1_block_bytes);
         }
     }
 
     const int64_t shape[] = {rows, cols};
-    TensorView tv(shape, DataType::q4_1, buf.data());
+    TensorView tv(shape, fmt, buf.data());
     return {std::move(buf), tv};
 }
 
@@ -403,19 +408,21 @@ void bench_i8_case(const GeMMCase& c) {
     print_report(run_geMM_i8(c, threads, iters));
 }
 
-// ---- Q4_1 right-hand side --------------------------------------------------
+// ---- Q4_0 / Q4_1 right-hand side ------------------------------------------
 //
-// B arrives at 0.625 bytes/value instead of 4 (f32) or 2 (f16); the file header
-// covers what the pack step does with it.
+// B arrives at 0.5625 (Q4_0) or 0.625 (Q4_1) bytes/value instead of 4 (f32) or
+// 2 (f16); the file header covers what the pack step does with it.
 template <typename T>
-GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int iters) {
+GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int iters,
+                       DataType fmt = DataType::q4_1)
+{
     const int64_t a_rows = c.ta ? c.K : c.M;
     const int64_t a_cols = c.ta ? c.M : c.K;
     const int64_t b_rows = c.tb ? c.N : c.K;
     const int64_t b_cols = c.tb ? c.K : c.N;
 
     auto [a_vec, a] = make_tensor<T>(a_rows, a_cols, a_cols + c.pad_a, 1);
-    auto [b_vec, b] = make_tensor_q4(b_rows, b_cols, 2);
+    auto [b_vec, b] = make_tensor_q4(b_rows, b_cols, 2, fmt);
 
     MatMulAttributes attrs{};
     attrs.transpose_a = c.ta;
@@ -429,21 +436,19 @@ GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int i
 
     // The route the call will take. Past the fused small-M limits a Q4_1 B is
     // the planned route, and on an SME machine that is the ZA plan.
-    [[maybe_unused]] constexpr bool sme_dtype =
-        std::is_same_v<T, float> || std::is_same_v<T, half>;
+    [[maybe_unused]] constexpr bool sme_dtype = std::is_same_v<T, float> || std::is_same_v<T, half>;
     [[maybe_unused]] const int fused_max =
-        c.tb ? (std::is_same_v<T, half> ? cpu::arch::Q4Block::fused_max_m_trans_f16 :
-                                          cpu::arch::Q4Block::fused_max_m_trans) :
-               cpu::arch::Q4Block::fused_max_m_copy;
+        c.tb ? (std::is_same_v<T, half> ? cpu::arch::Q4_1Block::fused_max_m_trans_f16 :
+                                          cpu::arch::Q4_1Block::fused_max_m_trans) :
+               cpu::arch::Q4_1Block::fused_max_m_copy;
     bool sme_route = false;
 #if defined(NNOPS_ARCH_SME)
     sme_route = sme_dtype && cpu::aarch64::available_sme() && c.M > 4 && c.N >= 16 && c.K > 0 &&
                 c.M > fused_max && attrs.alpha == 1.0f;
 #endif
 #if defined(NNOPS_ARCH_SME)
-    const cpu::MatMulPlan plan = sme_route ?
-                                     cpu::get_matmul_plan_sme(attrs, a_desc, b_desc, 1) :
-                                     cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
+    const cpu::MatMulPlan plan = sme_route ? cpu::get_matmul_plan_sme(attrs, a_desc, b_desc, 1) :
+                                             cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
 #else
     const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
 #endif
@@ -454,16 +459,17 @@ GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int i
 
     GeMMReport rep;
     rep.name = c.name;
-    rep.route = sme_route ? "q4-SME" : (plan.split_n ? "q4-NKM" : "q4-MKN");
+    rep.route = sme_route ? (fmt == DataType::q4_0 ? "q4_0-SME" : "q4-SME") :
+                            (plan.split_n ? (fmt == DataType::q4_0 ? "q4_0-NKM" : "q4-NKM") :
+                                            (fmt == DataType::q4_0 ? "q4_0-MKN" : "q4-MKN"));
     rep.unit = "GFLOPS";
     rep.pack_a = plan.pack_a;
     rep.pack_b = true;
     rep.mc = static_cast<int>(plan.mc);
     rep.nc = static_cast<int>(plan.nc);
     rep.kc = static_cast<int>(plan.kc);
-    rep.num_blocks = plan.split_n
-        ? (c.N + plan.nc - 1) / plan.nc
-        : cpu::split_block_count(c.M, plan.mc);
+    rep.num_blocks =
+        plan.split_n ? (c.N + plan.nc - 1) / plan.nc : cpu::split_block_count(c.M, plan.mc);
     rep.b_mb = static_cast<double>(b.storage_bytes()) / (1024.0 * 1024.0);
     rep.threads = threads;
 
@@ -483,22 +489,21 @@ GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int i
         }
         auto end = std::chrono::high_resolution_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(end - start).count();
-        rep.gflops.push_back(
-            2.0 * static_cast<double>(c.M) * static_cast<double>(c.N)
-                * static_cast<double>(c.K) * static_cast<double>(iters) / (ms * 1e6));
+        rep.gflops.push_back(2.0 * static_cast<double>(c.M) * static_cast<double>(c.N) *
+                             static_cast<double>(c.K) * static_cast<double>(iters) / (ms * 1e6));
     }
     return rep;
 }
 
-template <typename T>
-void bench_q4_case(const GeMMCase& c) {
+template <typename T> void bench_q4_case(const GeMMCase& c, DataType fmt = DataType::q4_1)
+{
     const int iters = 20;
     std::vector<int> threads{1, 2, 4, 8};
     int hw = static_cast<int>(std::thread::hardware_concurrency());
     if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
         threads.push_back(hw);
     }
-    print_report(run_geMM_q4<T>(c, threads, iters));
+    print_report(run_geMM_q4<T>(c, threads, iters, fmt));
 }
 
 /// The Q4_1 twin of bench_sme_ab: the same block stream through the ZA tiles and
@@ -1074,22 +1079,23 @@ void sweep_q4(const char* tag, const std::vector<SweepShape>& shapes,
 /// such switch and GEMVs to M = 4 regardless.
 template <typename Act>
 void m_ladder_q4(const char* tag, int64_t K, int64_t N, const std::vector<int64_t>& ms,
-                 const std::vector<int>& threads, double target_ms,
-                 bool tb = false, bool packed = false) {
-    std::printf("  M ladder q4_1 vs dense %s  K=%lld N=%lld  B=%s  budget=%.0f ms/cell\n",
-                tag, static_cast<long long>(K), static_cast<long long>(N),
-                tb ? "[N][K]" : "[K][N]", target_ms);
+                 const std::vector<int>& threads, double target_ms, bool tb = false,
+                 bool packed = false)
+{
+    std::printf("  M ladder q4_1 vs dense %s  K=%lld N=%lld  B=%s  budget=%.0f ms/cell\n", tag,
+                static_cast<long long>(K), static_cast<long long>(N), tb ? "[N][K]" : "[K][N]",
+                target_ms);
     if (packed) {
         std::printf("    q4_1 pinned to the packed route; the dense arm GEMVs to M = 4,\n"
                     "    so the small-M cells compare the format, not two routes\n");
     } else {
 #if defined(NNOPS_ARCH_X86_64)
-        constexpr int kTransM = std::is_same_v<Act, half>
-            ? cpu::arch::Q4Block::fused_max_m_trans_f16
-            : cpu::arch::Q4Block::fused_max_m_trans;
+        constexpr int kTransM = std::is_same_v<Act, half> ?
+                                    cpu::arch::Q4_1Block::fused_max_m_trans_f16 :
+                                    cpu::arch::Q4_1Block::fused_max_m_trans;
         std::printf("    as routed: q4_1 fuses to M = %d on %s; the dense arm GEMVs to\n"
                     "    M = 4, so the small-M cells compare routes\n",
-                    tb ? kTransM : int{cpu::arch::Q4Block::fused_max_m_copy},
+                    tb ? kTransM : int{cpu::arch::Q4_1Block::fused_max_m_copy},
                     tb ? "[N][K]" : "[K][N]");
 #else
         std::printf("    block formats take the packed route on this arch\n");
@@ -1136,80 +1142,78 @@ void m_ladder_q4(const char* tag, int64_t K, int64_t N, const std::vector<int64_
     }
 }
 
-/// Same A, dense vs Q4_1 B, interleaved round by round. Small M is
-/// weight-bandwidth bound and Q4_1 wins outright; as M grows the decode is
-/// amortised over more FLOPs and the gap narrows toward the pack cost.
+/// Same A, dense vs Q4_0 vs Q4_1 B, interleaved round by round. Small M is
+/// weight-bandwidth bound and the block formats win outright; as M grows the
+/// decode is amortised over more FLOPs and the gap narrows toward the pack cost.
 template <typename T>
-void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N,
-                       int rounds = 5, int iters = 20) {
+void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N, int rounds = 5,
+                       int iters = 20)
+{
     using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
 
     auto [av, a] = make_tensor<T>(M, K, K, 1);
     auto [bfv, bf] = make_tensor<T>(K, N, N, 2);
-    auto [bqv, bq] = make_tensor_q4(K, N, 2);
+    auto [b0v, b0] = make_tensor_q4(K, N, 2, DataType::q4_0);
+    auto [b1v, b1] = make_tensor_q4(K, N, 2, DataType::q4_1);
 
     MatMulAttributes attrs{};
-    auto op_f = MatMul::create(attrs, Backend::CPU);
-    auto op_q = MatMul::create(attrs, Backend::CPU);
+    OpPtr ops[3] = {MatMul::create(attrs, Backend::CPU), MatMul::create(attrs, Backend::CPU),
+                    MatMul::create(attrs, Backend::CPU)};
+    const TensorView ins[3][2] = {{a, bf}, {a, b0}, {a, b1}};
 
-    const TensorDesc arr_f[] = {a.desc(), bf.desc()};
-    const TensorDesc arr_q[] = {a.desc(), bq.desc()};
-    auto descs_f = op_f->getOutputTensorDesc(arr_f);
-    auto descs_q = op_q->getOutputTensorDesc(arr_q);
-    std::vector<T> out_f(static_cast<size_t>(descs_f[0].numel()));
-    std::vector<T> out_q(static_cast<size_t>(descs_q[0].numel()));
-    auto vout_f = test::make_channel_first(descs_f[0], out_f.data());
-    auto vout_q = test::make_channel_first(descs_q[0], out_q.data());
-
-    const TensorView ins_f[] = {a, bf};
-    const TensorView ins_q[] = {a, bq};
-
-    const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N)
-                       * static_cast<double>(K);
-
-    auto time_f = [&]() {
-        for (int i = 0; i < 2; ++i) { op_f->compute(vout_f, ins_f, {}, nullptr); }
-        const auto t0 = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < iters; ++i) { op_f->compute(vout_f, ins_f, {}, nullptr); }
-        const double ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t0).count();
-        return flops * iters / (ms * 1e6);
-    };
-    auto time_q = [&]() {
-        for (int i = 0; i < 2; ++i) { op_q->compute(vout_q, ins_q, {}, nullptr); }
-        const auto t0 = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < iters; ++i) { op_q->compute(vout_q, ins_q, {}, nullptr); }
-        const double ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t0).count();
-        return flops * iters / (ms * 1e6);
-    };
-
-    const double b_f_mb = static_cast<double>(bf.storage_bytes()) / (1024.0 * 1024.0);
-    const double b_q_mb = static_cast<double>(bq.storage_bytes()) / (1024.0 * 1024.0);
-
-    const char* dense = std::is_same_v<T, float> ? "f32" : "f16";
-    std::printf("  %s B-format A/B  %lldx%lldx%lld  1T  rounds=%d iters=%d  "
-                "B: %s %.2f MB, q4_1 %.2f MB\n",
-                tag, static_cast<long long>(M), static_cast<long long>(K),
-                static_cast<long long>(N), rounds, iters, dense, b_f_mb, b_q_mb);
-
-    std::vector<double> vf, vq;
-    for (int r = 0; r < rounds; ++r) {
-        const double gf = time_f();
-        const double gq = time_q();
-        vf.push_back(gf);
-        vq.push_back(gq);
-        std::printf("    round %d:  %s=%7.1f  q4_1=%7.1f   q4/%s=%.3f\n",
-                    r, dense, gf, gq, dense, gq / gf);
+    std::vector<T> out_buf[3];
+    TensorView vout[3];
+    for (int i = 0; i < 3; ++i) {
+        const TensorDesc arr[] = {a.desc(), ins[i][1].desc()};
+        const auto descs = ops[i]->getOutputTensorDesc(arr);
+        out_buf[i].assign(static_cast<size_t>(descs[0].numel()), T{});
+        vout[i] = test::make_channel_first(descs[0], out_buf[i].data());
     }
 
-    auto median = [](std::vector<double> v) {
-        std::sort(v.begin(), v.end());
-        return v[v.size() / 2];
+    const double flops =
+        2.0 * static_cast<double>(M) * static_cast<double>(N) * static_cast<double>(K);
+    auto time_arm = [&](int i) {
+        for (int w = 0; w < 2; ++w) {
+            ops[i]->compute(vout[i], ins[i], {}, nullptr);
+        }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < iters; ++it) {
+            ops[i]->compute(vout[i], ins[i], {}, nullptr);
+        }
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::high_resolution_clock::now() - t0)
+                              .count();
+        return flops * iters / (ms * 1e6);
     };
-    const double mf = median(vf), mq = median(vq);
-    std::printf("    median:   %s=%7.1f  q4_1=%7.1f   q4/%s=%.3f\n", dense, mf, mq,
-                dense, mq / mf);
+
+    const double mb = 1024.0 * 1024.0;
+    std::printf(
+        "  %s B-format A/B  %lldx%lldx%lld  1T  rounds=%d iters=%d  "
+        "B: dense %.2f MB, q4_0 %.2f MB, q4_1 %.2f MB\n",
+        tag, static_cast<long long>(M), static_cast<long long>(K), static_cast<long long>(N),
+        rounds, iters, static_cast<double>(bf.storage_bytes()) / mb,
+        static_cast<double>(b0.storage_bytes()) / mb, static_cast<double>(b1.storage_bytes()) / mb);
+
+    std::vector<double> v[3];
+    for (int r = 0; r < rounds; ++r) {
+        double g[3];
+        for (int i = 0; i < 3; ++i) {
+            g[i] = time_arm(i);
+            v[i].push_back(g[i]);
+        }
+        std::printf("    round %d:  dense=%7.1f  q4_0=%7.1f  q4_1=%7.1f   "
+                    "q4_0/dense=%.3f  q4_1/dense=%.3f\n",
+                    r, g[0], g[1], g[2], g[1] / g[0], g[2] / g[0]);
+    }
+
+    auto median = [](std::vector<double> x) {
+        std::sort(x.begin(), x.end());
+        return x[x.size() / 2];
+    };
+    const double m[3] = {median(v[0]), median(v[1]), median(v[2])};
+    std::printf("    median:   dense=%7.1f  q4_0=%7.1f  q4_1=%7.1f   "
+                "q4_0/dense=%.3f  q4_1/dense=%.3f\n",
+                m[0], m[1], m[2], m[1] / m[0], m[2] / m[0]);
 }
 
 // Interleaved A/B of the two activation dtypes over identical memory: one byte
@@ -1787,57 +1791,93 @@ NNOPS_BENCH(matmul_u8s8_vs_s8_ab) {
 // int8 with an integer destination (s32 / s8 / u8) + int32 bias
 // ============================================================
 
-NNOPS_BENCH(matmul_i8_out_256) {
+NNOPS_BENCH(matmul_i8_out_256)
+{
     // Small enough that the output pass is a real share of the call.
     bench_i8_out_ab("nn", 256, 256, 256);
 }
 
-NNOPS_BENCH(matmul_i8_out_large) {
+NNOPS_BENCH(matmul_i8_out_large)
+{
     // GEMM-bound: the same pass amortized over 4x the work.
     bench_i8_out_ab("nn", 1024, 512, 1024);
 }
 
-NNOPS_BENCH(matmul_i8_out_decode) {
+NNOPS_BENCH(matmul_i8_out_decode)
+{
     // One token: the pass is M rows, the GEMM is M·K·N, so s8 costs the most
     // relative to s32 here.
     bench_i8_out_ab("nn", 8, 4096, 4096);
 }
 
 // ============================================================
-// Q4_1 weights — llama.cpp block stream on the RHS
+// Q4_0 / Q4_1 weights — llama.cpp block stream on the RHS
 // ============================================================
 
-NNOPS_BENCH(matmul_q4_f32_nn_large) {
+NNOPS_BENCH(matmul_q4_f32_nn_large)
+{
     bench_q4_case<float>({"q4/f32 nn 1024x512x1024", 1024, 512, 1024});
 }
 
-NNOPS_BENCH(matmul_q4_f32_tb_large) {
+NNOPS_BENCH(matmul_q4_f32_tb_large)
+{
     // LLM-style: the weight is stored [N][K] and consumed as A @ W^T, which is
     // the layout a quantized checkpoint is loaded in.
     bench_q4_case<float>({"q4/f32 tb 1024x512x1024", 1024, 512, 1024,
                           /*ta=*/false, /*tb=*/true});
 }
 
-NNOPS_BENCH(matmul_q4_f16_nn) {
+NNOPS_BENCH(matmul_q4_f16_nn)
+{
     bench_q4_case<half>({"q4/f16 nn 1024x512x1024", 1024, 512, 1024,
                          /*ta=*/false, /*tb=*/false, /*pad_a=*/0, /*pad_b=*/0,
                          /*f16=*/true});
 }
 
-NNOPS_BENCH(matmul_q4_f16_tb) {
+NNOPS_BENCH(matmul_q4_f16_tb)
+{
     bench_q4_case<half>({"q4/f16 tb 1024x512x1024", 1024, 512, 1024,
                          /*ta=*/false, /*tb=*/true, /*pad_a=*/0, /*pad_b=*/0,
                          /*f16=*/true});
 }
 
-NNOPS_BENCH(matmul_q4_decode) {
+NNOPS_BENCH(matmul_q4_decode)
+{
     // One token, almost no A-side work: the weight stream's bandwidth limit.
     // The block bytes swept per call print as "B=... MB" next to the tiles.
     bench_q4_case<float>({"q4/f32 decode 1x4096x4096", 1, 4096, 4096,
                           /*ta=*/false, /*tb=*/true});
 }
 
-NNOPS_BENCH(matmul_q4_sme_ab) {
+NNOPS_BENCH(matmul_q4_0_f32_nn_large)
+{
+    bench_q4_case<float>({"q4_0/f32 nn 1024x512x1024", 1024, 512, 1024}, DataType::q4_0);
+}
+
+NNOPS_BENCH(matmul_q4_0_f32_tb_large)
+{
+    bench_q4_case<float>({"q4_0/f32 tb 1024x512x1024", 1024, 512, 1024,
+                          /*ta=*/false, /*tb=*/true},
+                         DataType::q4_0);
+}
+
+NNOPS_BENCH(matmul_q4_0_f16_nn)
+{
+    bench_q4_case<half>({"q4_0/f16 nn 1024x512x1024", 1024, 512, 1024,
+                         /*ta=*/false, /*tb=*/false, /*pad_a=*/0, /*pad_b=*/0,
+                         /*f16=*/true},
+                        DataType::q4_0);
+}
+
+NNOPS_BENCH(matmul_q4_0_decode)
+{
+    bench_q4_case<float>({"q4_0/f32 decode 1x4096x4096", 1, 4096, 4096,
+                          /*ta=*/false, /*tb=*/true},
+                         DataType::q4_0);
+}
+
+NNOPS_BENCH(matmul_q4_sme_ab)
+{
     // The ZA tiles against the generic engine on the same block stream, both
     // physical B layouts. M is past the fused small-M limits, so the planned
     // route is the one under test.
@@ -1879,15 +1919,13 @@ NNOPS_BENCH(matmul_q4_pack_only) {
                 const int ldd = static_cast<int>(
                     cpu::mma_pack_align(nr * actual_kc * sizeof(float)) / sizeof(float));
                 if (arm == kQ4) {
-                    cpu::tile_pack_rhs_q4_1(trans, n0, width, k, actual_kc,
-                                            buf.data(), ldd, streams[arm], row_blocks,
-                                            scale);
+                    cpu::tile_pack_rhs_q4(trans, n0, width, k, actual_kc, buf.data(), ldd,
+                                          streams[arm], row_blocks, scale, DataType::q4_1);
                 } else {
-                    const float* src = trans
-                        ? fv.data() + static_cast<int64_t>(n0) * K + k
-                        : fv.data() + static_cast<int64_t>(k) * N + n0;
-                    cpu::tile_pack_rhs(trans, width, actual_kc, buf.data(), ldd,
-                                       src, static_cast<int>(N), scale);
+                    const float* src = trans ? fv.data() + static_cast<int64_t>(n0) * K + k :
+                                               fv.data() + static_cast<int64_t>(k) * N + n0;
+                    cpu::tile_pack_rhs(trans, width, actual_kc, buf.data(), ldd, src,
+                                       static_cast<int>(N), scale);
                 }
             }
         }
@@ -2756,77 +2794,130 @@ NNOPS_BENCH(matmul_dq_m_ladder) {
 // Same binary, read as a table: the point cases answer "which route", these
 // answer "at what size". Everything is capped at 2048^3.
 
-NNOPS_BENCH(matmul_f32_size_sweep) {
+NNOPS_BENCH(matmul_f32_size_sweep)
+{
     // Square, doubling-ish from 64 to the 2048 cap. The left end is where the
     // pool has nothing to hand out (256^3 = 2 M-blocks), the right end past L2/L3.
-    sweep_fp<float>("f32", {
-        {64, 64, 64},       {96, 96, 96},       {128, 128, 128},   {192, 192, 192},
-        {256, 256, 256},    {384, 384, 384},    {512, 512, 512},   {768, 768, 768},
-        {1024, 1024, 1024}, {1536, 1536, 1536}, {2048, 2048, 2048},
-    }, sweep_threads(), 120.0);
+    sweep_fp<float>("f32",
+                    {
+                        {64, 64, 64},
+                        {96, 96, 96},
+                        {128, 128, 128},
+                        {192, 192, 192},
+                        {256, 256, 256},
+                        {384, 384, 384},
+                        {512, 512, 512},
+                        {768, 768, 768},
+                        {1024, 1024, 1024},
+                        {1536, 1536, 1536},
+                        {2048, 2048, 2048},
+                    },
+                    sweep_threads(), 120.0);
 }
 
-NNOPS_BENCH(matmul_f32_shape_sweep) {
+NNOPS_BENCH(matmul_f32_shape_sweep)
+{
     // Asymmetric shapes, each isolating one axis as the one that must carry the
     // parallelism; at M=1 the block count is whatever N yields.
-    sweep_fp<float>("f32", {
-        {1, 2048, 2048},      // decode: one token, M is not a splittable axis
-        {16, 2048, 2048},     // small-batch decode
-        {2048, 512, 128},     // tall-skinny: only M splits
-        {128, 512, 2048},     // short-fat: N > M, takes the NKM split
-        {512, 2048, 512},     // deep K: kc blocking, not tile count, dominates
-        {2048, 2048, 2048},   // the cap, as the square reference point
-    }, sweep_threads(), 120.0);
+    sweep_fp<float>("f32",
+                    {
+                        {1, 2048, 2048},    // decode: one token, M is not a splittable axis
+                        {16, 2048, 2048},   // small-batch decode
+                        {2048, 512, 128},   // tall-skinny: only M splits
+                        {128, 512, 2048},   // short-fat: N > M, takes the NKM split
+                        {512, 2048, 512},   // deep K: kc blocking, not tile count, dominates
+                        {2048, 2048, 2048}, // the cap, as the square reference point
+                    },
+                    sweep_threads(), 120.0);
 }
 
-NNOPS_BENCH(matmul_f16_size_sweep) {
+NNOPS_BENCH(matmul_f16_size_sweep)
+{
     // f16 runs at the F16C cvt→compute→cvt rate (~78 GFLOPS at 1T on this
     // host), so 2048^3 is a ~220 ms iteration — one per cell here.
-    sweep_fp<half>("f16", {
-        {128, 128, 128},   {256, 256, 256},   {384, 384, 384},   {512, 512, 512},
-        {768, 768, 768},   {1024, 1024, 1024},{1536, 1536, 1536}, {2048, 2048, 2048},
-    }, sweep_threads(), 120.0);
+    sweep_fp<half>("f16",
+                   {
+                       {128, 128, 128},
+                       {256, 256, 256},
+                       {384, 384, 384},
+                       {512, 512, 512},
+                       {768, 768, 768},
+                       {1024, 1024, 1024},
+                       {1536, 1536, 1536},
+                       {2048, 2048, 2048},
+                   },
+                   sweep_threads(), 120.0);
 }
 
-NNOPS_BENCH(matmul_i8_size_sweep) {
+NNOPS_BENCH(matmul_i8_size_sweep)
+{
     // The int8 point case 256^3 collapses at 20T (the kc budget shrinks the tiles
     // as the pool grows); this walks the same curve where the tiles have room.
-    sweep_i8({
-        {128, 128, 128},    {192, 192, 192},    {256, 256, 256},   {384, 384, 384},
-        {512, 512, 512},    {768, 768, 768},    {1024, 1024, 1024},
-        {1536, 1536, 1536}, {2048, 2048, 2048},
-    }, sweep_threads(), 120.0);
+    sweep_i8(
+        {
+            {128, 128, 128},
+            {192, 192, 192},
+            {256, 256, 256},
+            {384, 384, 384},
+            {512, 512, 512},
+            {768, 768, 768},
+            {1024, 1024, 1024},
+            {1536, 1536, 1536},
+            {2048, 2048, 2048},
+        },
+        sweep_threads(), 120.0);
 }
 
-NNOPS_BENCH(matmul_q4_size_sweep) {
+NNOPS_BENCH(matmul_q4_size_sweep)
+{
     // Same square ladder as f32 so the two tables can be read side by side:
     // the delta at each size is what the block-stream pack costs (or saves).
-    sweep_q4<float>("f32", {
-        {64, 64, 64},       {96, 96, 96},       {128, 128, 128},   {192, 192, 192},
-        {256, 256, 256},    {384, 384, 384},    {512, 512, 512},   {768, 768, 768},
-        {1024, 1024, 1024}, {1536, 1536, 1536}, {2048, 2048, 2048},
-    }, sweep_threads(), 120.0);
+    sweep_q4<float>("f32",
+                    {
+                        {64, 64, 64},
+                        {96, 96, 96},
+                        {128, 128, 128},
+                        {192, 192, 192},
+                        {256, 256, 256},
+                        {384, 384, 384},
+                        {512, 512, 512},
+                        {768, 768, 768},
+                        {1024, 1024, 1024},
+                        {1536, 1536, 1536},
+                        {2048, 2048, 2048},
+                    },
+                    sweep_threads(), 120.0);
 }
 
-NNOPS_BENCH(matmul_q4_decode_sweep) {
+NNOPS_BENCH(matmul_q4_decode_sweep)
+{
     // Decode-shaped rows: M stays small while K and N grow, so B is the whole
     // working set and the weight-BW line is the real limit.
-    sweep_q4<float>("f32 decode", {
-        {1, 1024, 1024},  {1, 2048, 2048},  {1, 4096, 4096},
-        {16, 4096, 4096}, {64, 4096, 4096}, {256, 4096, 4096},
-    }, sweep_threads(), 120.0);
+    sweep_q4<float>("f32 decode",
+                    {
+                        {1, 1024, 1024},
+                        {1, 2048, 2048},
+                        {1, 4096, 4096},
+                        {16, 4096, 4096},
+                        {64, 4096, 4096},
+                        {256, 4096, 4096},
+                    },
+                    sweep_threads(), 120.0);
 }
 
-NNOPS_BENCH(matmul_q4_decode_rate) {
+void bench_q4_decode_rate(DataType fmt)
+{
+    const char* q4name = fmt == DataType::q4_0 ? "q4_0" : "q4_1";
 #if defined(NNOPS_ARCH_X86_64)
     // Raw block-decode throughput: no A, no panel, no output traffic. This is
     // the floor the fused route can reach — the packed route additionally
     // writes and re-reads every decoded value.
-    const int64_t rows = 4096, blocks_per_row = 128;   // 4096 x 4096 values
-    auto [bv, b] = make_tensor_q4(rows, blocks_per_row * 32, 3);
+    const int64_t rows = 4096, blocks_per_row = 128; // 4096 x 4096 values
+    auto [bv, b] = make_tensor_q4(rows, blocks_per_row * 32, 3, fmt);
     const uint8_t* p = bv.data();
     const int64_t nblk = rows * blocks_per_row;
     const int64_t values = nblk * 32;
+    const int64_t bb = static_cast<int64_t>(data_type_block_bytes(fmt));
 
     double best = 1e30;
     for (int r = 0; r < 5; ++r) {
@@ -2834,17 +2925,19 @@ NNOPS_BENCH(matmul_q4_decode_rate) {
         const auto t0 = std::chrono::high_resolution_clock::now();
         for (int64_t i = 0; i < nblk; ++i) {
             __m256 v0, v1, v2, v3;
-            cpu::arch::decode_q4_1_block_ps(p + i * 20, v0, v1, v2, v3);
-            acc = _mm256_add_ps(acc, _mm256_add_ps(_mm256_add_ps(v0, v1),
-                                                   _mm256_add_ps(v2, v3)));
+            cpu::arch::decode_q4_block_ps(p + i * bb, v0, v1, v2, v3, 1.0f, fmt);
+            acc = _mm256_add_ps(acc, _mm256_add_ps(_mm256_add_ps(v0, v1), _mm256_add_ps(v2, v3)));
         }
         const double ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t0).count();
-        if (_mm256_cvtss_f32(acc) == 12345.0f) { std::printf(" "); }
+                              std::chrono::high_resolution_clock::now() - t0)
+                              .count();
+        if (_mm256_cvtss_f32(acc) == 12345.0f) {
+            std::printf(" ");
+        }
         best = std::min(best, ms);
     }
-    std::printf("  q4_1 decode-only  4096x4096 blocks: %.3f ms  = %.2f Gvalues/s\n",
-                best, static_cast<double>(values) / (best * 1e6));
+    std::printf("  %s decode-only  4096x4096 blocks: %.3f ms  = %.2f Gvalues/s\n", q4name, best,
+                static_cast<double>(values) / (best * 1e6));
 
     // Same stream through the packer's 32-value decode (writes a small stack
     // array per block, no panel). All four vectors are read back out, or the
@@ -2855,23 +2948,30 @@ NNOPS_BENCH(matmul_q4_decode_rate) {
         __m256 acc = _mm256_setzero_ps();
         const auto t0 = std::chrono::high_resolution_clock::now();
         for (int64_t i = 0; i < nblk; ++i) {
-            cpu::arch::decode_q4_1_block<float>(p + i * 20, vals);
+            cpu::arch::decode_q4_block<float>(p + i * bb, vals, 1.0f, fmt);
             acc = _mm256_add_ps(acc, _mm256_loadu_ps(vals));
             acc = _mm256_add_ps(acc, _mm256_loadu_ps(vals + 8));
             acc = _mm256_add_ps(acc, _mm256_loadu_ps(vals + 16));
             acc = _mm256_add_ps(acc, _mm256_loadu_ps(vals + 24));
         }
         const double ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t0).count();
-        if (_mm256_cvtss_f32(acc) == 12345.0f) { std::printf(" "); }
+                              std::chrono::high_resolution_clock::now() - t0)
+                              .count();
+        if (_mm256_cvtss_f32(acc) == 12345.0f) {
+            std::printf(" ");
+        }
         best = std::min(best, ms);
     }
-    std::printf("  q4_1 decode+stack 4096x4096 blocks: %.3f ms  = %.2f Gvalues/s\n",
-                best, static_cast<double>(values) / (best * 1e6));
+    std::printf("  %s decode+stack 4096x4096 blocks: %.3f ms  = %.2f Gvalues/s\n", q4name, best,
+                static_cast<double>(values) / (best * 1e6));
 #else
-    std::printf("  q4_1 decode rate: x86_64 only\n");
+    std::printf("  %s decode rate: x86_64 only\n", q4name);
 #endif
 }
+
+NNOPS_BENCH(matmul_q4_decode_rate) { bench_q4_decode_rate(DataType::q4_1); }
+
+NNOPS_BENCH(matmul_q4_0_decode_rate) { bench_q4_decode_rate(DataType::q4_0); }
 
 // ---- bias A/B --------------------------------------------------------------
 //

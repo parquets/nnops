@@ -29,9 +29,9 @@
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/core/quant_params.hpp"
-#include "nnops/detail/q4_1.hpp"
+#include "nnops/detail/q4.hpp"
 #include "nnops/detail/half.hpp"
-#include "detail/bench_knobs.hpp" // disable_sme — pin the prepacked comparison
+#include "detail/bench_knobs.hpp"              // disable_sme — pin the prepacked comparison
 #include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme — the blob layout fork
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
@@ -1014,60 +1014,70 @@ namespace {
 /// values; d and m are f16-exact, so the decoded values are exact in f32.
 struct Q4Weight {
     std::vector<uint8_t> bytes;
-    std::vector<float>   decoded;
+    std::vector<float> decoded;
     int64_t rows = 0, cols = 0, blocks = 0;
 };
 
-Q4Weight make_q4_weight(int64_t rows, int64_t cols, uint32_t seed) {
+Q4Weight make_q4_weight(int64_t rows, int64_t cols, uint32_t seed, DataType fmt = DataType::q4_1)
+{
     Q4Weight w;
     w.rows = rows;
     w.cols = cols;
     w.blocks = (cols + q4_1_block_elems - 1) / q4_1_block_elems;
-    w.bytes.assign(static_cast<size_t>(rows * w.blocks
-                                       * static_cast<int64_t>(q4_1_block_bytes)), 0);
+    const int64_t bb = static_cast<int64_t>(data_type_block_bytes(fmt));
+    const int qoff = q4_has_min(fmt) ? 4 : 2;
+    w.bytes.assign(static_cast<size_t>(rows * w.blocks * bb), 0);
     w.decoded.assign(static_cast<size_t>(rows * cols), 0.0f);
 
     for (int64_t r = 0; r < rows; ++r) {
         for (int64_t b = 0; b < w.blocks; ++b) {
-            uint8_t* blk = w.bytes.data() + static_cast<size_t>(
-                (r * w.blocks + b) * static_cast<int64_t>(q4_1_block_bytes));
+            uint8_t* blk = w.bytes.data() + static_cast<size_t>((r * w.blocks + b) * bb);
             const float d = 0.125f * static_cast<float>(1 + (seed + r + b) % 8);
-            const float m = -0.25f * static_cast<float>((seed + 2 * r + b) % 4);
+            const float m =
+                q4_has_min(fmt) ? -0.25f * static_cast<float>((seed + 2 * r + b) % 4) : 0.0f;
             const uint16_t d_bits = backend::cpu::half_to_bits(float_to_half(d));
             const uint16_t m_bits = backend::cpu::half_to_bits(float_to_half(m));
             std::memcpy(blk + 0, &d_bits, 2);
-            std::memcpy(blk + 2, &m_bits, 2);
+            if (q4_has_min(fmt)) {
+                std::memcpy(blk + 2, &m_bits, 2);
+            }
             for (int j = 0; j < 16; ++j) {
                 const int q0 = static_cast<int>((seed + r * 13 + b * 7 + j * 5) & 0x0F);
                 const int q1 = static_cast<int>((seed + r * 7 + b * 11 + j * 3) & 0x0F);
-                blk[4 + j] = static_cast<uint8_t>(q0 | (q1 << 4));
+                blk[qoff + j] = static_cast<uint8_t>(q0 | (q1 << 4));
             }
             const int64_t base = r * cols + b * q4_1_block_elems;
-            const int n = static_cast<int>(std::min<int64_t>(
-                q4_1_block_elems, cols - b * q4_1_block_elems));
+            const int n =
+                static_cast<int>(std::min<int64_t>(q4_1_block_elems, cols - b * q4_1_block_elems));
             for (int j = 0; j < n; ++j) {
-                const int q = (j < 16) ? (blk[4 + j] & 0x0F) : (blk[4 + j - 16] >> 4);
+                const int q = (j < 16) ? (blk[qoff + j] & 0x0F) : (blk[qoff + j - 16] >> 4);
+                const float qv =
+                    q4_has_min(fmt) ? static_cast<float>(q) : static_cast<float>(q - 8);
                 w.decoded[static_cast<size_t>(base + j)] =
-                    half_to_float(float_to_half(d)) * static_cast<float>(q) +
-                    half_to_float(float_to_half(m));
+                    half_to_float(float_to_half(d)) * qv +
+                    (q4_has_min(fmt) ? half_to_float(float_to_half(m)) : 0.0f);
             }
         }
     }
     return w;
 }
 
-template <class T>
-T from_f32(float f) {
-    if constexpr (std::is_same_v<T, half>) { return float_to_half(f); }
-    else if constexpr (std::is_same_v<T, bfloat16>) { return float_to_bfloat16(f); }
-    else { return f; }
+template <class T> T from_f32(float f)
+{
+    if constexpr (std::is_same_v<T, half>) {
+        return float_to_half(f);
+    } else if constexpr (std::is_same_v<T, bfloat16>) {
+        return float_to_bfloat16(f);
+    } else {
+        return f;
+    }
 }
 
 /// The bf16 q4_1 pack narrows each decoded weight once; the reference does the
 /// same so the comparison is against the operand the GEMM actually reads.
 /// (f32/f16 keep the historical f32-decoded reference.)
-template <class T>
-float q4_weight_value(float decoded) {
+template <class T> float q4_weight_value(float decoded)
+{
     if constexpr (std::is_same_v<T, bfloat16>) {
         return bfloat16_to_float(float_to_bfloat16(decoded));
     } else {
@@ -1078,11 +1088,10 @@ float q4_weight_value(float decoded) {
 /// Linear with a q4_1 weight against C = A × Wᵀ from the decoded values, then
 /// the bias, the pre-activation residual and the activation.
 template <class T>
-void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias,
-                     EpilogueActivateType act, float tol, uint32_t seed,
-                     bool pre_act = false)
+void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias, EpilogueActivateType act,
+                     float tol, uint32_t seed, bool pre_act = false, DataType fmt = DataType::q4_1)
 {
-    Q4Weight w = make_q4_weight(N, K, seed);
+    Q4Weight w = make_q4_weight(N, K, seed, fmt);
 
     std::vector<T> a_buf(static_cast<size_t>(M * K));
     nnops::test::XorShift128 rng(seed + 1);
@@ -1097,11 +1106,11 @@ void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias,
     const int64_t ashape[] = {M, K};
     const int64_t wshape[] = {N, K};
     const int64_t bshape[] = {N};
-    constexpr DataType fp_dt = std::is_same_v<T, half>     ? DataType::f16
-                             : std::is_same_v<T, bfloat16> ? DataType::bf16
-                                                           : DataType::f32;
+    constexpr DataType fp_dt = std::is_same_v<T, half>     ? DataType::f16 :
+                               std::is_same_v<T, bfloat16> ? DataType::bf16 :
+                                                             DataType::f32;
     TensorView a(ashape, fp_dt, a_buf.data());
-    TensorView wv(wshape, DataType::q4_1, w.bytes.data());
+    TensorView wv(wshape, fmt, w.bytes.data());
     TensorView bv(bshape, fp_dt, b_buf.data());
 
     LinearAttributes attrs;
@@ -1170,7 +1179,27 @@ NNOPS_TEST(linear_q4_1_weight) {
     check_linear_q4<float>(17, 70, 37, true, EpilogueActivateType::Relu, tol, 37, true);
 }
 
-NNOPS_TEST(linear_q4_1_weight_f16) {
+/// Q4_0 differs from Q4_1 only in the decode (d·(q − 8), no min); the same
+/// fused/packed/SME route ladder applies.
+NNOPS_TEST(linear_q4_0_weight)
+{
+    const float tol = 2e-4f;
+    check_linear_q4<float>(1, 70, 37, false, EpilogueActivateType::None, tol, 31, false,
+                           DataType::q4_0);
+    check_linear_q4<float>(17, 70, 37, true, EpilogueActivateType::Relu, tol, 33, false,
+                           DataType::q4_0);
+    check_linear_q4<float>(5, 33, 18, true, EpilogueActivateType::Relu6, tol, 34, false,
+                           DataType::q4_0);
+    check_linear_q4<float>(64, 96, 44, false, EpilogueActivateType::None, tol, 35, false,
+                           DataType::q4_0);
+    check_linear_q4<float>(17, 70, 37, true, EpilogueActivateType::Relu, tol, 37, true,
+                           DataType::q4_0);
+    check_linear_q4<half>(64, 96, 44, false, EpilogueActivateType::None, test::kF16AccumTol, 45,
+                          false, DataType::q4_0);
+}
+
+NNOPS_TEST(linear_q4_1_weight_f16)
+{
     // f16 activations are the w4a16 decode case: the weight decodes into f32
     // registers and the output round-trips through f16 once.
     const float tol = test::kF16AccumTol;
