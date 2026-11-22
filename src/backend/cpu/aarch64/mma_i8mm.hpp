@@ -100,29 +100,174 @@ i8mm_store12_tail(int32_t* NNOPS_RESTRICT ce, int32_t* NNOPS_RESTRICT co, bool s
                   int32x4_t c0, int32x4_t c1, int32x4_t c2, int32x4_t c3, int32x4_t c4,
                   int32x4_t c5, int32_t clamp_min, int32_t clamp_max) noexcept
 {
-    const int32x4_t acc[6] = {c0, c1, c2, c3, c4, c5};
-    for (int half = 0; half < 2; ++half) {
-        if (half == 1 && !store_odd) {
-            break;
+    if (rem > 0) {
+        int32_t x = vgetq_lane_s32(c0, 0);
+        if constexpr (!zero_mode) {
+            x += ce[0];
         }
-        int32_t* NNOPS_RESTRICT cp = (half == 0) ? ce : co;
-        for (int j = 0; j < 6; ++j) {
-            const int col0 = 2 * j;
-            if (col0 >= rem) {
-                break;
+        ce[0] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 1) {
+        int32_t x = vgetq_lane_s32(c0, 1);
+        if constexpr (!zero_mode) {
+            x += ce[1];
+        }
+        ce[1] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 2) {
+        int32_t x = vgetq_lane_s32(c1, 0);
+        if constexpr (!zero_mode) {
+            x += ce[2];
+        }
+        ce[2] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 3) {
+        int32_t x = vgetq_lane_s32(c1, 1);
+        if constexpr (!zero_mode) {
+            x += ce[3];
+        }
+        ce[3] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 4) {
+        int32_t x = vgetq_lane_s32(c2, 0);
+        if constexpr (!zero_mode) {
+            x += ce[4];
+        }
+        ce[4] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 5) {
+        int32_t x = vgetq_lane_s32(c2, 1);
+        if constexpr (!zero_mode) {
+            x += ce[5];
+        }
+        ce[5] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 6) {
+        int32_t x = vgetq_lane_s32(c3, 0);
+        if constexpr (!zero_mode) {
+            x += ce[6];
+        }
+        ce[6] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 7) {
+        int32_t x = vgetq_lane_s32(c3, 1);
+        if constexpr (!zero_mode) {
+            x += ce[7];
+        }
+        ce[7] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 8) {
+        int32_t x = vgetq_lane_s32(c4, 0);
+        if constexpr (!zero_mode) {
+            x += ce[8];
+        }
+        ce[8] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 9) {
+        int32_t x = vgetq_lane_s32(c4, 1);
+        if constexpr (!zero_mode) {
+            x += ce[9];
+        }
+        ce[9] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 10) {
+        int32_t x = vgetq_lane_s32(c5, 0);
+        if constexpr (!zero_mode) {
+            x += ce[10];
+        }
+        ce[10] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (rem > 11) {
+        int32_t x = vgetq_lane_s32(c5, 1);
+        if constexpr (!zero_mode) {
+            x += ce[11];
+        }
+        ce[11] = std::min(std::max(x, clamp_min), clamp_max);
+    }
+    if (store_odd) {
+        if (rem > 0) {
+            int32_t x = vgetq_lane_s32(c0, 2);
+            if constexpr (!zero_mode) {
+                x += co[0];
             }
-            int32_t lane[4];
-            vst1q_s32(lane, acc[j]);
-            for (int h = 0; h < 2; ++h) {
-                if (col0 + h >= rem) {
-                    break;
-                }
-                int32_t v = lane[half * 2 + h];
-                if constexpr (!zero_mode) {
-                    v += cp[col0 + h];
-                }
-                cp[col0 + h] = std::min(std::max(v, clamp_min), clamp_max);
+            co[0] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 1) {
+            int32_t x = vgetq_lane_s32(c0, 3);
+            if constexpr (!zero_mode) {
+                x += co[1];
             }
+            co[1] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 2) {
+            int32_t x = vgetq_lane_s32(c1, 2);
+            if constexpr (!zero_mode) {
+                x += co[2];
+            }
+            co[2] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 3) {
+            int32_t x = vgetq_lane_s32(c1, 3);
+            if constexpr (!zero_mode) {
+                x += co[3];
+            }
+            co[3] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 4) {
+            int32_t x = vgetq_lane_s32(c2, 2);
+            if constexpr (!zero_mode) {
+                x += co[4];
+            }
+            co[4] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 5) {
+            int32_t x = vgetq_lane_s32(c2, 3);
+            if constexpr (!zero_mode) {
+                x += co[5];
+            }
+            co[5] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 6) {
+            int32_t x = vgetq_lane_s32(c3, 2);
+            if constexpr (!zero_mode) {
+                x += co[6];
+            }
+            co[6] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 7) {
+            int32_t x = vgetq_lane_s32(c3, 3);
+            if constexpr (!zero_mode) {
+                x += co[7];
+            }
+            co[7] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 8) {
+            int32_t x = vgetq_lane_s32(c4, 2);
+            if constexpr (!zero_mode) {
+                x += co[8];
+            }
+            co[8] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 9) {
+            int32_t x = vgetq_lane_s32(c4, 3);
+            if constexpr (!zero_mode) {
+                x += co[9];
+            }
+            co[9] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 10) {
+            int32_t x = vgetq_lane_s32(c5, 2);
+            if constexpr (!zero_mode) {
+                x += co[10];
+            }
+            co[10] = std::min(std::max(x, clamp_min), clamp_max);
+        }
+        if (rem > 11) {
+            int32_t x = vgetq_lane_s32(c5, 3);
+            if constexpr (!zero_mode) {
+                x += co[11];
+            }
+            co[11] = std::min(std::max(x, clamp_min), clamp_max);
         }
     }
 }
@@ -379,24 +524,89 @@ mma_pack_mr1_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ld
             }
             vst1q_s32(c0_ptr + 8, vminq_s32(vmaxq_s32(v, vmin), vmax));
         } else {
-            const int32x4_t acc[6] = {v_c00, v_c01, v_c02, v_c03, v_c04, v_c05};
-            for (int j = 0; j < 6; ++j) {
-                const int col0 = 2 * j;
-                if (col0 >= rem) {
-                    break;
+            if (rem > 0) {
+                int32_t x = vgetq_lane_s32(v_c00, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[0];
                 }
-                int32_t lane[4];
-                vst1q_s32(lane, acc[j]);
-                for (int h = 0; h < 2; ++h) {
-                    if (col0 + h >= rem) {
-                        break;
-                    }
-                    int32_t v = lane[h];
-                    if constexpr (!zero_mode) {
-                        v += c0_ptr[col0 + h];
-                    }
-                    c0_ptr[col0 + h] = std::min(std::max(v, clamp_min), clamp_max);
+                c0_ptr[0] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 1) {
+                int32_t x = vgetq_lane_s32(v_c00, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[1];
                 }
+                c0_ptr[1] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 2) {
+                int32_t x = vgetq_lane_s32(v_c01, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[2];
+                }
+                c0_ptr[2] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 3) {
+                int32_t x = vgetq_lane_s32(v_c01, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[3];
+                }
+                c0_ptr[3] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 4) {
+                int32_t x = vgetq_lane_s32(v_c02, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[4];
+                }
+                c0_ptr[4] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 5) {
+                int32_t x = vgetq_lane_s32(v_c02, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[5];
+                }
+                c0_ptr[5] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 6) {
+                int32_t x = vgetq_lane_s32(v_c03, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[6];
+                }
+                c0_ptr[6] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 7) {
+                int32_t x = vgetq_lane_s32(v_c03, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[7];
+                }
+                c0_ptr[7] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 8) {
+                int32_t x = vgetq_lane_s32(v_c04, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[8];
+                }
+                c0_ptr[8] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 9) {
+                int32_t x = vgetq_lane_s32(v_c04, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[9];
+                }
+                c0_ptr[9] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 10) {
+                int32_t x = vgetq_lane_s32(v_c05, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[10];
+                }
+                c0_ptr[10] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 11) {
+                int32_t x = vgetq_lane_s32(v_c05, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[11];
+                }
+                c0_ptr[11] = std::min(std::max(x, clamp_min), clamp_max);
             }
         }
 
@@ -732,24 +942,89 @@ mma_direct_mr1_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int 
             }
             vst1q_s32(c0_ptr + 8, vminq_s32(vmaxq_s32(v, vmin), vmax));
         } else {
-            const int32x4_t acc[6] = {v_c00, v_c01, v_c02, v_c03, v_c04, v_c05};
-            for (int j = 0; j < 6; ++j) {
-                const int col0 = 2 * j;
-                if (col0 >= rem) {
-                    break;
+            if (rem > 0) {
+                int32_t x = vgetq_lane_s32(v_c00, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[0];
                 }
-                int32_t lane[4];
-                vst1q_s32(lane, acc[j]);
-                for (int h = 0; h < 2; ++h) {
-                    if (col0 + h >= rem) {
-                        break;
-                    }
-                    int32_t v = lane[h];
-                    if constexpr (!zero_mode) {
-                        v += c0_ptr[col0 + h];
-                    }
-                    c0_ptr[col0 + h] = std::min(std::max(v, clamp_min), clamp_max);
+                c0_ptr[0] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 1) {
+                int32_t x = vgetq_lane_s32(v_c00, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[1];
                 }
+                c0_ptr[1] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 2) {
+                int32_t x = vgetq_lane_s32(v_c01, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[2];
+                }
+                c0_ptr[2] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 3) {
+                int32_t x = vgetq_lane_s32(v_c01, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[3];
+                }
+                c0_ptr[3] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 4) {
+                int32_t x = vgetq_lane_s32(v_c02, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[4];
+                }
+                c0_ptr[4] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 5) {
+                int32_t x = vgetq_lane_s32(v_c02, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[5];
+                }
+                c0_ptr[5] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 6) {
+                int32_t x = vgetq_lane_s32(v_c03, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[6];
+                }
+                c0_ptr[6] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 7) {
+                int32_t x = vgetq_lane_s32(v_c03, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[7];
+                }
+                c0_ptr[7] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 8) {
+                int32_t x = vgetq_lane_s32(v_c04, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[8];
+                }
+                c0_ptr[8] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 9) {
+                int32_t x = vgetq_lane_s32(v_c04, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[9];
+                }
+                c0_ptr[9] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 10) {
+                int32_t x = vgetq_lane_s32(v_c05, 0);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[10];
+                }
+                c0_ptr[10] = std::min(std::max(x, clamp_min), clamp_max);
+            }
+            if (rem > 11) {
+                int32_t x = vgetq_lane_s32(v_c05, 1);
+                if constexpr (!zero_mode) {
+                    x += c0_ptr[11];
+                }
+                c0_ptr[11] = std::min(std::max(x, clamp_min), clamp_max);
             }
         }
 

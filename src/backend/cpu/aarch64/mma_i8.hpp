@@ -7,8 +7,8 @@
 /// [clamp_min, clamp_max]. The int8 sibling of mma_f32.hpp / mma_f16.hpp, with
 /// the same runtime panel height `mr` and the same partial-M convention: rows
 /// past `mr` reuse the last live row's index in A and C, so a short panel needs
-/// no per-row guards. Those C rows alias the last live row, which is why the
-/// tail store loops over the live rows only.
+/// no per-row guards: the tail stores the duplicate rows back to the same
+/// address.
 ///
 /// Two A presentations share the same packed B:
 ///   - packed A (mma_pack_mr{8,4,1}_nr12_*): four-byte k groups, one group
@@ -314,37 +314,172 @@ inline void mma_pack_mr8_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS
             }
         }
 
-        const int32x4_t acc[8][3] = {
-            {v_c00, v_c01, v_c02}, {v_c10, v_c11, v_c12}, {v_c20, v_c21, v_c22},
-            {v_c30, v_c31, v_c32}, {v_c40, v_c41, v_c42}, {v_c50, v_c51, v_c52},
-            {v_c60, v_c61, v_c62}, {v_c70, v_c71, v_c72},
-        };
-        int32_t* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
-                                             c4_ptr, c5_ptr, c6_ptr, c7_ptr};
-        // Only the live rows: an alias row would write the last live row over itself.
-        for (int r = 0; r < mr; ++r) {
-            int32_t* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 4; rr -= 4, ++g) {
-                int32x4_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_s32(v, vld1q_s32(cp));
-                }
-                vst1q_s32(cp, vminq_s32(vmaxq_s32(v, vmin), vmax));
-                cp += 4;
+        if (rem >= 4) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
+                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
+                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
+                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
+                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
             }
-            if (rr > 0) {
-                int32_t lane[4];
-                vst1q_s32(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    int32_t v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v += cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, clamp_min), clamp_max);
-                }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
+            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
+            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
+            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+            v_c00 = v_c01;
+            v_c10 = v_c11;
+            v_c20 = v_c21;
+            v_c30 = v_c31;
+            v_c40 = v_c41;
+            v_c50 = v_c51;
+            v_c60 = v_c61;
+            v_c70 = v_c71;
+        }
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
+                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
+                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
+                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
+                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
             }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
+            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
+            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
+            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+            v_c00 = v_c02;
+            v_c10 = v_c12;
+            v_c20 = v_c22;
+            v_c30 = v_c32;
+            v_c40 = v_c42;
+            v_c50 = v_c52;
+            v_c60 = v_c62;
+            v_c70 = v_c72;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
+                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
+                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
+                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
+                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
+            }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
+            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
+            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
+            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const int32x2_t vmin2 = vget_low_s32(vmin);
+            const int32x2_t vmax2 = vget_low_s32(vmax);
+            int32x2_t v0 = vget_low_s32(v_c00);
+            int32x2_t v1 = vget_low_s32(v_c10);
+            int32x2_t v2 = vget_low_s32(v_c20);
+            int32x2_t v3 = vget_low_s32(v_c30);
+            int32x2_t v4 = vget_low_s32(v_c40);
+            int32x2_t v5 = vget_low_s32(v_c50);
+            int32x2_t v6 = vget_low_s32(v_c60);
+            int32x2_t v7 = vget_low_s32(v_c70);
+            if constexpr (!zero_mode) {
+                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
+                v1 = vadd_s32(v1, vld1_s32(c1_ptr));
+                v2 = vadd_s32(v2, vld1_s32(c2_ptr));
+                v3 = vadd_s32(v3, vld1_s32(c3_ptr));
+                v4 = vadd_s32(v4, vld1_s32(c4_ptr));
+                v5 = vadd_s32(v5, vld1_s32(c5_ptr));
+                v6 = vadd_s32(v6, vld1_s32(c6_ptr));
+                v7 = vadd_s32(v7, vld1_s32(c7_ptr));
+            }
+            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
+            vst1_s32(c1_ptr, vmin_s32(vmax_s32(v1, vmin2), vmax2));
+            vst1_s32(c2_ptr, vmin_s32(vmax_s32(v2, vmin2), vmax2));
+            vst1_s32(c3_ptr, vmin_s32(vmax_s32(v3, vmin2), vmax2));
+            vst1_s32(c4_ptr, vmin_s32(vmax_s32(v4, vmin2), vmax2));
+            vst1_s32(c5_ptr, vmin_s32(vmax_s32(v5, vmin2), vmax2));
+            vst1_s32(c6_ptr, vmin_s32(vmax_s32(v6, vmin2), vmax2));
+            vst1_s32(c7_ptr, vmin_s32(vmax_s32(v7, vmin2), vmax2));
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+            c4_ptr += 2;
+            c5_ptr += 2;
+            c6_ptr += 2;
+            c7_ptr += 2;
+        }
+        if (rl & 1) {
+            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
+            int32_t x1 = (rl & 2) ? vgetq_lane_s32(v_c10, 2) : vgetq_lane_s32(v_c10, 0);
+            int32_t x2 = (rl & 2) ? vgetq_lane_s32(v_c20, 2) : vgetq_lane_s32(v_c20, 0);
+            int32_t x3 = (rl & 2) ? vgetq_lane_s32(v_c30, 2) : vgetq_lane_s32(v_c30, 0);
+            int32_t x4 = (rl & 2) ? vgetq_lane_s32(v_c40, 2) : vgetq_lane_s32(v_c40, 0);
+            int32_t x5 = (rl & 2) ? vgetq_lane_s32(v_c50, 2) : vgetq_lane_s32(v_c50, 0);
+            int32_t x6 = (rl & 2) ? vgetq_lane_s32(v_c60, 2) : vgetq_lane_s32(v_c60, 0);
+            int32_t x7 = (rl & 2) ? vgetq_lane_s32(v_c70, 2) : vgetq_lane_s32(v_c70, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+                x1 += c1_ptr[0];
+                x2 += c2_ptr[0];
+                x3 += c3_ptr[0];
+                x4 += c4_ptr[0];
+                x5 += c5_ptr[0];
+                x6 += c6_ptr[0];
+                x7 += c7_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
+            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
+            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
+            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
+            c4_ptr[0] = std::min(std::max(x4, clamp_min), clamp_max);
+            c5_ptr[0] = std::min(std::max(x5, clamp_min), clamp_max);
+            c6_ptr[0] = std::min(std::max(x6, clamp_min), clamp_max);
+            c7_ptr[0] = std::min(std::max(x7, clamp_min), clamp_max);
         }
     }
 }
@@ -492,36 +627,100 @@ inline void mma_pack_mr4_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS
             }
         }
 
-        const int32x4_t acc[4][3] = {
-            {v_c00, v_c01, v_c02},
-            {v_c10, v_c11, v_c12},
-            {v_c20, v_c21, v_c22},
-            {v_c30, v_c31, v_c32},
-        };
-        int32_t* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
-        for (int r = 0; r < mr; ++r) {
-            int32_t* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 4; rr -= 4, ++g) {
-                int32x4_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_s32(v, vld1q_s32(cp));
-                }
-                vst1q_s32(cp, vminq_s32(vmaxq_s32(v, vmin), vmax));
-                cp += 4;
+        if (rem >= 4) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
             }
-            if (rr > 0) {
-                int32_t lane[4];
-                vst1q_s32(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    int32_t v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v += cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, clamp_min), clamp_max);
-                }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            v_c00 = v_c01;
+            v_c10 = v_c11;
+            v_c20 = v_c21;
+            v_c30 = v_c31;
+        }
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
             }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            v_c00 = v_c02;
+            v_c10 = v_c12;
+            v_c20 = v_c22;
+            v_c30 = v_c32;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
+            }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const int32x2_t vmin2 = vget_low_s32(vmin);
+            const int32x2_t vmax2 = vget_low_s32(vmax);
+            int32x2_t v0 = vget_low_s32(v_c00);
+            int32x2_t v1 = vget_low_s32(v_c10);
+            int32x2_t v2 = vget_low_s32(v_c20);
+            int32x2_t v3 = vget_low_s32(v_c30);
+            if constexpr (!zero_mode) {
+                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
+                v1 = vadd_s32(v1, vld1_s32(c1_ptr));
+                v2 = vadd_s32(v2, vld1_s32(c2_ptr));
+                v3 = vadd_s32(v3, vld1_s32(c3_ptr));
+            }
+            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
+            vst1_s32(c1_ptr, vmin_s32(vmax_s32(v1, vmin2), vmax2));
+            vst1_s32(c2_ptr, vmin_s32(vmax_s32(v2, vmin2), vmax2));
+            vst1_s32(c3_ptr, vmin_s32(vmax_s32(v3, vmin2), vmax2));
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+        }
+        if (rl & 1) {
+            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
+            int32_t x1 = (rl & 2) ? vgetq_lane_s32(v_c10, 2) : vgetq_lane_s32(v_c10, 0);
+            int32_t x2 = (rl & 2) ? vgetq_lane_s32(v_c20, 2) : vgetq_lane_s32(v_c20, 0);
+            int32_t x3 = (rl & 2) ? vgetq_lane_s32(v_c30, 2) : vgetq_lane_s32(v_c30, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+                x1 += c1_ptr[0];
+                x2 += c2_ptr[0];
+                x3 += c3_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
+            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
+            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
+            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
         }
     }
 }
@@ -612,28 +811,46 @@ inline void mma_pack_mr1_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS
             }
         }
 
-        const int32x4_t acc[3] = {v_c00, v_c01, v_c02};
-        int32_t* NNOPS_RESTRICT cp = c0_ptr;
-        int rr = rem;
-        int g = 0;
-        for (; rr >= 4; rr -= 4, ++g) {
-            int32x4_t v = acc[g];
+        if (rem >= 4) {
             if constexpr (!zero_mode) {
-                v = vaddq_s32(v, vld1q_s32(cp));
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
             }
-            vst1q_s32(cp, vminq_s32(vmaxq_s32(v, vmin), vmax));
-            cp += 4;
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            c0_ptr += 4;
+            v_c00 = v_c01;
         }
-        if (rr > 0) {
-            int32_t lane[4];
-            vst1q_s32(lane, acc[g]);
-            for (int i = 0; i < rr; ++i) {
-                int32_t v = lane[i];
-                if constexpr (!zero_mode) {
-                    v += cp[i];
-                }
-                cp[i] = std::min(std::max(v, clamp_min), clamp_max);
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
             }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            c0_ptr += 4;
+            v_c00 = v_c02;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+            }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            c0_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const int32x2_t vmin2 = vget_low_s32(vmin);
+            const int32x2_t vmax2 = vget_low_s32(vmax);
+            int32x2_t v0 = vget_low_s32(v_c00);
+            if constexpr (!zero_mode) {
+                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
+            }
+            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
+            c0_ptr += 2;
+        }
+        if (rl & 1) {
+            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
         }
     }
 }
@@ -909,36 +1126,172 @@ inline void mma_direct_mr8_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNO
             }
         }
 
-        const int32x4_t acc[8][3] = {
-            {v_c00, v_c01, v_c02}, {v_c10, v_c11, v_c12}, {v_c20, v_c21, v_c22},
-            {v_c30, v_c31, v_c32}, {v_c40, v_c41, v_c42}, {v_c50, v_c51, v_c52},
-            {v_c60, v_c61, v_c62}, {v_c70, v_c71, v_c72},
-        };
-        int32_t* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
-                                             c4_ptr, c5_ptr, c6_ptr, c7_ptr};
-        for (int r = 0; r < mr; ++r) {
-            int32_t* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 4; rr -= 4, ++g) {
-                int32x4_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_s32(v, vld1q_s32(cp));
-                }
-                vst1q_s32(cp, vminq_s32(vmaxq_s32(v, vmin), vmax));
-                cp += 4;
+        if (rem >= 4) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
+                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
+                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
+                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
+                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
             }
-            if (rr > 0) {
-                int32_t lane[4];
-                vst1q_s32(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    int32_t v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v += cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, clamp_min), clamp_max);
-                }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
+            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
+            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
+            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+            v_c00 = v_c01;
+            v_c10 = v_c11;
+            v_c20 = v_c21;
+            v_c30 = v_c31;
+            v_c40 = v_c41;
+            v_c50 = v_c51;
+            v_c60 = v_c61;
+            v_c70 = v_c71;
+        }
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
+                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
+                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
+                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
+                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
             }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
+            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
+            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
+            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+            v_c00 = v_c02;
+            v_c10 = v_c12;
+            v_c20 = v_c22;
+            v_c30 = v_c32;
+            v_c40 = v_c42;
+            v_c50 = v_c52;
+            v_c60 = v_c62;
+            v_c70 = v_c72;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
+                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
+                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
+                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
+                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
+            }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
+            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
+            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
+            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const int32x2_t vmin2 = vget_low_s32(vmin);
+            const int32x2_t vmax2 = vget_low_s32(vmax);
+            int32x2_t v0 = vget_low_s32(v_c00);
+            int32x2_t v1 = vget_low_s32(v_c10);
+            int32x2_t v2 = vget_low_s32(v_c20);
+            int32x2_t v3 = vget_low_s32(v_c30);
+            int32x2_t v4 = vget_low_s32(v_c40);
+            int32x2_t v5 = vget_low_s32(v_c50);
+            int32x2_t v6 = vget_low_s32(v_c60);
+            int32x2_t v7 = vget_low_s32(v_c70);
+            if constexpr (!zero_mode) {
+                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
+                v1 = vadd_s32(v1, vld1_s32(c1_ptr));
+                v2 = vadd_s32(v2, vld1_s32(c2_ptr));
+                v3 = vadd_s32(v3, vld1_s32(c3_ptr));
+                v4 = vadd_s32(v4, vld1_s32(c4_ptr));
+                v5 = vadd_s32(v5, vld1_s32(c5_ptr));
+                v6 = vadd_s32(v6, vld1_s32(c6_ptr));
+                v7 = vadd_s32(v7, vld1_s32(c7_ptr));
+            }
+            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
+            vst1_s32(c1_ptr, vmin_s32(vmax_s32(v1, vmin2), vmax2));
+            vst1_s32(c2_ptr, vmin_s32(vmax_s32(v2, vmin2), vmax2));
+            vst1_s32(c3_ptr, vmin_s32(vmax_s32(v3, vmin2), vmax2));
+            vst1_s32(c4_ptr, vmin_s32(vmax_s32(v4, vmin2), vmax2));
+            vst1_s32(c5_ptr, vmin_s32(vmax_s32(v5, vmin2), vmax2));
+            vst1_s32(c6_ptr, vmin_s32(vmax_s32(v6, vmin2), vmax2));
+            vst1_s32(c7_ptr, vmin_s32(vmax_s32(v7, vmin2), vmax2));
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+            c4_ptr += 2;
+            c5_ptr += 2;
+            c6_ptr += 2;
+            c7_ptr += 2;
+        }
+        if (rl & 1) {
+            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
+            int32_t x1 = (rl & 2) ? vgetq_lane_s32(v_c10, 2) : vgetq_lane_s32(v_c10, 0);
+            int32_t x2 = (rl & 2) ? vgetq_lane_s32(v_c20, 2) : vgetq_lane_s32(v_c20, 0);
+            int32_t x3 = (rl & 2) ? vgetq_lane_s32(v_c30, 2) : vgetq_lane_s32(v_c30, 0);
+            int32_t x4 = (rl & 2) ? vgetq_lane_s32(v_c40, 2) : vgetq_lane_s32(v_c40, 0);
+            int32_t x5 = (rl & 2) ? vgetq_lane_s32(v_c50, 2) : vgetq_lane_s32(v_c50, 0);
+            int32_t x6 = (rl & 2) ? vgetq_lane_s32(v_c60, 2) : vgetq_lane_s32(v_c60, 0);
+            int32_t x7 = (rl & 2) ? vgetq_lane_s32(v_c70, 2) : vgetq_lane_s32(v_c70, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+                x1 += c1_ptr[0];
+                x2 += c2_ptr[0];
+                x3 += c3_ptr[0];
+                x4 += c4_ptr[0];
+                x5 += c5_ptr[0];
+                x6 += c6_ptr[0];
+                x7 += c7_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
+            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
+            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
+            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
+            c4_ptr[0] = std::min(std::max(x4, clamp_min), clamp_max);
+            c5_ptr[0] = std::min(std::max(x5, clamp_min), clamp_max);
+            c6_ptr[0] = std::min(std::max(x6, clamp_min), clamp_max);
+            c7_ptr[0] = std::min(std::max(x7, clamp_min), clamp_max);
         }
     }
 }
@@ -1102,36 +1455,100 @@ inline void mma_direct_mr4_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNO
             }
         }
 
-        const int32x4_t acc[4][3] = {
-            {v_c00, v_c01, v_c02},
-            {v_c10, v_c11, v_c12},
-            {v_c20, v_c21, v_c22},
-            {v_c30, v_c31, v_c32},
-        };
-        int32_t* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
-        for (int r = 0; r < mr; ++r) {
-            int32_t* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 4; rr -= 4, ++g) {
-                int32x4_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_s32(v, vld1q_s32(cp));
-                }
-                vst1q_s32(cp, vminq_s32(vmaxq_s32(v, vmin), vmax));
-                cp += 4;
+        if (rem >= 4) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
             }
-            if (rr > 0) {
-                int32_t lane[4];
-                vst1q_s32(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    int32_t v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v += cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, clamp_min), clamp_max);
-                }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            v_c00 = v_c01;
+            v_c10 = v_c11;
+            v_c20 = v_c21;
+            v_c30 = v_c31;
+        }
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
             }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            v_c00 = v_c02;
+            v_c10 = v_c12;
+            v_c20 = v_c22;
+            v_c30 = v_c32;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
+                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
+                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
+            }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
+            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
+            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const int32x2_t vmin2 = vget_low_s32(vmin);
+            const int32x2_t vmax2 = vget_low_s32(vmax);
+            int32x2_t v0 = vget_low_s32(v_c00);
+            int32x2_t v1 = vget_low_s32(v_c10);
+            int32x2_t v2 = vget_low_s32(v_c20);
+            int32x2_t v3 = vget_low_s32(v_c30);
+            if constexpr (!zero_mode) {
+                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
+                v1 = vadd_s32(v1, vld1_s32(c1_ptr));
+                v2 = vadd_s32(v2, vld1_s32(c2_ptr));
+                v3 = vadd_s32(v3, vld1_s32(c3_ptr));
+            }
+            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
+            vst1_s32(c1_ptr, vmin_s32(vmax_s32(v1, vmin2), vmax2));
+            vst1_s32(c2_ptr, vmin_s32(vmax_s32(v2, vmin2), vmax2));
+            vst1_s32(c3_ptr, vmin_s32(vmax_s32(v3, vmin2), vmax2));
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+        }
+        if (rl & 1) {
+            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
+            int32_t x1 = (rl & 2) ? vgetq_lane_s32(v_c10, 2) : vgetq_lane_s32(v_c10, 0);
+            int32_t x2 = (rl & 2) ? vgetq_lane_s32(v_c20, 2) : vgetq_lane_s32(v_c20, 0);
+            int32_t x3 = (rl & 2) ? vgetq_lane_s32(v_c30, 2) : vgetq_lane_s32(v_c30, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+                x1 += c1_ptr[0];
+                x2 += c2_ptr[0];
+                x3 += c3_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
+            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
+            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
+            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
         }
     }
 }
@@ -1222,28 +1639,46 @@ inline void mma_direct_mr1_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNO
             }
         }
 
-        const int32x4_t acc[3] = {v_c00, v_c01, v_c02};
-        int32_t* NNOPS_RESTRICT cp = c0_ptr;
-        int rr = rem;
-        int g = 0;
-        for (; rr >= 4; rr -= 4, ++g) {
-            int32x4_t v = acc[g];
+        if (rem >= 4) {
             if constexpr (!zero_mode) {
-                v = vaddq_s32(v, vld1q_s32(cp));
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
             }
-            vst1q_s32(cp, vminq_s32(vmaxq_s32(v, vmin), vmax));
-            cp += 4;
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            c0_ptr += 4;
+            v_c00 = v_c01;
         }
-        if (rr > 0) {
-            int32_t lane[4];
-            vst1q_s32(lane, acc[g]);
-            for (int i = 0; i < rr; ++i) {
-                int32_t v = lane[i];
-                if constexpr (!zero_mode) {
-                    v += cp[i];
-                }
-                cp[i] = std::min(std::max(v, clamp_min), clamp_max);
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
             }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            c0_ptr += 4;
+            v_c00 = v_c02;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
+            }
+            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
+            c0_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const int32x2_t vmin2 = vget_low_s32(vmin);
+            const int32x2_t vmax2 = vget_low_s32(vmax);
+            int32x2_t v0 = vget_low_s32(v_c00);
+            if constexpr (!zero_mode) {
+                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
+            }
+            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
+            c0_ptr += 2;
+        }
+        if (rl & 1) {
+            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
         }
     }
 }

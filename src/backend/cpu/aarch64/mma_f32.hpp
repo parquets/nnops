@@ -19,7 +19,8 @@
 ///
 /// Rows past `mr` alias the last live row in A and C -- the convention the
 /// packers fill on the A side and the C row pointers repeat -- so a partial-M
-/// tile needs no per-row guards; only the tail's store loop stops at `mr`.
+/// tile needs no per-row guards: the tail stores the duplicate rows back to the
+/// same address.
 ///
 /// Bias seed: 1 is per-row (`bias[r]`) -- a dense row is an output channel;
 /// 2 is per-column (`bias + n + off`) -- the NHWC shape, where rows are pixels
@@ -259,35 +260,172 @@ inline void mma_pack_mr8_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_
             }
         }
 
-        const float32x4_t acc[8][3] = {
-            {c00, c01, c02}, {c10, c11, c12}, {c20, c21, c22}, {c30, c31, c32},
-            {c40, c41, c42}, {c50, c51, c52}, {c60, c61, c62}, {c70, c71, c72},
-        };
-        float* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
-                                           c4_ptr, c5_ptr, c6_ptr, c7_ptr};
-        for (int r = 0; r < mr; ++r) {
-            float* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 4; rr -= 4, ++g) {
-                float32x4_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_f32(v, vld1q_f32(cp));
-                }
-                vst1q_f32(cp, vminq_f32(vmaxq_f32(v, vmin), vmax));
-                cp += 4;
+        if (rem >= 4) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
+                c40 = vaddq_f32(c40, vld1q_f32(c4_ptr));
+                c50 = vaddq_f32(c50, vld1q_f32(c5_ptr));
+                c60 = vaddq_f32(c60, vld1q_f32(c6_ptr));
+                c70 = vaddq_f32(c70, vld1q_f32(c7_ptr));
             }
-            if (rr > 0) {
-                float lane[4];
-                vst1q_f32(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    float v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v += cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, clamp_min), clamp_max);
-                }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            vst1q_f32(c4_ptr, vminq_f32(vmaxq_f32(c40, vmin), vmax));
+            vst1q_f32(c5_ptr, vminq_f32(vmaxq_f32(c50, vmin), vmax));
+            vst1q_f32(c6_ptr, vminq_f32(vmaxq_f32(c60, vmin), vmax));
+            vst1q_f32(c7_ptr, vminq_f32(vmaxq_f32(c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+            c00 = c01;
+            c10 = c11;
+            c20 = c21;
+            c30 = c31;
+            c40 = c41;
+            c50 = c51;
+            c60 = c61;
+            c70 = c71;
+        }
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
+                c40 = vaddq_f32(c40, vld1q_f32(c4_ptr));
+                c50 = vaddq_f32(c50, vld1q_f32(c5_ptr));
+                c60 = vaddq_f32(c60, vld1q_f32(c6_ptr));
+                c70 = vaddq_f32(c70, vld1q_f32(c7_ptr));
             }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            vst1q_f32(c4_ptr, vminq_f32(vmaxq_f32(c40, vmin), vmax));
+            vst1q_f32(c5_ptr, vminq_f32(vmaxq_f32(c50, vmin), vmax));
+            vst1q_f32(c6_ptr, vminq_f32(vmaxq_f32(c60, vmin), vmax));
+            vst1q_f32(c7_ptr, vminq_f32(vmaxq_f32(c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+            c00 = c02;
+            c10 = c12;
+            c20 = c22;
+            c30 = c32;
+            c40 = c42;
+            c50 = c52;
+            c60 = c62;
+            c70 = c72;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
+                c40 = vaddq_f32(c40, vld1q_f32(c4_ptr));
+                c50 = vaddq_f32(c50, vld1q_f32(c5_ptr));
+                c60 = vaddq_f32(c60, vld1q_f32(c6_ptr));
+                c70 = vaddq_f32(c70, vld1q_f32(c7_ptr));
+            }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            vst1q_f32(c4_ptr, vminq_f32(vmaxq_f32(c40, vmin), vmax));
+            vst1q_f32(c5_ptr, vminq_f32(vmaxq_f32(c50, vmin), vmax));
+            vst1q_f32(c6_ptr, vminq_f32(vmaxq_f32(c60, vmin), vmax));
+            vst1q_f32(c7_ptr, vminq_f32(vmaxq_f32(c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const float32x2_t vmin2 = vget_low_f32(vmin);
+            const float32x2_t vmax2 = vget_low_f32(vmax);
+            float32x2_t v0 = vget_low_f32(c00);
+            float32x2_t v1 = vget_low_f32(c10);
+            float32x2_t v2 = vget_low_f32(c20);
+            float32x2_t v3 = vget_low_f32(c30);
+            float32x2_t v4 = vget_low_f32(c40);
+            float32x2_t v5 = vget_low_f32(c50);
+            float32x2_t v6 = vget_low_f32(c60);
+            float32x2_t v7 = vget_low_f32(c70);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f32(v0, vld1_f32(c0_ptr));
+                v1 = vadd_f32(v1, vld1_f32(c1_ptr));
+                v2 = vadd_f32(v2, vld1_f32(c2_ptr));
+                v3 = vadd_f32(v3, vld1_f32(c3_ptr));
+                v4 = vadd_f32(v4, vld1_f32(c4_ptr));
+                v5 = vadd_f32(v5, vld1_f32(c5_ptr));
+                v6 = vadd_f32(v6, vld1_f32(c6_ptr));
+                v7 = vadd_f32(v7, vld1_f32(c7_ptr));
+            }
+            vst1_f32(c0_ptr, vmin_f32(vmax_f32(v0, vmin2), vmax2));
+            vst1_f32(c1_ptr, vmin_f32(vmax_f32(v1, vmin2), vmax2));
+            vst1_f32(c2_ptr, vmin_f32(vmax_f32(v2, vmin2), vmax2));
+            vst1_f32(c3_ptr, vmin_f32(vmax_f32(v3, vmin2), vmax2));
+            vst1_f32(c4_ptr, vmin_f32(vmax_f32(v4, vmin2), vmax2));
+            vst1_f32(c5_ptr, vmin_f32(vmax_f32(v5, vmin2), vmax2));
+            vst1_f32(c6_ptr, vmin_f32(vmax_f32(v6, vmin2), vmax2));
+            vst1_f32(c7_ptr, vmin_f32(vmax_f32(v7, vmin2), vmax2));
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+            c4_ptr += 2;
+            c5_ptr += 2;
+            c6_ptr += 2;
+            c7_ptr += 2;
+        }
+        if (rl & 1) {
+            float x0 = (rl & 2) ? vgetq_lane_f32(c00, 2) : vgetq_lane_f32(c00, 0);
+            float x1 = (rl & 2) ? vgetq_lane_f32(c10, 2) : vgetq_lane_f32(c10, 0);
+            float x2 = (rl & 2) ? vgetq_lane_f32(c20, 2) : vgetq_lane_f32(c20, 0);
+            float x3 = (rl & 2) ? vgetq_lane_f32(c30, 2) : vgetq_lane_f32(c30, 0);
+            float x4 = (rl & 2) ? vgetq_lane_f32(c40, 2) : vgetq_lane_f32(c40, 0);
+            float x5 = (rl & 2) ? vgetq_lane_f32(c50, 2) : vgetq_lane_f32(c50, 0);
+            float x6 = (rl & 2) ? vgetq_lane_f32(c60, 2) : vgetq_lane_f32(c60, 0);
+            float x7 = (rl & 2) ? vgetq_lane_f32(c70, 2) : vgetq_lane_f32(c70, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+                x1 += c1_ptr[0];
+                x2 += c2_ptr[0];
+                x3 += c3_ptr[0];
+                x4 += c4_ptr[0];
+                x5 += c5_ptr[0];
+                x6 += c6_ptr[0];
+                x7 += c7_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
+            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
+            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
+            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
+            c4_ptr[0] = std::min(std::max(x4, clamp_min), clamp_max);
+            c5_ptr[0] = std::min(std::max(x5, clamp_min), clamp_max);
+            c6_ptr[0] = std::min(std::max(x6, clamp_min), clamp_max);
+            c7_ptr[0] = std::min(std::max(x7, clamp_min), clamp_max);
         }
     }
 }
@@ -439,36 +577,100 @@ inline void mma_pack_mr4_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_
             }
         }
 
-        const float32x4_t acc[4][3] = {
-            {c00, c01, c02},
-            {c10, c11, c12},
-            {c20, c21, c22},
-            {c30, c31, c32},
-        };
-        float* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
-        for (int r = 0; r < mr; ++r) {
-            float* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 4; rr -= 4, ++g) {
-                float32x4_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_f32(v, vld1q_f32(cp));
-                }
-                vst1q_f32(cp, vminq_f32(vmaxq_f32(v, vmin), vmax));
-                cp += 4;
+        if (rem >= 4) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
             }
-            if (rr > 0) {
-                float lane[4];
-                vst1q_f32(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    float v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v += cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, clamp_min), clamp_max);
-                }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c00 = c01;
+            c10 = c11;
+            c20 = c21;
+            c30 = c31;
+        }
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
             }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c00 = c02;
+            c10 = c12;
+            c20 = c22;
+            c30 = c32;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
+            }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const float32x2_t vmin2 = vget_low_f32(vmin);
+            const float32x2_t vmax2 = vget_low_f32(vmax);
+            float32x2_t v0 = vget_low_f32(c00);
+            float32x2_t v1 = vget_low_f32(c10);
+            float32x2_t v2 = vget_low_f32(c20);
+            float32x2_t v3 = vget_low_f32(c30);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f32(v0, vld1_f32(c0_ptr));
+                v1 = vadd_f32(v1, vld1_f32(c1_ptr));
+                v2 = vadd_f32(v2, vld1_f32(c2_ptr));
+                v3 = vadd_f32(v3, vld1_f32(c3_ptr));
+            }
+            vst1_f32(c0_ptr, vmin_f32(vmax_f32(v0, vmin2), vmax2));
+            vst1_f32(c1_ptr, vmin_f32(vmax_f32(v1, vmin2), vmax2));
+            vst1_f32(c2_ptr, vmin_f32(vmax_f32(v2, vmin2), vmax2));
+            vst1_f32(c3_ptr, vmin_f32(vmax_f32(v3, vmin2), vmax2));
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+        }
+        if (rl & 1) {
+            float x0 = (rl & 2) ? vgetq_lane_f32(c00, 2) : vgetq_lane_f32(c00, 0);
+            float x1 = (rl & 2) ? vgetq_lane_f32(c10, 2) : vgetq_lane_f32(c10, 0);
+            float x2 = (rl & 2) ? vgetq_lane_f32(c20, 2) : vgetq_lane_f32(c20, 0);
+            float x3 = (rl & 2) ? vgetq_lane_f32(c30, 2) : vgetq_lane_f32(c30, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+                x1 += c1_ptr[0];
+                x2 += c2_ptr[0];
+                x3 += c3_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
+            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
+            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
+            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
         }
     }
 }
@@ -560,28 +762,46 @@ inline void mma_pack_mr1_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_
             }
         }
 
-        const float32x4_t acc[3] = {c00, c01, c02};
-        float* NNOPS_RESTRICT cp = c0_ptr;
-        int rr = rem;
-        int g = 0;
-        for (; rr >= 4; rr -= 4, ++g) {
-            float32x4_t v = acc[g];
+        if (rem >= 4) {
             if constexpr (!zero_mode) {
-                v = vaddq_f32(v, vld1q_f32(cp));
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
             }
-            vst1q_f32(cp, vminq_f32(vmaxq_f32(v, vmin), vmax));
-            cp += 4;
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            c0_ptr += 4;
+            c00 = c01;
         }
-        if (rr > 0) {
-            float lane[4];
-            vst1q_f32(lane, acc[g]);
-            for (int i = 0; i < rr; ++i) {
-                float v = lane[i];
-                if constexpr (!zero_mode) {
-                    v += cp[i];
-                }
-                cp[i] = std::min(std::max(v, clamp_min), clamp_max);
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
             }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            c0_ptr += 4;
+            c00 = c02;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+            }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            c0_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const float32x2_t vmin2 = vget_low_f32(vmin);
+            const float32x2_t vmax2 = vget_low_f32(vmax);
+            float32x2_t v0 = vget_low_f32(c00);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f32(v0, vld1_f32(c0_ptr));
+            }
+            vst1_f32(c0_ptr, vmin_f32(vmax_f32(v0, vmin2), vmax2));
+            c0_ptr += 2;
+        }
+        if (rl & 1) {
+            float x0 = (rl & 2) ? vgetq_lane_f32(c00, 2) : vgetq_lane_f32(c00, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
         }
     }
 }
@@ -838,35 +1058,172 @@ inline void mma_direct_mr8_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOP
             }
         }
 
-        const float32x4_t acc[8][3] = {
-            {c00, c01, c02}, {c10, c11, c12}, {c20, c21, c22}, {c30, c31, c32},
-            {c40, c41, c42}, {c50, c51, c52}, {c60, c61, c62}, {c70, c71, c72},
-        };
-        float* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
-                                           c4_ptr, c5_ptr, c6_ptr, c7_ptr};
-        for (int r = 0; r < mr; ++r) {
-            float* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 4; rr -= 4, ++g) {
-                float32x4_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_f32(v, vld1q_f32(cp));
-                }
-                vst1q_f32(cp, vminq_f32(vmaxq_f32(v, vmin), vmax));
-                cp += 4;
+        if (rem >= 4) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
+                c40 = vaddq_f32(c40, vld1q_f32(c4_ptr));
+                c50 = vaddq_f32(c50, vld1q_f32(c5_ptr));
+                c60 = vaddq_f32(c60, vld1q_f32(c6_ptr));
+                c70 = vaddq_f32(c70, vld1q_f32(c7_ptr));
             }
-            if (rr > 0) {
-                float lane[4];
-                vst1q_f32(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    float v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v += cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, clamp_min), clamp_max);
-                }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            vst1q_f32(c4_ptr, vminq_f32(vmaxq_f32(c40, vmin), vmax));
+            vst1q_f32(c5_ptr, vminq_f32(vmaxq_f32(c50, vmin), vmax));
+            vst1q_f32(c6_ptr, vminq_f32(vmaxq_f32(c60, vmin), vmax));
+            vst1q_f32(c7_ptr, vminq_f32(vmaxq_f32(c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+            c00 = c01;
+            c10 = c11;
+            c20 = c21;
+            c30 = c31;
+            c40 = c41;
+            c50 = c51;
+            c60 = c61;
+            c70 = c71;
+        }
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
+                c40 = vaddq_f32(c40, vld1q_f32(c4_ptr));
+                c50 = vaddq_f32(c50, vld1q_f32(c5_ptr));
+                c60 = vaddq_f32(c60, vld1q_f32(c6_ptr));
+                c70 = vaddq_f32(c70, vld1q_f32(c7_ptr));
             }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            vst1q_f32(c4_ptr, vminq_f32(vmaxq_f32(c40, vmin), vmax));
+            vst1q_f32(c5_ptr, vminq_f32(vmaxq_f32(c50, vmin), vmax));
+            vst1q_f32(c6_ptr, vminq_f32(vmaxq_f32(c60, vmin), vmax));
+            vst1q_f32(c7_ptr, vminq_f32(vmaxq_f32(c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+            c00 = c02;
+            c10 = c12;
+            c20 = c22;
+            c30 = c32;
+            c40 = c42;
+            c50 = c52;
+            c60 = c62;
+            c70 = c72;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
+                c40 = vaddq_f32(c40, vld1q_f32(c4_ptr));
+                c50 = vaddq_f32(c50, vld1q_f32(c5_ptr));
+                c60 = vaddq_f32(c60, vld1q_f32(c6_ptr));
+                c70 = vaddq_f32(c70, vld1q_f32(c7_ptr));
+            }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            vst1q_f32(c4_ptr, vminq_f32(vmaxq_f32(c40, vmin), vmax));
+            vst1q_f32(c5_ptr, vminq_f32(vmaxq_f32(c50, vmin), vmax));
+            vst1q_f32(c6_ptr, vminq_f32(vmaxq_f32(c60, vmin), vmax));
+            vst1q_f32(c7_ptr, vminq_f32(vmaxq_f32(c70, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const float32x2_t vmin2 = vget_low_f32(vmin);
+            const float32x2_t vmax2 = vget_low_f32(vmax);
+            float32x2_t v0 = vget_low_f32(c00);
+            float32x2_t v1 = vget_low_f32(c10);
+            float32x2_t v2 = vget_low_f32(c20);
+            float32x2_t v3 = vget_low_f32(c30);
+            float32x2_t v4 = vget_low_f32(c40);
+            float32x2_t v5 = vget_low_f32(c50);
+            float32x2_t v6 = vget_low_f32(c60);
+            float32x2_t v7 = vget_low_f32(c70);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f32(v0, vld1_f32(c0_ptr));
+                v1 = vadd_f32(v1, vld1_f32(c1_ptr));
+                v2 = vadd_f32(v2, vld1_f32(c2_ptr));
+                v3 = vadd_f32(v3, vld1_f32(c3_ptr));
+                v4 = vadd_f32(v4, vld1_f32(c4_ptr));
+                v5 = vadd_f32(v5, vld1_f32(c5_ptr));
+                v6 = vadd_f32(v6, vld1_f32(c6_ptr));
+                v7 = vadd_f32(v7, vld1_f32(c7_ptr));
+            }
+            vst1_f32(c0_ptr, vmin_f32(vmax_f32(v0, vmin2), vmax2));
+            vst1_f32(c1_ptr, vmin_f32(vmax_f32(v1, vmin2), vmax2));
+            vst1_f32(c2_ptr, vmin_f32(vmax_f32(v2, vmin2), vmax2));
+            vst1_f32(c3_ptr, vmin_f32(vmax_f32(v3, vmin2), vmax2));
+            vst1_f32(c4_ptr, vmin_f32(vmax_f32(v4, vmin2), vmax2));
+            vst1_f32(c5_ptr, vmin_f32(vmax_f32(v5, vmin2), vmax2));
+            vst1_f32(c6_ptr, vmin_f32(vmax_f32(v6, vmin2), vmax2));
+            vst1_f32(c7_ptr, vmin_f32(vmax_f32(v7, vmin2), vmax2));
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+            c4_ptr += 2;
+            c5_ptr += 2;
+            c6_ptr += 2;
+            c7_ptr += 2;
+        }
+        if (rl & 1) {
+            float x0 = (rl & 2) ? vgetq_lane_f32(c00, 2) : vgetq_lane_f32(c00, 0);
+            float x1 = (rl & 2) ? vgetq_lane_f32(c10, 2) : vgetq_lane_f32(c10, 0);
+            float x2 = (rl & 2) ? vgetq_lane_f32(c20, 2) : vgetq_lane_f32(c20, 0);
+            float x3 = (rl & 2) ? vgetq_lane_f32(c30, 2) : vgetq_lane_f32(c30, 0);
+            float x4 = (rl & 2) ? vgetq_lane_f32(c40, 2) : vgetq_lane_f32(c40, 0);
+            float x5 = (rl & 2) ? vgetq_lane_f32(c50, 2) : vgetq_lane_f32(c50, 0);
+            float x6 = (rl & 2) ? vgetq_lane_f32(c60, 2) : vgetq_lane_f32(c60, 0);
+            float x7 = (rl & 2) ? vgetq_lane_f32(c70, 2) : vgetq_lane_f32(c70, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+                x1 += c1_ptr[0];
+                x2 += c2_ptr[0];
+                x3 += c3_ptr[0];
+                x4 += c4_ptr[0];
+                x5 += c5_ptr[0];
+                x6 += c6_ptr[0];
+                x7 += c7_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
+            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
+            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
+            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
+            c4_ptr[0] = std::min(std::max(x4, clamp_min), clamp_max);
+            c5_ptr[0] = std::min(std::max(x5, clamp_min), clamp_max);
+            c6_ptr[0] = std::min(std::max(x6, clamp_min), clamp_max);
+            c7_ptr[0] = std::min(std::max(x7, clamp_min), clamp_max);
         }
     }
 }
@@ -1029,36 +1386,100 @@ inline void mma_direct_mr4_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOP
             }
         }
 
-        const float32x4_t acc[4][3] = {
-            {c00, c01, c02},
-            {c10, c11, c12},
-            {c20, c21, c22},
-            {c30, c31, c32},
-        };
-        float* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
-        for (int r = 0; r < mr; ++r) {
-            float* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 4; rr -= 4, ++g) {
-                float32x4_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_f32(v, vld1q_f32(cp));
-                }
-                vst1q_f32(cp, vminq_f32(vmaxq_f32(v, vmin), vmax));
-                cp += 4;
+        if (rem >= 4) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
             }
-            if (rr > 0) {
-                float lane[4];
-                vst1q_f32(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    float v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v += cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, clamp_min), clamp_max);
-                }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c00 = c01;
+            c10 = c11;
+            c20 = c21;
+            c30 = c31;
+        }
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
             }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c00 = c02;
+            c10 = c12;
+            c20 = c22;
+            c30 = c32;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+                c10 = vaddq_f32(c10, vld1q_f32(c1_ptr));
+                c20 = vaddq_f32(c20, vld1q_f32(c2_ptr));
+                c30 = vaddq_f32(c30, vld1q_f32(c3_ptr));
+            }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            vst1q_f32(c1_ptr, vminq_f32(vmaxq_f32(c10, vmin), vmax));
+            vst1q_f32(c2_ptr, vminq_f32(vmaxq_f32(c20, vmin), vmax));
+            vst1q_f32(c3_ptr, vminq_f32(vmaxq_f32(c30, vmin), vmax));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const float32x2_t vmin2 = vget_low_f32(vmin);
+            const float32x2_t vmax2 = vget_low_f32(vmax);
+            float32x2_t v0 = vget_low_f32(c00);
+            float32x2_t v1 = vget_low_f32(c10);
+            float32x2_t v2 = vget_low_f32(c20);
+            float32x2_t v3 = vget_low_f32(c30);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f32(v0, vld1_f32(c0_ptr));
+                v1 = vadd_f32(v1, vld1_f32(c1_ptr));
+                v2 = vadd_f32(v2, vld1_f32(c2_ptr));
+                v3 = vadd_f32(v3, vld1_f32(c3_ptr));
+            }
+            vst1_f32(c0_ptr, vmin_f32(vmax_f32(v0, vmin2), vmax2));
+            vst1_f32(c1_ptr, vmin_f32(vmax_f32(v1, vmin2), vmax2));
+            vst1_f32(c2_ptr, vmin_f32(vmax_f32(v2, vmin2), vmax2));
+            vst1_f32(c3_ptr, vmin_f32(vmax_f32(v3, vmin2), vmax2));
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+        }
+        if (rl & 1) {
+            float x0 = (rl & 2) ? vgetq_lane_f32(c00, 2) : vgetq_lane_f32(c00, 0);
+            float x1 = (rl & 2) ? vgetq_lane_f32(c10, 2) : vgetq_lane_f32(c10, 0);
+            float x2 = (rl & 2) ? vgetq_lane_f32(c20, 2) : vgetq_lane_f32(c20, 0);
+            float x3 = (rl & 2) ? vgetq_lane_f32(c30, 2) : vgetq_lane_f32(c30, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+                x1 += c1_ptr[0];
+                x2 += c2_ptr[0];
+                x3 += c3_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
+            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
+            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
+            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
         }
     }
 }
@@ -1207,28 +1628,46 @@ inline void mma_direct_mr1_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOP
             }
         }
 
-        const float32x4_t acc[3] = {c00, c01, c02};
-        float* NNOPS_RESTRICT cp = c0_ptr;
-        int rr = rem;
-        int g = 0;
-        for (; rr >= 4; rr -= 4, ++g) {
-            float32x4_t v = acc[g];
+        if (rem >= 4) {
             if constexpr (!zero_mode) {
-                v = vaddq_f32(v, vld1q_f32(cp));
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
             }
-            vst1q_f32(cp, vminq_f32(vmaxq_f32(v, vmin), vmax));
-            cp += 4;
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            c0_ptr += 4;
+            c00 = c01;
         }
-        if (rr > 0) {
-            float lane[4];
-            vst1q_f32(lane, acc[g]);
-            for (int i = 0; i < rr; ++i) {
-                float v = lane[i];
-                if constexpr (!zero_mode) {
-                    v += cp[i];
-                }
-                cp[i] = std::min(std::max(v, clamp_min), clamp_max);
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
             }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            c0_ptr += 4;
+            c00 = c02;
+        }
+        if (rem >= 12) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f32(c00, vld1q_f32(c0_ptr));
+            }
+            vst1q_f32(c0_ptr, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+            c0_ptr += 4;
+        }
+        const int rl = rem & 3;
+        if (rl & 2) {
+            const float32x2_t vmin2 = vget_low_f32(vmin);
+            const float32x2_t vmax2 = vget_low_f32(vmax);
+            float32x2_t v0 = vget_low_f32(c00);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f32(v0, vld1_f32(c0_ptr));
+            }
+            vst1_f32(c0_ptr, vmin_f32(vmax_f32(v0, vmin2), vmax2));
+            c0_ptr += 2;
+        }
+        if (rl & 1) {
+            float x0 = (rl & 2) ? vgetq_lane_f32(c00, 2) : vgetq_lane_f32(c00, 0);
+            if constexpr (!zero_mode) {
+                x0 += c0_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
         }
     }
 }

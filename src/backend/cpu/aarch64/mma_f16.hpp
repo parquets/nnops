@@ -224,35 +224,222 @@ inline void mma_pack_mr8_nr16_mrxncxkc_f16(int mr, int nc, int kc, float16_t* NN
             }
         }
 
-        const float16x8_t acc[8][2] = {
-            {c00, c01}, {c10, c11}, {c20, c21}, {c30, c31},
-            {c40, c41}, {c50, c51}, {c60, c61}, {c70, c71},
-        };
-        float16_t* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
-                                               c4_ptr, c5_ptr, c6_ptr, c7_ptr};
-        for (int r = 0; r < mr; ++r) {
-            float16_t* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 8; rr -= 8, ++g) {
-                float16x8_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_f16(v, vld1q_f16(cp));
-                }
-                vst1q_f16(cp, vminq_f16(vmaxq_f16(v, vmin), vmax));
-                cp += 8;
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
+                c10 = vaddq_f16(c10, vld1q_f16(c1_ptr));
+                c20 = vaddq_f16(c20, vld1q_f16(c2_ptr));
+                c30 = vaddq_f16(c30, vld1q_f16(c3_ptr));
+                c40 = vaddq_f16(c40, vld1q_f16(c4_ptr));
+                c50 = vaddq_f16(c50, vld1q_f16(c5_ptr));
+                c60 = vaddq_f16(c60, vld1q_f16(c6_ptr));
+                c70 = vaddq_f16(c70, vld1q_f16(c7_ptr));
             }
-            if (rr > 0) {
-                float16_t lane[8];
-                vst1q_f16(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    float16_t v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v = v + cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, cmin), cmax);
-                }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            vst1q_f16(c1_ptr, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+            vst1q_f16(c2_ptr, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+            vst1q_f16(c3_ptr, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+            vst1q_f16(c4_ptr, vminq_f16(vmaxq_f16(c40, vmin), vmax));
+            vst1q_f16(c5_ptr, vminq_f16(vmaxq_f16(c50, vmin), vmax));
+            vst1q_f16(c6_ptr, vminq_f16(vmaxq_f16(c60, vmin), vmax));
+            vst1q_f16(c7_ptr, vminq_f16(vmaxq_f16(c70, vmin), vmax));
+            c0_ptr += 8;
+            c1_ptr += 8;
+            c2_ptr += 8;
+            c3_ptr += 8;
+            c4_ptr += 8;
+            c5_ptr += 8;
+            c6_ptr += 8;
+            c7_ptr += 8;
+            c00 = c01;
+            c10 = c11;
+            c20 = c21;
+            c30 = c31;
+            c40 = c41;
+            c50 = c51;
+            c60 = c61;
+            c70 = c71;
+        }
+        if (rem >= 16) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
+                c10 = vaddq_f16(c10, vld1q_f16(c1_ptr));
+                c20 = vaddq_f16(c20, vld1q_f16(c2_ptr));
+                c30 = vaddq_f16(c30, vld1q_f16(c3_ptr));
+                c40 = vaddq_f16(c40, vld1q_f16(c4_ptr));
+                c50 = vaddq_f16(c50, vld1q_f16(c5_ptr));
+                c60 = vaddq_f16(c60, vld1q_f16(c6_ptr));
+                c70 = vaddq_f16(c70, vld1q_f16(c7_ptr));
             }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            vst1q_f16(c1_ptr, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+            vst1q_f16(c2_ptr, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+            vst1q_f16(c3_ptr, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+            vst1q_f16(c4_ptr, vminq_f16(vmaxq_f16(c40, vmin), vmax));
+            vst1q_f16(c5_ptr, vminq_f16(vmaxq_f16(c50, vmin), vmax));
+            vst1q_f16(c6_ptr, vminq_f16(vmaxq_f16(c60, vmin), vmax));
+            vst1q_f16(c7_ptr, vminq_f16(vmaxq_f16(c70, vmin), vmax));
+            c0_ptr += 8;
+            c1_ptr += 8;
+            c2_ptr += 8;
+            c3_ptr += 8;
+            c4_ptr += 8;
+            c5_ptr += 8;
+            c6_ptr += 8;
+            c7_ptr += 8;
+        }
+        const int rl = rem & 7;
+        if (rl & 4) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = vget_low_f16(c00);
+            float16x4_t v1 = vget_low_f16(c10);
+            float16x4_t v2 = vget_low_f16(c20);
+            float16x4_t v3 = vget_low_f16(c30);
+            float16x4_t v4 = vget_low_f16(c40);
+            float16x4_t v5 = vget_low_f16(c50);
+            float16x4_t v6 = vget_low_f16(c60);
+            float16x4_t v7 = vget_low_f16(c70);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f16(v0, vld1_f16(c0_ptr));
+                v1 = vadd_f16(v1, vld1_f16(c1_ptr));
+                v2 = vadd_f16(v2, vld1_f16(c2_ptr));
+                v3 = vadd_f16(v3, vld1_f16(c3_ptr));
+                v4 = vadd_f16(v4, vld1_f16(c4_ptr));
+                v5 = vadd_f16(v5, vld1_f16(c5_ptr));
+                v6 = vadd_f16(v6, vld1_f16(c6_ptr));
+                v7 = vadd_f16(v7, vld1_f16(c7_ptr));
+            }
+            vst1_f16(c0_ptr, vmin_f16(vmax_f16(v0, vmin4), vmax4));
+            vst1_f16(c1_ptr, vmin_f16(vmax_f16(v1, vmin4), vmax4));
+            vst1_f16(c2_ptr, vmin_f16(vmax_f16(v2, vmin4), vmax4));
+            vst1_f16(c3_ptr, vmin_f16(vmax_f16(v3, vmin4), vmax4));
+            vst1_f16(c4_ptr, vmin_f16(vmax_f16(v4, vmin4), vmax4));
+            vst1_f16(c5_ptr, vmin_f16(vmax_f16(v5, vmin4), vmax4));
+            vst1_f16(c6_ptr, vmin_f16(vmax_f16(v6, vmin4), vmax4));
+            vst1_f16(c7_ptr, vmin_f16(vmax_f16(v7, vmin4), vmax4));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+        }
+        if (rl & 2) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = (rl & 4) ? vget_high_f16(c00) : vget_low_f16(c00);
+            float16x4_t v1 = (rl & 4) ? vget_high_f16(c10) : vget_low_f16(c10);
+            float16x4_t v2 = (rl & 4) ? vget_high_f16(c20) : vget_low_f16(c20);
+            float16x4_t v3 = (rl & 4) ? vget_high_f16(c30) : vget_low_f16(c30);
+            float16x4_t v4 = (rl & 4) ? vget_high_f16(c40) : vget_low_f16(c40);
+            float16x4_t v5 = (rl & 4) ? vget_high_f16(c50) : vget_low_f16(c50);
+            float16x4_t v6 = (rl & 4) ? vget_high_f16(c60) : vget_low_f16(c60);
+            float16x4_t v7 = (rl & 4) ? vget_high_f16(c70) : vget_low_f16(c70);
+            if constexpr (!zero_mode) {
+                v0 = vset_lane_f16(vget_lane_f16(v0, 0) + c0_ptr[0], v0, 0);
+                v0 = vset_lane_f16(vget_lane_f16(v0, 1) + c0_ptr[1], v0, 1);
+                v1 = vset_lane_f16(vget_lane_f16(v1, 0) + c1_ptr[0], v1, 0);
+                v1 = vset_lane_f16(vget_lane_f16(v1, 1) + c1_ptr[1], v1, 1);
+                v2 = vset_lane_f16(vget_lane_f16(v2, 0) + c2_ptr[0], v2, 0);
+                v2 = vset_lane_f16(vget_lane_f16(v2, 1) + c2_ptr[1], v2, 1);
+                v3 = vset_lane_f16(vget_lane_f16(v3, 0) + c3_ptr[0], v3, 0);
+                v3 = vset_lane_f16(vget_lane_f16(v3, 1) + c3_ptr[1], v3, 1);
+                v4 = vset_lane_f16(vget_lane_f16(v4, 0) + c4_ptr[0], v4, 0);
+                v4 = vset_lane_f16(vget_lane_f16(v4, 1) + c4_ptr[1], v4, 1);
+                v5 = vset_lane_f16(vget_lane_f16(v5, 0) + c5_ptr[0], v5, 0);
+                v5 = vset_lane_f16(vget_lane_f16(v5, 1) + c5_ptr[1], v5, 1);
+                v6 = vset_lane_f16(vget_lane_f16(v6, 0) + c6_ptr[0], v6, 0);
+                v6 = vset_lane_f16(vget_lane_f16(v6, 1) + c6_ptr[1], v6, 1);
+                v7 = vset_lane_f16(vget_lane_f16(v7, 0) + c7_ptr[0], v7, 0);
+                v7 = vset_lane_f16(vget_lane_f16(v7, 1) + c7_ptr[1], v7, 1);
+            }
+            const float16x4_t w0 = vmin_f16(vmax_f16(v0, vmin4), vmax4);
+            vst1_lane_f16(c0_ptr + 0, w0, 0);
+            vst1_lane_f16(c0_ptr + 1, w0, 1);
+            const float16x4_t w1 = vmin_f16(vmax_f16(v1, vmin4), vmax4);
+            vst1_lane_f16(c1_ptr + 0, w1, 0);
+            vst1_lane_f16(c1_ptr + 1, w1, 1);
+            const float16x4_t w2 = vmin_f16(vmax_f16(v2, vmin4), vmax4);
+            vst1_lane_f16(c2_ptr + 0, w2, 0);
+            vst1_lane_f16(c2_ptr + 1, w2, 1);
+            const float16x4_t w3 = vmin_f16(vmax_f16(v3, vmin4), vmax4);
+            vst1_lane_f16(c3_ptr + 0, w3, 0);
+            vst1_lane_f16(c3_ptr + 1, w3, 1);
+            const float16x4_t w4 = vmin_f16(vmax_f16(v4, vmin4), vmax4);
+            vst1_lane_f16(c4_ptr + 0, w4, 0);
+            vst1_lane_f16(c4_ptr + 1, w4, 1);
+            const float16x4_t w5 = vmin_f16(vmax_f16(v5, vmin4), vmax4);
+            vst1_lane_f16(c5_ptr + 0, w5, 0);
+            vst1_lane_f16(c5_ptr + 1, w5, 1);
+            const float16x4_t w6 = vmin_f16(vmax_f16(v6, vmin4), vmax4);
+            vst1_lane_f16(c6_ptr + 0, w6, 0);
+            vst1_lane_f16(c6_ptr + 1, w6, 1);
+            const float16x4_t w7 = vmin_f16(vmax_f16(v7, vmin4), vmax4);
+            vst1_lane_f16(c7_ptr + 0, w7, 0);
+            vst1_lane_f16(c7_ptr + 1, w7, 1);
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+            c4_ptr += 2;
+            c5_ptr += 2;
+            c6_ptr += 2;
+            c7_ptr += 2;
+        }
+        if (rl & 1) {
+            float16_t x0 = (rl & 6) == 6 ? vgetq_lane_f16(c00, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c00, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c00, 2) :
+                                           vgetq_lane_f16(c00, 0);
+            float16_t x1 = (rl & 6) == 6 ? vgetq_lane_f16(c10, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c10, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c10, 2) :
+                                           vgetq_lane_f16(c10, 0);
+            float16_t x2 = (rl & 6) == 6 ? vgetq_lane_f16(c20, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c20, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c20, 2) :
+                                           vgetq_lane_f16(c20, 0);
+            float16_t x3 = (rl & 6) == 6 ? vgetq_lane_f16(c30, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c30, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c30, 2) :
+                                           vgetq_lane_f16(c30, 0);
+            float16_t x4 = (rl & 6) == 6 ? vgetq_lane_f16(c40, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c40, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c40, 2) :
+                                           vgetq_lane_f16(c40, 0);
+            float16_t x5 = (rl & 6) == 6 ? vgetq_lane_f16(c50, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c50, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c50, 2) :
+                                           vgetq_lane_f16(c50, 0);
+            float16_t x6 = (rl & 6) == 6 ? vgetq_lane_f16(c60, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c60, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c60, 2) :
+                                           vgetq_lane_f16(c60, 0);
+            float16_t x7 = (rl & 6) == 6 ? vgetq_lane_f16(c70, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c70, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c70, 2) :
+                                           vgetq_lane_f16(c70, 0);
+            if constexpr (!zero_mode) {
+                x0 = x0 + c0_ptr[0];
+                x1 = x1 + c1_ptr[0];
+                x2 = x2 + c2_ptr[0];
+                x3 = x3 + c3_ptr[0];
+                x4 = x4 + c4_ptr[0];
+                x5 = x5 + c5_ptr[0];
+                x6 = x6 + c6_ptr[0];
+                x7 = x7 + c7_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, cmin), cmax);
+            c1_ptr[0] = std::min(std::max(x1, cmin), cmax);
+            c2_ptr[0] = std::min(std::max(x2, cmin), cmax);
+            c3_ptr[0] = std::min(std::max(x3, cmin), cmax);
+            c4_ptr[0] = std::min(std::max(x4, cmin), cmax);
+            c5_ptr[0] = std::min(std::max(x5, cmin), cmax);
+            c6_ptr[0] = std::min(std::max(x6, cmin), cmax);
+            c7_ptr[0] = std::min(std::max(x7, cmin), cmax);
         }
     }
 }
@@ -475,35 +662,222 @@ inline void mma_direct_mr8_nr16_mrxncxkc_f16(
             }
         }
 
-        const float16x8_t acc[8][2] = {
-            {c00, c01}, {c10, c11}, {c20, c21}, {c30, c31},
-            {c40, c41}, {c50, c51}, {c60, c61}, {c70, c71},
-        };
-        float16_t* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
-                                               c4_ptr, c5_ptr, c6_ptr, c7_ptr};
-        for (int r = 0; r < mr; ++r) {
-            float16_t* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 8; rr -= 8, ++g) {
-                float16x8_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_f16(v, vld1q_f16(cp));
-                }
-                vst1q_f16(cp, vminq_f16(vmaxq_f16(v, vmin), vmax));
-                cp += 8;
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
+                c10 = vaddq_f16(c10, vld1q_f16(c1_ptr));
+                c20 = vaddq_f16(c20, vld1q_f16(c2_ptr));
+                c30 = vaddq_f16(c30, vld1q_f16(c3_ptr));
+                c40 = vaddq_f16(c40, vld1q_f16(c4_ptr));
+                c50 = vaddq_f16(c50, vld1q_f16(c5_ptr));
+                c60 = vaddq_f16(c60, vld1q_f16(c6_ptr));
+                c70 = vaddq_f16(c70, vld1q_f16(c7_ptr));
             }
-            if (rr > 0) {
-                float16_t lane[8];
-                vst1q_f16(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    float16_t v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v = v + cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, cmin), cmax);
-                }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            vst1q_f16(c1_ptr, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+            vst1q_f16(c2_ptr, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+            vst1q_f16(c3_ptr, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+            vst1q_f16(c4_ptr, vminq_f16(vmaxq_f16(c40, vmin), vmax));
+            vst1q_f16(c5_ptr, vminq_f16(vmaxq_f16(c50, vmin), vmax));
+            vst1q_f16(c6_ptr, vminq_f16(vmaxq_f16(c60, vmin), vmax));
+            vst1q_f16(c7_ptr, vminq_f16(vmaxq_f16(c70, vmin), vmax));
+            c0_ptr += 8;
+            c1_ptr += 8;
+            c2_ptr += 8;
+            c3_ptr += 8;
+            c4_ptr += 8;
+            c5_ptr += 8;
+            c6_ptr += 8;
+            c7_ptr += 8;
+            c00 = c01;
+            c10 = c11;
+            c20 = c21;
+            c30 = c31;
+            c40 = c41;
+            c50 = c51;
+            c60 = c61;
+            c70 = c71;
+        }
+        if (rem >= 16) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
+                c10 = vaddq_f16(c10, vld1q_f16(c1_ptr));
+                c20 = vaddq_f16(c20, vld1q_f16(c2_ptr));
+                c30 = vaddq_f16(c30, vld1q_f16(c3_ptr));
+                c40 = vaddq_f16(c40, vld1q_f16(c4_ptr));
+                c50 = vaddq_f16(c50, vld1q_f16(c5_ptr));
+                c60 = vaddq_f16(c60, vld1q_f16(c6_ptr));
+                c70 = vaddq_f16(c70, vld1q_f16(c7_ptr));
             }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            vst1q_f16(c1_ptr, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+            vst1q_f16(c2_ptr, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+            vst1q_f16(c3_ptr, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+            vst1q_f16(c4_ptr, vminq_f16(vmaxq_f16(c40, vmin), vmax));
+            vst1q_f16(c5_ptr, vminq_f16(vmaxq_f16(c50, vmin), vmax));
+            vst1q_f16(c6_ptr, vminq_f16(vmaxq_f16(c60, vmin), vmax));
+            vst1q_f16(c7_ptr, vminq_f16(vmaxq_f16(c70, vmin), vmax));
+            c0_ptr += 8;
+            c1_ptr += 8;
+            c2_ptr += 8;
+            c3_ptr += 8;
+            c4_ptr += 8;
+            c5_ptr += 8;
+            c6_ptr += 8;
+            c7_ptr += 8;
+        }
+        const int rl = rem & 7;
+        if (rl & 4) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = vget_low_f16(c00);
+            float16x4_t v1 = vget_low_f16(c10);
+            float16x4_t v2 = vget_low_f16(c20);
+            float16x4_t v3 = vget_low_f16(c30);
+            float16x4_t v4 = vget_low_f16(c40);
+            float16x4_t v5 = vget_low_f16(c50);
+            float16x4_t v6 = vget_low_f16(c60);
+            float16x4_t v7 = vget_low_f16(c70);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f16(v0, vld1_f16(c0_ptr));
+                v1 = vadd_f16(v1, vld1_f16(c1_ptr));
+                v2 = vadd_f16(v2, vld1_f16(c2_ptr));
+                v3 = vadd_f16(v3, vld1_f16(c3_ptr));
+                v4 = vadd_f16(v4, vld1_f16(c4_ptr));
+                v5 = vadd_f16(v5, vld1_f16(c5_ptr));
+                v6 = vadd_f16(v6, vld1_f16(c6_ptr));
+                v7 = vadd_f16(v7, vld1_f16(c7_ptr));
+            }
+            vst1_f16(c0_ptr, vmin_f16(vmax_f16(v0, vmin4), vmax4));
+            vst1_f16(c1_ptr, vmin_f16(vmax_f16(v1, vmin4), vmax4));
+            vst1_f16(c2_ptr, vmin_f16(vmax_f16(v2, vmin4), vmax4));
+            vst1_f16(c3_ptr, vmin_f16(vmax_f16(v3, vmin4), vmax4));
+            vst1_f16(c4_ptr, vmin_f16(vmax_f16(v4, vmin4), vmax4));
+            vst1_f16(c5_ptr, vmin_f16(vmax_f16(v5, vmin4), vmax4));
+            vst1_f16(c6_ptr, vmin_f16(vmax_f16(v6, vmin4), vmax4));
+            vst1_f16(c7_ptr, vmin_f16(vmax_f16(v7, vmin4), vmax4));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+            c4_ptr += 4;
+            c5_ptr += 4;
+            c6_ptr += 4;
+            c7_ptr += 4;
+        }
+        if (rl & 2) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = (rl & 4) ? vget_high_f16(c00) : vget_low_f16(c00);
+            float16x4_t v1 = (rl & 4) ? vget_high_f16(c10) : vget_low_f16(c10);
+            float16x4_t v2 = (rl & 4) ? vget_high_f16(c20) : vget_low_f16(c20);
+            float16x4_t v3 = (rl & 4) ? vget_high_f16(c30) : vget_low_f16(c30);
+            float16x4_t v4 = (rl & 4) ? vget_high_f16(c40) : vget_low_f16(c40);
+            float16x4_t v5 = (rl & 4) ? vget_high_f16(c50) : vget_low_f16(c50);
+            float16x4_t v6 = (rl & 4) ? vget_high_f16(c60) : vget_low_f16(c60);
+            float16x4_t v7 = (rl & 4) ? vget_high_f16(c70) : vget_low_f16(c70);
+            if constexpr (!zero_mode) {
+                v0 = vset_lane_f16(vget_lane_f16(v0, 0) + c0_ptr[0], v0, 0);
+                v0 = vset_lane_f16(vget_lane_f16(v0, 1) + c0_ptr[1], v0, 1);
+                v1 = vset_lane_f16(vget_lane_f16(v1, 0) + c1_ptr[0], v1, 0);
+                v1 = vset_lane_f16(vget_lane_f16(v1, 1) + c1_ptr[1], v1, 1);
+                v2 = vset_lane_f16(vget_lane_f16(v2, 0) + c2_ptr[0], v2, 0);
+                v2 = vset_lane_f16(vget_lane_f16(v2, 1) + c2_ptr[1], v2, 1);
+                v3 = vset_lane_f16(vget_lane_f16(v3, 0) + c3_ptr[0], v3, 0);
+                v3 = vset_lane_f16(vget_lane_f16(v3, 1) + c3_ptr[1], v3, 1);
+                v4 = vset_lane_f16(vget_lane_f16(v4, 0) + c4_ptr[0], v4, 0);
+                v4 = vset_lane_f16(vget_lane_f16(v4, 1) + c4_ptr[1], v4, 1);
+                v5 = vset_lane_f16(vget_lane_f16(v5, 0) + c5_ptr[0], v5, 0);
+                v5 = vset_lane_f16(vget_lane_f16(v5, 1) + c5_ptr[1], v5, 1);
+                v6 = vset_lane_f16(vget_lane_f16(v6, 0) + c6_ptr[0], v6, 0);
+                v6 = vset_lane_f16(vget_lane_f16(v6, 1) + c6_ptr[1], v6, 1);
+                v7 = vset_lane_f16(vget_lane_f16(v7, 0) + c7_ptr[0], v7, 0);
+                v7 = vset_lane_f16(vget_lane_f16(v7, 1) + c7_ptr[1], v7, 1);
+            }
+            const float16x4_t w0 = vmin_f16(vmax_f16(v0, vmin4), vmax4);
+            vst1_lane_f16(c0_ptr + 0, w0, 0);
+            vst1_lane_f16(c0_ptr + 1, w0, 1);
+            const float16x4_t w1 = vmin_f16(vmax_f16(v1, vmin4), vmax4);
+            vst1_lane_f16(c1_ptr + 0, w1, 0);
+            vst1_lane_f16(c1_ptr + 1, w1, 1);
+            const float16x4_t w2 = vmin_f16(vmax_f16(v2, vmin4), vmax4);
+            vst1_lane_f16(c2_ptr + 0, w2, 0);
+            vst1_lane_f16(c2_ptr + 1, w2, 1);
+            const float16x4_t w3 = vmin_f16(vmax_f16(v3, vmin4), vmax4);
+            vst1_lane_f16(c3_ptr + 0, w3, 0);
+            vst1_lane_f16(c3_ptr + 1, w3, 1);
+            const float16x4_t w4 = vmin_f16(vmax_f16(v4, vmin4), vmax4);
+            vst1_lane_f16(c4_ptr + 0, w4, 0);
+            vst1_lane_f16(c4_ptr + 1, w4, 1);
+            const float16x4_t w5 = vmin_f16(vmax_f16(v5, vmin4), vmax4);
+            vst1_lane_f16(c5_ptr + 0, w5, 0);
+            vst1_lane_f16(c5_ptr + 1, w5, 1);
+            const float16x4_t w6 = vmin_f16(vmax_f16(v6, vmin4), vmax4);
+            vst1_lane_f16(c6_ptr + 0, w6, 0);
+            vst1_lane_f16(c6_ptr + 1, w6, 1);
+            const float16x4_t w7 = vmin_f16(vmax_f16(v7, vmin4), vmax4);
+            vst1_lane_f16(c7_ptr + 0, w7, 0);
+            vst1_lane_f16(c7_ptr + 1, w7, 1);
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+            c4_ptr += 2;
+            c5_ptr += 2;
+            c6_ptr += 2;
+            c7_ptr += 2;
+        }
+        if (rl & 1) {
+            float16_t x0 = (rl & 6) == 6 ? vgetq_lane_f16(c00, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c00, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c00, 2) :
+                                           vgetq_lane_f16(c00, 0);
+            float16_t x1 = (rl & 6) == 6 ? vgetq_lane_f16(c10, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c10, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c10, 2) :
+                                           vgetq_lane_f16(c10, 0);
+            float16_t x2 = (rl & 6) == 6 ? vgetq_lane_f16(c20, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c20, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c20, 2) :
+                                           vgetq_lane_f16(c20, 0);
+            float16_t x3 = (rl & 6) == 6 ? vgetq_lane_f16(c30, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c30, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c30, 2) :
+                                           vgetq_lane_f16(c30, 0);
+            float16_t x4 = (rl & 6) == 6 ? vgetq_lane_f16(c40, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c40, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c40, 2) :
+                                           vgetq_lane_f16(c40, 0);
+            float16_t x5 = (rl & 6) == 6 ? vgetq_lane_f16(c50, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c50, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c50, 2) :
+                                           vgetq_lane_f16(c50, 0);
+            float16_t x6 = (rl & 6) == 6 ? vgetq_lane_f16(c60, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c60, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c60, 2) :
+                                           vgetq_lane_f16(c60, 0);
+            float16_t x7 = (rl & 6) == 6 ? vgetq_lane_f16(c70, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c70, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c70, 2) :
+                                           vgetq_lane_f16(c70, 0);
+            if constexpr (!zero_mode) {
+                x0 = x0 + c0_ptr[0];
+                x1 = x1 + c1_ptr[0];
+                x2 = x2 + c2_ptr[0];
+                x3 = x3 + c3_ptr[0];
+                x4 = x4 + c4_ptr[0];
+                x5 = x5 + c5_ptr[0];
+                x6 = x6 + c6_ptr[0];
+                x7 = x7 + c7_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, cmin), cmax);
+            c1_ptr[0] = std::min(std::max(x1, cmin), cmax);
+            c2_ptr[0] = std::min(std::max(x2, cmin), cmax);
+            c3_ptr[0] = std::min(std::max(x3, cmin), cmax);
+            c4_ptr[0] = std::min(std::max(x4, cmin), cmax);
+            c5_ptr[0] = std::min(std::max(x5, cmin), cmax);
+            c6_ptr[0] = std::min(std::max(x6, cmin), cmax);
+            c7_ptr[0] = std::min(std::max(x7, cmin), cmax);
         }
     }
 }
@@ -640,36 +1014,126 @@ inline void mma_pack_mr4_nr16_mrxncxkc_f16(int mr, int nc, int kc, float16_t* NN
             }
         }
 
-        const float16x8_t acc[4][2] = {
-            {c00, c01},
-            {c10, c11},
-            {c20, c21},
-            {c30, c31},
-        };
-        float16_t* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
-        for (int r = 0; r < mr; ++r) {
-            float16_t* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 8; rr -= 8, ++g) {
-                float16x8_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_f16(v, vld1q_f16(cp));
-                }
-                vst1q_f16(cp, vminq_f16(vmaxq_f16(v, vmin), vmax));
-                cp += 8;
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
+                c10 = vaddq_f16(c10, vld1q_f16(c1_ptr));
+                c20 = vaddq_f16(c20, vld1q_f16(c2_ptr));
+                c30 = vaddq_f16(c30, vld1q_f16(c3_ptr));
             }
-            if (rr > 0) {
-                float16_t lane[8];
-                vst1q_f16(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    float16_t v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v = v + cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, cmin), cmax);
-                }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            vst1q_f16(c1_ptr, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+            vst1q_f16(c2_ptr, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+            vst1q_f16(c3_ptr, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+            c0_ptr += 8;
+            c1_ptr += 8;
+            c2_ptr += 8;
+            c3_ptr += 8;
+            c00 = c01;
+            c10 = c11;
+            c20 = c21;
+            c30 = c31;
+        }
+        if (rem >= 16) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
+                c10 = vaddq_f16(c10, vld1q_f16(c1_ptr));
+                c20 = vaddq_f16(c20, vld1q_f16(c2_ptr));
+                c30 = vaddq_f16(c30, vld1q_f16(c3_ptr));
             }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            vst1q_f16(c1_ptr, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+            vst1q_f16(c2_ptr, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+            vst1q_f16(c3_ptr, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+            c0_ptr += 8;
+            c1_ptr += 8;
+            c2_ptr += 8;
+            c3_ptr += 8;
+        }
+        const int rl = rem & 7;
+        if (rl & 4) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = vget_low_f16(c00);
+            float16x4_t v1 = vget_low_f16(c10);
+            float16x4_t v2 = vget_low_f16(c20);
+            float16x4_t v3 = vget_low_f16(c30);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f16(v0, vld1_f16(c0_ptr));
+                v1 = vadd_f16(v1, vld1_f16(c1_ptr));
+                v2 = vadd_f16(v2, vld1_f16(c2_ptr));
+                v3 = vadd_f16(v3, vld1_f16(c3_ptr));
+            }
+            vst1_f16(c0_ptr, vmin_f16(vmax_f16(v0, vmin4), vmax4));
+            vst1_f16(c1_ptr, vmin_f16(vmax_f16(v1, vmin4), vmax4));
+            vst1_f16(c2_ptr, vmin_f16(vmax_f16(v2, vmin4), vmax4));
+            vst1_f16(c3_ptr, vmin_f16(vmax_f16(v3, vmin4), vmax4));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+        }
+        if (rl & 2) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = (rl & 4) ? vget_high_f16(c00) : vget_low_f16(c00);
+            float16x4_t v1 = (rl & 4) ? vget_high_f16(c10) : vget_low_f16(c10);
+            float16x4_t v2 = (rl & 4) ? vget_high_f16(c20) : vget_low_f16(c20);
+            float16x4_t v3 = (rl & 4) ? vget_high_f16(c30) : vget_low_f16(c30);
+            if constexpr (!zero_mode) {
+                v0 = vset_lane_f16(vget_lane_f16(v0, 0) + c0_ptr[0], v0, 0);
+                v0 = vset_lane_f16(vget_lane_f16(v0, 1) + c0_ptr[1], v0, 1);
+                v1 = vset_lane_f16(vget_lane_f16(v1, 0) + c1_ptr[0], v1, 0);
+                v1 = vset_lane_f16(vget_lane_f16(v1, 1) + c1_ptr[1], v1, 1);
+                v2 = vset_lane_f16(vget_lane_f16(v2, 0) + c2_ptr[0], v2, 0);
+                v2 = vset_lane_f16(vget_lane_f16(v2, 1) + c2_ptr[1], v2, 1);
+                v3 = vset_lane_f16(vget_lane_f16(v3, 0) + c3_ptr[0], v3, 0);
+                v3 = vset_lane_f16(vget_lane_f16(v3, 1) + c3_ptr[1], v3, 1);
+            }
+            const float16x4_t w0 = vmin_f16(vmax_f16(v0, vmin4), vmax4);
+            vst1_lane_f16(c0_ptr + 0, w0, 0);
+            vst1_lane_f16(c0_ptr + 1, w0, 1);
+            const float16x4_t w1 = vmin_f16(vmax_f16(v1, vmin4), vmax4);
+            vst1_lane_f16(c1_ptr + 0, w1, 0);
+            vst1_lane_f16(c1_ptr + 1, w1, 1);
+            const float16x4_t w2 = vmin_f16(vmax_f16(v2, vmin4), vmax4);
+            vst1_lane_f16(c2_ptr + 0, w2, 0);
+            vst1_lane_f16(c2_ptr + 1, w2, 1);
+            const float16x4_t w3 = vmin_f16(vmax_f16(v3, vmin4), vmax4);
+            vst1_lane_f16(c3_ptr + 0, w3, 0);
+            vst1_lane_f16(c3_ptr + 1, w3, 1);
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+        }
+        if (rl & 1) {
+            float16_t x0 = (rl & 6) == 6 ? vgetq_lane_f16(c00, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c00, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c00, 2) :
+                                           vgetq_lane_f16(c00, 0);
+            float16_t x1 = (rl & 6) == 6 ? vgetq_lane_f16(c10, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c10, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c10, 2) :
+                                           vgetq_lane_f16(c10, 0);
+            float16_t x2 = (rl & 6) == 6 ? vgetq_lane_f16(c20, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c20, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c20, 2) :
+                                           vgetq_lane_f16(c20, 0);
+            float16_t x3 = (rl & 6) == 6 ? vgetq_lane_f16(c30, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c30, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c30, 2) :
+                                           vgetq_lane_f16(c30, 0);
+            if constexpr (!zero_mode) {
+                x0 = x0 + c0_ptr[0];
+                x1 = x1 + c1_ptr[0];
+                x2 = x2 + c2_ptr[0];
+                x3 = x3 + c3_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, cmin), cmax);
+            c1_ptr[0] = std::min(std::max(x1, cmin), cmax);
+            c2_ptr[0] = std::min(std::max(x2, cmin), cmax);
+            c3_ptr[0] = std::min(std::max(x3, cmin), cmax);
         }
     }
 }
@@ -816,36 +1280,126 @@ inline void mma_direct_mr4_nr16_mrxncxkc_f16(
             }
         }
 
-        const float16x8_t acc[4][2] = {
-            {c00, c01},
-            {c10, c11},
-            {c20, c21},
-            {c30, c31},
-        };
-        float16_t* NNOPS_RESTRICT c_rows[4] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr};
-        for (int r = 0; r < mr; ++r) {
-            float16_t* NNOPS_RESTRICT cp = c_rows[r];
-            int rr = rem;
-            int g = 0;
-            for (; rr >= 8; rr -= 8, ++g) {
-                float16x8_t v = acc[r][g];
-                if constexpr (!zero_mode) {
-                    v = vaddq_f16(v, vld1q_f16(cp));
-                }
-                vst1q_f16(cp, vminq_f16(vmaxq_f16(v, vmin), vmax));
-                cp += 8;
+        if (rem >= 8) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
+                c10 = vaddq_f16(c10, vld1q_f16(c1_ptr));
+                c20 = vaddq_f16(c20, vld1q_f16(c2_ptr));
+                c30 = vaddq_f16(c30, vld1q_f16(c3_ptr));
             }
-            if (rr > 0) {
-                float16_t lane[8];
-                vst1q_f16(lane, acc[r][g]);
-                for (int i = 0; i < rr; ++i) {
-                    float16_t v = lane[i];
-                    if constexpr (!zero_mode) {
-                        v = v + cp[i];
-                    }
-                    cp[i] = std::min(std::max(v, cmin), cmax);
-                }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            vst1q_f16(c1_ptr, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+            vst1q_f16(c2_ptr, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+            vst1q_f16(c3_ptr, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+            c0_ptr += 8;
+            c1_ptr += 8;
+            c2_ptr += 8;
+            c3_ptr += 8;
+            c00 = c01;
+            c10 = c11;
+            c20 = c21;
+            c30 = c31;
+        }
+        if (rem >= 16) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
+                c10 = vaddq_f16(c10, vld1q_f16(c1_ptr));
+                c20 = vaddq_f16(c20, vld1q_f16(c2_ptr));
+                c30 = vaddq_f16(c30, vld1q_f16(c3_ptr));
             }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            vst1q_f16(c1_ptr, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+            vst1q_f16(c2_ptr, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+            vst1q_f16(c3_ptr, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+            c0_ptr += 8;
+            c1_ptr += 8;
+            c2_ptr += 8;
+            c3_ptr += 8;
+        }
+        const int rl = rem & 7;
+        if (rl & 4) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = vget_low_f16(c00);
+            float16x4_t v1 = vget_low_f16(c10);
+            float16x4_t v2 = vget_low_f16(c20);
+            float16x4_t v3 = vget_low_f16(c30);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f16(v0, vld1_f16(c0_ptr));
+                v1 = vadd_f16(v1, vld1_f16(c1_ptr));
+                v2 = vadd_f16(v2, vld1_f16(c2_ptr));
+                v3 = vadd_f16(v3, vld1_f16(c3_ptr));
+            }
+            vst1_f16(c0_ptr, vmin_f16(vmax_f16(v0, vmin4), vmax4));
+            vst1_f16(c1_ptr, vmin_f16(vmax_f16(v1, vmin4), vmax4));
+            vst1_f16(c2_ptr, vmin_f16(vmax_f16(v2, vmin4), vmax4));
+            vst1_f16(c3_ptr, vmin_f16(vmax_f16(v3, vmin4), vmax4));
+            c0_ptr += 4;
+            c1_ptr += 4;
+            c2_ptr += 4;
+            c3_ptr += 4;
+        }
+        if (rl & 2) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = (rl & 4) ? vget_high_f16(c00) : vget_low_f16(c00);
+            float16x4_t v1 = (rl & 4) ? vget_high_f16(c10) : vget_low_f16(c10);
+            float16x4_t v2 = (rl & 4) ? vget_high_f16(c20) : vget_low_f16(c20);
+            float16x4_t v3 = (rl & 4) ? vget_high_f16(c30) : vget_low_f16(c30);
+            if constexpr (!zero_mode) {
+                v0 = vset_lane_f16(vget_lane_f16(v0, 0) + c0_ptr[0], v0, 0);
+                v0 = vset_lane_f16(vget_lane_f16(v0, 1) + c0_ptr[1], v0, 1);
+                v1 = vset_lane_f16(vget_lane_f16(v1, 0) + c1_ptr[0], v1, 0);
+                v1 = vset_lane_f16(vget_lane_f16(v1, 1) + c1_ptr[1], v1, 1);
+                v2 = vset_lane_f16(vget_lane_f16(v2, 0) + c2_ptr[0], v2, 0);
+                v2 = vset_lane_f16(vget_lane_f16(v2, 1) + c2_ptr[1], v2, 1);
+                v3 = vset_lane_f16(vget_lane_f16(v3, 0) + c3_ptr[0], v3, 0);
+                v3 = vset_lane_f16(vget_lane_f16(v3, 1) + c3_ptr[1], v3, 1);
+            }
+            const float16x4_t w0 = vmin_f16(vmax_f16(v0, vmin4), vmax4);
+            vst1_lane_f16(c0_ptr + 0, w0, 0);
+            vst1_lane_f16(c0_ptr + 1, w0, 1);
+            const float16x4_t w1 = vmin_f16(vmax_f16(v1, vmin4), vmax4);
+            vst1_lane_f16(c1_ptr + 0, w1, 0);
+            vst1_lane_f16(c1_ptr + 1, w1, 1);
+            const float16x4_t w2 = vmin_f16(vmax_f16(v2, vmin4), vmax4);
+            vst1_lane_f16(c2_ptr + 0, w2, 0);
+            vst1_lane_f16(c2_ptr + 1, w2, 1);
+            const float16x4_t w3 = vmin_f16(vmax_f16(v3, vmin4), vmax4);
+            vst1_lane_f16(c3_ptr + 0, w3, 0);
+            vst1_lane_f16(c3_ptr + 1, w3, 1);
+            c0_ptr += 2;
+            c1_ptr += 2;
+            c2_ptr += 2;
+            c3_ptr += 2;
+        }
+        if (rl & 1) {
+            float16_t x0 = (rl & 6) == 6 ? vgetq_lane_f16(c00, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c00, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c00, 2) :
+                                           vgetq_lane_f16(c00, 0);
+            float16_t x1 = (rl & 6) == 6 ? vgetq_lane_f16(c10, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c10, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c10, 2) :
+                                           vgetq_lane_f16(c10, 0);
+            float16_t x2 = (rl & 6) == 6 ? vgetq_lane_f16(c20, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c20, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c20, 2) :
+                                           vgetq_lane_f16(c20, 0);
+            float16_t x3 = (rl & 6) == 6 ? vgetq_lane_f16(c30, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c30, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c30, 2) :
+                                           vgetq_lane_f16(c30, 0);
+            if constexpr (!zero_mode) {
+                x0 = x0 + c0_ptr[0];
+                x1 = x1 + c1_ptr[0];
+                x2 = x2 + c2_ptr[0];
+                x3 = x3 + c3_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, cmin), cmax);
+            c1_ptr[0] = std::min(std::max(x1, cmin), cmax);
+            c2_ptr[0] = std::min(std::max(x2, cmin), cmax);
+            c3_ptr[0] = std::min(std::max(x3, cmin), cmax);
         }
     }
 }
@@ -936,28 +1490,54 @@ inline void mma_pack_mr1_nr16_mrxncxkc_f16(int mr, int nc, int kc, float16_t* NN
             }
         }
 
-        const float16x8_t acc[2] = {c00, c01};
-        float16_t* NNOPS_RESTRICT cp = c0_ptr;
-        int rr = rem;
-        int g = 0;
-        for (; rr >= 8; rr -= 8, ++g) {
-            float16x8_t v = acc[g];
+        if (rem >= 8) {
             if constexpr (!zero_mode) {
-                v = vaddq_f16(v, vld1q_f16(cp));
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
             }
-            vst1q_f16(cp, vminq_f16(vmaxq_f16(v, vmin), vmax));
-            cp += 8;
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            c0_ptr += 8;
+            c00 = c01;
         }
-        if (rr > 0) {
-            float16_t lane[8];
-            vst1q_f16(lane, acc[g]);
-            for (int i = 0; i < rr; ++i) {
-                float16_t v = lane[i];
-                if constexpr (!zero_mode) {
-                    v = v + cp[i];
-                }
-                cp[i] = std::min(std::max(v, cmin), cmax);
+        if (rem >= 16) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
             }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            c0_ptr += 8;
+        }
+        const int rl = rem & 7;
+        if (rl & 4) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = vget_low_f16(c00);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f16(v0, vld1_f16(c0_ptr));
+            }
+            vst1_f16(c0_ptr, vmin_f16(vmax_f16(v0, vmin4), vmax4));
+            c0_ptr += 4;
+        }
+        if (rl & 2) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = (rl & 4) ? vget_high_f16(c00) : vget_low_f16(c00);
+            if constexpr (!zero_mode) {
+                v0 = vset_lane_f16(vget_lane_f16(v0, 0) + c0_ptr[0], v0, 0);
+                v0 = vset_lane_f16(vget_lane_f16(v0, 1) + c0_ptr[1], v0, 1);
+            }
+            const float16x4_t w0 = vmin_f16(vmax_f16(v0, vmin4), vmax4);
+            vst1_lane_f16(c0_ptr + 0, w0, 0);
+            vst1_lane_f16(c0_ptr + 1, w0, 1);
+            c0_ptr += 2;
+        }
+        if (rl & 1) {
+            float16_t x0 = (rl & 6) == 6 ? vgetq_lane_f16(c00, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c00, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c00, 2) :
+                                           vgetq_lane_f16(c00, 0);
+            if constexpr (!zero_mode) {
+                x0 = x0 + c0_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, cmin), cmax);
         }
     }
 }
@@ -1094,28 +1674,54 @@ inline void mma_direct_mr1_nr16_mrxncxkc_f16(
             }
         }
 
-        const float16x8_t acc[2] = {c00, c01};
-        float16_t* NNOPS_RESTRICT cp = c0_ptr;
-        int rr = rem;
-        int g = 0;
-        for (; rr >= 8; rr -= 8, ++g) {
-            float16x8_t v = acc[g];
+        if (rem >= 8) {
             if constexpr (!zero_mode) {
-                v = vaddq_f16(v, vld1q_f16(cp));
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
             }
-            vst1q_f16(cp, vminq_f16(vmaxq_f16(v, vmin), vmax));
-            cp += 8;
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            c0_ptr += 8;
+            c00 = c01;
         }
-        if (rr > 0) {
-            float16_t lane[8];
-            vst1q_f16(lane, acc[g]);
-            for (int i = 0; i < rr; ++i) {
-                float16_t v = lane[i];
-                if constexpr (!zero_mode) {
-                    v = v + cp[i];
-                }
-                cp[i] = std::min(std::max(v, cmin), cmax);
+        if (rem >= 16) {
+            if constexpr (!zero_mode) {
+                c00 = vaddq_f16(c00, vld1q_f16(c0_ptr));
             }
+            vst1q_f16(c0_ptr, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+            c0_ptr += 8;
+        }
+        const int rl = rem & 7;
+        if (rl & 4) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = vget_low_f16(c00);
+            if constexpr (!zero_mode) {
+                v0 = vadd_f16(v0, vld1_f16(c0_ptr));
+            }
+            vst1_f16(c0_ptr, vmin_f16(vmax_f16(v0, vmin4), vmax4));
+            c0_ptr += 4;
+        }
+        if (rl & 2) {
+            const float16x4_t vmin4 = vget_low_f16(vmin);
+            const float16x4_t vmax4 = vget_low_f16(vmax);
+            float16x4_t v0 = (rl & 4) ? vget_high_f16(c00) : vget_low_f16(c00);
+            if constexpr (!zero_mode) {
+                v0 = vset_lane_f16(vget_lane_f16(v0, 0) + c0_ptr[0], v0, 0);
+                v0 = vset_lane_f16(vget_lane_f16(v0, 1) + c0_ptr[1], v0, 1);
+            }
+            const float16x4_t w0 = vmin_f16(vmax_f16(v0, vmin4), vmax4);
+            vst1_lane_f16(c0_ptr + 0, w0, 0);
+            vst1_lane_f16(c0_ptr + 1, w0, 1);
+            c0_ptr += 2;
+        }
+        if (rl & 1) {
+            float16_t x0 = (rl & 6) == 6 ? vgetq_lane_f16(c00, 6) :
+                           (rl & 4)      ? vgetq_lane_f16(c00, 4) :
+                           (rl & 2)      ? vgetq_lane_f16(c00, 2) :
+                                           vgetq_lane_f16(c00, 0);
+            if constexpr (!zero_mode) {
+                x0 = x0 + c0_ptr[0];
+            }
+            c0_ptr[0] = std::min(std::max(x0, cmin), cmax);
         }
     }
 }
