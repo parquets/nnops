@@ -206,8 +206,8 @@ void run_mha(const MhaCase& c, const std::vector<int>& threads, int iters) {
         const int64_t cdims[] = {c.B, H, Sk, D};
         ck_vec.assign(static_cast<size_t>(c.B * H * Sk * D), T{});
         cv_vec.assign(static_cast<size_t>(c.B * H * Sk * D), T{});
-        const T* kp = k.ptr<T>();
-        const T* vp = v.ptr<T>();
+        const T* kp = k.template ptr<T>();
+        const T* vp = v.template ptr<T>();
         for (int64_t b = 0; b < c.B; ++b) {
             for (int64_t h = 0; h < H; ++h) {
                 for (int64_t s = 0; s < Sq; ++s) {
@@ -342,10 +342,10 @@ void run_gqa(const GqaCase& c, const std::vector<int>& threads, int iters) {
         const int64_t cdims[] = {c.B, c.Hkv, Sk, c.D};
         ck_vec.assign(static_cast<size_t>(c.B * c.Hkv * Sk * c.D), T{});
         cv_vec.assign(static_cast<size_t>(c.B * c.Hkv * Sk * c.D), T{});
-        const T* kp = k.ptr<T>();
-        const T* vp = v.ptr<T>();
-        const T* pkp = Sk_past > 0 ? past_k.ptr<T>() : nullptr;
-        const T* pvp = Sk_past > 0 ? past_v.ptr<T>() : nullptr;
+        const T* kp = k.template ptr<T>();
+        const T* vp = v.template ptr<T>();
+        const T* pkp = Sk_past > 0 ? past_k.template ptr<T>() : nullptr;
+        const T* pvp = Sk_past > 0 ? past_v.template ptr<T>() : nullptr;
         for (int64_t b = 0; b < c.B; ++b) {
             for (int64_t h = 0; h < c.Hkv; ++h) {
                 for (int64_t t = 0; t < Sk; ++t) {
@@ -615,8 +615,8 @@ DtypeArm make_mha_arm(const MhaCase& c, double& flops) {
         const int64_t cdims[] = {c.B, c.H, Sk, c.D};
         ck_buf->assign(static_cast<size_t>(c.B * c.H * Sk * c.D), T{});
         cv_buf->assign(static_cast<size_t>(c.B * c.H * Sk * c.D), T{});
-        const T* kp = ins[1].ptr<T>();
-        const T* vp = ins[2].ptr<T>();
+        const T* kp = ins[1].template ptr<T>();
+        const T* vp = ins[2].template ptr<T>();
         for (int64_t b = 0; b < c.B; ++b) {
             for (int64_t h = 0; h < c.H; ++h) {
                 for (int64_t s = 0; s < Sq; ++s) {
@@ -715,15 +715,15 @@ DtypeArm make_gqa_arm(const GqaCase& c, double& flops) {
         const int64_t cdims[] = {c.B, c.Hkv, Sk, c.D};
         ck_buf->assign(static_cast<size_t>(c.B * c.Hkv * Sk * c.D), T{});
         cv_buf->assign(static_cast<size_t>(c.B * c.Hkv * Sk * c.D), T{});
-        const T* kp = ins[1].ptr<T>();
-        const T* vp = ins[2].ptr<T>();
+        const T* kp = ins[1].template ptr<T>();
+        const T* vp = ins[2].template ptr<T>();
         const T* pkp = nullptr;
         const T* pvp = nullptr;
         if (Sk_past > 0) {
             ins.push_back(adopt(pk_buf, pshape, 24));
             ins.push_back(adopt(pv_buf, pshape, 25));
-            pkp = ins[3].ptr<T>();
-            pvp = ins[4].ptr<T>();
+            pkp = ins[3].template ptr<T>();
+            pvp = ins[4].template ptr<T>();
         }
         for (int64_t b = 0; b < c.B; ++b) {
             for (int64_t h = 0; h < c.Hkv; ++h) {
@@ -1072,6 +1072,135 @@ NNOPS_BENCH(gqa_f32_mqa) {
 NNOPS_BENCH(gqa_f16_prefill) {
     bench_gqa({"gqa f16 prefill B1 S512 H32 Hkv8 D128", 1, 512, 32, 8, 128,
                /*Sk=*/0, /*causal=*/true, /*f16=*/true});
+}
+
+// ---- prefilling over an int8 cache: fp vs dynamic-query int8 Q·Kᵀ ----------
+//
+// Both arms read the same s8 cache and differ only in `quantize_query`, so the
+// ratio isolates the integer Q·Kᵀ path (the cache's dequantized fp route is the
+// baseline). Arms alternate inside one process and the median of three runs is
+// reported, per the measurement caveats.
+template <typename T>
+void bench_gqa_qk8_ab(const char* tag, int64_t B, int64_t Sq, int64_t Sk, int64_t H, int64_t Hkv,
+                      int64_t D) {
+    const std::vector<int64_t> qshape = {B, Sq, H * D};
+    const std::vector<int64_t> kshape = {B, Sk, Hkv * D};
+    auto [q_vec, q] = make_random<T>(qshape, 41);
+    auto [k_vec, k] = make_random<T>(kshape, 42);
+    auto [v_vec, v] = make_random<T>(kshape, 43);
+
+    // Symmetric int8 cache, one scale per (batch, kv head, token).
+    const int64_t n_cache = B * Hkv * Sk * D;
+    std::vector<int8_t> qk(static_cast<size_t>(n_cache)), qv(static_cast<size_t>(n_cache));
+    std::vector<float> sk(static_cast<size_t>(B * Hkv * Sk)), sv(sk.size());
+    const T* kp = k.template ptr<T>();
+    const T* vp = v.template ptr<T>();
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t h = 0; h < Hkv; ++h) {
+            for (int64_t t = 0; t < Sk; ++t) {
+                const int64_t row = ((b * Hkv + h) * Sk + t) * D;
+                float ak = 0.0f, av = 0.0f;
+                for (int64_t d = 0; d < D; ++d) {
+                    ak = std::max(ak, std::fabs(simd::s_load(&kp[row + d])));
+                    av = std::max(av, std::fabs(simd::s_load(&vp[row + d])));
+                }
+                const float sc_k = ak > 0.0f ? ak / 127.0f : 1.0f;
+                const float sc_v = av > 0.0f ? av / 127.0f : 1.0f;
+                const size_t srow = static_cast<size_t>((b * Hkv + h) * Sk + t);
+                sk[srow] = sc_k;
+                sv[srow] = sc_v;
+                for (int64_t d = 0; d < D; ++d) {
+                    qk[static_cast<size_t>(row + d)] = static_cast<int8_t>(std::nearbyintf(
+                        simd::s_load(&kp[row + d]) / sc_k));
+                    qv[static_cast<size_t>(row + d)] = static_cast<int8_t>(std::nearbyintf(
+                        simd::s_load(&vp[row + d]) / sc_v));
+                }
+            }
+        }
+    }
+    const int64_t cdims[] = {B, Hkv, Sk, D};
+    const int64_t sdim[] = {B, Hkv, Sk};
+    TensorView ck(cdims, DataType::s8, qk.data());
+    TensorView cv(cdims, DataType::s8, qv.data());
+    TensorView ksc(sdim, DataType::f32, sk.data());
+    TensorView vsc(sdim, DataType::f32, sv.data());
+    const std::vector<TensorView> ins = {q, ck, cv, TensorView{}, TensorView{}, ksc, vsc};
+
+    GroupQueryAttentionAttributes attrs{};
+    attrs.num_heads = H;
+    attrs.kv_num_heads = Hkv;
+    attrs.causal = true;
+    auto op_fp = GroupQueryAttention::create(attrs, Backend::CPU);
+    attrs.quantize_query = true;
+    auto op_q8 = GroupQueryAttention::create(attrs, Backend::CPU);
+
+    std::vector<TensorDesc> descs;
+    for (const auto& t : ins) { descs.push_back(t.desc()); }
+    const auto out_descs = op_fp->getOutputTensorDesc(descs);
+    std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto output = test::make_channel_first(out_descs[0], out_buf.data());
+
+    cpu::AttentionConfig cfg;
+    cfg.num_heads = H;
+    cfg.num_kv_heads = Hkv;
+    cfg.causal = true;
+    cfg.seqlens_slot = 3;
+    cfg.seqlens_is_length = true;
+    cfg.pos_ids_slot = 4;
+    cfg.k_scale_slot = 5;
+    cfg.v_scale_slot = 6;
+    cfg.sink_slot = 7;
+    cfg.gate_slot = 8;
+    cfg.quantize_q = true;
+    const auto plan = cpu::get_attention_plan(cfg, descs, out_descs, 1, true);
+
+    const double flops = 4.0 * static_cast<double>(B) * H * Sq * Sk * D;
+    const int iters = 5;
+
+    std::printf(
+        "  gqa %s int8 cache B%lld Sq%lld Sk%lld H%lld Hkv%lld D%lld  (causal, route=%s, qk8=%d)\n",
+        tag, (long long)B, (long long)Sq, (long long)Sk, (long long)H, (long long)Hkv,
+        (long long)D, plan.use_flash ? "flash" : (plan.use_decode ? "decode" : "standard"),
+        plan.flash_qk_i8 ? 1 : 0);
+
+    const std::vector<int> threads = thread_list();
+    std::printf("    ");
+    for (int nt : threads) {
+        BenchPool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+        std::vector<double> ns_fp, ns_q8;
+        for (int r = 0; r < 3; ++r) {
+            for (auto* arm : {op_fp.get(), op_q8.get()}) {
+                for (int i = 0; i < 2; ++i) { arm->compute(output, ins, use_ctx, nullptr); }
+                const auto t0 = std::chrono::high_resolution_clock::now();
+                for (int i = 0; i < iters; ++i) { arm->compute(output, ins, use_ctx, nullptr); }
+                const auto t1 = std::chrono::high_resolution_clock::now();
+                const double per_call =
+                    std::chrono::duration<double, std::nano>(t1 - t0).count() / iters;
+                (arm == op_fp.get() ? ns_fp : ns_q8).push_back(per_call);
+            }
+        }
+        std::sort(ns_fp.begin(), ns_fp.end());
+        std::sort(ns_q8.begin(), ns_q8.end());
+        const double fp = ns_fp[1], q8 = ns_q8[1];
+        std::printf(" %2dT fp %7.1f int8q %7.1f GFLOPS (%.2fx) |", nt, flops / fp, flops / q8,
+                    fp / q8);
+    }
+    std::printf("\n");
+}
+
+NNOPS_BENCH(gqa_qk_int8_ab) {
+    // 1T/2T/4T per the house rule; set NNOPS_BENCH_THREADS to widen.
+    for (const int64_t S : {int64_t{512}, int64_t{2048}}) {
+        bench_gqa_qk8_ab<float>("f32", 1, S, S, 32, 8, 128);
+        bench_gqa_qk8_ab<half>("f16", 1, S, S, 32, 8, 128);
+    }
+    // Chunked prefill: a short query block against a long cache, the shape a
+    // long-context decode step's prefill takes.
+    bench_gqa_qk8_ab<float>("f32 chunk", 1, 16, 4096, 16, 8, 128);
+    bench_gqa_qk8_ab<float>("f32 chunk", 1, 256, 4096, 16, 8, 128);
 }
 
 // ============================================================

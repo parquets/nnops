@@ -112,6 +112,15 @@
 /// into the score and the V scale into the probabilities, so no fp copy of the
 /// cache is made.
 ///
+/// cfg.quantize_q adds one route through that cache: the flash route quantizes
+/// each query row on the fly (its own symmetric scale) and runs Q·Kᵀ on the
+/// integer MMA (VNNI u8×s8 on x86, SDOT/i8mm on aarch64), dequantizing the
+/// int32 scores by scale·s_q[row]·s_k[key] before the mask and softmax. The
+/// cache's keys are used as stored — no widening pass. The plan reports the
+/// choice as flash_qk_i8, and it holds only for a head dim the integer pack's
+/// k group divides and packs in one k block (see qk_i8_enabled); every other
+/// route and shape runs fp.
+///
 /// Varlen (cu_seqlens_q / cu_seqlens_k): the two int32 [segments + 1] offsets of
 /// HuggingFace's packed batches. Q is [1, total_q, H*D] and K/V are
 /// [1, total_kv, ...], segment s owning query rows [cu_q[s], cu_q[s+1]) and key
@@ -196,6 +205,13 @@ struct AttentionConfig {
     /// Value a key_padding_mask uses for a padded key (onnxruntime's
     /// mask_filter_value, default -10000 — not -inf).
     float mask_filter_value = -10000.0f;
+    /// Dynamic int8 quantization of the query for Q·Kᵀ: every query row is
+    /// quantized on the fly (its own symmetric scale) and the product runs on
+    /// the integer MMA, dequantized into the score tile afterwards. Only the
+    /// flash route has the path, and only over an s8 cache whose query-key
+    /// width divides the integer pack's k group; everywhere else the fp route
+    /// runs unchanged.
+    bool quantize_q = false;
 
     int64_t kv_heads() const noexcept { return num_kv_heads > 0 ? num_kv_heads : num_heads; }
 };
@@ -215,6 +231,11 @@ struct AttentionPlan {
     /// merged with the online-softmax weights. > 1 only when the query-block
     /// grid would leave workers idle.
     int flash_splits = 1;
+    /// Flash route runs Q·Kᵀ on the integer MMA (dynamic per-row query
+    /// quantization over an s8 cache), and its scratch carries the quantized
+    /// query block and the int32 score tile. See cfg.quantize_q for when the
+    /// path is eligible.
+    bool flash_qk_i8 = false;
     /// Decode head batching: query heads one task serves. Under GQA/MQA the
     /// group's heads share a KV head, so one pass over K/V feeds all of them
     /// instead of each head re-reading the run.

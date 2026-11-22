@@ -36,7 +36,9 @@ Status attention_single(const AttentionConfig& cfg, TensorView& output,
     const bool kv8 = kv_is_int8(inputs);
 
     // An int8 cache keeps the query (and everything else on the activation
-    // side) fp: the routes dequantize on read. bf16 has no such route.
+    // side) fp: the routes dequantize on read, except the flash route's
+    // dynamic-query int8 Q·Kᵀ (cfg.quantize_q), which quantizes the query
+    // itself and reads the cache's bytes in place. bf16 has no such route.
     if (kv8 && dt != DataType::f32 && dt != DataType::f16) {
         return Status::unsupported;
     }
@@ -305,6 +307,7 @@ Status group_query_attention_cpu(const GroupQueryAttentionAttributes& attrs,
     cfg.output_gate = attrs.output_gate;
     cfg.bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
     cfg.mask_filter_value = attrs.mask_filter_value;
+    cfg.quantize_q = attrs.quantize_query;
 
     if (attrs.causal) {
         // Cache form: Q, k_cache, v_cache, kv_seqlens, k_scale, v_scale,

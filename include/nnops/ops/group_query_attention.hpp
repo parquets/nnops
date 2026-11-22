@@ -159,6 +159,20 @@ struct GroupQueryAttentionAttributes {
     /// (activation, multiply) the caller would otherwise run over the hidden,
     /// folded into one.
     EpilogueActivateType output_gate = EpilogueActivateType::None;
+
+    /// Dynamic int8 quantization of the query for Q·Kᵀ. With an s8 cache the
+    /// query still arrives fp; this quantizes each query row on the fly (its
+    /// own symmetric scale) and runs Q·Kᵀ on the integer MMA, so the product
+    /// costs the hardware's integer rate instead of its fp one. The score tile
+    /// is dequantized before the mask and softmax, so every other attribute and
+    /// input keeps its meaning — at int8 accuracy for the logits.
+    ///
+    /// It applies to the flash route only (long or split key runs), and only to
+    /// a query-key width the integer pack's k group divides and fits in one k
+    /// block; anything else — a short run on the materialized route, the
+    /// Sq == 1 GEMV route, an fp cache — runs unchanged on the fp path, so the
+    /// attribute is a hint, not a contract. Off by default.
+    bool quantize_query = false;
 };
 
 class GroupQueryAttention : public OpBase {

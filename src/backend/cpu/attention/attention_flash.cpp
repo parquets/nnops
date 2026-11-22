@@ -22,6 +22,13 @@
 ///
 /// Both GEMMs drive tile_mma_direct with a packed B. The first k-block of the
 /// whole task runs zero_mode, which is what lets o_acc skip a pre-zeroing pass.
+///
+/// Over an s8 cache with cfg.quantize_q set, GEMM1 instead runs on the integer
+/// MMA: the task's query rows are quantized once (one symmetric scale per row)
+/// into a signed byte block, the cache's keys are packed as stored, and the
+/// int32 scores are dequantized into the S tile by scale·s_q[row]·s_k[key].
+/// Softmax, masking and GEMM2 are untouched — P·V stays fp for now, so only the
+/// logits carry the int8 error.
 
 #include "attention_internal.h"
 
@@ -61,6 +68,9 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
 
     const bool kv8 = kv_is_int8(inputs);
     NNOPS_ASSERT(!(kv8 && split)); // a quantized cache has no past segment
+    // Dynamic-query int8 Q·Kᵀ: the plan resolved it (and sized the slot for it).
+    const bool qk8 = plan.flash_qk_i8;
+    NNOPS_ASSERT(!qk8 || kv8);
     const int8_t* k8_ptr = kv8 ? K.ptr<int8_t>() : nullptr;
     const int8_t* v8_ptr = kv8 ? V.ptr<int8_t>() : nullptr;
     const T* q_ptr = Q.ptr<T>();
@@ -106,7 +116,9 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
     const int hb = plan.flash_heads;
     const int64_t G = H / Hkv;
     const int64_t nb = (G + hb - 1) / hb;
-    const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8);
+    const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8, qk8);
+    const int64_t pack_elems = flash_pack_elems<T>(Bc, Dqk, Dv);
+    const FlashQkI8Layout qk_layout = flash_qk_i8_layout(Br, Bc, Dqk, hb);
 
     const int64_t NQ = (Sq + Br - 1) / Br; // number of Br-row query blocks
     const int64_t units = B * Hkv * nb * NQ;
@@ -181,6 +193,18 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                      (per_task - (kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(
                                             std::max<int64_t>(Dqk, Bc))) :
                                        0));
+        // The int8 Q·Kᵀ scratch sits between the packed-B area and i8_temp:
+        // the packed query block for every batched head, its row scales, and
+        // the one int32 score tile the integer MMA accumulates into.
+        int8_t* qpack = nullptr;
+        float* q_scale = nullptr;
+        int32_t* s32 = nullptr;
+        if (qk8) {
+            char* tail = reinterpret_cast<char*>(pack_b + pack_elems);
+            qpack = reinterpret_cast<int8_t*>(tail);
+            q_scale = reinterpret_cast<float*>(tail + qk_layout.qscale);
+            s32 = reinterpret_cast<int32_t*>(tail + qk_layout.s32);
+        }
 
         // Reset the running online-softmax state through the scalar simd
         // bridge: std::numeric_limits<T> is not specialized for half (it
@@ -229,26 +253,57 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
 
             // ---- S = Q[i0:i0+Br] @ K[j0:j0+Bc]^T * scale ----------
             // k0 == 0 overwrites (zero_mode) — each KV block owns its S tile.
-            for (int64_t k0 = 0; k0 < Dqk; k0 += kc) {
-                const int actual_kc = static_cast<int>(std::min<int64_t>(kc, Dqk - k0));
-                const int ldd_b = static_cast<int>(
-                    mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T))) /
-                    static_cast<int>(sizeof(T)));
-                if (kv8) {
-                    kv_pack_i8<T>(true, actual_bc, actual_kc, pack_b, ldd_b,
-                                  k8_head + koff * k_step + k0, static_cast<int>(k_step),
-                                  ks_head.shifted(j0), scale, i8_temp);
-                } else {
-                    tile_pack_rhs(true, actual_bc, actual_kc, pack_b, ldd_b,
-                                  kb + koff * k_step + k0, static_cast<int>(k_step), scale);
-                }
-                // One packed K tile feeds every batched head of the group.
+            if (qk8) {
+                // The cache's s8 keys go into the int8 B panels as they are,
+                // and the query was quantized once per task. int32 scores come
+                // back scaled by scale · s_q[row] · s_k[key].
+                const bool k_col = ks_head.ptr != nullptr && ks_head.step != 0;
+                const float k_all = k_col ? 1.0f : ks_head.at(0);
+                const float* kcol = k_col ? ks_head.ptr + j0 : nullptr;
+                // One packed K tile serves every batched head (the gate keeps
+                // the head dim inside one integer k block).
+                tile_pack_rhs_i8(true, actual_bc, static_cast<int>(Dqk),
+                                 reinterpret_cast<int8_t*>(pack_b),
+                                 static_cast<int>(int8_panel_stride(Dqk)),
+                                 k8_head + koff * k_step, static_cast<int>(k_step),
+                                 kQkI8ABiased);
+                const int8_t* b8 = reinterpret_cast<const int8_t*>(pack_b);
                 for (int j = 0; j < nh; ++j) {
-                    T* s_j = s + static_cast<int64_t>(j) * Br * actual_bc;
-                    tile_mma_direct(actual_br, actual_bc, actual_kc, s_j, actual_bc,
-                                    q_base + j * q_h + i0 * q_rs + k0, static_cast<int>(q_rs),
-                                    pack_b, /*ldb=*/-1, /*stage=*/nullptr, kNegInf, kPosInf,
-                                    k0 == 0);
+                    tile_mma_pack_i8(actual_br, actual_bc, static_cast<int>(Dqk), s32, actual_bc,
+                                     qpack + static_cast<int64_t>(j) *
+                                                 static_cast<int64_t>(qk_layout.q_head),
+                                     b8, /*ldb=*/0, INT32_MIN, INT32_MAX, /*zero_mode=*/true);
+                    const float* qs_j = q_scale + static_cast<int64_t>(j) * Br;
+                    for (int i = 0; i < actual_br; ++i) {
+                        T* srow = s + (static_cast<int64_t>(j) * Br + i) * actual_bc;
+                        const float row_mult = scale * qs_j[i] * k_all;
+                        qk_i8_dequant_row<T>(srow, s32 + static_cast<int64_t>(i) * actual_bc,
+                                             kcol, actual_bc, row_mult);
+                    }
+                }
+            }
+            if (!qk8) {
+                for (int64_t k0 = 0; k0 < Dqk; k0 += kc) {
+                    const int actual_kc = static_cast<int>(std::min<int64_t>(kc, Dqk - k0));
+                    const int ldd_b = static_cast<int>(
+                        mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T))) /
+                        static_cast<int>(sizeof(T)));
+                    if (kv8) {
+                        kv_pack_i8<T>(true, actual_bc, actual_kc, pack_b, ldd_b,
+                                      k8_head + koff * k_step + k0, static_cast<int>(k_step),
+                                      ks_head.shifted(j0), scale, i8_temp);
+                    } else {
+                        tile_pack_rhs(true, actual_bc, actual_kc, pack_b, ldd_b,
+                                      kb + koff * k_step + k0, static_cast<int>(k_step), scale);
+                    }
+                    // One packed K tile feeds every batched head of the group.
+                    for (int j = 0; j < nh; ++j) {
+                        T* s_j = s + static_cast<int64_t>(j) * Br * actual_bc;
+                        tile_mma_direct(actual_br, actual_bc, actual_kc, s_j, actual_bc,
+                                        q_base + j * q_h + i0 * q_rs + k0, static_cast<int>(q_rs),
+                                        pack_b, /*ldb=*/-1, /*stage=*/nullptr, kNegInf, kPosInf,
+                                        k0 == 0);
+                    }
                 }
             }
 
@@ -382,6 +437,28 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
             first_tile = false;
             return j0 + actual_bc;
         };
+
+        // ---- dynamic int8 quantization of the task's query rows ----------
+        // Once per task and head, before the KV stream: the same block is read
+        // by every KV tile, so quantizing here is amortized over the run. The
+        // scale is the row's own symmetric max — that is what keeps the int8
+        // product's error small on rows with outliers — and the block is packed
+        // as it is quantized, so the MMA reads the panel layout it wants.
+        if (qk8) {
+            for (int j = 0; j < nh; ++j) {
+                const T* qsrc = q_base + j * q_h + i0 * q_rs;
+                float* qs_j = q_scale + static_cast<int64_t>(j) * Br;
+                for (int i = 0; i < actual_br; ++i) {
+                    const float amax = row_absmax<T>(qsrc + static_cast<int64_t>(i) * q_rs, Dqk);
+                    qs_j[i] = amax > 0.0f ? amax / 127.0f : 1.0f;
+                }
+                tile_pack_quant_lhs_i8(
+                    actual_br, static_cast<int>(Dqk),
+                    qpack + static_cast<int64_t>(j) * static_cast<int64_t>(qk_layout.q_head),
+                    static_cast<int>(geom_ldd_i8_a(Dqk)), qsrc, static_cast<int>(q_rs), qs_j,
+                    nullptr, 1.0f, 0, /*u8=*/false, kQkI8ABiased);
+            }
+        }
 
         // The sink band is slice 0's; the window band is partitioned across the
         // slices, so each task streams one contiguous span of the run.

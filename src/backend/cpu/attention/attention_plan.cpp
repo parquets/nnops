@@ -132,6 +132,11 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
         plan.Br = Br;
         plan.Bc = Bc;
         const int64_t NQ = (Sq + Br - 1) / Br;
+        // Dynamic-query int8 Q·Kᵀ: its extra scratch (quantized query block,
+        // row scales, int32 score tile) rides in every slot, so the head-batch
+        // and split rules below see the same per-task size the kernel uses.
+        const bool qk8 = qk_i8_enabled(cfg, kv8, Dqk);
+        plan.flash_qk_i8 = qk8;
 
         // GQA head batching: the group's query heads share one K/V head, so one
         // task can pack and stream each K/V tile once for all of them. Only do
@@ -154,7 +159,8 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
                     if (tasks < min_tasks) {
                         continue;
                     }
-                    const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, cand, kv8);
+                    const int64_t per_task =
+                        flash_per_task_elems<T>(Br, Bc, Dqk, Dv, cand, kv8, qk8);
                     const int64_t slots =
                         plan_slot_count(num_threads, use_thread_slots, tasks);
                     if (static_cast<size_t>(slots) * static_cast<size_t>(per_task) *
@@ -182,7 +188,7 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
             while (splits > 1 && (Sk + splits - 1) / splits < min_slice) {
                 --splits;
             }
-            const int64_t task_elems = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8);
+            const int64_t task_elems = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8, qk8);
             while (splits > 1) {
                 const int64_t tasks = units * splits;
                 const int64_t slots =
@@ -202,7 +208,7 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
         }
         plan.flash_splits = static_cast<int>(splits);
         const int64_t tasks = units * splits;
-        const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8);
+        const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8, qk8);
         plan.num_slots =
             plan_slot_count(num_threads, use_thread_slots, std::max(tasks, B * H * NQ));
         size_t bytes =

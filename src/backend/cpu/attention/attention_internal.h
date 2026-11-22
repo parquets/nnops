@@ -21,6 +21,7 @@
 #include "backend/cpu/common/gate_combine.hpp" // gate_scale_row, the output gate
 #include "backend/cpu/matmul/matmul_helper.h"  // tile_mma_direct / tile_pack_rhs + panel constants
 #include "backend/cpu/simd_kernel/activation_kernels.hpp" // v_tanh, for softcapping
+#include "backend/cpu/simd_kernel/simd_int8_lane.hpp"     // v_cvt_i32_to_f32 (int8 QK dequant)
 #include "backend/cpu/simd_kernel/simd_softmax.hpp"       // softmax + FlashAttention row kernels
 #include "backend/cpu/simd_kernel/tiled_map.hpp"          // simd_vec_t
 #include "nnops/detail/assert.hpp"
@@ -39,6 +40,11 @@ namespace nnops::backend::cpu {
 
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 constexpr float kPosInf = std::numeric_limits<float>::infinity();
+
+inline size_t align_up_bytes(size_t n, size_t a)
+{
+    return (n + a - 1) & ~(a - 1);
+}
 
 // ---- dtype-selected tiling constants -------------------------------------
 // k-block length per dtype, mirroring matmul_helper.h so plan and kernels agree.
@@ -424,6 +430,124 @@ void kv_pack_i8(bool trans, int nc, int kc, T* dst, int ldd, const int8_t* src, 
     }
 }
 
+// ---- dynamic-query int8 Q·Kᵀ --------------------------------------------
+//
+// The query is quantized on the fly, one symmetric scale per row, and the
+// product runs on the integer MMA (VNNI u8×s8 on x86, SDOT/i8mm on aarch64)
+// with the cache's own s8 keys. int32 scores are then scaled back by
+// `scale · s_q[row] · s_k[key]` — the k scale can only ride the score, because
+// it varies along the reduction's *output* axis (per key), not along K.
+
+/// Whether the int8 Q·Kᵀ path can run: asked for, over an s8 cache, with a
+/// query-key width that divides the integer pack's k group (4, eight on the
+/// runtime i8mm route) and inside the pack's one-k-block cap. Everything else
+/// runs the fp route, which needs none of those.
+inline bool qk_i8_enabled(const AttentionConfig& cfg, bool kv8, int64_t Dqk)
+{
+    return cfg.quantize_q && kv8 && Dqk > 0 && Dqk <= KC_CAP_I8 &&
+           i8_k_round64(Dqk) == Dqk;
+}
+
+/// M panels walk_levels_exact emits for @p rows on the int8 ladder.
+inline int i8_m_panels(int rows)
+{
+    const int l0 = MR_I8[0], l1 = MR_I8[1];
+    const int greedy = rows / l0;
+    int best = rows + 1;
+    for (int q0 = greedy; q0 >= 0 && q0 >= greedy - 2; --q0) {
+        const int rest = rows - q0 * l0;
+        best = std::min(best, q0 + rest / l1 + rest % l1);
+    }
+    return best;
+}
+
+/// The most panels any row count up to @p rows emits: the count is not
+/// monotonic (63 rows is 12 panels, 64 is 11 — a three-row tail beats a
+/// six-row panel), and a task's last query block is exactly such a tail. A
+/// packed query block is sized by this, so no tail can overrun the slot.
+inline int i8_m_panels_max(int rows)
+{
+    int best = 1;
+    for (int r = 1; r <= rows; ++r) {
+        best = std::max(best, i8_m_panels(r));
+    }
+    return best;
+}
+
+/// A's correction block: the s8 query pack biases its bytes on x86 and neither
+/// pack nor kernel needs the column sums on aarch64 (see int8_a_pack_bias).
+constexpr bool kQkI8ABiased = int8_a_pack_bias(DataType::s8) != 0;
+
+/// max |x| over a row, the dynamic quantization scale's numerator.
+template <class T> inline float row_absmax(const T* x, int64_t n)
+{
+    using V = kernel::simd_vec_t<T>;
+    constexpr int64_t L = simd::simd_lane_for<T>;
+    int64_t i = 0;
+    V acc = simd::v_zero(x);
+    for (; i + L <= n; i += L) {
+        acc = simd::v_max(acc, simd::v_abs(simd::v_load(x + i)));
+    }
+    float best = simd::v_reduce_max(acc);
+    for (; i < n; ++i) {
+        best = std::max(best, std::abs(simd::s_load(&x[i])));
+    }
+    return best;
+}
+
+/// Byte layout of the int8 Q·Kᵀ scratch after a flash slot's packed-B area:
+/// one packed query block per batched head (from the region's base), their row
+/// scales, and the one int32 score tile the MMA accumulates into — each region
+/// 16-byte aligned. The plan sizes the slot from this and the kernel carves it
+/// the same way, so the two can never disagree.
+struct FlashQkI8Layout {
+    size_t q_head = 0;  ///< bytes one head's packed Br-row query block takes
+    size_t qscale = 0;  ///< the row scales, after every head's block
+    size_t s32 = 0;     ///< the int32 score tile
+    size_t bytes = 0;   ///< the whole region
+};
+
+inline FlashQkI8Layout flash_qk_i8_layout(int Br, int Bc, int64_t Dqk, int heads)
+{
+    FlashQkI8Layout o;
+    o.q_head = static_cast<size_t>(i8_m_panels_max(Br)) *
+               static_cast<size_t>(geom_ldd_i8_a(Dqk));
+    const size_t q_bytes = static_cast<size_t>(heads) * o.q_head;
+    o.qscale = align_up_bytes(q_bytes, 16);
+    o.s32 = o.qscale + align_up_bytes(static_cast<size_t>(heads) * static_cast<size_t>(Br) *
+                                          sizeof(float),
+                                      16);
+    o.bytes = o.s32 + align_up_bytes(
+                           static_cast<size_t>(Br) * static_cast<size_t>(Bc) * sizeof(int32_t), 16);
+    return o;
+}
+
+/// One int32 score row back into the route's score tile:
+/// s[n] = acc[n] · row_mult · col_scale[n], where @p col_scale is the cache's
+/// per-key scale (null for a per-tensor one, folded into row_mult).
+template <class T>
+inline void qk_i8_dequant_row(T* dst, const int32_t* acc, const float* col_scale, int64_t n,
+                              float row_mult)
+{
+    constexpr int64_t L = simd::simd_default_lane_f32;
+    const simd::v_f32x8 vm = simd::v_set1_f32x8(row_mult);
+    int64_t i = 0;
+    for (; i + L <= n; i += L) {
+        simd::v_f32x8 v = simd::v_mul(kernel::v_cvt_i32_to_f32(acc + i), vm);
+        if (col_scale != nullptr) {
+            v = simd::v_mul(v, simd::v_load(col_scale + i));
+        }
+        simd::v_store_f32<T>(dst + i, v);
+    }
+    for (; i < n; ++i) {
+        float v = static_cast<float>(acc[i]) * row_mult;
+        if (col_scale != nullptr) {
+            v *= col_scale[i];
+        }
+        simd::s_store(&dst[i], v);
+    }
+}
+
 /// Keys [0, sink) are visible to every row regardless of the window.
 inline int64_t sink_prefix(const AttentionConfig& cfg, int64_t run)
 {
@@ -619,12 +743,23 @@ inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk, i
 
 // Per-task scratch for one Br-row query block, matching the layout inside
 // attention_flash_impl: per head [m:Br][l:Br][s:Br*Bc][o_acc:Br*Dv], then one
-// shared [pack_b][i8 temp]. The packed-B slot serves GEMM1 (K = Dqk, N <= Bc)
-// and GEMM2 (K <= Bc, N = Dv) for every batched head; the trailing slot is the
-// int8 dequantization panel, present only when the KV cache is quantized.
-template <class T>
-inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv, int heads,
-                                    bool kv8 = false)
+// shared [pack_b][i8 temp], then — on the dynamic-query int8 path — the
+// quantized query block, its row scales and the int32 score tile. The packed-B
+// slot serves GEMM1 (K = Dqk, N <= Bc) and GEMM2 (K <= Bc, N = Dv) for every
+// batched head, holding the wider of the fp panels and the int8 Q·Kᵀ ones; the
+// trailing slot is the int8 dequantization panel, present only when the KV
+// cache is quantized.
+
+/// Panels a packed int8 B tile of any n <= n_max emits.
+constexpr int panels_for_pack_i8(int64_t n_max)
+{
+    return static_cast<int>((n_max + NR_MAX_I8 - 1) / NR_MAX_I8);
+}
+
+/// The packed-B slot, in T elements: the fp panels of both GEMMs, or the int8
+/// Q·Kᵀ panels when those are wider (they never are today, but the slot is one
+/// region and the two routes must both fit it).
+template <class T> inline int64_t flash_pack_elems(int Bc, int64_t Dqk, int64_t Dv)
 {
     constexpr int nr_max = nr_max_flt<T>();
     const int ldd_b_full = static_cast<int>(
@@ -632,12 +767,28 @@ inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv, int
                        static_cast<int>(sizeof(T))) /
         static_cast<int>(sizeof(T)));
     const int np_full = std::max(panels_for_pack<T>(Bc), panels_for_pack<T>(Dv));
-    const int pack_elems = np_full * ldd_b_full;
+    const int64_t fp_elems = static_cast<int64_t>(np_full) * ldd_b_full;
+    const int64_t i8_bytes = static_cast<int64_t>(panels_for_pack_i8(Bc)) *
+                             int8_panel_stride(std::min<int64_t>(Dqk, KC_CAP_I8));
+    const int64_t i8_elems = (i8_bytes + static_cast<int64_t>(sizeof(T)) - 1) /
+                             static_cast<int64_t>(sizeof(T));
+    return std::max(fp_elems, i8_elems);
+}
+
+template <class T>
+inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv, int heads,
+                                    bool kv8 = false, bool qk8 = false)
+{
     const int64_t i8_elems =
         kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(std::max<int64_t>(Dqk, Bc))) : 0;
+    const int64_t qk_elems =
+        qk8 ? static_cast<int64_t>((flash_qk_i8_layout(Br, Bc, Dqk, heads).bytes +
+                                    sizeof(T) - 1) /
+                                   sizeof(T)) :
+              0;
     const int64_t per_head = static_cast<int64_t>(Br) * 2 + static_cast<int64_t>(Br) * Bc +
                              static_cast<int64_t>(Br) * Dv;
-    return per_head * heads + pack_elems + i8_elems;
+    return per_head * heads + flash_pack_elems<T>(Bc, Dqk, Dv) + i8_elems + qk_elems;
 }
 
 /// Flash GQA head batching: the most query heads one task serves. Past four
@@ -651,11 +802,6 @@ constexpr int64_t kFlashMinSlice = 128;
 /// size class the request bypasses the pool, so the head batch and split count
 /// are reduced to stay under this.
 constexpr size_t kFlashScratchBudget = 16u << 20;
-
-inline size_t align_up_bytes(size_t n, size_t a)
-{
-    return (n + a - 1) & ~(a - 1);
-}
 
 // ---- decode route geometry -----------------------------------------------
 // Shared by attention_decode.cpp and the plan: the score block size the kernel
