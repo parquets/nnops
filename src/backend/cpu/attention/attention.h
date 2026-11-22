@@ -22,10 +22,13 @@
 ///     softmax each row in place, then output = attn·V.
 ///   - flash (Sq*Sk >= kFlashMinScores): FlashAttention-1 online softmax,
 ///     streaming KV in Br×Bc tiles so scores is never materialized. The task
-///     grid is batch × query head × query-block, so long-sequence prefill keeps
-///     its parallelism even when batch × head is small. A causal query block
-///     stops its KV stream at the block's causal limit, so prefill never walks
-///     the masked upper triangle.
+///     grid is batch × KV head × head-block × query-block × KV-slice, so
+///     long-sequence prefill keeps its parallelism even when batch × head is
+///     small. Up to four query heads of a KV head share a task (one K/V pack
+///     per group), and an underfilled grid splits the run into slices whose
+///     online-softmax states are merged. A causal query block stops its KV
+///     stream at the block's causal limit, so prefill never walks the masked
+///     upper triangle.
 ///
 /// Query head h reads kv head h / (H / H_kv), so one K/V slice serves a whole
 /// group under grouped-query attention, and H_kv == H is ordinary MHA.
@@ -205,6 +208,13 @@ struct AttentionPlan {
     int mc1 = 0, nc1 = 0;    ///< standard-path GEMM1 (Sq × Sk) tiles
     int mc2 = 0, nc2 = 0;    ///< standard-path GEMM2 (Sq × Dv) tiles
     int Br = 0, Bc = 0;      ///< flash-path query/KV block tiles
+    /// Flash head batching: query heads one flash task serves. They share a KV
+    /// head, so the K/V tile is packed and read once for the whole group.
+    int flash_heads = 1;
+    /// Flash KV splitting: slices of the run handled by independent tasks and
+    /// merged with the online-softmax weights. > 1 only when the query-block
+    /// grid would leave workers idle.
+    int flash_splits = 1;
     /// Decode head batching: query heads one task serves. Under GQA/MQA the
     /// group's heads share a KV head, so one pass over K/V feeds all of them
     /// instead of each head re-reading the run.

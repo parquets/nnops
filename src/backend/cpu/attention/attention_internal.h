@@ -618,12 +618,13 @@ inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk, i
 }
 
 // Per-task scratch for one Br-row query block, matching the layout inside
-// attention_flash_impl: [m:Br][l:Br][s:Br*Bc][o_acc:Br*Dv][pack_b][i8 temp].
-// The packed-B slot serves GEMM1 (K = Dqk, N <= Bc) and GEMM2 (K <= Bc, N =
-// Dv); the trailing slot is the int8 dequantization panel, present only when
-// the KV cache is quantized.
+// attention_flash_impl: per head [m:Br][l:Br][s:Br*Bc][o_acc:Br*Dv], then one
+// shared [pack_b][i8 temp]. The packed-B slot serves GEMM1 (K = Dqk, N <= Bc)
+// and GEMM2 (K <= Bc, N = Dv) for every batched head; the trailing slot is the
+// int8 dequantization panel, present only when the KV cache is quantized.
 template <class T>
-inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv, bool kv8 = false)
+inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv, int heads,
+                                    bool kv8 = false)
 {
     constexpr int nr_max = nr_max_flt<T>();
     const int ldd_b_full = static_cast<int>(
@@ -634,8 +635,26 @@ inline int64_t flash_per_task_elems(int Br, int Bc, int64_t Dqk, int64_t Dv, boo
     const int pack_elems = np_full * ldd_b_full;
     const int64_t i8_elems =
         kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(std::max<int64_t>(Dqk, Bc))) : 0;
-    return static_cast<int64_t>(Br) * 2 + static_cast<int64_t>(Br) * Bc +
-           static_cast<int64_t>(Br) * Dv + pack_elems + i8_elems;
+    const int64_t per_head = static_cast<int64_t>(Br) * 2 + static_cast<int64_t>(Br) * Bc +
+                             static_cast<int64_t>(Br) * Dv;
+    return per_head * heads + pack_elems + i8_elems;
+}
+
+/// Flash GQA head batching: the most query heads one task serves. Past four
+/// the per-head accumulators stop paying for the shared pack.
+constexpr int kFlashHeadBatchMax = 4;
+/// Flash KV splitting: slices of the run one underfilled grid is cut into, and
+/// the shortest slice worth its partial-output merge.
+constexpr int64_t kFlashMaxSplits = 8;
+constexpr int64_t kFlashMinSlice = 128;
+/// Scratch one attention plan may ask the pool for. Above the pool's 32 MiB
+/// size class the request bypasses the pool, so the head batch and split count
+/// are reduced to stay under this.
+constexpr size_t kFlashScratchBudget = 16u << 20;
+
+inline size_t align_up_bytes(size_t n, size_t a)
+{
+    return (n + a - 1) & ~(a - 1);
 }
 
 // ---- decode route geometry -----------------------------------------------

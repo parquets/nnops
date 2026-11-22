@@ -2,12 +2,18 @@
 /// @brief FlashAttention-1: stream KV in Br×Bc tiles with an online softmax,
 ///        so the Sq×Sk score matrix never exists.
 ///
-/// One task is one Br-row query block of one (batch, query head) — the grid is
-/// batch × query head × query-block, so long-sequence prefill keeps its
-/// parallelism even when batch × head is small. Each task walks the run in
-/// Bc-key tiles, carrying a running max (m), a running sum (l) and an output
-/// accumulator (o), and folds the mask and the causal bound into the S tile
-/// before the update.
+/// One task is one Br-row query block of one (batch, KV head, head block) and,
+/// when the grid would leave workers idle, one KV slice of the run. The grid is
+/// batch × KV head × head-block × query-block × slice. Each task walks its span
+/// in Bc-key tiles, carrying a running max (m), a running sum (l) and an output
+/// accumulator (o) per batched head, and folds the mask and the causal bound
+/// into the S tile before the update.
+///
+/// GQA head batching: up to four query heads of the same KV head share a task,
+/// so each K/V tile is packed and read once for the whole group. KV splitting:
+/// when the grid is smaller than the worker count, the run is cut into slices
+/// and the per-slice online-softmax states are merged afterwards, so a short
+/// chunk against a long cache keeps the workers busy.
 ///
 /// The run may be two segments, an optional past tensor followed by the step's
 /// new K/V; each is streamed in place, so nothing is concatenated. A causal
@@ -95,17 +101,43 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
 
     const int Br = plan.Br;
     const int Bc = plan.Bc;
-    const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, kv8);
+    // GQA head batching: one task serves `hb` query heads of the same KV head,
+    // so each K/V tile is packed and read once for the whole group.
+    const int hb = plan.flash_heads;
+    const int64_t G = H / Hkv;
+    const int64_t nb = (G + hb - 1) / hb;
+    const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8);
 
     const int64_t NQ = (Sq + Br - 1) / Br; // number of Br-row query blocks
-    const int64_t NG = B * H * NQ;
+    const int64_t units = B * Hkv * nb * NQ;
+    // KV splitting: slice s of every unit is one task; the slice dispatches
+    // leave unnormalized states that the merge pass combines.
+    const int64_t splits = plan.flash_splits;
+    const int64_t NG = units * splits;
+    const int64_t nmerge = B * H * NQ;
+    constexpr int64_t lanes = simd::simd_default_lane_f32;
     T* ws_base = static_cast<T*>(workspace);
+    const int64_t partial_step = static_cast<int64_t>(hb) * Br * (Dv + 2);
+    float* partials = nullptr;
+    float* merge_acc = nullptr;
+    if (splits > 1) {
+        char* base = static_cast<char*>(workspace);
+        const size_t slot_bytes = static_cast<size_t>(plan.num_slots) *
+                                  static_cast<size_t>(per_task) * sizeof(T);
+        partials = reinterpret_cast<float*>(base + align_up_bytes(slot_bytes, 16));
+        merge_acc = partials + static_cast<size_t>(units * splits) *
+                                   static_cast<size_t>(partial_step);
+    }
 
     const auto run = [&](int64_t idx) {
-        const int64_t qi = idx % NQ;
-        const int64_t b = (idx / NQ) / H;
-        const int64_t h = (idx / NQ) % H;
-        const int64_t hkv = h / (H / Hkv);
+        const int64_t si = idx % splits;
+        const int64_t unit = idx / splits;
+        const int64_t qi = unit % NQ;
+        const int64_t c = (unit / NQ) % nb;
+        const int64_t hkv = (unit / (NQ * nb)) % Hkv;
+        const int64_t b = unit / (NQ * nb * Hkv);
+        const int64_t h0 = hkv * G + c * hb; // first query head of this block
+        const int nh = static_cast<int>(std::min<int64_t>(hb, G - c * hb));
         const int64_t i0 = qi * Br;
         const int actual_br = static_cast<int>(std::min<int64_t>(Br, Sq - i0));
         // The batch's valid key run: its prefix of the [past | new] rows, and
@@ -113,14 +145,14 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
         const int64_t run_len = run_length(seqlens, b, Sk, seqlens_plus_one);
         const int64_t pos0 = batch_pos0(cfg, inputs, b);
 
-        const T* q_head = q_ptr + b * q_b + h * q_h;
+        const T* q_base = q_ptr + b * q_b + h0 * q_h;
         const T* k_head = kv8 ? nullptr : k_ptr + b * k_b + hkv * k_h;
         const T* v_head = kv8 ? nullptr : v_ptr + b * v_b + hkv * v_h;
         const int8_t* k8_head = kv8 ? k8_ptr + b * k_b + hkv * k_h : nullptr;
         const int8_t* v8_head = kv8 ? v8_ptr + b * v_b + hkv * v_h : nullptr;
         const KvScaleRow ks_head = kscale.row(b, hkv, Hkv, Sk);
         const KvScaleRow vs_head = vscale.row(b, hkv, Hkv, Sk);
-        T* o_head = out_ptr + b * o_b + h * o_h;
+        T* o_base = out_ptr + b * o_b + h0 * o_h;
         // The run is two contiguous segments, past first; without a past the
         // first is empty. Each is streamed in place, so the caller never has to
         // concatenate.
@@ -141,10 +173,10 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
 
         const int64_t slot = scratch_slot_of(ctx.cpu, NG, idx);
         T* m = ws_base + slot * per_task;
-        T* l = m + Br;
-        T* s = l + Br;
-        T* o_acc = s + static_cast<int64_t>(Br) * Bc;
-        T* pack_b = o_acc + static_cast<int64_t>(Br) * Dv;
+        T* l = m + static_cast<int64_t>(hb) * Br;
+        T* s = l + static_cast<int64_t>(hb) * Br;
+        T* o_acc = s + static_cast<int64_t>(hb) * Br * Bc;
+        T* pack_b = o_acc + static_cast<int64_t>(hb) * Br * Dv;
         T* i8_temp = ws_base + slot * per_task +
                      (per_task - (kv8 ? kv_i8_panel_elems<T>(kc_pack_bound<T>(
                                             std::max<int64_t>(Dqk, Bc))) :
@@ -154,9 +186,11 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
         // bridge: std::numeric_limits<T> is not specialized for half (it
         // silently yields 0, not -inf), and static_cast<half>(float) truncates
         // to an integer and stores it as bits on the x86 half wrapper.
-        for (int i = 0; i < actual_br; ++i) {
-            simd::s_store(&m[i], -std::numeric_limits<float>::infinity());
-            simd::s_store(&l[i], 0.0f);
+        for (int j = 0; j < nh; ++j) {
+            for (int i = 0; i < actual_br; ++i) {
+                simd::s_store(&m[j * Br + i], -std::numeric_limits<float>::infinity());
+                simd::s_store(&l[j * Br + i], 0.0f);
+            }
         }
         // Causal early exit: the causal limit grows with the query row, so the
         // last row of the block bounds every row in it. A KV block starting at
@@ -208,9 +242,14 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                     tile_pack_rhs(true, actual_bc, actual_kc, pack_b, ldd_b,
                                   kb + koff * k_step + k0, static_cast<int>(k_step), scale);
                 }
-                tile_mma_direct(actual_br, actual_bc, actual_kc, s, actual_bc,
-                                q_head + i0 * q_rs + k0, static_cast<int>(q_rs), pack_b, /*ldb=*/-1,
-                                /*stage=*/nullptr, kNegInf, kPosInf, k0 == 0);
+                // One packed K tile feeds every batched head of the group.
+                for (int j = 0; j < nh; ++j) {
+                    T* s_j = s + static_cast<int64_t>(j) * Br * actual_bc;
+                    tile_mma_direct(actual_br, actual_bc, actual_kc, s_j, actual_bc,
+                                    q_base + j * q_h + i0 * q_rs + k0, static_cast<int>(q_rs),
+                                    pack_b, /*ldb=*/-1, /*stage=*/nullptr, kNegInf, kPosInf,
+                                    k0 == 0);
+                }
             }
 
             // ---- softcap, additive mask and the out-of-range lanes ----
@@ -219,86 +258,98 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
             // one pass covers them: add the mask over the row's valid range
             // [n0, n1), then fill the rest of the tile with -inf.
             if (cfg.softcap > 0.0f) {
-                for (int i = 0; i < actual_br; ++i) {
-                    row_softcap(s + i * actual_bc, actual_bc, 1.0f, cfg.softcap);
+                for (int j = 0; j < nh; ++j) {
+                    for (int i = 0; i < actual_br; ++i) {
+                        row_softcap(s + (static_cast<int64_t>(j) * Br + i) * actual_bc, actual_bc,
+                                    1.0f, cfg.softcap);
+                    }
                 }
             }
             if (mask.any() || cfg.causal || cfg.window > 0) {
-                for (int i = 0; i < actual_br; ++i) {
-                    const int64_t row_i = i0 + i;
-                    const int64_t lo_i =
-                        sink_band ? 0
-                                  : std::max<int64_t>(key_lo(cfg, pos0, row_i, Sq, run_len),
-                                                      lo_floor);
-                    const int64_t lim = causal_limit(cfg, pos0, row_i, Sq, run_len);
-                    int64_t n0 = lo_i - j0;
-                    int64_t n1 = lim - j0;
-                    if (n0 < 0) {
-                        n0 = 0;
-                    }
-                    if (n0 > actual_bc) {
-                        n0 = actual_bc;
-                    }
-                    if (n1 < n0) {
-                        n1 = n0;
-                    }
-                    if (n1 > actual_bc) {
-                        n1 = actual_bc;
-                    }
-                    const int64_t n = n1 - n0;
-                    T* srow = s + i * actual_bc;
-                    if (mask.keep != nullptr) {
-                        const int64_t off =
-                            mask_offset(b, h, row_i, mask.keep_b, mask.keep_h, mask.keep_row);
-                        row_apply_keep(srow + n0, mask.keep + off + j0 + n0, n, mask.filter);
-                    }
-                    if (mask_ptr != nullptr) {
-                        const int64_t off =
-                            mask_offset(b, h, row_i, mask.bias_b, mask.bias_h, mask.bias_row);
-                        const T* mrow = mask_ptr + off + j0 + n0;
-                        int64_t j = 0;
-                        for (; j + L <= n; j += L) {
-                            simd::v_store(srow + n0 + j, simd::v_add(simd::v_load(srow + n0 + j),
-                                                                     simd::v_load(mrow + j)));
+                for (int j = 0; j < nh; ++j) {
+                    const int64_t h = h0 + j;
+                    for (int i = 0; i < actual_br; ++i) {
+                        const int64_t row_i = i0 + i;
+                        const int64_t lo_i =
+                            sink_band ? 0
+                                      : std::max<int64_t>(key_lo(cfg, pos0, row_i, Sq, run_len),
+                                                          lo_floor);
+                        const int64_t lim = causal_limit(cfg, pos0, row_i, Sq, run_len);
+                        int64_t n0 = lo_i - j0;
+                        int64_t n1 = lim - j0;
+                        if (n0 < 0) {
+                            n0 = 0;
                         }
-                        for (; j < n; ++j) {
-                            simd::s_store(&srow[n0 + j],
-                                          simd::s_load(&srow[n0 + j]) + simd::s_load(&mrow[j]));
+                        if (n0 > actual_bc) {
+                            n0 = actual_bc;
                         }
+                        if (n1 < n0) {
+                            n1 = n0;
+                        }
+                        if (n1 > actual_bc) {
+                            n1 = actual_bc;
+                        }
+                        const int64_t n = n1 - n0;
+                        T* srow = s + (static_cast<int64_t>(j) * Br + i) * actual_bc;
+                        if (mask.keep != nullptr) {
+                            const int64_t off =
+                                mask_offset(b, h, row_i, mask.keep_b, mask.keep_h, mask.keep_row);
+                            row_apply_keep(srow + n0, mask.keep + off + j0 + n0, n, mask.filter);
+                        }
+                        if (mask_ptr != nullptr) {
+                            const int64_t off =
+                                mask_offset(b, h, row_i, mask.bias_b, mask.bias_h, mask.bias_row);
+                            const T* mrow = mask_ptr + off + j0 + n0;
+                            int64_t k = 0;
+                            for (; k + L <= n; k += L) {
+                                simd::v_store(srow + n0 + k,
+                                              simd::v_add(simd::v_load(srow + n0 + k),
+                                                          simd::v_load(mrow + k)));
+                            }
+                            for (; k < n; ++k) {
+                                simd::s_store(&srow[n0 + k], simd::s_load(&srow[n0 + k]) +
+                                                                simd::s_load(&mrow[k]));
+                            }
+                        }
+                        row_fill(srow, n0, -std::numeric_limits<float>::infinity());
+                        row_fill(srow + n1, actual_bc - n1,
+                                 -std::numeric_limits<float>::infinity());
                     }
-                    row_fill(srow, n0, -std::numeric_limits<float>::infinity());
-                    row_fill(srow + n1, actual_bc - n1, -std::numeric_limits<float>::infinity());
                 }
             }
 
             // ---- online-softmax update + accumulate into o_acc -----
-            for (int i = 0; i < actual_br; ++i) {
-                T* srow = s + i * actual_bc;
-                const float rowmax = kernel::softmax_row_max<T>(srow, actual_bc);
-                if (rowmax == kNegInf) {
-                    // The whole tile is out of range for this row (a causal
-                    // row above the diagonal): S must be zero or the AV GEMM
-                    // would add -inf·v.
-                    row_fill(srow, actual_bc, 0.0f);
-                    continue;
-                }
-                const float old_m = simd::s_load(&m[i]);
-                const float new_m = std::max(old_m, rowmax);
-                const float exp_diff = std::exp(old_m - new_m); // 0 on the first KV block
-                simd::s_store(&m[i], new_m);
-                const float rowsum =
-                    kernel::softmax_row_exp_sum<T>(srow, srow, actual_bc, new_m, 1.0f);
-                simd::s_store(&l[i], exp_diff * simd::s_load(&l[i]) + rowsum);
-
-                if (exp_diff != 1.0f) {
-                    T* orow = o_acc + i * Dv;
-                    auto v_ed = simd::v_set1(orow, exp_diff);
-                    int64_t d = 0;
-                    for (; d + L <= Dv; d += L) {
-                        simd::v_store(orow + d, simd::v_mul(simd::v_load(orow + d), v_ed));
+            for (int j = 0; j < nh; ++j) {
+                const int64_t head_row = static_cast<int64_t>(j) * Br;
+                for (int i = 0; i < actual_br; ++i) {
+                    T* srow = s + (head_row + i) * actual_bc;
+                    const float rowmax = kernel::softmax_row_max<T>(srow, actual_bc);
+                    if (rowmax == kNegInf) {
+                        // The whole tile is out of range for this row (a causal
+                        // row above the diagonal): S must be zero or the AV GEMM
+                        // would add -inf·v.
+                        row_fill(srow, actual_bc, 0.0f);
+                        continue;
                     }
-                    for (; d < Dv; ++d) {
-                        simd::s_store(&orow[d], simd::s_load(&orow[d]) * exp_diff);
+                    const float old_m = simd::s_load(&m[head_row + i]);
+                    const float new_m = std::max(old_m, rowmax);
+                    const float exp_diff = std::exp(old_m - new_m); // 0 on the first KV block
+                    simd::s_store(&m[head_row + i], new_m);
+                    const float rowsum =
+                        kernel::softmax_row_exp_sum<T>(srow, srow, actual_bc, new_m, 1.0f);
+                    simd::s_store(&l[head_row + i],
+                                  exp_diff * simd::s_load(&l[head_row + i]) + rowsum);
+
+                    if (exp_diff != 1.0f) {
+                        T* orow = o_acc + (head_row + i) * Dv;
+                        auto v_ed = simd::v_set1(orow, exp_diff);
+                        int64_t d = 0;
+                        for (; d + L <= Dv; d += L) {
+                            simd::v_store(orow + d, simd::v_mul(simd::v_load(orow + d), v_ed));
+                        }
+                        for (; d < Dv; ++d) {
+                            simd::s_store(&orow[d], simd::s_load(&orow[d]) * exp_diff);
+                        }
                     }
                 }
             }
@@ -319,52 +370,161 @@ void attention_flash_impl(const AttentionConfig& cfg, TensorView& output,
                     tile_pack_rhs(false, static_cast<int>(Dv), actual_kc, pack_b, ldd_b,
                                   vb + (koff + k0) * v_step, static_cast<int>(v_step), 1.0f);
                 }
-                tile_mma_direct(actual_br, static_cast<int>(Dv), actual_kc, o_acc,
-                                static_cast<int>(Dv), s + k0, actual_bc, pack_b, /*ldb=*/-1,
-                                /*stage=*/nullptr, kNegInf, kPosInf, first_tile && k0 == 0);
+                // One packed V tile feeds every batched head of the group.
+                for (int j = 0; j < nh; ++j) {
+                    const int64_t head_row = static_cast<int64_t>(j) * Br;
+                    tile_mma_direct(actual_br, static_cast<int>(Dv), actual_kc,
+                                    o_acc + head_row * Dv, static_cast<int>(Dv),
+                                    s + head_row * actual_bc + k0, actual_bc, pack_b, /*ldb=*/-1,
+                                    /*stage=*/nullptr, kNegInf, kPosInf, first_tile && k0 == 0);
+                }
             }
             first_tile = false;
             return j0 + actual_bc;
         };
 
-        // The sink band first, then the window band; the second starts at the
-        // sink's end so no key is counted twice.
-        int64_t j0 = 0;
-        while (j0 < prefix) {
-            j0 = do_tile(j0, prefix, 0, /*sink_band=*/true);
+        // The sink band is slice 0's; the window band is partitioned across the
+        // slices, so each task streams one contiguous span of the run.
+        const int64_t band_lo =
+            std::max<int64_t>(key_lo(cfg, pos0, i0, Sq, run_len), prefix);
+        const int64_t span = kv_end > band_lo ? kv_end - band_lo : 0;
+        const int64_t slice_lo = band_lo + (span * si) / splits;
+        const int64_t slice_hi = band_lo + (span * (si + 1)) / splits;
+        if (si == 0) {
+            int64_t j = 0;
+            while (j < prefix) {
+                j = do_tile(j, prefix, 0, /*sink_band=*/true);
+            }
         }
-        j0 = std::max<int64_t>(key_lo(cfg, pos0, i0, Sq, run_len), prefix);
-        while (j0 < kv_end) {
-            j0 = do_tile(j0, kv_end, prefix, /*sink_band=*/false);
+        for (int64_t j = slice_lo; j < slice_hi;) {
+            j = do_tile(j, slice_hi, prefix, /*sink_band=*/false);
         }
 
-        // ---- final normalize: output = o_acc / l -------------------
+        // ---- final normalize, or the unnormalized state for the merge ----
         // The sink joins the denominator here, once: a key whose value is zero
         // leaves the accumulator untouched. A row every tile masked keeps its
-        // zeros — the whole weight lands on that virtual key.
-        const float sink = (sink_ptr != nullptr) ? simd::s_load(&sink_ptr[h]) : kNegInf;
-        for (int i = 0; i < actual_br; ++i) {
-            const float l_i = simd::s_load(&l[i]);
-            const float m_i = simd::s_load(&m[i]);
-            float inv_l = 0.0f;
-            if (m_i != kNegInf) {
-                const float denom = l_i + std::exp(sink - m_i);
-                inv_l = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-            }
-            const T* src = o_acc + i * Dv;
-            T* dst = o_head + (i0 + i) * o_rs;
-            auto v_inv = simd::v_set1(src, inv_l);
-            int64_t d = 0;
-            for (; d + L <= Dv; d += L) {
-                simd::v_store(dst + d, simd::v_mul(simd::v_load(src + d), v_inv));
-            }
-            for (; d < Dv; ++d) {
-                simd::s_store(&dst[d], simd::s_load(&src[d]) * inv_l);
+        // zeros — the whole weight lands on that virtual key. A split task
+        // leaves o/m/l for the merge pass instead.
+        float* ptask = (splits > 1) ? partials + idx * partial_step : nullptr;
+        for (int j = 0; j < nh; ++j) {
+            const int64_t h = h0 + j;
+            const float sink = (sink_ptr != nullptr) ? simd::s_load(&sink_ptr[h]) : kNegInf;
+            const int64_t head_row = static_cast<int64_t>(j) * Br;
+            for (int i = 0; i < actual_br; ++i) {
+                const float l_i = simd::s_load(&l[head_row + i]);
+                const float m_i = simd::s_load(&m[head_row + i]);
+                const T* src = o_acc + (head_row + i) * Dv;
+                if (splits > 1) {
+                    float* p = ptask + (head_row + i) * (Dv + 2);
+                    p[Dv] = m_i;
+                    p[Dv + 1] = (m_i == kNegInf) ? 0.0f : l_i;
+                    if (m_i == kNegInf) {
+                        continue;
+                    }
+                    int64_t d = 0;
+                    for (; d + lanes <= Dv; d += lanes) {
+                        simd::v_store_f32(p + d, simd::v_load_f32(src + d));
+                    }
+                    for (; d < Dv; ++d) {
+                        p[d] = simd::s_load(&src[d]);
+                    }
+                    continue;
+                }
+                float inv_l = 0.0f;
+                if (m_i != kNegInf) {
+                    const float denom = l_i + std::exp(sink - m_i);
+                    inv_l = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+                }
+                T* dst = o_base + j * o_h + (i0 + i) * o_rs;
+                auto v_inv = simd::v_set1(src, inv_l);
+                int64_t d = 0;
+                for (; d + L <= Dv; d += L) {
+                    simd::v_store(dst + d, simd::v_mul(simd::v_load(src + d), v_inv));
+                }
+                for (; d < Dv; ++d) {
+                    simd::s_store(&dst[d], simd::s_load(&src[d]) * inv_l);
+                }
             }
         }
     };
 
     ctx.cpu.run(0, NG, run);
+
+    if (splits == 1) {
+        return;
+    }
+
+    // ---- merge the KV slices --------------------------------------------
+    // Each slice left o = Σ e·v, m = its maximum and l = Σ e at that max. Under
+    // the global maximum M a slice is weighted by exp(m - M), so the
+    // online-softmax identity holds across slices exactly as it does across
+    // blocks within one. The sink logit joins the merged denominator once.
+    const auto merge = [&](int64_t idx) {
+        const int64_t qi = idx % NQ;
+        const int64_t h = (idx / NQ) % H;
+        const int64_t b = idx / (NQ * H);
+        const int64_t hkv = h / G;
+        const int64_t g = h - hkv * G;
+        const int64_t c = g / hb;
+        const int64_t j = g - c * hb;
+        const int64_t unit = ((b * Hkv + hkv) * nb + c) * NQ + qi;
+        const int64_t i0 = qi * Br;
+        const int actual_br = static_cast<int>(std::min<int64_t>(Br, Sq - i0));
+        const int64_t slot = scratch_slot_of(ctx.cpu, nmerge, idx);
+        float* acc = merge_acc + slot * Dv;
+        const float* pbase = partials + (unit * splits) * partial_step +
+                             (j * Br) * (Dv + 2);
+        const float sink = (sink_ptr != nullptr) ? simd::s_load(&sink_ptr[h]) : kNegInf;
+        for (int i = 0; i < actual_br; ++i) {
+            const float* p0 = pbase + i * (Dv + 2);
+            float M = kNegInf;
+            for (int64_t s = 0; s < splits; ++s) {
+                M = std::max(M, p0[s * partial_step + Dv]);
+            }
+            T* dst = out_ptr + b * o_b + h * o_h + (i0 + i) * o_rs;
+            if (M == kNegInf) {
+                for (int64_t d = 0; d < Dv; ++d) {
+                    simd::s_store(&dst[d], 0.0f);
+                }
+                continue;
+            }
+            for (int64_t d = 0; d < Dv; ++d) {
+                acc[d] = 0.0f;
+            }
+            float denom = 0.0f;
+            for (int64_t s = 0; s < splits; ++s) {
+                const float* p = p0 + s * partial_step;
+                const float ms = p[Dv];
+                if (ms == kNegInf) {
+                    continue;
+                }
+                const float w = std::exp(ms - M);
+                denom += w * p[Dv + 1];
+                auto vw = simd::v_set1(acc, w);
+                int64_t d = 0;
+                for (; d + lanes <= Dv; d += lanes) {
+                    simd::v_store(acc + d,
+                                  simd::v_fmadd(vw, simd::v_load(p + d), simd::v_load(acc + d)));
+                }
+                for (; d < Dv; ++d) {
+                    acc[d] += w * p[d];
+                }
+            }
+            if (sink_ptr != nullptr) {
+                denom += std::exp(sink - M);
+            }
+            const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+            auto v_inv = simd::v_set1_f32x8(inv);
+            int64_t d = 0;
+            for (; d + lanes <= Dv; d += lanes) {
+                simd::v_store_f32(dst + d, simd::v_mul(simd::v_load(acc + d), v_inv));
+            }
+            for (; d < Dv; ++d) {
+                simd::s_store(&dst[d], acc[d] * inv);
+            }
+        }
+    };
+    ctx.cpu.run(0, nmerge, merge);
 }
 
 } // anonymous namespace

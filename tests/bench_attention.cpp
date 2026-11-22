@@ -270,8 +270,8 @@ void run_mha(const MhaCase& c, const std::vector<int>& threads, int iters) {
                 (long long)(Sq * Sk), c.f16 ? "f16" : "f32",
                 c.mask ? "  mask" : "", c.causal ? "  causal" : "");
     if (plan.use_flash) {
-        std::printf("    route=flash Br=%d Bc=%d  ws=%zuB\n",
-                    plan.Br, plan.Bc, plan.workspace_size);
+        std::printf("    route=flash Br=%d Bc=%d hb=%d  ws=%zuB\n",
+                    plan.Br, plan.Bc, plan.flash_heads, plan.workspace_size);
     } else {
         std::printf("    route=standard GEMM1(mc=%d nc=%d) GEMM2(mc=%d nc=%d)  ws=%zuB\n",
                     plan.mc1, plan.nc1, plan.mc2, plan.nc2, plan.workspace_size);
@@ -581,8 +581,8 @@ std::string route_note(const cpu::AttentionPlan& plan) {
     if (plan.use_decode) {
         std::snprintf(buf, sizeof buf, "route=decode");
     } else if (plan.use_flash) {
-        std::snprintf(buf, sizeof buf, "route=flash Br=%d Bc=%d ws=%zuB",
-                      plan.Br, plan.Bc, plan.workspace_size);
+        std::snprintf(buf, sizeof buf, "route=flash Br=%d Bc=%d hb=%d ws=%zuB",
+                      plan.Br, plan.Bc, plan.flash_heads, plan.workspace_size);
     } else {
         std::snprintf(buf, sizeof buf, "route=standard GEMM1(mc=%d nc=%d) GEMM2(mc=%d nc=%d) ws=%zuB",
                       plan.mc1, plan.nc1, plan.mc2, plan.nc2, plan.workspace_size);
@@ -1041,6 +1041,13 @@ NNOPS_BENCH(gqa_f32_decode) {
     // One new token against a 2048-token key run: the GEMV decode route, and
     // shape where a kv head's reuse actually shows up.
     bench_gqa({"gqa f32 decode B1 S1 H32 Hkv8 D128", 1, 1, 32, 8, 128, /*Sk=*/2048});
+}
+
+NNOPS_BENCH(gqa_f32_chunked) {
+    // A short chunk against a long cache: only eight query-block tasks exist,
+    // so the plan splits the run into KV slices instead of leaving workers idle.
+    bench_gqa({"gqa f32 chunked B1 S16 H16 Hkv8 D128 Sk4096", 1, 16, 16, 8, 128,
+               /*Sk=*/4096, /*causal=*/true});
 }
 
 NNOPS_BENCH(gqa_f32_step_decode) {

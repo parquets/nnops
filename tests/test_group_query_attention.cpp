@@ -85,6 +85,7 @@ struct Case {
     bool per_tensor = false;       // one scale instead of one per token
     int64_t sink = 0;              // always-visible leading cache rows
     std::vector<int64_t> pos_ids;  // per-batch first query row; empty = derived
+    bool head_sink = false;        // the [H] virtual-key input
 };
 
 /// Element of a Q/K/V-like view: rank 3 is merged [B, S, H*D], rank 4 is
@@ -340,6 +341,11 @@ Built build(const Case& c, uint64_t seed)
         auto [gv, g] = test::make_random_tensor(c.qshape, -4.0f, 4.0f, seed + 6);
         b.keep_f32.push_back(std::move(gv));
         b.ins[8] = g;
+    }
+    if (c.head_sink) {
+        auto [sv, sink] = test::make_random_tensor({c.heads}, -3.0f, 3.0f, seed + 7);
+        b.keep_f32.push_back(std::move(sv));
+        b.ins[c.causal ? 7 : 5] = sink;
     }
 
     b.descs.clear();
@@ -1549,6 +1555,112 @@ NNOPS_TEST(gqa_degenerate_kv_zero_equals_h) {
     gqa->compute(b, ins);
 
     NNOPS_EXPECT_TRUE(test::allclose(a, b, 1e-6f, 1e-6f));
+}
+
+// ============================================================
+// Flash head batching and KV splitting (the automatic plan rules)
+// ============================================================
+
+NNOPS_TEST(gqa_flash_head_batch_matches_ref) {
+    // G=4 with enough query blocks: the plan batches four heads per task.
+    Case c = {};
+    c.qshape = {1, 256, 32 * 128};
+    c.kshape = {1, 512, 8 * 128};
+    c.heads = 32;
+    c.kv_heads = 8;
+    c.causal = false; // explicit form; 256*512 crosses the flash threshold
+    bool flash = false;
+    cpu::AttentionPlan plan;
+    NNOPS_EXPECT_TRUE(fast_vs_ref(c, flash, &plan));
+    NNOPS_EXPECT_TRUE(flash);
+    NNOPS_EXPECT_EQ(plan.flash_heads, 4);
+    NNOPS_EXPECT_EQ(plan.flash_splits, 1);
+
+    // A grid too small to batch keeps one head per task.
+    Case small = {};
+    small.qshape = {1, 256, 2 * 64};
+    small.kshape = {1, 512, 1 * 64};
+    small.heads = 2;
+    small.kv_heads = 1;
+    small.causal = false;
+    NNOPS_EXPECT_TRUE(fast_vs_ref(small, flash, &plan));
+    NNOPS_EXPECT_TRUE(flash);
+    NNOPS_EXPECT_EQ(plan.flash_heads, 1);
+    NNOPS_EXPECT_EQ(plan.flash_splits, 1);
+}
+
+NNOPS_TEST(gqa_flash_split_matches_ref) {
+    // A grid with fewer units than workers cuts the run into KV slices.
+    SimplePool pool(4);
+    const auto check = [&](const Case& c) {
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        NNOPS_EXPECT_TRUE(fast_vs_ref(c, flash, &plan, &pool.cpu));
+        NNOPS_EXPECT_TRUE(flash);
+        NNOPS_EXPECT_TRUE(plan.flash_splits > 1);
+    };
+    {
+        Case c = {};
+        c.qshape = {1, 128, 2 * 64};
+        c.kshape = {1, 512, 1 * 64};
+        c.heads = 2;
+        c.kv_heads = 1;
+        c.causal = false;
+        check(c);
+    }
+    {
+        // A symmetric int8 cache: the per-token K/V scales at the slice edges.
+        Case c = {};
+        c.qshape = {1, 128, 2 * 64};
+        c.kshape = {1, 512, 1 * 64};
+        c.heads = 2;
+        c.kv_heads = 1;
+        c.causal = false;
+        c.int8 = true;
+        check(c);
+    }
+    {
+        // A [past | new] run: a slice can straddle the segment boundary.
+        Case c = {};
+        c.qshape = {1, 128, 2 * 64};
+        c.kshape = {1, 128, 1 * 64};
+        c.heads = 2;
+        c.kv_heads = 1;
+        c.past = 512;
+        check(c);
+    }
+    {
+        // Head sink: the merge adds the virtual logit exactly once.
+        SimplePool wide(16);
+        Case c = {};
+        c.qshape = {1, 256, 2 * 64};
+        c.kshape = {1, 256, 1 * 64};
+        c.heads = 2;
+        c.kv_heads = 1;
+        c.head_sink = true;
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        NNOPS_EXPECT_TRUE(fast_vs_ref(c, flash, &plan, &wide.cpu));
+        NNOPS_EXPECT_TRUE(flash);
+        NNOPS_EXPECT_TRUE(plan.flash_splits > 1);
+    }
+}
+
+// ============================================================
+// Decode with per-head (BNSH) storage: heads step by a whole plane
+// ============================================================
+
+NNOPS_TEST(gqa_decode_bhsd_matches_ref) {
+    Case c = {};
+    c.qshape = {2, 8, 1, 16};   // [B, H, Sq, D], the cache-form query order
+    c.kshape = {2, 2, 32, 16};  // [B, H_kv, Skv, D]
+    c.heads = 8;
+    c.kv_heads = 2;
+    c.causal = true;
+    c.route = 2;
+    bool flash = false;
+    NNOPS_EXPECT_TRUE(fast_vs_ref(c, flash));
+    NNOPS_EXPECT_TRUE(!flash);
 }
 
 // ============================================================

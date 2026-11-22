@@ -131,11 +131,89 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
         resolve_flash_tile_sizes(sizeof(T), Sq, Sk, Dqk, Dv, cfg.causal, Br, Bc);
         plan.Br = Br;
         plan.Bc = Bc;
-        const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, kv8);
         const int64_t NQ = (Sq + Br - 1) / Br;
-        plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H * NQ);
-        plan.workspace_size =
+
+        // GQA head batching: the group's query heads share one K/V head, so one
+        // task can pack and stream each K/V tile once for all of them. Only do
+        // it while the reduced grid still leaves several waves for the workers
+        // — batching near the worker count turns a balanced static share into
+        // one short final wave — and the extra per-head scratch stays inside
+        // the pool budget.
+        const int64_t Hkv = cfg.kv_heads();
+        const int64_t G = H / Hkv;
+        const int64_t tasks_unbatched = B * H * NQ;
+        const int64_t nt = std::max<int64_t>(num_threads, 1);
+        const int64_t min_tasks = 8 * nt;
+        int hb = 1;
+        if (G > 1) {
+            if (tasks_unbatched >= min_tasks) {
+                const int cap = static_cast<int>(std::min<int64_t>(G, kFlashHeadBatchMax));
+                for (int cand = cap; cand >= 2; --cand) {
+                    const int64_t nb = (G + cand - 1) / cand;
+                    const int64_t tasks = B * Hkv * nb * NQ;
+                    if (tasks < min_tasks) {
+                        continue;
+                    }
+                    const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, cand, kv8);
+                    const int64_t slots =
+                        plan_slot_count(num_threads, use_thread_slots, tasks);
+                    if (static_cast<size_t>(slots) * static_cast<size_t>(per_task) *
+                            sizeof(T) >
+                        kFlashScratchBudget) {
+                        continue;
+                    }
+                    hb = cand;
+                    break;
+                }
+            }
+        }
+        plan.flash_heads = hb;
+        const int64_t nb = (G + hb - 1) / hb;
+        const int64_t units = B * Hkv * nb * NQ;
+
+        // KV splitting: a query-block grid smaller than the worker count leaves
+        // workers idle (a short chunk against a long cache, or a low head
+        // count). Cut the run into slices, each an independent task, and merge
+        // the unnormalized online-softmax states afterwards.
+        int64_t splits = 1;
+        if (nt > 1 && units < nt) {
+            splits = std::min<int64_t>(kFlashMaxSplits, (4 * nt + units - 1) / units);
+            const int64_t min_slice = std::max<int64_t>(Bc, kFlashMinSlice);
+            while (splits > 1 && (Sk + splits - 1) / splits < min_slice) {
+                --splits;
+            }
+            const int64_t task_elems = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8);
+            while (splits > 1) {
+                const int64_t tasks = units * splits;
+                const int64_t slots =
+                    plan_slot_count(num_threads, use_thread_slots, std::max(tasks, B * H * NQ));
+                const size_t slot_bytes =
+                    static_cast<size_t>(slots) * static_cast<size_t>(task_elems) * sizeof(T);
+                const size_t partial_bytes =
+                    static_cast<size_t>(tasks) * static_cast<size_t>(hb) *
+                    static_cast<size_t>(Br) * static_cast<size_t>(Dv + 2) * sizeof(float);
+                if (align_up_bytes(slot_bytes, 16) + partial_bytes +
+                        static_cast<size_t>(slots) * static_cast<size_t>(Dv) * sizeof(float) <=
+                    kFlashScratchBudget) {
+                    break;
+                }
+                --splits;
+            }
+        }
+        plan.flash_splits = static_cast<int>(splits);
+        const int64_t tasks = units * splits;
+        const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv, hb, kv8);
+        plan.num_slots =
+            plan_slot_count(num_threads, use_thread_slots, std::max(tasks, B * H * NQ));
+        size_t bytes =
             static_cast<size_t>(plan.num_slots) * static_cast<size_t>(per_task) * sizeof(T);
+        if (splits > 1) {
+            bytes = align_up_bytes(bytes, 16) +
+                    static_cast<size_t>(tasks) * static_cast<size_t>(hb) *
+                        static_cast<size_t>(Br) * static_cast<size_t>(Dv + 2) * sizeof(float) +
+                    static_cast<size_t>(plan.num_slots) * static_cast<size_t>(Dv) * sizeof(float);
+        }
+        plan.workspace_size = bytes;
         return plan;
     }
 

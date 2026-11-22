@@ -77,6 +77,69 @@ inline void dot_row4(const Q* q, const KV* k0, const KV* k1, const KV* k2, const
     out[3] = s3;
 }
 
+/// The same four keys dotted against two query rows. The K vector load (and its
+/// f16/int8 widen) feeds both FMAs, halving the K-side load slots of the
+/// head-batched GQA loop — the phase's limit is loads, not FMAs. Eight
+/// accumulators + two Q + one K stay inside the 16 YMM registers.
+template <class Q, class KV>
+inline void dot_row4x2(const Q* q0, const Q* q1, const KV* k0, const KV* k1, const KV* k2,
+                       const KV* k3, int64_t n, float* out0, float* out1)
+{
+    constexpr int L = simd::simd_lane_for<Q>;
+    auto a0 = simd::v_zero_f32x8();
+    auto a1 = a0, a2 = a0, a3 = a0;
+    auto b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    int64_t i = 0;
+    for (; i + L <= n; i += L) {
+        const auto qv0 = simd::v_load_f32(q0 + i);
+        const auto qv1 = simd::v_load_f32(q1 + i);
+        auto kv = kv_load_f32(k0 + i);
+        a0 = simd::v_fmadd(qv0, kv, a0);
+        b0 = simd::v_fmadd(qv1, kv, b0);
+        kv = kv_load_f32(k1 + i);
+        a1 = simd::v_fmadd(qv0, kv, a1);
+        b1 = simd::v_fmadd(qv1, kv, b1);
+        kv = kv_load_f32(k2 + i);
+        a2 = simd::v_fmadd(qv0, kv, a2);
+        b2 = simd::v_fmadd(qv1, kv, b2);
+        kv = kv_load_f32(k3 + i);
+        a3 = simd::v_fmadd(qv0, kv, a3);
+        b3 = simd::v_fmadd(qv1, kv, b3);
+    }
+    float s0 = simd::v_reduce_sum(a0);
+    float s1 = simd::v_reduce_sum(a1);
+    float s2 = simd::v_reduce_sum(a2);
+    float s3 = simd::v_reduce_sum(a3);
+    float t0 = simd::v_reduce_sum(b0);
+    float t1 = simd::v_reduce_sum(b1);
+    float t2 = simd::v_reduce_sum(b2);
+    float t3 = simd::v_reduce_sum(b3);
+    for (; i < n; ++i) {
+        const float qa = simd::s_load(&q0[i]);
+        const float qb = simd::s_load(&q1[i]);
+        const float kk0 = kv_load_scalar(&k0[i]);
+        const float kk1 = kv_load_scalar(&k1[i]);
+        const float kk2 = kv_load_scalar(&k2[i]);
+        const float kk3 = kv_load_scalar(&k3[i]);
+        s0 += qa * kk0;
+        s1 += qa * kk1;
+        s2 += qa * kk2;
+        s3 += qa * kk3;
+        t0 += qb * kk0;
+        t1 += qb * kk1;
+        t2 += qb * kk2;
+        t3 += qb * kk3;
+    }
+    out0[0] = s0;
+    out0[1] = s1;
+    out0[2] = s2;
+    out0[3] = s3;
+    out1[0] = t0;
+    out1[1] = t1;
+    out1[2] = t2;
+    out1[3] = t3;
+}
+
 template <class T, class KV>
 void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
                            std::span<const TensorView> inputs, const ComputeContext& ctx,
@@ -118,12 +181,10 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
     const T* sink_ptr = has_sink ? inputs[static_cast<size_t>(cfg.sink_slot)].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
-    const int64_t q_rs = head_seq_step(Q, hs.q_layout);
     const int64_t k_rs = head_seq_step(K, hs.kv_layout);
     const int64_t v_rs = head_seq_step(V, hs.kv_layout);
     const int64_t kp_rs = split ? head_seq_step(Kp, hs.kv_layout) : k_rs;
     const int64_t vp_rs = split ? head_seq_step(Vp, hs.kv_layout) : v_rs;
-    const int64_t o_rs = head_seq_step(output, hs.q_layout);
     const int64_t v_head_stride = merged_v_head_stride(cfg, Dqk, Dv);
 
     int64_t q_b, q_h, k_b, k_h, v_b, v_h, o_b, o_h;
@@ -180,12 +241,12 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
 
         const KV* k_head = k_ptr + b * k_b + hkv * k_h;
         const KV* v_head = v_ptr + b * v_b + hkv * v_h;
-        // The head block is contiguous in the head axis only for the row-head
-        // layouts; a BHSD tensor steps by a whole head plane.
         const T* q_base = q_ptr + b * q_b + h0 * q_h;
         T* o_base = out_ptr + b * o_b + h0 * o_h;
-        const int64_t q_step = hs.row_heads() ? Dqk : q_rs;
-        const int64_t o_step = hs.row_heads() ? Dv : o_rs;
+        // Successive query heads of the block: the head stride, whatever the
+        // layout — row-head layouts put it inside the row, BHSD in its own axis.
+        const int64_t q_step = q_h;
+        const int64_t o_step = o_h;
 
         // [past | new], the past segment empty when no past is passed.
         const KV* k_base[2] = {k_head, k_head};
@@ -236,7 +297,41 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
                 // query head is now one per group. Without a softcap the scale
                 // rides through the softmax exponential, so this stays a pure
                 // dot product.
-                for (int64_t j = 0; j < nh; ++j) {
+                // Two heads per pass: each K vector feeds both heads' FMAs, so
+                // the K-side load slots (and the f16/int8 widen) are halved.
+                for (int64_t j = 0; j + 2 <= nh; j += 2) {
+                    const T* q0 = q_base + j * q_step;
+                    const T* q1 = q0 + q_step;
+                    float* s0 = scores + j * kDecodeChunk;
+                    float* s1 = s0 + kDecodeChunk;
+                    for (int s = 0; s < 2; ++s) {
+                        const int64_t a = std::max(t0, seg_lo[s]);
+                        const int64_t b1 = std::min(t1, seg_hi[s]);
+                        const KV* kb = k_base[s];
+                        const int64_t rs = k_str[s];
+                        int64_t t = a;
+                        for (; t + 4 <= b1; t += 4) {
+                            const KV* kk = kb + (t - seg_lo[s]) * rs;
+                            dot_row4x2(q0, q1, kk, kk + rs, kk + 2 * rs, kk + 3 * rs, Dqk,
+                                       s0 + (t - t0), s1 + (t - t0));
+                        }
+                        for (; t < b1; ++t) {
+                            const KV* krow = kb + (t - seg_lo[s]) * rs;
+                            s0[t - t0] = dot_row(q0, krow, Dqk);
+                            s1[t - t0] = dot_row(q1, krow, Dqk);
+                        }
+                    }
+                    // The cache's per-token K scale multiplies the raw dot; it
+                    // has to land before the cap, which owns the scalar scale.
+                    if constexpr (kInt8) {
+                        for (int64_t t = 0; t < nc; ++t) {
+                            const float sc = ks_row.at(t0 + t);
+                            s0[t] *= sc;
+                            s1[t] *= sc;
+                        }
+                    }
+                }
+                for (int64_t j = (nh / 2) * 2; j < nh; ++j) {
                     const T* q_row = q_base + j * q_step;
                     float* sj = scores + j * kDecodeChunk;
                     for (int s = 0; s < 2; ++s) {
@@ -255,8 +350,6 @@ void attention_decode_impl(const AttentionConfig& cfg, TensorView& output,
                             sj[t - t0] = dot_row(q_row, krow, Dqk);
                         }
                     }
-                    // The cache's per-token K scale multiplies the raw dot; it
-                    // has to land before the cap, which owns the scalar scale.
                     if constexpr (kInt8) {
                         for (int64_t t = 0; t < nc; ++t) {
                             sj[t] *= ks_row.at(t0 + t);
