@@ -103,6 +103,33 @@ inline void pack_a_i8_sme(int mc, int kc, int8_t* dst, const int8_t* src, int64_
     }
 }
 
+/// Flip the u8-activation bias bit (^0x80) on @p rows rows of @p n bytes, in
+/// place, at row stride @p ld. The ZA pack has no XOR, so a caller that needs
+/// the shifted bytes flips them first — one byte pass unlocks the transpose.
+inline void flip_bias_i8(int8_t* p, int rows, int64_t ld, int n) noexcept
+{
+#if defined(__ARM_NEON)
+    const uint8x16_t mask = vdupq_n_u8(0x80u);
+    for (int r = 0; r < rows; ++r) {
+        uint8_t* q = reinterpret_cast<uint8_t*>(p + static_cast<int64_t>(r) * ld);
+        int i = 0;
+        for (; i + 16 <= n; i += 16) {
+            vst1q_u8(q + i, veorq_u8(vld1q_u8(q + i), mask));
+        }
+        for (; i < n; ++i) {
+            q[i] = static_cast<uint8_t>(q[i] ^ 0x80u);
+        }
+    }
+#else
+    for (int r = 0; r < rows; ++r) {
+        uint8_t* q = reinterpret_cast<uint8_t*>(p + static_cast<int64_t>(r) * ld);
+        for (int i = 0; i < n; ++i) {
+            q[i] = static_cast<uint8_t>(q[i] ^ 0x80u);
+        }
+    }
+#endif
+}
+
 /// Pack @p nc columns of B (row-major, stride @p ldb, @p kc rows) into
 /// [n/64][ceil(kc/4)][256].
 inline void pack_b_i8_sme(int nc, int kc, int8_t* dst, const int8_t* src, int64_t ldb,

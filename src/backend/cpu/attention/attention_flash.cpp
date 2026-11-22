@@ -44,7 +44,8 @@
 #include "attention_internal.h"
 #include "backend/cpu/simd_kernel/simd_quant.hpp" // quantization — the ZA query staging block
 #if defined(NNOPS_ARCH_SME)
-#include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme — the ZA route gate
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"     // available_sme — the ZA route gate
+#include "backend/cpu/aarch64/sme/pack_i8_sme.hpp" // flip_bias_i8 — the P pack's pre-XOR
 #endif
 
 namespace nnops::backend::cpu {
@@ -724,8 +725,16 @@ private:
                                          v8_head + tile.koff * tile.v_step,
                                          static_cast<int>(tile.v_step));
                     for (int j = 0; j < nh; ++j) {
+                        // The ZA pack has no XOR, so flip the u8-activation
+                        // bias bit in place first: one byte pass is far
+                        // cheaper than the scalar transpose it unlocks.
+                        int8_t* p8 = const_cast<int8_t*>(head_p8(j));
+                        if constexpr (kPvI8BiasA) {
+                            aarch64::flip_bias_i8(p8, actual_br, tile.actual_bc * sizeof(T),
+                                                  tile.actual_bc);
+                        }
                         tile_pack_lhs_i8_sme(/*trans=*/false, actual_br, tile.actual_bc, ppack,
-                                             head_p8(j), p_row_bytes, kPvI8BiasA);
+                                             p8, p_row_bytes, /*xor_bias=*/false);
                         tile_mma_pack_i8_sme(actual_br, static_cast<int>(Dv), tile.actual_bc,
                                              s32, static_cast<int>(Dv), ppack,
                                              reinterpret_cast<const int8_t*>(pack_b),
