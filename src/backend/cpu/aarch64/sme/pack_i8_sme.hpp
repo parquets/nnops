@@ -163,6 +163,44 @@ inline void pack_b_i8_sme(int nc, int kc, int8_t* dst, const int8_t* src, int64_
         return;
     }
 #endif
+    if (trans) {
+        // The transposed source's four K bytes of one column are already one
+        // contiguous word, so a k group of 16 columns is simply those 16 words
+        // in order — no byte transpose. The scalar walk below does 64 byte
+        // loads and 64 byte stores for the same 64 bytes.
+        const int full_g = kc / 4;
+        for (int nb = 0; nb < n_blocks; ++nb) {
+            const int n0 = nb * sme_nr_max;
+            const int cols = std::min(sme_nr_max, nc - n0);
+            int8_t* const blk = dst + static_cast<int64_t>(nb) * k_groups * (4 * sme_nr_max);
+            for (int g = 0; g < k_groups; ++g) {
+                int8_t* const out = blk + static_cast<int64_t>(g) * (4 * sme_nr_max);
+                const int k = 4 * g;
+                int j = 0;
+                if (g < full_g) {
+                    for (; j + 16 <= cols; j += 16) {
+                        const int8_t* const srow = src + static_cast<int64_t>(n0 + j) * ldb + k;
+                        int8_t* const o = out + static_cast<int64_t>(j / 16) * 64;
+                        for (int jj = 0; jj < 16; ++jj) {
+                            uint32_t w;
+                            __builtin_memcpy(&w, srow + static_cast<int64_t>(jj) * ldb, 4);
+                            __builtin_memcpy(o + jj * 4, &w, 4);
+                        }
+                    }
+                }
+                for (; j < sme_nr_max; ++j) {
+                    int8_t* const cell = out + static_cast<int64_t>(j / 16) * 64 + (j % 16) * 4;
+                    for (int p = 0; p < 4; ++p) {
+                        const int kk = k + p;
+                        cell[p] = (j < cols && kk < kc) ?
+                                      src[static_cast<int64_t>(n0 + j) * ldb + kk] :
+                                      0;
+                    }
+                }
+            }
+        }
+        return;
+    }
     for (int nb = 0; nb < n_blocks; ++nb) {
         const int n0 = nb * sme_nr_max;
         const int cols = std::min(sme_nr_max, nc - n0);
