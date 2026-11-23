@@ -1027,9 +1027,19 @@ constexpr int64_t kFlashMinScores = 1 << 16; // Sq*Sk threshold (≈ 256 KiB f32
 //    four query blocks are needed for the saved triangle to pay for the tiling
 //    overhead (a 128-row MLA block lost 5% at Br 64, its 1024-row prefill
 //    gained 7%).
+//  - A run with an integer GEMM takes the wide causal pair. Those two products
+//    are the ZA engine's 16x64 faces, and the QK face (Br x Bc x Dqk) at
+//    64x128 reaches only 1155 GFLOPS of the engine's 3618 while 128x256
+//    reaches 2127; end to end that is +22% at Sq=Sk=2048 and +16% at 512, 1T
+//    and 4T alike (D=128, causal). Bc is the cap that matters — Br 128 and 256
+//    measure the same. The fp routes keep the pair their own tuning settled
+//    on, where the wide pair measures within 2% either way and the
+//    dequantizing fp route over an s8 cache loses up to 9%.
 constexpr int kFlashBcMax = 256;
 constexpr int kCausalBrMax = 64;
 constexpr int kCausalBcMax = 128;
+constexpr int kCausalBrMaxI8 = 128;
+constexpr int kCausalBcMaxI8 = 256;
 
 inline bool should_use_flash_attention(int64_t Sq, int64_t Sk)
 {
@@ -1037,7 +1047,7 @@ inline bool should_use_flash_attention(int64_t Sq, int64_t Sk)
 }
 
 inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk, int64_t Dqk,
-                                     int64_t Dv, bool causal, int& Br, int& Bc)
+                                     int64_t Dv, bool causal, bool int8_gemms, int& Br, int& Bc)
 {
     const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
     const size_t l2_eff = l2 > 0 ? l2 : (1024u * 1024u); // 1 MiB fallback
@@ -1048,9 +1058,11 @@ inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk, i
         Bc = 1;
     }
     Br = static_cast<int>(std::min<int64_t>(Bc, head_pairs));
+    // Whether causal capping engages at all is the shape's call and is the
+    // same for both routes; the cap values are the route's own.
     if (causal && Sq >= 4 * kCausalBrMax && Sk <= 2 * Sq) {
-        Br = std::min(Br, kCausalBrMax);
-        Bc = std::min(Bc, kCausalBcMax);
+        Br = std::min(Br, int8_gemms ? kCausalBrMaxI8 : kCausalBrMax);
+        Bc = std::min(Bc, int8_gemms ? kCausalBcMaxI8 : kCausalBcMax);
     }
     Bc = static_cast<int>(std::min<int64_t>(Bc, Sk));
     Br = static_cast<int>(std::min<int64_t>(Br, Sq));

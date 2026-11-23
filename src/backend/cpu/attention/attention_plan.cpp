@@ -127,17 +127,21 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
     // Flash path — sized with the same Br/Bc the kernel uses. Slots are
     // per worker thread when thread ids are reported, else per query block.
     if (plan.use_flash) {
-        int Br, Bc;
-        resolve_flash_tile_sizes(sizeof(T), Sq, Sk, Dqk, Dv, cfg.causal, Br, Bc);
-        plan.Br = Br;
-        plan.Bc = Bc;
-        const int64_t NQ = (Sq + Br - 1) / Br;
-        // The integer GEMMs' extra scratch (packed query/probability blocks,
-        // the query's row scales, the int32 accumulator tile) rides in every
+        // Which engine each product takes is settled before the tiles, because
+        // an integer GEMM takes the wider causal pair (see the caps). qk8
+        // reads Dqk alone; pv8 reads Bc only through the one-k-block cap,
+        // which every Bc resolve_flash_tile_sizes can return already meets. The
+        // integer GEMMs' extra scratch (packed query/probability blocks, the
+        // query's row scales, the int32 accumulator tile) then rides in every
         // slot, so the head-batch and split rules below see the same per-task
         // size the kernel uses.
         const bool qk8 = qk_i8_enabled(cfg, kv8, Dqk);
-        const bool pv8 = pv_i8_enabled(cfg, kv8, Bc);
+        const bool pv8 = pv_i8_enabled(cfg, kv8, kFlashBcMax);
+        int Br, Bc;
+        resolve_flash_tile_sizes(sizeof(T), Sq, Sk, Dqk, Dv, cfg.causal, qk8 || pv8, Br, Bc);
+        plan.Br = Br;
+        plan.Bc = Bc;
+        const int64_t NQ = (Sq + Br - 1) / Br;
         plan.flash_qk_i8 = qk8;
         plan.flash_pv_i8 = pv8;
 
