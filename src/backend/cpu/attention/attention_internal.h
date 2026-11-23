@@ -1027,14 +1027,17 @@ constexpr int64_t kFlashMinScores = 1 << 16; // Sq*Sk threshold (≈ 256 KiB f32
 //    four query blocks are needed for the saved triangle to pay for the tiling
 //    overhead (a 128-row MLA block lost 5% at Br 64, its 1024-row prefill
 //    gained 7%).
-//  - A run with an integer GEMM takes the wide causal pair. Those two products
-//    are the ZA engine's 16x64 faces, and the QK face (Br x Bc x Dqk) at
-//    64x128 reaches only 1155 GFLOPS of the engine's 3618 while 128x256
+//  - A run whose GEMMs take the ZA engine takes the wide causal pair. Those
+//    products are the engine's block faces: the int8 QK face (Br x Bc x Dqk)
+//    at 64x128 reaches only 1155 GFLOPS of the engine's 3618 while 128x256
 //    reaches 2127; end to end that is +22% at Sq=Sk=2048 and +16% at 512, 1T
 //    and 4T alike (D=128, causal). Bc is the cap that matters — Br 128 and 256
-//    measure the same. The fp routes keep the pair their own tuning settled
-//    on, where the wide pair measures within 2% either way and the
-//    dequantizing fp route over an s8 cache loses up to 9%.
+//    measure the same. The fp ZA routes want the same pair for the same
+//    reason: +17% f32 / +27% f16 at B1 Sq=Sk=2048 H32 Hkv8 D128 causal (1T),
+//    and +19% / +29% for a causal MHA at S1024 H8 D128 (4T +18..21%). The
+//    fp route *without* the engine keeps the narrow pair: the wide one is
+//    within 2% there, and the dequantizing fp route over an s8 cache loses
+//    up to 9%.
 constexpr int kFlashBcMax = 256;
 constexpr int kCausalBrMax = 64;
 constexpr int kCausalBcMax = 128;
@@ -1047,7 +1050,7 @@ inline bool should_use_flash_attention(int64_t Sq, int64_t Sk)
 }
 
 inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk, int64_t Dqk,
-                                     int64_t Dv, bool causal, bool int8_gemms, int& Br, int& Bc)
+                                     int64_t Dv, bool causal, bool za_gemms, int& Br, int& Bc)
 {
     const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
     const size_t l2_eff = l2 > 0 ? l2 : (1024u * 1024u); // 1 MiB fallback
@@ -1059,10 +1062,14 @@ inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk, i
     }
     Br = static_cast<int>(std::min<int64_t>(Bc, head_pairs));
     // Whether causal capping engages at all is the shape's call and is the
-    // same for both routes; the cap values are the route's own.
+    // same for both routes; the cap values are the route's own. The wide pair
+    // additionally needs a key run of at least two of its KV tiles: a shorter
+    // run is one tile for most query blocks, the causal triangle cannot be
+    // skipped, and the wide pair would double a tiny run's work.
+    const bool wide = za_gemms && Sk >= 2 * kCausalBcMaxI8;
     if (causal && Sq >= 4 * kCausalBrMax && Sk <= 2 * Sq) {
-        Br = std::min(Br, int8_gemms ? kCausalBrMaxI8 : kCausalBrMax);
-        Bc = std::min(Bc, int8_gemms ? kCausalBcMaxI8 : kCausalBcMax);
+        Br = std::min(Br, wide ? kCausalBrMaxI8 : kCausalBrMax);
+        Bc = std::min(Bc, wide ? kCausalBcMaxI8 : kCausalBcMax);
     }
     Bc = static_cast<int>(std::min<int64_t>(Bc, Sk));
     Br = static_cast<int>(std::min<int64_t>(Br, Sq));

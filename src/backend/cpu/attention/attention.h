@@ -260,6 +260,11 @@ struct AttentionPlan {
     /// V scale folded in) and the int32 result is dequantized onto the output
     /// accumulator. See cfg.quantize_pv.
     bool flash_pv_i8 = false;
+    /// Flash route runs both fp products on the ZA engine (f32/f16 over a
+    /// dense cache, head dim inside one ZA k block — the kernel's own gate).
+    /// The plan decides it because the engine and the tile caps are one
+    /// choice: the ZA routes take the wide causal pair.
+    bool flash_fp_sme = false;
     /// Decode head batching: query heads one task serves. Under GQA/MQA the
     /// group's heads share a KV head, so one pass over K/V feeds all of them
     /// instead of each head re-reading the run.

@@ -13,6 +13,9 @@
 /// task; see scratch_per_worker in attention_internal.h.
 
 #include "attention_internal.h"
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme — the ZA fp route gate
+#endif
 
 namespace nnops::backend::cpu {
 
@@ -128,22 +131,35 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg, std::span<const Ten
     // per worker thread when thread ids are reported, else per query block.
     if (plan.use_flash) {
         // Which engine each product takes is settled before the tiles, because
-        // an integer GEMM takes the wider causal pair (see the caps). qk8
-        // reads Dqk alone; pv8 reads Bc only through the one-k-block cap,
-        // which every Bc resolve_flash_tile_sizes can return already meets. The
-        // integer GEMMs' extra scratch (packed query/probability blocks, the
+        // a run whose GEMMs take the ZA engine uses the wider causal pair (see
+        // the caps). qk8 reads Dqk alone; pv8 reads Bc only through the
+        // one-k-block cap, which every Bc resolve_flash_tile_sizes can return
+        // already meets. The fp engine's gate must be the kernel's exactly —
+        // f32/f16, a dense cache, and a head dim inside one ZA k block — since
+        // the kernel takes its engine from this field rather than re-deciding.
+        // The GEMMs' extra scratch (packed query/probability blocks, the
         // query's row scales, the int32 accumulator tile) then rides in every
         // slot, so the head-batch and split rules below see the same per-task
         // size the kernel uses.
         const bool qk8 = qk_i8_enabled(cfg, kv8, Dqk);
         const bool pv8 = pv_i8_enabled(cfg, kv8, kFlashBcMax);
+        bool fp_sme = false;
+#if defined(NNOPS_ARCH_SME)
+        if constexpr (kSmeBuilt && fp_sme_capable<T>) {
+            constexpr DataType sme_dt =
+                std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+            fp_sme = !kv8 && aarch64::available_sme() && Dqk <= sme_kc_for(sme_dt);
+        }
+#endif
         int Br, Bc;
-        resolve_flash_tile_sizes(sizeof(T), Sq, Sk, Dqk, Dv, cfg.causal, qk8 || pv8, Br, Bc);
+        resolve_flash_tile_sizes(sizeof(T), Sq, Sk, Dqk, Dv, cfg.causal, qk8 || pv8 || fp_sme,
+                                 Br, Bc);
         plan.Br = Br;
         plan.Bc = Bc;
         const int64_t NQ = (Sq + Br - 1) / Br;
         plan.flash_qk_i8 = qk8;
         plan.flash_pv_i8 = pv8;
+        plan.flash_fp_sme = fp_sme;
 
         // GQA head batching: the group's query heads share one K/V head, so one
         // task can pack and stream each K/V tile once for all of them. Only do

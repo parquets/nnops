@@ -162,15 +162,13 @@ public:
         per_task = flash_per_task_elems<T>(Br, Bc, hs.Dqk, hs.Dv, hb, kv8, qk8, pv8);
         pack_elems = flash_pack_elems<T>(Bc, hs.Dqk, hs.Dv);
         i8_layout = flash_i8_layout(Br, Bc, hs.Dqk, hs.Dv, hb, qk8, pv8);
-        // The ZA fp engine, when this build and CPU carry it: f32/f16 only, a
-        // dense cache only (an s8 cache keeps the dequantizing NEON pack), and
-        // a head dim the packed A slab can hold as one ZA k block.
-        constexpr DataType sme_dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        // The ZA fp engine — decided by the plan, together with the tile sizes
+        // it implies: f32/f16 only, a dense cache only (an s8 cache keeps the
+        // dequantizing NEON pack), and a head dim the packed A slab can hold
+        // as one ZA k block.
         bool sme_i8 = false;
+        sme = plan.flash_fp_sme;
 #if defined(NNOPS_ARCH_SME)
-        if constexpr (kSmeBuilt && fp_sme_capable<T>) {
-            sme = !kv8 && aarch64::available_sme() && hs.Dqk <= sme_kc_for(sme_dt);
-        }
         if constexpr (kSmeBuilt && fp_sme_capable<T>) {
             sme_i8 = kv8 && aarch64::available_sme();
         }
