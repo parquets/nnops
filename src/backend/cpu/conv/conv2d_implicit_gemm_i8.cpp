@@ -66,105 +66,97 @@ using nnops::simd::s_store;
 /// pixel's row, and the K groups come out of the tile vertically into
 /// [m/16][k/4][64]. The gather and the A pack are one pass, as in the float
 /// form — the source must already be signed (@p xr applied upstream) and four
-/// bytes wide per k group, and pixels outside the input read @p fill.
+/// bytes wide per k group.
+///
+/// A flat 256-pixel tile spans whole output rows, so it contains a row's first
+/// and last column and is rarely fully interior — a tile-wide "interior" flag
+/// made the branch-free path dead for the ResNet18 shapes. Validity is
+/// therefore resolved per *row segment* into a per-pixel source pointer: every
+/// invalid pixel points at @p fill (one input-channel run wide, so `+ c0` stays
+/// in bounds), and the load loop is a plain pointer load with no range tests.
 __arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
 inline void tile_im2col_pack_i8_sme(int8_t* dst, const int8_t* in, int64_t in_row_stride,
-                                    int64_t ic_stride, int8_t fill, int64_t p0, int OW, int mc,
-                                    int IH, int IW, int KH, int KW, int SH, int SW, int DH,
-                                    int DW, int PH, int PW, int icnc, int karea) noexcept
+                                    int64_t ic_stride, const int8_t* fill, int64_t p0, int OW,
+                                    int mc, int IH, int IW, int KH, int KW, int SH, int SW,
+                                    int DH, int DW, int PH, int PW, int icnc, int karea) noexcept
 {
     constexpr int kRows = aarch64::sme_mr;      // 16 pixels: one A panel
     constexpr int kChanMax = 64;                // bytes one ZA tile row spans
     constexpr int kMaxPix = 16 * aarch64::sme_mr; // one tile's pixels
     const int64_t groups = static_cast<int64_t>(karea) * icnc / 4;
-    int8_t fill_row[kChanMax];
-    // Per pixel: the patch's top-left corner. A tap is then two adds and two
-    // range tests, not a divide, per pixel.
-    int32_t ih0[kMaxPix];
-    int32_t iw0[kMaxPix];
-    std::memset(fill_row, static_cast<int>(static_cast<uint8_t>(fill)), sizeof(fill_row));
-
-    {
-        int64_t oh = p0 / OW;
-        int64_t ow = p0 - oh * OW;
-        for (int i = 0; i < mc; ++i, ++ow) {
-            if (ow == OW) {
-                ow = 0;
-                ++oh;
-            }
-            ih0[i] = static_cast<int32_t>(oh * SH - PH);
-            iw0[i] = static_cast<int32_t>(ow * SW - PW);
-        }
-    }
-
-    // A tile whose every pixel's whole patch lies inside the input is the common
-    // case, and there a tap is one add per pixel off a base computed once —
-    // no range tests, no multiplies. The bulk of this function's cost was that
-    // addressing, not the ZA moves themselves.
-    int64_t base0[kMaxPix];
-    bool interior = true;
-    {
-        const int64_t hspan = static_cast<int64_t>(KH - 1) * DH;
-        const int64_t wspan = static_cast<int64_t>(KW - 1) * DW;
-        for (int i = 0; i < mc; ++i) {
-            interior = interior && ih0[i] >= 0 && ih0[i] + hspan < IH && iw0[i] >= 0 &&
-                       iw0[i] + wspan < IW;
-            base0[i] = static_cast<int64_t>(ih0[i]) * in_row_stride +
-                       static_cast<int64_t>(iw0[i]) * ic_stride;
-        }
-    }
+    // Per pixel: this tap's run start, or `fill`.
+    const int8_t* src[kMaxPix];
+    const int64_t oh0 = p0 / OW;
+    const int ow0 = static_cast<int>(p0 - oh0 * OW);
 
     for (int t = 0; t < karea; ++t) {
         const int kh = t / KW;
         const int kw = t - kh * KW;
         const int trow = kh * DH;
         const int tcol = kw * DW;
-        int64_t base[kMaxPix];
-        bool live[kMaxPix];
-        if (interior) {
-            const int64_t shift = static_cast<int64_t>(trow) * in_row_stride +
-                                  static_cast<int64_t>(tcol) * ic_stride;
-            for (int i = 0; i < mc; ++i) {
-                base[i] = base0[i] + shift;
+        // iw = ow*SW + col_off is inside the image for one contiguous column
+        // range: [vlo, vhi).
+        const int col_off = tcol - PW;
+        const int vlo = col_off < 0 ? std::min(OW, (-col_off + SW - 1) / SW) : 0;
+        const int vhi =
+            IW - col_off > 0 ? std::min(OW, (IW - col_off + SW - 1) / SW) : 0;
+        const int64_t col_step = static_cast<int64_t>(SW) * ic_stride;
+
+        int i = 0;
+        int64_t oh = oh0;
+        int ow = ow0;
+        while (i < mc) {
+            const int run = std::min(OW - ow, mc - i);
+            const int ih = static_cast<int>(oh * SH - PH) + trow;
+            if (ih < 0 || ih >= IH) {
+                for (int j = i; j < i + run; ++j) {
+                    src[j] = fill;
+                }
+            } else {
+                const int a = i + std::min(run, std::max(0, vlo - ow));
+                const int b = i + std::min(run, std::max(0, vhi - ow));
+                int j = i;
+                for (; j < a; ++j) {
+                    src[j] = fill;
+                }
+                if (j < b) {
+                    const int64_t base = static_cast<int64_t>(ih) * in_row_stride +
+                                         static_cast<int64_t>(ow + (a - i)) * SW * ic_stride +
+                                         static_cast<int64_t>(col_off) * ic_stride;
+                    const int8_t* p = in + base;
+                    for (; j < b; ++j, p += col_step) {
+                        src[j] = p;
+                    }
+                }
+                for (; j < i + run; ++j) {
+                    src[j] = fill;
+                }
             }
-        } else {
-            for (int i = 0; i < mc; ++i) {
-                const int ih = ih0[i] + trow;
-                const int iw = iw0[i] + tcol;
-                live[i] = ih >= 0 && ih < IH && iw >= 0 && iw < IW;
-                base[i] = live[i] ? static_cast<int64_t>(ih) * in_row_stride +
-                                        static_cast<int64_t>(iw) * ic_stride :
-                                    0;
-            }
+            i += run;
+            ow = 0;
+            ++oh;
         }
+
         for (int c0 = 0; c0 < icnc; c0 += kChanMax) {
             const int words = std::min(kChanMax, icnc - c0) / 4;
             const svbool_t pc = svwhilelt_b32(0, words);
             for (int pstart = 0; pstart < mc; pstart += kRows) {
                 const int n = std::min(kRows, mc - pstart);
-                if (interior && n == kRows) {
+                if (n == kRows) {
                     // Constant row indices: the ZA slice folds into the
                     // instruction instead of a register, and the whole panel
-                    // pipelines. Worth 10-25% of this function.
+                    // pipelines.
 #pragma unroll
-                    for (int i = 0; i < kRows; ++i) {
+                    for (int r = 0; r < kRows; ++r) {
                         svld1_hor_za32(
-                            0, static_cast<uint32_t>(i), pc,
-                            reinterpret_cast<const uint32_t*>(in + base[pstart + i] + c0));
-                    }
-                } else if (interior) {
-                    for (int i = 0; i < n; ++i) {
-                        svld1_hor_za32(
-                            0, static_cast<uint32_t>(i), pc,
-                            reinterpret_cast<const uint32_t*>(in + base[pstart + i] + c0));
+                            0, static_cast<uint32_t>(r), pc,
+                            reinterpret_cast<const uint32_t*>(src[pstart + r] + c0));
                     }
                 } else {
-                    for (int i = 0; i < n; ++i) {
-                        const int8_t* const src = live[pstart + i] ?
-                                                      in + base[pstart + i] + c0 :
-                                                      fill_row;
-                        svld1_hor_za32(0, static_cast<uint32_t>(i), pc,
-                                       reinterpret_cast<const uint32_t*>(src));
+                    for (int r = 0; r < n; ++r) {
+                        svld1_hor_za32(
+                            0, static_cast<uint32_t>(r), pc,
+                            reinterpret_cast<const uint32_t*>(src[pstart + r] + c0));
                     }
                 }
                 const svbool_t pr = svwhilelt_b32(0, n);
@@ -390,6 +382,10 @@ template <class TAct, class TOut> struct I8ConvCtx {
     float out_scale = 0.0f;
     int32_t out_zp = 0;
     float epi_lo = 0.0f, epi_hi = 0.0f;
+
+    /// One input-channel run of the padded value: out-of-image taps read from
+    /// here, so the gather's source is always a valid pointer plus c0.
+    std::vector<int8_t> fill;
 
     SmeI8Shared sme;
 };
@@ -664,6 +660,17 @@ void init_i8_ctx(I8ConvCtx<TAct, TOut>& c, const Conv2DAttributes& attrs, Tensor
     pack_i8_sme_filter_shared(c);
     prepare_i8_input(c, input, ctx);
 
+    // The gather's out-of-image source: one channel run of the padded value, so
+    // every tap pointer is a valid address for the whole c0 range (see
+    // tile_im2col_pack_i8_sme).
+#if defined(NNOPS_ARCH_SME)
+    if (c.use_sme) {
+        const auto fillv =
+            static_cast<uint8_t>((c.plane ? c.zp_x + c.d : c.zp_x) ^ c.xr);
+        c.fill.assign(static_cast<size_t>(c.ic_per_group), static_cast<int8_t>(fillv));
+    }
+#endif
+
     c.a_pack_stride = plan.a_pack_stride;
     c.acc_size = plan.acc_size;
     c.total = (c.N * c.G) * (c.oh_chunks * c.oc_chunks);
@@ -791,10 +798,9 @@ I8ATile pick_i8_a(const I8ConvCtx<TAct, TOut>& c, const uint8_t* in_g, const uin
 #if defined(NNOPS_ARCH_SME)
         tile_im2col_pack_i8_sme(
             sme_a, reinterpret_cast<const int8_t*>(in_g + icn), c.in_row_stride, c.IC,
-            static_cast<int8_t>(static_cast<uint8_t>((c.plane ? c.zp_x + c.d : c.zp_x)) ^
-                                c.xr),
-            p, static_cast<int>(c.OW), mc, static_cast<int>(c.IH), static_cast<int>(c.IW),
-            c.KH, c.KW, c.SH, c.SW, c.DH, c.DW, c.PH, c.PW, static_cast<int>(icnc), c.karea);
+            c.fill.data(), p, static_cast<int>(c.OW), mc, static_cast<int>(c.IH),
+            static_cast<int>(c.IW), c.KH, c.KW, c.SH, c.SW, c.DH, c.DW, c.PH, c.PW,
+            static_cast<int>(icnc), c.karea);
         a.ptr = sme_a;
         a.lda = kdim4;
         a.packed = true;
