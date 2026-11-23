@@ -9,9 +9,11 @@
 /// validate()).
 ///
 /// compute() takes the raw filter, or the blob prepackWeights() built for it
-/// (PackedDHWIO). The prepack is the caller's decision because it allocates
-/// the buffer; it is what lets a repeated call skip the per-call B pack, and a
-/// prepacked filter is refused by every input it was not packed for.
+/// (PackedDHWIO, or PackedDHWIOSme on an AArch64 SME machine). The prepack is
+/// the caller's decision because it allocates the buffer; it is what lets a
+/// repeated call skip the per-call B pack — and, for the SME blob, what puts
+/// each group's GEMM on the ZA tiles — and a prepacked filter is refused by
+/// every input it was not packed for.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -103,11 +105,15 @@ public:
                  void* workspace = nullptr) override;
 
     /// Pack the filter into the GEMM's B once, for compute() to read in place
-    /// (layout PackedDHWIO): an empty outputs[0] queries the descriptor, a
+    /// (layout PackedDHWIO, or PackedDHWIOSme where the ZA kernels are
+    /// available): an empty outputs[0] queries the descriptor, a
     /// populated one receives the pack. inputs[0] is the raw filter; the query
     /// needs no activation, since the geometry follows from the attributes and
     /// the filter's own dims. f32/f16 and s8 filters only — any other dtype
-    /// queries an empty view.
+    /// queries an empty view. A depthwise filter (groups == channels, multiplier
+    /// 1) also queries an empty view: compute() runs it through the
+    /// channel-lane depthwise kernel, which reads the raw filter as stored, and
+    /// a GEMM blob would be both useless and slower.
     void prepackWeights(std::span<const TensorView> inputs,
                         std::span<TensorView> outputs,
                         const ComputeContext& ctx = {}) override;

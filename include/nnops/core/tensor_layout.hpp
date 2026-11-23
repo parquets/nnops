@@ -78,6 +78,14 @@ enum class TensorLayout : uint8_t {
     // Opaque outside the Conv3D kernel; 17 because 15 and 16 are taken.
     PackedDHWIO = 17,
 
+    // PackedDHWIOSme — the same container in the AArch64 SME tiles' B layout:
+    // per group, the ZA kernel's whole-K [⌈OC/G ÷ 64⌉][k][64] block (f16 K
+    // pairs, s8 four-K groups interleaved), which MatMul reads in place instead
+    // of packing B into its own panels every call. Produced only when the
+    // engine is available; compute() then routes each group's GEMM through the
+    // ZA plan. Opaque, like PackedDHWIO.
+    PackedDHWIOSme = 18,
+
     // ---- Prepacked matmul RHS (MatMul / Linear ::prepackWeights) ----
     //
     // The GEMM's B operand, packed over its *whole* K once at load time instead of
@@ -142,6 +150,7 @@ constexpr TensorLayout kAllTensorLayouts[] = {
     TensorLayout::PackedHWIOCuda,
     TensorLayout::DHWIO,
     TensorLayout::PackedDHWIO,
+    TensorLayout::PackedDHWIOSme,
     TensorLayout::PackedB,
     TensorLayout::PackedBSme,
     TensorLayout::PackedRecurrent,
@@ -210,7 +219,12 @@ constexpr bool is_cuda_conv_weight(TensorLayout layout) noexcept {
 
 /// True for Conv3D's prepacked filter; an opaque blob.
 constexpr bool is_packed_conv3d_weight(TensorLayout layout) noexcept {
-    return layout == TensorLayout::PackedDHWIO;
+    return layout == TensorLayout::PackedDHWIO || layout == TensorLayout::PackedDHWIOSme;
+}
+
+/// True for the 3-D filter blob in the AArch64 SME tiles' B layout.
+constexpr bool is_sme_conv3d_weight(TensorLayout layout) noexcept {
+    return layout == TensorLayout::PackedDHWIOSme;
 }
 
 /// True for the prepacked matmul RHS; opaque, addressed by matmul_packed_b_geom.

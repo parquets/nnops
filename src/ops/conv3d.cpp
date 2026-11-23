@@ -2,9 +2,10 @@
 /// @brief Conv3D operator dispatch — connects class API to backend implementations.
 ///
 /// The weight is DHWIO [KD][KH][KW][IC/G][OC] — TensorFlow's conv3d filter — or
-/// the blob prepackWeights() packed it into (PackedDHWIO). compute() takes
-/// either; a packed blob is addressed as the GEMM's B and nothing else, so it
-/// is refused by every shape it was not packed for.
+/// the blob prepackWeights() packed it into (PackedDHWIO, PackedDHWIOSme on an
+/// SME machine). compute() takes either; a packed blob is addressed as the
+/// GEMM's B and nothing else, so it is refused by every shape it was not
+/// packed for.
 
 #include "nnops/ops/conv3d.hpp"
 #include "nnops/detail/assert.hpp"

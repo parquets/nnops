@@ -35,6 +35,9 @@
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"
 #include "backend/cpu/common/memory_pool.hpp"
 #include "backend/cpu/matmul/matmul.h"
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/pack_i8_sme.hpp" // pack_b_i8_sme — the ZA blob's pack
+#endif
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
 
@@ -410,16 +413,29 @@ void conv3d_packed_weight_pack_i8(const Conv3DAttributes& attrs, const TensorVie
     const int64_t OCG = OC / G;
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1] * attrs.kernel_size[2];
     const int64_t kdim = ICG * karea;
+    const bool sme = is_sme_conv3d_weight(packed.layout());
     const Conv3DPackedWeight pg =
-        conv3d_packed_weight_geom(karea, ICG, OCG, G, DataType::s8);
+        conv3d_packed_weight_geom(karea, ICG, OCG, G, DataType::s8, sme);
     NNOPS_ASSERT(pg.total > 0 && packed.numel() >= pg.total &&
                  "conv3d_packed_weight_pack_i8: the buffer does not match the geometry");
 
-    // The blob is the raw filter with each group's OC/G column run compacted
-    // out of the pitch: row k of a group's B is the filter's (tap, ic) row, so
-    // one row copy is the whole pack.
+    // Row k of a group's B is the filter's (tap, ic) row, offset by the group's
+    // OC/G column run: a dense k-major matrix the NEON panels are built from, or
+    // the ZA block layout, whose pack reads the pitched rows in place.
     const int8_t* const src = weight.ptr<int8_t>();
     int8_t* const dst = packed.ptr<int8_t>();
+    if (sme) {
+        NNOPS_ASSERT(aarch64::available_sme() &&
+                     "conv3d_packed_weight_pack_i8: an SME blob without the engine");
+#if defined(NNOPS_ARCH_SME)
+        for (int64_t g = 0; g < G; ++g) {
+            aarch64::pack_b_i8_sme(static_cast<int>(OCG), static_cast<int>(kdim),
+                                   dst + g * pg.group_elems, src + g * OCG, OC,
+                                   /*trans=*/false);
+        }
+#endif
+        return;
+    }
     ctx.cpu.run(0, G * kdim, [&](int64_t i) {
         const int64_t g = i / kdim;
         const int64_t k = i % kdim;

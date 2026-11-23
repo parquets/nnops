@@ -55,6 +55,7 @@
 #include "backend/cpu/common/dtype_dispatch.hpp"
 #include "backend/cpu/common/memory_pool.hpp"
 #include "backend/cpu/matmul/matmul.h"
+#include "backend/cpu/conv/depthwise_conv_internal.h" // DepthwiseConvAttributes mapping
 #include "backend/cpu/matmul/matmul_helper.h"
 #include "nnops/core/parallel_for.hpp"
 
@@ -64,6 +65,12 @@
 #include <span>
 
 namespace nnops::backend::cpu {
+
+/// The depthwise family's CPU entry (depthwise_conv.cpp), shared with Conv1D's
+/// depthwise route; declared here rather than in a header the way conv1d.cpp
+/// does, since only this file's depthwise branch calls it.
+Status depthwise_conv_cpu(const DepthwiseConvAttributes&, TensorView&,
+                          std::span<const TensorView>, const ComputeContext&, void*);
 
 using namespace nnops::simd;
 
@@ -384,20 +391,31 @@ Status conv3d_impl(const ConvChannels& gm, TensorView& output, std::span<const T
 // DHWIO already stores each group's filter in the GEMM's k-major order, so the
 // blob is not a transpose — it is the pack MatMul would otherwise rebuild on
 // every call: the whole-K B panels for an fp filter, the group's compact
-// matrix for an s8 one. The geometry is a function of the attributes and the
-// filter's own dims, never the activation, so prepackWeights can answer the
-// query without one.
+// matrix for an s8 one, and on an SME machine the ZA kernels' whole-K block
+// layout instead of either. MatMul reads a ZA blob in place and its tile plan
+// takes both GEMMs to the engine; without one the same GEMM packs B per call
+// and, on a MatMul blob, the ZA route is out of reach. The geometry is a
+// function of the attributes and the filter's own dims, never the activation,
+// so prepackWeights can answer the query without one.
 
 Conv3DPackedWeight conv3d_packed_weight_geom(int64_t karea, int64_t ic_per_group,
                                              int64_t oc_per_group, int64_t groups,
-                                             DataType weight_dtype) noexcept
+                                             DataType weight_dtype, bool sme) noexcept
 {
     Conv3DPackedWeight g;
     if (karea <= 0 || ic_per_group <= 0 || oc_per_group <= 0 || groups <= 0) {
         return g;
     }
     const int64_t kdim = ic_per_group * karea;
-    if (weight_dtype == DataType::s8) {
+    if (sme) {
+        // Same 64-column whole-K block MatMul's own blob uses; empty for a
+        // dtype the engine has no kernel for.
+        const MatMulPackedB mb = matmul_packed_b_sme_geom(oc_per_group, kdim, weight_dtype);
+        if (!mb.ok()) {
+            return g;
+        }
+        g.group_elems = ((mb.total + oc_per_group - 1) / oc_per_group) * oc_per_group;
+    } else if (weight_dtype == DataType::s8) {
         g.group_elems = kdim * oc_per_group;
     } else {
         const MatMulPackedB mb = matmul_packed_b_geom(oc_per_group, kdim, weight_dtype);
@@ -415,8 +433,9 @@ Conv3DPackedWeight conv3d_packed_weight_geom(int64_t karea, int64_t ic_per_group
 
 bool conv3d_packed_blob_matches(const TensorView& wgt, const ConvChannels& gm)
 {
-    const Conv3DPackedWeight pg = conv3d_packed_weight_geom(
-        gm.karea(), gm.IC_per_G, gm.OC_per_G, gm.G, wgt.data_type());
+    const Conv3DPackedWeight pg =
+        conv3d_packed_weight_geom(gm.karea(), gm.IC_per_G, gm.OC_per_G, gm.G, wgt.data_type(),
+                                  is_sme_conv3d_weight(wgt.layout()));
     return pg.total > 0 && wgt.numel() == pg.total;
 }
 
@@ -432,8 +451,25 @@ TensorDesc conv3d_packed_weight_desc(const Conv3DAttributes& attrs, const Tensor
     if (G <= 0 || OC % G != 0 || ICG <= 0) {
         return TensorDesc{};
     }
+    // A depthwise filter (one channel per group, one output per group) has no
+    // GEMM blob worth having: the grouped route would run one 1-wide GEMM per
+    // channel, and compute() reads the raw filter far faster through the
+    // channel-lane depthwise kernel. Declining here leaves the caller the raw
+    // filter, which is the route it wants.
+    if (ICG == 1 && OC == G) {
+        return TensorDesc{};
+    }
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1] * attrs.kernel_size[2];
-    const Conv3DPackedWeight g = conv3d_packed_weight_geom(karea, ICG, OC / G, G, weight.dtype);
+    // The ZA layout when this machine has the engine and a kernel for the
+    // dtype: decided once, here, and carried by the tag — compute() never asks
+    // the CPU again, so a blob is read exactly as it was written. A K shorter
+    // than one 64-value run stays on the panels: a depthwise group's GEMM is
+    // then smaller than the pack that feeds it, and the ZA tiles lose to the
+    // narrow kernels on measured shapes.
+    const bool sme = ICG * karea >= 64 &&
+                     matmul_packed_b_sme_geom(OC / G, ICG * karea, weight.dtype).ok();
+    const Conv3DPackedWeight g =
+        conv3d_packed_weight_geom(karea, ICG, OC / G, G, weight.dtype, sme);
     if (g.total <= 0) {
         return TensorDesc{};
     }
@@ -441,7 +477,7 @@ TensorDesc conv3d_packed_weight_desc(const Conv3DAttributes& attrs, const Tensor
     TensorDesc d;
     d.rank = 2;
     d.dtype = weight.dtype;
-    d.layout = TensorLayout::PackedDHWIO;
+    d.layout = sme ? TensorLayout::PackedDHWIOSme : TensorLayout::PackedDHWIO;
     d.dims.resize(2);
     // OC first, the axis every consumer of a padded conv blob reads for shape
     // inference; group_elems is a multiple of OC/G, so OC divides the total.
@@ -471,7 +507,8 @@ void conv3d_packed_weight_pack(const Conv3DAttributes& attrs, const TensorView& 
 
     const DataType dt = weight.data_type();
     const int64_t esz = static_cast<int64_t>(data_type_size(dt));
-    const Conv3DPackedWeight g = conv3d_packed_weight_geom(karea, ICG, OCG, G, dt);
+    const bool sme = is_sme_conv3d_weight(packed.layout());
+    const Conv3DPackedWeight g = conv3d_packed_weight_geom(karea, ICG, OCG, G, dt, sme);
     NNOPS_ASSERT(g.total > 0 && packed.numel() >= g.total &&
                  "conv3d_packed_weight_pack: the buffer does not match the geometry");
 
@@ -489,7 +526,7 @@ void conv3d_packed_weight_pack(const Conv3DAttributes& attrs, const TensorView& 
         const int64_t dst_shape[] = {OCG, g.group_elems / OCG};
         TensorView dst(std::span<const int64_t>(dst_shape, 2), dt,
                        blob + gi * g.group_elems * esz, (g.group_elems / OCG) * esz,
-                       TensorLayout::PackedB);
+                       sme ? TensorLayout::PackedBSme : TensorLayout::PackedB);
         matmul_packed_b_pack(raw, dst, /*transpose_b=*/false, ctx);
     }
 }
@@ -503,20 +540,77 @@ TensorView conv3d_weight_group(const TensorView& weight, const ConvChannels& gm,
     char* const base = const_cast<char*>(static_cast<const char*>(weight.ptr<void>()));
 
     if (is_packed_conv3d_weight(weight.layout())) {
+        const bool sme = is_sme_conv3d_weight(weight.layout());
         const Conv3DPackedWeight pg =
-            conv3d_packed_weight_geom(gm.karea(), gm.IC_per_G, gm.OC_per_G, gm.G, dt);
+            conv3d_packed_weight_geom(gm.karea(), gm.IC_per_G, gm.OC_per_G, gm.G, dt, sme);
         char* const at = base + g * pg.group_elems * esz;
-        if (dt == DataType::s8) {
+        if (dt == DataType::s8 && !sme) {
             return TensorView(std::span<const int64_t>(shape, 2), dt, at,
                               gm.OC_per_G * esz, TensorLayout::Dense, weight.quant_params());
         }
         const int64_t pshape[] = {gm.OC_per_G, pg.group_elems / gm.OC_per_G};
         return TensorView(std::span<const int64_t>(pshape, 2), dt, at,
-                          (pg.group_elems / gm.OC_per_G) * esz, TensorLayout::PackedB,
+                          (pg.group_elems / gm.OC_per_G) * esz,
+                          sme ? TensorLayout::PackedBSme : TensorLayout::PackedB,
                           weight.quant_params());
     }
     return TensorView(std::span<const int64_t>(shape, 2), dt, base + g * gm.OC_per_G * esz,
                       weight.stride_elems(3) * esz, TensorLayout::Dense);
+}
+
+/// A depthwise filter — one input channel per group, one output channel per
+/// group — is the channel-lane kernel's shape, not a GEMM: the im2col route
+/// gathers C one-channel columns and runs C one-column GEMMs, which on the
+/// measured shapes is the slowest case in the family. The raw DHWIO filter
+/// already stores a tap as a contiguous run of C channels (the kernel's
+/// w_tap_stride), so nothing has to be repacked; a prepacked blob is a GEMM
+/// panel set and stays on that route.
+inline bool conv3d_depthwise_shape(const TensorView& input, const TensorView& weight,
+                                   TensorView& output, const ConvChannels& gm) noexcept
+{
+    if (is_packed_conv3d_weight(weight.layout()) || weight.rank() != 5 ||
+        !is_channel_last_weight_3d(weight.layout())) {
+        return false;
+    }
+    // Multiplier 1 only: the depthwise kernel has no output-channel axis.
+    if (gm.G <= 0 || gm.G != gm.IC || gm.OC != gm.IC || gm.IC_per_G != 1) {
+        return false;
+    }
+    // The kernel reads the filter as flat taps of C channels, so every tap
+    // boundary has to be one: [KD][KH][KW][1][C] dense, not a pitched view.
+    if (weight.stride_elems(4) != 1 || weight.stride_elems(3) != gm.OC ||
+        weight.stride_elems(2) != gm.OC || weight.stride_elems(1) != gm.KW * gm.OC ||
+        weight.stride_elems(0) != gm.KH * gm.KW * gm.OC) {
+        return false;
+    }
+    // It derives both D strides from the row stride, so the depth axis has to
+    // be dense on the way in and on the way out.
+    if (input.stride_elems(1) != gm.IH * input.row_stride_elems() ||
+        output.stride_elems(1) != gm.OH * output.row_stride_elems()) {
+        return false;
+    }
+    const DataType dt = input.data_type();
+    return (dt == DataType::f32 || dt == DataType::f16
+#ifdef NNOPS_ARCH_AARCH64
+            || dt == DataType::bf16
+#endif
+           ) &&
+           weight.data_type() == dt;
+}
+
+/// Map the 3-D attributes onto the depthwise operator's — the spatial arrays,
+/// the epilogue and the residual are the same fields; the groups live in the
+/// shapes, not in the attributes.
+inline DepthwiseConvAttributes conv3d_depthwise_attrs(const Conv3DAttributes& attrs) noexcept
+{
+    DepthwiseConvAttributes d;
+    d.kernel_size = attrs.kernel_size;
+    d.stride = attrs.stride;
+    d.dilation = attrs.dilation;
+    d.padding = attrs.padding;
+    d.epilogue = attrs.epilogue;
+    d.add_to = attrs.add_to;
+    return d;
 }
 
 Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
@@ -540,6 +634,10 @@ Status conv3d_cpu(const Conv3DAttributes& attrs, TensorView& output,
 
     if (weight.data_type() == DataType::s8) {
         return conv3d_i8_cpu(attrs, output, inputs, ctx);
+    }
+    if (conv3d_depthwise_shape(input, weight, output, gm)) {
+        const DepthwiseConvAttributes dwa = conv3d_depthwise_attrs(attrs);
+        return depthwise_conv_cpu(dwa, output, inputs, ctx, nullptr);
     }
     Status st = Status::unsupported;
     dispatch_f32_f16(input.data_type(), "conv3d_cpu", [&](auto tag) {

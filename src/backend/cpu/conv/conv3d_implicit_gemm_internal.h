@@ -88,9 +88,9 @@ inline bool conv3d_filter_is_matrix(const TensorView& w, const ConvChannels& gm)
            w.stride_elems(2) == gm.IC_per_G * gm.OC;
 }
 
-/// One group's sub-blob in the prepacked filter (PackedDHWIO): MatMul's
-/// whole-K PackedB panel set for an fp filter, the group's dense k-major
-/// matrix for an s8 one.
+/// One group's sub-blob in the prepacked filter: MatMul's whole-K PackedB
+/// panel set for an fp filter, the group's dense k-major matrix for an s8 one
+/// — or, for PackedDHWIOSme, MatMul's ZA whole-K block layout for either.
 struct Conv3DPackedWeight {
     int64_t group_elems = 0; ///< elements one group occupies
     int64_t groups = 0;
@@ -98,10 +98,12 @@ struct Conv3DPackedWeight {
 };
 
 /// The blob's geometry. Empty for a dtype with no packed form, which is
-/// anything but f32/f16/s8.
+/// anything but f32/f16/s8. @p sme selects the ZA block layout
+/// (PackedDHWIOSme); it is the caller's blob tag, never inferred, so a blob
+/// packed one way is never read as the other.
 Conv3DPackedWeight conv3d_packed_weight_geom(int64_t karea, int64_t ic_per_group,
                                              int64_t oc_per_group, int64_t groups,
-                                             DataType weight_dtype) noexcept;
+                                             DataType weight_dtype, bool sme = false) noexcept;
 
 /// The blob the filter prepacks into — the query half of the two-step pack,
 /// what Conv3D::prepackWeights returns. Shape [OC, ⌈elems / OC⌉] with an
@@ -113,7 +115,8 @@ TensorDesc conv3d_packed_weight_desc(const Conv3DAttributes& attrs, const Tensor
 void conv3d_packed_weight_pack(const Conv3DAttributes& attrs, const TensorView& weight,
                                TensorView& packed, const ComputeContext& ctx);
 
-/// The s8 half (conv3d_implicit_gemm_i8.cpp): each group's dense matrix.
+/// The s8 half (conv3d_implicit_gemm_i8.cpp): each group's dense matrix, or
+/// the ZA block layout when @p packed says PackedDHWIOSme.
 void conv3d_packed_weight_pack_i8(const Conv3DAttributes& attrs, const TensorView& weight,
                                   TensorView& packed, const ComputeContext& ctx);
 

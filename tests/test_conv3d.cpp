@@ -351,13 +351,33 @@ NNOPS_TEST(conv3d_grouped) {
 }
 
 NNOPS_TEST(conv3d_depthwise) {
-    // IC/G = OC/G = 1: the GEMM degenerates to kdim = KD·KH·KW rows.
-    Conv3DAttributes attrs;
-    attrs.kernel_size = {3, 3, 3};
-    attrs.padding     = {1, 1, 1};
-    attrs.groups      = 8;
-
-    test_vs_ref({1, 8, 3, 4, 4}, {3, 3, 3, 1, 8}, attrs, /*has_bias=*/true);
+    // IC/G = OC/G = 1: the channel-lane depthwise kernel owns the shape (the
+    // GEMM route would run one 1-wide GEMM per channel). Stride, dilation and
+    // a pitched row stride all have to reach it intact.
+    {
+        Conv3DAttributes attrs;
+        attrs.kernel_size = {3, 3, 3};
+        attrs.padding     = {1, 1, 1};
+        attrs.groups      = 8;
+        test_vs_ref({1, 8, 3, 4, 4}, {3, 3, 3, 1, 8}, attrs, /*has_bias=*/true);
+    }
+    {
+        Conv3DAttributes attrs;
+        attrs.kernel_size = {2, 3, 2};
+        attrs.stride      = {2, 1, 2};
+        attrs.dilation    = {2, 1, 1};
+        attrs.padding     = {1, 1, 0};
+        attrs.groups      = 6;
+        test_vs_ref({1, 6, 5, 4, 6}, {2, 3, 2, 1, 6}, attrs);
+    }
+    {
+        Conv3DAttributes attrs;
+        attrs.kernel_size = {3, 3, 3};
+        attrs.padding     = {1, 1, 1};
+        attrs.groups      = 8;
+        test_vs_ref({1, 8, 3, 4, 4}, {3, 3, 3, 1, 8}, attrs, /*has_bias=*/true,
+                    /*residual=*/true, /*pitch_w=*/true);
+    }
 }
 
 NNOPS_TEST(conv3d_dilated) {
@@ -457,12 +477,25 @@ NNOPS_TEST(conv3d_prepacked_filter) {
     test_vs_ref({1, 12, 3, 4, 3}, {2, 3, 2, 3, 20}, grouped, /*has_bias=*/true, false,
                 false, false, /*packed=*/true);
 
-    Conv3DAttributes depthwise;
-    depthwise.kernel_size = {3, 3, 3};
-    depthwise.padding = {1, 1, 1};
-    depthwise.groups = 8;
-    test_vs_ref({1, 8, 3, 4, 4}, {3, 3, 3, 1, 8}, depthwise, /*has_bias=*/true, false,
-                false, false, /*packed=*/true);
+    {
+        // A depthwise filter has no GEMM blob: the query declines so the caller
+        // keeps the raw filter, which compute() runs through the channel-lane
+        // depthwise kernel instead of one 1-wide GEMM per channel.
+        Conv3DAttributes depthwise;
+        depthwise.kernel_size = {3, 3, 3};
+        depthwise.padding = {1, 1, 1};
+        depthwise.groups = 8;
+        const int64_t w_shape[] = {3, 3, 3, 1, 8};
+        std::vector<float> w(static_cast<size_t>(27 * 8), 0.0f);
+        TensorView wt(std::span<const int64_t>(w_shape, 5), DataType::f32, w.data(),
+                      TensorLayout::DHWIO);
+        auto op = Conv3D::create(depthwise, Backend::CPU);
+        TensorView q;
+        const TensorView wi[] = {wt};
+        TensorView wq[] = {q};
+        op->prepackWeights(wi, wq);
+        NNOPS_EXPECT_EQ(wq[0].rank(), 0);
+    }
 
     test_vs_ref({1, 8, 3, 4, 5}, {3, 3, 3, 8, 8}, k3, /*has_bias=*/true,
                 /*residual=*/true, false, /*pitch_out=*/true, /*packed=*/true);

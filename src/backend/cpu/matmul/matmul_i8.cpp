@@ -37,6 +37,7 @@
 #include <span>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace nnops::backend::cpu {
 
@@ -545,12 +546,16 @@ Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
                                b.quant_params());
         MatMulAttributes attrs_n = attrs;
         attrs_n.transpose_b = false;
-        const TensorView ins[] = {a, dense};
+        // Only the RHS is replaced: the bias and the fused-epilogue inputs stay
+        // in their slots, or a decoded blob would silently drop them.
+        std::vector<TensorView> ins(inputs.begin(), inputs.end());
+        ins[1] = dense;
+        const std::span<const TensorView> ins_span(ins);
         if (dt_a == DataType::f32 || dt_a == DataType::f16) {
-            return matmul_dq_from_fp(attrs_n, output, ins, ctx);
+            return matmul_dq_from_fp(attrs_n, output, ins_span, ctx);
         }
         const auto plan = make_plan(attrs_n, a, dense, ctx);
-        return matmul_int8_tiled(attrs_n, output, ins, ctx, plan);
+        return matmul_int8_tiled(attrs_n, output, ins_span, ctx, plan);
     }
     // fp activations: quantize (in the pack, or into A_q), then dequantize out.
     if (dt_a == DataType::f32 || dt_a == DataType::f16) {
