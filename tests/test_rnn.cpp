@@ -585,6 +585,16 @@ NNOPS_TEST(lstm_f16_matches_reference) {
 // =========================================================================
 
 NNOPS_TEST(gru_linear_before_reset_both) {
+    {
+        // A ZA-width blob: whole-K 64-column blocks, and the raw pack must land
+        // on the same bytes.
+        LstmAttributes a;
+        a.hidden_size = 128;
+        Geo g;
+        g.T = 3; g.B = 4; g.I = 96; g.H = 128; g.h0 = true; g.c0 = true; g.q8 = true;
+        g.q8_wscale = 0.1f;
+        check_prepacked<float, Lstm>(RecurrentMode::Lstm, g, a);
+    }
     for (bool lbr : {false, true}) {
         GruAttributes a;
         a.hidden_size = 7;
@@ -673,6 +683,16 @@ NNOPS_TEST(lstm_bf16_matches_reference) {
 }
 
 NNOPS_TEST(gru_bf16_matches_reference) {
+    {
+        // A ZA-width blob: whole-K 64-column blocks, and the raw pack must land
+        // on the same bytes.
+        LstmAttributes a;
+        a.hidden_size = 128;
+        Geo g;
+        g.T = 3; g.B = 4; g.I = 96; g.H = 128; g.h0 = true; g.c0 = true; g.q8 = true;
+        g.q8_wscale = 0.1f;
+        check_prepacked<float, Lstm>(RecurrentMode::Lstm, g, a);
+    }
     for (bool lbr : {false, true}) {
         GruAttributes a;
         a.hidden_size = 7;
@@ -874,6 +894,16 @@ NNOPS_TEST(q8_lstm_matches_reference) {
 }
 
 NNOPS_TEST(q8_gru_matches_reference) {
+    {
+        // A ZA-width blob: whole-K 64-column blocks, and the raw pack must land
+        // on the same bytes.
+        LstmAttributes a;
+        a.hidden_size = 128;
+        Geo g;
+        g.T = 3; g.B = 4; g.I = 96; g.H = 128; g.h0 = true; g.c0 = true; g.q8 = true;
+        g.q8_wscale = 0.1f;
+        check_prepacked<float, Lstm>(RecurrentMode::Lstm, g, a);
+    }
     for (bool lbr : {false, true}) {
         GruAttributes a;
         a.hidden_size = 7;
@@ -919,6 +949,26 @@ NNOPS_TEST(q8_s8_activation_and_f16_compute) {
         check_rnn<half>(g, a, test::kF16AccumTol + kQ8Tol);
     }
     {
+        // Wide enough for the ZA layout, and f16 compute: the quantize pass and
+        // the staging pack under the engine's own tile.
+        RnnAttributes a;
+        a.hidden_size = 64;
+        Geo g;
+        g.T = 3; g.B = 2; g.I = 64; g.H = 64; g.h0 = true; g.q8 = true;
+        g.q8_wscale = 0.1f;
+        check_rnn<half>(g, a, test::kF16AccumTol + kQ8Tol);
+    }
+    {
+        // The same width with the activation bytes stored: they reach the ZA
+        // staging as stored instead of being quantized there.
+        LstmAttributes a;
+        a.hidden_size = 96;
+        Geo g;
+        g.T = 3; g.B = 2; g.I = 96; g.H = 96; g.h0 = true; g.c0 = true;
+        g.q8 = true; g.x_s8 = true; g.q8_wscale = 0.1f;
+        check_lstm<float>(g, a, kQ8Tol);
+    }
+    {
         // Pitched X and Y on the quantized route: the panel pack and the Y store
         // both honour the row stride.
         RnnAttributes a;
@@ -949,6 +999,16 @@ NNOPS_TEST(q8_bf16_compute_matches_reference) {
         g.q8 = true;
         check_lstm<bfloat16>(g, a, test::kBF16AccumTol + kQ8Tol);
     }
+    {
+        // A ZA-width shape in bf16: bf16 has no vector quantize kernel, so the
+        // staging fill takes the scalar arm.
+        RnnAttributes a;
+        a.hidden_size = 64;
+        Geo g;
+        g.T = 3; g.B = 3; g.I = 64; g.H = 64; g.h0 = true; g.q8 = true;
+        g.q8_wscale = 0.1f;
+        check_rnn<bfloat16>(g, a, test::kBF16AccumTol + kQ8Tol);
+    }
 }
 #endif  // NNOPS_ARCH_AARCH64
 
@@ -961,6 +1021,16 @@ NNOPS_TEST(q8_prepacked_matches_raw) {
         a.hidden_size = 9;
         Geo g;
         g.T = 4; g.B = 2; g.I = 5; g.H = 9; g.h0 = true; g.c0 = true; g.q8 = true;
+        check_prepacked<float, Lstm>(RecurrentMode::Lstm, g, a);
+    }
+    {
+        // A ZA-width blob: whole-K 64-column blocks, and the raw pack must land
+        // on the same bytes.
+        LstmAttributes a;
+        a.hidden_size = 128;
+        Geo g;
+        g.T = 3; g.B = 4; g.I = 96; g.H = 128; g.h0 = true; g.c0 = true; g.q8 = true;
+        g.q8_wscale = 0.1f;
         check_prepacked<float, Lstm>(RecurrentMode::Lstm, g, a);
     }
     for (bool lbr : {false, true}) {
@@ -1297,6 +1367,16 @@ NNOPS_TEST(prepacked_weights_match_raw) {
         Geo g;
         g.T = 3; g.B = 2; g.I = 4; g.H = 5; g.bias = false; g.h0 = true;
         check_prepacked<half, Rnn>(RecurrentMode::Rnn, g, a);
+    }
+    {
+        // A ZA-width blob: whole-K 64-column blocks, and the raw pack must land
+        // on the same bytes.
+        LstmAttributes a;
+        a.hidden_size = 128;
+        Geo g;
+        g.T = 3; g.B = 4; g.I = 96; g.H = 128; g.h0 = true; g.c0 = true; g.q8 = true;
+        g.q8_wscale = 0.1f;
+        check_prepacked<float, Lstm>(RecurrentMode::Lstm, g, a);
     }
     for (bool lbr : {false, true}) {
         GruAttributes a;

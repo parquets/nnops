@@ -15,10 +15,15 @@
 #include "backend/cpu/rnn/recurrent_internal.h"
 
 #include "backend/cpu/simd_kernel/simd_int8_lane.hpp"
+#include "backend/cpu/simd_kernel/simd_quant.hpp"
+#if defined(NNOPS_ARCH_SME)
+#include "backend/cpu/aarch64/sme/pack_i8_sme.hpp" // pack_b_i8_sme, pack_a_i8_sme
+#endif
 
 namespace nnops::backend::cpu {
 
 namespace {
+
 
 /// The direction's slice of a per-row scale table, or null for a per-tensor
 /// one. `rows` is one direction's row count; a table wider than that is per
@@ -87,6 +92,46 @@ inline void q8_pack_slabs(int8_t* dst, const int8_t* src, int64_t lds, int64_t k
     }
 }
 
+/// Pack one q8 weight region — the interleaved [cols, K] byte matrix — into
+/// whichever layout q8_pack_geom names: the ZA whole-K blocks, read in place
+/// (the source's rows are already the B matrix's), or the NEON slabs.
+inline void q8_pack_region(int8_t* dst, const int8_t* src, int64_t lds, int64_t cols, int64_t k,
+                           bool a_biased)
+{
+    const MatMulPackedB g = q8_pack_geom(cols, k);
+    if (q8_geom_is_za(g)) {
+        // The ZA pack has no activation shift; aarch64's s8 A takes none.
+        NNOPS_ASSERT(!a_biased && "q8: the ZA pack cannot fold an A shift");
+#if defined(NNOPS_ARCH_SME)
+        aarch64::pack_b_i8_sme(static_cast<int>(cols), static_cast<int>(k), dst, src, lds,
+                               /*trans=*/true);
+#endif
+        return;
+    }
+    q8_pack_slabs(dst, src, lds, k, cols, a_biased);
+}
+
+/// Quantize one row into the row-major staging the ZA A pack transposes. f32
+/// and f16 ride the vector kernel; bf16 has no quantize kernel and widens one
+/// value at a time.
+template <typename T>
+inline void q8_quant_row(const T* src, int64_t src_stride, int8_t* dst, int64_t dst_stride,
+                         int64_t n, float scale)
+{
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
+        kernel::quant_kernel::quantization<int8_t>(1, static_cast<int>(n), dst,
+                                                   static_cast<int>(dst_stride), src,
+                                                   static_cast<int>(src_stride), &scale, nullptr);
+    } else {
+        const float inv = 1.0f / scale;
+        for (int64_t i = 0; i < n; ++i) {
+            const float q = s_load(src + i) * inv;
+            const int32_t qi = static_cast<int32_t>(std::nearbyintf(q));
+            dst[i] = static_cast<int8_t>(std::min(std::max(qi, -128), 127));
+        }
+    }
+}
+
 } // namespace
 
 void prepare_q8_direction(const RecurrentParams& p, const RecurrentPackedHeader& h, int64_t d,
@@ -114,7 +159,7 @@ void prepare_q8_direction(const RecurrentParams& p, const RecurrentPackedHeader&
         interleave_scales(sw_rows, qw.scale, H, gates, gate_off, dst.sw + col);
         col += h.phase_cols[ph];
     }
-    q8_pack_slabs(dst.w, raw, I, I, h.total_cols, a_biased);
+    q8_pack_region(dst.w, raw, I, h.total_cols, I, a_biased);
 
     for (int64_t ph = 0; ph < h.nphases; ++ph) {
         const PhaseKind kind = phase_kind(p.mode, lbr, ph);
@@ -123,7 +168,7 @@ void prepare_q8_direction(const RecurrentParams& p, const RecurrentPackedHeader&
         interleave_gates<int8_t>(r.ptr<int8_t>(static_cast<size_t>(d * G * H)),
                                  r.row_stride_elems(), H, H, gates, gate_off, raw);
         interleave_scales(sr_rows, qr.scale, H, gates, gate_off, dst.sr[ph]);
-        q8_pack_slabs(dst.r[ph], raw, H, H, h.phase_cols[ph], a_biased);
+        q8_pack_region(dst.r[ph], raw, H, h.phase_cols[ph], H, a_biased);
     }
 
     // The bias is the caller's fp type; the regions are f32.
@@ -222,18 +267,45 @@ void run_phase_q8_kernel(const StepCtx<T>& s, const ComputeContext& ctx)
         const T* a = s.a + m0 * s.hp;
         quant_row_scales(a, s.hp, mcnt, s.hidden, psa);
 
-        int64_t slab = 0;
-        for (int64_t k = 0, kb = 0; k < s.hidden; k += s.kc, ++kb) {
-            const int64_t kc = std::min<int64_t>(s.kc, s.hidden - k);
-            tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc), pa,
-                                   static_cast<int>(geom_ldd_i8_a(kc)), a + k,
-                                   static_cast<int>(s.hp), psa, nullptr, 1.0f, 0,
-                                   /*u8=*/false, a_biased);
-            const int8_t* pb = s.q_r + slab + (n0 / NR_MAX_I8) * int8_panel_stride(kc);
-            tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt), static_cast<int>(kc),
-                             pc, static_cast<int>(s.nc), pa, pb, /*ldb=*/0, INT32_MIN, INT32_MAX,
-                             /*zero_mode=*/kb == 0);
-            slab += q8_slab_bytes(s.cols, kc);
+        if (s.q_za) {
+#if defined(NNOPS_ARCH_SME)
+            // The ZA A pack owns its layout, so the row is quantized into the
+            // staging block first (the scale is already known) and the pack's
+            // transpose moves a whole 16-row block at a time. B is read in
+            // place at its k-group offset, no per-call pack.
+            int8_t* const stage = pa + q8_a_slab_bytes(/*za=*/true, s.mc, s.kc);
+            const int64_t st = (s.kc + 3) & ~int64_t{3};
+            const int8_t* const rb = s.q_r + (n0 / aarch64::sme_nr_max) * s.q_r_ldd;
+            for (int64_t k = 0, kb = 0; k < s.hidden; k += s.kc, ++kb) {
+                const int64_t kc = std::min<int64_t>(s.kc, s.hidden - k);
+                for (int64_t m = 0; m < mcnt; ++m) {
+                    q8_quant_row(a + m * s.hp + k, s.hp, stage + m * st, st, kc, psa[m]);
+                }
+                tile_pack_lhs_i8_sme(/*trans=*/false, static_cast<int>(mcnt),
+                                     static_cast<int>(kc), pa, stage, static_cast<int>(st),
+                                     /*a_biased=*/false);
+                tile_mma_pack_i8_sme(
+                    static_cast<int>(mcnt), static_cast<int>(ncnt), static_cast<int>(kc), pc,
+                    static_cast<int>(s.nc), pa, rb + sme_b_k_offset(DataType::s8, k),
+                    s.q_r_ldd, INT32_MIN, INT32_MAX, /*zero_mode=*/kb == 0);
+            }
+#else
+            NNOPS_ASSERT(false && "q8: the ZA layout needs the engine");
+#endif
+        } else {
+            int64_t slab = 0;
+            for (int64_t k = 0, kb = 0; k < s.hidden; k += s.kc, ++kb) {
+                const int64_t kc = std::min<int64_t>(s.kc, s.hidden - k);
+                tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc), pa,
+                                       static_cast<int>(geom_ldd_i8_a(kc)), a + k,
+                                       static_cast<int>(s.hp), psa, nullptr, 1.0f, 0,
+                                       /*u8=*/false, a_biased);
+                const int8_t* pb = s.q_r + slab + (n0 / NR_MAX_I8) * int8_panel_stride(kc);
+                tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
+                                 static_cast<int>(kc), pc, static_cast<int>(s.nc), pa, pb,
+                                 /*ldb=*/0, INT32_MIN, INT32_MAX, /*zero_mode=*/kb == 0);
+                slab += q8_slab_bytes(s.cols, kc);
+            }
         }
 
         T* dst = (fresh ? s.rec : s.in_proj) + m0 * s.ldc + n0;
@@ -341,9 +413,9 @@ void run_phase_q8(const StepCtx<bfloat16>& s, PhaseKind kind, const ComputeConte
 /// B is W's per-k-block slabs; the dequant writes the fp chunk buffer.
 template <typename T>
 void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
-                      const int8_t* packed_w, const float* sw, int64_t cols, int64_t input,
-                      int64_t rows, int64_t mc, int64_t nc, const RowScales& xs,
-                      const Q8Scratch& qs, const ComputeContext& ctx)
+                      const int8_t* packed_w, const MatMulPackedB& wg, const float* sw,
+                      int64_t cols, int64_t input, int64_t rows, int64_t mc, int64_t nc,
+                      const RowScales& xs, const Q8Scratch& qs, const ComputeContext& ctx)
 {
     const int64_t n_blocks = (cols + nc - 1) / nc;
     const int64_t m_blocks = (rows + mc - 1) / mc;
@@ -351,6 +423,8 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
     const bool x_s8 = x.data_type() == DataType::s8;
     const int64_t x_ld = x.row_stride_elems();
     const bool a_biased = int8_a_pack_bias(DataType::s8) != 0;
+    const bool za = q8_geom_is_za(wg);
+    const int64_t k_block = q8_k_block(za, input);
 
     auto body = [&](int64_t task) {
         const int64_t slot =
@@ -378,24 +452,58 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
         const int8_t* xa8 = x_s8 ? x.ptr<int8_t>(static_cast<size_t>(x_row0 + m0)) : nullptr;
         const T* xa = x_s8 ? nullptr : x.ptr<T>(static_cast<size_t>(x_row0 + m0));
 
-        int64_t slab = 0;
-        for (int64_t at = 0, kb = 0; at < input; at += kQ8Kc, ++kb) {
-            const int64_t kc = std::min<int64_t>(kQ8Kc, input - at);
-            if (x_s8) {
-                tile_pack_lhs_i8(/*trans=*/false, static_cast<int>(mcnt), static_cast<int>(kc), pa,
-                                 static_cast<int>(geom_ldd_i8_a(kc)), xa8 + at,
-                                 static_cast<int>(x_ld), a_biased);
-            } else {
-                tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc), pa,
-                                       static_cast<int>(geom_ldd_i8_a(kc)), xa + at,
-                                       static_cast<int>(x_ld), psa, nullptr, 1.0f, 0, /*u8=*/false,
-                                       a_biased);
+        if (za) {
+#if defined(NNOPS_ARCH_SME)
+            // Same shape as the step's ZA arm: a quantized row block, one ZA
+            // transpose, and the whole-K blob read in place. An s8 activation
+            // reaches the same staging, so both input polarities share it.
+            int8_t* const stage = pa + q8_a_slab_bytes(/*za=*/true, mc, k_block);
+            const int64_t st = (k_block + 3) & ~int64_t{3};
+            const int8_t* const rb = packed_w + (n0 / aarch64::sme_nr_max) * wg.ldd;
+            for (int64_t at = 0, kb = 0; at < input; at += k_block, ++kb) {
+                const int64_t kc = std::min<int64_t>(k_block, input - at);
+                if (x_s8) {
+                    for (int64_t m = 0; m < mcnt; ++m) {
+                        std::memcpy(stage + m * st, xa8 + m * x_ld + at,
+                                    static_cast<size_t>(kc));
+                    }
+                } else {
+                    for (int64_t m = 0; m < mcnt; ++m) {
+                        q8_quant_row(xa + m * x_ld + at, x_ld, stage + m * st, st, kc, psa[m]);
+                    }
+                }
+                tile_pack_lhs_i8_sme(/*trans=*/false, static_cast<int>(mcnt),
+                                     static_cast<int>(kc), pa, stage, static_cast<int>(st),
+                                     /*a_biased=*/false);
+                tile_mma_pack_i8_sme(
+                    static_cast<int>(mcnt), static_cast<int>(ncnt), static_cast<int>(kc), pc,
+                    static_cast<int>(nc), pa,
+                    rb + sme_b_k_offset(DataType::s8, at), wg.ldd, INT32_MIN,
+                    INT32_MAX, /*zero_mode=*/kb == 0);
             }
-            const int8_t* pb = packed_w + slab + (n0 / NR_MAX_I8) * int8_panel_stride(kc);
-            tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt), static_cast<int>(kc),
-                             pc, static_cast<int>(nc), pa, pb, /*ldb=*/0, INT32_MIN, INT32_MAX,
-                             /*zero_mode=*/kb == 0);
-            slab += q8_slab_bytes(cols, kc);
+#else
+            NNOPS_ASSERT(false && "q8: the ZA layout needs the engine");
+#endif
+        } else {
+            int64_t slab = 0;
+            for (int64_t at = 0, kb = 0; at < input; at += kQ8Kc, ++kb) {
+                const int64_t kc = std::min<int64_t>(kQ8Kc, input - at);
+                if (x_s8) {
+                    tile_pack_lhs_i8(/*trans=*/false, static_cast<int>(mcnt), static_cast<int>(kc),
+                                     pa, static_cast<int>(geom_ldd_i8_a(kc)), xa8 + at,
+                                     static_cast<int>(x_ld), a_biased);
+                } else {
+                    tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc), pa,
+                                           static_cast<int>(geom_ldd_i8_a(kc)), xa + at,
+                                           static_cast<int>(x_ld), psa, nullptr, 1.0f, 0,
+                                           /*u8=*/false, a_biased);
+                }
+                const int8_t* pb = packed_w + slab + (n0 / NR_MAX_I8) * int8_panel_stride(kc);
+                tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
+                                 static_cast<int>(kc), pc, static_cast<int>(nc), pa, pb,
+                                 /*ldb=*/0, INT32_MIN, INT32_MAX, /*zero_mode=*/kb == 0);
+                slab += q8_slab_bytes(cols, kc);
+            }
         }
 
         T* dst = c + m0 * ldc + n0;
@@ -423,15 +531,18 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
 }
 
 template void project_chunk_q8<float>(const TensorView&, int64_t, float*, int64_t, const int8_t*,
-                                      const float*, int64_t, int64_t, int64_t, int64_t, int64_t,
-                                      const RowScales&, const Q8Scratch&, const ComputeContext&);
+                                      const MatMulPackedB&, const float*, int64_t, int64_t,
+                                      int64_t, int64_t, int64_t, const RowScales&,
+                                      const Q8Scratch&, const ComputeContext&);
 template void project_chunk_q8<half>(const TensorView&, int64_t, half*, int64_t, const int8_t*,
-                                     const float*, int64_t, int64_t, int64_t, int64_t, int64_t,
-                                     const RowScales&, const Q8Scratch&, const ComputeContext&);
+                                     const MatMulPackedB&, const float*, int64_t, int64_t,
+                                     int64_t, int64_t, int64_t, const RowScales&,
+                                     const Q8Scratch&, const ComputeContext&);
 #ifdef NNOPS_ARCH_AARCH64
 template void project_chunk_q8<bfloat16>(const TensorView&, int64_t, bfloat16*, int64_t,
-                                         const int8_t*, const float*, int64_t, int64_t, int64_t,
-                                         int64_t, int64_t, const RowScales&, const Q8Scratch&,
+                                         const int8_t*, const MatMulPackedB&, const float*,
+                                         int64_t, int64_t, int64_t, int64_t, int64_t,
+                                         const RowScales&, const Q8Scratch&,
                                          const ComputeContext&);
 #endif
 

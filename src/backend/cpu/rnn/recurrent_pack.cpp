@@ -27,9 +27,9 @@ PackedWeightOffsets packed_weight_offsets(const RecurrentPackedHeader& h) noexce
     if (h.q8 != 0) {
         // Panels are per k-block slabs; a blob packed once is readable by any
         // plan, because the k blocks are a function of K alone.
-        o.w = take_bytes(q8_packed_bytes(h.input, h.total_cols));
+        o.w = take_bytes(q8_region_bytes(h.total_cols, h.input));
         for (int64_t ph = 0; ph < h.nphases; ++ph) {
-            o.r[ph] = take_bytes(q8_packed_bytes(h.hidden, h.phase_cols[ph]));
+            o.r[ph] = take_bytes(q8_region_bytes(h.phase_cols[ph], h.hidden));
         }
         o.sw = take_bytes(4 * h.total_cols);
         for (int64_t ph = 0; ph < h.nphases; ++ph) {

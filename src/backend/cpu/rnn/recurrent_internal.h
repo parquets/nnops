@@ -120,8 +120,9 @@ struct PhaseGeom {
     int64_t q = 8;       ///< 8·gates — the column stride of a hidden block
     int64_t cols = 0;    ///< q · ⌈H/8⌉
     int64_t n_align = 0; ///< lcm(q, nr): the column-tile grid
-    MatMulPackedB rgeo;  ///< packed R [cols, H]
+    MatMulPackedB rgeo;  ///< packed R [cols, H] (fp, and the q8 layout)
     int64_t m_blocks = 1, n_blocks = 1, mc = 1, nc = 1;
+    int64_t q8_kc = 0;   ///< q8 only: the block the packed R is addressed in
 };
 
 struct RecPlan {
@@ -261,6 +262,81 @@ inline int64_t q8_packed_bytes(int64_t k, int64_t cols) noexcept
         bytes += q8_slab_bytes(cols, std::min<int64_t>(kQ8Kc, k - at));
     }
     return bytes;
+}
+
+/// Which layout a q8 weight region takes. The ZA kernels' whole-K 64-column
+/// blocks when the engine is up and both faces span at least one block — the
+/// 16-row A block they pad to needs a product big enough to repay it — and the
+/// NEON panels otherwise. One function, used by the packer, the plan and the
+/// kernels' addressing, so a region cannot be written one way and read another:
+/// like the fp route's w_pack_geom, the choice is a function of the shapes and
+/// the CPU, never of a per-call argument.
+inline MatMulPackedB q8_pack_geom(int64_t cols, int64_t k) noexcept
+{
+#if defined(NNOPS_ARCH_SME)
+    if (aarch64::available_sme() && cols >= aarch64::sme_nr_max && k >= aarch64::sme_nr_max) {
+        const MatMulPackedB g = matmul_packed_b_sme_geom(cols, k, DataType::s8);
+        if (g.ok()) {
+            return g;
+        }
+    }
+#endif
+    return matmul_packed_b_geom(cols, k, DataType::s8);
+}
+
+/// True when @p g is the ZA geometry (its panel is the SMOPA block's width).
+inline bool q8_geom_is_za(const MatMulPackedB& g) noexcept
+{
+#if defined(NNOPS_ARCH_SME)
+    return g.ok() && g.nr == aarch64::sme_nr_max;
+#else
+    (void)g;
+    return false;
+#endif
+}
+
+/// Bytes one packed q8 weight region occupies (W, or one phase's R).
+inline int64_t q8_region_bytes(int64_t cols, int64_t k) noexcept
+{
+    const MatMulPackedB g = q8_pack_geom(cols, k);
+    return q8_geom_is_za(g) ? packed_b_numel(cols, g.total) : q8_packed_bytes(k, cols);
+}
+
+/// The k-block a q8 kernel steps by: the ZA blob is addressed at any four-K
+/// group, so it takes one whole-K block when K fits and the engine's 2048 cap
+/// otherwise; the NEON panels keep their fixed 512.
+inline int64_t q8_k_block(bool za, int64_t k) noexcept
+{
+#if defined(NNOPS_ARCH_SME)
+    if (za) {
+        return std::min<int64_t>(k, sme_kc_for(DataType::s8));
+    }
+#endif
+    (void)za;
+    return std::min<int64_t>(kQ8Kc, k);
+}
+
+/// One slot's packed-A slab, and the row-major staging the ZA quantize-and-pack
+/// needs in front of it (zero for the NEON ladder, which quantizes in place).
+inline int64_t q8_a_slab_bytes(bool za, int64_t mc, int64_t kc) noexcept
+{
+#if defined(NNOPS_ARCH_SME)
+    if (za) {
+        return ((mc + aarch64::sme_mr - 1) / aarch64::sme_mr) * ((kc + 3) / 4) * 64;
+    }
+#endif
+    (void)za;
+    return num_panels_max(static_cast<int>(mc), MR_I8, 3) * geom_ldd_i8_a(kc);
+}
+
+inline int64_t q8_a_stage_bytes(bool za, int64_t mc, int64_t kc) noexcept
+{
+    return za ? mc * ((kc + 3) & ~int64_t{3}) : 0;
+}
+
+inline int64_t q8_a_bytes(bool za, int64_t mc, int64_t kc) noexcept
+{
+    return q8_a_slab_bytes(za, mc, kc) + q8_a_stage_bytes(za, mc, kc);
 }
 
 /// Where each region of one direction starts, in bytes from the direction's base.
@@ -416,8 +492,10 @@ template <typename T> struct StepCtx {
     const T* rh_bias = nullptr; ///< GRU h gate, linear_before_reset only
 
     // ---- quantized route only ----
-    const int8_t* q_r = nullptr; ///< R's int8 slabs, per k block
+    const int8_t* q_r = nullptr; ///< R's int8 panels or ZA blocks
     const float* sr = nullptr;   ///< R's interleaved per-column scales
+    bool q_za = false;           ///< q_r is the ZA block layout
+    int64_t q_r_ldd = 0;         ///< ZA: bytes between 64-column blocks
     Q8Scratch qs;                ///< the int8 scratch, one slot per worker
 
     T* h_prev = nullptr;
@@ -475,8 +553,8 @@ void project_chunk(const T* x, int64_t x_ld, T* c, int64_t ldc, const T* packed_
 /// half and bf16 in recurrent_q8.cpp.
 template <typename T>
 void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
-                      const int8_t* packed_w, const float* sw, int64_t cols, int64_t input,
-                      int64_t rows, int64_t mc, int64_t nc, const RowScales& xs,
-                      const Q8Scratch& qs, const ComputeContext& ctx);
+                      const int8_t* packed_w, const MatMulPackedB& wg, const float* sw,
+                      int64_t cols, int64_t input, int64_t rows, int64_t mc, int64_t nc,
+                      const RowScales& xs, const Q8Scratch& qs, const ComputeContext& ctx);
 
 } // namespace nnops::backend::cpu

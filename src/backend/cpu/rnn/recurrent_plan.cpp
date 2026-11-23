@@ -92,7 +92,6 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
     const int64_t esz = static_cast<int64_t>(data_type_size(p.dtype));
     const int64_t H = p.hidden;
     plan.q8 = p.weight_dtype == DataType::s8;
-    const int64_t nr = plan.q8 ? NR_MAX_I8 : nr_max_dt(p.dtype);
     const int64_t kc_cap = plan.q8 ? kQ8Kc :
                                      (p.dtype == DataType::f16  ? KC_CAP_F16 :
                                       p.dtype == DataType::bf16 ? KC_CAP_BF16 :
@@ -109,16 +108,23 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
         g.gates = phase_gates(g.kind);
         g.q = 8 * g.gates;
         g.cols = ((H + 7) / 8) * g.q;
-        g.n_align = lcm64(g.q, nr);
-        if (!plan.q8) {
+        // The R layout: the ZA blocks when the engine is up and the phase wide
+        // and deep enough, else the NEON panels — the packer and the kernel ask
+        // q8_pack_geom the same question, so the tile grid follows the layout.
+        if (plan.q8) {
+            g.rgeo = q8_pack_geom(g.cols, H);
+            g.q8_kc = q8_k_block(q8_geom_is_za(g.rgeo), H);
+        } else {
             g.rgeo = matmul_packed_b_geom(g.cols, H, p.dtype);
             if (!g.rgeo.ok()) {
                 return Status::invalid_argument;
             }
         }
+        g.n_align = lcm64(g.q, g.rgeo.nr);
         plan.col_base[ph] = plan.total_cols;
         plan.total_cols += g.cols;
-        solve_tiles(p.batch, g.cols, std::min(H, kc_cap), g.n_align, threads, g);
+        solve_tiles(p.batch, g.cols, plan.q8 ? g.q8_kc : std::min(H, kc_cap), g.n_align,
+                    threads, g);
     }
 
     if (!plan.q8) {
@@ -126,6 +132,8 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
         if (!plan.wgeo.ok()) {
             return Status::invalid_argument;
         }
+    } else {
+        plan.wgeo = q8_pack_geom(plan.total_cols, p.input);
     }
 
     plan.kc = std::max<int64_t>(1, std::min<int64_t>(H, kc_cap));
@@ -165,9 +173,12 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
             mc -= 8;
         }
         plan.proj_mc = std::min<int64_t>(mc, std::max<int64_t>(rows, 1));
-        // A column tile keeps one task's int32 accumulator bounded; the panels
-        // are addressed per k-block slab, so any nr multiple is addressable.
-        plan.proj_nc = std::min<int64_t>(plan.total_cols, kQ8ProjNc);
+        // A column tile keeps one task's int32 accumulator bounded. The NEON
+        // slabs are addressed per k-block at any panel multiple; the ZA blocks
+        // start on a 64-column boundary, so a ZA tile is a whole number of them
+        // (a short gate row is one tile at n0 = 0 either way).
+        const bool w_za = q8_geom_is_za(plan.wgeo);
+        plan.proj_nc = std::min<int64_t>(plan.total_cols, w_za ? 512 : kQ8ProjNc);
 
         // Scratch slots, by the library's rule: thread ids bound the slots when
         // the grid hands one worker several items, otherwise every task owns
@@ -183,15 +194,16 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
         plan.slots = (ctx.cpu.thread_slot_count() > 0 && workers < tasks_max) ?
                          workers :
                          std::max<int64_t>(tasks_max, 1);
-        plan.a_bytes = num_panels_max(static_cast<int>(plan.proj_mc), MR_I8, 3) *
-                       geom_ldd_i8_a(std::min<int64_t>(kQ8Kc, std::max<int64_t>(p.input, 1)));
+        // One slot holds the packed A and, on the ZA route, the row-major
+        // staging the quantize-and-pack writes first.
         plan.a_bytes =
-            std::max<int64_t>(plan.a_bytes, num_panels_max(static_cast<int>(p.batch), MR_I8, 3) *
-                                                geom_ldd_i8_a(std::min<int64_t>(kQ8Kc, H)));
+            q8_a_bytes(w_za, plan.proj_mc, q8_k_block(w_za, std::max<int64_t>(p.input, 1)));
         plan.c_elems = plan.proj_mc * plan.proj_nc;
         plan.s_elems = plan.proj_mc;
         for (int64_t ph = 0; ph < plan.nphases; ++ph) {
             const PhaseGeom& g = plan.phase[ph];
+            plan.a_bytes = std::max<int64_t>(
+                plan.a_bytes, q8_a_bytes(q8_geom_is_za(g.rgeo), g.mc, g.q8_kc));
             plan.c_elems = std::max<int64_t>(plan.c_elems, g.mc * g.nc);
             plan.s_elems = std::max<int64_t>(plan.s_elems, g.mc);
         }

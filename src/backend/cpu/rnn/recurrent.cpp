@@ -245,9 +245,9 @@ template <typename T> ScratchSize scratch_size(const Run<T>& run)
     if (!run.prepacked) {
         if (q8) {
             s.qbytes += plan.total_cols * std::max(run.I, run.H); // interleave staging
-            s.qbytes += q8_packed_bytes(run.I, plan.total_cols);
+            s.qbytes += q8_region_bytes(plan.total_cols, run.I);
             for (int64_t ph = 0; ph < plan.nphases; ++ph) {
-                s.qbytes += q8_packed_bytes(run.H, plan.phase[ph].cols);
+                s.qbytes += q8_region_bytes(plan.phase[ph].cols, run.H);
             }
             s.qbytes += 4 * plan.total_cols; // W's scales
             s.qbytes += 8 * run.G * run.H;   // bias staging, f32
@@ -373,11 +373,12 @@ void pack_q8_weights(const Run<T>& run, int64_t d, Arena& arena, DirWeights<T>& 
     int8_t* raw8 =
         reinterpret_cast<int8_t*>(arena.take_bytes(plan.total_cols * std::max(run.I, run.H)));
     Q8Regions reg;
-    reg.w = reinterpret_cast<int8_t*>(arena.take_bytes(q8_packed_bytes(run.I, plan.total_cols)));
+    reg.w = reinterpret_cast<int8_t*>(
+        arena.take_bytes(q8_region_bytes(plan.total_cols, run.I)));
     reg.sw = reinterpret_cast<float*>(arena.take_bytes(4 * plan.total_cols));
     for (int64_t ph = 0; ph < plan.nphases; ++ph) {
         reg.r[ph] = reinterpret_cast<int8_t*>(
-            arena.take_bytes(q8_packed_bytes(run.H, plan.phase[ph].cols)));
+            arena.take_bytes(q8_region_bytes(plan.phase[ph].cols, run.H)));
         reg.sr[ph] = reinterpret_cast<float*>(arena.take_bytes(4 * plan.phase[ph].cols));
         reg.bias[ph] = reinterpret_cast<float*>(arena.take_bytes(4 * plan.phase[ph].cols));
     }
@@ -498,7 +499,7 @@ StepCtx<T> step_ctx(const Run<T>& run, const DirState<T>& ds, const DirWeights<T
     s.hidden = run.H;
     s.hp = run.hp;
     s.cols = g.cols;
-    s.kc = run.plan.kc;
+    s.kc = run.q8 ? g.q8_kc : run.plan.kc;
     s.ldc = run.ldc;
     s.m_blocks = g.m_blocks;
     s.n_blocks = g.n_blocks;
@@ -512,6 +513,8 @@ StepCtx<T> step_ctx(const Run<T>& run, const DirState<T>& ds, const DirWeights<T
     s.r_nr = g.rgeo.nr;
     s.q_r = dw.q_r[ph];
     s.sr = dw.q_sr[ph];
+    s.q_za = q8_geom_is_za(g.rgeo);
+    s.q_r_ldd = g.rgeo.ldd;
     s.qs = qs;
     s.bias = dw.bias[ph];
     s.rh_bias = (run.lbr && g.kind == PhaseKind::GruAll) ? dw.rh : nullptr;
@@ -621,9 +624,10 @@ void run_direction(const Run<T>& run, int64_t d, void* base, size_t bytes,
         // same X rows, and neither's input projection waits on the other's
         // recurrence.
         if (run.q8) {
-            project_chunk_q8<T>(*run.x, t0 * run.B, ds.in_proj, run.ldc, dw.q_w, dw.q_sw,
-                                run.plan.total_cols, run.I, nrows * run.B, run.plan.proj_mc,
-                                run.plan.proj_nc, run.x_scales, qs, ctx);
+            project_chunk_q8<T>(*run.x, t0 * run.B, ds.in_proj, run.ldc, dw.q_w,
+                                run.plan.wgeo, dw.q_sw, run.plan.total_cols, run.I,
+                                nrows * run.B, run.plan.proj_mc, run.plan.proj_nc,
+                                run.x_scales, qs, ctx);
         } else {
             project_chunk<T>(run.x->template ptr<T>(static_cast<size_t>(t0 * run.B)), run.x_rows,
                              ds.in_proj, run.ldc, dw.w, run.plan.wgeo.ldd, run.plan.wgeo.nr,
