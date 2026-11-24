@@ -24,6 +24,11 @@ inline std::atomic<int> pooling_3x3_roll{0};
 /// the same rules as the auto choice).
 inline std::atomic<int> cuda_splitk{-1};
 
+/// CUDA recurrent bidirectional: 0 runs the two directions concurrently on a
+/// second stream, 1 keeps them on the caller's stream in sequence. A bench
+/// compares the arms; production leaves the default.
+inline std::atomic<int> cuda_rnn_serial{0};
+
 /// CUDA f16 narrow-m preference: -1 automatic, 0 keeps the tiled engine first,
 /// 1 hands a product of at most sixteen rows (A row-major, B `[k][n]`) to the
 /// FFMA streaming loop before the tiled engine is tried. The automatic rule

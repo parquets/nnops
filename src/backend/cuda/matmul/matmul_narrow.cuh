@@ -538,10 +538,21 @@ inline bool small_nt_applies(const GemmParams& p, GemmElem elem, bool trans_a, b
     if (!vectorized || trans_a || !trans_b) {
         return false;
     }
-    if (p.m < 1 || p.m > kSmallMRows || p.n < 1 || p.k < 1024) {
+    if (p.m < 1 || p.m > kSmallMRows || p.n < 1) {
         return false;
     }
     if (gemm_batch_count(p) != 1) {
+        return false;
+    }
+    // A caller's split hint is an opt-in to the loop for the poses the
+    // automatic rule keeps on the tile: f16 with more than one row, and a K
+    // below the loop's own floor (a recurrent step's K is the hidden size and
+    // its N the gate row, which is exactly the shape the tile wastes rows on).
+    // The hint never reaches an op that did not set it.
+    if (p.splits_hint > 0) {
+        return p.k >= 256 && (elem == GemmElem::F32 || elem == GemmElem::F16);
+    }
+    if (p.k < 1024) {
         return false;
     }
     // Sixteen rows of f16 stay on the tensor-core tiles by measurement (this
@@ -572,6 +583,15 @@ inline int small_nt_splits(const GemmParams& p)
     }
 
     const int64_t plane = int64_t(p.m) * p.n * int64_t(sizeof(float));
+    if (p.splits_hint > 0) {
+        // The caller's count, on the same bounds as the automatic one: the k
+        // tiles it has to cut, the 16-way cap, and the planes' cache budget.
+        int splits = std::max(1, std::min({p.splits_hint, k_tiles, 16}));
+        while (splits > 1 && int64_t(splits) * plane > kSplitKMaxBytes) {
+            splits /= 2;
+        }
+        return splits;
+    }
     int splits = int(std::min<int64_t>(std::max<int64_t>(p.k / 512, 1), 8));
     const int64_t l2 = device_l2_bytes();
     if (l2 > 0) {

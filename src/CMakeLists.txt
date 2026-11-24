@@ -218,6 +218,10 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/conv/depthwise_transpose_conv.cu
         backend/cuda/conv/depthwise_conv.cu
         backend/cuda/conv/pooling.cu
+        # The recurrent family: one timeline driver shared by RNN, GRU and
+        # LSTM — the chunked input projection and the per-step product both run
+        # on the dense GEMM engine, and one elementwise kernel does the gates.
+        backend/cuda/rnn/recurrent.cu
         # Unsupported operators' entry points, so the CUDA library resolves every
         # dispatch site the CPU backend references.
         backend/cuda/not_implemented.cu

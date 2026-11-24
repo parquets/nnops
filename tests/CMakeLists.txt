@@ -137,6 +137,7 @@ if(NNOPS_BUILD_CUDA)
         test_cuda_gather_scatter.cpp
         test_cuda_elementwise.cpp
         test_cuda_bf16.cpp
+        test_cuda_rnn.cpp
     )
 endif()
 
@@ -205,6 +206,7 @@ if(NNOPS_BUILD_BENCHMARKS)
             bench_cuda_pooling.cpp
             bench_cuda_resize.cpp
             bench_cuda_elementwise.cpp
+            bench_cuda_rnn.cpp
         )
     endif()
 

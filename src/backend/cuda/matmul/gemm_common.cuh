@@ -71,6 +71,15 @@ struct GemmParams {
     int k_splits = 1;
     float* partial = nullptr; ///< [batch][split][m][n], row-major
 
+    /// A caller's split count for the narrow-m loop, 0 for the automatic
+    /// choice. The loop's own rule sizes the split by K and the L2 planes and
+    /// never looks at N, so a short gate row (a recurrent step's N = gates·H)
+    /// leaves the machine half empty; a caller that knows its shape family can
+    /// say so. It only opens the loop for a pose the automatic rule keeps on
+    /// the tile (f16 with more than one row), so every existing caller is
+    /// unchanged. Clamped by the k tiles and the plane budget like the auto.
+    int splits_hint = 0;
+
     int batch_rank = 0;
     int64_t batch_size[4] = {1, 1, 1, 1};
     int64_t a_batch[4] = {0, 0, 0, 0};

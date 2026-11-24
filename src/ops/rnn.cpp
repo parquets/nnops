@@ -14,6 +14,9 @@
 #include "recurrent_common.hpp"
 
 #include "backend/cpu/rnn/recurrent.h"
+#if defined(NNOPS_HAS_CUDA)
+#include "backend/cuda/rnn/recurrent.h"
+#endif
 
 namespace nnops {
 
@@ -30,6 +33,10 @@ auto resolve_rnn_kernel(Backend backend) -> Rnn::Impl::KernelFn
     switch (backend) {
     case Backend::CPU:
         return backend::cpu::recurrent_cpu;
+#if defined(NNOPS_HAS_CUDA)
+    case Backend::CUDA:
+        return backend::cuda::recurrent_cuda;
+#endif
     default:
         return nullptr;
     }

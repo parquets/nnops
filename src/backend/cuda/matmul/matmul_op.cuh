@@ -188,6 +188,21 @@ inline Status dense_gemm_status(const GemmParams& p, DataType dtype, bool transp
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
     const bool vectorized = gemm_vectorizable(p, elem_size);
 
+    // A caller that named its split count wants the narrow-m loop first, even
+    // for the poses the automatic ladder would hand to the tile (f16 with more
+    // than one row, a K under the loop's floor). The splits it asked for are
+    // what puts enough column blocks on the machine when N is short.
+    if (p.splits_hint > 0 && (elem == GemmElem::F16 || elem == GemmElem::F32)) {
+        if (detail::small_nt_applies(p, elem, transpose_a, transpose_b, vectorized)) {
+            const bool half = elem == GemmElem::F16;
+            const bool ran = half ? detail::launch_small_nt<__half>(p, stream)
+                                  : detail::launch_small_nt<float>(p, stream);
+            if (ran) {
+                return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+            }
+        }
+    }
+
     // A 16-row f16 product is a bandwidth problem, and the FFMA streaming loop
     // reads B exactly once. When the tiled grid would leave the machine part
     // empty -- the decode shapes, where one 64x64 tile column is the whole
