@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "detail/bench_knobs.hpp"
 #include "matmul_f16_host.hpp"
 #include "matmul_f32_host.hpp"
 #include "matmul_narrow.cuh"
@@ -186,6 +187,27 @@ inline Status dense_gemm_status(const GemmParams& p, DataType dtype, bool transp
 
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
     const bool vectorized = gemm_vectorizable(p, elem_size);
+
+    // A 16-row f16 product is a bandwidth problem, and the FFMA streaming loop
+    // reads B exactly once. When the tiled grid would leave the machine part
+    // empty -- the decode shapes, where one 64x64 tile column is the whole
+    // grid -- it is the better engine (16x4096x4096 0.115 ms against the
+    // tile's 0.133, 16x2048x8192 0.105 against 0.134), so it is tried first
+    // there. `detail::cuda_narrow_m > 0` forces it for a bench.
+    if (elem == GemmElem::F16 && nnops::detail::cuda_narrow_m.load(std::memory_order_relaxed) != 0) {
+        const bool force = nnops::detail::cuda_narrow_m.load(std::memory_order_relaxed) > 0;
+        if (detail::small_m_applies(p, elem, transpose_a, transpose_b, vectorized) &&
+            (force || f16_auto_tile_blocks(p.m, p.n) < f16_auto_tile_slots())) {
+            if (detail::launch_small_m<__half>(p, stream)) {
+                return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+            }
+        }
+        if (force && detail::small_nt_applies(p, elem, transpose_a, transpose_b, vectorized)) {
+            if (detail::launch_small_nt<__half>(p, stream)) {
+                return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+            }
+        }
+    }
 
     // The tiled kernel, while its grid fills the machine.
     if (dtype == DataType::f32) {

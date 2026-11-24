@@ -1099,8 +1099,9 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
     print_cuda_header("CUDA MatMul f16 TN: hand-written PTX tile sweep");
     static const char* const kNames[] = {"64x64/2x2/bk32/s3", "64x32/2x4/bk32/s3",
                                          "64x32/1x4/bk32/s3", "64x64/skew-panel",
-                                         "64x64/direct-epi", "32x32/2x2 4blk"};
-    for (int64_t side : {256, 1024, 4096}) {
+                                         "64x64/direct-epi", "32x32/2x2 4blk",
+                                         "32x32/4x4 128x128", "32x32/2x2 raster"};
+    for (int64_t side : {384, 1024, 2048, 4096}) {
         MatMulAttributes attrs;
         attrs.transpose_b = true;
         HostTensor ha = make_host_random(std::vector<int64_t>{side, side},
@@ -1124,7 +1125,7 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
         }
 
         const double flops = 2.0 * double(side) * double(side) * double(side);
-        for (int t = 0; t < 6; ++t) {
+        for (int t = 0; t < 8; ++t) {
             nnops::backend::cuda::F16Call call;
             call.a = da.view.ptr<void>();
             call.b = db.view.ptr<void>();
@@ -1163,7 +1164,7 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
 
     // The n-major pose takes its own panel layout, so the menu has to be swept
     // there too: the two largest sizes are enough to rank it.
-    for (int64_t side : {1024, 4096}) {
+    for (int64_t side : {384, 1024, 2048, 4096}) {
         MatMulAttributes attrs;   // NN: B is [K, N]
         HostTensor ha = make_host_random(std::vector<int64_t>{side, side},
                                          DataType::f16, false, 17, -0.5f, 0.5f);
@@ -1175,7 +1176,7 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
         DeviceTensor db = to_device(hb);
         DeviceTensor dc = to_device(hc);
         const double flops = 2.0 * double(side) * double(side) * double(side);
-        for (int t = 0; t < 6; ++t) {
+        for (int t = 0; t < 8; ++t) {
             nnops::backend::cuda::F16Call call;
             call.a = da.view.ptr<void>();
             call.b = db.view.ptr<void>();
@@ -1194,6 +1195,212 @@ NNOPS_BENCH(cuda_matmul_ptx_tiles) {
             print_cuda_row(kNames[t], matmul_geometry(side, side, side, false, false),
                            ms, cuda_gflops(ms, flops));
         }
+    }
+}
+
+/// The decode shapes with the split count swept in one process, interleaved:
+/// the host drifts 15-20% between runs, so an arm measured in its own process
+/// cannot be compared with the heuristic's pick. `detail::cuda_splitk` is set
+/// per call; 0 disables the cut and -1 is the automatic choice.
+NNOPS_BENCH(cuda_matmul_decode_split) {
+    print_cuda_header("CUDA MatMul f16 decode: split-K A/B (interleaved)");
+    struct Shape {
+        int64_t m, n, k;
+        bool tb;
+    };
+    const Shape shapes[] = {{16, 4096, 4096, false}, {16, 8192, 2048, false},
+                            {16, 2048, 8192, false}, {16, 4096, 4096, true},
+                            {16, 8192, 2048, true},  {16, 2048, 8192, true}};
+    const int knobs[] = {0, -1, 2, 3, 5, 8, 12, 16};
+    constexpr int kKnobs = 8;
+    auto& knob = nnops::detail::cuda_splitk;
+
+    for (const Shape& s : shapes) {
+        MatMulAttributes attrs;
+        attrs.transpose_b = s.tb;
+        HostTensor ha = make_host_random(std::vector<int64_t>{s.m, s.k}, DataType::f16,
+                                         false, 17, -0.5f, 0.5f);
+        HostTensor hb = make_host_random(
+            std::vector<int64_t>{s.tb ? s.n : s.k, s.tb ? s.k : s.n}, DataType::f16, false,
+            29, -0.5f, 0.5f);
+        HostTensor hc = make_host_zeroed(std::vector<int64_t>{s.m, s.n}, DataType::f16, false);
+        DeviceTensor da = to_device(ha);
+        DeviceTensor db = to_device(hb);
+        DeviceTensor dc = to_device(hc);
+        auto op = MatMul::create(attrs, Backend::CUDA);
+        std::vector<TensorView> ins = {da.view, db.view};
+        TensorView out = dc.view;
+        auto launch = [&] { cuda_launch(*op, out, ins); };
+
+        cudaEvent_t begin = nullptr, end = nullptr;
+        NNOPS_CUDA_CHECK(cudaEventCreate(&begin));
+        NNOPS_CUDA_CHECK(cudaEventCreate(&end));
+        for (int k : knobs) {
+            knob.store(k, std::memory_order_relaxed);
+            launch();
+        }
+        CudaBuffer::sync();
+
+        std::vector<std::vector<double>> samples(kKnobs);
+        for (int round = 0; round < 12; ++round) {
+            for (int i = 0; i < kKnobs; ++i) {
+                const int ki = round % 2 == 0 ? i : kKnobs - 1 - i;
+                knob.store(knobs[ki], std::memory_order_relaxed);
+                samples[ki].push_back(timed_launch(launch, begin, end));
+            }
+        }
+        knob.store(-1, std::memory_order_relaxed);
+        NNOPS_CUDA_CHECK(cudaEventDestroy(begin));
+        NNOPS_CUDA_CHECK(cudaEventDestroy(end));
+
+        const double flops = 2.0 * double(s.m) * double(s.n) * double(s.k);
+        const std::string geo = matmul_geometry(s.m, s.n, s.k, false, s.tb);
+        for (int i = 0; i < kKnobs; ++i) {
+            char tag[48];
+            std::snprintf(tag, sizeof(tag), "f16 split=%d", knobs[i]);
+            const double ms = median_of(samples[i]);
+            print_cuda_row(tag, geo, ms, cuda_gflops(ms, flops));
+        }
+    }
+}
+
+/// The two engines on the decode shapes, interleaved in one process: the
+/// automatic route (the tiled kernel, split-K filled) against the FFMA
+/// streaming loop forced by `detail::cuda_narrow_m`.
+NNOPS_BENCH(cuda_matmul_decode_route) {
+    print_cuda_header("CUDA MatMul f16 decode: tiled vs narrow-m (interleaved)");
+    struct Shape {
+        int64_t m, n, k;
+        bool tb;
+    };
+    const Shape shapes[] = {{16, 4096, 4096, false}, {16, 8192, 2048, false},
+                            {16, 2048, 8192, false}, {16, 4096, 4096, true},
+                            {16, 8192, 2048, true},  {16, 2048, 8192, true}};
+    auto& knob = nnops::detail::cuda_narrow_m;
+
+    for (const Shape& s : shapes) {
+        MatMulAttributes attrs;
+        attrs.transpose_b = s.tb;
+        HostTensor ha = make_host_random(std::vector<int64_t>{s.m, s.k}, DataType::f16,
+                                         false, 17, -0.5f, 0.5f);
+        HostTensor hb = make_host_random(
+            std::vector<int64_t>{s.tb ? s.n : s.k, s.tb ? s.k : s.n}, DataType::f16, false,
+            29, -0.5f, 0.5f);
+        HostTensor hc = make_host_zeroed(std::vector<int64_t>{s.m, s.n}, DataType::f16, false);
+        DeviceTensor da = to_device(ha);
+        DeviceTensor db = to_device(hb);
+        DeviceTensor dc = to_device(hc);
+        auto op = MatMul::create(attrs, Backend::CUDA);
+        std::vector<TensorView> ins = {da.view, db.view};
+        TensorView out = dc.view;
+        auto launch = [&] { cuda_launch(*op, out, ins); };
+
+        cudaEvent_t begin = nullptr, end = nullptr;
+        NNOPS_CUDA_CHECK(cudaEventCreate(&begin));
+        NNOPS_CUDA_CHECK(cudaEventCreate(&end));
+        // {route, loop variant}: 0 keeps the tiled engine first; 1 forces the
+        // FFMA loop in each of its four (columns x B-rows) groups; -1 is the
+        // automatic rule. Interleaved, so a clock excursion moves all six.
+        const int routes[] = {0, 1, 1, 1, 1, -1};
+        const int variants[] = {0, 0, 1, 2, 3, 0};
+        constexpr int kArms = 6;
+        static const char* const kArmNames[kArms] = {
+            "f16 tiled", "f16 narrow prod", "f16 narrow 4x16",
+            "f16 narrow 2x16", "f16 narrow 2x32", "f16 auto"};
+        auto& var = nnops::detail::cuda_narrow_var;
+        for (int i = 0; i < kArms; ++i) {
+            knob.store(routes[i], std::memory_order_relaxed);
+            var.store(variants[i], std::memory_order_relaxed);
+            launch();
+        }
+        CudaBuffer::sync();
+
+        std::vector<std::vector<double>> samples(kArms);
+        for (int round = 0; round < 12; ++round) {
+            for (int i = 0; i < kArms; ++i) {
+                const int ai = round % 2 == 0 ? i : kArms - 1 - i;
+                knob.store(routes[ai], std::memory_order_relaxed);
+                var.store(variants[ai], std::memory_order_relaxed);
+                samples[size_t(ai)].push_back(timed_launch(launch, begin, end));
+            }
+        }
+        knob.store(-1, std::memory_order_relaxed);
+        var.store(0, std::memory_order_relaxed);
+        NNOPS_CUDA_CHECK(cudaEventDestroy(begin));
+        NNOPS_CUDA_CHECK(cudaEventDestroy(end));
+
+        const double flops = 2.0 * double(s.m) * double(s.n) * double(s.k);
+        const std::string geo = matmul_geometry(s.m, s.n, s.k, false, s.tb);
+        double ms[kArms];
+        for (int i = 0; i < kArms; ++i) {
+            ms[i] = median_of(samples[size_t(i)]);
+            print_cuda_row(kArmNames[i], geo, ms[i], cuda_gflops(ms[i], flops));
+        }
+        std::printf("    ratios/tiled:");
+        for (int i = 1; i < kArms; ++i) {
+            std::printf(" %.3f", ms[i] / ms[0]);
+        }
+        std::printf("\n");
+    }
+}
+
+/// The small squares whose split choice changed: their tiled grid is under
+/// twenty blocks, so the starved rule now cuts the reduction even where the
+/// planes are larger than the operands. That trade can go either way, so the
+/// cut and the uncut product are interleaved here.
+NNOPS_BENCH(cuda_matmul_small_split) {
+    print_cuda_header("CUDA MatMul f16 small squares: split-K A/B");
+    auto& knob = nnops::detail::cuda_splitk;
+    for (int64_t side : {96, 128, 192, 256, 320}) {
+        MatMulAttributes attrs;
+        HostTensor ha = make_host_random(std::vector<int64_t>{side, side}, DataType::f16,
+                                         false, 17, -0.5f, 0.5f);
+        HostTensor hb = make_host_random(std::vector<int64_t>{side, side}, DataType::f16,
+                                         false, 29, -0.5f, 0.5f);
+        HostTensor hc = make_host_zeroed(std::vector<int64_t>{side, side}, DataType::f16, false);
+        DeviceTensor da = to_device(ha);
+        DeviceTensor db = to_device(hb);
+        DeviceTensor dc = to_device(hc);
+        auto op = MatMul::create(attrs, Backend::CUDA);
+        std::vector<TensorView> ins = {da.view, db.view};
+        TensorView out = dc.view;
+        auto launch = [&] { cuda_launch(*op, out, ins); };
+
+        cudaEvent_t begin = nullptr, end = nullptr;
+        NNOPS_CUDA_CHECK(cudaEventCreate(&begin));
+        NNOPS_CUDA_CHECK(cudaEventCreate(&end));
+        for (int k : {-1, 0}) {
+            knob.store(k, std::memory_order_relaxed);
+            launch();
+        }
+        CudaBuffer::sync();
+
+        std::vector<double> ms_auto;
+        std::vector<double> ms_off;
+        for (int round = 0; round < 12; ++round) {
+            if (round % 2 == 0) {
+                knob.store(-1, std::memory_order_relaxed);
+                ms_auto.push_back(timed_launch(launch, begin, end));
+                knob.store(0, std::memory_order_relaxed);
+                ms_off.push_back(timed_launch(launch, begin, end));
+            } else {
+                knob.store(0, std::memory_order_relaxed);
+                ms_off.push_back(timed_launch(launch, begin, end));
+                knob.store(-1, std::memory_order_relaxed);
+                ms_auto.push_back(timed_launch(launch, begin, end));
+            }
+        }
+        knob.store(-1, std::memory_order_relaxed);
+        NNOPS_CUDA_CHECK(cudaEventDestroy(begin));
+        NNOPS_CUDA_CHECK(cudaEventDestroy(end));
+
+        const double flops = 2.0 * double(side) * double(side) * double(side);
+        const std::string geo = matmul_geometry(side, side, side, false, false);
+        const double am = median_of(ms_auto);
+        const double om = median_of(ms_off);
+        print_cuda_row("f16 auto", geo, am, cuda_gflops(am, flops));
+        print_cuda_row("f16 split off", geo, om, cuda_gflops(om, flops));
+        std::printf("    ratio auto/off %.3f\n", am / om);
     }
 }
 

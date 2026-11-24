@@ -11,11 +11,13 @@
 
 #pragma once
 
+#include "detail/bench_knobs.hpp"
 #include "matmul_splitk.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 namespace nnops::backend::cuda {
@@ -52,14 +54,14 @@ constexpr int kSmallMUnroll = 16; ///< rows of B in flight before the converts
 constexpr int kSmallNTCols = kSmallMThreads;
 constexpr int kSmallNTK = kSmallMK;
 
-template <class Elem>
+template <class Elem, int UK_ = kSmallMUnroll, int VEC_ = kSmallMVec>
 __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(GemmParams p)
 {
     constexpr int BM = kSmallMRows;
-    constexpr int VEC = kSmallMVec;
+    constexpr int VEC = VEC_;
     constexpr int KC = kSmallMK;
-    constexpr int UK = kSmallMUnroll;
-    constexpr int BN = kSmallMBn;
+    constexpr int UK = UK_;
+    constexpr int BN = kSmallMThreads * VEC;
 
     const Elem* __restrict__ A = static_cast<const Elem*>(p.a);
     const Elem* __restrict__ B = static_cast<const Elem*>(p.b);
@@ -110,13 +112,17 @@ __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(Gemm
 #pragma unroll
             for (int j = 0; j < UK; ++j) {
                 const Elem* src = B + int64_t(k0 + kk + j) * ldb + nrd;
-                if constexpr (sizeof(Elem) == 4) {
+                if constexpr (sizeof(Elem) == 4 && VEC == 4) {
                     const float4 v = *reinterpret_cast<const float4*>(src);
                     b[j][0] = v.x;
                     b[j][1] = v.y;
                     b[j][2] = v.z;
                     b[j][3] = v.w;
-                } else {
+                } else if constexpr (sizeof(Elem) == 4) {
+                    const float2 v = *reinterpret_cast<const float2*>(src);
+                    b[j][0] = v.x;
+                    b[j][1] = v.y;
+                } else if constexpr (VEC == 4) {
                     const uint2 raw = *reinterpret_cast<const uint2*>(src);
                     const float2 f0 =
                         __half22float2(__halves2half2(__ushort_as_half(uint16_t(raw.x)),
@@ -128,6 +134,12 @@ __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(Gemm
                     b[j][1] = f0.y;
                     b[j][2] = f1.x;
                     b[j][3] = f1.y;
+                } else {
+                    const uint32_t raw = *reinterpret_cast<const uint32_t*>(src);
+                    const float2 f =
+                        __half22float2(*reinterpret_cast<const __half2*>(&raw));
+                    b[j][0] = f.x;
+                    b[j][1] = f.y;
                 }
             }
 #pragma unroll
@@ -147,13 +159,17 @@ __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(Gemm
         for (; kk < kc; ++kk) {
             float b[VEC];
             const Elem* src = B + int64_t(k0 + kk) * ldb + nrd;
-            if constexpr (sizeof(Elem) == 4) {
+            if constexpr (sizeof(Elem) == 4 && VEC == 4) {
                 const float4 v = *reinterpret_cast<const float4*>(src);
                 b[0] = v.x;
                 b[1] = v.y;
                 b[2] = v.z;
                 b[3] = v.w;
-            } else {
+            } else if constexpr (sizeof(Elem) == 4) {
+                const float2 v = *reinterpret_cast<const float2*>(src);
+                b[0] = v.x;
+                b[1] = v.y;
+            } else if constexpr (VEC == 4) {
                 const uint2 raw = *reinterpret_cast<const uint2*>(src);
                 const float2 f0 = __half22float2(__halves2half2(
                     __ushort_as_half(uint16_t(raw.x)), __ushort_as_half(uint16_t(raw.x >> 16))));
@@ -163,6 +179,11 @@ __global__ __launch_bounds__(kSmallMThreads) void dense_gemm_small_m_kernel(Gemm
                 b[1] = f0.y;
                 b[2] = f1.x;
                 b[3] = f1.y;
+            } else {
+                const uint32_t raw = *reinterpret_cast<const uint32_t*>(src);
+                const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&raw));
+                b[0] = f.x;
+                b[1] = f.y;
             }
 #pragma unroll
             for (int m = 0; m < BM; ++m) {
@@ -246,8 +267,10 @@ inline int small_m_splits(const GemmParams& p)
     return splits;
 }
 
-template <class Elem> inline bool launch_small_m(const GemmParams& p, cudaStream_t stream)
+template <class Elem, int UK = kSmallMUnroll, int VEC = kSmallMVec>
+inline bool launch_small_m_uk(const GemmParams& p, cudaStream_t stream)
 {
+    constexpr int BN = kSmallMThreads * VEC;
     const int splits = small_m_splits(p);
     const int64_t bytes = int64_t(splits) * p.m * p.n * int64_t(sizeof(float));
     const GemmWorkspace ws = gemm_workspace_alloc(bytes, stream);
@@ -258,12 +281,36 @@ template <class Elem> inline bool launch_small_m(const GemmParams& p, cudaStream
     GemmParams q = p;
     q.k_splits = splits;
     q.partial = static_cast<float*>(ws.ptr);
-    const dim3 grid(static_cast<unsigned>((p.n + kSmallMBn - 1) / kSmallMBn), 1,
+    const dim3 grid(static_cast<unsigned>((p.n + BN - 1) / BN), 1,
                     static_cast<unsigned>(splits));
-    dense_gemm_small_m_kernel<Elem><<<grid, kSmallMThreads, 0, stream>>>(q);
+    dense_gemm_small_m_kernel<Elem, UK, VEC><<<grid, kSmallMThreads, 0, stream>>>(q);
     launch_splitk_reduce<Elem>(q, stream);
     gemm_workspace_free(ws, stream);
     return true;
+}
+
+/// The narrow-m loop. f16 keeps 32 B rows of B in flight (0.117 -> 0.114 ms at
+/// 16x2048x8192, 0.117 -> 0.113 at 16x8192x2048, and no loss anywhere else);
+/// f32 stays at 16, which is what the operator was measured with. The bench's
+/// other arms halve the block width to 2 columns -- twice the blocks on a grid
+/// that is under one wave -- and that loses 6-15% at every decode shape, so it
+/// is the sweep's arm only.
+template <class Elem> inline bool launch_small_m(const GemmParams& p, cudaStream_t stream)
+{
+    switch (::nnops::detail::cuda_narrow_var.load(std::memory_order_relaxed)) {
+    case 1:
+        return launch_small_m_uk<Elem, 16, 4>(p, stream);
+    case 2:
+        return launch_small_m_uk<Elem, 16, 2>(p, stream);
+    case 3:
+        return launch_small_m_uk<Elem, 32, 2>(p, stream);
+    default:
+        if constexpr (sizeof(Elem) == 2) {
+            return launch_small_m_uk<Elem, 32, 4>(p, stream);
+        } else {
+            return launch_small_m_uk<Elem>(p, stream);
+        }
+    }
 }
 
 /// The narrow-m loop for a transposed B: `Linear` stores its weight as `[n][k]`,
@@ -497,7 +544,14 @@ inline bool small_nt_applies(const GemmParams& p, GemmElem elem, bool trans_a, b
     if (gemm_batch_count(p) != 1) {
         return false;
     }
-    return elem == GemmElem::F32 || (elem == GemmElem::F16 && p.m == 1);
+    // Sixteen rows of f16 stay on the tensor-core tiles by measurement (this
+    // loop is 1.62 against the tile's 1.66 of cuBLAS at 4096x4096, 1.48 against
+    // 1.52 at 8192x2048, 1.89 against 1.65 at 2048x8192), so only the GEMV is
+    // automatic; `cuda_narrow_m > 0` opens the sixteen-row arm for a bench.
+    return elem == GemmElem::F32 ||
+           (elem == GemmElem::F16 &&
+            (p.m == 1 ||
+             ::nnops::detail::cuda_narrow_m.load(std::memory_order_relaxed) > 0));
 }
 
 /// A split is the only axis this grid grows on here too, but the block is four

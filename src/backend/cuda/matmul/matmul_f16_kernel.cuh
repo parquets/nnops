@@ -45,8 +45,28 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void f16_gemm_kernel(F16P
     const int lane = tid % 32;
     const int warp_m = warp / S::wn;
     const int warp_n = warp - warp_m * S::wn;
-    const int m_tile = int(blockIdx.x) * BM;
-    const int n_tile = int(blockIdx.y) * BN;
+    // L2 rasterization: the CTAs of one strip walk n before m, so the strip's
+    // B panels are the ones still in the cache (the f32 engine's scheme).
+    int blk_m = int(blockIdx.x), blk_n = int(blockIdx.y);
+    if constexpr (S::Raster > 0) {
+        const int bm = int(gridDim.x), bn = int(gridDim.y);
+        const int gsize = S::Raster * bn;
+        const int full = bm / S::Raster;
+        const int bid = blk_n * bm + blk_m;
+        if (bid < full * gsize) {
+            const int gid = bid / gsize;
+            const int idx = bid - gid * gsize;
+            blk_m = gid * S::Raster + idx % S::Raster;
+            blk_n = idx / S::Raster;
+        } else {
+            const int rem = bm - full * S::Raster;
+            const int idx = bid - full * gsize;
+            blk_m = full * S::Raster + idx % rem;
+            blk_n = idx / rem;
+        }
+    }
+    const int m_tile = blk_m * BM;
+    const int n_tile = blk_n * BN;
     const int m0 = m_tile + warp_m * WM;
     const int n0 = n_tile + warp_n * WN;
     const int M = int(p.m), N = int(p.n), K = int(p.k);
@@ -393,12 +413,13 @@ template <class Elem> __global__ void f16_gemm_reduce_kernel(F16Params p)
 }
 
 
-/// The candidate tiles, in the order a sweep reports them. The 64x64 warp tile
-/// on a 2x2 grid is the default: doubling the warp's n span halves the ldmatrix
+/// The candidate tiles, in the order a sweep reports them. The list is the
+/// search's menu, not a ranking: the automatic pick is Tile7 below, and the
+/// rows here are the arms that were measured against it. Tile0 is the 64x64
+/// warp tile on a 2x2 grid -- doubling the warp's n span halves the ldmatrix
 /// traffic per MAC, and on two CTAs of 128 threads that trade is a clear win at
 /// every size past a few hundred square (4096^3: 4.39 ms against 5.38 for the
-/// 64x32 tile and 7.07 for the tiled engine it replaced). The other two are
-/// edges the sweep leaves standing: the 16-warp CTA and the narrow 64-row CTA.
+/// 64x32 tile and 7.07 for the tiled engine it replaced).
 using Tile0 = F16TileShape<64, 64, 2, 2, 32, 3>;
 using Tile1 = F16TileShape<64, 32, 2, 4, 32, 3>;
 using Tile2 = F16TileShape<64, 32, 1, 4, 32, 3>;
@@ -411,26 +432,38 @@ using Tile4 = F16TileShape<64, 64, 2, 2, 32, 3, 1, false>;
 /// live on an SM (24.6 KB of panels each). A 2048^3 square then has 1024 blocks
 /// instead of 256, which is what fills the machine there.
 using Tile5 = F16TileShape<32, 32, 2, 2, 32, 3, 1, true, 4>;
-
+/// The wide-CTA arm: the shallow row's 32x32 warp tile on a 4x4 warp grid, so
+/// the CTA is 128x128 on 512 threads and A/B are re-read a quarter as often.
+/// It loses on this card, everywhere -- 4096^3 TN 5.77 ms against 4.69 for
+/// Tile7, 2048^3 0.761 against 0.664 -- because 49 KB of panels allow one CTA
+/// an SM, and the block-wide barrier every k tile then stalls all 16 warps
+/// with no second CTA to run. Kept as the sweep's arm, not as a candidate.
+using Tile6 = F16TileShape<32, 32, 4, 4, 32, 3, 1, true, 1, 8>;
+/// The production tile with the strip rasterization: same 64x64 CTA and same
+/// four-resident footprint, only the CTA order changes, so the strip's B panels
+/// are still in L2 when the next m tile asks for them.
+using Tile7 = F16TileShape<32, 32, 2, 2, 32, 3, 1, true, 4, 8>;
 struct TileDesc {
-    int bm, bn, bk, threads, smem_bytes;
+    int bm, bn, bk, threads, smem_bytes, min_blocks;
 };
 
-constexpr int kTileCount = 6;
+constexpr int kTileCount = 8;
 constexpr TileDesc kTileTable[kTileCount] = {
-    {Tile0::BM, Tile0::BN, Tile0::BK, Tile0::threads, Tile0::kSmemBytes},
-    {Tile1::BM, Tile1::BN, Tile1::BK, Tile1::threads, Tile1::kSmemBytes},
-    {Tile2::BM, Tile2::BN, Tile2::BK, Tile2::threads, Tile2::kSmemBytes},
-    {Tile3::BM, Tile3::BN, Tile3::BK, Tile3::threads, Tile3::kSmemBytes},
-    {Tile4::BM, Tile4::BN, Tile4::BK, Tile4::threads, Tile4::kSmemBytes},
-    {Tile5::BM, Tile5::BN, Tile5::BK, Tile5::threads, Tile5::kSmemBytes},
+    {Tile0::BM, Tile0::BN, Tile0::BK, Tile0::threads, Tile0::kSmemBytes, Tile0::MinBlocks},
+    {Tile1::BM, Tile1::BN, Tile1::BK, Tile1::threads, Tile1::kSmemBytes, Tile1::MinBlocks},
+    {Tile2::BM, Tile2::BN, Tile2::BK, Tile2::threads, Tile2::kSmemBytes, Tile2::MinBlocks},
+    {Tile3::BM, Tile3::BN, Tile3::BK, Tile3::threads, Tile3::kSmemBytes, Tile3::MinBlocks},
+    {Tile4::BM, Tile4::BN, Tile4::BK, Tile4::threads, Tile4::kSmemBytes, Tile4::MinBlocks},
+    {Tile5::BM, Tile5::BN, Tile5::BK, Tile5::threads, Tile5::kSmemBytes, Tile5::MinBlocks},
+    {Tile6::BM, Tile6::BN, Tile6::BK, Tile6::threads, Tile6::kSmemBytes, Tile6::MinBlocks},
+    {Tile7::BM, Tile7::BN, Tile7::BK, Tile7::threads, Tile7::kSmemBytes, Tile7::MinBlocks},
 };
 
-/// The shallow-grid row: a 32x32 warp tile on four warps, which lives four
-/// blocks to an SM instead of two. It is the row a short-K product wants — the
-/// 128x128 tiles spend a three-stage prologue on a k loop that only has a few
-/// steps to amortise it — and it is what `f16_dense_call` picks for both poses.
-constexpr int kF16TileShallow = 5;
+/// The automatic row: the shallow-grid tile (a 32x32 warp tile on four warps,
+/// four blocks to an SM) plus the strip rasterization. The raster is worth 8%
+/// at 4096^3 and costs nothing at 1024^3, so it ships on the production row;
+/// Tile5 stays in the menu as its no-raster twin for the sweep.
+constexpr int kF16TileAuto = 7;
 
 /// Queried once per process; 0 when unavailable.
 inline int f16_sm_count()
@@ -522,11 +555,20 @@ inline void f16_free(void* ptr, cudaStream_t stream)
     cudaFree(ptr);
 }
 
-/// How many k ranges to cut. The block grid has to fill the machine (a quarter of
-/// a wave is the floor the fp engine uses) and the planes have to stay near the
-/// cache; past that the extra blocks cost more than they buy.
+/// How many k ranges to cut. The split exists to fill the machine, so the grid
+/// is measured against the tile's *resident slots* (`SMs x blocks per SM`), not
+/// against the SM count: a 64x64 CTA that lives four to an SM makes 152 slots
+/// on this card, and a 64-block decode grid is 42% of one wave, not "full".
+/// The planes are still the price -- every split writes an f32 plane and the
+/// reduce reads it back -- so the cut is taken only when the grid is starved
+/// (under an eighth of a wave) or the planes are cheap against the operands
+/// (under a quarter of them). Both conditions are the f32 engine's.
 inline int f16_splits(const F16Call& call, const TileDesc& tile)
 {
+    const int forced = detail::splitk_env();
+    if (forced == 0) {
+        return 1;
+    }
     // The reduce pass sums the planes and applies alpha; the rest of the
     // epilogue (bias, beta·C, the residual, the activation) only runs on the
     // single-pass write-back, so a call that asks for any of it stays whole.
@@ -540,15 +582,22 @@ inline int f16_splits(const F16Call& call, const TileDesc& tile)
     const int64_t n_tiles = (call.n + tile.bn - 1) / tile.bn;
     const int64_t blocks = m_tiles * n_tiles;
     const int64_t k_tiles = (call.k + tile.bk - 1) / tile.bk;
-    const int sm = f16_sm_count();
-    if (sm <= 0 || blocks <= 0 || k_tiles < 2) {
+    if (k_tiles < 2) {
         return 1;
     }
-    if (blocks * 4 >= int64_t(sm)) {
+    if (forced > 1) {
+        return int(std::max<int64_t>(1, std::min<int64_t>(forced, std::min<int64_t>(k_tiles, 16))));
+    }
+    const int sm = f16_sm_count();
+    if (sm <= 0 || blocks <= 0) {
+        return 1;
+    }
+    const int64_t slots = int64_t(sm) * std::max(tile.min_blocks, 1);
+    if (blocks >= slots) {
         return 1;
     }
 
-    int64_t splits = std::min<int64_t>((int64_t(sm) * 4 + blocks - 1) / blocks, 16);
+    int64_t splits = std::min<int64_t>((slots + blocks - 1) / blocks, 16);
     splits = std::min<int64_t>(splits, k_tiles / 2);
     const int64_t plane = int64_t(call.m) * call.n * int64_t(sizeof(float));
     const int64_t l2 = f16_l2_bytes();
@@ -558,7 +607,21 @@ inline int f16_splits(const F16Call& call, const TileDesc& tile)
     while (splits > 1 && splits * plane > kMaxPlaneBytes) {
         splits /= 2;
     }
-    return int(std::max<int64_t>(splits, 1));
+    if (splits < 2) {
+        return 1;
+    }
+    // Half precision: two bytes an element. The split is worth its planes only
+    // when the grid is starved or the planes are a small part of the stream.
+    const int64_t partial_bytes = int64_t{8} * splits * plane; // f32 write + read
+    const int64_t operand_bytes = int64_t{2} * call.k * (int64_t(call.m) + call.n);
+    const bool starved = blocks * 8 <= slots;
+    const bool cheap = partial_bytes * 4 <= operand_bytes;
+    // A square product's planes are f32 against f16 operands, so the starved
+    // branch needs its own bound: 128^3 and 256^3 (planes 16-32x the operands)
+    // measured 1.97x and 1.63x slower cut than uncut. Decode shapes stay well
+    // inside eight operands (1x1024 and 16x1024 Linear, 16x4096x4096 tb).
+    const bool small_planes = partial_bytes <= operand_bytes * 8;
+    return (cheap || (starved && small_planes)) ? int(splits) : 1;
 }
 
 /// The grid gate. Below a full wave this kernel's per-block cost -- the panel
@@ -640,7 +703,7 @@ template <class S, class Elem> bool f16_run(const F16Call& call, cudaStream_t st
     const dim3 grid(unsigned((call.m + S::BM - 1) / S::BM), unsigned((call.n + S::BN - 1) / S::BN),
                     1);
     constexpr int kLaunchSmem = S::kSmemBytes;
-    const TileDesc tile{S::BM, S::BN, S::BK, S::threads, S::kSmemBytes};
+    const TileDesc tile{S::BM, S::BN, S::BK, S::threads, S::kSmemBytes, S::MinBlocks};
     int splits = f16_splits(call, tile);
     float* partial = nullptr;
     if (splits > 1) {
@@ -707,6 +770,10 @@ inline bool f16_dispatch_hi(const F16Call& call, int tile, cudaStream_t stream)
         return f16_run<Tile4, Elem>(call, stream);
     case 5:
         return f16_run<Tile5, Elem>(call, stream);
+    case 6:
+        return f16_run<Tile6, Elem>(call, stream);
+    case 7:
+        return f16_run<Tile7, Elem>(call, stream);
     default:
         return false;
     }

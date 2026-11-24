@@ -17,11 +17,14 @@
 ///
 /// Only compiled under NNOPS_HAS_CUDA.
 
+#include "detail/bench_knobs.hpp"
 #include "nnops/ops/linear.hpp"
 #include "common/bench_harness.hpp"
 #include "common/cuda_test_helper.hpp"
 #include "common/cuda_bench_helper.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -41,6 +44,27 @@ std::string linear_geometry(const std::vector<int64_t>& x_shape, int64_t n)
     }
     s += " -> " + std::to_string(n);
     return s;
+}
+
+/// One event-timed launch, for the interleaved A/B below (the shared
+/// `cuda_median_ms` runs one arm to completion, which is what the drift between
+/// two processes makes incomparable).
+template <typename F> double timed_launch(F&& launch, cudaEvent_t begin, cudaEvent_t end)
+{
+    NNOPS_CUDA_CHECK(cudaEventRecord(begin));
+    launch();
+    NNOPS_CUDA_CHECK(cudaEventRecord(end));
+    NNOPS_CUDA_CHECK(cudaEventSynchronize(end));
+    float elapsed = 0.0f;
+    NNOPS_CUDA_CHECK(cudaEventElapsedTime(&elapsed, begin, end));
+    return double(elapsed);
+}
+
+double median_of(std::vector<double> ms)
+{
+    const size_t mid = ms.size() / 2;
+    std::nth_element(ms.begin(), ms.begin() + std::ptrdiff_t(mid), ms.end());
+    return ms[mid];
 }
 
 /// One Linear call, timed with events. Returns GFLOPS.
@@ -139,6 +163,77 @@ NNOPS_BENCH(cuda_linear_writeback) {
         std::printf("  %s: bias %.1f%%, bias+relu+add_to %.1f%% of the plain product\n",
                     tag, 100.0 * (plain - with_bias) / plain,
                     100.0 * (plain - residual) / plain);
+    }
+}
+
+/// The small Linear shapes whose split choice changed: their tiled grid is
+/// under twenty blocks, so the starved rule now cuts the reduction. The cut and
+/// the uncut product are interleaved, because the planes can cost more than the
+/// extra blocks buy at these sizes.
+NNOPS_BENCH(cuda_linear_split_ab) {
+    print_cuda_header("CUDA Linear f16 small shapes: split-K A/B");
+    struct Shape {
+        std::vector<int64_t> x;
+        int64_t n;
+    };
+    const Shape shapes[] = {{{1, 1024}, 1024},  {{16, 1024}, 1024}, {{128, 1024}, 1024},
+                            {{16, 4096}, 4096}, {{2048, 1024}, 1024}};
+    auto& knob = nnops::detail::cuda_splitk;
+
+    for (const Shape& s : shapes) {
+        const int64_t k = s.x.back();
+        int64_t m = 1;
+        for (size_t i = 0; i + 1 < s.x.size(); ++i) { m *= s.x[i]; }
+        HostTensor hx = make_host_random(s.x, DataType::f16, false, 11, -0.5f, 0.5f);
+        HostTensor hw = make_host_random(std::vector<int64_t>{s.n, k}, DataType::f16, false, 13,
+                                         -0.25f, 0.25f);
+        std::vector<int64_t> out_shape = s.x;
+        out_shape.back() = s.n;
+        HostTensor hc = make_host_zeroed(out_shape, DataType::f16, false);
+        DeviceTensor dx = to_device(hx);
+        DeviceTensor dw = to_device(hw);
+        DeviceTensor dc = to_device(hc);
+        LinearAttributes attrs;
+        auto op = Linear::create(attrs, Backend::CUDA);
+        std::vector<TensorView> ins = {dx.view, dw.view};
+        TensorView out = dc.view;
+        auto launch = [&] { cuda_launch(*op, out, ins); };
+
+        cudaEvent_t begin = nullptr, end = nullptr;
+        NNOPS_CUDA_CHECK(cudaEventCreate(&begin));
+        NNOPS_CUDA_CHECK(cudaEventCreate(&end));
+        for (int v : {-1, 0}) {
+            knob.store(v, std::memory_order_relaxed);
+            launch();
+        }
+        CudaBuffer::sync();
+
+        std::vector<double> ms_auto;
+        std::vector<double> ms_off;
+        for (int round = 0; round < 12; ++round) {
+            if (round % 2 == 0) {
+                knob.store(-1, std::memory_order_relaxed);
+                ms_auto.push_back(timed_launch(launch, begin, end));
+                knob.store(0, std::memory_order_relaxed);
+                ms_off.push_back(timed_launch(launch, begin, end));
+            } else {
+                knob.store(0, std::memory_order_relaxed);
+                ms_off.push_back(timed_launch(launch, begin, end));
+                knob.store(-1, std::memory_order_relaxed);
+                ms_auto.push_back(timed_launch(launch, begin, end));
+            }
+        }
+        knob.store(-1, std::memory_order_relaxed);
+        NNOPS_CUDA_CHECK(cudaEventDestroy(begin));
+        NNOPS_CUDA_CHECK(cudaEventDestroy(end));
+
+        const double flops = 2.0 * double(m) * double(s.n) * double(k);
+        const std::string geo = linear_geometry(s.x, s.n);
+        const double am = median_of(ms_auto);
+        const double om = median_of(ms_off);
+        print_cuda_row("f16 auto", geo, am, cuda_gflops(am, flops));
+        print_cuda_row("f16 split off", geo, om, cuda_gflops(om, flops));
+        std::printf("    ratio auto/off %.3f\n", am / om);
     }
 }
 

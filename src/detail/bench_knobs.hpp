@@ -24,6 +24,17 @@ inline std::atomic<int> pooling_3x3_roll{0};
 /// the same rules as the auto choice).
 inline std::atomic<int> cuda_splitk{-1};
 
+/// CUDA f16 narrow-m preference: -1 automatic, 0 keeps the tiled engine first,
+/// 1 hands a product of at most sixteen rows (A row-major, B `[k][n]`) to the
+/// FFMA streaming loop before the tiled engine is tried. The automatic rule
+/// does that only when the tiled grid would leave the machine part empty.
+inline std::atomic<int> cuda_narrow_m{-1};
+
+/// CUDA narrow-m loop variant: 0 is the production pick (f16 keeps 32 B rows in
+/// flight, f32 16), 1 the 4-column / 16-row group, 2 the 2-column / 16-row one,
+/// 3 the 2-column / 32-row one. A bench compares them.
+inline std::atomic<int> cuda_narrow_var{0};
+
 /// CUDA Conv2D's 1x1 route: -1 automatic, 0 keep the implicit-GEMM conv kernel,
 /// 1 hand the unit-stride 1x1 to the dense GEMM.
 inline std::atomic<int> cuda_conv_pw{-1};

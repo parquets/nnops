@@ -16,6 +16,23 @@ bool f16_tile_half_lo(const F16Call& call, int tile, cudaStream_t stream)
     return f16_dispatch_lo<__half>(call, tile, stream);
 }
 
+int f16_auto_tile_blocks(int64_t m, int64_t n)
+{
+    const TileDesc& t = kTileTable[kF16TileAuto];
+    const int64_t bm = (m + t.bm - 1) / t.bm;
+    const int64_t bn = (n + t.bn - 1) / t.bn;
+    return int(bm * bn);
+}
+
+int f16_auto_tile_slots()
+{
+    const int sm = f16_sm_count();
+    const int residents = kTileTable[kF16TileAuto].min_blocks > 0 ?
+                              kTileTable[kF16TileAuto].min_blocks :
+                              1;
+    return sm > 0 ? sm * residents : 0;
+}
+
 bool f16_dense_call(const F16Call& call_in, cudaStream_t stream, bool force)
 {
     // A transposed is supported: the panel keeps the `[k][m]` arrival order and
@@ -40,13 +57,14 @@ bool f16_dense_call(const F16Call& call_in, cudaStream_t stream, bool force)
     // below.
     const bool named = call.tile >= 0 && call.tile < kTileCount;
     const bool forced = named || force;
-    // The shallow 32x32 row, in both B poses. The rest of the table was ranked
-    // on square products with a deep reduction, and on the shapes an operator
-    // actually poses it loses from 512^3 down -- 512^3 4.2 against 12.6, 1024^3
-    // 17.2 against 24.6 -- and by 3.5x on a short-K n-major product
-    // (50176x256x256: 5.7 against 20.1 TFLOPS). Only 4096^3 with B k-major puts
-    // another row first, by 1.2%, which is inside this host's run-to-run spread.
-    const int tile = named ? call.tile : kF16TileShallow;
+    // The shallow 32x32 row with the strip raster, in both B poses. The rest of
+    // the table was ranked on square products with a deep reduction, and on the
+    // shapes an operator actually poses it loses from 512^3 down -- 512^3 4.2
+    // against 12.6, 1024^3 17.2 against 24.6 -- and by 3.5x on a short-K n-major
+    // product (50176x256x256: 5.7 against 20.1 TFLOPS). Only 4096^3 with B
+    // k-major puts another row first, by 1.2%, which is inside this host's
+    // run-to-run spread.
+    const int tile = named ? call.tile : kF16TileAuto;
     if (!forced && !f16_grid_fills(call, kTileTable[tile])) {
         return false;
     }

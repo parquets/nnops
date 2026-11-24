@@ -67,7 +67,7 @@ namespace nnops::backend::cuda {
 /// compile-time constant, so a tile costs nothing at run time and the search is
 /// a switch.
 template <int WarpM_, int WarpN_, int WarpsM_, int WarpsN_, int BK_, int ST_, int Swz_ = 1,
-          bool StagedEpi_ = true, int MinBlocks_ = 1>
+          bool StagedEpi_ = true, int MinBlocks_ = 1, int Raster_ = 0>
 struct F16TileShape {
     static constexpr int WM = WarpM_;  ///< rows per warp (16-row atoms)
     static constexpr int WN = WarpN_;  ///< columns per warp (8-col atoms)
@@ -76,6 +76,10 @@ struct F16TileShape {
     static constexpr int wm = WarpsM_; ///< warps along m
     static constexpr int wn = WarpsN_; ///< warps along n
     static constexpr int threads = wm * wn * 32;
+    /// L2 rasterization strip: the CTAs of one strip walk n before m, so the
+    /// strip's B panels are the ones still in the cache. 0 keeps the plain
+    /// (m, n) order. The f32 engine's tile knob, ported.
+    static constexpr int Raster = Raster_;
     static constexpr int BM = WM * wm; ///< rows per CTA
     static constexpr int BN = WN * wn; ///< columns per CTA
     static constexpr int BK = BK_;     ///< reduction depth per stage

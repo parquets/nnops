@@ -66,4 +66,10 @@ bool f16_tile_bf16(const F16Call& call, int tile, cudaStream_t stream);
 /// at whatever rate it gets.
 bool f16_dense_call(const F16Call& call, cudaStream_t stream, bool force = false);
 
+/// The automatic tile's grid for an (m, n) product and the resident slots it is
+/// measured against. The narrow-m gate reads the pair to decide whether the
+/// tiled engine would leave the machine part empty.
+int f16_auto_tile_blocks(int64_t m, int64_t n);
+int f16_auto_tile_slots();
+
 } // namespace nnops::backend::cuda
