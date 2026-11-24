@@ -517,6 +517,82 @@ NNOPS_BENCH(cuda_conv2d_pointwise) {
     }
 }
 
+/// The 3x3 halo route against the tap-by-tap gather, interleaved per repetition
+/// (the arms are the same call with `detail::cuda_conv_direct` flipped). The
+/// last two rows are shapes the halo gate declines, so their ratio is the noise
+/// floor of the comparison rather than a result.
+NNOPS_BENCH(cuda_conv2d_direct_ab) {
+    print_cuda_header("CUDA Conv2D 3x3 f16: the staged band and the 16-warp tile");
+    struct C3 { int64_t side, ic, oc; };
+    // The wide planes the band's gate takes -- 64x64 is its smallest (one block
+    // an SM), 224x224 its edge (the output row is not a whole number of 64-pixel
+    // blocks). The declined shapes read the same kernel twice, which is the
+    // comparison's noise floor.
+    const C3 cases[] = {{512, 64, 64},  {448, 64, 64},   {512, 64, 128},
+                        {224, 64, 64}, {64, 64, 64},    {56, 64, 64},
+                        {112, 256, 256}, {28, 128, 128}};
+    auto& direct = nnops::detail::cuda_conv_direct;
+    auto& tile = nnops::detail::cuda_conv_tile;
+    // 0 production, 1 the 16x16 warp tile, 2 the staged band.
+    auto set_arm = [&](int a) {
+        direct.store(a == 2 ? 1 : 0, std::memory_order_relaxed);
+        tile.store(a == 1 ? 1 : 0, std::memory_order_relaxed);
+    };
+    const int kArms = 3;
+
+    for (const C3& s : cases) {
+        ConvBenchCase c;
+        c.dtype = DataType::f16;
+        c.ic = s.ic; c.oc = s.oc;
+        c.ih = c.iw = s.side;
+        double best[kArms] = {0.0, 0.0, 0.0};
+        for (int rep = 0; rep < 4; ++rep) {
+            for (int arm = 0; arm < kArms; ++arm) {
+                const int a = (rep & 1) ? kArms - 1 - arm : arm;
+                set_arm(a);
+                best[a] = std::max(best[a], run_conv(c, "f16", false, 8));
+            }
+        }
+        direct.store(-1, std::memory_order_relaxed);
+        tile.store(0, std::memory_order_relaxed);
+        std::printf("  %-42s gather %8.0f w16 %8.0f band %8.0f GFLOPS  | %5.3f %5.3f\n",
+                    conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[2],
+                    best[1] / best[0], best[2] / best[0]);
+    }
+}
+
+/// The 1x1 route's filter pose, priced end to end: the transposed copy is inside
+/// the timed call, so a row is the product plus the copy it buys. Both arms are
+/// the dense-GEMM route (`cuda_conv_pw` forced), so the conv kernel is out of
+/// the comparison; the last row's IC is outside the short-K window and should
+/// read as a tie.
+NNOPS_BENCH(cuda_conv2d_pw_pose) {
+    print_cuda_header("CUDA Conv2D 1x1 f16: HWIO filter (n-major B) vs a transposed copy (k-major B)");
+    struct Pw { int64_t side, ic, oc; };
+    const Pw cases[] = {{224, 256, 256}, {224, 128, 128}, {448, 256, 256}, {112, 512, 512}};
+    auto& pose = nnops::detail::cuda_conv_pw_pose;
+    nnops::detail::cuda_conv_pw.store(1, std::memory_order_relaxed);
+    for (const Pw& w : cases) {
+        ConvBenchCase c;
+        c.dtype = DataType::f16;
+        c.ic = w.ic; c.oc = w.oc;
+        c.ih = c.iw = w.side;
+        c.kh = c.kw = 1; c.ph = c.pw = 0;
+        double best[2] = {0.0, 0.0};
+        for (int rep = 0; rep < 4; ++rep) {
+            for (int arm = 0; arm < 2; ++arm) {
+                const int a = (rep & 1) ? 1 - arm : arm;
+                pose.store(a, std::memory_order_relaxed);
+                best[a] = std::max(best[a], run_conv(c, "f16", false, 8));
+            }
+        }
+        pose.store(-1, std::memory_order_relaxed);
+        std::printf("  %-40s hwio %8.0f  tp %8.0f GFLOPS  | %.3fx\n",
+                    conv_geometry(c, "nhwc").c_str(), best[0], best[1], best[1] / best[0]);
+    }
+    nnops::detail::cuda_conv_pw.store(-1, std::memory_order_relaxed);
+}
+
 NNOPS_BENCH(cuda_conv2d_f16) {
     print_cuda_header("CUDA Conv2D f16 (tensor core)");
     run_table(DataType::f16, "f16");

@@ -232,6 +232,17 @@ NNOPS_TEST(cuda_conv2d_wide_planes) {
         // the CPU oracle is what proves the span is the right bound.
         {1, 32, 32, 320, 3, 1, 1, DataType::f16},
         {1, 16, 32, 512, 3, 2, 1, DataType::f32},
+        // The halo-staged 3x3 route: a 64-channel group and an output row that
+        // is a whole number of 64-pixel blocks, which is its shape gate. The
+        // four rows are the gate's edges -- one block a row, several, more than
+        // one n tile, and a grouped layer whose slice is still 64 wide.
+        {1, 64, 64, 64, 3, 1, 1, DataType::f16},
+        {1, 64, 64, 128, 3, 1, 1, DataType::f16},
+        {1, 64, 128, 192, 3, 1, 1, DataType::f16},
+        {1, 128, 64, 128, 3, 1, 2, DataType::f16},
+        // The 1x1 route on its dense-GEMM pose: past the gate (m = 16384) and in
+        // the short-K window, so the filter takes the transposed copy.
+        {1, 256, 256, 128, 1, 1, 1, DataType::f16},
     };
     for (const Wide& w : cases) {
         ConvCase c;

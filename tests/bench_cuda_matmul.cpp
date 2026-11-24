@@ -899,7 +899,7 @@ NNOPS_BENCH(cuda_matmul_simt_tiles) {
         }
 
         const double flops = 2.0 * double(side) * double(side) * double(side);
-        for (int t = 0; t < 9; ++t) {
+        for (int t = 0; t < 8; ++t) {
             nnops::backend::cuda::F32Call call;
             call.a = da.view.ptr<void>();
             call.b = db.view.ptr<void>();
@@ -940,7 +940,7 @@ NNOPS_BENCH(cuda_matmul_simt_tiles) {
         DeviceTensor db = to_device(hb);
         DeviceTensor dc = to_device(hc);
         const double flops = 2.0 * double(side) * double(side) * double(side);
-        for (int t = 0; t < 9; ++t) {
+        for (int t = 0; t < 8; ++t) {
             nnops::backend::cuda::F32Call call;
             call.a = da.view.ptr<void>();
             call.b = db.view.ptr<void>();
@@ -960,6 +960,124 @@ NNOPS_BENCH(cuda_matmul_simt_tiles) {
                            matmul_geometry(side, side, side, false, false), ms,
                            cuda_gflops(ms, flops));
         }
+    }
+}
+
+/// The short-K product a 1x1 convolution poses: the pixel axis as M, the
+/// channels as K, and the HWIO filter's rows as B. K is eight k tiles or fewer
+/// here, so the ring's prologue and everything else a block pays once are a
+/// visible share of it, and the tile ranking is not the square products'. The
+/// menu is swept in place and order-reversed per repetition, so a row's best is
+/// not the last arm measured.
+NNOPS_BENCH(cuda_matmul_shortk) {
+    print_cuda_header("CUDA MatMul f16 short-K (the 1x1-conv pose) over the tile menu");
+    struct Sk { int64_t m, n, k; bool trans_b; };
+    const Sk shapes[] = {
+        {50176, 256, 256, false},  // 224x224x256 k1
+        {50176, 256, 64, false},   // 224x224x64 k1
+        {12544, 256, 256, false},  // 112x112x256 k1
+        {200704, 128, 128, false}, // 448x448x128 k1
+        {50176, 256, 256, true},   // the same product with Linear's [N, K] weight
+        // The same plane at a deeper reduction: where the short-K rows' rate
+        // ends up once the ring has something to hide behind.
+        {50176, 256, 512, false}, {50176, 256, 1024, false}, {50176, 256, 2048, false},
+    };
+    constexpr int kTiles = 8;
+    for (const Sk& s : shapes) {
+        HostTensor ha = make_host_random(std::vector<int64_t>{s.m, s.k}, DataType::f16, false, 17,
+                                         -0.5f, 0.5f);
+        HostTensor hb = make_host_random(
+            s.trans_b ? std::vector<int64_t>{s.n, s.k} : std::vector<int64_t>{s.k, s.n},
+            DataType::f16, false, 29, -0.25f, 0.25f);
+        HostTensor hc = make_host_zeroed(std::vector<int64_t>{s.m, s.n}, DataType::f16, false);
+        DeviceTensor da = to_device(ha);
+        DeviceTensor db = to_device(hb);
+        DeviceTensor dc = to_device(hc);
+
+        nnops::backend::cuda::F16Call call;
+        call.a = da.view.ptr<void>();
+        call.b = db.view.ptr<void>();
+        call.c = dc.view.ptr<void>();
+        call.m = int(s.m);
+        call.n = int(s.n);
+        call.k = int(s.k);
+        call.lda = s.k;
+        call.ldb = s.trans_b ? s.k : s.n;
+        call.ldc = s.n;
+        call.trans_b = s.trans_b;
+
+        const double flops = 2.0 * double(s.m) * double(s.n) * double(s.k);
+        double best[kTiles] = {};
+        for (int rep = 0; rep < 2; ++rep) {
+            for (int i = 0; i < kTiles; ++i) {
+                const int t = (rep & 1) ? kTiles - 1 - i : i;
+                call.tile = t;
+                const double ms = cuda_median_ms(
+                    [&] { nnops::backend::cuda::f16_dense_call(call, nullptr); });
+                best[t] = std::max(best[t], cuda_gflops(ms, flops));
+            }
+        }
+        int top = 0;
+        for (int t = 1; t < kTiles; ++t) {
+            if (best[t] > best[top]) { top = t; }
+        }
+        std::printf("  %-24s %s  K=%3lld  t0 %5.0f t1 %5.0f t2 %5.0f t3 %5.0f"
+                    " t4 %5.0f t5 %5.0f t6 %5.0f t7 %5.0f | best t%d\n",
+                    matmul_geometry(s.m, s.n, s.k, false, s.trans_b).c_str(),
+                    s.trans_b ? "tb" : "nn", (long long)s.k, best[0], best[1], best[2], best[3],
+                    best[4], best[5], best[6], best[7], top);
+    }
+}
+
+/// The two B poses on the same product, interleaved: the 1x1-conv pose is
+/// `[pixels][ic] x [ic][oc]` (n-major B, the filter as it sits in HWIO), and the
+/// same product with the filter transposed is the tb pose. If the pose is worth
+/// anything here, the 1x1 route can prepack the filter once and take it.
+NNOPS_BENCH(cuda_matmul_shortk_pose) {
+    print_cuda_header("CUDA MatMul f16 short-K: the two B poses, interleaved");
+    struct Sk { int64_t m, n, k; };
+    const Sk shapes[] = {{50176, 256, 256}, {50176, 256, 64},  {12544, 256, 256},
+                         {200704, 128, 128}, {50176, 256, 512}, {50176, 256, 1024},
+                         {50176, 512, 512}};
+    for (const Sk& s : shapes) {
+        HostTensor ha = make_host_random(std::vector<int64_t>{s.m, s.k}, DataType::f16, false, 17,
+                                         -0.5f, 0.5f);
+        HostTensor hbn = make_host_random(std::vector<int64_t>{s.k, s.n}, DataType::f16, false, 29,
+                                          -0.25f, 0.25f);
+        HostTensor hbt = make_host_random(std::vector<int64_t>{s.n, s.k}, DataType::f16, false, 29,
+                                          -0.25f, 0.25f);
+        HostTensor hc = make_host_zeroed(std::vector<int64_t>{s.m, s.n}, DataType::f16, false);
+        DeviceTensor da = to_device(ha);
+        DeviceTensor dbn = to_device(hbn);
+        DeviceTensor dbt = to_device(hbt);
+        DeviceTensor dc = to_device(hc);
+
+        nnops::backend::cuda::F16Call base;
+        base.a = da.view.ptr<void>();
+        base.c = dc.view.ptr<void>();
+        base.m = int(s.m);
+        base.n = int(s.n);
+        base.k = int(s.k);
+        base.lda = s.k;
+        base.ldc = s.n;
+        base.tile = 7;
+        const double flops = 2.0 * double(s.m) * double(s.n) * double(s.k);
+        double best[2] = {0.0, 0.0};
+        for (int rep = 0; rep < 4; ++rep) {
+            for (int arm = 0; arm < 2; ++arm) {
+                const int a = (rep & 1) ? 1 - arm : arm;
+                nnops::backend::cuda::F16Call call = base;
+                call.b = a == 0 ? dbn.view.ptr<void>() : dbt.view.ptr<void>();
+                call.trans_b = a != 0;
+                call.ldb = a == 0 ? s.n : s.k;
+                const double ms = cuda_median_ms(
+                    [&] { nnops::backend::cuda::f16_dense_call(call, nullptr); });
+                best[a] = std::max(best[a], cuda_gflops(ms, flops));
+            }
+        }
+        std::printf("  %-24s K=%4lld  nn %7.0f  tb %7.0f GFLOPS  | %.3fx\n",
+                    matmul_geometry(s.m, s.n, s.k, false, false).c_str(), (long long)s.k,
+                    best[0], best[1], best[1] / best[0]);
     }
 }
 

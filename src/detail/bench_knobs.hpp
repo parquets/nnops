@@ -39,6 +39,22 @@ inline std::atomic<int> cuda_narrow_var{0};
 /// 1 hand the unit-stride 1x1 to the dense GEMM.
 inline std::atomic<int> cuda_conv_pw{-1};
 
+/// CUDA Conv2D's 3x3 route: -1 automatic (the band-staged kernel wherever its
+/// shape gate holds), 0 keep the tap-by-tap gather, 1 force the staged band
+/// (and fall back to the gather when the gate declines).
+inline std::atomic<int> cuda_conv_direct{-1};
+
+/// CUDA Conv2D's 1x1 filter pose, on the dense-GEMM route: -1 automatic (the
+/// transposed copy where the short-K window holds), 0 keep the HWIO filter as
+/// the engine's n-major B, 1 force the transposed pose.
+inline std::atomic<int> cuda_conv_pw_pose{-1};
+
+/// CUDA Conv2D f16 warp tile: 0 is the production 32x16 tile (eight warps, three
+/// blocks a SM), 1 the 16x16 one (sixteen warps, two blocks) — the same CTA of
+/// output split over twice the warps, which halves the registers an accumulator
+/// fragment costs.
+inline std::atomic<int> cuda_conv_tile{0};
+
 /// CPU int8: 1 hides NEON i8mm (SMMLA) so the SDOT route is taken. The feature
 /// scan runs once, so set this before the first CpuFeatures::get().
 inline std::atomic<int> disable_i8mm{0};

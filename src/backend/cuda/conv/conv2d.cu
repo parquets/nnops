@@ -227,6 +227,14 @@ using ConvShapeH = F16TileShape<32, 16, 2, 4, 64, 2, 1, false, 3>;
 /// (see `kConvDeepKTiles`): 32x32 per warp, two stages, the same 64x64 of output.
 using ConvShapeHDeep = F16TileShape<32, 32, 2, 2, 64, 2, 1, false, 1>;
 
+/// The same 64x64 of output split sixteen ways instead of eight. The eight-warp
+/// tile is register-capped at three blocks (80 registers a thread), so 24 warps
+/// is the ceiling; a 16x16 warp tile halves the accumulator fragment and the
+/// blocks that fit become two of sixteen warps, which is 32. It is the search's
+/// arm for the wide planes, where nothing saturates (see the direct kernel's
+/// note): neither engine's pipe is above half.
+using ConvShapeH16 = F16TileShape<16, 16, 4, 4, 64, 2, 1, false, 2>;
+
 /// The gather's (row, col, stage) indexer over the k-major swizzled panel.
 template <class S, class Elem> using ConvHPanel = conv::KMajorPanel<S, Elem>;
 
@@ -356,6 +364,261 @@ void conv_gemm_h_kernel(ConvParams p)
     }
 
     // C: lane l holds (m = l/4, n = 2*(l%4)), plus the +1 column and the +8 row.
+    const int cm = lane / 4;
+    const int cn = 2 * (lane % 4);
+#pragma unroll
+    for (int i = 0; i < S::MA; ++i) {
+        const int gm = m0 + warp_m * S::WM + i * 16 + cm;
+#pragma unroll
+        for (int j = 0; j < S::NA; ++j) {
+            const int gn = n0 + warp_n * S::WN + j * 8 + cn;
+#pragma unroll
+            for (int rr = 0; rr < 2; ++rr) {
+                const int m = gm + rr * 8;
+                if (m >= M) {
+                    continue;
+                }
+                const int64_t row_base = conv_pixel_base(p, out_base, m);
+#pragma unroll
+                for (int cc = 0; cc < 2; ++cc) {
+                    const int n = gn + cc;
+                    if (n >= N) {
+                        continue;
+                    }
+                    float v = acc[i][j][rr * 2 + cc];
+                    if (part != nullptr) {
+                        part[int64_t(m) * N + n] = v;
+                        continue;
+                    }
+                    if (bias != nullptr) {
+                        v += float(bias[n]);
+                    }
+                    v = fminf(fmaxf(v, p.min_clip), p.max_clip);
+                    v = conv_activate<Epi>(p, v);
+                    conv_row_store<Elem>(p, row_base, n, v);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// f16 tensor-core kernel, band-staged 3x3
+// ============================================================
+
+/// The eight-warp tile again: the band route keeps the gather's CTA shape and
+/// its three-blocks-a-SM residency.
+using ConvShapeHDirect = F16TileShape<32, 16, 2, 4, 64, 2, 1, false, 3>;
+
+/// The band a block stages: one input row of BM + KW - 1 pixels over a whole
+/// channel group. The three taps of one kh read it, so a 3x3 walks three bands
+/// in kh order through one 8 KB slot -- 25 KB of gathers between them.
+template <class S> constexpr int conv_band_rows()
+{
+    return S::BM + 2;
+}
+
+template <class S, class Elem> constexpr int conv_direct_smem_bytes()
+{
+    return (conv_band_rows<S>() * S::BK + S::stages * S::kBMax) * int(sizeof(Elem));
+}
+
+/// `f16_gemm_tile` with the A rows taken from an offset: the band holds one
+/// input row, and a k tile's tap selects the BM-pixel window kw pixels into it.
+template <class S, class Elem>
+__device__ __forceinline__ void conv_tile_halo(const Elem* sA, int a_row, const Elem* sB, int warp_m,
+                                               int warp_n, int lane, float (&acc)[S::MA][S::NA][4])
+{
+    constexpr int MA = S::MA, NA = S::NA;
+    uint32_t frA[MA][4];
+    uint32_t frB[NA][2];
+    const int ld_row = lane % 16;
+    const int ld_col = (lane / 16) * 8;
+#pragma unroll
+    for (int ks = 0; ks < S::kKSteps; ++ks) {
+        const int kcol = ks * 16;
+#pragma unroll
+        for (int i = 0; i < MA; ++i) {
+            const Elem* src =
+                &sA[f16_swz<S>(a_row + warp_m * S::WM + i * 16 + ld_row, kcol + ld_col)];
+            ldmatrix_x4(&frA[i][0], &frA[i][1], &frA[i][2], &frA[i][3], src);
+        }
+#pragma unroll
+        for (int j = 0; j < NA; j += 2) {
+            const Elem* src = &sB[f16_swz_n<S>(kcol + ld_row, warp_n * S::WN + j * 8 + ld_col)];
+            uint32_t r0, r1, r2, r3;
+            ldmatrix_x4_trans(&r0, &r1, &r2, &r3, src);
+            frB[j][0] = r0;
+            frB[j][1] = r1;
+            frB[j + 1][0] = r2;
+            frB[j + 1][1] = r3;
+        }
+#pragma unroll
+        for (int i = 0; i < MA; ++i) {
+#pragma unroll
+            for (int j = 0; j < NA; ++j) {
+                f16_mma<Elem>(acc[i][j], frA[i], frB[j]);
+            }
+        }
+    }
+}
+
+/// The 3x3 gather, replaced by a staged window.
+///
+/// The gather reads a 3x3 tap's activation nine times: a block gathers 64
+/// pixels × 576 k per pass, and nine passes re-read the same three input rows.
+/// ncu puts the wide f16 planes at 68% of the L2 pipe with 11% of DRAM and a
+/// 95% hit rate, so the repetition is L2 traffic, not bandwidth. A block whose
+/// pixels are one output row can stage what the nine taps of one kh read -- one
+/// input row of BM+2 pixels, 8 KB against the 25 KB the three gathers move --
+/// and let the taps window into it: 2.9x less L2 traffic for A.
+///
+/// Staging all three input rows at once costs 41 KB a block, which is two
+/// blocks an SM instead of three, and the 16 warps it leaves gave the traffic
+/// cut back (measured 0.99x). One band at a time is 8 KB, so the ring still
+/// fits three blocks and the block keeps its 24 warps; a band switch costs one
+/// extra barrier, three a block. The B panel, the split-K cut and the epilogue
+/// are the gather kernel's.
+template <class Elem, class S, int Epi>
+__global__ __launch_bounds__(S::threads, S::MinBlocks)
+void conv_gemm_h_direct_kernel(ConvParams p)
+{
+    constexpr int BM = S::BM;
+    constexpr int BN = S::BN;
+    constexpr int BK = S::BK;
+    constexpr int ST = S::stages;
+    constexpr int HW = conv_band_rows<S>(); ///< band width in pixels
+    constexpr int kBand = HW * BK;          ///< halves per band slot
+    constexpr int kBStage = S::kBMax;
+    constexpr int kVPerRow = BK / 8; ///< one 16 B vector per eight channels
+
+    extern __shared__ __align__(16) unsigned char conv_smem[];
+    Elem* const sHalo = reinterpret_cast<Elem*>(conv_smem);
+    Elem* const sBbase = sHalo + kBand;
+
+    const int M = p.oh * p.ow;
+    const int N = p.ocg;
+    const int K = p.icg * p.kh * p.kw;
+    const int m0 = int(blockIdx.x) * BM;
+    const int n0 = int(blockIdx.y) * BN;
+    const int tid = int(threadIdx.x);
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int warp_m = warp / S::wn;
+    const int warp_n = warp - warp_m * S::wn;
+
+    const ConvBlock blk = conv_block(p);
+    const int zb = blk.zb;
+    const int g = blk.g;
+
+    const int64_t in_base = int64_t(zb) * p.in_batch + int64_t(g) * p.icg * p.in_c;
+    const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c;
+
+    Elem const* W = static_cast<Elem const*>(p.weight) + int64_t(g) * p.ocg * p.w_n;
+    Elem const* in = static_cast<Elem const*>(p.input) + in_base;
+
+    // The host gate keeps ow a multiple of BM, so the block's pixels are one
+    // output row and the window's origin is one subtraction from it.
+    const int oh = m0 / p.ow;
+    const int ow0 = m0 - oh * p.ow;
+    const int inh = int(p.in_h), inw = int(p.in_w);
+    const int ih0 = oh - p.ph;  // sh == 1
+    const int iw0 = ow0 - p.pw; // sw == 1
+    // One input row of the window, written over the band the last kh used: the
+    // tile's own barrier retires those reads first, so one slot is enough.
+    auto stage_band = [&](int kh) {
+        Elem* const dst = sHalo;
+        const int ih = ih0 + kh;
+        const bool row_ok = unsigned(ih) < unsigned(p.ih);
+        Elem const* src = in + ih * inh;
+        for (int i = tid; i < HW * kVPerRow; i += S::threads) {
+            const int row = i / kVPerRow;
+            const int kg = i - row * kVPerRow;
+            const int iw = iw0 + row;
+            uint4 v = {};
+            if (row_ok && unsigned(iw) < unsigned(p.iw)) {
+                v = *reinterpret_cast<const uint4*>(src + iw * inw + kg * 8);
+            }
+            *reinterpret_cast<uint4*>(&dst[f16_swz<S>(row, kg * 8)]) = v;
+        }
+    };
+
+    int kt_begin = 0, kt_count = 0;
+    conv_split_range(K, BK, p.k_splits, blk.split, kt_begin, kt_count);
+    const int kt_end = kt_begin + kt_count;
+
+    const bool n_full = (n0 + BN <= N);
+    constexpr int kNVec = BN / 8;
+
+    auto fill = [&](int kt, int stage) {
+        if (kt >= kt_end) {
+            cp_async_commit_group();
+            return;
+        }
+        const int k0 = kt * BK;
+        Elem* const sB = sBbase + stage * kBStage;
+        if (p.weight_vec && n_full && k0 + BK <= K) {
+            for (int i = tid; i < BK * kNVec; i += S::threads) {
+                const int kr = i / kNVec;
+                const int nv = i - kr * kNVec;
+                cp_async_ca_16B(&sB[f16_swz_n<S>(kr, nv * 8)],
+                                W + int64_t(n0 + nv * 8) * p.w_n + int64_t(k0 + kr) * p.w_ic);
+            }
+        } else {
+            for (int i = tid; i < BN * BK; i += S::threads) {
+                const int row = i / BK;
+                const int col = i - row * BK;
+                const int n = n0 + row;
+                const int k = k0 + col;
+                sB[f16_swz_n<S>(col, row)] =
+                    (n < N && k < K) ? conv_weight<Elem>(p, W, n, k) : gemm_zero<Elem>();
+            }
+        }
+        cp_async_commit_group();
+    };
+
+    float acc[S::MA][S::NA][4];
+#pragma unroll
+    for (int i = 0; i < S::MA; ++i)
+#pragma unroll
+        for (int j = 0; j < S::NA; ++j)
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                acc[i][j][t] = 0.0f;
+            }
+
+#pragma unroll
+    for (int t = 0; t < ST - 1; ++t) {
+        fill(kt_begin + t, (kt_begin + t) % ST);
+    }
+    int band = -1;
+    for (int kt = kt_begin; kt < kt_end; ++kt) {
+        const int stage = kt % ST;
+        // BK == IC/G, so a k tile is one tap and its k-tile index is the tap.
+        const int kh = kt / p.kw;
+        const int kw = kt - kh * p.kw;
+        cp_async_wait_group<ST - 2>();
+        __syncthreads();
+        // A band switch stages the next input row and publishes it with one more
+        // barrier, three a block: the tiles in between keep the ring's single
+        // barrier.
+        if (kh != band) {
+            stage_band(kh);
+            __syncthreads();
+            band = kh;
+        }
+        fill(kt + ST - 1, (kt + ST - 1) % ST);
+        conv_tile_halo<S, Elem>(sHalo, kw, sBbase + stage * kBStage, warp_m, warp_n, lane, acc);
+    }
+
+    Elem const* bias =
+        p.bias != nullptr ? static_cast<Elem const*>(p.bias) + int64_t(g) * p.ocg : nullptr;
+
+    float* part = nullptr;
+    if (p.k_splits > 1) {
+        part = p.partial + int64_t(blockIdx.z) * int64_t(M) * N;
+    }
+
     const int cm = lane / 4;
     const int cn = 2 * (lane % 4);
 #pragma unroll
@@ -669,8 +932,69 @@ inline bool conv_wants_deep(const ConvParams& p)
     return conv_k_depth(p) >= kConvDeepK;
 }
 
+/// The band route's shape: a 3x3 unit-stride window, one channel group per k
+/// tile, the 16 B activation the staging copies, and a block's pixels inside a
+/// single output row.
+inline bool conv_direct_applies(const ConvParams& p)
+{
+    return p.kh == 3 && p.kw == 3 && p.sh == 1 && p.sw == 1 && p.dh == 1 && p.dw == 1 &&
+           p.icg == ConvShapeHDirect::BK && p.fill_vec && p.ow % ConvShapeHDirect::BM == 0;
+}
+
+template <class Elem, class S, int Epi>
+inline void launch_conv_h_direct_as(ConvParams& p, cudaStream_t stream)
+{
+    constexpr int smem = conv_direct_smem_bytes<S, Elem>();
+    auto kernel = conv_gemm_h_direct_kernel<Elem, S, Epi>;
+    static const cudaError_t cfg =
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    (void)cfg;
+
+    const detail::GemmWorkspace ws = conv_split_workspace(p, S::BM, S::BN, S::BK, smem, 4, stream);
+    dim3 grid(ceil_div(p.oh * p.ow, S::BM), ceil_div(p.ocg, S::BN),
+              p.batch * p.groups * p.k_splits);
+    kernel<<<grid, S::threads, smem, stream>>>(p);
+    if (p.k_splits > 1) {
+        conv_reduce<Elem>(p, ws, stream);
+    }
+}
+
+template <class Elem> inline void launch_conv_h_direct(ConvParams& p, cudaStream_t stream)
+{
+    switch (conv_epi_tag(p)) {
+    case kConvEpiNone:
+        launch_conv_h_direct_as<Elem, ConvShapeHDirect, kConvEpiNone>(p, stream);
+        break;
+    case kConvEpiRelu:
+        launch_conv_h_direct_as<Elem, ConvShapeHDirect, kConvEpiRelu>(p, stream);
+        break;
+    default:
+        launch_conv_h_direct_as<Elem, ConvShapeHDirect, kConvEpiGeneral>(p, stream);
+        break;
+    }
+}
+
 template <class Elem> void launch_conv_h(ConvParams& p, cudaStream_t stream)
 {
+    const int knob = ::nnops::detail::cuda_conv_direct.load(std::memory_order_relaxed);
+    if (knob != 0 && conv_direct_applies(p)) {
+        launch_conv_h_direct<Elem>(p, stream);
+        return;
+    }
+    if (::nnops::detail::cuda_conv_tile.load(std::memory_order_relaxed) == 1 &&
+        !conv_wants_deep(p)) {
+        switch (conv_epi_tag(p)) {
+        case kConvEpiNone:
+            launch_conv_h_as<Elem, ConvShapeH16, kConvEpiNone>(p, stream);
+            return;
+        case kConvEpiRelu:
+            launch_conv_h_as<Elem, ConvShapeH16, kConvEpiRelu>(p, stream);
+            return;
+        default:
+            launch_conv_h_as<Elem, ConvShapeH16, kConvEpiGeneral>(p, stream);
+            return;
+        }
+    }
     if (conv_wants_deep(p)) {
         launch_conv_h_as<Elem, ConvShapeHDeep, kConvEpiGeneral>(p, stream);
         return;
@@ -722,6 +1046,41 @@ inline void launch_conv_f(ConvParams& p, cudaStream_t stream)
 constexpr int64_t kConvPointwiseMinPixels = 4096;
 constexpr int64_t kConvPointwiseF16DeepIc = 512;
 constexpr int64_t kConvPointwiseF16WidePixels = 16384;
+
+/// The short-K window where the engine's k-major B pose beats the n-major one.
+/// The n-major panel is read with `ldmatrix.trans`, and while a block is short
+/// the panel's fill and that read are a bigger share of it. Measured interleaved
+/// on one pair of buffers (`bench_cuda_matmul shortk_pose`, Tile7 both arms):
+/// K=64 1.000x, K=128 1.03x, K=256 1.06-1.08x, K=512 0.996x, K=1024 0.96x.
+constexpr int64_t kConvPointwisePoseMinIc = 128;
+constexpr int64_t kConvPointwisePoseMaxIc = 256;
+
+/// `[ic][oc]` to `[oc][ic]` through a 32x32 shared tile. The 1x1 route's filter
+/// is at most a few hundred KB, so this is one launch and one copy, and the pose
+/// it buys is worth 3-8% of the product at these depths.
+template <class Elem>
+__global__ void conv_filter_transpose_kernel(const Elem* __restrict__ src, Elem* __restrict__ dst,
+                                             int rows, int cols)
+{
+    __shared__ Elem tile[32][33];
+    const int bx = int(blockIdx.x), by = int(blockIdx.y);
+    const int tx = int(threadIdx.x), ty = int(threadIdx.y);
+    for (int j = 0; j < 32; j += 8) {
+        const int r = by * 32 + ty + j; // source row (ic)
+        const int c = bx * 32 + tx;     // source column (oc)
+        if (r < rows && c < cols) {
+            tile[ty + j][tx] = src[int64_t(r) * cols + c];
+        }
+    }
+    __syncthreads();
+    for (int j = 0; j < 32; j += 8) {
+        const int o = bx * 32 + ty + j; // destination row (oc)
+        const int i = by * 32 + tx;     // destination column (ic)
+        if (o < cols && i < rows) {
+            dst[int64_t(o) * rows + i] = tile[tx][ty + j];
+        }
+    }
+}
 
 /// A 1x1 filter at unit stride, no padding and one group is a plain GEMM, the
 /// same reduction the CPU route takes as its pointwise plan: the pixel axis is
@@ -790,11 +1149,35 @@ bool conv_pointwise_gemm(const Conv2DAttributes& attrs, const TensorView& act,
     p.a = act.ptr<void>();
     p.b = wgt.ptr<void>();
     p.c = output.ptr<void>();
+    // Short-K f16/bf16 takes the engine's k-major B pose: one transposed copy of
+    // the filter into the workspace, and the panel is read instead of
+    // `ldmatrix.trans`'d. The knob's 0 is the bench's n-major arm.
+    const DataType dt = act.data_type();
+    const int pose = ::nnops::detail::cuda_conv_pw_pose.load(std::memory_order_relaxed);
+    detail::GemmWorkspace fws;
+    if (pose != 0 && (dt == DataType::f16 || dt == DataType::bf16) &&
+        ic >= kConvPointwisePoseMinIc && ic <= kConvPointwisePoseMaxIc) {
+        fws = detail::gemm_workspace_alloc(ic * oc * int64_t(data_type_size(dt)), stream);
+        if (fws.ptr != nullptr) {
+            const dim3 grid(unsigned(ceil_div(oc, 32)), unsigned(ceil_div(ic, 32)));
+            const dim3 block(32, 8);
+            if (dt == DataType::f16) {
+                conv_filter_transpose_kernel<__half><<<grid, block, 0, stream>>>(
+                    static_cast<const __half*>(wgt.ptr<void>()), static_cast<__half*>(fws.ptr),
+                    int(ic), int(oc));
+            } else {
+                conv_filter_transpose_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(wgt.ptr<void>()),
+                    static_cast<__nv_bfloat16*>(fws.ptr), int(ic), int(oc));
+            }
+            p.b = fws.ptr;
+        }
+    }
     p.m = static_cast<int>(m);
     p.n = static_cast<int>(oc);
     p.k = static_cast<int>(ic);
     p.lda = ic;
-    p.ldb = oc;
+    p.ldb = fws.ptr != nullptr ? ic : oc;
     p.ldc = oc;
     p.alpha = 1.0f;
     p.beta = 0.0f;
@@ -813,8 +1196,12 @@ bool conv_pointwise_gemm(const Conv2DAttributes& attrs, const TensorView& act,
         p.ldr = oc;
     }
 
-    return dense_gemm_status(p, act.data_type(), /*transpose_a=*/false,
-                             /*transpose_b=*/false, stream) == Status::ok;
+    const Status st = dense_gemm_status(p, act.data_type(), /*transpose_a=*/false,
+                                        /*transpose_b=*/fws.ptr != nullptr, stream);
+    if (fws.ptr != nullptr) {
+        detail::gemm_workspace_free(fws, stream);
+    }
+    return st == Status::ok;
 }
 
 } // namespace
