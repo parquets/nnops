@@ -10,8 +10,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(CastAttributes, cast_cpu)
+NNOPS_DECLARE_CUDA(CastAttributes, cast_cuda)
 
-NNOPS_OP_BOILERPLATE(Cast, CastAttributes, backend::cpu::cast_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Cast, CastAttributes, backend::cpu::cast_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::cast_cuda), nullptr)
 
 namespace {
 

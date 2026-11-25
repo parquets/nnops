@@ -1,246 +1,389 @@
 /// @file reduce.cu
-/// @brief CUDA implementation of the Reduce operator.
+/// @brief CUDA Reduce — one axis, and four ways to walk it.
 ///
-/// Single-axis reduction using shared-memory block-level reductions.
-/// Supports Sum, Min, Max, Mean over f32, f16 and bf16 data types.
+/// The CPU describes a reduction as an outer group, the axis, and an inner
+/// group; so does this file, and the split decides the kernel:
 ///
-/// Two-kernel pattern (same as softmax/layer_norm/rms_norm):
-///   - reduce_fast_kernel: contiguous tail (axis == rank-1), strided access.
-///   - reduce_general_kernel: arbitrary axis with pre-computed inner offsets.
+///   - inner == 1 (the axis is the last one): the outputs are rows. A row
+///     that is at most one 16 B load wide gets one thread, a short one a warp,
+///     and a long one a block — the fan-out a row can use before the block
+///     reduction costs more than it saves.
+///   - inner > 1: the inner run is contiguous and the axis stride is a
+///     constant, so threads span the inner axis (coalesced on every step) and
+///     each carries one accumulator down the axis. That is also the shape of
+///     `Reduce(NHWC, axis=0)`, where the old offset table cost 195 ms on
+///     4096x4096: the table was an int64 per reduced element plus a
+///     `cudaMalloc`/`cudaFree` pair per call, and the strides alone describe
+///     the walk.
 ///
-/// Grid = outer_dim_count (one block per independent reduction row),
-/// Block = min(norm_size, kCudaBlockSize), Shared = block_size * sizeof(float).
+/// The comparison rules are the CPU's: a strict compare, so a NaN never
+/// replaces a finite value, and the seed is the op's identity (so an all-NaN
+/// row still answers ±1e30 the way the CPU does). Sum and Mean accumulate in
+/// float like the CPU's SIMD path.
+///
+/// f32, f16 and bf16. Workspace: not used.
 
 #include "cuda_common.cuh"
 #include "nnops/ops/reduce.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/detail/assert.hpp"
 
-#include <vector>
+#include <algorithm>
 #include <span>
 
 namespace nnops::backend::cuda {
 
 using namespace nnops;
 
-// ============================================================
-// Fast path kernel: axis == rank - 1 (contiguous tail)
-// ============================================================
-
-template <typename T>
-__global__ void reduce_fast_kernel(const T* __restrict__ x, T* __restrict__ y, int64_t norm_size,
-                                   int64_t row_stride,
-                                   int reduce_type) // 0=Sum, 1=Min, 2=Max, 3=Mean
-{
-    extern __shared__ float smem[];
-
-    const int tid = threadIdx.x;
-    const int64_t row = blockIdx.x;
-
-    const T* x_row = x + row * row_stride;
-
-    // Each thread accumulates its partial over norm_size elements
-    float result;
-    switch (reduce_type) {
-    case 0:   // Sum
-    case 3: { // Mean
-        float sum = 0.0f;
-        for (int i = tid; i < norm_size; i += blockDim.x) {
-            sum += s_load(&x_row[i]);
-        }
-        result = block_reduce_sum(sum, smem);
-        if (reduce_type == 3 && tid == 0) {
-            result /= static_cast<float>(norm_size);
-        }
-        break;
-    }
-    case 1: { // Min
-        float val = 1e30f;
-        for (int i = tid; i < norm_size; i += blockDim.x) {
-            float v = s_load(&x_row[i]);
-            if (v < val)
-                val = v;
-        }
-        result = block_reduce_min(val, smem);
-        break;
-    }
-    case 2: { // Max
-        float val = -1e30f;
-        for (int i = tid; i < norm_size; i += blockDim.x) {
-            float v = s_load(&x_row[i]);
-            if (v > val)
-                val = v;
-        }
-        result = block_reduce_max(val, smem);
-        break;
-    }
-    default:
-        result = 0.0f;
-        break;
-    }
-
-    // Only thread 0 writes the result
-    if (tid == 0) {
-        s_store(&y[row], result);
-    }
-}
-
-// ============================================================
-// General path kernel: arbitrary axis (scattered access via offsets)
-// ============================================================
-
-template <typename T>
-__global__ void reduce_general_kernel(const T* __restrict__ x, T* __restrict__ y, int64_t norm_size,
-                                      int64_t outer_stride,
-                                      const int64_t* __restrict__ inner_offsets, int reduce_type)
-{
-    extern __shared__ float smem[];
-
-    const int tid = threadIdx.x;
-    const int64_t row = blockIdx.x;
-
-    const T* x_base = x + row * outer_stride;
-
-    float result;
-    switch (reduce_type) {
-    case 0:   // Sum
-    case 3: { // Mean
-        float sum = 0.0f;
-        for (int i = tid; i < norm_size; i += blockDim.x) {
-            sum += s_load(&x_base[inner_offsets[i]]);
-        }
-        result = block_reduce_sum(sum, smem);
-        if (reduce_type == 3 && tid == 0) {
-            result /= static_cast<float>(norm_size);
-        }
-        break;
-    }
-    case 1: { // Min
-        float val = 1e30f;
-        for (int i = tid; i < norm_size; i += blockDim.x) {
-            float v = s_load(&x_base[inner_offsets[i]]);
-            if (v < val)
-                val = v;
-        }
-        result = block_reduce_min(val, smem);
-        break;
-    }
-    case 2: { // Max
-        float val = -1e30f;
-        for (int i = tid; i < norm_size; i += blockDim.x) {
-            float v = s_load(&x_base[inner_offsets[i]]);
-            if (v > val)
-                val = v;
-        }
-        result = block_reduce_max(val, smem);
-        break;
-    }
-    default:
-        result = 0.0f;
-        break;
-    }
-
-    if (tid == 0) {
-        s_store(&y[row], result);
-    }
-}
-
-// ============================================================
-// Host-side launcher
-// ============================================================
-
 namespace {
 
-int to_int_reduce_type(ReduceType t)
+enum RedOp : int { kRedSum = 0, kRedMin = 1, kRedMax = 2, kRedMean = 3 };
+
+template <int Op> __device__ __forceinline__ float red_init() noexcept
+{
+    if constexpr (Op == kRedMin) {
+        return 1e30f;
+    } else if constexpr (Op == kRedMax) {
+        return -1e30f;
+    }
+    return 0.0f;
+}
+
+template <int Op> __device__ __forceinline__ void red_step(float& a, float v) noexcept
+{
+    if constexpr (Op == kRedSum || Op == kRedMean) {
+        a += v;
+    } else if constexpr (Op == kRedMin) {
+        if (v < a) {
+            a = v;
+        }
+    } else {
+        if (v > a) {
+            a = v;
+        }
+    }
+}
+
+template <int Op> __device__ __forceinline__ float red_combine(float a, float b) noexcept
+{
+    if constexpr (Op == kRedSum || Op == kRedMean) {
+        return a + b;
+    } else if constexpr (Op == kRedMin) {
+        return (b < a) ? b : a;
+    } else {
+        return (b > a) ? b : a;
+    }
+}
+
+template <int Op> __device__ __forceinline__ float red_finish(float a, int64_t n) noexcept
+{
+    if constexpr (Op == kRedMean) {
+        return a / static_cast<float>(n);
+    }
+    return a;
+}
+
+template <int Op> __device__ __forceinline__ float red_warp(float v) noexcept
+{
+#pragma unroll
+    for (int off = kCudaWarpSize / 2; off > 0; off >>= 1) {
+        v = red_combine<Op>(v, __shfl_down_sync(0xffffffffu, v, off));
+    }
+    return v;
+}
+
+/// The per-row result is written by one lane, so a warp reduction has to be
+/// broadcast back out of lane 0.
+template <int Op> __device__ __forceinline__ float red_block(float v, float* smem) noexcept
+{
+    const int lane = int(threadIdx.x) & (kCudaWarpSize - 1);
+    const int wid = int(threadIdx.x) >> 5;
+    v = red_warp<Op>(v);
+    if (lane == 0) {
+        smem[wid] = v;
+    }
+    __syncthreads();
+    const int warps = int((blockDim.x + kCudaWarpSize - 1) / kCudaWarpSize);
+    float total = red_init<Op>();
+    if (wid == 0) {
+        total = (lane < warps) ? smem[lane] : red_init<Op>();
+        total = red_warp<Op>(total);
+    }
+    return total;
+}
+
+// ============================================================
+// inner == 1 — a row of outputs, three widths
+// ============================================================
+
+/// Rows of at most one 16 B load: one thread per row, so a 16-element f16 row
+/// still fills a warp's worth of sectors instead of a block.
+template <class T, int Op>
+__global__ void reduce_row_thread_kernel(const T* __restrict__ x, T* __restrict__ y, int64_t rows,
+                                         int64_t n, int64_t row_stride, int64_t out_stride)
+{
+    const int64_t stride = int64_t(gridDim.x) * blockDim.x;
+    for (int64_t r = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; r < rows; r += stride) {
+        const T* p = x + r * row_stride;
+        float acc = red_init<Op>();
+        for (int64_t k = 0; k < n; ++k) {
+            red_step<Op>(acc, s_load(&p[k]));
+        }
+        s_store(&y[r * out_stride], red_finish<Op>(acc, n));
+    }
+}
+
+/// A warp a row: the lanes stride the row, which keeps every step coalesced
+/// even when the row is shorter than a block.
+template <class T, int Op>
+__global__ void reduce_row_warp_kernel(const T* __restrict__ x, T* __restrict__ y, int64_t rows,
+                                       int64_t n, int64_t row_stride, int64_t out_stride)
+{
+    const int lane = int(threadIdx.x) & (kCudaWarpSize - 1);
+    const int warps = int(blockDim.x) >> 5;
+    const int warp = int(threadIdx.x) >> 5;
+    const int64_t stride = int64_t(gridDim.x) * warps;
+
+    for (int64_t r = int64_t(blockIdx.x) * warps + warp; r < rows; r += stride) {
+        const T* p = x + r * row_stride;
+        float acc = red_init<Op>();
+        for (int64_t k = lane; k < n; k += kCudaWarpSize) {
+            red_step<Op>(acc, s_load(&p[k]));
+        }
+        acc = red_warp<Op>(acc);
+        if (lane == 0) {
+            s_store(&y[r * out_stride], red_finish<Op>(acc, n));
+        }
+    }
+}
+
+/// A block a row, for rows too long for one warp to keep in flight.
+template <class T, int Op>
+__global__ void reduce_row_block_kernel(const T* __restrict__ x, T* __restrict__ y, int64_t rows,
+                                        int64_t n, int64_t row_stride, int64_t out_stride)
+{
+    extern __shared__ float smem[];
+
+    for (int64_t r = blockIdx.x; r < rows; r += gridDim.x) {
+        const T* p = x + r * row_stride;
+        float acc = red_init<Op>();
+        for (int64_t k = threadIdx.x; k < n; k += blockDim.x) {
+            red_step<Op>(acc, s_load(&p[k]));
+        }
+        acc = red_block<Op>(acc, smem);
+        if (threadIdx.x == 0) {
+            s_store(&y[r * out_stride], red_finish<Op>(acc, n));
+        }
+        __syncthreads();
+    }
+}
+
+// ============================================================
+// inner > 1 — a thread an inner position
+// ============================================================
+
+/// The axes after the reduced one, fastest last, with the strides of both
+/// operands — the inner run is only a flat index when both are compact, and a
+/// padded pitch or a channel-last row breaks that.
+struct InnerWalk {
+    int64_t rank = 0;
+    int64_t dims[8] = {};
+    int64_t in_stride[8] = {};
+    int64_t out_stride[8] = {};
+};
+
+__device__ __forceinline__ void inner_offsets(const InnerWalk& w, int64_t flat, int64_t& in,
+                                              int64_t& out) noexcept
+{
+    in = 0;
+    out = 0;
+    for (int64_t d = w.rank - 1; d >= 0; --d) {
+        const int64_t n = w.dims[d];
+        const int64_t c = flat % n;
+        in += c * w.in_stride[d];
+        out += c * w.out_stride[d];
+        flat /= n;
+    }
+}
+
+template <class T, int Op>
+__global__ void reduce_inner_kernel(const T* __restrict__ x, T* __restrict__ y, int64_t outer,
+                                    int64_t d, int64_t inner, int64_t axis_stride,
+                                    int64_t in_outer_stride, int64_t out_outer_stride,
+                                    InnerWalk w)
+{
+    const int64_t inner_stride = int64_t(gridDim.x) * blockDim.x;
+    for (int64_t o = blockIdx.y; o < outer; o += gridDim.y) {
+        const T* p = x + o * in_outer_stride;
+        T* q = y + o * out_outer_stride;
+        for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < inner;
+             i += inner_stride) {
+            int64_t io = 0;
+            int64_t oo = 0;
+            inner_offsets(w, i, io, oo);
+            const T* c = p + io;
+            float acc = red_init<Op>();
+            for (int64_t k = 0; k < d; ++k) {
+                red_step<Op>(acc, s_load(&c[k * axis_stride]));
+            }
+            s_store(&q[oo], red_finish<Op>(acc, d));
+        }
+    }
+}
+
+// ============================================================
+// Host side
+// ============================================================
+
+int to_op(ReduceType t) noexcept
 {
     switch (t) {
     case ReduceType::Sum:
-        return 0;
+        return kRedSum;
     case ReduceType::Min:
-        return 1;
+        return kRedMin;
     case ReduceType::Max:
-        return 2;
+        return kRedMax;
     case ReduceType::Mean:
-        return 3;
+        return kRedMean;
     }
-    return 0;
+    return kRedSum;
 }
 
-template <typename T>
+template <class T, int Op>
+void launch_rows(const T* x, T* y, int64_t rows, int64_t n, int64_t row_stride,
+                 int64_t out_stride, cudaStream_t stream)
+{
+    if (rows <= 0 || n <= 0) {
+        return;
+    }
+    // Up to 64 B a thread reads the whole row itself: 16 f16 or 16 f32 is one
+    // or two sectors, which a warp already gathers coalesced, while a warp per
+    // row would leave most of its lanes past the end.
+    const int64_t row_bytes = n * static_cast<int64_t>(sizeof(T));
+    if (row_bytes <= 64) {
+        const int64_t threads = std::min<int64_t>(rows, int64_t(1) << 20);
+        const unsigned blocks = static_cast<unsigned>((threads + kCudaBlockSize - 1) / kCudaBlockSize);
+        reduce_row_thread_kernel<T, Op><<<blocks, kCudaBlockSize, 0, stream>>>(
+            x, y, rows, n, row_stride, out_stride);
+        return;
+    }
+    if (n <= 4096) {
+        constexpr int kWarps = 8;
+        const int64_t warps = std::min<int64_t>(rows, int64_t(1) << 20);
+        const unsigned blocks = static_cast<unsigned>((warps + kWarps - 1) / kWarps);
+        reduce_row_warp_kernel<T, Op><<<blocks, kWarps * kCudaWarpSize, 0, stream>>>(
+            x, y, rows, n, row_stride, out_stride);
+        return;
+    }
+    const unsigned blocks = static_cast<unsigned>(std::min<int64_t>(rows, int64_t(1) << 20));
+    const int smem = int((kCudaBlockSize / kCudaWarpSize) * sizeof(float));
+    reduce_row_block_kernel<T, Op><<<blocks, kCudaBlockSize, smem, stream>>>(
+        x, y, rows, n, row_stride, out_stride);
+}
+
+template <class T, int Op>
+void launch_inner(const T* x, T* y, int64_t outer, int64_t d, int64_t inner, int64_t axis_stride,
+                  int64_t in_outer_stride, int64_t out_outer_stride, const InnerWalk& w,
+                  cudaStream_t stream)
+{
+    if (outer <= 0 || inner <= 0 || d <= 0) {
+        return;
+    }
+    const int64_t x_blocks = (inner + kCudaBlockSize - 1) / kCudaBlockSize;
+    const dim3 grid(static_cast<unsigned>(std::min<int64_t>(x_blocks, 65535)),
+                    static_cast<unsigned>(std::min<int64_t>(outer, 65535)));
+    reduce_inner_kernel<T, Op><<<grid, kCudaBlockSize, 0, stream>>>(
+        x, y, outer, d, inner, axis_stride, in_outer_stride, out_outer_stride, w);
+}
+
+template <class T>
 void reduce_cuda_impl(const ReduceAttributes& attrs, TensorView& output, const TensorView& input,
-                      int64_t axis, const ComputeContext& ctx)
+                      int64_t axis, cudaStream_t stream)
 {
     const int64_t rank = input.rank();
+    const int64_t n = input.shape(axis);
 
-    const int64_t outer_dim_count = [&]() {
-        int64_t n = 1;
-        for (int64_t d = 0; d < axis; ++d)
-            n *= input.shape(d);
-        return n;
-    }();
-    const int64_t norm_size = [&]() {
-        int64_t n = 1;
-        for (int64_t d = axis; d < rank; ++d)
-            n *= input.shape(d);
-        return n;
-    }();
+    int64_t outer = 1;
+    for (int64_t d = 0; d < axis; ++d) {
+        outer *= input.shape(d);
+    }
+    int64_t inner = 1;
+    for (int64_t d = axis + 1; d < rank; ++d) {
+        inner *= input.shape(d);
+    }
 
-    const T* x_ptr = input.ptr<T>();
-    T* y_ptr = output.ptr<T>();
-    cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
-    const int reduce_type = to_int_reduce_type(attrs.type);
+    const T* x = input.ptr<T>();
+    T* y = output.ptr<T>();
+    const int64_t axis_stride = input.stride_elems(axis);
 
-    const int block_size = std::min(static_cast<int>(norm_size), kCudaBlockSize);
-    const int shared_bytes = block_size * sizeof(float);
-    const int grid = std::min(static_cast<int>(outer_dim_count), 65535);
-
-    if (axis == rank - 1 && !is_channel_last(input.layout())) {
-        // Contiguous tail fast path: Dense only — NHWC keeps C innermost.
-        const int64_t row_stride = (axis > 0) ? input.stride_elems(axis - 1) : input.numel();
-        reduce_fast_kernel<T><<<grid, block_size, shared_bytes, stream>>>(x_ptr, y_ptr, norm_size,
-                                                                          row_stride, reduce_type);
-    } else {
-        // General axis: pre-compute inner offsets, upload to device.
-        // stride_elems() is layout-aware, so NHWC works unchanged.
-        std::vector<int64_t> h_offsets(norm_size);
-        for (int64_t flat = 0; flat < norm_size; ++flat) {
-            int64_t off = 0;
-            int64_t rem = flat;
-            for (int64_t d = rank - 1; d >= axis; --d) {
-                int64_t dim = input.shape(d);
-                off += (rem % dim) * input.stride_elems(d);
-                rem /= dim;
-            }
-            h_offsets[flat] = off;
+    if (inner == 1) {
+        // Rows are the axis-1 pitch apart: one spatial line of a channel-last
+        // view, or one row of a padded Dense one.
+        const int64_t row_stride = axis > 0 ? input.stride_elems(axis - 1) : n;
+        const int64_t out_stride = axis > 0 ? output.stride_elems(axis - 1) : 1;
+        switch (to_op(attrs.type)) {
+        case kRedSum:
+            launch_rows<T, kRedSum>(x, y, outer, n, row_stride, out_stride, stream);
+            break;
+        case kRedMin:
+            launch_rows<T, kRedMin>(x, y, outer, n, row_stride, out_stride, stream);
+            break;
+        case kRedMax:
+            launch_rows<T, kRedMax>(x, y, outer, n, row_stride, out_stride, stream);
+            break;
+        default:
+            launch_rows<T, kRedMean>(x, y, outer, n, row_stride, out_stride, stream);
+            break;
         }
+        return;
+    }
 
-        int64_t* d_offsets = nullptr;
-        cudaMalloc(&d_offsets, norm_size * sizeof(int64_t));
-        cudaMemcpyAsync(d_offsets, h_offsets.data(), norm_size * sizeof(int64_t),
-                        cudaMemcpyHostToDevice, stream);
+    // The axes after the reduced one are one odometer on each side: the input's
+    // outer stride past the axis is the run between consecutive inner blocks,
+    // and the output's is the same axis minus the one the reduce removed.
+    InnerWalk w;
+    for (int64_t d = axis + 1; d < rank; ++d) {
+        w.dims[w.rank] = input.shape(d);
+        w.in_stride[w.rank] = input.stride_elems(d);
+        w.out_stride[w.rank] =
+            output.stride_elems(attrs.keepdims ? d : d - 1);
+        ++w.rank;
+    }
+    const int64_t out_outer_stride = axis > 0 ? output.stride_elems(axis - 1) : 0;
+    const int64_t in_outer_stride = axis > 0 ? input.stride_elems(axis - 1) : 0;
 
-        const int64_t outer_stride = (axis > 0) ? input.stride_elems(axis - 1) : input.numel();
-        reduce_general_kernel<T><<<grid, block_size, shared_bytes, stream>>>(
-            x_ptr, y_ptr, norm_size, outer_stride, d_offsets, reduce_type);
-
-        cudaFree(d_offsets);
+    switch (to_op(attrs.type)) {
+    case kRedSum:
+        launch_inner<T, kRedSum>(x, y, outer, n, inner, axis_stride, in_outer_stride,
+                                 out_outer_stride, w, stream);
+        break;
+    case kRedMin:
+        launch_inner<T, kRedMin>(x, y, outer, n, inner, axis_stride, in_outer_stride,
+                                 out_outer_stride, w, stream);
+        break;
+    case kRedMax:
+        launch_inner<T, kRedMax>(x, y, outer, n, inner, axis_stride, in_outer_stride,
+                                 out_outer_stride, w, stream);
+        break;
+    default:
+        launch_inner<T, kRedMean>(x, y, outer, n, inner, axis_stride, in_outer_stride,
+                                  out_outer_stride, w, stream);
+        break;
     }
 }
 
 } // anonymous namespace
-
-// ============================================================
-// Entry point
-// ============================================================
 
 Status reduce_cuda(const ReduceAttributes& attrs, TensorView& output,
                    std::span<const TensorView> inputs, const ComputeContext& ctx,
                    void* /*workspace*/)
 {
     const auto& input = inputs[0];
+    const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
-    // Single-axis only for now; multi-axis and the empty-means-all default
-    // fall back to the caller.
+    // Single-axis only; multi-axis and the empty-means-all default fall back to
+    // the caller.
     if (attrs.axes.size() != 1) {
         return Status::unsupported;
     }
@@ -248,16 +391,19 @@ Status reduce_cuda(const ReduceAttributes& attrs, TensorView& output,
     if (axis < 0) {
         axis += input.rank();
     }
+    if (axis < 0 || axis >= input.rank()) {
+        return Status::invalid_argument;
+    }
 
     switch (input.data_type()) {
     case DataType::f32:
-        reduce_cuda_impl<float>(attrs, output, input, axis, ctx);
+        reduce_cuda_impl<float>(attrs, output, input, axis, stream);
         return Status::ok;
     case DataType::f16:
-        reduce_cuda_impl<__half>(attrs, output, input, axis, ctx);
+        reduce_cuda_impl<__half>(attrs, output, input, axis, stream);
         return Status::ok;
     case DataType::bf16:
-        reduce_cuda_impl<__nv_bfloat16>(attrs, output, input, axis, ctx);
+        reduce_cuda_impl<__nv_bfloat16>(attrs, output, input, axis, stream);
         return Status::ok;
     default:
         return Status::unsupported;

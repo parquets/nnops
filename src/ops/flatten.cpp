@@ -8,8 +8,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(FlattenAttributes, flatten_cpu)
+NNOPS_DECLARE_CUDA(FlattenAttributes, flatten_cuda)
 
-NNOPS_OP_BOILERPLATE(Flatten, FlattenAttributes, backend::cpu::flatten_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Flatten, FlattenAttributes, backend::cpu::flatten_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::flatten_cuda), nullptr)
 
 std::vector<TensorDesc> Flatten::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {

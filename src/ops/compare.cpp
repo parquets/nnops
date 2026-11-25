@@ -9,10 +9,14 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(CompareAttributes, compare_cpu)
+NNOPS_DECLARE_CUDA(CompareAttributes, compare_cuda)
 NNOPS_DECLARE_CPU(LogicalAttributes, logical_cpu)
+NNOPS_DECLARE_CUDA(LogicalAttributes, logical_cuda)
 
-NNOPS_OP_BOILERPLATE(Compare, CompareAttributes, backend::cpu::compare_cpu, nullptr, nullptr)
-NNOPS_OP_BOILERPLATE(Logical, LogicalAttributes, backend::cpu::logical_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Compare, CompareAttributes, backend::cpu::compare_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::compare_cuda), nullptr)
+NNOPS_OP_BOILERPLATE(Logical, LogicalAttributes, backend::cpu::logical_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::logical_cuda), nullptr)
 
 namespace {
 

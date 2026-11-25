@@ -8,9 +8,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(RoiAlignAttributes, roi_align_cpu)
+NNOPS_DECLARE_CUDA(RoiAlignAttributes, roi_align_cuda)
 
-NNOPS_OP_BOILERPLATE(RoiAlign, RoiAlignAttributes, backend::cpu::roi_align_cpu, nullptr,
-                     nullptr)
+NNOPS_OP_BOILERPLATE(RoiAlign, RoiAlignAttributes, backend::cpu::roi_align_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::roi_align_cuda), nullptr)
 
 std::vector<TensorDesc> RoiAlign::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {

@@ -78,17 +78,18 @@ template <class T> inline T pad_constant(float v)
 }
 
 template <class T>
-__global__ void pad_rows_kernel(const T* __restrict__ src, T* __restrict__ dst, PadGeom g, T cval)
+__global__ void pad_rows_kernel(const T* __restrict__ src, T* __restrict__ dst, PadGeom g, T cval,
+                                int64_t rows_per_block)
 {
-    const int64_t tid = int64_t(threadIdx.x);
-    const int64_t nth = int64_t(blockDim.x);
+    // Threads span one output row on x and several rows on y: a 4-D NHWC row is
+    // often only a few hundred bytes, and one block per row spent more time
+    // being scheduled than copying. `blockDim.x` is the row width `copy_run`
+    // splits across, so the multi-row form reuses it unchanged.
     const int64_t last = g.rank - 1;
     const int64_t n_in = g.in_dims[last];
     const int64_t begin = g.pad_begin[last];
     const int64_t in_step = g.in_strides[last];
     const int64_t out_step = g.out_strides[last];
-
-    // Inside [lo, hi) the last axis maps to itself, so nothing there is padded.
     const int64_t mid_begin = begin < 0 ? 0 : (begin > g.cols ? g.cols : begin);
     int64_t mid_end = begin + n_in;
     if (mid_end > g.cols) {
@@ -98,7 +99,8 @@ __global__ void pad_rows_kernel(const T* __restrict__ src, T* __restrict__ dst, 
         mid_end = mid_begin;
     }
 
-    for (int64_t r = blockIdx.x; r < g.rows; r += gridDim.x) {
+    for (int64_t r = int64_t(blockIdx.x) * rows_per_block + int64_t(threadIdx.y); r < g.rows;
+         r += int64_t(gridDim.x) * rows_per_block) {
         int64_t rem = r;
         int64_t so = 0;
         int64_t dof = 0;
@@ -118,19 +120,19 @@ __global__ void pad_rows_kernel(const T* __restrict__ src, T* __restrict__ dst, 
 
         T* drow = dst + dof;
         if (fill) {
-            for (int64_t i = tid; i < g.cols; i += nth) {
+            for (int64_t i = int64_t(threadIdx.x); i < g.cols; i += int64_t(blockDim.x)) {
                 drow[i * out_step] = cval;
             }
             continue;
         }
 
-        for (int64_t i = tid; i < mid_begin; i += nth) {
+        for (int64_t i = int64_t(threadIdx.x); i < mid_begin; i += int64_t(blockDim.x)) {
             const int64_t m = pad_map(i - begin, n_in, g.mode);
             drow[i * out_step] = (m < 0) ? cval : src[so + m * in_step];
         }
         copy_run(drow + mid_begin * out_step, src + so + (mid_begin - begin) * in_step,
                  mid_end - mid_begin, in_step, out_step);
-        for (int64_t i = mid_end + tid; i < g.cols; i += nth) {
+        for (int64_t i = mid_end + int64_t(threadIdx.x); i < g.cols; i += int64_t(blockDim.x)) {
             const int64_t m = pad_map(i - begin, n_in, g.mode);
             drow[i * out_step] = (m < 0) ? cval : src[so + m * in_step];
         }
@@ -162,9 +164,17 @@ Status pad_entry(const PadAttributes& attrs, TensorView& output, const TensorVie
     g.cols = g.out_dims[rank - 1];
     g.rows = (g.cols > 0) ? total / g.cols : 0;
 
-    const unsigned grid = static_cast<unsigned>(std::min<int64_t>(g.rows, int64_t(1) << 20));
-    pad_rows_kernel<T><<<grid, kCudaBlockSize, 0, stream>>>(input.ptr<T>(), output.ptr<T>(), g,
-                                                            pad_constant<T>(attrs.constant_value));
+    // One warp (or more) per row on x, and as many rows as fit on y, so a row
+    // of a few hundred bytes still fills the block.
+    const int64_t vec = int64_t(16 / sizeof(T));
+    int64_t lanes = (g.cols + vec - 1) / vec;
+    lanes = std::max<int64_t>(32, std::min<int64_t>((lanes + 31) / 32 * 32, kCudaBlockSize));
+    const int64_t rows_per_block = std::max<int64_t>(1, kCudaBlockSize / lanes);
+    const int64_t groups = (g.rows + rows_per_block - 1) / rows_per_block;
+    const unsigned grid = static_cast<unsigned>(std::min<int64_t>(groups, int64_t(1) << 20));
+    pad_rows_kernel<T><<<dim3(grid), dim3(unsigned(lanes), unsigned(rows_per_block)), 0, stream>>>(
+        input.ptr<T>(), output.ptr<T>(), g, pad_constant<T>(attrs.constant_value),
+        rows_per_block);
     return Status::ok;
 }
 

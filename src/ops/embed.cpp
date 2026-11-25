@@ -9,8 +9,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(EmbedAttributes, embed_cpu)
+NNOPS_DECLARE_CUDA(EmbedAttributes, embed_cuda)
 
-NNOPS_OP_BOILERPLATE(Embed, EmbedAttributes, backend::cpu::embed_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Embed, EmbedAttributes, backend::cpu::embed_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::embed_cuda), nullptr)
 
 std::vector<TensorDesc> Embed::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {

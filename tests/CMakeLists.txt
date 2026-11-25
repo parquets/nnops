@@ -138,6 +138,7 @@ if(NNOPS_BUILD_CUDA)
         test_cuda_elementwise.cpp
         test_cuda_bf16.cpp
         test_cuda_rnn.cpp
+        test_cuda_general_ops.cpp
     )
 endif()
 
@@ -207,6 +208,7 @@ if(NNOPS_BUILD_BENCHMARKS)
             bench_cuda_resize.cpp
             bench_cuda_elementwise.cpp
             bench_cuda_rnn.cpp
+            bench_cuda_general_ops.cpp
         )
     endif()
 

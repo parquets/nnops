@@ -15,8 +15,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(Pool1DAttributes, pool1d_cpu)
+NNOPS_DECLARE_CUDA(Pool1DAttributes, pool1d_cuda)
 
-NNOPS_OP_BOILERPLATE(Pool1D, Pool1DAttributes, backend::cpu::pool1d_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Pool1D, Pool1DAttributes, backend::cpu::pool1d_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::pool1d_cuda), nullptr)
 
 std::vector<TensorDesc> Pool1D::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {

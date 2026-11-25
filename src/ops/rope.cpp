@@ -13,8 +13,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(RoPEAttributes, rope_cpu)
+NNOPS_DECLARE_CUDA(RoPEAttributes, rope_cuda)
 
-NNOPS_OP_BOILERPLATE(RoPE, RoPEAttributes, backend::cpu::rope_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(RoPE, RoPEAttributes, backend::cpu::rope_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::rope_cuda), nullptr)
 
 std::vector<TensorDesc> RoPE::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {

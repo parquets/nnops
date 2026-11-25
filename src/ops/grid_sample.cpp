@@ -9,9 +9,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(GridSampleAttributes, grid_sample_cpu)
+NNOPS_DECLARE_CUDA(GridSampleAttributes, grid_sample_cuda)
 
-NNOPS_OP_BOILERPLATE(GridSample, GridSampleAttributes, backend::cpu::grid_sample_cpu, nullptr,
-                     nullptr)
+NNOPS_OP_BOILERPLATE(GridSample, GridSampleAttributes, backend::cpu::grid_sample_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::grid_sample_cuda), nullptr)
 
 std::vector<TensorDesc> GridSample::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {

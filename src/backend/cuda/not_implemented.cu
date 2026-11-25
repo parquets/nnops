@@ -14,24 +14,11 @@
 
 #include "nnops/core/status.hpp"
 #include "nnops/ops/linear_attention.hpp"
-#include "nnops/ops/quant_linear.hpp"
 
 namespace nnops::backend::cuda {
 
 Status linear_attention_cuda(const LinearAttentionAttributes&, std::span<TensorView>,
                              std::span<const TensorView>, const ComputeContext&, void*)
-{
-    return Status::unsupported;
-}
-
-Status quantize_linear_cuda(const QuantLinearAttributes&, TensorView&, std::span<const TensorView>,
-                            const ComputeContext&, void*)
-{
-    return Status::unsupported;
-}
-
-Status dequantize_linear_cuda(const QuantLinearAttributes&, TensorView&,
-                              std::span<const TensorView>, const ComputeContext&, void*)
 {
     return Status::unsupported;
 }

@@ -10,8 +10,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(ClampAttributes, clamp_cpu)
+NNOPS_DECLARE_CUDA(ClampAttributes, clamp_cuda)
 
-NNOPS_OP_BOILERPLATE(Clamp, ClampAttributes, backend::cpu::clamp_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Clamp, ClampAttributes, backend::cpu::clamp_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::clamp_cuda), nullptr)
 
 std::vector<TensorDesc> Clamp::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {

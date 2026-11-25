@@ -19,11 +19,20 @@
 /// still hold one pixel's channel vectors, which keeps the loads coalesced
 /// while the rows are walked in parallel.
 ///
+/// Pool1D is the width-only lift of this kernel: a rank-3 [N, L, C] signal is
+/// the rank-4 [N, 1, L, C] activation with a one-row window, so pool1d_cuda at
+/// the bottom only translates the attributes and lifts the views — no kernel of
+/// its own, exactly as the CPU route does. The lifted view keeps the source
+/// pitch, which for a channel-last rank-3 tensor is the whole spatial line
+/// (L·C), so its rank-4 strides come out right.
+///
 /// Supports f32, f16 and bf16. Workspace: not used.
 
 #include "../cuda_common.cuh"
+#include "nnops/ops/pool1d.hpp"
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 #include <algorithm>
 
@@ -664,6 +673,50 @@ Status pooling_cuda(const PoolingAttributes& attrs, TensorView& output,
     default:
         return Status::unsupported;
     }
+}
+
+namespace {
+
+/// [N, L, C] as [N, 1, L, C] — the same view, re-described.
+TensorView lift_wide(const TensorView& v)
+{
+    const int64_t s[4] = {v.shape(0), 1, v.shape(1), v.shape(2)};
+    return TensorView(std::span<const int64_t>(s, 4), v.data_type(),
+                      const_cast<void*>(v.ptr<void>()), v.pitch(), v.layout(), v.quant_params());
+}
+
+} // anonymous namespace
+
+/// Pool1D: a rank-3 signal does not fit a kernel that takes its spatial rank
+/// from the activation, so [N, L, C] lifts to [N, 1, L, C] with a {1, K} window
+/// and the translate is a slot shift. auto_pad is resolved here because the
+/// kernel only sees an explicit pad.
+Status pool1d_cuda(const Pool1DAttributes& attrs, TensorView& output,
+                   std::span<const TensorView> inputs, const ComputeContext& ctx, void* workspace)
+{
+    const TensorView& input = inputs[0];
+    PoolingAttributes a{};
+    a.type = attrs.type == Pool1DType::Max ? PoolingType::Max : PoolingType::Average;
+    a.kernel_shape = {1, 1, attrs.kernel_shape};
+    a.stride = {1, 1, attrs.stride};
+    a.padding = {0, 0, attrs.padding};
+    a.dilation = {1, 1, attrs.dilation};
+    a.exclude_pad = attrs.exclude_pad;
+    a.add_to = attrs.add_to;
+    a.global = attrs.global;
+    a.output_size = {0, 1, attrs.output_size};
+
+    if (!a.global && !a.adaptive() && attrs.auto_pad != Pool1DAttributes::AutoPad::NOTSET) {
+        a.padding[2] = resolve_leading_padding(
+            input.shape(2), attrs.kernel_shape, attrs.stride, attrs.dilation, attrs.padding,
+            static_cast<int>(attrs.auto_pad));
+    }
+    a.auto_pad = PoolingAttributes::AutoPad::NOTSET;
+
+    TensorView out4 = lift_wide(output);
+    TensorView in4 = lift_wide(input);
+    const TensorView ins[1] = {in4};
+    return pooling_cuda(a, out4, std::span<const TensorView>(ins, 1), ctx, workspace);
 }
 
 } // namespace nnops::backend::cuda

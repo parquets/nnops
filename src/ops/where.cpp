@@ -10,8 +10,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(WhereAttributes, where_cpu)
+NNOPS_DECLARE_CUDA(WhereAttributes, where_cuda)
 
-NNOPS_OP_BOILERPLATE(Where, WhereAttributes, backend::cpu::where_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Where, WhereAttributes, backend::cpu::where_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::where_cuda), nullptr)
 
 std::vector<TensorDesc> Where::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
 {

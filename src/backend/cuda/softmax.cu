@@ -262,86 +262,118 @@ __global__ void softmax_kernel(const T* __restrict__ input, T* __restrict__ outp
 }
 
 // ============================================================
-// General axis softmax kernel — reference-style decomposition
+// General axis softmax
 //
-// Each block normalizes D elements at stride axis_stride.
-// Launched with outer_size * inner_total blocks for full
-// parallelism across independent normalization groups.
-// outer_offsets/inner_offsets are the layout's own element offsets, walked once
-// on the host from stride_elems().
+// The axis is not the storage-innermost one, so a normalization group is D
+// elements at a constant stride. Each block takes one group, and the group's
+// two offsets are decoded from the view's own strides: the axes before the
+// softmax axis are one odometer, the axes after it another, and each is read
+// once per block. The old form built both tables on the host and copied them
+// in with a cudaMalloc/cudaFree pair per call, which cost more than the
+// softmax of a 64x4096x64 tensor did.
 // ============================================================
+
+/// One side of the group decomposition: the axes before (or after) the softmax
+/// axis, fastest last, with the strides of both operands.
+struct GroupWalk {
+    int64_t rank = 0;
+    int64_t dims[8] = {};
+    int64_t in_stride[8] = {};
+    int64_t out_stride[8] = {};
+};
+
+__device__ __forceinline__ int64_t group_offset_in(const GroupWalk& w, int64_t flat) noexcept
+{
+    int64_t off = 0;
+    for (int64_t d = w.rank - 1; d >= 0; --d) {
+        const int64_t n = w.dims[d];
+        off += (flat % n) * w.in_stride[d];
+        flat /= n;
+    }
+    return off;
+}
+
+__device__ __forceinline__ int64_t group_offset_out(const GroupWalk& w, int64_t flat) noexcept
+{
+    int64_t off = 0;
+    for (int64_t d = w.rank - 1; d >= 0; --d) {
+        const int64_t n = w.dims[d];
+        off += (flat % n) * w.out_stride[d];
+        flat /= n;
+    }
+    return off;
+}
 
 template <typename T>
 __global__ void softmax_general_kernel(const T* __restrict__ input, T* __restrict__ output,
-                                       int64_t outer_size, int64_t D, int64_t in_axis_stride,
-                                       int64_t out_axis_stride, int64_t inner_total,
-                                       const int64_t* __restrict__ outer_offsets,
-                                       const int64_t* __restrict__ inner_offsets,
-                                       const int64_t* __restrict__ out_outer_offsets,
-                                       const int64_t* __restrict__ out_inner_offsets,
-                                       bool log_softmax, bool row_resident, float inv_t)
+                                       int64_t groups, int64_t inner_total, int64_t D,
+                                       int64_t in_axis_stride, int64_t out_axis_stride,
+                                       GroupWalk outer, GroupWalk inner, bool log_softmax,
+                                       bool row_resident, float inv_t)
 {
     extern __shared__ float shared_buf[];
     float* row = row_resident ? shared_buf : nullptr;
     float* smem = shared_buf + (row_resident ? D : 0);
 
     const int tid = threadIdx.x;
-    const int outer = static_cast<int>(blockIdx.x / static_cast<unsigned int>(inner_total));
-    const int inner_idx = static_cast<int>(blockIdx.x % static_cast<unsigned int>(inner_total));
 
-    if (outer >= outer_size)
-        return;
+    for (int64_t g = blockIdx.x; g < groups; g += gridDim.x) {
+        const int64_t oi = g / inner_total;
+        const int64_t ii = g - oi * inner_total;
 
-    const int64_t base = outer_offsets[outer];
-    const int64_t inner_off = inner_offsets[inner_idx];
-    const int64_t y_base = out_outer_offsets[outer];
-    const int64_t y_inner_off = out_inner_offsets[inner_idx];
+        const int64_t base = group_offset_in(outer, oi);
+        const int64_t inner_off = group_offset_in(inner, ii);
+        const int64_t y_base = group_offset_out(outer, oi);
+        const int64_t y_inner_off = group_offset_out(inner, ii);
 
-    // ---- Pass 1: find max, and hold the row when it fits ----
-    float max_val = -1e30f;
-    for (int64_t k = tid; k < D; k += blockDim.x) {
-        const float x = s_load(&input[base + inner_off + k * in_axis_stride]);
-        max_val = fmaxf(max_val, x);
-        if (row != nullptr) {
-            row[k] = x;
-        }
-    }
-
-    max_val = block_reduce<true>(smem, max_val);
-
-    // ---- Pass 2: sum of exp(x - max) ----
-    // A resident row is overwritten with its exp values unless log-softmax needs
-    // the raw values again in pass 3, so that pass does not recompute the exp.
-    float sum_exp = 0.0f;
-    for (int64_t k = tid; k < D; k += blockDim.x) {
-        const float x =
-            (row != nullptr) ? row[k] : s_load(&input[base + inner_off + k * in_axis_stride]);
-        const float e = expf((x - max_val) * inv_t);
-        if (row != nullptr && !log_softmax) {
-            row[k] = e;
-        }
-        sum_exp += e;
-    }
-
-    sum_exp = block_reduce<false>(smem, sum_exp);
-
-    // ---- Pass 3: normalize ----
-    if (log_softmax) {
-        float log_sum = logf(sum_exp);
+        // ---- Pass 1: find max, and hold the row when it fits ----
+        float max_val = -1e30f;
         for (int64_t k = tid; k < D; k += blockDim.x) {
-            const int64_t off = base + inner_off + k * in_axis_stride;
-            const int64_t y_off = y_base + y_inner_off + k * out_axis_stride;
-            const float x = (row != nullptr) ? row[k] : s_load(&input[off]);
-            s_store(&output[y_off], (x - max_val) * inv_t - log_sum);
+            const float x = s_load(&input[base + inner_off + k * in_axis_stride]);
+            max_val = fmaxf(max_val, x);
+            if (row != nullptr) {
+                row[k] = x;
+            }
         }
-    } else {
-        float inv_sum = 1.0f / sum_exp;
+
+        max_val = block_reduce<true>(smem, max_val);
+
+        // ---- Pass 2: sum of exp(x - max) ----
+        // A non-resident row writes its exp values to the output here, and pass 3
+        // scales those instead of computing the exponential a second time.
+        float sum_exp = 0.0f;
         for (int64_t k = tid; k < D; k += blockDim.x) {
-            const int64_t off = base + inner_off + k * in_axis_stride;
-            const int64_t y_off = y_base + y_inner_off + k * out_axis_stride;
-            const float e =
-                (row != nullptr) ? row[k] : expf((s_load(&input[off]) - max_val) * inv_t);
-            s_store(&output[y_off], e * inv_sum);
+            const float x =
+                (row != nullptr) ? row[k] : s_load(&input[base + inner_off + k * in_axis_stride]);
+            const float e = expf((x - max_val) * inv_t);
+            if (row != nullptr) {
+                if (!log_softmax) {
+                    row[k] = e;
+                }
+            } else if (!log_softmax) {
+                s_store(&output[y_base + y_inner_off + k * out_axis_stride], e);
+            }
+            sum_exp += e;
+        }
+
+        sum_exp = block_reduce<false>(smem, sum_exp);
+
+        // ---- Pass 3: normalize ----
+        if (log_softmax) {
+            const float log_sum = logf(sum_exp);
+            for (int64_t k = tid; k < D; k += blockDim.x) {
+                const int64_t off = base + inner_off + k * in_axis_stride;
+                const int64_t y_off = y_base + y_inner_off + k * out_axis_stride;
+                const float x = (row != nullptr) ? row[k] : s_load(&input[off]);
+                s_store(&output[y_off], (x - max_val) * inv_t - log_sum);
+            }
+        } else {
+            const float inv_sum = 1.0f / sum_exp;
+            for (int64_t k = tid; k < D; k += blockDim.x) {
+                const int64_t y_off = y_base + y_inner_off + k * out_axis_stride;
+                const float e = (row != nullptr) ? row[k] : s_load(&output[y_off]);
+                s_store(&output[y_off], e * inv_sum);
+            }
         }
     }
 }
@@ -419,81 +451,50 @@ void softmax_cuda_impl(const SoftmaxAttributes& attrs, TensorView& output,
     }
 
     // ============================================================
-    // General axis: reference-style outer/D/inner decomposition
+    // General axis: outer / D / inner, both offsets decoded on device
     // ============================================================
 
     {
+        GroupWalk outer, inner;
+        for (int64_t d = 0; d < axis; ++d) {
+            outer.dims[outer.rank] = X.shape(d);
+            outer.in_stride[outer.rank] = X.stride_elems(d);
+            outer.out_stride[outer.rank] = output.stride_elems(d);
+            ++outer.rank;
+        }
+        // Softmax keeps the input's shape, so the inner axes keep their index.
+        for (int64_t d = axis + 1; d < rank; ++d) {
+            inner.dims[inner.rank] = X.shape(d);
+            inner.in_stride[inner.rank] = X.stride_elems(d);
+            inner.out_stride[inner.rank] = output.stride_elems(d);
+            ++inner.rank;
+        }
+
+        int64_t inner_total = 1;
+        for (int64_t d = 0; d < inner.rank; ++d) {
+            inner_total *= inner.dims[d];
+        }
         int64_t outer_size = 1;
-        for (int64_t i = 0; i < axis; ++i)
-            outer_size *= X.shape(i);
+        for (int64_t d = 0; d < outer.rank; ++d) {
+            outer_size *= outer.dims[d];
+        }
 
         const int64_t D = norm_size;
-        // No channel packing, so stride_elems() is the physical stride.
         const int64_t in_axis_stride = X.stride_elems(axis);
         const int64_t out_axis_stride = output.stride_elems(axis);
 
-        int64_t inner_total = 1;
-        for (int64_t i = axis + 1; i < rank; ++i)
-            inner_total *= X.shape(i);
-
-        // Precompute the position tables on host — one entry per outer position
-        // (the axis index left at 0) and one per inner position, for each side,
-        // since the output may carry a different pitch than the input.
-        const size_t table = static_cast<size_t>(outer_size + inner_total);
-        std::vector<int64_t> offsets(2 * table);
-        int64_t* outer_offsets = offsets.data();
-        int64_t* inner_offsets = offsets.data() + outer_size;
-        int64_t* y_outer_offsets = offsets.data() + table;
-        int64_t* y_inner_offsets = offsets.data() + table + outer_size;
-
-        for (int64_t o = 0; o < outer_size; ++o) {
-            int64_t off = 0, rem = o;
-            int64_t y_off = 0;
-            for (int64_t d = axis - 1; d >= 0; --d) {
-                int64_t dim = X.shape(d);
-                off += (rem % dim) * X.stride_elems(d);
-                y_off += (rem % dim) * output.stride_elems(d);
-                rem /= dim;
-            }
-            outer_offsets[o] = off;
-            y_outer_offsets[o] = y_off;
-        }
-        for (int64_t s = 0; s < inner_total; ++s) {
-            int64_t off = 0, rem = s;
-            int64_t y_off = 0;
-            for (int64_t d = rank - 1; d > axis; --d) {
-                int64_t dim = X.shape(d);
-                off += (rem % dim) * X.stride_elems(d);
-                y_off += (rem % dim) * output.stride_elems(d);
-                rem /= dim;
-            }
-            inner_offsets[static_cast<size_t>(s)] = off;
-            y_inner_offsets[static_cast<size_t>(s)] = y_off;
-        }
-
-        int64_t* d_offsets = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_offsets, offsets.size() * sizeof(int64_t)));
-        CUDA_CHECK(cudaMemcpyAsync(d_offsets, offsets.data(), offsets.size() * sizeof(int64_t),
-                                   cudaMemcpyHostToDevice, stream));
-
-        // Launch outer_size * inner_total blocks (one per normalization group).
-        // Use gridDim.y to carry inner_total so the kernel can decompose blockIdx.x.
-        const int block_size = std::min(static_cast<int>(D), kCudaBlockSize);
+        const int64_t groups = outer_size * inner_total;
+        const int block_size = static_cast<int>(std::min(D, int64_t(kCudaBlockSize)));
         const int64_t row_bytes = D * static_cast<int64_t>(sizeof(float));
         const bool row_resident = row_resident_worth(
             D, static_cast<int64_t>(sizeof(T)), block_size * static_cast<int64_t>(sizeof(float)));
         const int shared_bytes =
             static_cast<int>(block_size * sizeof(float) + (row_resident ? row_bytes : 0));
 
-        const int total_blocks = static_cast<int>(outer_size * inner_total);
-        dim3 grid(total_blocks);
-
-        softmax_general_kernel<<<grid, block_size, shared_bytes, stream>>>(
-            x_ptr, y_ptr, outer_size, D, in_axis_stride, out_axis_stride, inner_total, d_offsets,
-            d_offsets + outer_size, d_offsets + table, d_offsets + table + outer_size, log_softmax,
-            row_resident, 1.0f / attrs.temperature);
-
-        CUDA_CHECK(cudaFree(d_offsets));
+        const unsigned blocks = static_cast<unsigned>(std::min<int64_t>(groups, 65535));
+        softmax_general_kernel<<<blocks, block_size, shared_bytes, stream>>>(
+            x_ptr, y_ptr, groups, inner_total, D, in_axis_stride, out_axis_stride, outer, inner,
+            log_softmax, row_resident, 1.0f / attrs.temperature);
     }
 }
 

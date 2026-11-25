@@ -8,12 +8,14 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(SpaceToDepthAttributes, space_to_depth_cpu)
+NNOPS_DECLARE_CUDA(SpaceToDepthAttributes, space_to_depth_cuda)
 NNOPS_DECLARE_CPU(PixelShuffleAttributes, pixel_shuffle_cpu)
+NNOPS_DECLARE_CUDA(PixelShuffleAttributes, pixel_shuffle_cuda)
 
 NNOPS_OP_BOILERPLATE(SpaceToDepth, SpaceToDepthAttributes, backend::cpu::space_to_depth_cpu,
-                     nullptr, nullptr)
+                     NNOPS_IF_CUDA(backend::cuda::space_to_depth_cuda), nullptr)
 NNOPS_OP_BOILERPLATE(PixelShuffle, PixelShuffleAttributes, backend::cpu::pixel_shuffle_cpu,
-                     nullptr, nullptr)
+                     NNOPS_IF_CUDA(backend::cuda::pixel_shuffle_cuda), nullptr)
 
 namespace {
 

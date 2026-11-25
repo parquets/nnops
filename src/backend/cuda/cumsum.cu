@@ -43,7 +43,12 @@ cumsum_kernel(const T* __restrict__ input, T* __restrict__ output,
     // the same only for a dense row.
     const int64_t slice_start = outer * dim * axis_stride;
 
-    for (int64_t lower = threadIdx.x; lower < lower_dim_size; lower += blockDim.x) {
+    // The lower axis is independent per position, and on a wide one it is the
+    // only parallelism there is: [1024, 4096] along axis 0 used to run as one
+    // block of 256 threads and 1.3 ms. `blockIdx.y` splits it without touching
+    // the arithmetic, so every scan keeps its exact order.
+    for (int64_t lower = int64_t(blockIdx.y) * blockDim.x + threadIdx.x; lower < lower_dim_size;
+         lower += int64_t(gridDim.y) * blockDim.x) {
         if (!reverse) {
             // ---- Forward cumulative sum ----
             if (exclusive) {
@@ -124,11 +129,13 @@ void cumsum_cuda_impl(const CumSumAttributes& attrs, TensorView& output,
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
     const int block_size = std::min(static_cast<int>(lower_dim_size), kCudaBlockSize);
-    const int grid_size = static_cast<int>(upper_dim_count);
+    const int64_t lower_tiles = (lower_dim_size + block_size - 1) / block_size;
+    const dim3 grid(static_cast<unsigned>(std::min<int64_t>(upper_dim_count, 65535)),
+                    static_cast<unsigned>(std::min<int64_t>(lower_tiles, 65535)));
 
-    cumsum_kernel<<<grid_size, block_size, 0, stream>>>(input.ptr<T>(), output.ptr<T>(), dim,
-                                                        lower_dim_size, axis_stride,
-                                                        attrs.exclusive, attrs.reverse);
+    cumsum_kernel<<<grid, block_size, 0, stream>>>(input.ptr<T>(), output.ptr<T>(), dim,
+                                                   lower_dim_size, axis_stride, attrs.exclusive,
+                                                   attrs.reverse);
 }
 
 // ============================================================

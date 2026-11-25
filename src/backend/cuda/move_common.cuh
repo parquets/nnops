@@ -47,10 +47,13 @@ struct MoveLayout {
     int64_t strides[8] = {};
 };
 
-/// Offset of flat index `flat` under `l`. Runs once per row, so it stays out
-/// of line: inlined into `move_rows_kernel` the unrolled odometer makes cicc
-/// abort with "Failed to read bitcode" under `--split-compile=0`.
-static __host__ __device__ __noinline__ int64_t move_offset(const MoveLayout& l, int64_t flat)
+/// Offset of flat index `flat` under `l`. It has to be inlined: a device
+/// function call forces the 128 B layout through local memory for every
+/// thread, which measured 10x slower than the arithmetic itself on a row
+/// copy. The unrolled form makes cicc abort with "Failed to read bitcode"
+/// under `--split-compile=0`, so every translation unit that includes this
+/// header takes `--split-compile=1` (src/CMakeLists.txt).
+static __host__ __device__ __forceinline__ int64_t move_offset(const MoveLayout& l, int64_t flat)
 {
     int64_t off = 0;
     for (int i = 0; i < 8; ++i) {

@@ -15,6 +15,14 @@ Status nms_cpu(const NonMaxSuppressionAttributes& attrs, TensorView& indices,
                const ComputeContext& ctx, void* workspace);
 }
 
+#ifdef NNOPS_HAS_CUDA
+namespace backend::cuda {
+Status nms_cuda(const NonMaxSuppressionAttributes& attrs, TensorView& indices,
+                TensorView& num_selected, std::span<const TensorView> inputs,
+                const ComputeContext& ctx, void* workspace);
+}
+#endif
+
 struct NonMaxSuppression::Impl {
     using KernelFn = Status (*)(const NonMaxSuppressionAttributes&, TensorView&, TensorView&,
                                 std::span<const TensorView>, const ComputeContext&, void*);
@@ -28,6 +36,10 @@ auto resolve_nms_kernel(Backend backend) -> NonMaxSuppression::Impl::KernelFn
     switch (backend) {
     case Backend::CPU:
         return backend::cpu::nms_cpu;
+#ifdef NNOPS_HAS_CUDA
+    case Backend::CUDA:
+        return backend::cuda::nms_cuda;
+#endif
     default:
         return nullptr;
     }

@@ -222,10 +222,50 @@ if(NNOPS_BUILD_CUDA)
         # LSTM — the chunked input projection and the per-step product both run
         # on the dense GEMM engine, and one elementwise kernel does the gates.
         backend/cuda/rnn/recurrent.cu
+        # The general elementwise and movement family: conversions, clamp,
+        # compare/logical, where, flatten, the pixel-shuffle pair, embedding
+        # lookup and the quantize/dequantize pair.
+        backend/cuda/cast.cu
+        backend/cuda/clamp.cu
+        backend/cuda/compare.cu
+        backend/cuda/where.cu
+        backend/cuda/flatten.cu
+        backend/cuda/pixel_shuffle.cu
+        backend/cuda/embed.cu
+        backend/cuda/quant_linear.cu
+        backend/cuda/grid_sample.cu
+        backend/cuda/roi_align.cu
+        backend/cuda/rope.cu
+        backend/cuda/non_max_suppression.cu
         # Unsupported operators' entry points, so the CUDA library resolves every
         # dispatch site the CPU backend references.
         backend/cuda/not_implemented.cu
     )
+
+    # The elementwise/movement translation units are small and cicc fails to
+    # read its own intermediate bitcode for them under the target-wide
+    # --split-compile=0 (the flag that keeps the fat GEMM TU tractable). They
+    # take split-compile=1 instead; it is a compile-time knob only. Every TU
+    # that inlines the movement odometer (move_common.cuh) needs it too.
+    set_source_files_properties(
+        backend/cuda/cast.cu
+        backend/cuda/compare.cu
+        backend/cuda/where.cu
+        backend/cuda/quant_linear.cu
+        backend/cuda/grid_sample.cu
+        backend/cuda/roi_align.cu
+        backend/cuda/rope.cu
+        backend/cuda/non_max_suppression.cu
+        backend/cuda/permute.cu
+        backend/cuda/slice.cu
+        backend/cuda/tile.cu
+        backend/cuda/concat.cu
+        backend/cuda/split.cu
+        backend/cuda/flatten.cu
+        backend/cuda/gather.cu
+        backend/cuda/pad.cu
+        backend/cuda/scatter.cu
+        PROPERTIES COMPILE_OPTIONS "--split-compile=1")
 
     add_library(nnops_cuda STATIC ${NNOPS_CUDA_SOURCES})
     target_link_libraries(nnops_cuda PUBLIC nnops)

@@ -63,9 +63,20 @@ Status cumsum_impl(const CumSumAttributes& attrs, TensorView& output,
     };
 
     // The lane walk adds the lower-dim index straight to the slice address, so
-    // those axes must be physically adjacent — true for the innermost axis at
-    // any pitch, and for a middle axis only on a compact view.
-    if (axis != rank - 1 && (!is_compact_view(input) || !is_compact_view(output))) {
+    // those axes must be physically adjacent to each other — which a padded
+    // pitch does not disturb (it widens the row above them). Only an
+    // interleaved lower axis has to fall back.
+    const auto lower_is_adjacent = [&](const TensorView& v) {
+        int64_t want = 1;
+        for (int64_t d = v.rank() - 1; d > axis; --d) {
+            if (v.shape(d) != 1 && v.stride_elems(d) != want) {
+                return false;
+            }
+            want *= v.shape(d);
+        }
+        return true;
+    };
+    if (axis != rank - 1 && (!lower_is_adjacent(input) || !lower_is_adjacent(output))) {
         return Status::unsupported;
     }
 
