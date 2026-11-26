@@ -140,6 +140,7 @@ if(NNOPS_BUILD_CUDA)
         test_cuda_rnn.cpp
         test_cuda_general_ops.cpp
         test_cuda_attention.cpp
+        test_cuda_linear_attention.cpp
     )
 endif()
 
@@ -211,6 +212,7 @@ if(NNOPS_BUILD_BENCHMARKS)
             bench_cuda_rnn.cpp
             bench_cuda_general_ops.cpp
             bench_cuda_attention.cpp
+            bench_cuda_linear_attention.cpp
         )
     endif()
 

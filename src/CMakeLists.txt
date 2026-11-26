@@ -229,6 +229,9 @@ if(NNOPS_BUILD_CUDA)
         # (MHA at H_kv == H) and MultiLatentAttention, both forms — see
         # backend/common/attention_config.hpp for the shared description.
         backend/cuda/attention/attention.cu
+        # LinearAttention: the gated delta recurrence with the state slab in
+        # registers, one launch for the whole sequence.
+        backend/cuda/attention/linear_attention.cu
         # The general elementwise and movement family: conversions, clamp,
         # compare/logical, where, flatten, the pixel-shuffle pair, embedding
         # lookup and the quantize/dequantize pair.
@@ -244,9 +247,6 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/roi_align.cu
         backend/cuda/rope.cu
         backend/cuda/non_max_suppression.cu
-        # Unsupported operators' entry points, so the CUDA library resolves every
-        # dispatch site the CPU backend references.
-        backend/cuda/not_implemented.cu
     )
 
     # The elementwise/movement translation units are small and cicc fails to
