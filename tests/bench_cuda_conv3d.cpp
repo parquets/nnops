@@ -196,6 +196,18 @@ NNOPS_BENCH(cuda_transpose_conv3d)
     same.ih = same.iw = 32;
     run_tconv3d(same);
 
+    // A depthwise geometry: one channel a group on both sides. Conv3D hands
+    // this to the depthwise kernel; the transposed pose has no rank-5 depthwise
+    // op to hand it to, so its row is the grouped GEMM's floor.
+    C3Bench dw;
+    dw.ic = dw.oc = 64;
+    dw.groups = 64;
+    dw.id = 4;
+    dw.ih = dw.iw = 16;
+    dw.sd = dw.sh = dw.sw = 2;
+    dw.pd = dw.ph = dw.pw = 1;
+    run_tconv3d(dw);
+
     // A small-channel patch-decoder pose and a grouped one.
     C3Bench small;
     small.ic = 16;

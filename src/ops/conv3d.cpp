@@ -11,14 +11,50 @@
 #include "nnops/detail/assert.hpp"
 #include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
+#include "nnops/ops/depthwise_conv.hpp"
 #include "backend/cpu/conv/conv3d_implicit_gemm_internal.h"
 
+#include <span>
 #include <vector>
 
 namespace nnops {
 
+namespace {
+
+/// One input channel a group on both sides: the grouped GEMM degenerates there —
+/// a single-row product re-dispatched per group — while the depthwise kernels
+/// accumulate whole voxels a lane. The filter DHWIO [KD][KH][KW][1][C] is the
+/// depthwise [KD][KH][KW][C] order with the singleton axis dropped, so the hand
+/// over converts nothing.
+bool is_depthwise_geometry(const Conv3DAttributes& attrs, const TensorView& weight)
+{
+    if (attrs.groups <= 1 || !is_channel_last_weight_3d(weight.layout()) || weight.rank() != 5) {
+        return false;
+    }
+    return weight.shape(3) == 1 && weight.shape(4) == attrs.groups;
+}
+
+bool is_fp_depthwise(DataType dtype) noexcept
+{
+    return dtype == DataType::f32 || dtype == DataType::f16;
+}
+
+/// The depthwise kernels walk the filter as a dense [KD][KH][KW][C] run, so a
+/// padded row is the one thing the hand-over cannot carry: it would read the pad
+/// as channels. A pitched filter stays on the grouped route.
+bool is_dense_run(const TensorView& w) noexcept
+{
+    const int64_t cols = w.shape(w.rank() - 1);
+    return w.pitch() == static_cast<int64_t>(data_type_row_bytes(w.data_type(), cols));
+}
+
+} // anonymous namespace
+
 NNOPS_DECLARE_CPU(Conv3DAttributes, conv3d_cpu)
 NNOPS_DECLARE_CUDA(Conv3DAttributes, conv3d_cuda)
+// The depthwise hand-off a groups == channels geometry takes.
+NNOPS_DECLARE_CPU(DepthwiseConvAttributes, depthwise_conv_cpu)
+NNOPS_DECLARE_CUDA(DepthwiseConvAttributes, depthwise_conv_cuda)
 
 NNOPS_OP_BOILERPLATE(Conv3D, Conv3DAttributes, backend::cpu::conv3d_cpu,
                      NNOPS_IF_CUDA(backend::cuda::conv3d_cuda), nullptr)
@@ -103,6 +139,46 @@ Status Conv3D::compute(std::span<TensorView> outputs, std::span<const TensorView
                 attrs.padding[static_cast<size_t>(i)], ap);
         }
         attrs.auto_pad = Conv3DAttributes::AutoPad::NOTSET;
+    }
+
+    // A depthwise geometry reads the filter Conv3D was handed, so it costs no
+    // conversion in either layout: one channel a group on both sides makes the
+    // DHWIO filter the depthwise [KD][KH][KW][C] one axis shorter. The hand-over
+    // is worth roughly an order of magnitude — a depthwise row measured 18
+    // GFLOPS on the device, where every group is its own block on a tile that
+    // can only fill one of its 64 columns.
+    if ((backend_ == Backend::CPU || backend_ == Backend::CUDA) && inputs.size() >= 2 &&
+        is_fp_depthwise(inputs[0].data_type()) &&
+        inputs[1].data_type() == inputs[0].data_type() && output.data_type() == inputs[0].data_type() &&
+        is_depthwise_geometry(attrs, inputs[1]) && is_dense_run(inputs[1])) {
+        const auto& wgt = inputs[1];
+        DepthwiseConvAttributes dw;
+        dw.kernel_size = attrs.kernel_size;
+        dw.stride = attrs.stride;
+        dw.dilation = attrs.dilation;
+        dw.padding = attrs.padding;
+        dw.epilogue = attrs.epilogue;
+        dw.add_to = attrs.add_to;
+        // The filter as [KD][KH][KW][C]: the innermost row is the channel run in
+        // both orders, so the pitch and the layout are all that change.
+        const int64_t wsh[4] = {wgt.shape(0), wgt.shape(1), wgt.shape(2), wgt.shape(4)};
+        const TensorView w_view(std::span<const int64_t>(wsh, 4), wgt.data_type(),
+                                const_cast<void*>(wgt.ptr<void>()), wgt.pitch(),
+                                TensorLayout::HWCM);
+        TensorView operands[3] = {inputs[0], w_view, TensorView{}};
+        const size_t n_in = inputs.size();
+        if (n_in > 2) {
+            operands[2] = inputs[2];
+        }
+        const std::span<const TensorView> ins(operands, n_in);
+        if (backend_ == Backend::CPU) {
+            return backend::cpu::depthwise_conv_cpu(dw, output, ins, ctx, workspace);
+        }
+#if defined(NNOPS_HAS_CUDA)
+        return backend::cuda::depthwise_conv_cuda(dw, output, ins, ctx, workspace);
+#else
+        return Status::unsupported;
+#endif
     }
 
     if (!impl_->kernel_fn) {

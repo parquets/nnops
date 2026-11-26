@@ -74,6 +74,15 @@ bool is_fp(DataType dtype) noexcept
     return dtype == DataType::f32 || dtype == DataType::f16 || dtype == DataType::bf16;
 }
 
+/// The depthwise kernels walk the filter as a dense [KH][KW][C] run, so a padded
+/// row is the one thing the hand-over cannot carry — it would read the pad as
+/// channels. A pitched filter stays on the grouped route.
+bool is_dense_run(const TensorView& w) noexcept
+{
+    const int64_t cols = w.shape(w.rank() - 1);
+    return w.pitch() == static_cast<int64_t>(data_type_row_bytes(w.data_type(), cols));
+}
+
 auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm) -> Conv2D::Impl::KernelFn
 {
     if (algorithm == ConvAlgorithm::Winograd && backend == Backend::CPU) {
@@ -263,7 +272,7 @@ Status Conv2D::compute(std::span<TensorView> outputs, std::span<const TensorView
     if ((backend_ == Backend::CPU || backend_ == Backend::CUDA) &&
         attrs.algorithm != ConvAlgorithm::ImplicitGemm && inputs.size() >= 2 &&
         is_fp(inputs[0].data_type()) && is_fp(inputs[1].data_type()) &&
-        is_depthwise_geometry(attrs, inputs[1])) {
+        is_depthwise_geometry(attrs, inputs[1]) && is_dense_run(inputs[1])) {
         DepthwiseConvAttributes dw;
         dw.kernel_size = {1, attrs.kernel_size[0], attrs.kernel_size[1]};
         dw.stride = {1, attrs.stride[0], attrs.stride[1]};
