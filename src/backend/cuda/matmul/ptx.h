@@ -403,6 +403,17 @@ __device__ __forceinline__ void cp_async_wait_all(void)
 // 5. Shared Memory → 寄存器 (ldmatrix / ld.shared)
 // ============================================================================
 
+/// ldmatrix.x4.trans — 给定 32 位共享地址的转置加载 (P·V 的 V 操作数)
+__device__ __forceinline__ void ldmatrix_x4_trans_at(uint32_t* r0, uint32_t* r1, uint32_t* r2,
+                                                     uint32_t* r3, uint32_t addr)
+{
+#if PTX_SM80_ENABLED
+    asm volatile("ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(*r0), "=r"(*r1), "=r"(*r2), "=r"(*r3)
+                 : "r"(addr));
+#endif
+}
+
 /// ldmatrix.x2 — 每线程加载 2 个 uint32 寄存器
 __device__ __forceinline__ void ldmatrix_x2(uint32_t* r0, uint32_t* r1, const void* smem)
 {

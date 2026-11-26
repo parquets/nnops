@@ -222,6 +222,10 @@ if(NNOPS_BUILD_CUDA)
         # LSTM — the chunked input projection and the per-step product both run
         # on the dense GEMM engine, and one elementwise kernel does the gates.
         backend/cuda/rnn/recurrent.cu
+        # Attention: one tiled online-softmax kernel behind GroupQueryAttention
+        # (MHA at H_kv == H) and MultiLatentAttention, both forms — see
+        # backend/common/attention_config.hpp for the shared description.
+        backend/cuda/attention/attention.cu
         # The general elementwise and movement family: conversions, clamp,
         # compare/logical, where, flatten, the pixel-shuffle pair, embedding
         # lookup and the quantize/dequantize pair.

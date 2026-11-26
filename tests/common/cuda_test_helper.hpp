@@ -315,6 +315,14 @@ struct DeviceTensor {
 
 inline DeviceTensor to_device(const HostTensor& h)
 {
+    // An omitted optional input is a default HostTensor: no storage, no view.
+    // It must stay an empty device view too — uploading a zero-byte block would
+    // hand the kernel a non-null pointer and make the slot look present.
+    if (h.bytes.empty()) {
+        DeviceTensor d;
+        d.view = TensorView{};
+        return d;
+    }
     DeviceTensor d{CudaBuffer(h.bytes.size())};
     d.buf.upload(h.bytes.data(), h.bytes.size());
     d.view = TensorView(h.view.shape_span(), h.view.data_type(), d.buf.data(),

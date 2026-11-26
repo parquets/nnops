@@ -17,6 +17,7 @@
 /// live yet.
 
 #include <cstdint>
+#include <limits>
 
 namespace nnops {
 

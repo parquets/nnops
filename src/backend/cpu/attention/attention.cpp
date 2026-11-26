@@ -296,84 +296,15 @@ Status group_query_attention_cpu(const GroupQueryAttentionAttributes& attrs,
                                  std::span<TensorView> outputs, std::span<const TensorView> inputs,
                                  const ComputeContext& ctx, void* workspace)
 {
-    AttentionConfig cfg;
-    cfg.num_heads = attrs.num_heads;
-    cfg.num_kv_heads = attrs.kv_num_heads;
-    cfg.scale = attrs.scale;
-    cfg.causal = attrs.causal;
-    cfg.softcap = attrs.softcap;
-    cfg.window = attrs.local_window_size > 0 ? attrs.local_window_size : 0;
-    cfg.sink_tokens = attrs.sink_tokens;
-    cfg.output_gate = attrs.output_gate;
-    cfg.bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
-    cfg.mask_filter_value = attrs.mask_filter_value;
-    cfg.quantize_q = attrs.quantize_query;
-    cfg.quantize_pv = attrs.quantize_pv;
-
-    if (attrs.causal) {
-        // Cache form: Q, k_cache, v_cache, kv_seqlens, k_scale, v_scale,
-        // head_sink, output gate. The caches are BNSH whatever Q's layout is.
-        cfg.seqlens_slot = 3;
-        cfg.seqlens_is_length = true;
-        cfg.pos_ids_slot = 4;
-        cfg.k_scale_slot = 5;
-        cfg.v_scale_slot = 6;
-        cfg.sink_slot = 7;
-        cfg.gate_slot = 8;
-        cfg.kv_bshd = false;
-    } else {
-        // Explicit form: Q, K, V, attention_bias, key_padding_mask, head_sink,
-        // cu_seqlens_q/k, output gate. K/V follow Q's layout.
-        cfg.bias_slot = 3;
-        cfg.kpm_slot = 4;
-        cfg.sink_slot = 5;
-        cfg.cu_q_slot = 6;
-        cfg.cu_k_slot = 7;
-        cfg.gate_slot = 8;
-        cfg.kv_bshd = attrs.head_layout == AttentionHeadLayout::BSHD;
-    }
-    return attention_cpu(cfg, outputs, inputs, ctx, workspace);
+    return attention_cpu(make_attention_config(attrs), outputs, inputs, ctx, workspace);
 }
 
 Status multi_latent_attention_cpu(const MultiLatentAttentionAttributes& attrs,
                                   TensorView& output, std::span<const TensorView> inputs,
                                   const ComputeContext& ctx, void* workspace)
 {
-    AttentionConfig cfg;
-    cfg.num_heads = attrs.num_heads;
-    cfg.num_kv_heads = attrs.kv_num_heads;
-    cfg.v_head_dim = attrs.v_head_dim > 0 ? attrs.v_head_dim : attrs.kv_lora_rank;
-    cfg.scale =
-        attrs.scale != 0.0f ?
-            attrs.scale :
-            1.0f / std::sqrt(static_cast<float>(attrs.qk_nope_head_dim + attrs.qk_rope_head_dim));
-    cfg.causal = attrs.causal;
-    cfg.position_offset = attrs.position_offset;
-    // Absorbed: one latent row per token and the value is its prefix. The
-    // non-absorbed form takes a separate V tensor, as GQA does.
-    cfg.v_is_k = attrs.absorbed;
-    // MLA keeps its own slot list (there is no onnxruntime operator to mirror):
-    // Q, KV, [mask], [past KV], [seqlens_k], [cu_seqlens_q], [cu_seqlens_k] —
-    // or Q, K, V, [mask], [past K], [past V], [seqlens_k], [cu_q], [cu_k].
-    if (attrs.absorbed) {
-        cfg.bias_slot = 2;
-        cfg.past_k_slot = 3;
-        cfg.past_v_slot = 3;
-        cfg.seqlens_slot = 4;
-        cfg.pos_ids_slot = 5;
-        cfg.cu_q_slot = 6;
-        cfg.cu_k_slot = 7;
-    } else {
-        cfg.bias_slot = 3;
-        cfg.past_k_slot = 4;
-        cfg.past_v_slot = 5;
-        cfg.seqlens_slot = 6;
-        cfg.pos_ids_slot = 7;
-        cfg.cu_q_slot = 8;
-        cfg.cu_k_slot = 9;
-    }
     std::span<TensorView> outputs(&output, 1);
-    return attention_cpu(cfg, outputs, inputs, ctx, workspace);
+    return attention_cpu(make_attention_config(attrs), outputs, inputs, ctx, workspace);
 }
 
 } // namespace nnops::backend::cpu

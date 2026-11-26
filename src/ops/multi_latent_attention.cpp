@@ -36,9 +36,11 @@ int64_t latent_dim_of(const MultiLatentAttentionAttributes& attrs)
 } // anonymous namespace
 
 NNOPS_DECLARE_CPU(MultiLatentAttentionAttributes, multi_latent_attention_cpu)
+NNOPS_DECLARE_CUDA(MultiLatentAttentionAttributes, multi_latent_attention_cuda)
 
 NNOPS_OP_BOILERPLATE(MultiLatentAttention, MultiLatentAttentionAttributes,
-                     backend::cpu::multi_latent_attention_cpu, nullptr, nullptr)
+                     backend::cpu::multi_latent_attention_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::multi_latent_attention_cuda), nullptr)
 
 std::vector<TensorDesc>
 MultiLatentAttention::getOutputTensorDesc(std::span<const TensorDesc> inputs) const

@@ -35,6 +35,25 @@ inline std::atomic<int> cuda_rnn_serial{0};
 /// does that only when the tiled grid would leave the machine part empty.
 inline std::atomic<int> cuda_narrow_m{-1};
 
+/// CUDA attention decode split-KV: -1 automatic, 0 keeps the whole run in one
+/// block, N > 1 forces N splits (clamped by the same rules as the auto choice).
+inline std::atomic<int> cuda_attn_split{-1};
+
+/// CUDA attention decode head group: -1 automatic, N > 0 forces N query heads
+/// per decode block (clamped by the same rules as the auto choice).
+inline std::atomic<int> cuda_attn_headbatch{-1};
+
+/// CUDA attention prefill tile: -1 automatic (the register-blocked tile when the
+/// shape is eligible), 0 forces the older one-row-per-thread tiled kernel, 1
+/// takes the blocked tile whenever it is eligible.
+inline std::atomic<int> cuda_attn_blocked{-1};
+
+/// CUDA attention 16-bit tensor-core tile: -1 automatic (a 16-bit cache takes
+/// the m16n8k16 tile whenever the shape is eligible), 0 keeps it on the FFMA
+/// tile. The blocked knob above then decides between the FFMA tile and the
+/// older tiled kernel, so the bench can A/B all three.
+inline std::atomic<int> cuda_attn_tc{-1};
+
 /// CUDA narrow-m loop variant: 0 is the production pick (f16 keeps 32 B rows in
 /// flight, f32 16), 1 the 4-column / 16-row group, 2 the 2-column / 16-row one,
 /// 3 the 2-column / 32-row one. A bench compares them.

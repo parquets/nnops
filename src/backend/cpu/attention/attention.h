@@ -145,6 +145,7 @@
 /// attention_internal.h; attention_plan.cpp owns the tile and scratch sizing,
 /// and attention.cpp holds the public entry and the operator mappings.
 
+#include "backend/common/attention_config.hpp" // AttentionConfig, shared with CUDA
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/status.hpp"
@@ -155,85 +156,10 @@
 
 namespace nnops::backend::cpu {
 
-/// The head geometry and behaviour one attention call is run with.
-///
-/// Input slots are fields, not positions: each operator's front-end maps its
-/// onnxruntime-aligned input list onto them, and the routes never assume a
-/// numbering. A -1 means the operator has no such slot; an empty view there
-/// means the caller left it out.
-struct AttentionConfig {
-    int64_t num_heads = 1;    ///< query heads (H)
-    int64_t num_kv_heads = 0; ///< key/value heads; 0 means num_heads
-    int64_t v_head_dim = 0;   ///< value width; only read when v_is_k
-    float scale = 0.0f;       ///< 0 means 1/sqrt(query-key width)
-    bool causal = false;      ///< causal mask over the run
-    bool v_is_k = false;      ///< value = leading v_head_dim of the key row
-    /// Absolute position of query row 0; negative (the default) means
-    /// bottom-right, q0 = run - Sq. Only consulted when causal.
-    int64_t position_offset = -1;
-    /// Logit cap (Gemma2/3 softcapping): s = cap·tanh(s/cap), applied after the
-    /// scale and before the additive mask. 0 disables.
-    float softcap = 0.0f;
-    /// Sliding window: query row i also skips keys older than its position
-    /// minus window + 1 (Gemma2/3 local layers). 0 disables.
-    int64_t window = 0;
-    /// StreamingLLM-style sinks: the first `sink_tokens` key positions stay
-    /// visible to every query row even outside the window. Only meaningful
-    /// with `window`; 0 disables. A row's visible keys are then
-    /// [0, sink) ∪ [pos_i - window + 1, pos_i + 1).
-    int64_t sink_tokens = 0;
-    /// Output gate (Qwen3-Next/3.5): the finished output is multiplied in place
-    /// by act(gate) of the trailing input slot. None disables.
-    EpilogueActivateType output_gate = EpilogueActivateType::None;
-
-    // ---- input slots (-1 means the operator has no such slot) ----
-    int past_k_slot = -1;    ///< past K rows; past_v_slot is past K + 1
-    int past_v_slot = -1;
-    int seqlens_slot = -1;   ///< int32 [B] per-batch valid run (see seqlens_is_length)
-    /// seqlens entries are already lengths; false is onnxruntime's last valid
-    /// key index (T-1). The cache form is a length, MLA's seqlens_k is not.
-    bool seqlens_is_length = false;
-    int kpm_slot = -1;       ///< int32 key_padding_mask: [B] lengths or a keep mask
-    int sink_slot = -1;      ///< per-head attention sink (softmax denominator)
-    int bias_slot = -1;      ///< float additive attention_bias
-    int cu_q_slot = -1;      ///< varlen offsets; cu_k_slot is cu_q_slot + 1
-    int cu_k_slot = -1;
-    int gate_slot = -1;      ///< output gate, shaped like the output
-    /// int64 [B]: the absolute position of query row 0 for each batch, rows
-    /// consecutive. Overrides position_offset (a scalar for every batch) and
-    /// the bottom-right default. The same input RoPE reads.
-    int pos_ids_slot = -1;
-    /// f32 dequantization scales for an int8 K / V cache; -1 (or an empty
-    /// view) with an fp cache. numel 1 is per-tensor, H_kv·D per-channel.
-    int k_scale_slot = -1;
-    int v_scale_slot = -1;
-    /// The rank-4 per-head form of Q is [B, S, H, D] instead of [B, H, S, D]
-    /// (onnxruntime's BNSH). Both are the same rank, so this is explicit.
-    bool bshd = false;
-    /// The rank-4 K/V form is [B, S, H_kv, D] rather than BNSH. The explicit
-    /// form follows Q's layout; the cache is always BNSH.
-    bool kv_bshd = false;
-    /// Value a key_padding_mask uses for a padded key (onnxruntime's
-    /// mask_filter_value, default -10000 — not -inf).
-    float mask_filter_value = -10000.0f;
-    /// Dynamic int8 quantization of the query for Q·Kᵀ: every query row is
-    /// quantized on the fly (its own symmetric scale) and the product runs on
-    /// the integer MMA, dequantized into the score tile afterwards. Only the
-    /// flash route has the path, and only over an s8 cache whose query-key
-    /// width divides the integer pack's k group; everywhere else the fp route
-    /// runs unchanged.
-    bool quantize_q = false;
-    /// int8 probabilities in P·V: the flash route rounds the (already
-    /// max-subtracted, so [0,1]) probability tile onto a static 255-level
-    /// grid and runs the second product on the integer MMA too, folding the
-    /// cache's per-key V scale into the probabilities. This is the lossiest of
-    /// the integer steps — it rounds the weights themselves — so it is a
-    /// separate switch from quantize_q. Same eligibility as quantize_q apart
-    /// from the head width: an s8 cache on the flash route.
-    bool quantize_pv = false;
-
-    int64_t kv_heads() const noexcept { return num_kv_heads > 0 ? num_kv_heads : num_heads; }
-};
+/// The head geometry and behaviour one attention call is run with — shared
+/// with the CUDA backend (backend/common/attention_config.hpp); kept under this
+/// namespace so the routes and the tests read it unqualified.
+using AttentionConfig = ::nnops::backend::AttentionConfig;
 
 /// Tile sizes + scratch layout, resolved once and shared by the kernels and
 /// the scratch sizing.

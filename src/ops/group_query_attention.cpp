@@ -55,6 +55,15 @@ Status group_query_attention_cpu(const GroupQueryAttentionAttributes& attrs,
                                  void* workspace);
 } // namespace backend::cpu
 
+#if defined(NNOPS_HAS_CUDA)
+namespace backend::cuda {
+Status group_query_attention_cuda(const GroupQueryAttentionAttributes& attrs,
+                                  std::span<TensorView> outputs,
+                                  std::span<const TensorView> inputs, const ComputeContext& ctx,
+                                  void* workspace);
+} // namespace backend::cuda
+#endif
+
 struct GroupQueryAttention::Impl {
     using KernelFn = Status (*)(const GroupQueryAttentionAttributes&, std::span<TensorView>,
                                 std::span<const TensorView>, const ComputeContext&, void*);
@@ -68,6 +77,10 @@ auto resolve_gqa_kernel(Backend backend) -> GroupQueryAttention::Impl::KernelFn
     switch (backend) {
     case Backend::CPU:
         return backend::cpu::group_query_attention_cpu;
+#if defined(NNOPS_HAS_CUDA)
+    case Backend::CUDA:
+        return backend::cuda::group_query_attention_cuda;
+#endif
     default:
         return nullptr;
     }
