@@ -108,6 +108,43 @@ void run_case(const T3Case& c, const char* what)
 
 } // anonymous namespace
 
+NNOPS_TEST(cuda_transpose_conv3d_smallest)
+{
+    // One voxel, one tap, no stride: the smallest product there is.
+    T3Case c;
+    c.id = c.ih = c.iw = 1;
+    c.ic = 4;
+    c.oc = 4;
+    c.kd = c.kh = c.kw = 1;
+    c.pd = c.ph = c.pw = 0;
+    run_case(c, "cuda_tconv3d_smallest");
+}
+
+NNOPS_TEST(cuda_transpose_conv3d_voxel_rows)
+{
+    // Two voxels a side, still one tap: the output is strided.
+    T3Case c;
+    c.id = c.ih = c.iw = 2;
+    c.ic = 4;
+    c.oc = 4;
+    c.kd = c.kh = c.kw = 1;
+    c.pd = c.ph = c.pw = 0;
+    run_case(c, "cuda_tconv3d_voxel_rows");
+}
+
+NNOPS_TEST(cuda_transpose_conv3d_single_tap_stride)
+{
+    // One tap, stride two: only the aligned outputs contribute.
+    T3Case c;
+    c.id = c.ih = c.iw = 2;
+    c.ic = 4;
+    c.oc = 4;
+    c.kd = c.kh = c.kw = 1;
+    c.pd = c.ph = c.pw = 0;
+    c.sd = c.sh = c.sw = 2;
+    run_case(c, "cuda_tconv3d_single_tap_stride");
+}
+
 NNOPS_TEST(cuda_transpose_conv3d_stride)
 {
     for (DataType dt : {DataType::f32, DataType::f16}) {

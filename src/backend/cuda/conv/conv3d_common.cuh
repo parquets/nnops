@@ -1,6 +1,6 @@
 #pragma once
 /// @file conv3d_common.cuh
-/// @brief The 3-D convolution family's kernel: one implicit GEMM over the
+/// @brief The 3-D convolution family's kernels: one implicit GEMM over the
 ///        output-voxel axis, with the transposed pose as a gather predicate.
 ///
 /// Conv3D and TransposeConv3D are the same product. Both write an output voxel
@@ -11,47 +11,81 @@
 /// the epilogue — is shared, so it is one kernel with a template flag.
 ///
 /// M is the output-voxel axis, N the output channels of one group, K the
-/// reduction IC/G·KD·KH·KW. One block owns 64 voxels by 64 channels, sixteen a
-/// thread in a 4x4 register tile, and steps the reduction 32 k at a time. The
-/// activation tile is the gathered operand: its panels are k-major so the inner
-/// loop reads one float4 from each of A and B per four-by-four of the tile, and
-/// the fill is m-fastest inside a k so a warp's reads are one tap's channels,
-/// which are the contiguous ones.
+/// reduction IC/G·KD·KH·KW. One block owns 64 voxels by 64 channels and steps
+/// the reduction a stage of k at a time through a cp.async ring, so the gather
+/// of stage t+1 runs under the MMA of stage t.
 ///
-/// The k index decodes to a tap and an input channel, which for Conv3D's DHWIO
-/// filter is also the filter's own innermost order; both filter orders are
-/// walked through their strides, so a padded or grouped filter reads correctly
-/// and one expression serves DHWIO and TransposeConv3D's [IC][OC/G][KD][KH][KW].
+/// The mainloops are the GEMM engine's, not this file's: `f32_gemm_tile` on a
+/// padded panel pair for f32, `f16_gemm_tile` on the swizzled pair for the
+/// 16-bit dtypes. Both take the panels in their own layouts, which is what lets
+/// a gathered fill sit where the dense GEMM's cp.async copy sits.
 ///
-/// The decode is done once per k into shared memory rather than once per
-/// (voxel, k): the 64 rows of a tile share it, and a division per element is
-/// most of what the fill would otherwise cost.
+/// **The gather is the whole cost** — with it stubbed out this kernel runs at
+/// 6253 GFLOPS against 3144 with it — and three things keep it off the critical
+/// path. A thread owns one k column, one tap's channel run, so the tap decodes
+/// once a stage rather than once an element; a division by a runtime value is a
+/// twenty-instruction sequence on this ISA and the element-at-a-time form spent
+/// two of them on every element of the panel. The run is one 16 B vector — four
+/// channels for f32, eight for the 16-bit dtypes — which is exactly what a tap's
+/// channels are in NDHWC, so one address computation and one bounds test cover
+/// the vector. And a vector tap is either wholly inside the volume or wholly
+/// outside it, so the test is per (voxel, tap) at the vector's granularity, and
+/// the copy is one cp.async or one zero.
 
 #include "backend/cuda/cuda_common.cuh"
 #include "backend/cuda/matmul/matmul_epilogue.cuh" // gemm_apply_activation
+#include "backend/cuda/matmul/matmul_f16.cuh"
+#include "backend/cuda/matmul/matmul_f32.cuh"
+#include "backend/cuda/matmul/ptx.h"
 #include "nnops/core/status.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <type_traits>
 
 namespace nnops::backend::cuda::conv3d {
 
-constexpr int kC3Threads = 256;
-constexpr int kC3BM = 64; ///< output voxels a block owns
-constexpr int kC3BN = 64; ///< output channels a block owns
-constexpr int kC3BK = 32; ///< reduction per step
-constexpr int kC3TM = 4;  ///< voxels a thread computes
-constexpr int kC3TN = 4;  ///< channels a thread computes
-/// Panel row stride: a multiple of four elements so the inner loop's float4 read
-/// is aligned, and 4 past the row so the sixteen lanes of a row spread over
-/// eight bank groups twice rather than thirty-two once.
-constexpr int kC3SA = kC3BM + 4;
-constexpr int kC3SB = kC3BN + 4;
+/// The f32 tile: 128 voxels by 64 channels, 4x8 a lane, eight warps, 16 k a
+/// stage, two stages. Conv2D's lane tile, one warp row wider: a 3-D output has
+/// the voxel axis to itself, so the extra warps go there and the block reaches
+/// 24 resident warps at 29 KB of panels.
+using C3ShapeF = F32TileShape<4, 8, 4, 2, 16, 2, 4, 8, 4, 3>;
+/// The transposed pose reads the same tile one warp row taller: its gather
+/// divides the source index, which costs the same per voxel however tall the
+/// tile, so the extra rows amortize it (measured: 2704 -> 3497 GFLOPS on a 2x
+/// upsampling, against 3102 -> 2677 the other way for the forward pose).
+using C3ShapeFT = F32TileShape<4, 8, 4, 2, 16, 2, 4, 8, 4, 3>;
+/// The 16-bit tile: the same 64 by 64 output block, eight warps, 64 k a stage on
+/// the m16n8k16 atom.
+using C3ShapeH = F16TileShape<32, 16, 2, 4, 64, 2, 1, false, 3>;
+
+/// The tile an element type runs: the host's grid and the kernel's block both
+/// read it here, so a shape is one place.
+template <class Elem, bool TRANS> struct C3ShapeOf {
+    using type = std::conditional_t<sizeof(Elem) == 4,
+                                    std::conditional_t<TRANS, C3ShapeFT, C3ShapeF>, C3ShapeH>;
+};
+/// The tile a (dtype, pose) pair runs.
+template <class Elem, bool TRANS> using C3Shape = typename C3ShapeOf<Elem, TRANS>::type;
+/// The tile's geometry, for the host's grid.
+template <class Elem, bool TRANS> constexpr int c3_bm()
+{
+    return C3Shape<Elem, TRANS>::BM;
+}
+template <class Elem, bool TRANS> constexpr int c3_bn()
+{
+    return C3Shape<Elem, TRANS>::BN;
+}
+/// The largest row block either pose uses: the row table is sized to it.
+constexpr int kC3Rows = 128;
+static_assert(C3ShapeF::BM <= kC3Rows && C3ShapeFT::BM <= kC3Rows &&
+                  C3ShapeH::BM <= kC3Rows, "the row table must hold a tile");
 
 /// One 3-D convolution's geometry, strides and epilogue. The input points at its
 /// batch slice and the output at its batch·group slice; the filter at the
-/// group's base.
+/// group's base. Every gather offset is 32-bit, which the host guarantees by
+/// refusing a slice whose span leaves the int range.
 struct C3Params {
     int id = 0, ih = 0, iw = 0, ic = 0;
     int od = 0, oh = 0, ow = 0, oc = 0;
@@ -76,9 +110,60 @@ struct C3Params {
     float ep_alpha = 0.0f, ep_beta = 1.0f;
     EpilogueActivateType ep = EpilogueActivateType::None;
     int add_to = 0, pre_act = 0;
+    /// 16 B copies are legal: the activation's tap run and the filter's output
+    /// channel run are each contiguous and aligned.
+    int fill_vec = 0, w_vec = 0;
 };
 
-/// The k index (tap·IC/G + ic) of the reduction, decoded once per k.
+/// The tile's voxel coordinates, one a row of the tile, filled once a block:
+/// the gather walks rows the compute does not own, so they live in shared
+/// memory rather than in the compute's registers.
+///
+/// `d0/h0/w0` carry the pose's own head of the source index — Conv3D's
+/// o·s − p, TransposeConv3D's o + p — so a tap only adds or subtracts its own
+/// k·d, and `inbase` folds the forward pose's base in once a row. The tap part
+/// is the calling thread's (one tap a thread), so the two are added, never
+/// counted twice. `obase` is the output element's offset. `ok` is false past the
+/// end of the slice, which is the block's last tile of voxels.
+struct C3RowTable {
+    int d0[kC3Rows], h0[kC3Rows], w0[kC3Rows];
+    int inbase[kC3Rows], obase[kC3Rows], ok[kC3Rows];
+};
+
+template <bool TRANS>
+__device__ __forceinline__ void c3_row_table(C3RowTable& t, const C3Params& p, int64_t m0,
+                                             int tid) noexcept
+{
+    if (tid >= kC3Rows) {
+        return;
+    }
+    const int64_t v = m0 + tid;
+    if (v >= p.m) {
+        t.d0[tid] = 0;
+        t.h0[tid] = 0;
+        t.w0[tid] = 0;
+        t.inbase[tid] = 0;
+        t.obase[tid] = 0;
+        t.ok[tid] = 0;
+        return;
+    }
+    const int64_t ow = v % p.ow;
+    const int64_t r = v / p.ow;
+    const int od = static_cast<int>(r / p.oh);
+    const int oh = static_cast<int>(r % p.oh);
+    t.d0[tid] = static_cast<int>(TRANS ? od + p.pd : od * p.sd - p.pd);
+    t.h0[tid] = static_cast<int>(TRANS ? oh + p.ph : oh * p.sh - p.ph);
+    t.w0[tid] = static_cast<int>(TRANS ? int(ow) + p.pw : int(ow) * p.sw - p.pw);
+    t.inbase[tid] = TRANS ? 0
+                          : static_cast<int>(int64_t(t.d0[tid]) * p.in_d +
+                                             int64_t(t.h0[tid]) * p.in_h +
+                                             int64_t(t.w0[tid]) * p.in_w);
+    t.obase[tid] = static_cast<int>(int64_t(od) * p.out_d + int64_t(oh) * p.out_h +
+                                    int64_t(ow) * p.out_w);
+    t.ok[tid] = 1;
+}
+
+/// The k index (tap·IC/G + ic) of the reduction, decoded once per tap.
 /// Conv3D's DHWIO filter is in this order; TransposeConv3D's is not, and walks
 /// its own strides from the same three tap indices.
 __device__ __forceinline__ void c3_decode(const C3Params& p, int k, int& kd, int& kh, int& kw,
@@ -92,216 +177,357 @@ __device__ __forceinline__ void c3_decode(const C3Params& p, int k, int& kd, int
     kw = r - kh * p.kw;
 }
 
-/// The activation element a (voxel, k) pair names, or zero for a tap outside the
-/// volume. `in` is already this batch·group's slice.
-///
-/// Conv3D walks forward: i = o·s − p + k·d. TransposeConv3D walks back:
-/// o + p − k·d must divide by the stride, and the quotient is i. The remainder
-/// test is correct for negative numerators too — C++ truncation makes an exact
-/// divisible value's remainder zero either way — and the range test then drops
-/// everything left of the volume.
-template <bool TRANS, class Elem>
-__device__ __forceinline__ float c3_gather(const C3Params& p, const Elem* in, int od, int oh,
-                                           int ow, int kd, int kh, int kw, int ic) noexcept
-{
-    int64_t id, ih, iw;
-    if constexpr (TRANS) {
-        const int nd = od + p.pd - kd * p.dd;
-        const int nh = oh + p.ph - kh * p.dh;
-        const int nw = ow + p.pw - kw * p.dw;
-        if (nd % p.sd != 0 || nh % p.sh != 0 || nw % p.sw != 0) {
-            return 0.0f;
-        }
-        id = nd / p.sd;
-        ih = nh / p.sh;
-        iw = nw / p.sw;
-    } else {
-        id = int64_t(od) * p.sd - p.pd + kd * p.dd;
-        ih = int64_t(oh) * p.sh - p.ph + kh * p.dh;
-        iw = int64_t(ow) * p.sw - p.pw + kw * p.dw;
+/// The three panel indexers the fills write through, in the layouts the two GEMM
+/// tiles read. f32's panels are padded `[m][k]` / `[k][n]`; the 16-bit ones are
+/// swizzled, which costs no padding bytes at all.
+template <int LDA> struct C3PanelF {
+    float* base;
+    __device__ __forceinline__ float& operator()(int row, int col) const noexcept
+    {
+        return base[row * LDA + col];
     }
-    if (id < 0 || id >= p.id || ih < 0 || ih >= p.ih || iw < 0 || iw >= p.iw) {
-        return 0.0f;
+};
+
+template <class S, class Elem> struct C3PanelA {
+    Elem* base;
+    __device__ __forceinline__ Elem& operator()(int row, int col) const noexcept
+    {
+        return base[f16_swz<S>(row, col)];
     }
-    return s_load(in + id * p.in_d + ih * p.in_h + iw * p.in_w + ic * p.in_c);
-}
+};
 
-/// Four panel elements as floats. The f32 panel is one 128-bit load; the 2-byte
-/// panels are two pairs, which is one conversion each rather than four.
-template <class Elem> struct C3Pair;
-template <> struct C3Pair<float> { using type = float; };
-template <> struct C3Pair<__half> { using type = __half2; };
-template <> struct C3Pair<__nv_bfloat16> { using type = __nv_bfloat162; };
-
-__device__ __forceinline__ float2 c3_pair_to_float2(__half2 v) noexcept
-{
-    return __half22float2(v);
-}
-__device__ __forceinline__ float2 c3_pair_to_float2(__nv_bfloat162 v) noexcept
-{
-    return __bfloat1622float2(v);
-}
-
-template <class Elem>
-__device__ __forceinline__ void c3_ld4(const Elem* p, float (&o)[4]) noexcept
-{
-    if constexpr (sizeof(Elem) == 4) {
-        const float4 v = *reinterpret_cast<const float4*>(p);
-        o[0] = v.x;
-        o[1] = v.y;
-        o[2] = v.z;
-        o[3] = v.w;
-    } else {
-        using P = typename C3Pair<Elem>::type;
-        const float2 a = c3_pair_to_float2(*reinterpret_cast<const P*>(p));
-        const float2 b = c3_pair_to_float2(*reinterpret_cast<const P*>(p + 2));
-        o[0] = a.x;
-        o[1] = a.y;
-        o[2] = b.x;
-        o[3] = b.y;
+template <class S, class Elem> struct C3PanelB {
+    Elem* base;
+    __device__ __forceinline__ Elem& operator()(int row, int col) const noexcept
+    {
+        return base[f16_swz_n<S>(row, col)];
     }
-}
+};
 
-template <class Elem, bool TRANS>
-__global__ void __launch_bounds__(kC3Threads)
-conv3d_kernel(C3Params p)
+/// Gather one A stage: BM voxels by BK k, one thread per (tap, channel run)
+/// walking the voxel rows, so the tap decodes once and its bounds test is the
+/// only per-row work. A 16 B run of `CH` channels starting at `col` is `CH`
+/// contiguous panel elements, which is what makes the vector copy legal; a
+/// geometry whose group holds fewer than `CH` channels — or a run that would
+/// straddle two taps — takes the element path, where a thread owns a single k
+/// and the tap still decodes once.
+template <class Elem, int BK, int BM, int THREADS, bool TRANS, class At>
+__device__ __forceinline__ void c3_fill_a(const C3Params& p, At at, const C3RowTable& rows,
+                                          int64_t k0, const Elem* in, int tid, int64_t K) noexcept
 {
-    __shared__ Elem sA[kC3BK * kC3SA];
-    __shared__ Elem sB[kC3BK * kC3SB];
-    __shared__ int s_od[kC3BM], s_oh[kC3BM], s_ow[kC3BM];
-    __shared__ int s_kd[kC3BK], s_kh[kC3BK], s_kw[kC3BK], s_ic[kC3BK];
+    constexpr int CH = 16 / int(sizeof(Elem)); // one 16 B vector of k
+    using Vec = std::conditional_t<sizeof(Elem) == 2, uint4, float4>;
+    const int in_d = static_cast<int>(p.in_d), in_h = static_cast<int>(p.in_h);
+    const int in_w = static_cast<int>(p.in_w);
+    const bool vec = p.fill_vec != 0;
 
-    const int tid = threadIdx.x;
-    const int64_t m0 = int64_t(blockIdx.x) * kC3BM;
-    const int64_t n0 = int64_t(blockIdx.y) * kC3BN;
-    const int64_t g = int64_t(blockIdx.z) % p.groups;
-    const int64_t b = int64_t(blockIdx.z) / p.groups;
+    // One k a thread on the element path, one channel run a thread on the vector
+    // path; `span` is how many panel elements that thread writes a row.
+    const int col = vec ? tid % (BK / CH) : tid % BK;
+    const int first = vec ? col * CH : col;
+    const int span = vec ? CH : 1;
+    const int rowsPerPass = THREADS / (vec ? (BK / CH) : BK);
 
-    const int tm = tid >> 4;  // tile row index of this thread's first voxel
-    const int tn = tid & 15;  // tile column index of this thread's first channel
-    const int mv = tm * kC3TM;
-    const int nv = tn * kC3TN;
+    const int k = static_cast<int>(k0) + first;
+    int kd = 0, kh = 0, kw = 0, ic = 0;
+    c3_decode(p, k, kd, kh, kw, ic);
+    const bool k_ok = k < K;
+    const int dd = kd * p.dd, dh = kh * p.dh, dw = kw * p.dw;
+    // The run's first channel, and the tap's share of the *forward* source
+    // offset. The transposed pose folds the tap into the source index itself,
+    // so it takes the channel part alone.
+    const int ch_off = ic;
+    const int tap_off = dd * in_d + dh * in_h + dw * in_w;
+    const Vec zero = {};
 
-    // The tile's voxel coordinates, shared because the fill walks rows the
-    // compute does not own; one set of divisions a block, not one a element.
-    if (tid < kC3BM) {
-        const int64_t v = m0 + tid;
-        if (v < p.m) {
-            const int64_t ow = v % p.ow;
-            const int64_t r = v / p.ow;
-            s_ow[tid] = static_cast<int>(ow);
-            s_oh[tid] = static_cast<int>(r % p.oh);
-            s_od[tid] = static_cast<int>(r / p.oh);
-        }
-    }
-
-    const Elem* in = static_cast<const Elem*>(p.in) + b * p.in_batch + g * p.icg * p.in_c;
-    const Elem* w = static_cast<const Elem*>(p.w) + g * p.w_group;
-    Elem* out = static_cast<Elem*>(p.out) + b * p.out_batch + g * p.ocg * p.out_c;
-    const Elem* bias = p.bias != nullptr ? static_cast<const Elem*>(p.bias) + g * p.ocg : nullptr;
-
-    const int64_t K = int64_t(p.icg) * p.kd * p.kh * p.kw;
-
-    float acc[kC3TM][kC3TN];
-#pragma unroll
-    for (int i = 0; i < kC3TM; ++i) {
-#pragma unroll
-        for (int j = 0; j < kC3TN; ++j) {
-            acc[i][j] = 0.0f;
-        }
-    }
-
-    for (int64_t k0 = 0; k0 < K; k0 += kC3BK) {
-        const int64_t rem = K - k0;
-        const int kn = static_cast<int>(rem < kC3BK ? rem : kC3BK);
-        // Decode this chunk's taps. It races nothing the previous step reads,
-        // and the barrier below both publishes it and closes that step's
-        // panel reads.
-        if (tid < kC3BK) {
-            int kd = 0, kh = 0, kw = 0, ic = 0;
-            if (tid < kn) {
-                c3_decode(p, static_cast<int>(k0) + tid, kd, kh, kw, ic);
-            }
-            s_kd[tid] = kd;
-            s_kh[tid] = kh;
-            s_kw[tid] = kw;
-            s_ic[tid] = ic;
-        }
-        __syncthreads();
-
-        // A: the gathered activation, written k-major so the inner loop reads a
-        // row of voxels. The fill is k-fastest for the same reason the other
-        // way round: a warp then reads one tap's channel run.
-        for (int idx = tid; idx < kC3BM * kC3BK; idx += kC3Threads) {
-            const int mm = idx >> 5;
-            const int c = idx & (kC3BK - 1);
-            float v = 0.0f;
-            if (c < kn && m0 + mm < p.m) {
-                v = c3_gather<TRANS, Elem>(p, in, s_od[mm], s_oh[mm], s_ow[mm], s_kd[c], s_kh[c],
-                                           s_kw[c], s_ic[c]);
-            }
-            s_store(sA + c * kC3SA + mm, v);
-        }
-        // B: the filter. n is the fast axis, which Conv3D's DHWIO filter has
-        // contiguous; TransposeConv3D's walks a stride and is gathered instead.
-        for (int idx = tid; idx < kC3BK * kC3BN; idx += kC3Threads) {
-            const int c = idx >> 6;
-            const int nn = idx & (kC3BN - 1);
-            float v = 0.0f;
-            if (c < kn && n0 + nn < p.ocg) {
-                v = s_load(w + s_ic[c] * p.w_ic + (n0 + nn) * p.w_oc + s_kd[c] * p.w_kd +
-                           s_kh[c] * p.w_kh + s_kw[c] * p.w_kw);
-            }
-            s_store(sB + c * kC3SB + nn, v);
-        }
-        __syncthreads();
-
-#pragma unroll
-        for (int c = 0; c < kC3BK; ++c) {
-            float a[kC3TM], bb[kC3TN];
-            c3_ld4(sA + c * kC3SA + mv, a);
-            c3_ld4(sB + c * kC3SB + nv, bb);
-#pragma unroll
-            for (int i = 0; i < kC3TM; ++i) {
-#pragma unroll
-                for (int j = 0; j < kC3TN; ++j) {
-                    acc[i][j] = fmaf(a[i], bb[j], acc[i][j]);
+    for (int row = tid / (vec ? (BK / CH) : BK); row < BM; row += rowsPerPass) {
+        int off = -1;
+        if (k_ok && rows.ok[row]) {
+            if constexpr (!TRANS) {
+                const int id = rows.d0[row] + dd;
+                const int ih = rows.h0[row] + dh;
+                const int iw = rows.w0[row] + dw;
+                if (unsigned(id) < unsigned(p.id) && unsigned(ih) < unsigned(p.ih) &&
+                    unsigned(iw) < unsigned(p.iw)) {
+                    off = rows.inbase[row] + tap_off + ch_off;
+                }
+            } else {
+                // o + p − k·d must divide by the stride; the quotient is i.
+                const int nd = rows.d0[row] - dd;
+                const int nh = rows.h0[row] - dh;
+                const int nw = rows.w0[row] - dw;
+                if (nd % p.sd == 0 && nh % p.sh == 0 && nw % p.sw == 0) {
+                    const int id = nd / p.sd, ih = nh / p.sh, iw = nw / p.sw;
+                    if (unsigned(id) < unsigned(p.id) && unsigned(ih) < unsigned(p.ih) &&
+                        unsigned(iw) < unsigned(p.iw)) {
+                        off = id * in_d + ih * in_h + iw * in_w + ch_off;
+                    }
                 }
             }
         }
-    }
-
-    // Write-back: bias, the residual in the order the operator asked for, the
-    // clamp and the activation. The epilogue address is the operator's own, not
-    // a strided C, because an NDHWC row is pitched.
-#pragma unroll
-    for (int i = 0; i < kC3TM; ++i) {
-        const int64_t v = m0 + mv + i;
-        if (v >= p.m) {
+        if (vec && off >= 0) {
+            cp_async_ca_16B(&at(row, first), in + off);
             continue;
         }
-        const int64_t base = int64_t(s_od[mv + i]) * p.out_d + int64_t(s_oh[mv + i]) * p.out_h +
-                             int64_t(s_ow[mv + i]) * p.out_w;
+        for (int c = 0; c < span; ++c) {
+            at(row, first + c) = off >= 0 ? in[off + c] : static_cast<Elem>(0);
+        }
+    }
+}
+
+/// Gather one B stage: BK k by BN output channels. A thread owns one k, so its
+/// tap decodes once and the channel runs walk. Conv3D's DHWIO filter has the
+/// output channel innermost, so a run is one 16 B copy; TransposeConv3D's order
+/// puts the tap axes innermost and its run is a stride, which the host reports
+/// as `w_vec = 0` and the fill walks element by element.
+template <class Elem, int BK, int BN, int THREADS, class At>
+__device__ __forceinline__ void c3_fill_b(const C3Params& p, At at, int n0, int64_t k0,
+                                          const Elem* w, int tid, int64_t K) noexcept
+{
+    constexpr int CH = 16 / int(sizeof(Elem));
+    constexpr int kCols = BN / CH;
+    constexpr int kRowsPerPass = THREADS / kCols;
+    using Vec = std::conditional_t<sizeof(Elem) == 2, uint4, float4>;
+    const Vec zero = {};
+
+    // The channel run is the fast axis, so a warp's copies are one contiguous
+    // run of the filter — the row is what walks, one k at a time.
+    const int nr = tid % kCols;
+    const int n = n0 + nr * CH;
+    for (int krow = tid / kCols; krow < BK; krow += kRowsPerPass) {
+        const int k = static_cast<int>(k0) + krow;
+        int kd = 0, kh = 0, kw = 0, ic = 0;
+        c3_decode(p, k, kd, kh, kw, ic);
+        if (k < K && p.w_vec && n + CH <= p.ocg) {
+            cp_async_ca_16B(&at(krow, nr * CH),
+                            w + int64_t(ic) * p.w_ic + int64_t(n) * p.w_oc +
+                                int64_t(kd) * p.w_kd + int64_t(kh) * p.w_kh +
+                                int64_t(kw) * p.w_kw);
+            continue;
+        }
+        const int koff = k < K ? static_cast<int>(ic * p.w_ic + kd * p.w_kd + kh * p.w_kh +
+                                                 kw * p.w_kw)
+                               : 0;
+        for (int c = 0; c < CH; ++c) {
+            at(krow, nr * CH + c) = (k < K && n + c < p.ocg)
+                                        ? w[koff + int64_t(n + c) * p.w_oc]
+                                        : static_cast<Elem>(0);
+        }
+    }
+}
+
+/// The f32 kernel: the SIMT tile over a padded panel ring.
+template <class S, bool TRANS>
+__global__ __launch_bounds__(S::threads, S::MinBlocks)
+void conv3d_kernel_f(C3Params p)
+{
+    constexpr int BM = S::BM, BN = S::BN, BK = S::BK, ST = S::stages;
+
+    extern __shared__ __align__(16) unsigned char c3_smem[];
+    float* const sAbase = reinterpret_cast<float*>(c3_smem);
+    float* const sBbase = sAbase + ST * S::a_panel(false);
+    __shared__ C3RowTable rows;
+
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int warp_m = warp % S::wm;
+    const int warp_n = warp / S::wm;
+
+    const int m0 = static_cast<int>(blockIdx.x) * BM;
+    const int n0 = static_cast<int>(blockIdx.y) * BN;
+    const int64_t g = int64_t(blockIdx.z) % p.groups;
+    const int64_t b = int64_t(blockIdx.z) / p.groups;
+
+    const float* in = static_cast<const float*>(p.in) + b * p.in_batch + g * p.icg * p.in_c;
+    const float* W = static_cast<const float*>(p.w) + g * p.w_group;
+    float* out = static_cast<float*>(p.out) + b * p.out_batch + g * p.ocg * p.out_c;
+    const float* bias =
+        p.bias != nullptr ? static_cast<const float*>(p.bias) + g * p.ocg : nullptr;
+
+    c3_row_table<TRANS>(rows, p, m0, tid);
+    __syncthreads();
+
+    const int64_t K = int64_t(p.icg) * p.kd * p.kh * p.kw;
+    const int kt_end = static_cast<int>((K + BK - 1) / BK);
+
+    auto fill = [&](int kt, int stage) {
+        c3_fill_a<float, BK, BM, S::threads, TRANS>(p, C3PanelF<S::LDA>{sAbase + stage * S::a_panel(false)},
+                                                    rows, int64_t(kt) * BK, in, tid, K);
+        c3_fill_b<float, BK, BN, S::threads>(p, C3PanelF<S::LDN>{sBbase + stage * S::b_panel(false)},
+                                             n0, int64_t(kt) * BK, W, tid, K);
+        cp_async_commit_group();
+    };
+
+    float acc[S::LaneRow][S::LaneCol];
 #pragma unroll
-        for (int j = 0; j < kC3TN; ++j) {
-            const int64_t n = n0 + nv + j;
+    for (int r = 0; r < S::LaneRow; ++r) {
+#pragma unroll
+        for (int c = 0; c < S::LaneCol; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+
+    // Prime every stage but one; the loop keeps ST-1 groups in flight, so
+    // `wait_group<ST-2>` retires exactly the tile about to be read.
+#pragma unroll
+    for (int t = 0; t < ST - 1; ++t) {
+        fill(t, t % ST);
+    }
+    for (int kt = 0; kt < kt_end; ++kt) {
+        const int stage = kt % ST;
+        cp_async_wait_group<ST - 2>();
+        __syncthreads();
+        fill(kt + ST - 1, (kt + ST - 1) % ST);
+        f32_gemm_tile<S, false, false>(sAbase + stage * S::a_panel(false),
+                                       sBbase + stage * S::b_panel(false), warp_m, warp_n, lane,
+                                       acc);
+    }
+
+    // A lane is four lane-rows by eight lane-cols: its accumulator row r is the
+    // row eight apart, its column c the next column of the lane's row.
+    const int lrow = lane % 8;
+    const int lcol = lane / 8;
+    const int row0 = warp_m * S::warpRows + lrow;
+    const int col0 = warp_n * S::warpCols + lcol * S::LaneCol;
+#pragma unroll
+    for (int r = 0; r < S::LaneRow; ++r) {
+        const int row = row0 + r * 8;
+        const int m = m0 + row;
+        if (m >= p.m) {
+            continue;
+        }
+        const int64_t base = rows.obase[row];
+#pragma unroll
+        for (int c = 0; c < S::LaneCol; ++c) {
+            const int n = n0 + col0 + c;
             if (n >= p.ocg) {
                 continue;
             }
-            Elem* dst = out + base + n * p.out_c;
-            float x = acc[i][j];
+            float v = acc[r][c];
+            float* dst = out + base + int64_t(n) * p.out_c;
             if (bias != nullptr) {
-                x += s_load(bias + n);
+                v += bias[n];
             }
             if (p.add_to && p.pre_act) {
-                x += s_load(dst);
+                v += *dst;
             }
-            x = fminf(fmaxf(x, p.min_clip), p.max_clip);
-            x = gemm_apply_activation(p.ep, p.ep_alpha, p.ep_beta, x);
+            v = fminf(fmaxf(v, p.min_clip), p.max_clip);
+            v = gemm_apply_activation(p.ep, p.ep_alpha, p.ep_beta, v);
             if (p.add_to && !p.pre_act) {
-                x += s_load(dst);
+                v += *dst;
             }
-            s_store(dst, x);
+            *dst = v;
+        }
+    }
+}
+
+/// The 16-bit kernel: the m16n8k16 tile over a swizzled panel ring.
+template <class S, class Elem, bool TRANS>
+__global__ __launch_bounds__(S::threads, S::MinBlocks)
+void conv3d_kernel_h(C3Params p)
+{
+    constexpr int BM = S::BM, BN = S::BN, BK = S::BK, ST = S::stages;
+
+    extern __shared__ __align__(16) unsigned char c3_smem[];
+    Elem* const sAbase = reinterpret_cast<Elem*>(c3_smem);
+    Elem* const sBbase = sAbase + ST * S::kAMax;
+    __shared__ C3RowTable rows;
+
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int warp_m = warp % S::wm;
+    const int warp_n = warp / S::wm;
+
+    const int m0 = static_cast<int>(blockIdx.x) * BM;
+    const int n0 = static_cast<int>(blockIdx.y) * BN;
+    const int64_t g = int64_t(blockIdx.z) % p.groups;
+    const int64_t b = int64_t(blockIdx.z) / p.groups;
+
+    const Elem* in = static_cast<const Elem*>(p.in) + b * p.in_batch + g * p.icg * p.in_c;
+    const Elem* W = static_cast<const Elem*>(p.w) + g * p.w_group;
+    Elem* out = static_cast<Elem*>(p.out) + b * p.out_batch + g * p.ocg * p.out_c;
+    const Elem* bias = p.bias != nullptr ? static_cast<const Elem*>(p.bias) + g * p.ocg : nullptr;
+
+    c3_row_table<TRANS>(rows, p, m0, tid);
+    __syncthreads();
+
+    const int64_t K = int64_t(p.icg) * p.kd * p.kh * p.kw;
+    const int kt_end = static_cast<int>((K + BK - 1) / BK);
+
+    auto fill = [&](int kt, int stage) {
+        c3_fill_a<Elem, BK, BM, S::threads, TRANS>(
+            p, C3PanelA<S, Elem>{sAbase + stage * S::kAMax}, rows, int64_t(kt) * BK, in, tid, K);
+        c3_fill_b<Elem, BK, BN, S::threads>(p, C3PanelB<S, Elem>{sBbase + stage * S::kBMax}, n0,
+                                            int64_t(kt) * BK, W, tid, K);
+        cp_async_commit_group();
+    };
+
+    float acc[S::MA][S::NA][4];
+#pragma unroll
+    for (int i = 0; i < S::MA; ++i) {
+#pragma unroll
+        for (int j = 0; j < S::NA; ++j) {
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                acc[i][j][t] = 0.0f;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < ST - 1; ++t) {
+        fill(t, t % ST);
+    }
+    for (int kt = 0; kt < kt_end; ++kt) {
+        const int stage = kt % ST;
+        cp_async_wait_group<ST - 2>();
+        __syncthreads();
+        fill(kt + ST - 1, (kt + ST - 1) % ST);
+        f16_gemm_tile<S, Elem, false, false>(sAbase + stage * S::kAMax,
+                                             sBbase + stage * S::kBMax, warp_m, warp_n, lane, acc);
+    }
+
+    // C: lane l holds (m = l/4, n = 2*(l%4)), plus the +1 column and the +8 row.
+    const int cm = lane / 4;
+    const int cn = 2 * (lane % 4);
+#pragma unroll
+    for (int i = 0; i < S::MA; ++i) {
+        const int gm = warp_m * S::WM + i * 16 + cm;
+#pragma unroll
+        for (int j = 0; j < S::NA; ++j) {
+            const int gn = n0 + warp_n * S::WN + j * 8 + cn;
+#pragma unroll
+            for (int rr = 0; rr < 2; ++rr) {
+                const int row = gm + rr * 8;
+                const int m = m0 + row;
+                if (m >= p.m) {
+                    continue;
+                }
+                const int64_t base = rows.obase[row];
+#pragma unroll
+                for (int cc = 0; cc < 2; ++cc) {
+                    const int n = gn + cc;
+                    if (n >= p.ocg) {
+                        continue;
+                    }
+                    float v = acc[i][j][rr * 2 + cc];
+                    Elem* dst = out + base + int64_t(n) * p.out_c;
+                    if (bias != nullptr) {
+                        v += s_load(bias + n);
+                    }
+                    if (p.add_to && p.pre_act) {
+                        v += s_load(dst);
+                    }
+                    v = fminf(fmaxf(v, p.min_clip), p.max_clip);
+                    v = gemm_apply_activation(p.ep, p.ep_alpha, p.ep_beta, v);
+                    if (p.add_to && !p.pre_act) {
+                        v += s_load(dst);
+                    }
+                    s_store(dst, v);
+                }
+            }
         }
     }
 }
@@ -309,7 +535,14 @@ conv3d_kernel(C3Params p)
 template <class Elem, bool TRANS>
 inline Status c3_launch(const C3Params& p, dim3 grid, cudaStream_t stream)
 {
-    conv3d_kernel<Elem, TRANS><<<grid, kC3Threads, 0, stream>>>(p);
+    using S = C3Shape<Elem, TRANS>;
+    if constexpr (sizeof(Elem) == 4) {
+        constexpr int smem = S::panel_bytes(false, false);
+        conv3d_kernel_f<S, TRANS><<<grid, S::threads, smem, stream>>>(p);
+    } else {
+        constexpr int smem = S::kSmemBytes;
+        conv3d_kernel_h<S, Elem, TRANS><<<grid, S::threads, smem, stream>>>(p);
+    }
     return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
 }
 

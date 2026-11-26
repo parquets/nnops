@@ -98,6 +98,15 @@ Status transpose_conv3d_cuda(const TransposeConv3DAttributes& attrs, TensorView&
     // A group steps along the filter's IC axis.
     p.w_group = p.icg * p.w_ic;
 
+    // 16 B copies: a tap's channel run is contiguous and aligned. The filter's
+    // output channel axis here has the tap axes inside it, so its run is a
+    // stride and the fill walks elements instead.
+    const int64_t ch = 16 / int64_t(data_type_size(dt));
+    p.fill_vec = p.in_c == 1 && p.icg % ch == 0 && p.in_w % ch == 0 &&
+                 p.in_batch % ch == 0 &&
+                 reinterpret_cast<uintptr_t>(p.in) % 16 == 0;
+    p.w_vec = 0;
+
     p.in = act.ptr<void>();
     p.w = wgt.ptr<void>();
     p.out = output.ptr<void>();
@@ -120,9 +129,21 @@ Status transpose_conv3d_cuda(const TransposeConv3DAttributes& attrs, TensorView&
     if (int64_t(act.shape(0)) * p.groups > 65535) {
         return Status::unsupported;
     }
+    // The gather's offsets are 32-bit: a slice whose span leaves the int range
+    // would wrap, so it is refused rather than run.
+    if (int64_t(p.id) * p.in_d > (int64_t(1) << 30) ||
+        int64_t(p.ih) * p.in_h > (int64_t(1) << 30) ||
+        int64_t(p.ic) * p.in_c > (int64_t(1) << 30) ||
+        int64_t(p.od) * p.out_d > (int64_t(1) << 30) ||
+        int64_t(p.oc) * p.out_c > (int64_t(1) << 30)) {
+        return Status::unsupported;
+    }
 
-    const dim3 grid(static_cast<unsigned>(ceil_div(p.m, int64_t(kC3BM))),
-                    static_cast<unsigned>(ceil_div(int64_t(p.ocg), int64_t(kC3BN))),
+    const bool fp32 = dt == DataType::f32;
+    const int64_t bm = fp32 ? int64_t(c3_bm<float, true>()) : int64_t(c3_bm<__half, true>());
+    const int64_t bn = fp32 ? int64_t(c3_bn<float, true>()) : int64_t(c3_bn<__half, true>());
+    const dim3 grid(static_cast<unsigned>(ceil_div(p.m, bm)),
+                    static_cast<unsigned>(ceil_div(int64_t(p.ocg), bn)),
                     static_cast<unsigned>(int64_t(act.shape(0)) * p.groups));
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 

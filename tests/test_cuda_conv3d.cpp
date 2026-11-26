@@ -105,6 +105,60 @@ void run_case(const C3Case& c, const char* what)
 
 } // anonymous namespace
 
+NNOPS_TEST(cuda_conv3d_smallest)
+{
+    // One voxel, one tap, four channels: the smallest product the kernel can
+    // form, which pins the panel layout and the one-stage path.
+    C3Case c;
+    c.id = c.ih = c.iw = 1;
+    c.ic = 4;
+    c.oc = 4;
+    c.kd = c.kh = c.kw = 1;
+    c.pd = c.ph = c.pw = 0;
+    c.use_bias = false;
+    run_case(c, "cuda_conv3d_smallest");
+}
+
+NNOPS_TEST(cuda_conv3d_voxel_rows)
+{
+    // A second voxel row on every axis, one tap: the row table's decode.
+    C3Case c;
+    c.id = c.ih = c.iw = 2;
+    c.ic = 4;
+    c.oc = 4;
+    c.kd = c.kh = c.kw = 1;
+    c.pd = c.ph = c.pw = 0;
+    run_case(c, "cuda_conv3d_voxel_rows");
+}
+
+NNOPS_TEST(cuda_conv3d_k_stages)
+{
+    // K past one f32 stage: 20 channels, one tap, so the ring wraps.
+    C3Case c;
+    c.id = c.ih = c.iw = 2;
+    c.ic = 20;
+    c.oc = 8;
+    c.kd = c.kh = c.kw = 1;
+    c.pd = c.ph = c.pw = 0;
+    run_case(c, "cuda_conv3d_k_stages");
+}
+
+NNOPS_TEST(cuda_conv3d_axis_taps)
+{
+    // Three taps along W only, still inside one stage: one axis carries the
+    // whole tap list, which is the decode's per-axis split.
+    C3Case c;
+    c.id = c.ih = 2;
+    c.iw = 4;
+    c.ic = 4;
+    c.oc = 8;
+    c.kd = c.kh = 1;
+    c.kw = 3;
+    c.pd = c.ph = 0;
+    c.pw = 1;
+    run_case(c, "cuda_conv3d_axis_taps");
+}
+
 NNOPS_TEST(cuda_conv3d_patch_embed)
 {
     // The pose a vision transformer's 3-D patch embedding runs: a k3s1p1 filter
