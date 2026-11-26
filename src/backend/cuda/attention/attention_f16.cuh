@@ -1,5 +1,5 @@
 #pragma once
-/// @file attention_tc.cuh
+/// @file attention_f16.cuh
 /// @brief 16-bit Tensor Core prefill — m16n8k16 HMMA over a 64 x 32 tile.
 ///
 /// Why. The FFMA tile (attention_blocked.cuh) is bound by the vector FP32 pipe:
@@ -54,7 +54,7 @@
 #include "backend/cuda/matmul/ptx.h"
 
 namespace nnops::backend::cuda::attn {
-namespace tc {
+namespace f16 {
 
 constexpr int kBlockM = 64;                    ///< query rows one block owns
 constexpr int kBlockN = 32;                    ///< keys one chunk carries
@@ -84,48 +84,6 @@ inline int64_t smem_bytes(int64_t dqk, int64_t dv)
 {
     return static_cast<int64_t>(sizeof(half)) * kBlockN *
            (kKStages * panel_stride(dqk) + kVStages * panel_stride(dv));
-}
-
-/// One mma into four fp32 accumulators, the accumulator as the C operand.
-template <class T>
-__device__ __forceinline__ void hmma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0,
-                                     uint32_t b1)
-{
-#if PTX_SM80_ENABLED
-    if constexpr (std::is_same_v<T, __half>) {
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-    } else {
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-    }
-#endif
-}
-
-/// exp2, one MUFU. The softmax runs in log2 units — the scores are scaled by
-/// `log2(e)` on the way in and the head sink converted on the way out — so the
-/// exponential is this without the multiply `__expf` hides inside it.
-__device__ __forceinline__ float ex2(float x)
-{
-    float r;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
-    return r;
-}
-
-/// Two floats as one packed 16-bit pair — the A fragment of a PV step.
-template <class T> __device__ __forceinline__ uint32_t pack2(float lo, float hi)
-{
-    if constexpr (std::is_same_v<T, __half>) {
-        const __half2 v = __floats2half2_rn(lo, hi);
-        return *reinterpret_cast<const uint32_t*>(&v);
-    } else {
-        const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
-        return *reinterpret_cast<const uint32_t*>(&v);
-    }
 }
 
 /// Stage one panel of a chunk: kBlockN rows of K (or of V), D columns each.
@@ -159,82 +117,6 @@ __device__ __forceinline__ void stage_panel(const P& p, int64_t b, int64_t hkv, 
     }
 }
 
-/// The gate activation, with the choice a template argument: a constant `act`
-/// folds the switch in `gate_act_value` away, so one arm is emitted instead of
-/// five. That is not what makes the kernel small — the arms are still unrolled
-/// once per stored element — it is what makes the *gated* instantiation cost
-/// 4.7x the ungated one instead of dwarfing it.
-template <int kAct> __device__ __forceinline__ float gate_value(float g)
-{
-    return gate_act_value(kAct, g);
-}
-
-/// The store pass. The four row pointers are formed once a lane instead of once
-/// an element, and `kAct < 0` — the common case — is a compile-time form that
-/// carries no activation at all.
-template <class T, int NT, int kAct, class P>
-__device__ __forceinline__ void store_output(const P& p, const float (&o)[NT][4], int64_t obase,
-                                             int64_t gbase, int64_t i0, int c0, int row0,
-                                             int row1, bool live0, bool live1, float scl0,
-                                             float scl1, float norm0, float norm1)
-{
-    T* const dst0 = p.o + obase + (i0 + row0) * p.o_s;
-    T* const dst1 = p.o + obase + (i0 + row1) * p.o_s;
-    const T* const grow0 = p.gate + gbase + (i0 + row0) * p.g_s;
-    const T* const grow1 = p.gate + gbase + (i0 + row1) * p.g_s;
-#pragma unroll
-    for (int t = 0; t < NT; ++t) {
-        const int col = 8 * t + c0;
-#pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            if (!(half == 0 ? live0 : live1)) {
-                continue;
-            }
-            const float scl = half == 0 ? scl0 : scl1;
-            const float norm = half == 0 ? norm0 : norm1;
-            T* const dst = half == 0 ? dst0 : dst1;
-            float v0 = (half == 0 ? o[t][0] : o[t][2]) * scl * norm;
-            float v1 = (half == 0 ? o[t][1] : o[t][3]) * scl * norm;
-            if constexpr (kAct >= 0) {
-                const T* const grow = half == 0 ? grow0 : grow1;
-                v0 *= gate_value<kAct>(s_load(grow + col));
-                v1 *= gate_value<kAct>(s_load(grow + col + 1));
-            }
-            s_store(dst + col, v0);
-            s_store(dst + col + 1, v1);
-        }
-    }
-}
-
-/// Pick the store pass's activation once for the block, so the element loop is
-/// instantiated once an activation rather than once an element.
-template <class T, int NT, class P>
-__device__ __forceinline__ void store_output_dispatch(const P& p, const float (&o)[NT][4],
-                                                      int64_t obase, int64_t gbase, int64_t i0,
-                                                      int c0, int row0, int row1, bool live0,
-                                                      bool live1, float scl0, float scl1,
-                                                      float norm0, float norm1)
-{
-#define NNOPS_TC_STORE(ACT)                                                          \
-    store_output<T, NT, (ACT)>(p, o, obase, gbase, i0, c0, row0, row1, live0, live1, \
-                               scl0, scl1, norm0, norm1)
-    if (!p.has_gate) {
-        NNOPS_TC_STORE(-1);
-        return;
-    }
-    switch (p.gate_act) {
-    case int(EpilogueActivateType::Silu): NNOPS_TC_STORE(int(EpilogueActivateType::Silu)); return;
-    case int(EpilogueActivateType::Gelu): NNOPS_TC_STORE(int(EpilogueActivateType::Gelu)); return;
-    case int(EpilogueActivateType::Relu): NNOPS_TC_STORE(int(EpilogueActivateType::Relu)); return;
-    case int(EpilogueActivateType::Sigmoid):
-        NNOPS_TC_STORE(int(EpilogueActivateType::Sigmoid));
-        return;
-    case int(EpilogueActivateType::Tanh): NNOPS_TC_STORE(int(EpilogueActivateType::Tanh)); return;
-    default: NNOPS_TC_STORE(-1); return;
-    }
-#undef NNOPS_TC_STORE
-}
-
 // ============================================================
 // The kernel
 // ============================================================
@@ -244,7 +126,7 @@ __device__ __forceinline__ void store_output_dispatch(const P& p, const float (&
 /// what keeps the common kernel small enough to stay out of the I-cache's way
 /// (five activations x 32 elements x 2 values was three quarters of its code).
 template <class T, int DQK, int DV, bool kGate>
-__global__ void __launch_bounds__(kThreads, 3) attention_tc_kernel(AttnParams<T, false> p)
+__global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, false> p)
 {
     using P = AttnParams<T, false>;
     using KVT = typename P::KVT;
@@ -585,5 +467,5 @@ __global__ void __launch_bounds__(kThreads, 3) attention_tc_kernel(AttnParams<T,
     }
 }
 
-} // namespace tc
+} // namespace f16
 } // namespace nnops::backend::cuda::attn

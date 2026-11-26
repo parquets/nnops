@@ -10,8 +10,10 @@
 ///   attention_kernel.cuh         the tiled online-softmax kernel — every shape;
 ///   attention_blocked.cuh        the register-blocked FFMA prefill tile — the
 ///                                f32 fast path;
-///   attention_tc.cuh             the m16n8k16 tensor-core prefill tile — the
+///   attention_f16.cuh            the m16n8k16 tensor-core prefill tile — the
 ///                                16-bit fast path;
+///   attention_i8.cuh             the m16n8k32 tile an s8 cache with
+///                                cfg.quantize_q takes — the integer route;
 ///   attention_decode.cuh         flash decoding — the one-row (Sq == 1) kernel,
 ///                                its split-KV form and the merge pass;
 ///   attention_common.cuh         the shared description, layout strides, K/V
@@ -21,7 +23,7 @@
 /// cuda/matmul (gemm_common.cuh + per-kernel .cuh): the kernels are header-only
 /// device code included by this one translation unit, the host side stays here.
 ///
-/// Both kernels share the CPU core's semantics (see attention_config.hpp): the
+/// Every kernel shares the CPU core's semantics (see attention_config.hpp): the
 /// visible key range is [0, sink) ∪ [max(0, pos_i - window + 1), pos_i + 1)
 /// intersected with the batch's run length, the additive bias and keep-mask
 /// follow the softcap, the head sink is a virtual zero-valued key in the
@@ -33,7 +35,8 @@
 #include "attention_blocked.cuh"
 #include "attention_decode.cuh"
 #include "attention_kernel.cuh"
-#include "attention_tc.cuh"
+#include "attention_f16.cuh"
+#include "attention_i8.cuh"
 #include "backend/common/attention_config.hpp"
 #include "backend/cuda/matmul/gemm_common.cuh" // the split-KV scratch pool
 #include "detail/bench_knobs.hpp"
@@ -208,17 +211,17 @@ inline bool tc_eligible(const AttnParams<T, KV8>& p)
 template <class T, int DQK, int DV>
 inline bool launch_tc_shape(const AttnParams<T, false>& p, const dim3& grid, cudaStream_t stream)
 {
-    const size_t bytes = static_cast<size_t>(tc::smem_bytes(DQK, DV));
+    const size_t bytes = static_cast<size_t>(f16::smem_bytes(DQK, DV));
     if (!p.has_gate) {
-        if (!set_dyn_smem_packed(&tc::attention_tc_kernel<T, DQK, DV, false>, bytes)) {
+        if (!set_dyn_smem_packed(&f16::attention_kernel<T, DQK, DV, false>, bytes)) {
             return false;
         }
-        tc::attention_tc_kernel<T, DQK, DV, false><<<grid, tc::kThreads, bytes, stream>>>(p);
+        f16::attention_kernel<T, DQK, DV, false><<<grid, f16::kThreads, bytes, stream>>>(p);
     } else {
-        if (!set_dyn_smem_packed(&tc::attention_tc_kernel<T, DQK, DV, true>, bytes)) {
+        if (!set_dyn_smem_packed(&f16::attention_kernel<T, DQK, DV, true>, bytes)) {
             return false;
         }
-        tc::attention_tc_kernel<T, DQK, DV, true><<<grid, tc::kThreads, bytes, stream>>>(p);
+        f16::attention_kernel<T, DQK, DV, true><<<grid, f16::kThreads, bytes, stream>>>(p);
     }
     return cudaGetLastError() == cudaSuccess;
 }
@@ -228,10 +231,10 @@ inline bool launch_tc(const AttnParams<T, false>& p, cudaStream_t stream)
 {
     const size_t budget = static_cast<size_t>(smem_budget());
     const dim3 grid(static_cast<unsigned>(p.H),
-                    static_cast<unsigned>(ceil_div(p.Sq, static_cast<int64_t>(tc::kBlockM))),
+                    static_cast<unsigned>(ceil_div(p.Sq, static_cast<int64_t>(f16::kBlockM))),
                     static_cast<unsigned>(p.B));
     auto fits = [&](int64_t dqk, int64_t dv) {
-        return static_cast<size_t>(tc::smem_bytes(dqk, dv)) <= budget;
+        return static_cast<size_t>(f16::smem_bytes(dqk, dv)) <= budget;
     };
 
     if (p.Dqk == 128 && p.Dv == 128 && fits(128, 128)) {
@@ -242,6 +245,127 @@ inline bool launch_tc(const AttnParams<T, false>& p, cudaStream_t stream)
         return launch_tc_shape<T, 192, 128>(p, grid, stream);
     }
     return false;
+}
+
+/// Whether the integer tile can carry this call: an s8 cache, a query the
+/// operator asked to quantize, the score features that need no per-element
+/// gather, and one of the (head, value) widths the launcher instantiates. The
+/// value product stays 16-bit unless cfg.quantize_pv, which is a query-dtype
+/// requirement the tile itself carries: an f32 query has no 16-bit P·V, so it
+/// only takes the integer route when both products are integer.
+template <class T, bool KV8>
+inline bool i8_eligible(const AttnParams<T, KV8>& p)
+{
+    if constexpr (!KV8) {
+        return false;
+    } else {
+        const int mode = ::nnops::detail::cuda_attn_i8.load(std::memory_order_relaxed);
+        if (mode == 0 || !p.quantize_q) {
+            return false;
+        }
+        if constexpr (std::is_same_v<T, float>) {
+            if (!p.quantize_pv) {
+                return false;
+            }
+        }
+        if (p.has_bias || p.has_keep || p.softcap_on) {
+            return false;
+        }
+        const bool shape = (p.Dqk == 128 && p.Dv == 128) || (p.Dqk == 64 && p.Dv == 64) ||
+                           (p.Dqk == 192 && p.Dv == 128);
+        if (!shape) {
+            return false;
+        }
+        return p.quantize_pv || (p.Dv % 64) == 0;
+    }
+}
+
+/// Launch the m16n8k32 tile. False means the device will not carry the
+/// shared-memory request; the caller falls back.
+template <class T, int DQK, int DV, bool PV8>
+inline bool launch_i8_shape(const AttnParams<T, true>& p, const dim3& grid, cudaStream_t stream)
+{
+    const size_t bytes = static_cast<size_t>(i8::smem_bytes(DQK, DV, PV8));
+    if (!set_dyn_smem_packed(&i8::attention_kernel<T, DQK, DV, PV8>, bytes)) {
+        return false;
+    }
+    i8::attention_kernel<T, DQK, DV, PV8><<<grid, i8::kThreads, bytes, stream>>>(p);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+/// The value product's dtype decides the instantiation: an f32 query has no
+/// 16-bit arm (there is no f32 tensor core), so only the integer one exists for
+/// it.
+template <class T, int DQK, int DV>
+inline bool launch_i8_pv(const AttnParams<T, true>& p, const dim3& grid, cudaStream_t stream)
+{
+    if (p.quantize_pv) {
+        return launch_i8_shape<T, DQK, DV, true>(p, grid, stream);
+    }
+    if constexpr (!std::is_same_v<T, float>) {
+        return launch_i8_shape<T, DQK, DV, false>(p, grid, stream);
+    }
+    return false;
+}
+
+template <class T>
+inline bool launch_i8(AttnParams<T, true> p, cudaStream_t stream)
+{
+    const dim3 grid(static_cast<unsigned>(p.H),
+                    static_cast<unsigned>(ceil_div(p.Sq, static_cast<int64_t>(i8::kBlockM))),
+                    static_cast<unsigned>(p.B));
+    const size_t budget = static_cast<size_t>(smem_budget());
+    auto fits = [&](int64_t dqk, int64_t dv) {
+        return static_cast<size_t>(i8::smem_bytes(dqk, dv, p.quantize_pv)) <= budget;
+    };
+
+    // Both value prepasses exist so the tile never transposes or widens a chunk
+    // in every block: an fp P·V reads the run widened to 16-bit, the integer one
+    // reads it turned over to `[column][key]` (its B panel's pose). The scratch
+    // is the run in 16-bit (2 bytes) or in s8 (1 byte), so a cache too large to
+    // stage declines the tile rather than paying more than the kernel would.
+    const int64_t skt = (p.Sk + 31) & ~static_cast<int64_t>(31);
+    detail::GemmWorkspace ws;
+    {
+        const int64_t bytes = p.quantize_pv
+                                  ? p.B * p.Hkv * p.Dv * skt
+                                  : p.B * p.Hkv * p.Sk * p.Dv * static_cast<int64_t>(sizeof(T));
+        if (bytes > (64LL << 20)) {
+            return false;
+        }
+        ws = detail::gemm_workspace_alloc(bytes, stream);
+        if (ws.ptr == nullptr) {
+            return false;
+        }
+        if (p.quantize_pv) {
+            p.vt = ws.ptr;
+            p.vt_s = skt;
+            const dim3 pgrid(static_cast<unsigned>(skt / i8::kBlockN),
+                             static_cast<unsigned>(p.Hkv), static_cast<unsigned>(p.B));
+            i8::attention_vt_prep_kernel<AttnParams<T, true>>
+                <<<pgrid, 128, 0, stream>>>(p, static_cast<int8_t*>(ws.ptr), skt);
+        } else {
+            p.vprep = ws.ptr;
+            const dim3 pgrid(static_cast<unsigned>(p.B * p.Hkv * p.Sk));
+            i8::attention_v_prep_kernel<T, AttnParams<T, true>>
+                <<<pgrid, 128, 0, stream>>>(p, static_cast<T*>(ws.ptr));
+        }
+        if (cudaGetLastError() != cudaSuccess) {
+            detail::gemm_workspace_free(ws, stream);
+            return false;
+        }
+    }
+
+    bool ok = false;
+    if (p.Dqk == 128 && p.Dv == 128 && fits(128, 128)) {
+        ok = launch_i8_pv<T, 128, 128>(p, grid, stream);
+    } else if (p.Dqk == 64 && p.Dv == 64 && fits(64, 64)) {
+        ok = launch_i8_pv<T, 64, 64>(p, grid, stream);
+    } else if (p.Dqk == 192 && p.Dv == 128 && fits(192, 128)) {
+        ok = launch_i8_pv<T, 192, 128>(p, grid, stream);
+    }
+    detail::gemm_workspace_free(ws, stream); // stream-ordered when pooled
+    return ok;
 }
 
 /// The decode: one block per (head, batch, split) over `splits` spans of the
@@ -490,6 +614,8 @@ Status launch_typed(const AttentionConfig& cfg, TensorView& out,
 
     p.causal = cfg.causal;
     p.v_is_k = v_is_k;
+    p.quantize_q = cfg.quantize_q;
+    p.quantize_pv = cfg.quantize_pv;
     p.softcap_on = cfg.softcap > 0.0f;
     p.softcap = cfg.softcap;
     p.window = cfg.window;
@@ -522,7 +648,14 @@ Status launch_typed(const AttentionConfig& cfg, TensorView& out,
         return launch_decode<T, KV8>(p, stream);
     }
 
-    if constexpr (!KV8) {
+    if constexpr (KV8) {
+        // An s8 cache the operator asked to quantize against runs the integer
+        // tile; every other s8 call keeps widening on read through the tiled
+        // kernel below (the FFMA and 16-bit tiles take an fp cache only).
+        if (i8_eligible(p) && launch_i8<T>(p, stream)) {
+            return Status::ok;
+        }
+    } else {
         // The 16-bit cache goes to the tensor cores first; the FFMA tile is its
         // fallback and the f32 route. (The constexpr keeps the f32 T from
         // instantiating the m16n8k16 kernels at all.)
@@ -744,11 +877,6 @@ Status attention_cuda(const AttentionConfig& cfg, std::span<TensorView> outputs,
 {
     if (outputs.empty() || outputs[0].is_empty()) {
         return Status::invalid_argument;
-    }
-    // No dynamic int8 query/probability route on the device; the fp routes
-    // handle an s8 cache by dequantizing on read.
-    if (cfg.quantize_q || cfg.quantize_pv) {
-        return Status::unsupported;
     }
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     TensorView& out = outputs[0];

@@ -132,6 +132,83 @@ NNOPS_BENCH(cuda_attention_gqa_prefill) {
     run_gqa("gqa prefill MQA", B, H, 1, D, S, S, true, DataType::f32, flops);
 }
 
+/// The int8-cache arms. Same run of keys, same query, three operators: the fp
+/// route (which widens the s8 cache on read), the dynamic-query int8 route, and
+/// that route with the integer P·V. The ratio isolates each step — the first
+/// answers "what is the widening tax", the second what the 32-k product adds.
+void run_gqa_i8(const char* tag, int64_t B, int64_t H, int64_t Hkv, int64_t D, int64_t Sq,
+                int64_t Sk, DataType dt, double flops, bool q8, bool pv8)
+{
+    std::vector<int8_t> qk(static_cast<size_t>(B * Hkv * Sk * D));
+    std::vector<int8_t> qv(qk.size());
+    std::vector<float> sk(static_cast<size_t>(B * Hkv * Sk)), sv(sk.size());
+    HostTensor kf = make_host_random(std::vector<int64_t>{B, Hkv, Sk, D}, DataType::f32, false, 12,
+                                     -0.5f, 0.5f);
+    HostTensor vf = make_host_random(std::vector<int64_t>{B, Hkv, Sk, D}, DataType::f32, false, 13,
+                                     -0.5f, 0.5f);
+    const float* kp = kf.view.ptr<float>();
+    const float* vp = vf.view.ptr<float>();
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t h = 0; h < Hkv; ++h) {
+            for (int64_t t = 0; t < Sk; ++t) {
+                const int64_t row = ((b * Hkv + h) * Sk + t) * D;
+                float ak = 0.0f, av = 0.0f;
+                for (int64_t d = 0; d < D; ++d) {
+                    ak = std::max(ak, std::fabs(kp[row + d]));
+                    av = std::max(av, std::fabs(vp[row + d]));
+                }
+                const float sc_k = ak > 0.0f ? ak / 127.0f : 1.0f;
+                const float sc_v = av > 0.0f ? av / 127.0f : 1.0f;
+                const size_t srow = static_cast<size_t>((b * Hkv + h) * Sk + t);
+                sk[srow] = sc_k;
+                sv[srow] = sc_v;
+                for (int64_t d = 0; d < D; ++d) {
+                    qk[static_cast<size_t>(row + d)] =
+                        static_cast<int8_t>(std::nearbyintf(kp[row + d] / sc_k));
+                    qv[static_cast<size_t>(row + d)] =
+                        static_cast<int8_t>(std::nearbyintf(vp[row + d] / sc_v));
+                }
+            }
+        }
+    }
+
+    std::vector<HostTensor> in(9);
+    in[0] = make_host_random(std::vector<int64_t>{B, Sq, H * D}, dt, false, 11, -0.5f, 0.5f);
+    HostTensor tk = make_host_zeroed(std::vector<int64_t>{B, Hkv, Sk, D}, DataType::s8, false);
+    HostTensor tv = make_host_zeroed(std::vector<int64_t>{B, Hkv, Sk, D}, DataType::s8, false);
+    std::memcpy(tk.bytes.data(), qk.data(), qk.size());
+    std::memcpy(tv.bytes.data(), qv.data(), qv.size());
+    in[1] = std::move(tk);
+    in[2] = std::move(tv);
+    HostTensor s1 = make_host_zeroed(std::vector<int64_t>{B, Hkv, Sk}, DataType::f32, false);
+    HostTensor s2 = make_host_zeroed(std::vector<int64_t>{B, Hkv, Sk}, DataType::f32, false);
+    std::memcpy(s1.bytes.data(), sk.data(), sk.size() * sizeof(float));
+    std::memcpy(s2.bytes.data(), sv.data(), sv.size() * sizeof(float));
+    in[5] = std::move(s1);
+    in[6] = std::move(s2);
+    std::vector<DeviceTensor> dins;
+    for (auto& t : in) {
+        dins.push_back(to_device(t));
+    }
+    std::vector<TensorView> dv;
+    for (auto& d : dins) {
+        dv.push_back(d.view);
+    }
+    HostTensor got = make_host_zeroed(std::vector<int64_t>{B, Sq, H * D}, dt, false);
+    CudaBuffer obuf(got.bytes.size());
+    TensorView ov(got.view.shape_span(), dt, obuf.data(), got.view.pitch());
+
+    GroupQueryAttentionAttributes attrs;
+    attrs.num_heads = H;
+    attrs.kv_num_heads = Hkv;
+    attrs.causal = true;
+    attrs.quantize_query = q8;
+    attrs.quantize_pv = pv8;
+    auto op = GroupQueryAttention::create(attrs, Backend::CUDA);
+    const double ms = cuda_median_ms([&] { cuda_launch(*op, ov, dv); });
+    print_cuda_row(tag, gqa_geom(B, H, Hkv, D, Sq, Sk, dt), ms, cuda_gflops(ms, flops));
+}
+
 NNOPS_BENCH(cuda_attention_gqa_decode) {
     const int64_t B = 1, H = 32, Hkv = 8, D = 128, Sk = 2048;
     // One query row reads the whole run: 2 products × 2·H·Sk·D.
@@ -161,6 +238,33 @@ NNOPS_BENCH(cuda_attention_decode_headgroup) {
                 4.0 * 16 * 1024 * 192);
     }
     nnops::detail::cuda_attn_headbatch.store(-1);
+}
+
+// The int8-cache arms: one s8 cache, one query, and the three routes over it.
+// The fp row is the baseline the integer tile has to beat — on an s8 cache it
+// widens every element on read and multiplies in FFMA, which is what the tiled
+// kernel does today.
+NNOPS_BENCH(cuda_attention_int8_cache) {
+    const int64_t B = 1, H = 32, Hkv = 8, D = 128, S = 512;
+    const double flops = 2.0 * B * H * S * S * D;
+    print_cuda_header("int8 cache (causal prefill, 512 x 512)");
+    for (int arm = 0; arm < 3; ++arm) {
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "gqa i8cache f32 arm=%d", arm);
+        run_gqa_i8(tag, B, H, Hkv, D, S, S, DataType::f32, flops, arm >= 1, arm >= 2);
+        std::snprintf(tag, sizeof(tag), "gqa i8cache f16 arm=%d", arm);
+        run_gqa_i8(tag, B, H, Hkv, D, S, S, DataType::f16, flops, arm >= 1, arm >= 2);
+    }
+    // The same routes at four times the scores: the integer tile's per-element
+    // cost is what decides whether a longer run moves it off the scalar side.
+    const double flops2 = 2.0 * B * H * 1024 * 1024 * D;
+    for (int arm = 1; arm < 3; ++arm) {
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "gqa i8cache 1024 f32 arm=%d", arm);
+        run_gqa_i8(tag, B, H, Hkv, D, 1024, 1024, DataType::f32, flops2, true, arm >= 2);
+        std::snprintf(tag, sizeof(tag), "gqa i8cache 1024 f16 arm=%d", arm);
+        run_gqa_i8(tag, B, H, Hkv, D, 1024, 1024, DataType::f16, flops2, true, arm >= 2);
+    }
 }
 
 NNOPS_BENCH(cuda_attention_mla) {

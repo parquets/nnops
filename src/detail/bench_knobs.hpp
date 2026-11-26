@@ -54,6 +54,11 @@ inline std::atomic<int> cuda_attn_blocked{-1};
 /// older tiled kernel, so the bench can A/B all three.
 inline std::atomic<int> cuda_attn_tc{-1};
 
+/// CUDA attention int8 tensor-core tile: -1 automatic (an s8 cache with
+/// cfg.quantize_q takes the m16n8k32 tile whenever the shape is eligible), 0
+/// keeps it on the tiled kernel, 1 takes the tile whenever it is eligible.
+inline std::atomic<int> cuda_attn_i8{-1};
+
 /// CUDA narrow-m loop variant: 0 is the production pick (f16 keeps 32 B rows in
 /// flight, f32 16), 1 the 4-column / 16-row group, 2 the 2-column / 16-row one,
 /// 3 the 2-column / 32-row one. A bench compares them.

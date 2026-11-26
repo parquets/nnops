@@ -251,6 +251,9 @@ struct CacheOpt {
     std::vector<int64_t> pos_ids;
     bool int8 = false;
     bool per_tensor = false;
+    /// The operator's dynamic integer route over that s8 cache.
+    bool quantize_q = false;
+    bool quantize_pv = false;
     int64_t window = -1;
     int64_t sink = 0;
     float softcap = 0.0f;
@@ -355,6 +358,8 @@ void expect_cache(const std::vector<int64_t>& qdims, int64_t Sk_new, int64_t H, 
     attrs.local_window_size = o.window;
     attrs.sink_tokens = o.sink;
     attrs.head_layout = o.bshd ? AttentionHeadLayout::BSHD : AttentionHeadLayout::Auto;
+    attrs.quantize_query = o.quantize_q;
+    attrs.quantize_pv = o.quantize_pv;
     if (o.gate) {
         attrs.output_gate = EpilogueActivateType::Silu;
     }
@@ -504,7 +509,7 @@ NNOPS_TEST(cuda_gqa_long_shapes_matches_cpu) {
     expect_cache({1, 20, 4 * 16}, 40, 4, 2, q8, tol, rel, "int8 long");
 }
 
-// The 16-bit tensor-core tile (attention_tc.cuh): 128 query rows x 64 keys a
+// The 16-bit tensor-core tile (attention_f16.cuh): 64 query rows x 32 keys a
 // block, 16 rows a warp, m16n8k16 with fp32 accumulators. It carries the shapes
 // with a head and value width of 64, 128 or 192/128 and no score-side gather
 // (bias, keep mask, softcap), so these cases are the ones that reach it.
@@ -668,6 +673,53 @@ NNOPS_TEST(cuda_gqa_int8_cache_matches_cpu) {
     dec.past = 15;
     dec.int8 = true;
     expect_cache({1, 1, 8 * 8}, 1, 8, 2, dec, tol, rel, "int8 decode");
+}
+
+/// The dynamic integer route: the CPU flash core as the oracle, both sides
+/// reading the same s8 cache and quantizing on the fly, so the comparison is
+/// one integer product against another rather than against the fp route.
+///
+/// The shape is above the flash threshold (Sq·Sk >= 2^16) on purpose — below
+/// it the CPU runs the standard route, which has no integer product to compare
+/// with. Every case here is a configuration the device tile carries: an f32
+/// query only takes it when P·V is integer too (there is no f32 tensor core
+/// for the 16-bit value product), and an integer P·V is independent of the
+/// query dtype.
+NNOPS_TEST(cuda_gqa_quantize_matches_cpu) {
+    const float tol = 1e-3f, rel = 5e-3f;
+    // An f16 query is compared at the f16 accumulator tolerance: the CPU's f16
+    // route keeps its score tile and probabilities in half, so it is the noisier
+    // of the two by far whatever the product is.
+    const float htol = kF16AccumTol, hrel = 5e-2f;
+    const std::vector<int64_t> q = {1, 128, 4 * 128};
+
+    CacheOpt qk_f16;
+    qk_f16.int8 = true;
+    qk_f16.quantize_q = true;
+    qk_f16.dt = DataType::f16;
+    expect_cache(q, 512, 4, 2, qk_f16, htol, hrel, "quantize_q f16 per token");
+
+    CacheOpt both_f32;
+    both_f32.int8 = true;
+    both_f32.quantize_q = true;
+    both_f32.quantize_pv = true;
+    expect_cache(q, 512, 4, 2, both_f32, tol, rel, "quantize_q+pv f32 per token");
+
+    CacheOpt both_f16;
+    both_f16.int8 = true;
+    both_f16.per_tensor = true;
+    both_f16.quantize_q = true;
+    both_f16.quantize_pv = true;
+    both_f16.dt = DataType::f16;
+    expect_cache(q, 512, 4, 2, both_f16, htol, hrel, "quantize_q+pv f16 per tensor");
+
+    // A run shorter than one vector tile's four keys per lane still has to
+    // quantize and mask correctly.
+    CacheOpt ragged;
+    ragged.int8 = true;
+    ragged.quantize_q = true;
+    ragged.quantize_pv = true;
+    expect_cache({1, 200, 4 * 64}, 700, 4, 2, ragged, tol, rel, "quantize_q+pv d64 ragged");
 }
 
 NNOPS_TEST(cuda_gqa_varlen_matches_cpu) {

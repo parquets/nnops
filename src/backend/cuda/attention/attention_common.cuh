@@ -11,6 +11,7 @@
 
 #include "backend/common/attention_config.hpp"
 #include "backend/cuda/cuda_common.cuh"
+#include "backend/cuda/matmul/ptx.h" // PTX_SM80_ENABLED gates the mma wrappers below
 #include "nnops/core/status.hpp"
 #include "nnops/core/tensor_view.hpp"
 
@@ -123,6 +124,14 @@ struct AttnParams {
 
     // ---- pointers ----
     const T* q = nullptr;
+    /// The value run widened once into a scratch buffer (attention_i8's fp
+    /// P·V): the same `[batch][kv head][row][d]` order, already scaled.
+    const void* vprep = nullptr;
+    /// The same run turned over for the integer P·V — `[batch][kv head][d][row]`
+    /// s8, zero-padded to `vt_s` rows — so its B panel needs no in-tile
+    /// transpose.
+    const void* vt = nullptr;
+    int64_t vt_s = 0; ///< row stride (keys) of `vt`
     const KVT* k = nullptr;
     const KVT* v = nullptr;
     const KVT* pk = nullptr;
@@ -135,6 +144,11 @@ struct AttnParams {
     // ---- flags ----
     bool causal = false;
     bool v_is_k = false;
+    /// The operator's dynamic integer route (cfg.quantize_q / cfg.quantize_pv):
+    /// attention_i8.cuh runs Q·Kᵀ on the s8 atom when the first is set, and P·V
+    /// on it when both are. The fp routes ignore them and dequantize on read.
+    bool quantize_q = false;
+    bool quantize_pv = false;
     bool has_bias = false;
     bool has_keep = false;
     bool has_gate = false;
@@ -236,6 +250,131 @@ __device__ __forceinline__ float gate_act_value(int act, float g)
     default:
         return g;
     }
+}
+
+// ============================================================
+// The tensor-core epilogue — shared by attention_f16.cuh and attention_i8.cuh
+// ============================================================
+//
+// An output element is the same whatever produced it: value times the softmax
+// denominator, optionally times the gate activation, stored in the query dtype.
+// The two tiles differ in their product and their panels, never in this.
+/// One mma into four fp32 accumulators, the accumulator as the C operand.
+template <class T>
+__device__ __forceinline__ void hmma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0,
+                                     uint32_t b1)
+{
+#if PTX_SM80_ENABLED
+    if constexpr (std::is_same_v<T, __half>) {
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    } else {
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    }
+#endif
+}
+
+/// exp2, one MUFU. The softmax runs in log2 units — the scores are scaled by
+/// `log2(e)` on the way in and the head sink converted on the way out — so the
+/// exponential is this without the multiply `__expf` hides inside it.
+__device__ __forceinline__ float ex2(float x)
+{
+    float r;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+/// Two floats as one packed 16-bit pair — the A fragment of a PV step.
+template <class T> __device__ __forceinline__ uint32_t pack2(float lo, float hi)
+{
+    if constexpr (std::is_same_v<T, __half>) {
+        const __half2 v = __floats2half2_rn(lo, hi);
+        return *reinterpret_cast<const uint32_t*>(&v);
+    } else {
+        const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+        return *reinterpret_cast<const uint32_t*>(&v);
+    }
+}
+
+/// The gate activation, with the choice a template argument: a constant `act`
+/// folds the switch in `gate_act_value` away, so one arm is emitted instead of
+/// five. That is not what makes the kernel small — the arms are still unrolled
+/// once per stored element — it is what makes the *gated* instantiation cost
+/// 4.7x the ungated one instead of dwarfing it.
+template <int kAct> __device__ __forceinline__ float gate_value(float g)
+{
+    return gate_act_value(kAct, g);
+}
+
+/// The store pass. The four row pointers are formed once a lane instead of once
+/// an element, and `kAct < 0` — the common case — is a compile-time form that
+/// carries no activation at all.
+template <class T, int NT, int kAct, class P>
+__device__ __forceinline__ void store_output(const P& p, const float (&o)[NT][4], int64_t obase,
+                                             int64_t gbase, int64_t i0, int c0, int row0,
+                                             int row1, bool live0, bool live1, float scl0,
+                                             float scl1, float norm0, float norm1)
+{
+    T* const dst0 = p.o + obase + (i0 + row0) * p.o_s;
+    T* const dst1 = p.o + obase + (i0 + row1) * p.o_s;
+    const T* const grow0 = p.gate + gbase + (i0 + row0) * p.g_s;
+    const T* const grow1 = p.gate + gbase + (i0 + row1) * p.g_s;
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const int col = 8 * t + c0;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            if (!(half == 0 ? live0 : live1)) {
+                continue;
+            }
+            const float scl = half == 0 ? scl0 : scl1;
+            const float norm = half == 0 ? norm0 : norm1;
+            T* const dst = half == 0 ? dst0 : dst1;
+            float v0 = (half == 0 ? o[t][0] : o[t][2]) * scl * norm;
+            float v1 = (half == 0 ? o[t][1] : o[t][3]) * scl * norm;
+            if constexpr (kAct >= 0) {
+                const T* const grow = half == 0 ? grow0 : grow1;
+                v0 *= gate_value<kAct>(s_load(grow + col));
+                v1 *= gate_value<kAct>(s_load(grow + col + 1));
+            }
+            s_store(dst + col, v0);
+            s_store(dst + col + 1, v1);
+        }
+    }
+}
+
+/// Pick the store pass's activation once for the block, so the element loop is
+/// instantiated once an activation rather than once an element.
+template <class T, int NT, class P>
+__device__ __forceinline__ void store_output_dispatch(const P& p, const float (&o)[NT][4],
+                                                      int64_t obase, int64_t gbase, int64_t i0,
+                                                      int c0, int row0, int row1, bool live0,
+                                                      bool live1, float scl0, float scl1,
+                                                      float norm0, float norm1)
+{
+#define NNOPS_TC_STORE(ACT)                                                          \
+    store_output<T, NT, (ACT)>(p, o, obase, gbase, i0, c0, row0, row1, live0, live1, \
+                               scl0, scl1, norm0, norm1)
+    if (!p.has_gate) {
+        NNOPS_TC_STORE(-1);
+        return;
+    }
+    switch (p.gate_act) {
+    case int(EpilogueActivateType::Silu): NNOPS_TC_STORE(int(EpilogueActivateType::Silu)); return;
+    case int(EpilogueActivateType::Gelu): NNOPS_TC_STORE(int(EpilogueActivateType::Gelu)); return;
+    case int(EpilogueActivateType::Relu): NNOPS_TC_STORE(int(EpilogueActivateType::Relu)); return;
+    case int(EpilogueActivateType::Sigmoid):
+        NNOPS_TC_STORE(int(EpilogueActivateType::Sigmoid));
+        return;
+    case int(EpilogueActivateType::Tanh): NNOPS_TC_STORE(int(EpilogueActivateType::Tanh)); return;
+    default: NNOPS_TC_STORE(-1); return;
+    }
+#undef NNOPS_TC_STORE
 }
 
 } // namespace nnops::backend::cuda::attn
