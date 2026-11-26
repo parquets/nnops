@@ -87,6 +87,61 @@ void run_case(const LinearCase& c, const char* what)
     expect_same(out_dev, out_ref, tol, c.dtype == DataType::f16 ? 2e-2f : 1e-4f, what);
 }
 
+/// w4a16 Linear against the CPU route: an f16 activation, a block-packed
+/// weight, and the same epilogue/residual ordering the dense path uses.
+void run_q4_case(const std::vector<int64_t>& xshape, int64_t n, DataType fmt, bool bias,
+                 bool add_to, Epilogue ep, bool padded, const char* what)
+{
+    LinearAttributes attrs;
+    attrs.epilogue = ep;
+    attrs.add_to = add_to;
+    attrs.output_dtype = DataType::f16;
+
+    const int64_t k = xshape.back();
+    HostTensor x = make_host_random(xshape, DataType::f16, padded, 41);
+    HostTensor w = make_host_q4(std::vector<int64_t>{n, k}, fmt, 43);
+    HostTensor b;
+    if (bias) {
+        b = make_host_random(std::vector<int64_t>{n}, DataType::f16, false, 47, -0.25f, 0.25f);
+    }
+
+    std::vector<TensorDesc> descs = {x.view.desc(), w.view.desc()};
+    if (bias) {
+        descs.push_back(b.view.desc());
+    }
+
+    auto op_cpu = Linear::create(attrs, Backend::CPU);
+    const TensorDesc od = op_cpu->getOutputTensorDesc(descs).front();
+
+    const auto seed = [&](uint64_t s) {
+        return add_to ? make_host_random(od.dims, od.dtype, false, s, 0.0f, 0.5f) :
+                        make_host_zeroed(od.dims, od.dtype, false);
+    };
+    HostTensor out_ref = seed(53);
+    HostTensor out_dev = seed(53);
+
+    std::vector<TensorView> cpu_ins = {x.view, w.view};
+    if (bias) {
+        cpu_ins.push_back(b.view);
+    }
+    cpu_run(*op_cpu, out_ref.view, cpu_ins);
+
+    auto op_dev = Linear::create(attrs, Backend::CUDA);
+    DeviceTensor dx = to_device(x);
+    DeviceTensor dw = to_device(w);
+    DeviceTensor db;
+    std::vector<TensorView> dev_ins = {dx.view, dw.view};
+    if (bias) {
+        db = to_device(b);
+        dev_ins.push_back(db.view);
+    }
+    DeviceTensor dout = alloc_like(out_dev.view, out_dev);
+    cuda_run(*op_dev, dout.view, dev_ins);
+    from_device(dout, out_dev);
+
+    expect_same(out_dev, out_ref, kF16AccumTol, 2e-2f, what);
+}
+
 }  // namespace
 
 NNOPS_TEST(cuda_linear_2d) {
@@ -367,6 +422,107 @@ NNOPS_TEST(cuda_linear_rejects_rank_above_six) {
     const TensorView ins[] = {xv, wv};
     NNOPS_EXPECT_EQ(op->compute({&cv, 1}, ins, cuda_context(), nullptr),
                     Status::unsupported);
+}
+
+NNOPS_TEST(cuda_linear_batched_add_to) {
+    // `add_to` means "fold this slice's old output in", so the residual has to
+    // carry the same batch offset C does. Reading it un-offset left every slice
+    // folding batch 0's -- right only for a batch of one, which is what the
+    // 2-D cases above are.
+    Epilogue ep;
+    ep.type = EpilogueActivateType::Relu;
+    for (DataType dt : {DataType::f32, DataType::f16}) {
+        LinearCase c;
+        c.x_shape = {2, 37, 65};
+        c.n = 43;
+        c.dtype = dt;
+        c.add_to = true;
+        c.epilogue = ep;
+        run_case(c, dt == DataType::f16 ? "linear batched add_to f16"
+                                        : "linear batched add_to f32");
+    }
+}
+
+NNOPS_TEST(cuda_linear_q4) {
+    // w4a16: the weight is a llama.cpp block stream, the activation f16. The
+    // CPU route reads the same bytes, so it stays the oracle; the shapes walk
+    // the decode's edges — one row (a decode GEMM), a whole tile, a k that ends
+    // mid-block, a pitched activation, and both destinations (plain and
+    // add_to, whose residual lands after the activation).
+    Epilogue relu;
+    relu.type = EpilogueActivateType::Relu;
+
+    for (DataType fmt : {DataType::q4_0, DataType::q4_1, DataType::q8_0}) {
+        run_q4_case({1, 96}, 64, fmt, true, false, Epilogue{}, false, "cuda_linear_q4 one row");
+        run_q4_case({7, 65}, 43, fmt, false, false, Epilogue{}, true, "cuda_linear_q4 k tail");
+        run_q4_case({64, 128}, 96, fmt, true, false, Epilogue{}, false, "cuda_linear_q4 tile");
+        run_q4_case({65, 17}, 33, fmt, true, true, relu, false,
+                    "cuda_linear_q4 partial block add_to");
+        run_q4_case({2, 37, 65}, 33, fmt, true, false, Epilogue{}, false,
+                    "cuda_linear_q4 batched");
+        // The narrow-m loop: one, four and sixteen live rows, k deep enough
+        // for its split. The decode runs in registers there, not through a
+        // panel.
+        run_q4_case({1, 2048}, 96, fmt, true, false, Epilogue{}, false,
+                    "cuda_linear_q4 narrow gemv");
+        run_q4_case({3, 1024}, 64, fmt, false, false, Epilogue{}, false,
+                    "cuda_linear_q4 narrow four rows");
+        run_q4_case({4, 2048}, 128, fmt, true, true, relu, false,
+                    "cuda_linear_q4 narrow four rows add_to");
+    }
+}
+
+NNOPS_TEST(cuda_linear_q4_bf16) {
+    // The same block stream with bf16 activations. The CPU has no bf16 block
+    // route on x86, so the reference decodes the blocks itself — rounding each
+    // weight value to bf16 exactly as the panel fill does — and accumulates in
+    // f32, which is the kernel's own arithmetic order-independent sum.
+    using nnops::backend::cpu::bfloat16;
+    using nnops::backend::cpu::bfloat16_to_float;
+    using nnops::backend::cpu::float_to_bfloat16;
+    const int64_t M = 37, N = 43, K = 65;
+    const int64_t blocks = (K + q4_block_elems - 1) / q4_block_elems;
+    const size_t bb = data_type_block_bytes(DataType::q4_1);
+
+    HostTensor x = make_host_random(std::vector<int64_t>{M, K}, DataType::bf16, false, 101);
+    HostTensor w = make_host_q4(std::vector<int64_t>{N, K}, DataType::q4_1, 103);
+
+    LinearAttributes attrs;
+    attrs.output_dtype = DataType::bf16;
+    auto op = Linear::create(attrs, Backend::CUDA);
+    HostTensor out = make_host_zeroed(std::vector<int64_t>{M, N}, DataType::bf16, false);
+
+    DeviceTensor dx = to_device(x);
+    DeviceTensor dw = to_device(w);
+    DeviceTensor dout = alloc_like(out.view, out);
+    const TensorView ins[] = {dx.view, dw.view};
+    cuda_run(*op, dout.view, ins);
+    from_device(dout, out);
+
+    const auto* xp = reinterpret_cast<const bfloat16*>(x.bytes.data());
+    const uint8_t* bp = reinterpret_cast<const uint8_t*>(w.bytes.data());
+    const auto* cp = reinterpret_cast<const bfloat16*>(out.bytes.data());
+    float worst = 0.0f;
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            float bv[q4_block_elems];
+            for (int64_t blk = 0; blk < blocks; ++blk) {
+                q4_unpack_block(bp + (n * blocks + blk) * bb, bv, DataType::q4_1);
+                for (int j = 0; j < q4_block_elems; ++j) {
+                    const int64_t k = blk * q4_block_elems + j;
+                    if (k >= K) {
+                        break;
+                    }
+                    const float wv = bfloat16_to_float(float_to_bfloat16(bv[j]));
+                    acc += bfloat16_to_float(xp[m * K + k]) * wv;
+                }
+            }
+            const float got = bfloat16_to_float(cp[m * N + n]);
+            worst = std::max(worst, std::fabs(got - acc) / std::max(1.0f, std::fabs(acc)));
+        }
+    }
+    NNOPS_EXPECT_TRUE(worst <= 2e-2f);
 }
 
 #endif  // NNOPS_HAS_CUDA

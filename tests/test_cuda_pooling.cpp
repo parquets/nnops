@@ -20,6 +20,7 @@
 #include "common/test_helpers.hpp"
 #include "common/cuda_test_helper.hpp"
 
+#include <array>
 #include <vector>
 
 #ifdef NNOPS_HAS_CUDA
@@ -201,6 +202,34 @@ NNOPS_TEST(cuda_pooling_global_nhwc) {
     d.attrs.type = PoolingType::Average;
     d.add_to = true;
     run_case(d, "cuda_pooling_global_nhwc");
+}
+
+NNOPS_TEST(cuda_pooling_adaptive) {
+    // Adaptive pooling: output index o covers input [floor(o*I/O),
+    // ceil((o+1)*I/O)) -- a window a fixed kernel/stride cannot express, which
+    // is what this used to compute instead.
+    for (PoolingType type : {PoolingType::Max, PoolingType::Average}) {
+        for (std::array<int64_t, 3> os :
+             {std::array<int64_t, 3>{0, 3, 4}, std::array<int64_t, 3>{0, 1, 1},
+              std::array<int64_t, 3>{0, 5, 2}}) {
+            PoolCase c;
+            c.shape = {2, 7, 9, 8};
+            c.attrs.type = type;
+            c.attrs.output_size = os;
+            run_case(c, type == PoolingType::Max ? "adaptive max" : "adaptive average");
+        }
+    }
+    // 3D, and an output larger than the input on one axis.
+    PoolCase d3;
+    d3.shape = {1, 4, 5, 6, 8};
+    d3.attrs.type = PoolingType::Max;
+    d3.attrs.output_size = {2, 2, 3};
+    run_case(d3, "adaptive 3d max");
+    PoolCase big;
+    big.shape = {1, 5, 8, 8};
+    big.attrs.type = PoolingType::Average;
+    big.attrs.output_size = {0, 9, 9};
+    run_case(big, "adaptive larger output");
 }
 
 #endif  // NNOPS_HAS_CUDA

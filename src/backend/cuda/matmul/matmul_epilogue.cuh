@@ -88,6 +88,24 @@ template <> __device__ __forceinline__ float gemm_epilogue_load<__half>(const __
     return __half2float(p[i]);
 }
 
+/// The epilogue with its residual moved to this batch slice. `add_to`'s old
+/// value is the one C is about to overwrite, so it takes C's batch offset --
+/// without it every slice would fold batch 0's. A broadcast axis (stride 0)
+/// leaves the pointer alone.
+template <class Elem>
+__device__ __forceinline__ GemmEpilogue gemm_epilogue_for_batch(const GemmEpilogue& e,
+                                                               const int64_t* size,
+                                                               const int64_t* r_bstr, int rank,
+                                                               int64_t batch)
+{
+    GemmEpilogue out = e;
+    if (out.residual != nullptr) {
+        out.residual = static_cast<const Elem*>(out.residual) +
+                       f16_batch_offset(size, r_bstr, rank, batch);
+    }
+    return out;
+}
+
 /// One destination element: `dst` points at C[m][n] and `dst[n]` is its old
 /// value for the beta term.
 template <class Elem>

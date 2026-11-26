@@ -13,6 +13,7 @@
 #include "matmul_f16_host.hpp"
 #include "matmul_f32_host.hpp"
 #include "matmul_narrow.cuh"
+#include "matmul_q4_host.hpp"
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/status.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -116,6 +117,7 @@ inline F16Call make_f16_call(const GemmParams& p, bool trans_a, bool trans_b, bo
         call.a_bstr[d] = p.a_batch[d];
         call.b_bstr[d] = p.b_batch[d];
         call.c_bstr[d] = p.c_batch[d];
+        call.r_bstr[d] = p.r_batch[d];
     }
     return call;
 }
@@ -153,8 +155,40 @@ inline F32Call make_f32_call(const GemmParams& p, bool trans_a, bool trans_b)
         call.a_bstr[d] = p.a_batch[d];
         call.b_bstr[d] = p.b_batch[d];
         call.c_bstr[d] = p.c_batch[d];
+        call.r_bstr[d] = p.r_batch[d];
     }
     return call;
+}
+
+/// A block-packed weight's view of the same product: the dense 16-bit call
+/// with B reinterpreted as a llama.cpp block stream.
+inline Q4Call make_q4_call(const GemmParams& p, bool trans_a, bool trans_b, bool bf16,
+                           DataType fmt)
+{
+    Q4Call call;
+    call.gemm = make_f16_call(p, trans_a, trans_b, bf16);
+    call.b_row_blocks = p.ldb;
+    call.fmt = int(fmt);
+    return call;
+}
+
+/// Launch the w4a16 engine; false when the call is outside its pose.
+inline Status q4_gemm_status(const Q4Call& call, DataType dtype, cudaStream_t stream)
+{
+    if (dtype != DataType::f16 && dtype != DataType::bf16) {
+        return Status::unsupported;
+    }
+    if (call.gemm.m <= 0 || call.gemm.n <= 0 || call.gemm.k <= 0) {
+        return Status::unsupported;
+    }
+    // Same grid bound as the dense f16 engine: the n axis is blockIdx.y.
+    if ((int64_t(call.gemm.n) + 63) / 64 > kGemmMaxGridAxis) {
+        return Status::unsupported;
+    }
+    if (!q4_dense_call(call, stream)) {
+        return Status::unsupported;
+    }
+    return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
 }
 
 /// Launch a fully configured dense GEMM; f32, f16 and bf16 only.

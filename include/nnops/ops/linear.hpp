@@ -7,6 +7,8 @@
 ///                                      (32 values per 20-byte block, decoded
 ///                                      inside the RHS pack or the fused kernel)
 ///   bf16 × bf16, bf16 : q4_1         → aarch64 only, same output rule
+///   CUDA f16/bf16 : q4_0/q4_1/q8_0   → w4a16: the same output rule, with the
+///                                      decode fused into the B panel fill
 ///   u8 × s8, s8 × s8 (quantized)     → output follows `output_dtype`:
 ///                                      f32/f16 dequantizes, s32/s8/u8 stays
 ///                                      integral

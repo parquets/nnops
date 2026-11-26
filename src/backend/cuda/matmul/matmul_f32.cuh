@@ -110,6 +110,10 @@ struct F32Params {
     int64_t a_bstr[4] = {0, 0, 0, 0};
     int64_t b_bstr[4] = {0, 0, 0, 0};
     int64_t c_bstr[4] = {0, 0, 0, 0};
+    /// The residual's batch strides: `add_to`'s old value is this slice's, so
+    /// the epilogue adds the same batch offset C does -- stride 0 broadcasts,
+    /// exactly as the operands' do.
+    int64_t r_bstr[4] = {0, 0, 0, 0};
     /// The operator-level epilogue: alpha, bias, beta, clamp, activation,
     /// residual, in that order.
     GemmEpilogue epi;

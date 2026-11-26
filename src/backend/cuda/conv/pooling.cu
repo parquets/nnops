@@ -59,6 +59,8 @@ struct PoolGeom {
     PoolingType type;
     bool exclude_pad;
     bool add_to;
+    /// Adaptive: the window comes from the output index, not the fixed fields.
+    bool adaptive;
 };
 
 // ============================================================
@@ -143,6 +145,88 @@ __global__ void pooling_flat_kernel(const T* __restrict__ input, T* __restrict__
         }
     }
     store_channels<T, Vec>(out, acc);
+}
+
+/// Adaptive pooling: output index `o` covers input `[floor(o*I/O),
+/// ceil((o+1)*I/O))` -- PyTorch's rule, which is also the only one that
+/// expresses an `I % O != 0` size. The lane still spans channels, and the two
+/// loops let one launch cover any output grid.
+__device__ inline void adaptive_span(int64_t o, int64_t in, int64_t out, int64_t& lo, int64_t& hi)
+{
+    lo = (o * in) / out;
+    hi = ((o + 1) * in + out - 1) / out;
+}
+
+template <typename T, int Vec, bool IsMax>
+__global__ void pooling_adaptive_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                        PoolGeom g, int64_t c_begin, int64_t chunks)
+{
+    const int64_t chunk = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (chunk >= chunks) {
+        return;
+    }
+    const T* in_base = input + c_begin + chunk * Vec;
+    T* out_base = output + c_begin + chunk * Vec;
+    const int64_t z_end = g.N * g.OD * g.OH;
+
+    for (int64_t z = int64_t(blockIdx.z); z < z_end; z += int64_t(gridDim.z)) {
+        const int64_t oh = z % g.OH;
+        const int64_t p = z / g.OH;
+        const int64_t od = p % g.OD;
+        const int64_t img = p / g.OD;
+
+        int64_t d0, d1, h0, h1;
+        adaptive_span(od, g.ID, g.OD, d0, d1);
+        adaptive_span(oh, g.IH, g.OH, h0, h1);
+
+        const T* in_img = in_base + img * (g.ID * g.in_d_stride);
+        T* out_img = out_base + img * (g.OD * g.out_d_stride);
+
+        for (int64_t ow = int64_t(blockIdx.y) * blockDim.y + threadIdx.y; ow < g.OW;
+             ow += int64_t(gridDim.y) * blockDim.y) {
+            int64_t w0, w1;
+            adaptive_span(ow, g.IW, g.OW, w0, w1);
+
+            float acc[Vec];
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                acc[i] = IsMax ? -std::numeric_limits<float>::infinity() : 0.0f;
+            }
+            for (int64_t id = d0; id < d1; ++id) {
+                const T* in_d = in_img + id * g.in_d_stride;
+                for (int64_t ih = h0; ih < h1; ++ih) {
+                    const T* row = in_d + ih * g.in_row_stride;
+                    for (int64_t iw = w0; iw < w1; ++iw) {
+                        float v[Vec];
+                        load_channels<T, Vec>(row + iw * g.in_pix_stride, v);
+#pragma unroll
+                        for (int i = 0; i < Vec; ++i) {
+                            acc[i] = IsMax ? fmaxf(acc[i], v[i]) : acc[i] + v[i];
+                        }
+                    }
+                }
+            }
+            if (!IsMax) {
+                const int64_t vol = (d1 - d0) * (h1 - h0) * (w1 - w0);
+                const float scale = vol > 0 ? 1.0f / static_cast<float>(vol) : 0.0f;
+#pragma unroll
+                for (int i = 0; i < Vec; ++i) {
+                    acc[i] *= scale;
+                }
+            }
+
+            T* out = out_img + od * g.out_d_stride + oh * g.out_row_stride + ow * g.out_pix_stride;
+            if (g.add_to) {
+                float prev[Vec];
+                load_channels<T, Vec>(out, prev);
+#pragma unroll
+                for (int i = 0; i < Vec; ++i) {
+                    acc[i] += prev[i];
+                }
+            }
+            store_channels<T, Vec>(out, acc);
+        }
+    }
 }
 
 /// ROWS output rows per thread. Consecutive rows share K-1 of their input rows,
@@ -487,6 +571,7 @@ inline PoolGeom pooling_geom(const PoolingAttributes& attrs, const TensorView& i
     g.type = attrs.type;
     g.exclude_pad = attrs.exclude_pad;
     g.add_to = attrs.add_to;
+    g.adaptive = attrs.adaptive();
 
     g.in_pix_stride = input.shape(rank - 1);
     g.in_row_stride = input.row_stride_elems();
@@ -512,6 +597,25 @@ void pooling_launch(const PoolGeom& g, TensorView& output, const TensorView& inp
     const dim3 block(static_cast<unsigned>(bx), static_cast<unsigned>(by), 1);
     const dim3 gxy(static_cast<unsigned>((chunks + bx - 1) / bx),
                    static_cast<unsigned>((g.OW + by - 1) / by));
+
+    // Adaptive first: its window comes from the output index, so none of the
+    // fixed-window geometry below (the row kernel's square window, the grid's
+    // 65 535 limit) applies -- the kernel strides its own z and ow instead.
+    if (g.adaptive) {
+        const int64_t z_end = g.N * g.OD * g.OH;
+        const dim3 agrid(gxy.x,
+                         static_cast<unsigned>(std::min<int64_t>(gxy.y, 65535)),
+                         static_cast<unsigned>(std::min<int64_t>(z_end, 65535)));
+        if (g.type == PoolingType::Max) {
+            pooling_adaptive_kernel<T, Vec, true><<<agrid, block, 0, stream>>>(
+                input.ptr<T>(), output.ptr<T>(), g, c_begin, chunks);
+        } else {
+            pooling_adaptive_kernel<T, Vec, false><<<agrid, block, 0, stream>>>(
+                input.ptr<T>(), output.ptr<T>(), g, c_begin, chunks);
+        }
+        return;
+    }
+
     const bool grid_ok = g.OW <= 65535;
 
     const bool square = g.KH == g.KW && (g.KH == 2 || g.KH == 3 || g.KH == 5);

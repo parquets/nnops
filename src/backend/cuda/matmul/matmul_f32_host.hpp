@@ -31,6 +31,8 @@ struct F32Call {
     int64_t a_bstr[4] = {0, 0, 0, 0};
     int64_t b_bstr[4] = {0, 0, 0, 0};
     int64_t c_bstr[4] = {0, 0, 0, 0};
+    /// The residual's batch strides, when `residual` is set.
+    int64_t r_bstr[4] = {0, 0, 0, 0};
     /// The operator epilogue: bias and residual point at f32 arrays. `epilogue`
     /// is EpilogueActivateType as an int, so this header stays free of the
     /// operator's includes.

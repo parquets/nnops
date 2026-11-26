@@ -141,6 +141,8 @@ struct F16Params {
     int64_t a_bstr[4] = {0, 0, 0, 0};
     int64_t b_bstr[4] = {0, 0, 0, 0};
     int64_t c_bstr[4] = {0, 0, 0, 0};
+    /// The residual's batch strides (`add_to`'s old value is this slice's).
+    int64_t r_bstr[4] = {0, 0, 0, 0};
     /// Split-K scratch: [splits][batch][m][n] f32 planes, or null for one pass.
     float* partial = nullptr;
     /// 1 when both operands' bases and row pitches allow a 16 B cp.async. A

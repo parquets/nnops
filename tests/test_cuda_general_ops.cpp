@@ -827,6 +827,15 @@ NNOPS_TEST(cuda_pool1d_modes) {
             check([&](Backend b) { return Pool1D::create(a, b); }, {&x}, tol,
                   "pool1d adaptive");
 
+            // 9 -> 5 is not K 3 / S 2's four windows, and its spans are uneven:
+            // the one size above happens to line up with the fixed window, so
+            // it did not exercise the adaptive walk at all.
+            a.kernel_shape = 0;
+            a.stride = 0;
+            a.output_size = 5;
+            check([&](Backend b) { return Pool1D::create(a, b); }, {&x}, tol,
+                  "pool1d adaptive uneven");
+
             Pool1DAttributes same;
             same.type = a.type;
             same.kernel_shape = 3;

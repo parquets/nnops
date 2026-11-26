@@ -432,4 +432,56 @@ NNOPS_TEST(cuda_batch_norm_f16) {
     run_case(c, "cuda_batch_norm_f16");
 }
 
+NNOPS_TEST(cuda_norm_one_plus_weight) {
+    // Gemma's zero-centered weight: the stored tensor is the offset from one,
+    // so the row kernel must apply `w + 1`. The flag is part of the contract
+    // for LayerNorm and RMSNorm alike.
+    const std::vector<int64_t> shape{1, 4, 8};
+    const uint64_t seeds[] = {11, 12};
+    for (NormType type : {NormType::LayerNorm, NormType::RMSNorm}) {
+        NormAttributes attrs;
+        attrs.type = type;
+        attrs.axis = -1;
+        attrs.one_plus_weight = true;
+        HostTensor x = make_host_random(shape, DataType::f32, false, seeds[0], -1.0f, 1.0f);
+        HostTensor w = make_host_random(std::vector<int64_t>{8}, DataType::f32, false,
+                                        seeds[1], -1.0f, 1.0f);
+        const HostTensor ins[] = {x, w};
+        run_op_close([&](Backend be) { return Norm::create(attrs, be); }, ins, 2e-4f, 2e-4f,
+                     type == NormType::RMSNorm ? "rmsnorm one_plus_weight"
+                                               : "layernorm one_plus_weight");
+    }
+}
+
+NNOPS_TEST(cuda_norm_gate) {
+    // RMSNormGated: `y = rms_norm(x) * scale * act(gate)`, the gate a trailing
+    // input shaped like X. The fused step multiplies the row before `add_to`.
+    const std::vector<int64_t> shape{1, 4, 8};
+    for (EpilogueActivateType act :
+         {EpilogueActivateType::Silu, EpilogueActivateType::Gelu, EpilogueActivateType::Relu}) {
+        for (bool residual : {false, true}) {
+            NormAttributes attrs;
+            attrs.type = NormType::RMSNorm;
+            attrs.axis = -1;
+            attrs.gate_activation = act;
+            attrs.add_residual = residual;
+            HostTensor x = make_host_random(shape, DataType::f32, false, 51, -1.0f, 1.0f);
+            HostTensor w = make_host_random(std::vector<int64_t>{8}, DataType::f32, false, 52,
+                                            -1.0f, 1.0f);
+            HostTensor r = make_host_random(shape, DataType::f32, false, 53, -1.0f, 1.0f);
+            HostTensor g = make_host_random(shape, DataType::f32, false, 54, -2.0f, 2.0f);
+            std::vector<HostTensor> own;
+            own.push_back(std::move(x));
+            own.push_back(std::move(w));
+            if (residual) { own.push_back(std::move(r)); }
+            own.push_back(std::move(g));
+            std::vector<TensorView> ins;
+            for (auto& t : own) { ins.push_back(t.view); }
+            run_op_close([&](Backend be) { return Norm::create(attrs, be); },
+                         std::span<const HostTensor>(own.data(), own.size()), 2e-4f, 2e-4f,
+                         residual ? "rmsnorm gated + residual" : "rmsnorm gated");
+        }
+    }
+}
+
 #endif  // NNOPS_HAS_CUDA

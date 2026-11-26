@@ -888,6 +888,105 @@ NNOPS_TEST(cuda_matmul_i8_dequant) {
       run_i8_case(c, "cuda_matmul_i8_dequant"); }
 }
 
+/// w4a16 against the CPU route: an f16 activation and a llama.cpp block
+/// weight, in both physical B layouts. The CPU packed route decodes the same
+/// bytes, so it is the oracle for the kernel's own decode, the batch offset
+/// (which is counted in blocks, not elements) and the epilogue.
+void run_q4_case(const std::vector<int64_t>& ashape, const std::vector<int64_t>& bshape,
+                 bool transpose_a, bool transpose_b, DataType fmt, float alpha, float beta,
+                 Epilogue ep, bool bias, const char* what)
+{
+    MatMulAttributes attrs;
+    attrs.transpose_a = transpose_a;
+    attrs.transpose_b = transpose_b;
+    attrs.alpha = alpha;
+    attrs.beta = beta;
+    attrs.epilogue = ep;
+
+    HostTensor a = make_host_random(ashape, DataType::f16, false, 17);
+    HostTensor b = make_host_q4(bshape, fmt, 29);
+    HostTensor bias_t;
+    if (bias) {
+        // The bias is indexed by the column: N is B's row count when
+        // transposed, its last extent otherwise.
+        const int64_t n = transpose_b ? bshape[bshape.size() - 2] : bshape.back();
+        bias_t = make_host_random(std::vector<int64_t>{n}, DataType::f16, false, 31, -0.25f, 0.25f);
+    }
+
+    std::vector<TensorDesc> descs = {a.view.desc(), b.view.desc()};
+    if (bias) {
+        descs.push_back(bias_t.view.desc());
+    }
+
+    auto op_cpu = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc od = op_cpu->getOutputTensorDesc(descs).front();
+    const auto seed = [&](uint64_t s) {
+        return beta != 0.0f ? make_host_random(od.dims, od.dtype, false, s, 0.0f, 0.5f) :
+                              make_host_zeroed(od.dims, od.dtype, false);
+    };
+    HostTensor out_ref = seed(37);
+    HostTensor out_dev = seed(37);
+
+    std::vector<TensorView> cpu_ins = {a.view, b.view};
+    if (bias) {
+        cpu_ins.push_back(bias_t.view);
+    }
+    cpu_run(*op_cpu, out_ref.view, cpu_ins);
+
+    auto op_dev = MatMul::create(attrs, Backend::CUDA);
+    DeviceTensor da = to_device(a);
+    DeviceTensor db = to_device(b);
+    DeviceTensor dbias;
+    std::vector<TensorView> dev_ins = {da.view, db.view};
+    if (bias) {
+        dbias = to_device(bias_t);
+        dev_ins.push_back(dbias.view);
+    }
+    DeviceTensor dout = alloc_like(out_dev.view, out_dev);
+    cuda_run(*op_dev, dout.view, dev_ins);
+    from_device(dout, out_dev);
+
+    expect_same(out_dev, out_ref, kF16AccumTol, 2e-2f, what);
+}
+
+NNOPS_TEST(cuda_matmul_q4) {
+    Epilogue relu;
+    relu.type = EpilogueActivateType::Relu;
+
+    for (DataType fmt : {DataType::q4_0, DataType::q4_1, DataType::q8_0}) {
+        // [M, K] x [N, K] with transpose_b, the Linear pose: one row, a k tail,
+        // and a full tile against a wider N.
+        run_q4_case({1, 96}, {64, 96}, false, true, fmt, 1.0f, 0.0f, Epilogue{}, false,
+                    "cuda_matmul_q4 k-major");
+        run_q4_case({5, 65}, {64, 65}, false, true, fmt, 1.0f, 0.0f, Epilogue{}, true,
+                    "cuda_matmul_q4 k tail");
+        run_q4_case({64, 128}, {96, 128}, false, true, fmt, 0.5f, 0.5f, relu, true,
+                    "cuda_matmul_q4 alpha beta relu");
+        // [M, K] x [K, N] without transpose_b: the pose whose block is picked by
+        // the column instead of the row.
+        run_q4_case({5, 65}, {65, 64}, false, false, fmt, 1.0f, 0.0f, Epilogue{}, true,
+                    "cuda_matmul_q4 n-major");
+        run_q4_case({64, 128}, {128, 96}, false, false, fmt, 1.0f, 0.0f, relu, false,
+                    "cuda_matmul_q4 n-major tile");
+    }
+
+    // The narrow-m loop (a Linear pose at most sixteen rows deep), taken here
+    // through MatMul's own front end.
+    run_q4_case({4, 2048}, {80, 2048}, false, true, DataType::q4_1, 1.0f, 0.0f, Epilogue{},
+                true, "cuda_matmul_q4 narrow");
+
+    // transpose_a goes through the A panel's own copy atom.
+    run_q4_case({65, 8}, {64, 65}, true, true, DataType::q4_1, 1.0f, 0.0f, Epilogue{}, false,
+                "cuda_matmul_q4 transpose_a");
+
+    // A batched B: each slice's block offset is its row count times the pitch,
+    // counted in blocks.
+    run_q4_case({2, 7, 64}, {2, 33, 64}, false, true, DataType::q4_1, 1.0f, 0.0f, Epilogue{},
+                true, "cuda_matmul_q4 batched B");
+    run_q4_case({3, 5, 64}, {64, 64}, false, true, DataType::q4_0, 1.0f, 0.0f, Epilogue{}, false,
+                "cuda_matmul_q4 broadcast B");
+}
+
 NNOPS_TEST(cuda_matmul_rejects_rank_above_six) {
     // Four batch axes are all the kernels carry, so a rank-seven call is refused
     // by validate() instead of reaching the launch and failing there.

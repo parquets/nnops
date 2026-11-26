@@ -14,7 +14,9 @@
 /// output_dtype s32/s8/u8 (integral) or f32/f16 (dequantized), and an fp
 /// activation carrying QuantParams × s8 (quantized on the fly). On aarch64
 /// bf16 takes the float routes too, including a Q4_0/Q4_1/Q8_0 B decoded into the
-/// BFMMLA operand layout. N-D batched with
+/// BFMMLA operand layout. On CUDA a 16-bit activation against a block-packed B
+/// is the w4a16 kernel (the decode is fused into the B panel fill); a f32
+/// activation against one stays on the CPU. N-D batched with
 /// numpy-style broadcasting on the leading dims. alpha rides the RHS pack on the
 /// fp routes; the integer routes ignore it, since requantization belongs in the
 /// output QuantParams.

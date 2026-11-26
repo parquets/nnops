@@ -210,6 +210,9 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/matmul/matmul_f16.cu
         backend/cuda/matmul/matmul_f16_tail.cu
         backend/cuda/matmul/matmul_bf16.cu
+        # w4a16: the same 16-bit tile with the weight panel decoded from a
+        # llama.cpp Q4_0/Q4_1/Q8_0 block stream.
+        backend/cuda/matmul/matmul_q4.cu
         backend/cuda/matmul/matmul_f32.cu
         backend/cuda/matmul/matmul_i8_ptx.cu
         backend/cuda/conv/conv2d.cu

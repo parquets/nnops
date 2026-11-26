@@ -79,6 +79,10 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void f32_gemm_kernel(F32P
     float* const C =
         static_cast<float*>(p.c) + f16_batch_offset(p.bsize, p.c_bstr, p.batch_rank, batch);
 
+    /// The residual is this slice's, so it rides the same batch offset C does.
+    const GemmEpilogue epi =
+        gemm_epilogue_for_batch<float>(p.epi, p.bsize, p.r_bstr, p.batch_rank, batch);
+
     const int vrow = tid / S::kVecPerRow;
     const int vcol = (tid % S::kVecPerRow) * KU;
     // The fill walks a fixed set of rows per thread, so each row's base pointer
@@ -298,7 +302,7 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void f32_gemm_kernel(F32P
             float v[4];
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
-                v[q] = gemm_epilogue_element<float>(p.epi, acc[r][c + q], gm, gn + q, crow);
+                v[q] = gemm_epilogue_element<float>(epi, acc[r][c + q], gm, gn + q, crow);
             }
             if (vec4 && gn + 4 <= N) {
                 *reinterpret_cast<float4*>(crow + gn) = make_float4(v[0], v[1], v[2], v[3]);
@@ -597,6 +601,7 @@ template <class S> bool f32_run(const F32Call& call, cudaStream_t stream)
         q.a_bstr[d] = call.a_bstr[d];
         q.b_bstr[d] = call.b_bstr[d];
         q.c_bstr[d] = call.c_bstr[d];
+        q.r_bstr[d] = call.r_bstr[d];
     }
 
     const dim3 grid(unsigned((call.m + S::BM - 1) / S::BM), unsigned((call.n + S::BN - 1) / S::BN),

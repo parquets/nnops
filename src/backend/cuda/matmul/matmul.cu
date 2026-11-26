@@ -94,6 +94,55 @@ Status matmul_i8_cuda(const MatMulAttributes& attrs, TensorView& output,
                                 static_cast<cudaStream_t>(ctx.cuda_stream));
 }
 
+/// The w4a16 route: a 16-bit activation against a llama.cpp Q4_0/Q4_1/Q8_0
+/// block stream. The weight's logical dims read the same as a dense one — the
+/// block packing changes the storage, not the shape — and its strides are
+/// already in blocks, which is exactly what the kernel walks.
+Status matmul_q4_cuda(const MatMulAttributes& attrs, TensorView& output,
+                      std::span<const TensorView> inputs, const ComputeContext& ctx)
+{
+    const TensorView& a = inputs[0];
+    const TensorView& b = inputs[1];
+    const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
+
+    const int64_t M = attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2);
+    const int64_t Ka = attrs.transpose_a ? a.shape(a.rank() - 2) : a.shape(a.rank() - 1);
+    const int64_t Kb = attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2);
+    const int64_t N = attrs.transpose_b ? b.shape(b.rank() - 2) : b.shape(b.rank() - 1);
+    if (Ka != Kb) {
+        return Status::invalid_argument;
+    }
+
+    GemmParams p;
+    p.a = a.ptr<void>();
+    p.b = b.ptr<void>();
+    p.c = output.ptr<void>();
+    p.bias = bias != nullptr ? bias->ptr<void>() : nullptr;
+    p.m = static_cast<int>(M);
+    p.n = static_cast<int>(N);
+    p.k = static_cast<int>(Ka);
+    p.lda = a.row_stride_elems();
+    p.ldb = b.row_stride_elems();
+    p.ldc = output.row_stride_elems();
+    p.alpha = attrs.alpha;
+    p.beta = attrs.beta;
+    p.epilogue = attrs.epilogue.type;
+    p.ep_alpha = attrs.epilogue.alpha;
+    p.ep_beta = attrs.epilogue.beta;
+    p.min_clip = attrs.epilogue.min_clip;
+    p.max_clip = attrs.epilogue.max_clip;
+
+    if (!gemm_batch_layout(a, b, output, nullptr, p)) {
+        return Status::unsupported;
+    }
+
+    const DataType dt = a.data_type();
+    return q4_gemm_status(
+        make_q4_call(p, attrs.transpose_a, attrs.transpose_b, dt == DataType::bf16,
+                     b.data_type()),
+        dt, static_cast<cudaStream_t>(ctx.cuda_stream));
+}
+
 } // namespace
 
 Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
@@ -113,6 +162,12 @@ Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
             return Status::unsupported;
         }
         return matmul_i8_cuda(attrs, output, inputs, ctx, kind);
+    }
+    if (is_block_packed_dtype(b.data_type())) {
+        if (output.numel() == 0) {
+            return Status::ok;
+        }
+        return matmul_q4_cuda(attrs, output, inputs, ctx);
     }
     if ((dt != DataType::f32 && dt != DataType::f16 && dt != DataType::bf16) ||
         b.data_type() != dt) {

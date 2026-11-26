@@ -18,6 +18,7 @@
 
 #include "nnops/ops/activation.hpp"
 #include "nnops/ops/softmax.hpp"
+#include "nnops/ops/eltwise.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/cuda_test_helper.hpp"
@@ -148,6 +149,46 @@ NNOPS_TEST(cuda_softmax_temperature) {
                 "cuda_softmax_t_half", kF32Abs, kF32Rel, 0.5f);
     run_softmax({64, 1000}, -1, DataType::f32, true, TensorLayout::NHWC, true,
                 "cuda_softmax_t_two_log", kF32Abs, kF32Rel, 2.0f);
+}
+
+NNOPS_TEST(cuda_eltwise_broadcast) {
+    // The operator broadcasts under the NumPy rules (`Eltwise::validate` says
+    // so); the CUDA kernels used to assume both operands had the output's
+    // shape, so a bias add read past the short operand.
+    const auto run = [](EltwiseType type, std::vector<int64_t> as, std::vector<int64_t> bs,
+                        bool add_to, const char* what, bool padded_out = false) {
+        EltwiseAttributes attrs;
+        attrs.type = type;
+        attrs.add_to = add_to;
+        HostTensor a = make_host_random(as, DataType::f32, false, 31, -1.0f, 1.0f);
+        HostTensor b = make_host_random(bs, DataType::f32, false, 32, -1.0f, 1.0f);
+        const HostTensor ins[] = {a, b};
+        run_op_close([&](Backend be) { return Eltwise::create(attrs, be); }, ins, 1e-5f, 1e-5f,
+                     what, padded_out);
+    };
+    // Trailing-axis broadcast: the bias add a graph produces.
+    run(EltwiseType::Add, {64, 128}, {128}, false, "eltwise broadcast row");
+    // A leading broadcast axis, and the same axis twice.
+    run(EltwiseType::Mul, {4, 8, 16}, {4, 1, 16}, false, "eltwise broadcast mid");
+    run(EltwiseType::Sub, {1, 8, 16}, {6, 8, 16}, false, "eltwise broadcast lead");
+    // The same run accumulating into the old output.
+    run(EltwiseType::Add, {8, 32}, {32}, true, "eltwise broadcast add_to");
+    // A row that is not a whole 32 B unit, so the output is pitched: the row
+    // walk has to read the destination through its own stride, not the flat
+    // index.
+    run(EltwiseType::Add, {2, 3, 5, 13}, {13}, false, "eltwise broadcast short row", true);
+    run(EltwiseType::Mul, {2, 3, 5, 13}, {2, 1, 5, 13}, true, "eltwise broadcast short row add_to",
+        true);
+    // f16 takes the same walk.
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Add;
+    HostTensor a = make_host_random(std::vector<int64_t>{16, 24}, DataType::f16, false, 33,
+                                    -1.0f, 1.0f);
+    HostTensor b = make_host_random(std::vector<int64_t>{24}, DataType::f16, false, 34,
+                                    -1.0f, 1.0f);
+    const HostTensor ins[] = {a, b};
+    run_op_close([&](Backend be) { return Eltwise::create(attrs, be); }, ins, 2e-3f, 2e-3f,
+                 "eltwise broadcast f16");
 }
 
 #endif  // NNOPS_HAS_CUDA

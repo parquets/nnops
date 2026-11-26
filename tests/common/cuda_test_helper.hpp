@@ -24,6 +24,7 @@
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/tensor_view.hpp"
+#include "nnops/detail/q4.hpp"
 
 #include "random_tensor.hpp"
 #include "test_helpers.hpp"
@@ -307,6 +308,31 @@ inline HostTensor make_host_zeroed(std::span<const int64_t> shape, DataType dt,
     return t;
 }
 
+/// A llama.cpp block-packed host tensor: the last dim is the row, earlier dims
+/// are whole rows, and each row is encoded on its own because a row owns its
+/// block group (the row length need not be a multiple of 32).
+inline HostTensor make_host_q4(std::span<const int64_t> shape, DataType fmt, uint64_t seed)
+{
+    const int64_t cols = shape.back();
+    int64_t rows = 1;
+    for (size_t i = 0; i + 1 < shape.size(); ++i) {
+        rows *= shape[i];
+    }
+    const int64_t blocks = (cols + q4_block_elems - 1) / q4_block_elems;
+    const size_t bb = data_type_block_bytes(fmt);
+
+    HostTensor dense = make_host_random(shape, DataType::f32, false, seed, -1.0f, 1.0f);
+    HostTensor t;
+    t.bytes.assign(static_cast<size_t>(rows * blocks) * bb, std::byte{0});
+    const float* src = reinterpret_cast<const float*>(dense.bytes.data());
+    for (int64_t r = 0; r < rows; ++r) {
+        quantize_q4(src + r * cols, cols,
+                    t.bytes.data() + static_cast<size_t>(r * blocks) * bb, fmt);
+    }
+    t.view = TensorView(shape, fmt, t.bytes.data());
+    return t;
+}
+
 /// A device tensor: the allocation and a view over it with the source's pitch.
 struct DeviceTensor {
     CudaBuffer buf;
@@ -430,7 +456,8 @@ inline void expect_same_bytes(const HostTensor& got, const HostTensor& want,
 /// takes the tolerance form instead.
 template <class Factory>
 void run_op_both_impl(Factory make, std::span<const HostTensor> ins,
-                      const char* what, bool exact, float tol_abs, float tol_rel)
+                      const char* what, bool exact, float tol_abs, float tol_rel,
+                      bool padded_out = false)
 {
     std::vector<TensorDesc> descs;
     std::vector<TensorView> views;
@@ -452,8 +479,8 @@ void run_op_both_impl(Factory make, std::span<const HostTensor> ins,
     ref.reserve(odescs.size());
     got.reserve(odescs.size());
     for (const TensorDesc& d : odescs) {
-        ref.push_back(make_host_zeroed(d.dims, d.dtype, false, d.layout));
-        got.push_back(make_host_zeroed(d.dims, d.dtype, false, d.layout));
+        ref.push_back(make_host_zeroed(d.dims, d.dtype, padded_out, d.layout));
+        got.push_back(make_host_zeroed(d.dims, d.dtype, padded_out, d.layout));
     }
 
     std::vector<TensorView> rv, gv;
@@ -511,9 +538,9 @@ void run_op_both(Factory make, std::span<const HostTensor> ins, const char* what
 /// The same run, compared to a per-element budget of `tol_abs + tol_rel·|ref|`.
 template <class Factory>
 void run_op_close(Factory make, std::span<const HostTensor> ins, float tol_abs,
-                  float tol_rel, const char* what)
+                  float tol_rel, const char* what, bool padded_out = false)
 {
-    run_op_both_impl(make, ins, what, false, tol_abs, tol_rel);
+    run_op_both_impl(make, ins, what, false, tol_abs, tol_rel, padded_out);
 }
 
 // ============================================================

@@ -47,6 +47,8 @@ struct F16Call {
     int64_t a_bstr[4] = {0, 0, 0, 0};
     int64_t b_bstr[4] = {0, 0, 0, 0};
     int64_t c_bstr[4] = {0, 0, 0, 0};
+    /// The residual's batch strides, when `residual` is set.
+    int64_t r_bstr[4] = {0, 0, 0, 0};
     /// Tile index into the compiled candidate list (-1 = the automatic pick).
     /// A bench sweeps it; every production caller leaves it alone.
     int tile = -1;

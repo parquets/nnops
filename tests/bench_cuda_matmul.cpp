@@ -114,6 +114,38 @@ double run_dense(int64_t m, int64_t n, int64_t k, DataType dt, bool ta, bool tb,
     return cuda_gflops(ms, flops);
 }
 
+/// The w4a16 twin of run_dense: the same product with B uploaded as a llama.cpp
+/// block stream. The GFLOPs are the product's, so a row reads directly against
+/// the dense one it replaces.
+double run_q4(int64_t m, int64_t n, int64_t k, DataType fmt, bool tb, const char* tag)
+{
+    MatMulAttributes attrs;
+    attrs.transpose_b = tb;
+
+    const std::vector<int64_t> a_shape{m, k};
+    const std::vector<int64_t> b_shape =
+        tb ? std::vector<int64_t>{n, k} : std::vector<int64_t>{k, n};
+
+    HostTensor ha = make_host_random(a_shape, DataType::f16, false, 17, -0.5f, 0.5f);
+    HostTensor hb = make_host_q4(b_shape, fmt, 29);
+    HostTensor hc = make_host_zeroed(std::vector<int64_t>{m, n}, DataType::f16, false);
+
+    DeviceTensor da = to_device(ha);
+    DeviceTensor db = to_device(hb);
+    DeviceTensor dc = to_device(hc);
+
+    auto op = MatMul::create(attrs, Backend::CUDA);
+    std::vector<TensorView> ins = {da.view, db.view};
+
+    TensorView out = dc.view;
+    auto launch = [&] { cuda_launch(*op, out, ins); };
+    const double ms = cuda_median_ms(launch);
+
+    const double flops = 2.0 * double(m) * double(n) * double(k);
+    print_cuda_row(tag, matmul_geometry(m, n, k, false, tb), ms, cuda_gflops(ms, flops));
+    return cuda_gflops(ms, flops);
+}
+
 /// The same row-major product through cuBLAS. cuBLAS is column-major, so it is
 /// handed the transposes — C^T = B^T·A^T — which costs nothing because the
 /// leading dimensions come out as the operand's own row length (n for B, k for
@@ -398,6 +430,28 @@ NNOPS_BENCH(cuda_matmul_transposes) {
                   "f32");
         run_dense(1024, 1024, 1024, DataType::f16, ta, tb, Epilogue{}, false,
                   "f16");
+    }
+}
+
+/// w4a16 against the dense f16 weight it replaces: the same product, so the
+/// ratio is what the decode costs and what the halved weight stream buys. The
+/// rows are the shapes a llama-family graph asks for — the decode batch sizes
+/// (1, 16) and two prefills — with Linear's `[n][k]` weight.
+NNOPS_BENCH(cuda_matmul_q4) {
+    print_cuda_header("CUDA MatMul w4a16 (f16 activation, block weight)");
+    const int64_t shapes[][3] = {
+        {1, 4096, 4096}, {2, 4096, 4096}, {4, 4096, 4096}, {8, 4096, 4096},
+        {16, 4096, 4096}, {128, 4096, 4096}, {512, 4096, 4096},
+        {1, 32000, 4096}, {2, 32000, 4096}, {4, 32000, 4096}, {16, 32000, 4096},
+    };
+    for (const auto& s : shapes) {
+        run_dense(s[0], s[1], s[2], DataType::f16, false, true, Epilogue{}, false,
+                  "f16 dense NT");
+        for (DataType fmt : {DataType::q4_0, DataType::q4_1, DataType::q8_0}) {
+            const char* name = fmt == DataType::q4_0 ? "q4_0 NT" :
+                               fmt == DataType::q4_1 ? "q4_1 NT" : "q8_0 NT";
+            run_q4(s[0], s[1], s[2], fmt, true, name);
+        }
     }
 }
 

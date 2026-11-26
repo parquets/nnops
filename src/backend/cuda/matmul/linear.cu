@@ -89,6 +89,58 @@ Status linear_i8_cuda(const LinearAttributes& attrs, TensorView& output,
                                 static_cast<cudaStream_t>(ctx.cuda_stream));
 }
 
+/// The w4a16 route: a 16-bit activation against a llama.cpp Q4_0/Q4_1/Q8_0
+/// `[N, K]` weight. add_to is the post-activation residual, as on the dense
+/// path, so it reaches the call as the epilogue's residual rather than beta.
+Status linear_q4_cuda(const LinearAttributes& attrs, TensorView& output,
+                      std::span<const TensorView> inputs, const ComputeContext& ctx)
+{
+    const TensorView& x = inputs[0];
+    const TensorView& w = inputs[1];
+    const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
+
+    const int64_t M = x.shape(x.rank() - 2);
+    const int64_t K = x.shape(x.rank() - 1);
+    const int64_t N = w.shape(0);
+    if (w.shape(1) != K) {
+        return Status::invalid_argument;
+    }
+
+    GemmParams p;
+    p.a = x.ptr<void>();
+    p.b = w.ptr<void>();
+    p.c = output.ptr<void>();
+    p.bias = bias != nullptr ? bias->ptr<void>() : nullptr;
+    p.m = static_cast<int>(M);
+    p.n = static_cast<int>(N);
+    p.k = static_cast<int>(K);
+    p.lda = x.row_stride_elems();
+    p.ldb = w.row_stride_elems();
+    p.ldc = output.row_stride_elems();
+    p.alpha = 1.0f;
+    p.beta = 0.0f;
+    p.epilogue = attrs.epilogue.type;
+    p.ep_alpha = attrs.epilogue.alpha;
+    p.ep_beta = attrs.epilogue.beta;
+    p.min_clip = attrs.epilogue.min_clip;
+    p.max_clip = attrs.epilogue.max_clip;
+
+    if (attrs.add_to) {
+        p.residual = output.ptr<void>();
+        p.ldr = p.ldc;
+    }
+
+    if (!gemm_batch_layout(x, w, output, attrs.add_to ? &output : nullptr, p)) {
+        return Status::unsupported;
+    }
+
+    const DataType dt = x.data_type();
+    return q4_gemm_status(
+        make_q4_call(p, /*trans_a=*/false, /*trans_b=*/true, dt == DataType::bf16,
+                     w.data_type()),
+        dt, static_cast<cudaStream_t>(ctx.cuda_stream));
+}
+
 } // namespace
 
 Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
@@ -112,6 +164,12 @@ Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
             return Status::unsupported;
         }
         return linear_i8_cuda(attrs, output, inputs, ctx, kind);
+    }
+    if (is_block_packed_dtype(w.data_type())) {
+        if (output.numel() == 0) {
+            return Status::ok;
+        }
+        return linear_q4_cuda(attrs, output, inputs, ctx);
     }
     if ((dt != DataType::f32 && dt != DataType::f16 && dt != DataType::bf16) ||
         w.data_type() != dt) {

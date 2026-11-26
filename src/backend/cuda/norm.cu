@@ -30,6 +30,7 @@
 /// Workspace: not used.
 
 #include "cuda_common.cuh"
+#include "matmul/matmul_epilogue.cuh"
 #include "nnops/ops/norm.hpp"
 #include "nnops/detail/axis_walk.hpp"
 
@@ -173,10 +174,16 @@ __device__ inline void block_sums2(float& a, float& b, float* smem) noexcept
 template <class T, bool HasMean, bool HasScale, bool HasBias, bool HasRes>
 __global__ void norm_row_kernel(const T* __restrict__ x, const T* __restrict__ scale,
                                 const T* __restrict__ bias, const T* __restrict__ res,
-                                T* __restrict__ y, RowWalk w, float eps, bool scale_scalar,
+                                const T* __restrict__ gate, T* __restrict__ y, RowWalk w, float eps,
+                                EpilogueActivateType gate_act, bool scale_scalar, bool one_plus,
                                 bool add_to, bool row_resident)
 {
     constexpr int VEC = sizeof(T) == 2 ? 8 : 4;
+    /// Gemma's 1-centered norm: the stored weight is the offset from one, so
+    /// the effective scale is `w + 1`. Applied at the load, as the CPU does,
+    /// rather than folded into the weight -- an f16/bf16 weight keeps its
+    /// small-|w| correction that way.
+    const float one = one_plus ? 1.0f : 0.0f;
 
     extern __shared__ float shared_buf[];
     float* row = row_resident ? shared_buf : nullptr;
@@ -199,10 +206,13 @@ __global__ void norm_row_kernel(const T* __restrict__ x, const T* __restrict__ s
 
         const T* x_row = x + xb;
         const T* r_row = HasRes ? res + rb : nullptr;
+        /// The gate mirrors X (`RMSNormGated`), so it rides x's walk; its own
+        /// pointer is null for every other form.
+        const T* gate_row = gate != nullptr ? gate + xb : nullptr;
         T* y_row = y + yb;
 
         const int64_t vec_end = (x_flat && y_flat && r_flat && aligned16(x_row, y_row) &&
-                                 (!HasRes || aligned16(r_row))) ?
+                                 (!HasRes || aligned16(r_row)) && (gate == nullptr || x_flat)) ?
                                     (w.size / VEC) * VEC :
                                     0;
 
@@ -285,7 +295,7 @@ __global__ void norm_row_kernel(const T* __restrict__ x, const T* __restrict__ s
 
             if (HasScale) {
                 if (scale_scalar) {
-                    const float s = s_load(scale);
+                    const float s = s_load(scale) + one;
 #pragma unroll
                     for (int k = 0; k < VEC; ++k) {
                         v[k] *= s;
@@ -295,12 +305,12 @@ __global__ void norm_row_kernel(const T* __restrict__ x, const T* __restrict__ s
                     load_channels<T, VEC>(&scale[i], s);
 #pragma unroll
                     for (int k = 0; k < VEC; ++k) {
-                        v[k] *= s[k];
+                        v[k] *= s[k] + one;
                     }
                 } else {
 #pragma unroll
                     for (int k = 0; k < VEC; ++k) {
-                        v[k] *= s_load(&scale[i + k]);
+                        v[k] *= s_load(&scale[i + k]) + one;
                     }
                 }
             }
@@ -326,6 +336,14 @@ __global__ void norm_row_kernel(const T* __restrict__ x, const T* __restrict__ s
                 }
             }
 
+            if (gate_row != nullptr) {
+                float g[VEC];
+                load_channels<T, VEC>(&gate_row[i], g);
+#pragma unroll
+                for (int k = 0; k < VEC; ++k) {
+                    v[k] *= gemm_apply_activation(gate_act, 1.0f, 1.0f, g[k]);
+                }
+            }
             if (add_to) {
                 float o[VEC];
                 load_channels<T, VEC>(&y_row[i], o);
@@ -345,10 +363,15 @@ __global__ void norm_row_kernel(const T* __restrict__ x, const T* __restrict__ s
             float val = (v - mean) * inv_std;
             const int64_t si = scale_scalar ? 0 : i;
             if (HasScale) {
-                val *= s_load(&scale[si]);
+                val *= s_load(&scale[si]) + one;
             }
             if (HasBias) {
                 val += s_load(&bias[si]);
+            }
+
+            if (gate != nullptr) {
+                val *= gemm_apply_activation(
+                    gate_act, 1.0f, 1.0f, s_load(&gate[xb + axis_group_offset(i, w.post)]));
             }
 
             const int64_t oe = yb + axis_group_offset(i, w.out_post);
@@ -531,8 +554,9 @@ inline int block_for(int64_t size)
 }
 
 template <class T, bool HasMean, bool HasScale, bool HasBias, bool HasRes>
-void launch_rows(const T* x, const T* scale, const T* bias, const T* res, T* y, const RowWalk& w,
-                 float eps, bool scale_scalar, bool add_to, cudaStream_t stream)
+void launch_rows(const T* x, const T* scale, const T* bias, const T* res, const T* gate, T* y,
+                 const RowWalk& w, float eps, EpilogueActivateType gate_act, bool scale_scalar,
+                 bool one_plus, bool add_to, cudaStream_t stream)
 {
     const unsigned grid =
         static_cast<unsigned>(std::min<int64_t>(std::max<int64_t>(w.rows, 1), 65535));
@@ -547,30 +571,36 @@ void launch_rows(const T* x, const T* scale, const T* bias, const T* res, T* y, 
         static_cast<int>(block_size * sizeof(float) + (row_resident ? row_bytes : 0));
 
     norm_row_kernel<T, HasMean, HasScale, HasBias, HasRes>
-        <<<grid, block_size, shared_bytes, stream>>>(x, scale, bias, res, y, w, eps, scale_scalar,
-                                                     add_to, row_resident);
+        <<<grid, block_size, shared_bytes, stream>>>(x, scale, bias, res, gate, y, w, eps, gate_act,
+                                                     scale_scalar, one_plus, add_to,
+                                                     row_resident);
 }
 
 template <class T, bool HasMean, bool HasScale>
-void launch_rows_bias(const T* x, const T* scale, const T* bias, const T* res, T* y,
-                      const RowWalk& w, float eps, bool scale_scalar, bool add_to, bool has_bias,
-                      bool has_res, cudaStream_t stream)
+void launch_rows_bias(const T* x, const T* scale, const T* bias, const T* res, const T* gate,
+                      T* y, const RowWalk& w, float eps, EpilogueActivateType gate_act,
+                      bool scale_scalar, bool one_plus, bool add_to, bool has_bias, bool has_res,
+                      cudaStream_t stream)
 {
     if (has_bias) {
         if (has_res) {
-            launch_rows<T, HasMean, HasScale, true, true>(x, scale, bias, res, y, w, eps,
-                                                          scale_scalar, add_to, stream);
+            launch_rows<T, HasMean, HasScale, true, true>(x, scale, bias, res, gate, y, w, eps,
+                                                          gate_act, scale_scalar, one_plus, add_to,
+                                                          stream);
         } else {
-            launch_rows<T, HasMean, HasScale, true, false>(x, scale, bias, nullptr, y, w, eps,
-                                                           scale_scalar, add_to, stream);
+            launch_rows<T, HasMean, HasScale, true, false>(x, scale, bias, nullptr, gate, y, w, eps,
+                                                           gate_act, scale_scalar, one_plus, add_to,
+                                                           stream);
         }
     } else {
         if (has_res) {
-            launch_rows<T, HasMean, HasScale, false, true>(x, scale, nullptr, res, y, w, eps,
-                                                           scale_scalar, add_to, stream);
+            launch_rows<T, HasMean, HasScale, false, true>(x, scale, nullptr, res, gate, y, w, eps,
+                                                           gate_act, scale_scalar, one_plus, add_to,
+                                                           stream);
         } else {
-            launch_rows<T, HasMean, HasScale, false, false>(x, scale, nullptr, nullptr, y, w, eps,
-                                                            scale_scalar, add_to, stream);
+            launch_rows<T, HasMean, HasScale, false, false>(x, scale, nullptr, nullptr, gate, y, w,
+                                                            eps, gate_act, scale_scalar, one_plus,
+                                                            add_to, stream);
         }
     }
 }
@@ -578,7 +608,7 @@ void launch_rows_bias(const T* x, const T* scale, const T* bias, const T* res, T
 template <class T, bool HasMean, bool HasScale>
 Status run_row_norm(const NormAttributes& attrs, TensorView& output,
                     std::span<const TensorView> inputs, int64_t scale_slot, int64_t bias_slot,
-                    int64_t res_slot, cudaStream_t stream)
+                    int64_t res_slot, int64_t gate_slot, cudaStream_t stream)
 {
     const auto& x = inputs[0];
     auto& y = output;
@@ -591,6 +621,7 @@ Status run_row_norm(const NormAttributes& attrs, TensorView& output,
     };
     const bool has_bias = present(bias_slot);
     const bool has_res = present(res_slot);
+    const bool has_gate = present(gate_slot);
     const bool scale_scalar = scale != nullptr && scale->numel() == 1;
 
     const int64_t ax = attrs.axis < 0 ? attrs.axis + x.rank() : attrs.axis;
@@ -602,7 +633,9 @@ Status run_row_norm(const NormAttributes& attrs, TensorView& output,
     launch_rows_bias<T, HasMean, HasScale>(x.ptr<T>(), scale ? scale->ptr<T>() : nullptr,
                                            has_bias ? inputs[bias_slot].ptr<T>() : nullptr,
                                            has_res ? inputs[res_slot].ptr<T>() : nullptr,
-                                           y.ptr<T>(), w, attrs.epsilon, scale_scalar, attrs.add_to,
+                                           has_gate ? inputs[gate_slot].ptr<T>() : nullptr,
+                                           y.ptr<T>(), w, attrs.epsilon, attrs.gate_activation,
+                                           scale_scalar, attrs.one_plus_weight, attrs.add_to,
                                            has_bias, has_res, stream);
     return Status::ok;
 }
@@ -717,17 +750,22 @@ Status norm_entry(const NormAttributes& attrs, TensorView& output,
     case NormType::LayerNorm:
         // [X, scale, bias?, residual?]
         return run_row_norm<T, true, true>(attrs, output, inputs, 1, 2, attrs.add_residual ? 3 : -1,
-                                           stream);
+                                           -1, stream);
     case NormType::RMSNorm:
         // [X, scale, residual?]
-        return run_row_norm<T, false, true>(attrs, output, inputs, 1, -1,
-                                            attrs.add_residual ? 2 : -1, stream);
+        // Gated RMSNorm appends the gate after the residual: [X, scale, gate]
+        // or [X, scale, residual, gate].
+        return run_row_norm<T, false, true>(
+            attrs, output, inputs, 1, -1, attrs.add_residual ? 2 : -1,
+            attrs.gate_activation == EpilogueActivateType::None ? -1
+                                                               : (attrs.add_residual ? 3 : 2),
+            stream);
     case NormType::GroupNorm:
         return group_norm_launch<T>(attrs, output, inputs, stream);
     case NormType::L2Norm:
         // [X, residual?]
         return run_row_norm<T, false, false>(attrs, output, inputs, -1, -1,
-                                             attrs.add_residual ? 1 : -1, stream);
+                                             attrs.add_residual ? 1 : -1, -1, stream);
     }
     return Status::invalid_argument;
 }

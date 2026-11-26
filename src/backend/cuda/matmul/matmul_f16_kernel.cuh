@@ -21,13 +21,169 @@
 
 namespace nnops::backend::cuda {
 
+/// The output half of the mainloop, shared with the block-quantized kernel that
+/// fills the same panel layouts by decoding instead of copying: either the
+/// split's f32 plane, or the staged epilogue behind one barrier.
+template <class S, class Elem>
+__device__ __forceinline__ void f16_gemm_writeback(const F16Params& p, Elem* const smem,
+                                                   int m_tile, int n_tile, int warp_m,
+                                                   int warp_n, int lane, Elem* const C,
+                                                   const GemmEpilogue& epi,
+                                                   const float (&acc)[S::MA][S::NA][4])
+{
+    const int M = int(p.m), N = int(p.n);
+    const int m0 = m_tile + warp_m * S::WM;
+    const int n0 = n_tile + warp_n * S::WN;
+
+    // A split's block stops at its accumulator: the sum and the alpha belong to
+    // the reduce pass, which sees every plane.
+    if (p.partial != nullptr) {
+        const int bsz = int(p.batch > 0 ? p.batch : 1);
+        const int splits = int(gridDim.z) / bsz;
+        const int batch = int(blockIdx.z) / splits;
+        const int split = int(blockIdx.z) - batch * splits;
+        float* part = p.partial + (int64_t(batch) * splits + split) * M * N;
+#pragma unroll
+        for (int i = 0; i < S::MA; ++i) {
+            const int gm = m0 + i * 16 + lane / 4;
+#pragma unroll
+            for (int j = 0; j < S::NA; ++j) {
+                const int gn = n0 + j * 8 + 2 * (lane % 4);
+                if (gm < M && gn + 1 < N) {
+                    part[int64_t(gm) * N + gn] = acc[i][j][0];
+                    part[int64_t(gm) * N + gn + 1] = acc[i][j][1];
+                    if (gm + 8 < M) {
+                        part[int64_t(gm + 8) * N + gn] = acc[i][j][2];
+                        part[int64_t(gm + 8) * N + gn + 1] = acc[i][j][3];
+                    }
+                } else {
+                    const int rows[2] = {gm, gm + 8};
+                    for (int rr = 0; rr < 2; ++rr) {
+                        for (int cc = 0; cc < 2; ++cc) {
+                            if (rows[rr] < M && gn + cc < N) {
+                                part[int64_t(rows[rr]) * N + gn + cc] = acc[i][j][rr * 2 + cc];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // The staging buffer is the panel buffer, and the loop no longer ends on a
+    // barrier: this one retires every warp's last ldmatrix before the epilogue
+    // writes over it.
+    __syncthreads();
+
+    // C: lane l holds (m = l/4, n = 2*(l%4)), plus the +1 column and +8 row.
+    const int cm = lane / 4;
+    const int cn = 2 * (lane % 4);
+    if constexpr (!S::StagedEpi) {
+        // Straight out: one 4 B store per atom row, masked at the tile edge.
+        // Cheaper than staging (no barrier, no round trip) but the stores are
+        // scattered, which is why this is the search's other arm, not the
+        // default. A row pitch that is not a whole number of 4 B stores -- an
+        // odd N on a dense destination -- walks the same two elements as 2 B
+        // writes instead, which is what an unpadded N=4103 does.
+        const bool pair4 = (p.ldc % 2) == 0;
+#pragma unroll
+        for (int i = 0; i < S::MA; ++i) {
+            const int gm = m0 + i * 16 + cm;
+#pragma unroll
+            for (int j = 0; j < S::NA; ++j) {
+                const int gn = n0 + j * 8 + cn;
+                for (int rr = 0; rr < 2; ++rr) {
+                    const int row = gm + rr * 8;
+                    if (row >= M) {
+                        continue;
+                    }
+                    Elem* const dst = C + int64_t(row) * p.ldc;
+                    const float v0 = gemm_epilogue_element<Elem>(epi, acc[i][j][rr * 2], row, gn, dst);
+                    const float v1 =
+                        gn + 1 < N ?
+                            gemm_epilogue_element<Elem>(epi, acc[i][j][rr * 2 + 1], row, gn + 1, dst) :
+                            0.0f;
+                    if (pair4 && gn + 2 <= N) {
+                        *reinterpret_cast<uint32_t*>(dst + gn) = gemm_pack2<Elem>(v0, v1);
+                    } else {
+                        for (int cc = 0; cc < 2 && gn + cc < N; ++cc) {
+                            dst[gn + cc] = gemm_from_float<Elem>(cc == 0 ? v0 : v1);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Every slot of the tile is written -- the tail is masked on the way out, not
+    // on the way in -- so the staging pass needs no bounds test.
+    Elem* const stage = smem;
+#pragma unroll
+    for (int i = 0; i < S::MA; ++i) {
+        const int em = warp_m * S::WM + i * 16 + cm;
+        const int gm = m0 + i * 16 + cm;
+#pragma unroll
+        for (int j = 0; j < S::NA; ++j) {
+            const int en = warp_n * S::WN + j * 8 + cn;
+            const int gn = n0 + j * 8 + cn;
+            // Every slot is written and the tail is masked on the way out, so an
+            // out-of-range slot stores zero: the epilogue's own loads (bias, the
+            // beta term, the residual) must not run past the tensors.
+            const bool in_hi = gm < M && gn < N;
+            const bool in_lo = gm + 8 < M && gn < N;
+            const Elem* const dhi = C + int64_t(gm) * p.ldc;
+            const Elem* const dlo = C + int64_t(gm + 8) * p.ldc;
+            const float v0 = in_hi ? gemm_epilogue_element<Elem>(epi, acc[i][j][0], gm, gn, dhi) : 0.0f;
+            const float v1 = in_hi && gn + 1 < N ?
+                                 gemm_epilogue_element<Elem>(epi, acc[i][j][1], gm, gn + 1, dhi) :
+                                 0.0f;
+            const float v2 =
+                in_lo ? gemm_epilogue_element<Elem>(epi, acc[i][j][2], gm + 8, gn, dlo) : 0.0f;
+            const float v3 = in_lo && gn + 1 < N ?
+                                 gemm_epilogue_element<Elem>(epi, acc[i][j][3], gm + 8, gn + 1, dlo) :
+                                 0.0f;
+            *reinterpret_cast<uint32_t*>(&stage[f16_epi_offset<S>(em, en)]) =
+                gemm_pack2<Elem>(v0, v1);
+            *reinterpret_cast<uint32_t*>(&stage[f16_epi_offset<S>(em + 8, en)]) =
+                gemm_pack2<Elem>(v2, v3);
+        }
+    }
+    __syncthreads();
+
+    // 16 B per thread per pass: eight consecutive columns of one row. The chunk
+    // the swizzle moved them to is the chunk this thread reads, so the store
+    // stays inside one 256 B span of the row and the banks stay clean.
+    const bool vec = (p.ldc % 8) == 0;
+    const int total = S::BM * S::kNChunks;
+    for (int idx = int(threadIdx.x); idx < total; idx += S::threads) {
+        const int row = idx / S::kNChunks;
+        const int c = idx - row * S::kNChunks;
+        const int gm = m_tile + row;
+        if (gm >= M) {
+            continue;
+        }
+        const int gn = n_tile + c * 8;
+        const Elem* src = &stage[f16_epi_offset<S>(row, c * 8)];
+        Elem* dst = C + int64_t(gm) * p.ldc + gn;
+        if (vec && gn + 8 <= N) {
+            *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+        } else {
+            for (int t = 0; t < 8 && gn + t < N; ++t) {
+                dst[t] = src[t];
+            }
+        }
+    }
+}
+
 /// The 16-bit GEMM: per-warp value tile from `S`, cp.async ring, swizzled panels.
 template <class S, class Elem, bool TransA, bool TransB>
 __global__ __launch_bounds__(S::threads, S::MinBlocks) void f16_gemm_kernel(F16Params p)
 {
     constexpr int BM = S::BM, BN = S::BN, BK = S::BK, ST = S::stages;
-    constexpr int WM = S::WM, WN = S::WN, MA = S::MA, NA = S::NA;
-    constexpr int LDA = S::LDA, LDN = S::LDN;
+    constexpr int MA = S::MA, NA = S::NA;
+    constexpr int LDA = S::LDA;
 
     // One buffer for both phases: the panels until the k loop ends, the staging
     // buffer after it. The loop's closing barrier is what makes the hand-off
@@ -67,8 +223,6 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void f16_gemm_kernel(F16P
     }
     const int m_tile = blk_m * BM;
     const int n_tile = blk_n * BN;
-    const int m0 = m_tile + warp_m * WM;
-    const int n0 = n_tile + warp_n * WN;
     const int M = int(p.m), N = int(p.n), K = int(p.k);
     const int k_tiles = (K + BK - 1) / BK;
     // Split-K: blockIdx.z picks a proportional k-tile range. The tile grid alone
@@ -91,6 +245,10 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void f16_gemm_kernel(F16P
         static_cast<const Elem*>(p.b) + f16_batch_offset(p.bsize, p.b_bstr, p.batch_rank, batch);
     Elem* const C =
         static_cast<Elem*>(p.c) + f16_batch_offset(p.bsize, p.c_bstr, p.batch_rank, batch);
+
+    /// The residual is this slice's, so it rides the same batch offset C does.
+    const GemmEpilogue epi =
+        gemm_epilogue_for_batch<Elem>(p.epi, p.bsize, p.r_bstr, p.batch_rank, batch);
 
     // gmem -> smem: one 16 B vector per thread per pass. A k row is BK/8 vectors
     // wide, so a pass covers threads/(BK/8) rows and the panel takes BM divided
@@ -251,143 +409,7 @@ __global__ __launch_bounds__(S::threads, S::MinBlocks) void f16_gemm_kernel(F16P
                                                     sBbase + stage * S::kBMax, warp_m, warp_n,
                                                     lane, acc);
     }
-
-    // A split's block stops at its accumulator: the sum and the alpha belong to
-    // the reduce pass, which sees every plane.
-    if (p.partial != nullptr) {
-        float* part = p.partial + (int64_t(batch) * splits + split) * M * N;
-#pragma unroll
-        for (int i = 0; i < MA; ++i) {
-            const int gm = m0 + i * 16 + lane / 4;
-#pragma unroll
-            for (int j = 0; j < NA; ++j) {
-                const int gn = n0 + j * 8 + 2 * (lane % 4);
-                if (gm < M && gn + 1 < N) {
-                    part[int64_t(gm) * N + gn] = acc[i][j][0];
-                    part[int64_t(gm) * N + gn + 1] = acc[i][j][1];
-                    if (gm + 8 < M) {
-                        part[int64_t(gm + 8) * N + gn] = acc[i][j][2];
-                        part[int64_t(gm + 8) * N + gn + 1] = acc[i][j][3];
-                    }
-                } else {
-                    const int rows[2] = {gm, gm + 8};
-                    for (int rr = 0; rr < 2; ++rr) {
-                        for (int cc = 0; cc < 2; ++cc) {
-                            if (rows[rr] < M && gn + cc < N) {
-                                part[int64_t(rows[rr]) * N + gn + cc] = acc[i][j][rr * 2 + cc];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    // The staging buffer is the panel buffer, and the loop no longer ends on a
-    // barrier: this one retires every warp's last ldmatrix before the epilogue
-    // writes over it.
-    __syncthreads();
-
-    // C: lane l holds (m = l/4, n = 2*(l%4)), plus the +1 column and +8 row.
-    const int cm = lane / 4;
-    const int cn = 2 * (lane % 4);
-    if constexpr (!S::StagedEpi) {
-        // Straight out: one 4 B store per atom row, masked at the tile edge.
-        // Cheaper than staging (no barrier, no round trip) but the stores are
-        // scattered, which is why this is the search's other arm, not the
-        // default. A row pitch that is not a whole number of 4 B stores -- an
-        // odd N on a dense destination -- walks the same two elements as 2 B
-        // writes instead, which is what an unpadded N=4103 does.
-        const bool pair4 = (p.ldc % 2) == 0;
-#pragma unroll
-        for (int i = 0; i < MA; ++i) {
-            const int gm = m0 + i * 16 + cm;
-#pragma unroll
-            for (int j = 0; j < NA; ++j) {
-                const int gn = n0 + j * 8 + cn;
-                for (int rr = 0; rr < 2; ++rr) {
-                    const int row = gm + rr * 8;
-                    if (row >= M) {
-                        continue;
-                    }
-                    Elem* const dst = C + int64_t(row) * p.ldc;
-                    const float v0 = gemm_epilogue_element<Elem>(p.epi, acc[i][j][rr * 2], row, gn, dst);
-                    const float v1 =
-                        gn + 1 < N ?
-                            gemm_epilogue_element<Elem>(p.epi, acc[i][j][rr * 2 + 1], row, gn + 1, dst) :
-                            0.0f;
-                    if (pair4 && gn + 2 <= N) {
-                        *reinterpret_cast<uint32_t*>(dst + gn) = gemm_pack2<Elem>(v0, v1);
-                    } else {
-                        for (int cc = 0; cc < 2 && gn + cc < N; ++cc) {
-                            dst[gn + cc] = gemm_from_float<Elem>(cc == 0 ? v0 : v1);
-                        }
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    // Every slot of the tile is written -- the tail is masked on the way out, not
-    // on the way in -- so the staging pass needs no bounds test.
-    Elem* const stage = smem;
-#pragma unroll
-    for (int i = 0; i < MA; ++i) {
-        const int em = warp_m * WM + i * 16 + cm;
-        const int gm = m0 + i * 16 + cm;
-#pragma unroll
-        for (int j = 0; j < NA; ++j) {
-            const int en = warp_n * WN + j * 8 + cn;
-            const int gn = n0 + j * 8 + cn;
-            // Every slot is written and the tail is masked on the way out, so an
-            // out-of-range slot stores zero: the epilogue's own loads (bias, the
-            // beta term, the residual) must not run past the tensors.
-            const bool in_hi = gm < M && gn < N;
-            const bool in_lo = gm + 8 < M && gn < N;
-            const Elem* const dhi = C + int64_t(gm) * p.ldc;
-            const Elem* const dlo = C + int64_t(gm + 8) * p.ldc;
-            const float v0 = in_hi ? gemm_epilogue_element<Elem>(p.epi, acc[i][j][0], gm, gn, dhi) : 0.0f;
-            const float v1 = in_hi && gn + 1 < N ?
-                                 gemm_epilogue_element<Elem>(p.epi, acc[i][j][1], gm, gn + 1, dhi) :
-                                 0.0f;
-            const float v2 =
-                in_lo ? gemm_epilogue_element<Elem>(p.epi, acc[i][j][2], gm + 8, gn, dlo) : 0.0f;
-            const float v3 = in_lo && gn + 1 < N ?
-                                 gemm_epilogue_element<Elem>(p.epi, acc[i][j][3], gm + 8, gn + 1, dlo) :
-                                 0.0f;
-            *reinterpret_cast<uint32_t*>(&stage[f16_epi_offset<S>(em, en)]) =
-                gemm_pack2<Elem>(v0, v1);
-            *reinterpret_cast<uint32_t*>(&stage[f16_epi_offset<S>(em + 8, en)]) =
-                gemm_pack2<Elem>(v2, v3);
-        }
-    }
-    __syncthreads();
-
-    // 16 B per thread per pass: eight consecutive columns of one row. The chunk
-    // the swizzle moved them to is the chunk this thread reads, so the store
-    // stays inside one 256 B span of the row and the banks stay clean.
-    const bool vec = (p.ldc % 8) == 0;
-    const int total = BM * S::kNChunks;
-    for (int idx = tid; idx < total; idx += S::threads) {
-        const int row = idx / S::kNChunks;
-        const int c = idx - row * S::kNChunks;
-        const int gm = m_tile + row;
-        if (gm >= M) {
-            continue;
-        }
-        const int gn = n_tile + c * 8;
-        const Elem* src = &stage[f16_epi_offset<S>(row, c * 8)];
-        Elem* dst = C + int64_t(gm) * p.ldc + gn;
-        if (vec && gn + 8 <= N) {
-            *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-        } else {
-            for (int t = 0; t < 8 && gn + t < N; ++t) {
-                dst[t] = src[t];
-            }
-        }
-    }
+    f16_gemm_writeback<S, Elem>(p, smem, m_tile, n_tile, warp_m, warp_n, lane, C, epi, acc);
 }
 
 /// Sum the split-K planes and write the destination, one thread per element.
@@ -698,6 +720,7 @@ template <class S, class Elem> bool f16_run(const F16Call& call, cudaStream_t st
         q.a_bstr[d] = call.a_bstr[d];
         q.b_bstr[d] = call.b_bstr[d];
         q.c_bstr[d] = call.c_bstr[d];
+        q.r_bstr[d] = call.r_bstr[d];
     }
 
     const dim3 grid(unsigned((call.m + S::BM - 1) / S::BM), unsigned((call.n + S::BN - 1) / S::BN),

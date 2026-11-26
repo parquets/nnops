@@ -113,8 +113,8 @@ Status Norm::validate(std::span<const TensorDesc> inputs, std::span<const Tensor
     }
 
     // RMSNormGated is the gated form's one model (GatedDeltaNet): the gate is a
-    // per-element multiplier over the normalized row, which only the RMSNorm
-    // row kernel has.
+    // per-element multiplier over the normalized row (`act(g)`, then `add_to`),
+    // which only the RMSNorm row kernel has -- the CUDA one included.
     if (gated &&
         (attrs_.type != NormType::RMSNorm || !is_gate_activation(attrs_.gate_activation))) {
         return Status::unsupported;

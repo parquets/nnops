@@ -7,6 +7,7 @@
 ///
 /// Supports f32, f16 and bf16. Workspace: not used.
 
+#include "bcast.cuh"
 #include "cuda_common.cuh"
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/detail/assert.hpp"
@@ -382,6 +383,72 @@ __global__ void eltwise_kernel(const T* __restrict__ a, const T* __restrict__ b,
 }
 
 // ============================================================
+// Broadcast kernel — operands of different shapes
+// ============================================================
+
+/// One element of the operator, in float. Every path here works in float for a
+/// 16-bit element type, the same as the pair of kernels above.
+__device__ __forceinline__ float eltwise_apply_f(EltwiseType t, float av, float bv)
+{
+    switch (t) {
+    case EltwiseType::Add:
+        return av + bv;
+    case EltwiseType::Sub:
+        return av - bv;
+    case EltwiseType::Mul:
+        return av * bv;
+    case EltwiseType::Div:
+        return av / bv;
+    case EltwiseType::Min:
+        return av < bv ? av : bv;
+    case EltwiseType::Max:
+        return av > bv ? av : bv;
+    case EltwiseType::Pow:
+        return powf(av, bv);
+    }
+    return av;
+}
+
+/// The broadcast walk `bcast.cuh` shares with Compare, Logical and Where: the
+/// output is flat, each operand's offset for an output row comes from one
+/// mixed-radix decode on thread 0, and inside the row the operand advances by
+/// its last-axis step -- 0 when that axis was broadcast. Before this the pair
+/// of kernels above assumed both operands had the output's shape, so a bias add
+/// of [N,C] against [C] read past the operand.
+template <class T>
+__global__ void eltwise_bcast_kernel(const T* __restrict__ a, const T* __restrict__ b,
+                                     T* __restrict__ out, int64_t rows, int64_t cols,
+                                     int64_t o_row_stride, BcastOperand pa, BcastOperand pb,
+                                     EltwiseType op_type, bool add_to)
+{
+    __shared__ int64_t s_off[2];
+    const int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = int64_t(blockDim.x) * gridDim.x;
+    for (int64_t r = blockIdx.y; r < rows; r += gridDim.y) {
+        const int64_t base = r * cols;
+        if (!(pa.linear && pb.linear)) {
+            if (threadIdx.x == 0) {
+                s_off[0] = pa.linear ? base : bcast_offset(pa.layout, base);
+                s_off[1] = pb.linear ? base : bcast_offset(pb.layout, base);
+            }
+            __syncthreads();
+        }
+        const T* const arow = a + (pa.linear ? base : s_off[0]);
+        const T* const brow = b + (pb.linear ? base : s_off[1]);
+        // The output is walked by its own pitch: a row shorter than the 32 B
+        // alignment is padded, and the flat index is not the address there.
+        T* const orow = out + r * o_row_stride;
+        for (int64_t i = tid; i < cols; i += stride) {
+            float rv = eltwise_apply_f(op_type, s_load(arow + i * pa.step), s_load(brow + i * pb.step));
+            if (add_to) {
+                rv += s_load(orow + i);
+            }
+            s_store(orow + i, rv);
+        }
+    }
+}
+
+// ============================================================
 // Flat kernel for 1D / scalar tensors
 // ============================================================
 
@@ -749,14 +816,33 @@ void eltwise_cuda_impl(const EltwiseAttributes& attrs, TensorView& output,
 {
     const auto& A = inputs[0];
     const auto& B = inputs[1];
-    const int64_t total = A.numel();
-    if (total == 0)
+    if (output.numel() == 0)
         return;
-    NNOPS_ASSERT(A.numel() == B.numel());
-    NNOPS_ASSERT(output.numel() == total);
-
-    const int64_t rank = A.rank();
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
+
+    // The broadcast form first: an operand whose shape is not the output's
+    // takes the row walk below. Two dense operands of the output's own shape
+    // resolve to `linear` and keep the pair of kernels this file has always
+    // used, which are vectorized and unrolled per operator.
+    int64_t dims[8];
+    bcast_out_dims(output, dims);
+    const int64_t orank = output.rank();
+    const BcastOperand pa = make_bcast(A, dims, orank);
+    const BcastOperand pb = make_bcast(B, dims, orank);
+    if (!(pa.linear && pb.linear)) {
+        const int64_t cols = dims[orank - 1];
+        const int64_t rows = cols > 0 ? output.numel() / cols : 0;
+        if (rows <= 0 || cols <= 0)
+            return;
+        const dim3 grid = bcast_grid(cols, rows, 1);
+        eltwise_bcast_kernel<T><<<grid, kBcastThreads, 0, stream>>>(
+            A.ptr<T>(), B.ptr<T>(), output.ptr<T>(), rows, cols, output.row_stride_elems(), pa,
+            pb, attrs.type, attrs.add_to);
+        return;
+    }
+
+    const int64_t total = A.numel();
+    const int64_t rank = A.rank();
 
     if (rank <= 1) {
         // Flat tensor — use flat kernel with grid-stride loop
