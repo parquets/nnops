@@ -37,22 +37,24 @@
 /// ldmatrix land on disjoint bank quads.
 ///
 /// Staging is shaped by what the counters say. The f32 accumulator (Dv/8 tiles
-/// of four floats) pins this kernel at 12 warps an SM whatever the block shape,
-/// so — unlike the 16-bit tile, which is throttled by the tensor pipe — it runs
-/// issue-bound: the pipe is idle more than it is busy, and spent warp-cycles
-/// per issued instruction are 2.6 on a global dependency and 1.7 on a full load
-/// queue. So each of the four reads a chunk needs is resolved once a chunk and
-/// stepped by a constant rather than per row: the run is one or two contiguous
-/// segments, so `base + r * step` is a row, and `rows == kBlockN` inside one
-/// segment takes the fill with no bounds test and no zero path (that is every
-/// chunk but the last a block walks, and a straddling or tail chunk keeps the
-/// general accessor below). Two things left the chunk loop entirely: the value
-/// run's transpose — a per-call pass into a key-minor scratch, `[column][key]`,
-/// so the integer B panel is fed by `cp.async` like the 16-bit tile's instead of
-/// four dependent 8 B gathers and a sixteen-`__byte_perm` turn a chunk — and the
-/// per-key V scale, staged into shared with the 255 level and the chunk's max
-/// already folded in, where the P quantization used to gather it from global a
-/// score.
+/// of four floats) is what bounds the warps this kernel can run: 64 registers of
+/// accumulator leave 128 a thread, and that is four blocks of four warps — 16 of
+/// the SM's 48 — which is why the panels are sized to let an SM hold four (see
+/// `kVtRow` and `p_in_q`). Unlike the 16-bit tile, which is throttled by the
+/// tensor pipe, this one is latency-bound: no pipe passes 30% of its peak, and
+/// occupancy is the lever that moves it (12 warps gave 34.5 TFLOPS at a 1024-key
+/// causal run, 16 gave 35.5, eight gave 27.9). So each of the four reads a chunk
+/// needs is resolved once a chunk and stepped by a constant rather than per row:
+/// the run is one or two contiguous segments, so `base + r * step` is a row, and
+/// `rows == kBlockN` inside one segment takes the fill with no bounds test and
+/// no zero path (that is every chunk but the last a block walks, and a
+/// straddling or tail chunk keeps the general accessor below). Two things left
+/// the chunk loop entirely: the value run's transpose — a per-call pass into a
+/// key-minor scratch, `[column][key]`, so the integer B panel is fed by
+/// `cp.async` like the 16-bit tile's instead of four dependent 8 B gathers and a
+/// sixteen-`__byte_perm` turn a chunk — and the per-key V scale, staged into
+/// shared with the 255 level and the chunk's max already folded in, where the P
+/// quantization used to gather it from global a score.
 ///
 /// P never takes the fragment shuffle: the score accumulator's four values a
 /// lane holds are two keys of one row, while the integer A fragment wants four
@@ -77,27 +79,49 @@ constexpr int kRowsPerWarp = kBlockM / kWarps;  ///< 16: one m16n8k32 tile a war
 constexpr int kScoreNt = kBlockN / 8;           ///< 8-key score groups per warp
 constexpr int kKStages = 1;
 constexpr int kVStages = 2;
-/// Every byte panel row carries 16 B of pad: it keeps the row 16 B aligned for
-/// ldmatrix and puts the eight rows a fragment read touches on the eight
-/// disjoint bank quads (a 32-key row is 8 words, so 8 rows would otherwise hit
-/// two banks).
+/// The Q and K panel rows carry 16 B of pad, and so does the P staging row: a
+/// panel row is `Dqk` bytes (a P row 32), so the eight rows one fragment read
+/// touches would otherwise land on the same bank quads. The value panel needs
+/// none of it — one `ldmatrix.x2` there reads eight 32-key rows as 256
+/// contiguous bytes, which is already the conflict-free case — and the block
+/// wants the four blocks an SM will give it, so it keeps the bare stride.
 constexpr int kPad = 16;
+constexpr int kVtRow = kBlockN;                 ///< Vᵀ panel row, bytes
+constexpr int kPs = kBlockN + kPad;             ///< P staging row, bytes
 
 static_assert(kRowsPerWarp == 16, "one m16n8k32 tile a warp");
 static_assert(kBlockN == 32, "the integer atom consumes one chunk's keys in one k step");
+
+/// Whether the P staging panel fits in the Q panel beside the K ring's second
+/// stage. It does for every shape but the narrow 64-key one, whose Q panel is
+/// only a quarter over a K stage — and that shape has shared memory to spare.
+constexpr bool p_in_q(int64_t dqk)
+{
+    return static_cast<int64_t>(kBlockM) * (dqk + kPad) >=
+           static_cast<int64_t>(kBlockN) * (dqk + kPad) + static_cast<int64_t>(kBlockM) * kPs;
+}
 
 constexpr int64_t smem_bytes(int64_t dqk, int64_t dv, bool pv8)
 {
     const int64_t q = static_cast<int64_t>(kBlockM) * (dqk + kPad);
     const int64_t qsc = static_cast<int64_t>(kBlockM) * sizeof(float);
     const int64_t k = static_cast<int64_t>(kKStages) * kBlockN * (dqk + kPad);
-    const int64_t v = pv8 ? static_cast<int64_t>(kVStages) * dv * (kBlockN + kPad)
+    const int64_t v = pv8 ? static_cast<int64_t>(kVStages) * dv * kVtRow
                           : static_cast<int64_t>(kVStages) * kBlockN * (dv + 8) * sizeof(half);
-    const int64_t p = pv8 ? static_cast<int64_t>(kBlockM) * (kBlockN + kPad) : 0;
+    const int64_t p = (pv8 && !p_in_q(dqk)) ? static_cast<int64_t>(kBlockM) * kPs : 0;
     const int64_t vsc = pv8 ? static_cast<int64_t>(kVStages) * sizeof(float) : 0;
     const int64_t vf = pv8 ? static_cast<int64_t>(kVStages) * kBlockN * sizeof(float) : 0;
     const int64_t ksc = static_cast<int64_t>(kVStages) * kBlockN * sizeof(float);
     return (q + qsc + k + v + p + vsc + vf + ksc + 15) & ~static_cast<int64_t>(15);
+}
+
+/// Blocks an SM can hold at this shape, which is also what the launch bounds
+/// ask the register allocator for: aiming at four where the panel only fits
+/// three trades a clean 168-register kernel for a spilled 128-register one.
+constexpr int blocks_per_sm(int64_t dqk, int64_t dv, bool pv8)
+{
+    const int64_t per_block = smem_bytes(dqk, dv, pv8) + 1024; ///< + driver reserve
+    return per_block * 4 <= 102400 ? 4 : 3;
 }
 
 // ============================================================
@@ -156,11 +180,19 @@ __host__ __device__ __forceinline__ Src seg_src(const int8_t* past, int64_t past
     return {main_ != nullptr ? main_ + j * main_step : nullptr, main_step};
 }
 
+/// Whether the branch-free fill can cover a chunk exactly: the threads must
+/// split into whole segments and whole rows. A 192-key head gives twelve
+/// segments, which divides neither, and takes the row walk below instead.
+template <int DQK>
+constexpr bool k_fill_exact = (kThreads % (DQK / 16)) == 0 &&
+                              (kBlockN % (kThreads / (DQK / 16))) == 0;
+
 /// The interior K fill: one `cp.async` 16 B segment a thread, no row test.
 template <int DQK>
 __device__ __forceinline__ void stage_k_fast(const int8_t* src, int64_t step, int8_t* dst,
                                              int tid)
 {
+    static_assert(k_fill_exact<DQK>, "the branch-free fill must cover the chunk exactly");
     constexpr int kSegs = DQK / 16;
     constexpr int kRowsPerPass = kThreads / kSegs;
     constexpr int kStride = DQK + kPad;
@@ -212,7 +244,7 @@ __device__ __forceinline__ void stage_vt_prep(const int8_t* vt, int64_t j0, int6
 {
     constexpr int kSegs = kBlockN / 16;
     constexpr int kRowsPerPass = kThreads / kSegs;
-    constexpr int kStride = kBlockN + kPad;
+    constexpr int kStride = kVtRow;
     static_assert(DV % kRowsPerPass == 0, "the fill must divide the value columns");
     const int s = (tid % kSegs) * 16;
     const int r0 = tid / kSegs;
@@ -221,68 +253,6 @@ __device__ __forceinline__ void stage_vt_prep(const int8_t* vt, int64_t j0, int6
         const int r = r0 + q * kRowsPerPass;
         cp_async_ca_16B(dst + static_cast<int64_t>(r) * kStride + s,
                         vt + static_cast<int64_t>(r) * skt + j0 + s);
-    }
-}
-
-/// V transposed into the panel the integer B fragment reads: `[value column]
-/// [key]`, 32-key rows. Each thread owns four keys by eight value columns — one
-/// 8 B load a key, not a 4 B one — and turns the 4x4 byte blocks over with
-/// `__byte_perm`: a 32 B sector then carries 8 B instead of 2, which is what a
-/// 4-byte load at a head-width stride would waste. The fallback for a run too
-/// large to stage; the scratch above is the route the tile normally takes.
-template <class P, int DV>
-__device__ __forceinline__ void stage_vt(const P& p, int64_t b, int64_t hkv, int64_t j0,
-                                         int8_t* dst, int tid)
-{
-    constexpr int kStride = kBlockN + kPad;
-    constexpr int kCols = 8;                ///< value columns a thread carries
-    constexpr int kPerRow = kBlockN / 4;    ///< four-key groups in a chunk
-    constexpr int kBlocks = (DV / kCols) * kPerRow;
-    for (int t = tid; t < kBlocks; t += kThreads) {
-        const int kb = t & (kPerRow - 1);   ///< which four keys
-        const int db = t / kPerRow;         ///< which eight value columns
-        uint2 w[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int8_t* const src = v_row(p, b, hkv, j0 + 4 * kb + i);
-            w[i] = src != nullptr ? *reinterpret_cast<const uint2*>(src + kCols * db)
-                                  : make_uint2(0u, 0u);
-        }
-#pragma unroll
-        for (int s = 0; s < 2; ++s) {
-            const uint32_t k0 = s == 0 ? w[0].x : w[0].y;
-            const uint32_t k1 = s == 0 ? w[1].x : w[1].y;
-            const uint32_t k2 = s == 0 ? w[2].x : w[2].y;
-            const uint32_t k3 = s == 0 ? w[3].x : w[3].y;
-            const uint32_t x0 = __byte_perm(k0, k1, 0x5140); // k0d0 k1d0 k0d1 k1d1
-            const uint32_t x1 = __byte_perm(k0, k1, 0x7362); // k0d2 k1d2 k0d3 k1d3
-            const uint32_t x2 = __byte_perm(k2, k3, 0x5140); // k2d0 k3d0 k2d1 k3d1
-            const uint32_t x3 = __byte_perm(k2, k3, 0x7362); // k2d2 k3d2 k2d3 k3d3
-            int8_t* const o = dst + static_cast<int64_t>(kCols * db + 4 * s) * kStride + 4 * kb;
-            *reinterpret_cast<uint32_t*>(o) = __byte_perm(x0, x2, 0x5410);
-            *reinterpret_cast<uint32_t*>(o + kStride) = __byte_perm(x0, x2, 0x7632);
-            *reinterpret_cast<uint32_t*>(o + 2 * kStride) = __byte_perm(x1, x3, 0x5410);
-            *reinterpret_cast<uint32_t*>(o + 3 * kStride) = __byte_perm(x1, x3, 0x7632);
-        }
-    }
-}
-
-/// V widened into the 16-bit panel the f16 tile's P·V reads, its per-key scale
-/// already in it. One element a step; the row is the key, so the scale is a
-/// scalar per run row. The fallback for a value run that could not be staged.
-template <class T, class P, int DV>
-__device__ __forceinline__ void stage_v_fp(const P& p, int64_t b, int64_t hkv, int64_t j0,
-                                           T* dst, int tid)
-{
-    constexpr int kStride = DV + 8;
-    for (int t = tid; t < kBlockN * DV; t += kThreads) {
-        const int key = t / DV;
-        const int d = t - key * DV;
-        const int8_t* const src = v_row(p, b, hkv, j0 + key);
-        const int64_t j = j0 + key;
-        const float vs = kv_scale_at(p.vscale, p.scale_per_token, b, hkv, j, p.Hkv, p.Sk);
-        dst[static_cast<int64_t>(key) * kStride + d] =
-            float_to_elem<T>(src != nullptr ? static_cast<float>(src[d]) * vs : 0.0f);
     }
 }
 
@@ -433,16 +403,16 @@ __device__ __forceinline__ void stage_v_prep(const T* vbase, int64_t j0, int64_t
 // ============================================================
 
 template <class T, int DQK, int DV, bool kPv8>
-__global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, true> p)
+__global__ void __launch_bounds__(kThreads, blocks_per_sm(DQK, DV, kPv8))
+    attention_kernel(AttnParams<T, true> p)
 {
     using P = AttnParams<T, true>;
 
     constexpr int kqs = DQK + kPad;             ///< Q / K panel row, bytes
-    constexpr int kVs = kBlockN + kPad;         ///< Vᵀ / P staging row, bytes
     constexpr int kVh = DV + 8;                 ///< 16-bit V panel row, elements
     constexpr int kNt = DV / 8;
     constexpr int kPvSteps = kBlockN / 16;      ///< 16-bit P·V steps
-    constexpr int kVbytes = kPv8 ? DV * kVs : kBlockN * kVh * static_cast<int>(sizeof(T));
+    constexpr int kVbytes = kPv8 ? DV * kVtRow : kBlockN * kVh * static_cast<int>(sizeof(T));
 
     extern __shared__ char tc8_smem[];
     int8_t* const Qs = reinterpret_cast<int8_t*>(tc8_smem);
@@ -452,13 +422,15 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, tr
     /// fragments are in registers (it is twice a K stage, since the block owns
     /// twice the query rows a chunk holds keys). That buys the double buffer
     /// without an extra byte of shared memory, which is what lets the refill
-    /// ride the chunk's one barrier.
+    /// ride the chunk's one barrier — and the P staging panel, a quarter of the
+    /// rest, lives in the other half of the same dead panel.
     int8_t* const Kb2 = Qs;
-    static_assert(kBlockM >= kBlockN, "the Q panel must hold a K stage");
     constexpr int kKStageBytes = kBlockN * kqs;
+    constexpr bool kPinQ = p_in_q(DQK);
     int8_t* const Vb = reinterpret_cast<int8_t*>(Kb + static_cast<int64_t>(kKStages) * kKStageBytes);
-    int8_t* const Pb = Vb + static_cast<int64_t>(kVStages) * kVbytes;
-    float* const Vsc = reinterpret_cast<float*>(Pb + (kPv8 ? static_cast<int64_t>(kBlockM) * kVs : 0));
+    int8_t* const Pb = kPinQ ? Qs + kKStageBytes : Vb + static_cast<int64_t>(kVStages) * kVbytes;
+    float* const Vsc = reinterpret_cast<float*>(
+        Vb + static_cast<int64_t>(kVStages) * kVbytes + (kPv8 && !kPinQ ? kBlockM * kPs : 0));
     float* const Vf = Vsc + (kPv8 ? kVStages : 0);
     float* const Ksc = Vf + (kPv8 ? static_cast<int64_t>(kVStages) * kBlockN : 0);
     T* const Vh = reinterpret_cast<T*>(Vb);
@@ -577,15 +549,11 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, tr
     // The per-(batch, kv head) base of both scale arrays, resolved once.
     const float* const ksc_base = p.kscale != nullptr ? p.kscale + (b * p.Hkv + hkv) * p.Sk : nullptr;
     const int64_t vsc_off = (b * p.Hkv + hkv) * p.Sk;
-    // The two runs' segment bases, likewise.
+    // The key run's segment bases, likewise. The value run is read through the
+    // staged scratch, so only this one is addressed in the tile.
     const int8_t* const pk_b0 = p.pk != nullptr ? p.pk + b * p.pk_b + hkv * p.pk_h : nullptr;
     const int8_t* const k_b0 = p.k != nullptr ? p.k + b * p.k_b + hkv * p.k_h : nullptr;
-    const int8_t* const pv_b0 = p.pv != nullptr ? p.pv + b * p.pv_b + hkv * p.pv_h : nullptr;
-    const int8_t* const v_b0 = p.v != nullptr ? p.v + b * p.v_b + hkv * p.v_h : nullptr;
     auto ksrc_at = [&](int64_t j) { return seg_src(pk_b0, p.pk_s, k_b0, p.k_s, p.Sk_past, j); };
-    auto vsrc_at = [&](int64_t j) {
-        return p.v_is_k ? ksrc_at(j) : seg_src(pv_b0, p.pv_s, v_b0, p.v_s, p.Sk_past, j);
-    };
     /// A chunk is one segment's when it does not straddle the past boundary.
     auto one_segment = [&](int64_t j) { return j + kBlockN <= p.Sk_past || j >= p.Sk_past; };
 
@@ -599,31 +567,31 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, tr
         }
     }
 
+    /// The launcher stages the value run before it launches this tile and
+    /// declines it otherwise, so one of the two is always there.
     const T* const vprep = static_cast<const T*>(p.vprep);
-    const int8_t* const vt = static_cast<const int8_t*>(p.vt);
-    const T* const vprep_base = vprep != nullptr ? vprep + (b * p.Hkv + hkv) * p.Sk * p.Dv : nullptr;
-    const int8_t* const vt_base = vt != nullptr ? vt + (b * p.Hkv + hkv) * p.Dv * p.vt_s : nullptr;
+    const T* const vprep_base = vprep + (b * p.Hkv + hkv) * p.Sk * p.Dv;
+    const int8_t* const vt_base =
+        static_cast<const int8_t*>(p.vt) + (b * p.Hkv + hkv) * p.Dv * p.vt_s;
     const int64_t kv_rows = std::min(kv_end, p.Sk);
 
     if (j_begin < kv_end) {
         const int nrows = chunk_rows(j_begin, kv_rows);
-        if (nrows == kBlockN && one_segment(j_begin)) {
-            const Src ks = ksrc_at(j_begin);
-            stage_k_fast<DQK>(ks.base, ks.step, Kb, tid);
+        if constexpr (k_fill_exact<DQK>) {
+            if (nrows == kBlockN && one_segment(j_begin)) {
+                const Src ks = ksrc_at(j_begin);
+                stage_k_fast<DQK>(ks.base, ks.step, Kb, tid);
+            } else {
+                stage_k<P, DQK>(p, b, hkv, j_begin, Kb, tid);
+            }
         } else {
             stage_k<P, DQK>(p, b, hkv, j_begin, Kb, tid);
         }
         if constexpr (kPv8) {
-            if (vt_base != nullptr) {
-                stage_vt_prep<DV>(vt_base, j_begin, p.vt_s, Vb, tid);
-            } else {
-                stage_vt<P, DV>(p, b, hkv, j_begin, Vb, tid);
-            }
+            stage_vt_prep<DV>(vt_base, j_begin, p.vt_s, Vb, tid);
             stage_vfact(p, vsc_off, j_begin, Vsc, Vf, tid);
-        } else if (vprep_base != nullptr) {
-            stage_v_prep<T, DV>(vprep_base, j_begin, p.Sk, Vh, tid);
         } else {
-            stage_v_fp<T, P, DV>(p, b, hkv, j_begin, Vh, tid);
+            stage_v_prep<T, DV>(vprep_base, j_begin, p.Sk, Vh, tid);
         }
         if (kcol) {
             stage_ksc(p, ksc_base, j_begin, Ksc, tid);
@@ -637,7 +605,7 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, tr
     const uint32_t vh_off = static_cast<uint32_t>((lane & 7) + ((lane >> 3) & 1) * 8) *
                                 static_cast<uint32_t>(kVh * 2) +
                             static_cast<uint32_t>((lane >> 4) * 16);
-    const uint32_t vt_off = static_cast<uint32_t>(lane & 7) * static_cast<uint32_t>(kVs) +
+    const uint32_t vt_off = static_cast<uint32_t>(lane & 7) * static_cast<uint32_t>(kVtRow) +
                             static_cast<uint32_t>((lane >> 3) & 1) * 16u;
 
     const int64_t jhi_w =
@@ -654,6 +622,12 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, tr
     const float rm1 = p.scale * Qsc[row1] * l2e;
     const int jc0 = 2 * (lane & 3);
 
+    /// A pointer-advance fill (each thread's sources one add a chunk instead of
+    /// a 64-bit multiply a row) was measured here and dropped: it removes a
+    /// fifth of the loop's instructions but costs eight live pointers, and at
+    /// this tile's four blocks an SM — 128 registers — the spills it forces
+    /// come to more than the arithmetic saves. The fill is on the uniform pipe
+    /// and is not what the loop waits on.
     int stage = 0;
     for (int64_t j0 = j_begin; j0 < kv_end; j0 += kBlockN) {
         cp_async_wait_group<0>();
@@ -666,30 +640,27 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, tr
         /// barrier as the previous chunk's reads.
         const uint32_t kb = smem_addr_u32(stage == 0 ? Kb : Kb2);
         if (jn < kv_end) {
-            {
-                const int nrows = chunk_rows(jn, kv_rows);
-                int8_t* const dst = ns == 0 ? Kb : Kb2;
+            const int nrows = chunk_rows(jn, kv_rows);
+            int8_t* const dst = ns == 0 ? Kb : Kb2;
+            if constexpr (k_fill_exact<DQK>) {
                 if (nrows == kBlockN && one_segment(jn)) {
                     const Src ks = ksrc_at(jn);
                     stage_k_fast<DQK>(ks.base, ks.step, dst, tid);
                 } else {
                     stage_k<P, DQK>(p, b, hkv, jn, dst, tid);
                 }
+            } else {
+                stage_k<P, DQK>(p, b, hkv, jn, dst, tid);
             }
             if constexpr (kPv8) {
-                if (vt_base != nullptr) {
-                    stage_vt_prep<DV>(vt_base, jn, p.vt_s, Vb + static_cast<int64_t>(ns) * kVbytes,
-                                      tid);
-                } else {
-                    stage_vt<P, DV>(p, b, hkv, jn, Vb + static_cast<int64_t>(ns) * kVbytes, tid);
-                }
-                stage_vfact(p, vsc_off, jn, Vsc + ns, Vf + static_cast<int64_t>(ns) * kBlockN, tid);
-            } else if (vprep_base != nullptr) {
+                stage_vt_prep<DV>(vt_base, jn, p.vt_s, Vb + static_cast<int64_t>(ns) * kVbytes,
+                                  tid);
+            } else {
                 stage_v_prep<T, DV>(vprep_base, jn, p.Sk,
                                     Vh + static_cast<int64_t>(ns) * kBlockN * kVh, tid);
-            } else {
-                stage_v_fp<T, P, DV>(p, b, hkv, jn,
-                                     Vh + static_cast<int64_t>(ns) * kBlockN * kVh, tid);
+            }
+            if constexpr (kPv8) {
+                stage_vfact(p, vsc_off, jn, Vsc + ns, Vf + static_cast<int64_t>(ns) * kBlockN, tid);
             }
             if (kcol) {
                 stage_ksc(p, ksc_base, jn, Ksc + static_cast<int64_t>(ns) * kBlockN, tid);
@@ -815,8 +786,8 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, tr
             // folded into `Vf` when the scale was staged.
             const float deq = p.vscale != nullptr ? Vsc[stage] : 1.0f / 255.0f;
             const float* const vf = Vf + static_cast<int64_t>(stage) * kBlockN + jc0;
-            int8_t* const p0 = Pb + static_cast<int64_t>(row0) * kVs + jc0;
-            int8_t* const p1 = Pb + static_cast<int64_t>(row1) * kVs + jc0;
+            int8_t* const p0 = Pb + static_cast<int64_t>(row0) * kPs + jc0;
+            int8_t* const p1 = Pb + static_cast<int64_t>(row1) * kPs + jc0;
 #pragma unroll
             for (int t = 0; t < kScoreNt; ++t) {
                 const float2 f = *reinterpret_cast<const float2*>(vf + 8 * t);
@@ -837,15 +808,15 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, tr
             ldmatrix_x4_at(&pa[0], &pa[1], &pa[2], &pa[3],
                            smem_addr_u32(Pb) +
                                static_cast<uint32_t>(warp * kRowsPerWarp) *
-                                   static_cast<uint32_t>(kVs) +
-                               static_cast<uint32_t>(lane & 15) * static_cast<uint32_t>(kVs) +
+                                   static_cast<uint32_t>(kPs) +
+                               static_cast<uint32_t>(lane & 15) * static_cast<uint32_t>(kPs) +
                                static_cast<uint32_t>((lane >> 4) * 16));
             const uint32_t vb = smem_addr_u32(Vb) + static_cast<uint32_t>(stage * kVbytes);
 #pragma unroll
             for (int g = 0; g < kNt; ++g) {
                 uint32_t vfrag[2];
                 ldmatrix_x2_at(&vfrag[0], &vfrag[1],
-                               vb + vt_off + static_cast<uint32_t>(8 * g * kVs));
+                               vb + vt_off + static_cast<uint32_t>(8 * g * kVtRow));
                 int32_t acc[4] = {0, 0, 0, 0};
                 uint32_t* const d = reinterpret_cast<uint32_t*>(acc);
                 mma_m16n8k32_u8s8(&d[0], &d[1], &d[2], &d[3], pa[0], pa[1], pa[2], pa[3],
