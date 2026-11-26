@@ -374,6 +374,12 @@ inline FpFinish fp_finish(const Conv2DAttributes& attrs, bool has_bias) noexcept
 {
     constexpr float kInf = std::numeric_limits<float>::infinity();
     const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
+    // The descriptor's own bounds are half the epilogue contract — every backend
+    // writes activate(clamp(x, min_clip, max_clip)) — so a bound that is set
+    // keeps the activation out of the folded clamp. The fold's bounds are the
+    // activation's, and folding over a clip would drop it.
+    const bool clipped =
+        attrs.epilogue.min_clip > -kInf || attrs.epilogue.max_clip < kInf;
 
     FpFinish f;
     f.clamp_lo = -kInf;
@@ -382,18 +388,21 @@ inline FpFinish fp_finish(const Conv2DAttributes& attrs, bool has_bias) noexcept
         switch (attrs.epilogue.type) {
         case EpilogueActivateType::Relu:
             f.clamp_lo = 0.0f;
-            f.epi_folded = true;
+            f.epi_folded = !clipped;
             break;
         case EpilogueActivateType::Relu6:
             f.clamp_lo = 0.0f;
             f.clamp_hi = 6.0f;
-            f.epi_folded = true;
+            f.epi_folded = !clipped;
             break;
         default:
             break;
         }
     }
-    const bool epi_active = attrs.epilogue.type != EpilogueActivateType::None;
+    // The identity epilogue is the identity only when no bound is set: a
+    // clip-only epilogue still has work to do, and it is the pass that does it.
+    const bool epi_active =
+        attrs.epilogue.type != EpilogueActivateType::None || clipped;
     f.epi_pass = epi_active && !f.epi_folded;
     // add_to folds the pre-existing output into the accumulator seed when the
     // epilogue is the identity, and the pre-activation order always does; the

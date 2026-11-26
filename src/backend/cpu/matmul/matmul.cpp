@@ -469,14 +469,19 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs, TensorView& output,
     // Fold pure-clamp activations into min_clip/max_clip, which kblock_clamp
     // (and the Q4_1 routes) read directly. A normalization of the attributes
     // that every route shares, so it happens before the family is picked.
+    //
+    // The fold *composes* with the descriptor's bounds, it does not replace
+    // them: clamp(clamp(x, lo, hi), 0, 6) is clamp(x, max(lo, 0), min(hi, 6)),
+    // which is the same rule the conv family's int8 store follows. Writing the
+    // activation's bounds over the caller's would widen a narrower clip.
     MatMulAttributes attrs_n = attrs;
     switch (attrs_n.epilogue.type) {
     case EpilogueActivateType::Relu:
-        attrs_n.epilogue.min_clip = 0.0f;
+        attrs_n.epilogue.min_clip = std::max(attrs_n.epilogue.min_clip, 0.0f);
         break;
     case EpilogueActivateType::Relu6:
-        attrs_n.epilogue.min_clip = 0.0f;
-        attrs_n.epilogue.max_clip = 6.0f;
+        attrs_n.epilogue.min_clip = std::max(attrs_n.epilogue.min_clip, 0.0f);
+        attrs_n.epilogue.max_clip = std::min(attrs_n.epilogue.max_clip, 6.0f);
         break;
     default:
         break;

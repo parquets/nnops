@@ -187,19 +187,37 @@ NNOPS_TEST(cuda_conv3d_epilogue)
         run_case(c, "cuda_conv3d_epilogue");
     }
 
-    // The clip rides with a non-foldable activation: the CPU's conv family
-    // folds Relu/Relu6 into an accumulator clamp and skips its epilogue pass, so
-    // a bound set beside one of those — or beside the identity — never reaches
-    // the output, and CUDA's unconditional clamp would disagree with it.
-    Epilogue clipped;
-    clipped.type = EpilogueActivateType::LeakyRelu;
-    clipped.alpha = 0.1f;
-    clipped.min_clip = -0.1f;
-    clipped.max_clip = 0.2f;
-    C3Case c;
-    c.use_bias = true;
-    c.epilogue = clipped;
-    run_case(c, "cuda_conv3d_clip");
+    // The clip is the second half of the epilogue contract, and it composes
+    // with the activation rather than being replaced by it: on its own, beside
+    // the two activations the CPU folds into an accumulator clamp, and beside a
+    // non-foldable one. All four must reach the same output.
+    for (auto type : {EpilogueActivateType::None, EpilogueActivateType::Relu,
+                      EpilogueActivateType::Relu6, EpilogueActivateType::LeakyRelu}) {
+        Epilogue clipped;
+        clipped.type = type;
+        clipped.alpha = 0.1f;
+        clipped.min_clip = -0.1f;
+        clipped.max_clip = 0.2f;
+        C3Case k;
+        k.use_bias = true;
+        k.epilogue = clipped;
+        run_case(k, "cuda_conv3d_clip");
+    }
+    // The same bounds on a grouped geometry, whose group loop is a different
+    // walk of the same finish.
+    {
+        Epilogue clipped;
+        clipped.type = EpilogueActivateType::Relu;
+        clipped.min_clip = -0.1f;
+        clipped.max_clip = 0.2f;
+        C3Case g;
+        g.ic = 16;
+        g.oc = 32;
+        g.groups = 4;
+        g.epilogue = clipped;
+        run_case(g, "cuda_conv3d_clip_groups");
+    }
+
 }
 
 NNOPS_TEST(cuda_conv3d_tiles)

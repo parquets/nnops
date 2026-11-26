@@ -712,6 +712,43 @@ NNOPS_TEST(matmul_epilogue_relu) {
     NNOPS_EXPECT_NEAR(c[3], 15.0f, 1e-6f);   // relu(15) = 15
 }
 
+NNOPS_TEST(matmul_epilogue_clip_composes) {
+    // The clip bounds are the other half of the epilogue contract:
+    // activate(clamp(x, min_clip, max_clip)). The pure-clamp fold composes with
+    // them instead of writing the activation's own bounds over them —
+    // clamp(clamp(x, 0.5, 2), 0, 6) is clamp(x, 0.5, 2), where replacing them
+    // would have yielded clamp(x, 0, 6).
+    const int64_t ashape[] = {2, 3};
+    const int64_t bshape[] = {3, 2};
+    float a_data[6] = {1, 2, 3, -4, -5, -6};
+    float b_data[6] = {1, -1, 1, -1, 1, -1};
+
+    TensorView a(ashape, DataType::f32, a_data);
+    TensorView b(bshape, DataType::f32, b_data);
+
+    MatMulAttributes attrs{};
+    attrs.epilogue.type = EpilogueActivateType::Relu6;
+    attrs.epilogue.min_clip = 0.5f;
+    attrs.epilogue.max_clip = 2.0f;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs.size(), 1u);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    // A×B = [[6,-6],[-15,15]], then clamp(0.5, 2) and Relu6 (a no-op inside it).
+    float* c = out_buf.data();
+    NNOPS_EXPECT_NEAR(c[0], 2.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(c[1], 0.5f, 1e-6f);
+    NNOPS_EXPECT_NEAR(c[2], 0.5f, 1e-6f);
+    NNOPS_EXPECT_NEAR(c[3], 2.0f, 1e-6f);
+}
+
 NNOPS_TEST(matmul_epilogue_relu_with_beta) {
     // A: [1, 2], B: [2, 2]  →  C: [1, 2]
     const int64_t ashape[] = {1, 2};

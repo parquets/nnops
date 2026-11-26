@@ -24,6 +24,8 @@
 ///   dimension carries the transform order.
 
 #include "nnops/ops/conv2d.hpp"
+
+#include <limits>
 #include "nnops/core/compute_context.hpp"
 #include "nnops/detail/half.hpp"
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"
@@ -200,7 +202,9 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
                      ConvAlgorithm alg = ConvAlgorithm::Auto,
                      bool packed_filter = false,
                      bool pre_act = false,
-                     bool allow_sme = false)
+                     bool allow_sme = false,
+                     float min_clip = -std::numeric_limits<float>::infinity(),
+                     float max_clip = std::numeric_limits<float>::infinity())
 {
     const int64_t N = c.ishape[0], IC = c.ishape[1];
     const int64_t IH = c.ishape[2], IW = c.ishape[3];
@@ -229,6 +233,8 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
     attrs.padding     = {c.ph, c.pw};
     attrs.groups      = c.groups;
     attrs.epilogue.type = ep;
+    attrs.epilogue.min_clip = min_clip;
+    attrs.epilogue.max_clip = max_clip;
     attrs.add_to      = add_to;
     attrs.residual_pre_activation = pre_act;
     attrs.algorithm   = alg;
@@ -380,10 +386,12 @@ void expect_fp_close(const FpCase& c, DataType dt, float tol,
                      bool add_to = false, uint64_t seed = 900, int idx = -1,
                      ConvAlgorithm alg = ConvAlgorithm::Auto,
                      bool packed_filter = false, bool pre_act = false,
-                     bool allow_sme = false)
+                     bool allow_sme = false,
+                     float min_clip = -std::numeric_limits<float>::infinity(),
+                     float max_clip = std::numeric_limits<float>::infinity())
 {
     const FpResult r = run_fp_case(c, dt, ep, add_to, seed, alg, packed_filter,
-                                   pre_act, allow_sme);
+                                   pre_act, allow_sme, min_clip, max_clip);
     if (r.worst > tol) {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
@@ -687,6 +695,51 @@ NNOPS_TEST(conv2d_fp_epilogues) {
     expect_fp_close({{1, 8, 12, 12}, 16, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},
                     DataType::f32, 2e-4f, EpilogueActivateType::Relu, true, 616,
                     -1, ConvAlgorithm::Auto, false, true);
+}
+
+NNOPS_TEST(conv2d_fp_clip) {
+    // The descriptor's clip bounds are half the epilogue contract: every backend
+    // writes activate(clamp(x, min_clip, max_clip)). Two ways the im2col route
+    // used to lose them — an identity activation skipped the pass that applies
+    // them, and a foldable one (Relu, Relu6) folded the activation's own bounds
+    // over them. The bounds here are inside the range the case's sums reach, so
+    // a dropped or widened clip shows up.
+    const FpCase c = {{1, 6, 11, 11}, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, true};
+    constexpr float kLo = -0.3f;
+    constexpr float kHi = 0.4f;
+
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::None, false, 700,
+                    -1, ConvAlgorithm::Auto, false, false, false, kLo, kHi);
+    // Composed with the foldable activations rather than replaced by them.
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::Relu, false, 701,
+                    -1, ConvAlgorithm::Auto, false, false, false, kLo, kHi);
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::Relu6, false, 702,
+                    -1, ConvAlgorithm::Auto, false, false, false, kLo, kHi);
+    // A bound narrower than the activation's: min_clip above 0 with Relu6's 6
+    // removed by max_clip below it, which is where an overwrite differs.
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::Relu6, false, 703,
+                    -1, ConvAlgorithm::Auto, false, false, false, 0.1f, 0.2f);
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::Relu, false, 704,
+                    -1, ConvAlgorithm::Auto, false, false, false, 0.1f, 0.2f);
+
+    // add_to in both orders, and the f16 route whose seed is a converted panel.
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::None, true, 705,
+                    -1, ConvAlgorithm::Auto, false, false, false, kLo, kHi);
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::None, true, 706,
+                    -1, ConvAlgorithm::Auto, false, true, false, kLo, kHi);
+    expect_fp_close(c, DataType::f16, nnops::test::kF16AccumTol,
+                    EpilogueActivateType::None, false, 707,
+                    -1, ConvAlgorithm::Auto, false, false, false, kLo, kHi);
+
+    // The pointwise hand-off (a 1x1 filter at unit stride goes to the dense
+    // GEMM, whose own fold composes with these bounds) and Winograd.
+    expect_fp_close({{1, 64, 7, 7}, 32, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
+                    DataType::f32, 2e-4f, EpilogueActivateType::Relu, false, 708,
+                    -1, ConvAlgorithm::Auto, false, false, false, kLo, kHi);
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::None, false, 709,
+                    -1, ConvAlgorithm::Winograd, false, false, false, kLo, kHi);
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::Relu, false, 710,
+                    -1, ConvAlgorithm::Winograd, false, false, false, kLo, kHi);
 }
 
 // ============================================================

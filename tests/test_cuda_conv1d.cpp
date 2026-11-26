@@ -177,20 +177,36 @@ NNOPS_TEST(cuda_conv1d_epilogue)
         run_case(c, "cuda_conv1d_epilogue");
     }
 
-    // The clamp bounds travel with the epilogue on every backend.
-    // The clip rides with a non-foldable activation: the CPU's conv family
-    // folds Relu/Relu6 into an accumulator clamp and skips its epilogue pass, so
-    // a bound set beside one of those — or beside the identity — never reaches
-    // the output, and CUDA's unconditional clamp would disagree with it.
-    Epilogue clipped;
-    clipped.type = EpilogueActivateType::LeakyRelu;
-    clipped.alpha = 0.1f;
-    clipped.min_clip = -0.1f;
-    clipped.max_clip = 0.2f;
-    C1Case c;
-    c.epilogue = clipped;
-    c.use_bias = true;
-    run_case(c, "cuda_conv1d_clip");
+    // The clip is the second half of the epilogue contract, and it composes
+    // with the activation rather than being replaced by it: on its own, beside
+    // the two activations the CPU folds into an accumulator clamp, and beside a
+    // non-foldable one. All four must reach the same output.
+    for (auto type : {EpilogueActivateType::None, EpilogueActivateType::Relu,
+                      EpilogueActivateType::Relu6, EpilogueActivateType::LeakyRelu}) {
+        Epilogue clipped;
+        clipped.type = type;
+        clipped.alpha = 0.1f;
+        clipped.min_clip = -0.1f;
+        clipped.max_clip = 0.2f;
+        C1Case k;
+        k.use_bias = true;
+        k.epilogue = clipped;
+        run_case(k, "cuda_conv1d_clip");
+    }
+    // The depthwise route takes the 2D op's hand-off, so its own finish sees
+    // the same bounds.
+    {
+        Epilogue clipped;
+        clipped.type = EpilogueActivateType::Relu;
+        clipped.min_clip = -0.1f;
+        clipped.max_clip = 0.2f;
+        C1Case dw;
+        dw.ic = 16;
+        dw.oc = 16;
+        dw.groups = 16;
+        dw.epilogue = clipped;
+        run_case(dw, "cuda_conv1d_clip_depthwise");
+    }
 }
 
 NNOPS_TEST(cuda_conv1d_batched)
