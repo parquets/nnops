@@ -218,6 +218,12 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/conv/conv2d.cu
         backend/cuda/conv/conv2d_i8.cu
         backend/cuda/conv/transpose_conv2d.cu
+        # Conv1D is a rank-4 lift onto conv2d.cu; the 3-D pair shares one
+        # implicit GEMM whose only difference is the activation gather
+        # (conv3d_common.cuh).
+        backend/cuda/conv/conv1d.cu
+        backend/cuda/conv/conv3d.cu
+        backend/cuda/conv/transpose_conv3d.cu
         backend/cuda/conv/depthwise_transpose_conv.cu
         backend/cuda/conv/depthwise_conv.cu
         backend/cuda/conv/pooling.cu

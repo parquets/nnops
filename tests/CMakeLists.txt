@@ -125,7 +125,10 @@ if(NNOPS_BUILD_CUDA)
         test_cuda_matmul.cpp
         test_cuda_linear.cpp
         test_cuda_conv2d.cpp
+        test_cuda_conv1d.cpp
+        test_cuda_conv3d.cpp
         test_cuda_transpose_conv2d.cpp
+        test_cuda_transpose_conv3d.cpp
         test_cuda_depthwise_transpose_conv.cpp
         test_cuda_depthwise_conv.cpp
         test_cuda_pooling.cpp
@@ -205,6 +208,8 @@ if(NNOPS_BUILD_BENCHMARKS)
             bench_cuda_matmul.cpp
             bench_cuda_linear.cpp
             bench_cuda_conv2d.cpp
+            bench_cuda_conv1d.cpp
+            bench_cuda_conv3d.cpp
             bench_cuda_transpose_conv2d.cpp
             bench_cuda_pooling.cpp
             bench_cuda_resize.cpp

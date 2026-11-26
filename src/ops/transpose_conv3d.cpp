@@ -10,9 +10,11 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(TransposeConv3DAttributes, transpose_conv3d_cpu)
+NNOPS_DECLARE_CUDA(TransposeConv3DAttributes, transpose_conv3d_cuda)
 
-NNOPS_OP_BOILERPLATE(TransposeConv3D, TransposeConv3DAttributes, backend::cpu::transpose_conv3d_cpu,
-                     nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(TransposeConv3D, TransposeConv3DAttributes,
+                     backend::cpu::transpose_conv3d_cpu,
+                     NNOPS_IF_CUDA(backend::cuda::transpose_conv3d_cuda), nullptr)
 
 std::vector<TensorDesc>
 TransposeConv3D::getOutputTensorDesc(std::span<const TensorDesc> inputs) const
