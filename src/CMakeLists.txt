@@ -233,7 +233,10 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/rnn/recurrent.cu
         # Attention: one tiled online-softmax kernel behind GroupQueryAttention
         # (MHA at H_kv == H) and MultiLatentAttention, both forms — see
-        # backend/common/attention_config.hpp for the shared description.
+        # backend/common/attention_config.hpp for the shared description — plus
+        # the per-dtype prefill tiles (FFMA, m16n8k16, m16n8k32) and the
+        # absorbed-MLA tile, where one latent row serves sixteen query heads and
+        # the value comes out of the key panel.
         backend/cuda/attention/attention.cu
         # LinearAttention: the gated delta recurrence with the state slab in
         # registers, one launch for the whole sequence, and the chunked-WY route

@@ -20,6 +20,7 @@
 
 #include "nnops/ops/group_query_attention.hpp"
 #include "nnops/ops/multi_latent_attention.hpp"
+#include "backend/cuda/attention/attention_mla_host.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/cuda_test_helper.hpp"
@@ -30,6 +31,8 @@
 #include <cstring>
 #include <initializer_list>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #ifdef NNOPS_HAS_CUDA
@@ -251,6 +254,9 @@ struct CacheOpt {
     std::vector<int64_t> pos_ids;
     bool int8 = false;
     bool per_tensor = false;
+    /// The two dequantization scales are independent tensors, so the value
+    /// side keeps its own granularity.
+    bool v_per_tensor = false;
     /// The operator's dynamic integer route over that s8 cache.
     bool quantize_q = false;
     bool quantize_pv = false;
@@ -313,7 +319,7 @@ std::vector<HostTensor> build_cache(const std::vector<int64_t>& qdims, int64_t S
         std::vector<int8_t> qk, qv;
         std::vector<float> sk, sv;
         quantize_cache(ck, B, Hkv, Skv, D, o.per_tensor, qk, sk);
-        quantize_cache(cv, B, Hkv, Skv, D, o.per_tensor, qv, sv);
+        quantize_cache(cv, B, Hkv, Skv, D, o.v_per_tensor, qv, sv);
         HostTensor tk = make_host_zeroed(cdims, DataType::s8, false);
         HostTensor tv = make_host_zeroed(cdims, DataType::s8, false);
         std::memcpy(tk.bytes.data(), qk.data(), qk.size());
@@ -322,8 +328,10 @@ std::vector<HostTensor> build_cache(const std::vector<int64_t>& qdims, int64_t S
         in[2] = std::move(tv);
         const std::vector<int64_t> sd =
             o.per_tensor ? std::vector<int64_t>{1} : std::vector<int64_t>{B, Hkv, Skv};
+        const std::vector<int64_t> sdv =
+            o.v_per_tensor ? std::vector<int64_t>{1} : std::vector<int64_t>{B, Hkv, Skv};
         HostTensor s1 = make_host_zeroed(sd, DataType::f32, false);
-        HostTensor s2 = make_host_zeroed(sd, DataType::f32, false);
+        HostTensor s2 = make_host_zeroed(sdv, DataType::f32, false);
         std::memcpy(s1.bytes.data(), sk.data(), sk.size() * sizeof(float));
         std::memcpy(s2.bytes.data(), sv.data(), sv.size() * sizeof(float));
         in[5] = std::move(s1);
@@ -339,7 +347,9 @@ std::vector<HostTensor> build_cache(const std::vector<int64_t>& qdims, int64_t S
         in[4] = i64_tensor(o.pos_ids);
     }
     if (o.head_sink) {
-        in[7] = make_host_random(std::vector<int64_t>{H}, DataType::f32, false, seed + 7, -3.0f, 3.0f);
+        // The op validates the sink against the query's dtype, so it follows
+        // `o.dt` rather than staying f32.
+        in[7] = make_host_random(std::vector<int64_t>{H}, o.dt, false, seed + 7, -3.0f, 3.0f);
     }
     if (o.gate) {
         in[8] = make_host_random(qdims, o.dt, false, seed + 6, -4.0f, 4.0f);
@@ -411,7 +421,9 @@ void expect_mla(int64_t B, int64_t Sq, int64_t Sk, int64_t H, int64_t Hkv, int64
     const size_t past_slot = o.absorbed ? 3 : 4;
     const size_t seq_slot = o.absorbed ? 4 : 6;
     if (o.mask) {
-        in[mask_slot] = make_host_random(std::vector<int64_t>{Sq, Sk_all}, DataType::f32, false, 304, -2.0f, 2.0f);
+        // The CPU core wants the mask in the data dtype, so an f16 call masks
+        // in f16.
+        in[mask_slot] = make_host_random(std::vector<int64_t>{Sq, Sk_all}, o.dt, false, 304, -2.0f, 2.0f);
     }
     if (o.past > 0) {
         in[past_slot] = make_host_random(std::vector<int64_t>{B, o.past, Hkv * dk}, o.dt, false, 305);
@@ -426,6 +438,23 @@ void expect_mla(int64_t B, int64_t Sq, int64_t Sk, int64_t H, int64_t Hkv, int64
 
     auto make = [attrs](Backend be) { return MultiLatentAttention::create(attrs, be); };
     run_op_close(make, in, tol_abs, tol_rel, what);
+}
+
+/// expect_mla, plus whether the absorbed tile carried the call. A decline falls
+/// back to the general route and answers just as correctly, so comparing
+/// outputs cannot tell the two apart — the tile's own call count can.
+void expect_mla_route(int64_t B, int64_t Sq, int64_t Sk, int64_t H, int64_t Hkv, int64_t rank,
+                      int64_t rope, const MlaOpt& o, bool want_tile, float tol_abs,
+                      float tol_rel, const char* what)
+{
+    const int64_t before = nnops::backend::cuda::attention_mla_runs();
+    expect_mla(B, Sq, Sk, H, Hkv, rank, rope, o, tol_abs, tol_rel, what);
+    const int64_t ran = nnops::backend::cuda::attention_mla_runs() - before;
+    if (ran != (want_tile ? 1 : 0)) {
+        throw std::runtime_error(std::string(what) + ": absorbed tile runs " +
+                                 std::to_string(ran) + ", wanted " +
+                                 (want_tile ? "1" : "0"));
+    }
 }
 
 } // namespace
@@ -546,11 +575,24 @@ NNOPS_TEST(cuda_gqa_tensor_core_cache_matches_cpu) {
     win.sink = 3;
     win.dt = DataType::f16;
     expect_cache({1, 128, 4 * 128}, 128, 4, 2, win, kF16AccumTol, 5e-2f, "tc f16 window+sink");
+    // A window wider than a chunk but narrower than a warp's row span: a chunk
+    // can sit below every row's causal end yet still straddle the floors, and
+    // "this chunk needs no mask" has to be decided by the warp's *last* row.
+    CacheOpt wide;
+    wide.past = 17;
+    wide.window = 40;
+    wide.dt = DataType::f16;
+    expect_cache({1, 128, 4 * 128}, 512, 4, 2, wide, kF16AccumTol, 5e-2f, "tc f16 window 40");
     CacheOpt gated;
     gated.past = 16;
     gated.gate = true;
     gated.dt = DataType::f16;
     expect_cache({1, 64, 4 * 128}, 64, 4, 2, gated, kF16AccumTol, 5e-2f, "tc f16 cache gate");
+    CacheOpt hsh;
+    hsh.past = 40;
+    hsh.head_sink = true;
+    hsh.dt = DataType::f16;
+    expect_cache({1, 128, 4 * 128}, 128, 4, 2, hsh, kF16AccumTol, 5e-2f, "tc f16 head sink");
 }
 
 NNOPS_TEST(cuda_mla_tensor_core_matches_cpu) {
@@ -562,6 +604,45 @@ NNOPS_TEST(cuda_mla_tensor_core_matches_cpu) {
     MlaOpt past = f16;
     past.past = 40;
     expect_mla(1, 64, 64, 2, 1, 128, 64, past, kF16AccumTol, 5e-2f, "mla f16 tc past");
+}
+
+NNOPS_TEST(cuda_mla_absorbed_latent_matches_cpu) {
+    // The dedicated absorbed tile serves sixteen query heads under one KV head
+    // at the DeepSeek geometry: 576 = 512 latent + 64 rope a key row, and the
+    // value is the 512 latent channels the key panel already holds.
+    MlaOpt f16;
+    f16.dt = DataType::f16;
+    expect_mla_route(1, 64, 64, 16, 1, 512, 64, f16, true, kF16AccumTol, 5e-2f, "mla latent f16");
+    // A past segment spliced ahead of the step's rows, and per-batch lengths.
+    MlaOpt past = f16;
+    past.past = 37;
+    expect_mla_route(1, 32, 32, 16, 1, 512, 64, past, true, kF16AccumTol, 5e-2f,
+                     "mla latent past");
+    MlaOpt seq = f16;
+    seq.past = 20;
+    seq.seqlens = {28, 20};
+    expect_mla_route(2, 8, 8, 16, 1, 512, 64, seq, true, kF16AccumTol, 5e-2f, "mla latent seqlens");
+    // A decode row over a run the split cuts into spans (and the merge pass),
+    // and one behind a past segment at the same shape.
+    expect_mla_route(1, 1, 300, 16, 1, 512, 64, f16, true, kF16AccumTol, 5e-2f,
+                     "mla latent decode split");
+    MlaOpt dpast = f16;
+    dpast.past = 100;
+    expect_mla_route(1, 1, 50, 16, 1, 512, 64, dpast, true, kF16AccumTol, 5e-2f,
+                     "mla latent decode past");
+    MlaOpt nc = f16;
+    nc.causal = false;
+    expect_mla_route(1, 8, 40, 16, 1, 512, 64, nc, true, kF16AccumTol, 5e-2f,
+                     "mla latent non-causal");
+    // A masked call is the additive-bias fallback (the tile takes no per-score
+    // gather), and a narrow latent (192 x 128) stays on the m16n8k16 tile,
+    // which is 2x faster there — both must decline cleanly and answer right.
+    MlaOpt dm = f16;
+    dm.mask = true;
+    expect_mla_route(1, 20, 40, 16, 1, 512, 64, dm, false, kF16AccumTol, 5e-2f,
+                     "mla latent mask falls back");
+    expect_mla_route(1, 64, 64, 16, 1, 128, 64, f16, false, kF16AccumTol, 5e-2f,
+                     "mla narrow declines");
 }
 
 NNOPS_TEST(cuda_gqa_tensor_core_bf16_matches_cpu) {
@@ -656,6 +737,17 @@ NNOPS_TEST(cuda_gqa_cache_features_matches_cpu) {
     dpos.past = 9;
     dpos.pos_ids = {4};
     expect_cache({1, 1, 4 * 8}, 1, 4, 2, dpos, tol, rel, "decode pos_ids");
+    // A sink in the query's dtype, not f32.
+    CacheOpt dhsh;
+    dhsh.past = 9;
+    dhsh.head_sink = true;
+    dhsh.dt = DataType::f16;
+    expect_cache({1, 1, 8 * 8}, 1, 8, 2, dhsh, kF16AccumTol, 5e-2f, "decode f16 head sink");
+    // A value width of 192 over a group of 4: the head batch has to shrink to
+    // a *divisor* of the group when the shared partials no longer fit.
+    CacheOpt d192;
+    d192.past = 200;
+    expect_cache({1, 1, 32 * 192}, 1, 32, 8, d192, tol, rel, "decode dv 192 group 4");
 }
 
 NNOPS_TEST(cuda_gqa_int8_cache_matches_cpu) {
@@ -673,6 +765,22 @@ NNOPS_TEST(cuda_gqa_int8_cache_matches_cpu) {
     dec.past = 15;
     dec.int8 = true;
     expect_cache({1, 1, 8 * 8}, 1, 8, 2, dec, tol, rel, "int8 decode");
+    // The two scales are separate tensors with separate granularities.
+    CacheOpt mixed;
+    mixed.past = 7;
+    mixed.int8 = true;
+    mixed.v_per_tensor = true;
+    expect_cache({1, 6, 8 * 8}, 6, 8, 2, mixed, tol, rel, "int8 k token v tensor");
+    CacheOpt mixed_t;
+    mixed_t.past = 7;
+    mixed_t.int8 = true;
+    mixed_t.per_tensor = true;
+    expect_cache({1, 6, 8 * 8}, 6, 8, 2, mixed_t, tol, rel, "int8 k tensor v token");
+    CacheOpt dmixed;
+    dmixed.past = 15;
+    dmixed.int8 = true;
+    dmixed.v_per_tensor = true;
+    expect_cache({1, 1, 8 * 8}, 1, 8, 2, dmixed, tol, rel, "int8 decode k token v tensor");
 }
 
 /// The dynamic integer route: the CPU flash core as the oracle, both sides
@@ -713,6 +821,13 @@ NNOPS_TEST(cuda_gqa_quantize_matches_cpu) {
     both_f16.dt = DataType::f16;
     expect_cache(q, 512, 4, 2, both_f16, htol, hrel, "quantize_q+pv f16 per tensor");
 
+    CacheOpt qmixed;
+    qmixed.int8 = true;
+    qmixed.quantize_q = true;
+    qmixed.v_per_tensor = true;
+    qmixed.dt = DataType::f16;
+    expect_cache(q, 512, 4, 2, qmixed, htol, hrel, "quantize_q k token v tensor");
+
     // A run shorter than one vector tile's four keys per lane still has to
     // quantize and mask correctly.
     CacheOpt ragged;
@@ -720,6 +835,15 @@ NNOPS_TEST(cuda_gqa_quantize_matches_cpu) {
     ragged.quantize_q = true;
     ragged.quantize_pv = true;
     expect_cache({1, 200, 4 * 64}, 700, 4, 2, ragged, tol, rel, "quantize_q+pv d64 ragged");
+
+    // The same wide-window mask over the integer tile's chunk shortcut.
+    CacheOpt wide8;
+    wide8.past = 17;
+    wide8.window = 40;
+    wide8.int8 = true;
+    wide8.quantize_q = true;
+    wide8.dt = DataType::f16;
+    expect_cache({1, 128, 4 * 128}, 512, 4, 2, wide8, htol, hrel, "quantize_q f16 window 40");
 }
 
 NNOPS_TEST(cuda_gqa_varlen_matches_cpu) {
@@ -767,6 +891,14 @@ NNOPS_TEST(cuda_mla_matches_cpu) {
     dm.mask = true;
     expect_mla(1, 1, 6, 4, 1, 16, 8, dm, 5e-4f, 3e-3f, "mla decode mask");
     expect_mla(1, 1, 300, 4, 1, 512, 64, {}, 1e-3f, 5e-3f, "mla decode wide value");
+    // Dqk 192 by Dv 64 in half falls off the tensor tile's instantiation list
+    // onto the register-blocked one at its 16-key V slice -- eight values a
+    // thread, the width the two-vector staging has to fill.
+    MlaOpt deep;
+    deep.absorbed = false;
+    deep.vdim = 64;
+    deep.dt = DataType::f16;
+    expect_mla(1, 40, 40, 4, 2, 128, 64, deep, kF16AccumTol, 5e-2f, "mla deep f16");
 }
 
 #endif // NNOPS_HAS_CUDA

@@ -154,6 +154,20 @@ __device__ __forceinline__ void fetchw(const T* row, int d0, int dqk, float (&ds
                 dst[8 * i + 6] = d.x;
                 dst[8 * i + 7] = d.y;
             }
+        } else if constexpr (W == 8) {
+            const uint4 v = reinterpret_cast<const uint4*>(row + d0)[0];
+            const float2 a = unpack_pair<T>(v.x);
+            const float2 b = unpack_pair<T>(v.y);
+            const float2 c = unpack_pair<T>(v.z);
+            const float2 d = unpack_pair<T>(v.w);
+            dst[0] = a.x;
+            dst[1] = a.y;
+            dst[2] = b.x;
+            dst[3] = b.y;
+            dst[4] = c.x;
+            dst[5] = c.y;
+            dst[6] = d.x;
+            dst[7] = d.y;
         } else {
             const uint2 v = reinterpret_cast<const uint2*>(row + d0)[0];
             const float2 a = unpack_pair<T>(v.x);
@@ -626,7 +640,7 @@ __global__ void __launch_bounds__(kThreads) attention_blocked_kernel(AttnParams<
     if (tid < kBlockM) {
         if (p.sink != nullptr) {
             const float mo = rM[tid];
-            const float sv = p.sink[h] * 1.4426950408889634f;
+            const float sv = sink_at(p, h) * 1.4426950408889634f;
             const float mn = fmaxf(mo, sv);
             const float sc = (mo == kNegInf) ? 0.0f : exp2f(mo - mn);
             rL[tid] = rL[tid] * sc + exp2f(sv - mn);

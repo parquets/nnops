@@ -59,6 +59,11 @@ inline std::atomic<int> cuda_attn_tc{-1};
 /// keeps it on the tiled kernel, 1 takes the tile whenever it is eligible.
 inline std::atomic<int> cuda_attn_i8{-1};
 
+/// CUDA MultiLatentAttention's absorbed tile: -1 automatic (an eligible
+/// absorbed 16-bit call takes it), 0 keeps it on the general 16-bit tile, 1
+/// takes it whenever the shape is eligible.
+inline std::atomic<int> cuda_attn_mla{-1};
+
 /// CUDA narrow-m loop variant: 0 is the production pick (f16 keeps 32 B rows in
 /// flight, f32 16), 1 the 4-column / 16-row group, 2 the 2-column / 16-row one,
 /// 3 the 2-column / 32-row one. A bench compares them.

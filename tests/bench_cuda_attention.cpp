@@ -20,6 +20,7 @@
 #include "nnops/ops/group_query_attention.hpp"
 #include "nnops/ops/multi_latent_attention.hpp"
 #include "detail/bench_knobs.hpp"
+#include "backend/cuda/attention/attention_mla_host.hpp"
 #include "common/bench_harness.hpp"
 #include "common/cuda_bench_helper.hpp"
 #include "common/cuda_test_helper.hpp"
@@ -109,14 +110,21 @@ void run_mla(const char* tag, int64_t B, int64_t H, int64_t Hkv, int64_t rank, i
     attrs.causal = causal;
     auto op = MultiLatentAttention::create(attrs, Backend::CUDA);
 
+    // Which route the row actually took: the absorbed tile declines silently by
+    // shape, and a row that quietly moved to the general kernel reads as a
+    // number, not a mistake.
+    const int64_t before = nnops::backend::cuda::attention_mla_runs();
     const double ms = cuda_median_ms([&] { cuda_launch(*op, ov, dv); });
+    const bool tile = nnops::backend::cuda::attention_mla_runs() != before;
+
     char geom[180];
     std::snprintf(geom, sizeof(geom), "B=%lld Sq=%lld Sk=%lld H=%lld Hkv=%lld Dkv=%lld %s",
                   static_cast<long long>(B), static_cast<long long>(Sq),
                   static_cast<long long>(Sk), static_cast<long long>(H),
                   static_cast<long long>(Hkv), static_cast<long long>(dk),
                   dt == DataType::f32 ? "f32" : "f16");
-    print_cuda_row(tag, geom, ms, cuda_gflops(ms, flops));
+    const std::string name = tile ? std::string(tag) + " mla" : std::string(tag);
+    print_cuda_row(name.c_str(), geom, ms, cuda_gflops(ms, flops));
 }
 
 } // namespace
@@ -268,12 +276,71 @@ NNOPS_BENCH(cuda_attention_int8_cache) {
 }
 
 NNOPS_BENCH(cuda_attention_mla) {
-    const int64_t B = 1, H = 16, Hkv = 1, rank = 128, rope = 64, vdim = 128;
     print_cuda_header("MLA absorbed");
-    const double pre = 2.0 * B * H * 512 * 512 * (rank + rope);
-    run_mla("mla prefill", B, H, Hkv, rank, rope, vdim, 512, 512, true, DataType::f32, pre);
-    const double dec = 4.0 * B * H * 1024 * (rank + rope);
-    run_mla("mla decode", B, H, Hkv, rank, rope, vdim, 1, 1024, true, DataType::f32, dec);
+    {
+        const int64_t B = 1, H = 16, Hkv = 1, rank = 128, rope = 64, vdim = 128;
+        const double pre = 2.0 * B * H * 512 * 512 * (rank + rope);
+        const double dec = 4.0 * B * H * 1024 * (rank + rope);
+        run_mla("mla prefill", B, H, Hkv, rank, rope, vdim, 512, 512, true, DataType::f32, pre);
+        run_mla("mla decode", B, H, Hkv, rank, rope, vdim, 1, 1024, true, DataType::f32, dec);
+        run_mla("mla prefill f16", B, H, Hkv, rank, rope, vdim, 512, 512, true, DataType::f16, pre);
+        run_mla("mla decode f16", B, H, Hkv, rank, rope, vdim, 1, 1024, true, DataType::f16, dec);
+    }
+    // DeepSeek's own geometry: 512 latent + 64 rope a key row, and the value is
+    // the 512 latent channels — the shape the dedicated tile exists for. The
+    // f32 rows keep falling back to the general kernel, which is the comparison.
+    {
+        const int64_t B = 1, H = 16, Hkv = 1, rank = 512, rope = 64, vdim = 512;
+        const int64_t dk = rank + rope;
+        const double pre = 2.0 * B * H * 512 * 512 * (dk + vdim);
+        const double dec = 2.0 * B * H * 4096 * (dk + vdim);
+        run_mla("mla ds prefill", B, H, Hkv, rank, rope, vdim, 512, 512, true, DataType::f16, pre);
+        run_mla("mla ds prefill f32", B, H, Hkv, rank, rope, vdim, 512, 512, true, DataType::f32,
+                pre);
+        run_mla("mla ds decode", B, H, Hkv, rank, rope, vdim, 1, 4096, true, DataType::f16, dec);
+        run_mla("mla ds decode f32", B, H, Hkv, rank, rope, vdim, 1, 4096, true, DataType::f32,
+                dec);
+    }
+    // The head count a DeepSeek layer runs: 128 heads over one latent row, so
+    // the decode grid holds eight head groups before the run is split. The
+    // prefill pairs below double the head groups over the same run: the blocks
+    // of one query position read the same prefix, so the cost of the second
+    // group says whether the tile is issue-bound or still paying for the latent.
+    {
+        const int64_t B = 1, H = 128, Hkv = 1, rank = 512, rope = 64, vdim = 512;
+        const double dec = 2.0 * B * H * 4096 * (rank + rope + vdim);
+        run_mla("mla ds decode h128", B, H, Hkv, rank, rope, vdim, 1, 4096, true, DataType::f16,
+                dec);
+        for (const int64_t h : {32, 64}) {
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "mla ds prefill h%lld", static_cast<long long>(h));
+            run_mla(tag, B, h, Hkv, rank, rope, vdim, 512, 512, true, DataType::f16,
+                    2.0 * B * h * 512 * 512 * (rank + rope + vdim));
+        }
+    }
+}
+
+// The absorbed tile against the general route on the same rows: the former
+// reads the value out of the key panel it already staged, the latter stages V
+// again and caps at a 128-wide value (so the 512-wide rows only have the one
+// arm at all). mla=0 is the general route, mla=1 the absorbed tile. The narrow
+// 192 x 128 latent stays on the m16n8k16 tile by dispatch — the absorbed tile
+// measured 0.15 ms against its 0.081 on the 512-row prefill — so its rows above
+// are the tile's own shape only.
+NNOPS_BENCH(cuda_attention_mla_tile) {
+    print_cuda_header("absorbed MLA tile arms");
+    const int64_t B = 1, H = 16, Hkv = 1, rank = 512, rope = 64, vdim = 512;
+    const double pre = 2.0 * B * H * 512 * 512 * (rank + rope + vdim);
+    const double dec = 2.0 * B * H * 4096 * (rank + rope + vdim);
+    for (int arm = 0; arm < 2; ++arm) {
+        nnops::detail::cuda_attn_mla.store(arm);
+        char tag[80];
+        std::snprintf(tag, sizeof(tag), "mla ds prefill f16 mla=%d", arm);
+        run_mla(tag, B, H, Hkv, rank, rope, vdim, 512, 512, true, DataType::f16, pre);
+        std::snprintf(tag, sizeof(tag), "mla ds decode f16 mla=%d", arm);
+        run_mla(tag, B, H, Hkv, rank, rope, vdim, 1, 4096, true, DataType::f16, dec);
+    }
+    nnops::detail::cuda_attn_mla.store(-1);
 }
 
 // The prefill tile arms: the two register-blocked tiles against the older
@@ -324,6 +391,14 @@ NNOPS_BENCH(cuda_attention_decode_splits) {
         std::snprintf(tag, sizeof(tag), "mla decode split=%d", a);
         run_mla(tag, 1, 16, 1, 128, 64, 128, 1, 1024, true, DataType::f32,
                 4.0 * 16 * 1024 * 192);
+        // The absorbed tile's own decode shape, at both a small and the
+        // DeepSeek head count (one and eight head groups before the split).
+        std::snprintf(tag, sizeof(tag), "mla ds decode split=%d", a);
+        run_mla(tag, 1, 16, 1, 512, 64, 512, 1, 4096, true, DataType::f16,
+                2.0 * 16 * 4096 * 1088);
+        std::snprintf(tag, sizeof(tag), "mla ds decode h128 split=%d", a);
+        run_mla(tag, 1, 128, 1, 512, 64, 512, 1, 4096, true, DataType::f16,
+                2.0 * 128 * 4096 * 1088);
     }
     nnops::detail::cuda_attn_split.store(-1);
 }

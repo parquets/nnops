@@ -14,6 +14,9 @@
 ///                                16-bit fast path;
 ///   attention_i8.cuh             the m16n8k32 tile an s8 cache with
 ///                                cfg.quantize_q takes — the integer route;
+///   attention_mla.cuh            the absorbed-MLA tile — one latent row serves
+///                                sixteen query heads, and the value is read out
+///                                of the key tile itself (FlashMLA's pose);
 ///   attention_decode.cuh         flash decoding — the one-row (Sq == 1) kernel,
 ///                                its split-KV form and the merge pass;
 ///   attention_common.cuh         the shared description, layout strides, K/V
@@ -37,11 +40,14 @@
 #include "attention_kernel.cuh"
 #include "attention_f16.cuh"
 #include "attention_i8.cuh"
+#include "attention_mla.cuh"
+#include "attention_mla_host.hpp"
 #include "backend/common/attention_config.hpp"
 #include "backend/cuda/matmul/gemm_common.cuh" // the split-KV scratch pool
 #include "detail/bench_knobs.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <span>
@@ -446,6 +452,149 @@ Status launch_decode(const AttnParams<T, KV8>& p, cudaStream_t stream)
     return Status::ok;
 }
 
+// ============================================================
+// MultiLatentAttention's absorbed tile
+// ============================================================
+
+/// Calls the absorbed tile carried (see attention_mla_host.hpp). One counter a
+/// process, like the linear attention route's.
+std::atomic<int64_t> g_mla_runs{0};
+
+/// The absorbed tile's shared slab is larger than the 96 KB the other attention
+/// kernels are capped at — it stages the whole 576-wide latent row once and
+/// reads the value out of that panel — so it asks the device for its own limit
+/// rather than the shared cap above. Queried once per process.
+inline int mla_smem_budget()
+{
+    static int budget = [] {
+        int v = 48 * 1024;
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) !=
+                cudaSuccess) {
+            (void)cudaGetLastError();
+            v = 48 * 1024;
+        }
+        return v;
+    }();
+    return budget;
+}
+
+/// Whether the absorbed-MLA tile can carry this call: the latent value form, the
+/// score features that need no per-element gather, sixteen query heads under one
+/// KV head, and a (key, value) width the launcher instantiates.
+template <class T>
+inline bool mla_eligible(const AttnParams<T, false>& p)
+{
+    if constexpr (!std::is_same_v<T, __half>) {
+        return false;
+    } else {
+        const int mode = ::nnops::detail::cuda_attn_mla.load(std::memory_order_relaxed);
+        if (mode == 0) {
+            return false;
+        }
+        if (!p.v_is_k || p.has_bias || p.has_keep || p.softcap_on) {
+            return false;
+        }
+        if (p.group < mla::kRows || (p.group % mla::kRows) != 0) {
+            return false;
+        }
+        if (p.Dv % 64 != 0 || p.Dv > p.Dqk || p.Dqk % 32 != 0) {
+            return false;
+        }
+        // The DeepSeek latent only. A narrow absorbed call (192 x 128) belongs
+        // to the m16n8k16 tile, which beats this one 2x there (0.082 against
+        // 0.153 ms on the 512-row prefill) — the wide value is what this tile
+        // is for.
+        return p.Dqk == 576 && p.Dv == 512;
+    }
+}
+
+/// How many ways to cut a decode step's run. A block is one (head group, batch)
+/// at one CTA a multiprocessor, so the DeepSeek shape offers eight blocks on
+/// this part and the run is the only other axis to spread over.
+///
+/// The target is one full wave, and an *under*-filled one: every head group of
+/// a step reads the same latent run, so blocks resident together share it
+/// through L2, while one block over the wave line costs a whole second round of
+/// the slowest block. Measured on the 4096-token decode, eight head groups
+/// (DeepSeek's 128 heads): four splits, 32 blocks, 0.16 ms; five splits, 40
+/// blocks — two over 38 SMs — 0.22 ms; eight splits 0.19. One head group reads
+/// 0.084 ms at sixteen splits, 0.097 at thirty-two, so the run-axis split stops
+/// at sixteen.
+inline int mla_decode_splits(int64_t blocks, int64_t sk)
+{
+    const int forced = ::nnops::detail::cuda_attn_split.load(std::memory_order_relaxed);
+    int splits = 1;
+    if (forced >= 0) {
+        splits = forced;
+    } else if (blocks > 0 && blocks < sm_count()) {
+        splits = static_cast<int>(sm_count() / blocks);
+    }
+    splits = static_cast<int>(std::min<int64_t>(splits, std::max<int64_t>(1, sk / (4 * mla::kBlockN))));
+    return std::max(1, std::min(splits, 16));
+}
+
+/// Launch the absorbed-MLA tile (and the split merge when the run was cut).
+/// False means the shape has no instantiation or the device will not carry the
+/// shared-memory request; the caller falls back.
+template <class T>
+inline bool launch_mla(const AttnParams<T, false>& p, cudaStream_t stream)
+{
+    // One instantiation, the DeepSeek latent `mla_eligible` gates on; the slab
+    // is sized from the same two constants so a widened gate cannot launch a
+    // kernel whose panel stride disagrees with its staging.
+    constexpr int kDqk = 576, kDv = 512;
+    const size_t slab = static_cast<size_t>(mla::smem_bytes(kDqk));
+    if (slab > static_cast<size_t>(mla_smem_budget())) {
+        return false;
+    }
+    const int64_t blocks = p.B * (p.H / mla::kRows);
+    const int splits = p.Sq == 1 ? mla_decode_splits(blocks, p.Sk) : 1;
+    if (p.B * splits > 65535 || p.Sq > 65535) {
+        return false;
+    }
+
+    mla::MlaSplits s;
+    detail::GemmWorkspace ws;
+    if (splits > 1) {
+        const int64_t rows = p.B * p.H;
+        const int64_t bytes = rows * splits * 2 * static_cast<int64_t>(sizeof(float)) +
+                              rows * splits * p.Dv * static_cast<int64_t>(sizeof(float));
+        ws = detail::gemm_workspace_alloc(static_cast<size_t>(bytes), stream);
+        if (ws.ptr == nullptr) {
+            return false;
+        }
+        char* base = static_cast<char*>(ws.ptr);
+        s.splits = splits;
+        s.m = reinterpret_cast<float*>(base);
+        s.l = s.m + rows * splits;
+        s.o = reinterpret_cast<float*>(base + rows * splits * 2 * static_cast<int64_t>(sizeof(float)));
+    }
+
+    const dim3 grid(static_cast<unsigned>(p.H / mla::kRows), static_cast<unsigned>(p.Sq),
+                    static_cast<unsigned>(p.B * splits));
+    auto* const kern = &mla::attention_mla_kernel<T, kDqk, kDv>;
+    bool ok = false;
+    if (set_dyn_smem_packed(kern, slab)) {
+        kern<<<grid, mla::kThreads, slab, stream>>>(p, s);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok && splits > 1) {
+        const dim3 mgrid(static_cast<unsigned>(p.H / mla::kRows), static_cast<unsigned>(p.B),
+                         static_cast<unsigned>(p.Sq));
+        mla::attention_mla_merge_kernel<T><<<mgrid, mla::kMergeThreads, 0, stream>>>(p, s);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (splits > 1) {
+        detail::gemm_workspace_free(ws, stream);
+    }
+    if (ok) {
+        g_mla_runs.fetch_add(1, std::memory_order_relaxed);
+    }
+    return ok;
+}
+
 /// The dtype/route gate plus the parameter fill. Returns unsupported (rather
 /// than a wrong answer) for a value width above the register bound, a shared
 /// tile that cannot fit, or an integer route this kernel does not carry.
@@ -589,7 +738,9 @@ Status launch_typed(const AttentionConfig& cfg, TensorView& out,
     p.position_offset = cfg.position_offset;
 
     if (slot_present(cfg, cfg.sink_slot, in)) {
-        p.sink = in[static_cast<size_t>(cfg.sink_slot)].ptr<float>();
+        // The sink rides the query's dtype; the kernels read it through
+        // `sink_at`.
+        p.sink = in[static_cast<size_t>(cfg.sink_slot)].ptr<void>();
     }
     if (slot_present(cfg, cfg.k_scale_slot, in)) {
         const TensorView& s = in[static_cast<size_t>(cfg.k_scale_slot)];
@@ -597,7 +748,9 @@ Status launch_typed(const AttentionConfig& cfg, TensorView& out,
         p.scale_per_token = s.numel() > 1;
     }
     if (slot_present(cfg, cfg.v_scale_slot, in)) {
-        p.vscale = in[static_cast<size_t>(cfg.v_scale_slot)].ptr<float>();
+        const TensorView& s = in[static_cast<size_t>(cfg.v_scale_slot)];
+        p.vscale = s.ptr<float>();
+        p.vscale_per_token = s.numel() > 1;
     }
 
     // ---- pointers ----
@@ -638,6 +791,17 @@ Status launch_typed(const AttentionConfig& cfg, TensorView& out,
     // past pair follows the K/V order.
     if (has_past && (P->rank() != K.rank() || (!v_is_k && PV->rank() != V.rank()))) {
         return Status::invalid_argument;
+    }
+
+    // The absorbed MLA form has its own tile before the general routes: the
+    // value is the latent row's prefix, so one staging feeds both products, and
+    // the query axis is the head group (see attention_mla.cuh).
+    // The constexpr keeps the f32 and bf16 dispatches from instantiating the
+    // tile at all: `mla_eligible` can only answer true for half.
+    if constexpr (!KV8 && std::is_same_v<T, __half>) {
+        if (mla_eligible(p) && launch_mla<T>(p, stream)) {
+            return Status::ok;
+        }
     }
 
     // A single query row is the decode shape: all 256 threads work on it, and
@@ -871,6 +1035,8 @@ Status attention_varlen(const AttentionConfig& cfg, TensorView& out,
 // ============================================================
 
 namespace nnops::backend::cuda {
+
+int64_t attention_mla_runs() { return attn::g_mla_runs.load(std::memory_order_relaxed); }
 
 Status attention_cuda(const AttentionConfig& cfg, std::span<TensorView> outputs,
                       std::span<const TensorView> inputs, const ComputeContext& ctx, void*)

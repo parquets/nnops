@@ -86,7 +86,7 @@ template <class T> struct DecodeMergeParams {
     int64_t B = 0, H = 0, Dv = 0;
     int64_t o_b = 0, o_h = 0;
     int64_t g_b = 0, g_h = 0;
-    const float* sink = nullptr;
+    const void* sink = nullptr;
     const T* gate = nullptr;
     T* o = nullptr;
     int gate_act = 0;
@@ -117,15 +117,16 @@ inline int decode_head_batch(int64_t group, int64_t dv)
     const int forced = ::nnops::detail::cuda_attn_headbatch.load(std::memory_order_relaxed);
     int hb = static_cast<int>(std::min<int64_t>(group, kMaxHeadBatch));
     if (forced > 0) {
-        hb = std::min(forced, static_cast<int>(group));
+        hb = std::min(forced, static_cast<int>(std::min<int64_t>(group, kMaxHeadBatch)));
     }
     hb = std::max(hb, 1);
-    while (hb > 1 && (group % hb) != 0) {
-        --hb;
-    }
     const int64_t budget = 24 * 1024 / static_cast<int64_t>(sizeof(float)); // 24 KB
+    // Both conditions on every step: a width that does not divide the group
+    // would put two K/V heads in one block, and the budget step must not walk
+    // off the divisors.
     while (hb > 1 &&
-           (static_cast<int64_t>(kWarps) * hb * dv + 2 * kWarps * hb) > budget) {
+           ((group % hb) != 0 ||
+            (static_cast<int64_t>(kWarps) * hb * dv + 2 * kWarps * hb) > budget)) {
         --hb;
     }
     return hb;
@@ -474,7 +475,7 @@ __global__ void __launch_bounds__(kThreads) attention_decode_kernel(AttnParams<T
                 continue;
             }
             if constexpr (KV8) {
-                const float vs = kv_scale_at(p.vscale, p.scale_per_token, b, hkv, jj, p.Hkv, p.Sk);
+                const float vs = kv_scale_at(p.vscale, p.vscale_per_token, b, hkv, jj, p.Hkv, p.Sk);
 #pragma unroll
                 for (int hh = 0; hh < kMaxHeadBatch; ++hh) {
                     pt[hh] *= vs;
@@ -528,7 +529,7 @@ __global__ void __launch_bounds__(kThreads) attention_decode_kernel(AttnParams<T
             mg = fmaxf(mg, wm[hh * kWarps + u]);
         }
         if (single && p.sink != nullptr) {
-            mg = fmaxf(mg, p.sink[h0 + hh]);
+            mg = fmaxf(mg, s_load(static_cast<const T*>(p.sink) + h0 + hh));
         }
         float w[kWarps];
         float lsum = 0.0f;
@@ -538,7 +539,7 @@ __global__ void __launch_bounds__(kThreads) attention_decode_kernel(AttnParams<T
             lsum += w[u] * wm[hb * kWarps + hh * kWarps + u];
         }
         if (single && p.sink != nullptr && mg != kNegInf) {
-            lsum += __expf(p.sink[h0 + hh] - mg);
+            lsum += __expf(s_load(static_cast<const T*>(p.sink) + h0 + hh) - mg);
         }
 
         const int64_t h = h0 + hh;
@@ -617,7 +618,7 @@ __global__ void __launch_bounds__(kThreads) attention_decode_merge_kernel(
         mg = fmaxf(mg, w[i]);
     }
     if (p.sink != nullptr) {
-        mg = fmaxf(mg, p.sink[h]);
+        mg = fmaxf(mg, s_load(static_cast<const T*>(p.sink) + h));
     }
     __syncthreads(); // every thread has read the raw maxima
 
@@ -631,7 +632,7 @@ __global__ void __launch_bounds__(kThreads) attention_decode_merge_kernel(
         l += w[i] * s.l[base + i];
     }
     if (p.sink != nullptr && mg != kNegInf) {
-        l += __expf(p.sink[h] - mg);
+        l += __expf(s_load(static_cast<const T*>(p.sink) + h) - mg);
     }
     const float inv = l > 0.0f ? (1.0f / l) : 0.0f;
 

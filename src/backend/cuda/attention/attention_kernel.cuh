@@ -187,7 +187,11 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttnParams<T, KV8> 
                 const int64_t j = j0 + c;
                 float s = acc * p.scale;
                 if constexpr (KV8) {
-                    s *= kv_scale_at(p.kscale, p.scale_per_token, b, hkv, j, p.Hkv, p.Sk);
+                    // A tile's tail keys can sit past the run (they are masked
+                    // below); the per-token scale array ends at Sk.
+                    s *= j < p.Sk ? kv_scale_at(p.kscale, p.scale_per_token, b, hkv, j, p.Hkv,
+                                                p.Sk)
+                                  : 1.0f;
                 }
                 if (p.softcap_on) {
                     s = p.softcap * tanhf(s / p.softcap);
@@ -264,7 +268,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttnParams<T, KV8> 
                         continue;
                     }
                     if constexpr (KV8) {
-                        pv *= kv_scale_at(p.vscale, p.scale_per_token, b, hkv, j, p.Hkv, p.Sk);
+                        pv *= kv_scale_at(p.vscale, p.vscale_per_token, b, hkv, j, p.Hkv, p.Sk);
                     }
                     const float* vrow = Vs + static_cast<int64_t>(c) * p.Dv;
                     const int col0 = g * cw;
@@ -286,7 +290,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttnParams<T, KV8> 
         if (rr < rows) {
             if (p.sink != nullptr) {
                 const float m_old = rowM[rr];
-                const float sinkv = p.sink[h];
+                const float sinkv = sink_at(p, h);
                 const float m_new = fmaxf(m_old, sinkv);
                 const float sc = (m_old == kNegInf) ? 0.0f : __expf(m_old - m_new);
                 rowL[rr] = rowL[rr] * sc + __expf(sinkv - m_new);

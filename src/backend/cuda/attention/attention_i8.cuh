@@ -273,7 +273,7 @@ __device__ __forceinline__ void stage_vfact(const P& p, int64_t vsc_off, int64_t
         // The head offset only addresses a per-token array; a per-tensor scale
         // is one float and every head reads it as-is.
         const int64_t j = j0 + tid;
-        v = (p.scale_per_token && j < p.Sk) ? p.vscale[vsc_off + j] : p.vscale[0];
+        v = (p.vscale_per_token && j < p.Sk) ? p.vscale[vsc_off + j] : p.vscale[0];
     }
     float mx = v;
 #pragma unroll
@@ -314,7 +314,7 @@ __global__ void attention_v_prep_kernel(P p, T* out)
     const int64_t b = bh / p.Hkv;
     const int64_t hkv = bh - b * p.Hkv;
     const int8_t* const src = v_row(p, b, hkv, j);
-    const float vs = kv_scale_at(p.vscale, p.scale_per_token, b, hkv, j, p.Hkv, p.Sk);
+    const float vs = kv_scale_at(p.vscale, p.vscale_per_token, b, hkv, j, p.Hkv, p.Sk);
     T* const dst = out + row * p.Dv;
     for (int64_t d = threadIdx.x; d < p.Dv; d += blockDim.x) {
         dst[d] = float_to_elem<T>(src != nullptr ? static_cast<float>(src[d]) * vs : 0.0f);
@@ -545,7 +545,7 @@ __global__ void __launch_bounds__(kThreads, blocks_per_sm(DQK, DV, kPv8))
 
     const bool kcol = p.kscale != nullptr && p.scale_per_token;
     const float kall = (p.kscale != nullptr && !p.scale_per_token) ? p.kscale[0] : 1.0f;
-    const bool vcol = p.vscale != nullptr && p.scale_per_token;
+    const bool vcol = p.vscale != nullptr && p.vscale_per_token;
     // The per-(batch, kv head) base of both scale arrays, resolved once.
     const float* const ksc_base = p.kscale != nullptr ? p.kscale + (b * p.Hkv + hkv) * p.Sk : nullptr;
     const int64_t vsc_off = (b * p.Hkv + hkv) * p.Sk;
@@ -612,9 +612,14 @@ __global__ void __launch_bounds__(kThreads, blocks_per_sm(DQK, DV, kPv8))
         p.causal ? std::min<int64_t>(run, q0 + i0 + warp * kRowsPerWarp + kRowsPerWarp) : run;
     const int64_t jfull_w =
         p.causal ? std::min<int64_t>(run, q0 + i0 + warp * kRowsPerWarp + 1) : run;
+    /// The chunk shortcut's two bounds are the binding row's: `jfull_w` the
+    /// first key past the warp's *first* row (`hi` is the smallest of the
+    /// sixteen), `lofull_w` the first key its *last* row can see (`lo` is the
+    /// largest) -- the first row's floor would let a chunk straddling the
+    /// floors through unmasked, which is any window of 32 keys or more.
     const int64_t lofull_w =
         (p.window > 0 && p.causal)
-            ? std::max<int64_t>(0, q0 + i0 + warp * kRowsPerWarp - p.window)
+            ? std::max<int64_t>(0, q0 + i0 + warp * kRowsPerWarp + kRowsPerWarp - p.window)
             : 0;
 
     const float l2e = 1.4426950408889634f;
@@ -862,7 +867,7 @@ __global__ void __launch_bounds__(kThreads, blocks_per_sm(DQK, DV, kPv8))
     // ---- the head sink, normalization and the gate ----
     float scl0 = 1.0f, scl1 = 1.0f;
     if (p.sink != nullptr) {
-        const float sv = p.sink[h] * l2e;
+        const float sv = sink_at(p, h) * l2e;
         const float a0 = fmaxf(m0, sv);
         const float a1 = fmaxf(m1, sv);
         scl0 = (m0 == kNegInf) ? 0.0f : ex2(m0 - a0);

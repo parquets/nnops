@@ -87,6 +87,7 @@ inline bool slot_present(const AttentionConfig& cfg, int slot, std::span<const T
 template <class T, bool KV8>
 struct AttnParams {
     using KVT = std::conditional_t<KV8, int8_t, T>;
+    using QT = T; ///< the query's type, which the head sink shares
     static constexpr bool kv8 = KV8;
 
     // ---- geometry ----
@@ -117,10 +118,15 @@ struct AttnParams {
     bool run_plus_one = false;
     const int64_t* pos_ids = nullptr;
     int64_t position_offset = -1;
-    const float* sink = nullptr;
+    /// One logit a query head, in the query's dtype (the operator validates
+    /// it against Q) -- `sink_at`, not a float read.
+    const void* sink = nullptr;
     const float* kscale = nullptr;
     const float* vscale = nullptr;
+    /// Each scale tensor has its own granularity (the op's validator takes a
+    /// one-float or a per-(batch, head, row) array on either slot).
     bool scale_per_token = false;
+    bool vscale_per_token = false;
 
     // ---- pointers ----
     const T* q = nullptr;
@@ -162,6 +168,12 @@ struct AttnParams {
 // ============================================================
 // Device helpers
 // ============================================================
+
+/// The head sink's logit of head `h`, in the query's dtype.
+template <class P> __device__ __forceinline__ float sink_at(const P& p, int64_t h)
+{
+    return s_load(static_cast<const typename P::QT*>(p.sink) + h);
+}
 
 template <class P> __device__ __forceinline__ float kv_elem(const typename P::KVT* p)
 {

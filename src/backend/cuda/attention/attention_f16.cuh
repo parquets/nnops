@@ -262,13 +262,16 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, fa
         p.causal ? std::min<int64_t>(run, q0 + i0 + warp * kRowsPerWarp + kRowsPerWarp) : run;
     // The window every row of this warp shares: a chunk whose keys all fall
     // inside it needs no per-score mask at all, which is every chunk but the
-    // diagonal one. `jfull_w` is the first key past the warp's *first* row (its
-    // `hi` is the smallest of the sixteen), `lofull_w` the last key before it.
+    // diagonal one. Both bounds are the binding row's: `jfull_w` is the first
+    // key past the warp's *first* row (`hi` is the smallest of the sixteen) and
+    // `lofull_w` the first key its *last* row can see (`lo` is the largest of
+    // the sixteen) -- the first row's floor would let a chunk straddling the
+    // floors through unmasked, which is any window of 32 keys or more.
     const int64_t jfull_w =
         p.causal ? std::min<int64_t>(run, q0 + i0 + warp * kRowsPerWarp + 1) : run;
     const int64_t lofull_w =
         (p.window > 0 && p.causal)
-            ? std::max<int64_t>(0, q0 + i0 + warp * kRowsPerWarp - p.window + 1)
+            ? std::max<int64_t>(0, q0 + i0 + warp * kRowsPerWarp + kRowsPerWarp - p.window)
             : 0;
 
     int stage = 0;
@@ -446,7 +449,7 @@ __global__ void __launch_bounds__(kThreads, 3) attention_kernel(AttnParams<T, fa
     // ---- the head sink, normalization and the gate ----
     float scl0 = 1.0f, scl1 = 1.0f, norm0 = 0.0f, norm1 = 0.0f;
     if (p.sink != nullptr) {
-        const float sv = p.sink[h] * 1.4426950408889634f;
+        const float sv = sink_at(p, h) * 1.4426950408889634f;
         const float a0 = fmaxf(m0, sv);
         const float a1 = fmaxf(m1, sv);
         scl0 = (m0 == kNegInf) ? 0.0f : ex2(m0 - a0);
