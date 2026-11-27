@@ -337,7 +337,11 @@ __device__ __forceinline__ void la_commit(float* sb, float* ringK, float* ringQ,
                 if constexpr (CV == 0) {
                     kv = k_in[sl];
                 } else if constexpr (CK4) {
-                    kv = la_fold4(ringK, p.dkpad, k_in[sl], t, i, wk);
+                    // The register taps are the thread's own channel's; a slot
+                    // past the first is another channel's and takes its own.
+                    kv = i == tid ? la_fold4(ringK, p.dkpad, k_in[sl], t, i, wk)
+                                  : la_fold_any<T>(ringK, p.dkpad, k_in[sl], t, i, p.ck,
+                                                   cwk + i * p.cws0, p.cws2, kbase, p.ks2);
                 } else {
                     kv = la_fold_any<T>(ringK, p.dkpad, k_in[sl], t, i, p.ck, cwk + i * p.cws0,
                                         p.cws2, kbase, p.ks2);
@@ -364,7 +368,10 @@ __device__ __forceinline__ void la_commit(float* sb, float* ringK, float* ringQ,
                 if constexpr (CV == 0) {
                     qv = q_in[sl][h];
                 } else if constexpr (CK4) {
-                    qv = la_fold4(ringH, p.dkpad, q_in[sl][h], t, i, wq[h]);
+                    qv = i == tid ? la_fold4(ringH, p.dkpad, q_in[sl][h], t, i, wq[h])
+                                  : la_fold_any<T>(ringH, p.dkpad, q_in[sl][h], t, i, p.ck,
+                                                   cwq + (h * p.dk + i) * p.cws0, p.cws2,
+                                                   qbase + h * p.qs1, p.qs2);
                 } else {
                     qv = la_fold_any<T>(ringH, p.dkpad, q_in[sl][h], t, i, p.ck,
                                         cwq + (h * p.dk + i) * p.cws0, p.cws2,
@@ -389,7 +396,9 @@ __device__ __forceinline__ void la_commit(float* sb, float* ringK, float* ringQ,
                 if constexpr (CV == 0) {
                     vv = v_in[sl];
                 } else if constexpr (CK4) {
-                    vv = la_fold4(ringV, p.cj, v_in[sl], t, c, wv);
+                    vv = c == tid ? la_fold4(ringV, p.cj, v_in[sl], t, c, wv)
+                                  : la_fold_any<T>(ringV, p.cj, v_in[sl], t, c, p.ck,
+                                                   cwv + jc * p.cws0, p.cws2, vbase, p.vs2);
                 } else {
                     vv = la_fold_any<T>(ringV, p.cj, v_in[sl], t, c, p.ck, cwv + jc * p.cws0,
                                         p.cws2, vbase, p.vs2);
@@ -402,7 +411,9 @@ __device__ __forceinline__ void la_commit(float* sb, float* ringK, float* ringQ,
 
 /// Load this thread's conv taps once: they are per channel and the channel is
 /// the thread's for the whole sequence, so they belong in registers rather than
-/// in a per-token load inside the fold's dependent chain.
+/// in a per-token load inside the fold's dependent chain. Only the thread's own
+/// slot is cached: a wider block walks channels past `tid`, and those take
+/// their own taps from global in the fold (the price of Dk > 128).
 template <typename T, int GQ>
 __device__ __forceinline__ void la_weights(const LaParams& p, int tid, const T* cwk,
                                            const T* cwq, const T* cwv, float (&wk)[kLaRing],
@@ -570,12 +581,20 @@ linear_attention_kernel(LaParams p)
         // skip bound checks. Without a conv there is no fold and no ring.
         if constexpr (CONV) {
             for (int sl = 0; sl < kLaRing; ++sl) {
-                if (tid < p.dkpad) {
-                    ringK[sl * p.dkpad + tid] = 0.0f;
-                    ringQ[sl * p.dkpad + tid] = 0.0f;
+#pragma unroll
+                for (int s2 = 0; s2 < kLaSlots; ++s2) {
+                    const int i = tid + s2 * kLaThreads;
+                    if (i < p.dkpad) {
+                        ringK[sl * p.dkpad + i] = 0.0f;
+                        ringQ[sl * p.dkpad + i] = 0.0f;
+                    }
                 }
-                if (tid < p.cj) {
-                    ringV[sl * p.cj + tid] = 0.0f;
+#pragma unroll
+                for (int s2 = 0; s2 < kLaVSlots; ++s2) {
+                    const int c = tid + s2 * kLaThreads;
+                    if (c < p.cj) {
+                        ringV[sl * p.cj + c] = 0.0f;
+                    }
                 }
             }
         }

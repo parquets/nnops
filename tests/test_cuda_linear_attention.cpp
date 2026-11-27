@@ -398,6 +398,20 @@ NNOPS_TEST(linear_attention_cuda_dk128)
     expect_case(c, "dk 128");
 }
 
+NNOPS_TEST(linear_attention_cuda_dk256_conv)
+{
+    // Dk past a thread's own 16-row group: the block walks two slots of raw
+    // rows, and the four-tap fold's register taps belong to one channel each.
+    Case c;
+    c.H = 1;
+    c.Hk = 1;
+    c.S = 8;
+    c.D = 256;
+    c.Dv = 256;
+    c.CK = 4;
+    expect_case(c, "dk 256 conv");
+}
+
 NNOPS_TEST(linear_attention_cuda_dk_odd)
 {
     Case c;
@@ -422,6 +436,21 @@ NNOPS_TEST(linear_attention_cuda_narrow_key)
     c.D = 8;
     c.Dv = 256;
     expect_case(c, "narrow key");
+}
+
+NNOPS_TEST(linear_attention_cuda_narrow_key_conv)
+{
+    // The other axis of the same split: Dk under 16 puts one thread in every
+    // row group, so the value slab is two slots wide and the fold walks the
+    // second one -- and the ring's zero rows are wider than the thread count.
+    Case c;
+    c.H = 1;
+    c.Hk = 1;
+    c.S = 6;
+    c.D = 8;
+    c.Dv = 256;
+    c.CK = 4;
+    expect_case(c, "narrow key conv");
 }
 
 NNOPS_TEST(linear_attention_cuda_padded)
