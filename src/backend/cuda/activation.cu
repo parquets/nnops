@@ -11,9 +11,17 @@
 /// 4. The row base has to sit on the 16 B bound for that, so a row that does not
 /// — and the tail of one that does — walks the scalar loop.
 ///
-/// Supports f32, f16 and bf16. Workspace: not used.
+/// f32, f16 and bf16 run the element functions above. The quantized route takes
+/// an s8/u8 input and output and fuses the two conversions around the same
+/// device functions: dequantize each element with its row's parameters, apply
+/// the activation in f32, requantize with the output's. It walks the tensor as
+/// dense rows of the last dim, the decomposition the CPU's fused transform
+/// uses, and refuses add_to (there is no float destination to accumulate into).
+///
+/// Workspace: not used.
 
 #include "cuda_common.cuh"
+#include "quant_elementwise.cuh"
 #include "nnops/ops/activation.hpp"
 #include "nnops/detail/assert.hpp"
 
@@ -279,6 +287,104 @@ void activation_cuda_impl(const ActivationAttributes& attrs, TensorView& output,
 }
 
 // ============================================================
+// Quantized route — dequantize, activate, requantize in one pass
+// ============================================================
+
+/// One 128-bit lane (16 elements) per thread step, with the row's parameters
+/// decoded once per row. The grid covers the rows on y and column lanes on x;
+/// a row longer than the grid's reach strides on.
+template <class InT, class OutT>
+__global__ void activation_quant_kernel(const InT* __restrict__ input, OutT* __restrict__ output,
+                                        int64_t rows, int64_t cols, qelem::ParamRef qin,
+                                        qelem::ParamRef qout, ActivationType type, float alpha,
+                                        float beta)
+{
+    constexpr int VEC = 16;
+    const ActivationFn fn = get_activation_fn(type);
+
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const qelem::RowParam pin = qelem::row_param(qin, row);
+        const qelem::RowParam pout = qelem::row_param(qout, row);
+        const InT* in_row = input + row * cols;
+        OutT* out_row = output + row * cols;
+
+        const int64_t vec_end = aligned16(in_row, out_row) ? (cols / VEC) * VEC : 0;
+        const int64_t vstep = int64_t(gridDim.x) * blockDim.x * VEC;
+        for (int64_t i = int64_t(blockIdx.x) * blockDim.x * VEC + threadIdx.x * VEC; i < vec_end;
+             i += vstep) {
+            const qelem::pack16<InT> v = *reinterpret_cast<const qelem::pack16<InT>*>(&in_row[i]);
+            qelem::pack16<OutT> r;
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                r.data[k] = qelem::requant<OutT>(
+                    fn(qelem::dequant(v.data[k], pin), alpha, beta), pout);
+            }
+            *reinterpret_cast<qelem::pack16<OutT>*>(&out_row[i]) = r;
+        }
+
+        const int64_t sstep = int64_t(gridDim.x) * blockDim.x;
+        for (int64_t i = vec_end + int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < cols;
+             i += sstep) {
+            const float x = qelem::dequant(in_row[i], pin);
+            out_row[i] = qelem::requant<OutT>(fn(x, alpha, beta), pout);
+        }
+    }
+}
+
+template <class InT, class OutT>
+Status activation_quant_cuda(const ActivationAttributes& attrs, TensorView& output,
+                             const TensorView& input, cudaStream_t stream)
+{
+    if (attrs.add_to) {
+        return Status::unsupported;
+    }
+    const int64_t total = input.numel();
+    if (total == 0) {
+        return Status::ok;
+    }
+    const int64_t cols = input.shape(input.rank() - 1);
+    if (cols <= 0) {
+        return Status::invalid_argument;
+    }
+    const int64_t rows = total / cols;
+
+    qelem::Stage in_scale_s, in_zp_s, out_scale_s, out_zp_s;
+    qelem::ParamRef qin, qout;
+    Status st = qelem::stage_qparams(input.quant_params(), rows, stream, in_scale_s, in_zp_s, qin);
+    if (is_ok(st)) {
+        st = qelem::stage_qparams(output.quant_params(), rows, stream, out_scale_s, out_zp_s, qout);
+    }
+    if (is_ok(st)) {
+        constexpr int VEC = 16;
+        const int block_size = kCudaBlockSize;
+        const int64_t col_tiles = ceil_div(cols, int64_t(block_size) * VEC);
+        const dim3 grid(static_cast<unsigned>(std::min<int64_t>(col_tiles, 65535)),
+                        static_cast<unsigned>(std::min<int64_t>(rows, 65535)));
+        activation_quant_kernel<InT, OutT><<<grid, block_size, 0, stream>>>(
+            input.ptr<InT>(), output.ptr<OutT>(), rows, cols, qin, qout, attrs.type, attrs.alpha,
+            attrs.beta);
+        st = cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+    }
+    in_scale_s.release(stream);
+    in_zp_s.release(stream);
+    out_scale_s.release(stream);
+    out_zp_s.release(stream);
+    return st;
+}
+
+/// The four storage pairs the fused route carries. Both sides are int8-sized,
+/// so one kernel serves each pair with the same lane layout.
+template <class InT>
+Status activation_quant_pair(const ActivationAttributes& attrs, TensorView& output,
+                             std::span<const TensorView> inputs, cudaStream_t stream)
+{
+    if (output.data_type() == DataType::s8) {
+        return activation_quant_cuda<InT, int8_t>(attrs, output, inputs[0], stream);
+    }
+    return activation_quant_cuda<InT, uint8_t>(attrs, output, inputs[0], stream);
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 
@@ -291,7 +397,21 @@ Status activation_cuda(const ActivationAttributes& attrs, TensorView& output,
     if (attrs.type == ActivationType::PRelu) {
         return Status::unsupported;
     }
-    const auto dtype = inputs[0].data_type();
+    const DataType dtype = inputs[0].data_type();
+    const DataType out_dtype = output.data_type();
+    const bool in_int = dtype == DataType::s8 || dtype == DataType::u8;
+    const bool out_int = out_dtype == DataType::s8 || out_dtype == DataType::u8;
+    if (in_int || out_int) {
+        // No float↔int mixing: the fused route reads and writes integers.
+        if (!in_int || !out_int) {
+            return Status::invalid_argument;
+        }
+        const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
+        if (dtype == DataType::s8) {
+            return activation_quant_pair<int8_t>(attrs, output, inputs, stream);
+        }
+        return activation_quant_pair<uint8_t>(attrs, output, inputs, stream);
+    }
     switch (dtype) {
     case DataType::f32:
         activation_cuda_impl<float>(attrs, output, inputs, ctx);

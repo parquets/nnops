@@ -23,6 +23,7 @@
 
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/data_type.hpp"
+#include "nnops/core/quant_params.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/detail/q4.hpp"
 
@@ -198,6 +199,12 @@ inline std::vector<float> to_floats(const void* data, DataType dt, size_t count)
             std::memcpy(&f, &bits, 4);
             out[i] = f;
         }
+    } else if (dt == DataType::s8) {
+        const int8_t* src = static_cast<const int8_t*>(data);
+        for (size_t i = 0; i < count; ++i) { out[i] = static_cast<float>(src[i]); }
+    } else if (dt == DataType::u8) {
+        const uint8_t* src = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < count; ++i) { out[i] = static_cast<float>(src[i]); }
     } else {
         const float* src = static_cast<const float*>(data);
         for (size_t i = 0; i < count; ++i) { out[i] = src[i]; }
@@ -306,6 +313,39 @@ inline HostTensor make_host_zeroed(std::span<const int64_t> shape, DataType dt,
     t.view = padded ? TensorView(shape, dt, t.bytes.data(), pitch, layout)
                     : TensorView(shape, dt, t.bytes.data(), layout);
     return t;
+}
+
+/// A dense host tensor of an integer dtype (make_host_random fills floats).
+inline HostTensor make_host_int(std::span<const int64_t> shape, DataType dt, uint64_t seed,
+                                int64_t lo, int64_t hi)
+{
+    HostTensor t;
+    const TensorView probe(shape, dt, nullptr);
+    t.bytes.assign(probe.storage_bytes(), std::byte{0});
+    XorShift128 rng(seed);
+    const int64_t n = probe.numel();
+    const uint64_t span = static_cast<uint64_t>(hi - lo + 1);
+    if (dt == DataType::s8) {
+        auto* p = reinterpret_cast<int8_t*>(t.bytes.data());
+        for (int64_t i = 0; i < n; ++i) {
+            p[i] = static_cast<int8_t>(lo + int64_t(rng.next_u64() % span));
+        }
+    } else {
+        auto* p = reinterpret_cast<uint8_t*>(t.bytes.data());
+        for (int64_t i = 0; i < n; ++i) {
+            p[i] = static_cast<uint8_t>(lo + int64_t(rng.next_u64() % span));
+        }
+    }
+    t.view = TensorView(shape, dt, t.bytes.data());
+    return t;
+}
+
+/// The same storage with quantization metadata attached (the view is a handle;
+/// the parameters must outlive every run that reads them).
+inline TensorView with_quant_params(const TensorView& v, const QuantParams& qp)
+{
+    return TensorView(v.shape_span(), v.data_type(), const_cast<void*>(v.ptr<void>()),
+                      v.pitch(), v.layout(), qp);
 }
 
 /// A llama.cpp block-packed host tensor: the last dim is the row, earlier dims
@@ -541,6 +581,66 @@ void run_op_close(Factory make, std::span<const HostTensor> ins, float tol_abs,
                   float tol_rel, const char* what, bool padded_out = false)
 {
     run_op_both_impl(make, ins, what, false, tol_abs, tol_rel, padded_out);
+}
+
+/// The quantized twin of `run_op_both_impl`: the views carry their quantization
+/// metadata on both backends, the output is allocated from the CPU's descriptor
+/// (its dtype is the caller's choice for Norm) and seeded with `out_qp`, and the
+/// result is compared to the CPU's within `tol_abs`. One integer step of slack is
+/// the realistic budget — the CPU evaluates the transcendentals with its own SIMD
+/// approximations and dequantizes a row's tail without the vector path's FMA.
+template <class Factory>
+void run_quant_op(Factory make, std::span<const TensorView> in_views,
+                  std::span<const HostTensor* const> owners, const QuantParams& out_qp,
+                  float tol_abs, const char* what)
+{
+    std::vector<TensorDesc> descs;
+    descs.reserve(in_views.size());
+    for (const TensorView& v : in_views) { descs.push_back(v.desc()); }
+
+    auto op_cpu = make(Backend::CPU);
+    const std::vector<TensorDesc> odescs = op_cpu->getOutputTensorDesc(descs);
+    if (odescs.empty()) {
+        throw std::runtime_error(std::string(what) + ": no output desc");
+    }
+    const TensorDesc& od = odescs.front();
+
+    HostTensor ref = make_host_zeroed(od.dims, od.dtype, false, od.layout);
+    HostTensor got = make_host_zeroed(od.dims, od.dtype, false, od.layout);
+    TensorView ref_view = with_quant_params(ref.view, out_qp);
+    TensorView got_view = with_quant_params(got.view, out_qp);
+
+    std::vector<TensorView> views(in_views.begin(), in_views.end());
+    if (op_cpu->compute(std::span<TensorView>(&ref_view, 1), views, cpu_context(), nullptr) !=
+        Status::ok) {
+        throw std::runtime_error(std::string(what) + ": cpu compute failed");
+    }
+
+    std::vector<DeviceTensor> dins;
+    dins.reserve(owners.size());
+    for (size_t i = 0; i < owners.size(); ++i) {
+        dins.push_back(to_device(*owners[i]));
+        // `to_device` drops the metadata; the host arrays stay where they are
+        // and the backend stages them.
+        dins.back().view = with_quant_params(dins.back().view, in_views[i].quant_params());
+    }
+    std::vector<TensorView> dviews;
+    dviews.reserve(dins.size());
+    for (DeviceTensor& d : dins) { dviews.push_back(d.view); }
+
+    DeviceTensor dout = alloc_like(got_view, got);
+    dout.view = with_quant_params(dout.view, out_qp);
+
+    auto op_dev = make(Backend::CUDA);
+    std::vector<TensorView> dv = {dout.view};
+    const Status st = op_dev->compute(dv, dviews, cuda_context(), nullptr);
+    if (st != Status::ok) {
+        throw std::runtime_error(std::string(what) + ": cuda compute returned " +
+                                 to_string(st));
+    }
+    CudaBuffer::sync();
+    from_device(dout, got);
+    expect_same(got, ref, tol_abs, 0.0f, what);
 }
 
 // ============================================================

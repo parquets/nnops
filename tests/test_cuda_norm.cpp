@@ -484,4 +484,139 @@ NNOPS_TEST(cuda_norm_gate) {
     }
 }
 
+// ============================================================
+// Quantized input — dequantize, normalize, write back
+// ============================================================
+//
+// The row is the quantization unit, so a per-token pair addresses exactly the
+// row it belongs to. The CPU's row sum and the block's reduction tree round
+// differently, so an integer destination is compared within one step and a
+// dequantized f32 destination within a small budget.
+
+namespace {
+
+QuantParams qtensor(float scale, int32_t zp)
+{
+    QuantParams qp;
+    qp.scale = scale;
+    qp.zero_point = zp;
+    return qp;
+}
+
+void qtoken(int64_t rows, uint64_t seed, std::vector<float>& scale, std::vector<int32_t>& zp,
+            QuantParams& qp)
+{
+    scale.resize(static_cast<size_t>(rows));
+    zp.resize(static_cast<size_t>(rows));
+    XorShift128 rng(seed);
+    for (int64_t r = 0; r < rows; ++r) {
+        scale[static_cast<size_t>(r)] = rng.next_float(0.01f, 0.04f);
+        zp[static_cast<size_t>(r)] = static_cast<int32_t>(rng.next_u64() % 9) - 4;
+    }
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale.data();
+    qp.zero_point_data = zp.data();
+    qp.num_scales = rows;
+}
+
+}  // namespace
+
+NNOPS_TEST(cuda_layer_norm_quant_input) {
+    std::vector<HostTensor> own;
+    own.push_back(make_host_int(std::vector<int64_t>{4, 32}, DataType::s8, 511, -128, 127));
+    own.push_back(make_host_random(std::vector<int64_t>{32}, DataType::f32, false, 512, -1.0f,
+                                   1.0f));
+    own.push_back(make_host_random(std::vector<int64_t>{32}, DataType::f32, false, 513, -1.0f,
+                                   1.0f));
+
+    const QuantParams xq = qtensor(0.02f, -3);
+    const QuantParams yq = qtensor(0.01f, 7);
+    const TensorView ins[] = {with_quant_params(own[0].view, xq), own[1].view, own[2].view};
+    const HostTensor* owners[] = {&own[0], &own[1], &own[2]};
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    attrs.axis = -1;
+    attrs.output_dtype = DataType::s8;
+    run_quant_op([&](Backend b) { return Norm::create(attrs, b); },
+                 std::span<const TensorView>(ins, 3),
+                 std::span<const HostTensor* const>(owners, 3), yq, 1.0f,
+                 "layer_norm quant s8 per-tensor");
+}
+
+NNOPS_TEST(cuda_layer_norm_quant_per_token_u8_out) {
+    const int64_t rows = 6, cols = 24;
+    std::vector<HostTensor> own;
+    own.push_back(make_host_int(std::vector<int64_t>{rows, cols}, DataType::s8, 521, -128, 127));
+    own.push_back(make_host_random(std::vector<int64_t>{cols}, DataType::f32, false, 522, -1.0f,
+                                   1.0f));
+    own.push_back(make_host_random(std::vector<int64_t>{cols}, DataType::f32, false, 523,
+                                   -1.0f, 1.0f));
+
+    std::vector<float> xs, ys;
+    std::vector<int32_t> xz, yz;
+    QuantParams xq, yq;
+    qtoken(rows, 524, xs, xz, xq);
+    qtoken(rows, 525, ys, yz, yq);
+    for (int64_t r = 0; r < rows; ++r) {
+        yz[static_cast<size_t>(r)] = 90 + static_cast<int32_t>(r);
+    }
+    const TensorView ins[] = {with_quant_params(own[0].view, xq), own[1].view, own[2].view};
+    const HostTensor* owners[] = {&own[0], &own[1], &own[2]};
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    attrs.axis = -1;
+    attrs.output_dtype = DataType::u8;
+    run_quant_op([&](Backend b) { return Norm::create(attrs, b); },
+                 std::span<const TensorView>(ins, 3),
+                 std::span<const HostTensor* const>(owners, 3), yq, 1.0f,
+                 "layer_norm quant per-token u8");
+}
+
+NNOPS_TEST(cuda_rms_norm_quant_dequantized_output) {
+    const int64_t rows = 3, cols = 48;
+    std::vector<HostTensor> own;
+    own.push_back(make_host_int(std::vector<int64_t>{rows, cols}, DataType::u8, 531, 0, 255));
+    own.push_back(make_host_random(std::vector<int64_t>{cols}, DataType::f32, false, 532, 0.5f,
+                                   1.5f));
+
+    std::vector<float> xs;
+    std::vector<int32_t> xz;
+    QuantParams xq;
+    qtoken(rows, 533, xs, xz, xq);
+    for (int64_t r = 0; r < rows; ++r) {
+        xz[static_cast<size_t>(r)] = 110 + static_cast<int32_t>(r);
+    }
+    const TensorView ins[] = {with_quant_params(own[0].view, xq), own[1].view};
+    const HostTensor* owners[] = {&own[0], &own[1]};
+
+    NormAttributes attrs;
+    attrs.type = NormType::RMSNorm;
+    attrs.axis = -1;
+    attrs.output_dtype = DataType::f32;
+    run_quant_op([&](Backend b) { return Norm::create(attrs, b); },
+                 std::span<const TensorView>(ins, 2),
+                 std::span<const HostTensor* const>(owners, 2), QuantParams{}, 1e-3f,
+                 "rms_norm quant per-token f32 out");
+}
+
+NNOPS_TEST(cuda_l2_norm_quant) {
+    std::vector<HostTensor> own;
+    own.push_back(make_host_int(std::vector<int64_t>{8, 16}, DataType::s8, 541, -128, 127));
+
+    const QuantParams xq = qtensor(0.03f, 1);
+    const TensorView ins[] = {with_quant_params(own[0].view, xq)};
+    const HostTensor* owners[] = {&own[0]};
+
+    NormAttributes attrs;
+    attrs.type = NormType::L2Norm;
+    attrs.axis = -1;
+    attrs.output_dtype = DataType::f32;
+    run_quant_op([&](Backend b) { return Norm::create(attrs, b); },
+                 std::span<const TensorView>(ins, 1),
+                 std::span<const HostTensor* const>(owners, 1), QuantParams{}, 1e-4f,
+                 "l2_norm quant");
+}
+
 #endif  // NNOPS_HAS_CUDA

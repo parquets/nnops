@@ -25,11 +25,18 @@
 /// and the spatial walk come from the view, which covers NHWC and dense
 /// in the same kernel.
 ///
-/// f32, f16 and bf16 in, f32 compute. s8/u8 input stays on the CPU (its dequantize /
-/// requantize kernels live there), so a quantized X answers Status::unsupported.
+/// f32, f16 and bf16 in, f32 compute. The quantized route takes an s8/u8 X for
+/// LayerNorm / RMSNorm / L2Norm over the trailing axis: each row is dequantized
+/// with its own parameters, reduced, normalized, and written back either
+/// dequantized (f32/f16/bf16) or requantized with the output's parameters
+/// (s8/u8). It is the CPU row route's shape — one row per unit, so a PerToken
+/// pair addresses exactly the row it belongs to — and refuses add_to, a
+/// residual, a gate, modulation and an inner axis, all as the CPU does.
+///
 /// Workspace: not used.
 
 #include "cuda_common.cuh"
+#include "quant_elementwise.cuh"
 #include "matmul/matmul_epilogue.cuh"
 #include "nnops/ops/norm.hpp"
 #include "nnops/detail/axis_walk.hpp"
@@ -770,6 +777,268 @@ Status norm_entry(const NormAttributes& attrs, TensorView& output,
     return Status::invalid_argument;
 }
 
+// ============================================================
+// Quantized input — LayerNorm / RMSNorm / L2Norm over the trailing axis
+// ============================================================
+
+/// One block per row: dequantize while folding sum and sum-of-squares, then
+/// walk the row again to apply, as the CPU's row route does. The second read is
+/// the storage's int8 bytes, so the row staying out of shared memory costs a
+/// quarter of what the f32 route pays.
+template <class InT, class OutT, bool HasMean, bool HasScale, bool HasBias>
+__global__ void norm_quant_kernel(const InT* __restrict__ x, const float* __restrict__ scale,
+                                  const float* __restrict__ bias, OutT* __restrict__ y,
+                                  int64_t rows, int64_t n, int64_t x_row_stride,
+                                  int64_t y_row_stride, qelem::ParamRef qin,
+                                  qelem::ParamRef qout, float eps, bool scale_scalar,
+                                  bool one_plus)
+{
+    extern __shared__ float smem[];
+    const float one = one_plus ? 1.0f : 0.0f;
+
+    for (int64_t r = blockIdx.x; r < rows; r += gridDim.x) {
+        const qelem::RowParam pin = qelem::row_param(qin, r);
+        const InT* x_row = x + r * x_row_stride;
+
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+            const float v = qelem::dequant(x_row[i], pin);
+            sum += v;
+            sum_sq += v * v;
+        }
+        block_sums2(sum, sum_sq, smem);
+
+        const float inv_n = 1.0f / static_cast<float>(n);
+        float mean = 0.0f;
+        float inv_std;
+        if (HasMean) {
+            mean = sum * inv_n;
+            float var = sum_sq * inv_n - mean * mean;
+            if (var < 0.0f) {
+                var = 0.0f;
+            }
+            inv_std = rsqrtf(var + eps);
+        } else if (HasScale) {
+            inv_std = rsqrtf(sum_sq * inv_n + eps);
+        } else {
+            inv_std = rsqrtf(sum_sq + eps);
+        }
+
+        const qelem::RowParam pout = qelem::row_param(qout, r);
+        OutT* y_row = y + r * y_row_stride;
+        for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+            float v = (qelem::dequant(x_row[i], pin) - mean) * inv_std;
+            const int64_t si = scale_scalar ? 0 : i;
+            if (HasScale) {
+                v *= s_load(&scale[si]) + one;
+            }
+            if (HasBias) {
+                v += s_load(&bias[si]);
+            }
+            qelem::store_elem(&y_row[i], v, pout);
+        }
+    }
+}
+
+template <class InT, class OutT, bool HasMean, bool HasScale>
+Status launch_norm_quant(const NormAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs, const TensorView* scale,
+                         const TensorView* bias, int64_t rows, int64_t n, bool scale_scalar,
+                         qelem::ParamRef qin, qelem::ParamRef qout, cudaStream_t stream)
+{
+    constexpr int kScratch = 2 * (kCudaBlockSize / kCudaWarpSize) * int(sizeof(float));
+    // The same floor the float row route uses: a warp is the reduction's unit,
+    // so a one-element row still fills one.
+    const int block_size = block_for(n);
+    if (block_size <= 0) {
+        return Status::ok;
+    }
+    const unsigned grid = static_cast<unsigned>(std::min<int64_t>(rows, 65535));
+    const int64_t x_stride = inputs[0].row_stride_elems();
+    const int64_t y_stride = output.row_stride_elems();
+    const float* s_ptr = scale != nullptr ? scale->ptr<float>() : nullptr;
+    const float* b_ptr = bias != nullptr ? bias->ptr<float>() : nullptr;
+
+    if (b_ptr != nullptr) {
+        norm_quant_kernel<InT, OutT, HasMean, HasScale, true><<<grid, block_size, kScratch, stream>>>(
+            inputs[0].ptr<InT>(), s_ptr, b_ptr, output.ptr<OutT>(), rows, n, x_stride, y_stride,
+            qin, qout, attrs.epsilon, scale_scalar, attrs.one_plus_weight);
+    } else {
+        norm_quant_kernel<InT, OutT, HasMean, HasScale, false>
+            <<<grid, block_size, kScratch, stream>>>(inputs[0].ptr<InT>(), s_ptr, nullptr,
+                                                     output.ptr<OutT>(), rows, n, x_stride,
+                                                     y_stride, qin, qout, attrs.epsilon,
+                                                     scale_scalar, attrs.one_plus_weight);
+    }
+    return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+}
+
+template <class InT, class OutT, bool HasMean, bool HasScale>
+Status dispatch_norm_quant(const NormAttributes& attrs, TensorView& output,
+                           std::span<const TensorView> inputs, qelem::ParamRef qin,
+                           qelem::ParamRef qout, cudaStream_t stream)
+{
+    const auto& x = inputs[0];
+    const int64_t rank = x.rank();
+    const int64_t n = x.shape(rank - 1);
+    int64_t rows = 1;
+    for (int64_t d = 0; d < rank - 1; ++d) {
+        rows *= x.shape(d);
+    }
+    if (rows == 0 || n == 0) {
+        return Status::ok;
+    }
+
+    const TensorView* scale =
+        (HasScale && inputs.size() >= 2 && !inputs[1].is_empty()) ? &inputs[1] : nullptr;
+    const TensorView* bias =
+        (HasMean && inputs.size() >= 3 && !inputs[2].is_empty()) ? &inputs[2] : nullptr;
+    if (scale != nullptr && scale->data_type() != DataType::f32) {
+        return Status::invalid_argument;
+    }
+    if (bias != nullptr && bias->data_type() != DataType::f32) {
+        return Status::invalid_argument;
+    }
+    const bool scale_scalar = scale != nullptr && scale->numel() == 1;
+    return launch_norm_quant<InT, OutT, HasMean, HasScale>(attrs, output, inputs, scale, bias,
+                                                           rows, n, scale_scalar, qin, qout,
+                                                           stream);
+}
+
+template <class InT, class OutT>
+Status norm_quant_out(const NormAttributes& attrs, TensorView& output,
+                      std::span<const TensorView> inputs, qelem::ParamRef qin,
+                      qelem::ParamRef qout, cudaStream_t stream)
+{
+    switch (attrs.type) {
+    case NormType::LayerNorm:
+        return dispatch_norm_quant<InT, OutT, true, true>(attrs, output, inputs, qin, qout, stream);
+    case NormType::RMSNorm:
+        return dispatch_norm_quant<InT, OutT, false, true>(attrs, output, inputs, qin, qout,
+                                                           stream);
+    case NormType::L2Norm:
+        return dispatch_norm_quant<InT, OutT, false, false>(attrs, output, inputs, qin, qout,
+                                                            stream);
+    default:
+        return Status::unsupported;
+    }
+}
+
+template <class InT>
+Status norm_quant_in(const NormAttributes& attrs, TensorView& output,
+                     std::span<const TensorView> inputs, qelem::ParamRef qin,
+                     qelem::ParamRef qout, cudaStream_t stream)
+{
+    switch (output.data_type()) {
+    case DataType::f32:
+        return norm_quant_out<InT, float>(attrs, output, inputs, qin, qout, stream);
+    case DataType::f16:
+        return norm_quant_out<InT, __half>(attrs, output, inputs, qin, qout, stream);
+    case DataType::bf16:
+        return norm_quant_out<InT, __nv_bfloat16>(attrs, output, inputs, qin, qout, stream);
+    case DataType::s8:
+        return norm_quant_out<InT, int8_t>(attrs, output, inputs, qin, qout, stream);
+    case DataType::u8:
+        return norm_quant_out<InT, uint8_t>(attrs, output, inputs, qin, qout, stream);
+    default:
+        return Status::unsupported;
+    }
+}
+
+/// Validate the quantized call before anything is dereferenced, mirroring
+/// `norm_quant_impl` on the CPU.
+Status norm_quant_cuda(const NormAttributes& attrs, TensorView& output,
+                       std::span<const TensorView> inputs, cudaStream_t stream)
+{
+    const auto& X = inputs[0];
+
+    // add_to would mean accumulating into a pre-existing quantized output.
+    if (attrs.add_to) {
+        return Status::unsupported;
+    }
+    if (!X.is_quantized()) {
+        return Status::invalid_argument;
+    }
+
+    const auto& x_qp = X.quant_params();
+    if (x_qp.granularity != QuantGranularity::PerTensor &&
+        x_qp.granularity != QuantGranularity::PerToken) {
+        return Status::unsupported;
+    }
+    const int64_t rank = X.rank();
+    const int64_t ax = attrs.axis < 0 ? attrs.axis + rank : attrs.axis;
+    if (ax != rank - 1 || is_channel_last(X.layout())) {
+        return Status::unsupported;
+    }
+    if (attrs.type != NormType::LayerNorm && attrs.type != NormType::RMSNorm &&
+        attrs.type != NormType::L2Norm) {
+        return Status::unsupported;
+    }
+
+    const int64_t n = X.shape(rank - 1);
+    int64_t rows = 1;
+    for (int64_t d = 0; d < rank - 1; ++d) {
+        rows *= X.shape(d);
+    }
+    if (rows == 0 || n == 0) {
+        return Status::ok;
+    }
+    if (x_qp.granularity == QuantGranularity::PerToken &&
+        (x_qp.scale_data == nullptr || x_qp.num_scales < rows)) {
+        return Status::invalid_argument;
+    }
+
+    const DataType y_dtype = output.data_type();
+    const bool y_int = y_dtype == DataType::s8 || y_dtype == DataType::u8;
+    if (!y_int && y_dtype != DataType::f32 && y_dtype != DataType::f16 &&
+        y_dtype != DataType::bf16) {
+        return Status::unsupported;
+    }
+    if (y_int) {
+        if (!output.is_quantized()) {
+            return Status::invalid_argument;
+        }
+        const auto& y_qp = output.quant_params();
+        if (y_qp.granularity != QuantGranularity::PerTensor &&
+            y_qp.granularity != QuantGranularity::PerToken) {
+            return Status::unsupported;
+        }
+        if (y_qp.granularity == QuantGranularity::PerToken &&
+            (y_qp.scale_data == nullptr || y_qp.num_scales < rows)) {
+            return Status::invalid_argument;
+        }
+    }
+    if (inputs.size() >= 2 && !inputs[1].is_empty() && inputs[1].data_type() != DataType::f32) {
+        return Status::invalid_argument;
+    }
+    if (inputs.size() >= 3 && !inputs[2].is_empty() && inputs[2].data_type() != DataType::f32) {
+        return Status::invalid_argument;
+    }
+
+    qelem::Stage in_scale_s, in_zp_s, out_scale_s, out_zp_s;
+    qelem::ParamRef qin, qout;
+    Status st = qelem::stage_qparams(x_qp, rows, stream, in_scale_s, in_zp_s, qin);
+    if (is_ok(st)) {
+        // A float destination has no output parameters to read.
+        st = y_int ? qelem::stage_qparams(output.quant_params(), rows, stream, out_scale_s,
+                                          out_zp_s, qout)
+                   : Status::ok;
+    }
+    if (is_ok(st)) {
+        if (X.data_type() == DataType::s8) {
+            st = norm_quant_in<int8_t>(attrs, output, inputs, qin, qout, stream);
+        } else {
+            st = norm_quant_in<uint8_t>(attrs, output, inputs, qin, qout, stream);
+        }
+    }
+    in_scale_s.release(stream);
+    in_zp_s.release(stream);
+    out_scale_s.release(stream);
+    out_zp_s.release(stream);
+    return st;
+}
+
 } // anonymous namespace
 
 // ============================================================
@@ -780,11 +1049,14 @@ Status norm_cuda(const NormAttributes& attrs, TensorView& output,
                  std::span<const TensorView> inputs, const ComputeContext& ctx, void* /*workspace*/)
 {
     const auto& x = inputs[0];
+    const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     if (is_quantized_dtype(x.data_type())) {
-        return Status::unsupported;
+        if (x.data_type() != DataType::s8 && x.data_type() != DataType::u8) {
+            return Status::unsupported;
+        }
+        return norm_quant_cuda(attrs, output, inputs, stream);
     }
 
-    const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     switch (x.data_type()) {
     case DataType::f32:
         return norm_entry<float>(attrs, output, inputs, stream);

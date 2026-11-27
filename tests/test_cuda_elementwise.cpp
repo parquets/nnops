@@ -19,6 +19,7 @@
 #include "nnops/ops/activation.hpp"
 #include "nnops/ops/softmax.hpp"
 #include "nnops/ops/eltwise.hpp"
+#include "nnops/ops/unary.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/cuda_test_helper.hpp"
@@ -189,6 +190,180 @@ NNOPS_TEST(cuda_eltwise_broadcast) {
     const HostTensor ins[] = {a, b};
     run_op_close([&](Backend be) { return Eltwise::create(attrs, be); }, ins, 2e-3f, 2e-3f,
                  "eltwise broadcast f16");
+}
+
+// ============================================================
+// Quantized routes — dequantize, op, requantize in one pass
+// ============================================================
+//
+// The views carry QuantParams on both backends. A per-token pair is compared
+// within one integer step: the CPU evaluates the transcendentals with its own
+// SIMD approximations, and its dequantize falls to a non-FMA scalar tail when a
+// row is not a whole vector multiple.
+
+namespace {
+
+QuantParams per_tensor(float scale, int32_t zp)
+{
+    QuantParams qp;
+    qp.scale = scale;
+    qp.zero_point = zp;
+    return qp;
+}
+
+/// Random per-row parameters over `rows`; the caller binds them to a view.
+void fill_per_token(int64_t rows, uint64_t seed, std::vector<float>& scale,
+                    std::vector<int32_t>& zp, QuantParams& qp)
+{
+    scale.resize(static_cast<size_t>(rows));
+    zp.resize(static_cast<size_t>(rows));
+    XorShift128 rng(seed);
+    for (int64_t r = 0; r < rows; ++r) {
+        scale[static_cast<size_t>(r)] = rng.next_float(0.01f, 0.05f);
+        zp[static_cast<size_t>(r)] = static_cast<int32_t>(rng.next_u64() % 9) - 4;
+    }
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale.data();
+    qp.zero_point_data = zp.data();
+    qp.num_scales = rows;
+}
+
+}  // namespace
+
+NNOPS_TEST(cuda_activation_quant_per_tensor) {
+    const std::vector<int64_t> shape = {3, 7, 32};
+    HostTensor x = make_host_int(std::span<const int64_t>(shape), DataType::s8, 311, -128, 127);
+    const QuantParams xq = per_tensor(0.02f, -4);
+    const QuantParams yq = per_tensor(0.05f, 10);
+    const TensorView xv = with_quant_params(x.view, xq);
+    const TensorView ins[] = {xv};
+    const HostTensor* owners[] = {&x};
+
+    for (ActivationType t : {ActivationType::Relu, ActivationType::Sigmoid,
+                             ActivationType::LeakyRelu}) {
+        ActivationAttributes attrs;
+        attrs.type = t;
+        run_quant_op([&](Backend b) { return Activation::create(attrs, b); },
+                     std::span<const TensorView>(ins, 1),
+                     std::span<const HostTensor* const>(owners, 1), yq, 1.0f,
+                     "activation quant per-tensor");
+    }
+}
+
+NNOPS_TEST(cuda_activation_quant_pairs_and_tokens) {
+    // u8 both sides, a zero point in the middle of the range.
+    {
+        HostTensor x = make_host_int(std::vector<int64_t>{2, 5, 64}, DataType::u8, 313, 0, 255);
+        const QuantParams xq = per_tensor(0.01f, 128);
+        const QuantParams yq = per_tensor(0.02f, 120);
+        const TensorView xv = with_quant_params(x.view, xq);
+        const TensorView ins[] = {xv};
+        const HostTensor* owners[] = {&x};
+        ActivationAttributes attrs;
+        attrs.type = ActivationType::HardSwish;
+        run_quant_op([&](Backend b) { return Activation::create(attrs, b); },
+                     std::span<const TensorView>(ins, 1),
+                     std::span<const HostTensor* const>(owners, 1), yq, 1.0f,
+                     "activation quant u8");
+    }
+    // s8 in, u8 out — the pair the fused route carries.
+    {
+        HostTensor x = make_host_int(std::vector<int64_t>{16}, DataType::s8, 317, -128, 127);
+        const QuantParams xq = per_tensor(0.03f, 0);
+        const QuantParams yq = per_tensor(0.04f, 100);
+        const TensorView xv = with_quant_params(x.view, xq);
+        const TensorView ins[] = {xv};
+        const HostTensor* owners[] = {&x};
+        ActivationAttributes attrs;
+        attrs.type = ActivationType::Elu;
+        run_quant_op([&](Backend b) { return Activation::create(attrs, b); },
+                     std::span<const TensorView>(ins, 1),
+                     std::span<const HostTensor* const>(owners, 1), yq, 1.0f,
+                     "activation quant s8 to u8");
+    }
+    // Per-token: one scale pair per row, on a row that leaves a scalar tail.
+    {
+        const int64_t rows = 5, cols = 40;
+        HostTensor x = make_host_int(std::vector<int64_t>{rows, cols}, DataType::s8, 319, -128, 127);
+        std::vector<float> xs, ys;
+        std::vector<int32_t> xz, yz;
+        QuantParams xq, yq;
+        fill_per_token(rows, 321, xs, xz, xq);
+        fill_per_token(rows, 323, ys, yz, yq);
+        const TensorView xv = with_quant_params(x.view, xq);
+        const TensorView ins[] = {xv};
+        const HostTensor* owners[] = {&x};
+        ActivationAttributes attrs;
+        attrs.type = ActivationType::Gelu;
+        run_quant_op([&](Backend b) { return Activation::create(attrs, b); },
+                     std::span<const TensorView>(ins, 1),
+                     std::span<const HostTensor* const>(owners, 1), yq, 1.0f,
+                     "activation quant per-token");
+    }
+}
+
+NNOPS_TEST(cuda_unary_quant) {
+    HostTensor x = make_host_int(std::vector<int64_t>{4, 48}, DataType::s8, 331, -128, 127);
+    const QuantParams xq = per_tensor(0.02f, 3);
+    const QuantParams yq = per_tensor(0.01f, -5);
+    const TensorView xv = with_quant_params(x.view, xq);
+    const TensorView ins[] = {xv};
+    const HostTensor* owners[] = {&x};
+
+    for (UnaryType t : {UnaryType::Exp, UnaryType::Tanh, UnaryType::Abs, UnaryType::Sign}) {
+        UnaryAttributes attrs;
+        attrs.type = t;
+        run_quant_op([&](Backend b) { return Unary::create(attrs, b); },
+                     std::span<const TensorView>(ins, 1),
+                     std::span<const HostTensor* const>(owners, 1), yq, 1.0f,
+                     "unary quant per-tensor");
+    }
+}
+
+NNOPS_TEST(cuda_unary_quant_per_token_u8) {
+    const int64_t rows = 3, cols = 32;
+    HostTensor x = make_host_int(std::vector<int64_t>{rows, cols}, DataType::u8, 337, 0, 255);
+    std::vector<float> xs, ys;
+    std::vector<int32_t> xz, yz;
+    QuantParams xq, yq;
+    fill_per_token(rows, 339, xs, xz, xq);
+    fill_per_token(rows, 341, ys, yz, yq);
+    // A u8 zero point instead of the signed spread.
+    for (int64_t r = 0; r < rows; ++r) {
+        xz[static_cast<size_t>(r)] = 100 + static_cast<int32_t>(r);
+        yz[static_cast<size_t>(r)] = 120 - static_cast<int32_t>(r);
+    }
+    const TensorView xv = with_quant_params(x.view, xq);
+    const TensorView ins[] = {xv};
+    const HostTensor* owners[] = {&x};
+    UnaryAttributes attrs;
+    attrs.type = UnaryType::Sin;
+    run_quant_op([&](Backend b) { return Unary::create(attrs, b); },
+                 std::span<const TensorView>(ins, 1),
+                 std::span<const HostTensor* const>(owners, 1), yq, 1.0f,
+                 "unary quant per-token u8");
+}
+
+NNOPS_TEST(cuda_eltwise_quant) {
+    HostTensor a = make_host_int(std::vector<int64_t>{2, 8, 16}, DataType::s8, 343, -128, 127);
+    HostTensor b = make_host_int(std::vector<int64_t>{2, 8, 16}, DataType::s8, 347, -128, 127);
+    const QuantParams aq = per_tensor(0.02f, -1);
+    const QuantParams bq = per_tensor(0.03f, 2);
+    const QuantParams yq = per_tensor(0.04f, -7);
+    const TensorView av = with_quant_params(a.view, aq);
+    const TensorView bv = with_quant_params(b.view, bq);
+    const TensorView ins[] = {av, bv};
+    const HostTensor* owners[] = {&a, &b};
+
+    for (EltwiseType t : {EltwiseType::Add, EltwiseType::Mul, EltwiseType::Max,
+                          EltwiseType::Sub}) {
+        EltwiseAttributes attrs;
+        attrs.type = t;
+        run_quant_op([&](Backend be) { return Eltwise::create(attrs, be); },
+                     std::span<const TensorView>(ins, 2),
+                     std::span<const HostTensor* const>(owners, 2), yq, 1.0f,
+                     "eltwise quant per-tensor");
+    }
 }
 
 #endif  // NNOPS_HAS_CUDA

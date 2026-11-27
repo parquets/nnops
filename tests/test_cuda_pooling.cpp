@@ -232,4 +232,79 @@ NNOPS_TEST(cuda_pooling_adaptive) {
     run_case(big, "adaptive larger output");
 }
 
+// ============================================================
+// Quantized pooling — the channel lane over int8 storage
+// ============================================================
+//
+// PerTensor parameters on both sides, the CPU's quantized contract. Max is
+// exact in any domain, and Average divides two f32 values that came from the
+// same integers, so the two routes agree within one integer step.
+
+namespace {
+
+QuantParams qtensor(float scale, int32_t zp)
+{
+    QuantParams qp;
+    qp.scale = scale;
+    qp.zero_point = zp;
+    return qp;
+}
+
+void run_quant_pool(std::vector<int64_t> shape, PoolingAttributes attrs, DataType dt,
+                    bool global, const char* what)
+{
+    attrs.global = global;
+    const bool s8 = dt == DataType::s8;
+
+    HostTensor x = make_host_int(shape, dt, 601, s8 ? -128 : 0, s8 ? 127 : 255);
+    const TensorLayout layout = shape.size() == 5 ? TensorLayout::NDHWC : TensorLayout::NHWC;
+    x.view = TensorView(x.view.shape_span(), dt, x.bytes.data(), layout);
+
+    const QuantParams xq = qtensor(0.02f, s8 ? -5 : 128);
+    const QuantParams yq = qtensor(0.05f, s8 ? 3 : 110);
+    const TensorView ins[] = {with_quant_params(x.view, xq)};
+    const HostTensor* owners[] = {&x};
+
+    run_quant_op([&](Backend b) { return Pooling::create(attrs, b); },
+                 std::span<const TensorView>(ins, 1),
+                 std::span<const HostTensor* const>(owners, 1), yq, 1.0f, what);
+}
+
+}  // namespace
+
+NNOPS_TEST(cuda_pooling_quant_lane) {
+    // C = 16 is one vector; 5 leaves a scalar tail.
+    for (int64_t C : {16, 5}) {
+        for (PoolingType type : {PoolingType::Max, PoolingType::Average}) {
+            PoolingAttributes a;
+            a.type = type;
+            a.kernel_shape = {1, 3, 3};
+            a.stride = {1, 2, 2};
+            a.padding = {0, 1, 1};
+            a.dilation = {1, 1, 1};
+            a.exclude_pad = (type == PoolingType::Average);
+            run_quant_pool({2, 9, 11, C}, a, C == 16 ? DataType::s8 : DataType::u8, false,
+                           "pooling quant lane");
+        }
+    }
+}
+
+NNOPS_TEST(cuda_pooling_quant_3d_and_global) {
+    PoolingAttributes a;
+    a.type = PoolingType::Max;
+    a.kernel_shape = {2, 2, 2};
+    a.stride = {1, 2, 2};
+    a.padding = {1, 1, 1};
+    a.dilation = {1, 1, 1};
+    run_quant_pool({1, 4, 5, 6, 8}, a, DataType::s8, false, "pooling quant 3d");
+
+    PoolingAttributes g;
+    g.type = PoolingType::Average;
+    g.kernel_shape = {1, 1, 1};
+    g.stride = {1, 1, 1};
+    g.padding = {0, 0, 0};
+    g.dilation = {1, 1, 1};
+    run_quant_pool({2, 7, 9, 16}, g, DataType::u8, true, "pooling quant global");
+}
+
 #endif  // NNOPS_HAS_CUDA

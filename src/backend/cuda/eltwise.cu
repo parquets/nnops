@@ -5,10 +5,18 @@
 /// row-by-row pitch-aware kernel for rank >= 2 (supports packed layouts).
 /// All 4 operations: Add, Sub, Mul, Div.
 ///
-/// Supports f32, f16 and bf16. Workspace: not used.
+/// f32, f16 and bf16 run the kernels above. The quantized route takes s8/u8
+/// inputs and output and fuses both dequantizations and the requantization into
+/// one pass, walking dense rows of the last dim as the CPU's fused transform
+/// does. It requires the two inputs to have the output's shape — a broadcast
+/// would need the index arithmetic re-derived per scale row — and refuses
+/// add_to, both matching the CPU.
+///
+/// Workspace: not used.
 
 #include "bcast.cuh"
 #include "cuda_common.cuh"
+#include "quant_elementwise.cuh"
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/detail/assert.hpp"
 
@@ -871,6 +879,135 @@ void eltwise_cuda_impl(const EltwiseAttributes& attrs, TensorView& output,
 }
 
 // ============================================================
+// Quantized route — dequantize both, apply, requantize in one pass
+// ============================================================
+
+__device__ inline float eltwise_quant_op(EltwiseType type, float a, float b) noexcept
+{
+    switch (type) {
+    case EltwiseType::Add:
+        return a + b;
+    case EltwiseType::Sub:
+        return a - b;
+    case EltwiseType::Mul:
+        return a * b;
+    case EltwiseType::Div:
+        return a / b;
+    case EltwiseType::Min:
+        return fminf(a, b);
+    case EltwiseType::Max:
+        return fmaxf(a, b);
+    case EltwiseType::Pow:
+        return powf(a, b);
+    }
+    return a;
+}
+
+template <class InT, class OutT>
+__global__ void eltwise_quant_kernel(const InT* __restrict__ a, const InT* __restrict__ b,
+                                     OutT* __restrict__ output, int64_t rows, int64_t cols,
+                                     qelem::ParamRef qa, qelem::ParamRef qb,
+                                     qelem::ParamRef qout, EltwiseType type)
+{
+    constexpr int VEC = 16;
+
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const qelem::RowParam pa = qelem::row_param(qa, row);
+        const qelem::RowParam pb = qelem::row_param(qb, row);
+        const qelem::RowParam po = qelem::row_param(qout, row);
+        const InT* a_row = a + row * cols;
+        const InT* b_row = b + row * cols;
+        OutT* o_row = output + row * cols;
+
+        const int64_t vec_end =
+            aligned16(a_row, b_row, o_row) ? (cols / VEC) * VEC : 0;
+        const int64_t vstep = int64_t(gridDim.x) * blockDim.x * VEC;
+        for (int64_t i = int64_t(blockIdx.x) * blockDim.x * VEC + threadIdx.x * VEC; i < vec_end;
+             i += vstep) {
+            const qelem::pack16<InT> va = *reinterpret_cast<const qelem::pack16<InT>*>(&a_row[i]);
+            const qelem::pack16<InT> vb = *reinterpret_cast<const qelem::pack16<InT>*>(&b_row[i]);
+            qelem::pack16<OutT> r;
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) {
+                r.data[k] = qelem::requant<OutT>(
+                    eltwise_quant_op(type, qelem::dequant(va.data[k], pa),
+                                     qelem::dequant(vb.data[k], pb)),
+                    po);
+            }
+            *reinterpret_cast<qelem::pack16<OutT>*>(&o_row[i]) = r;
+        }
+
+        const int64_t sstep = int64_t(gridDim.x) * blockDim.x;
+        for (int64_t i = vec_end + int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < cols;
+             i += sstep) {
+            o_row[i] = qelem::requant<OutT>(
+                eltwise_quant_op(type, qelem::dequant(a_row[i], pa), qelem::dequant(b_row[i], pb)),
+                po);
+        }
+    }
+}
+
+template <class InT, class OutT>
+Status eltwise_quant_cuda(const EltwiseAttributes& attrs, TensorView& output,
+                          std::span<const TensorView> inputs, cudaStream_t stream)
+{
+    if (attrs.add_to) {
+        return Status::unsupported;
+    }
+    const TensorView& a = inputs[0];
+    const TensorView& b = inputs[1];
+    if (a.numel() != b.numel() || a.numel() != output.numel()) {
+        return Status::unsupported;
+    }
+    const int64_t total = a.numel();
+    if (total == 0) {
+        return Status::ok;
+    }
+    const int64_t cols = a.shape(a.rank() - 1);
+    if (cols <= 0) {
+        return Status::invalid_argument;
+    }
+    const int64_t rows = total / cols;
+
+    qelem::Stage a_s, a_z, b_s, b_z, o_s, o_z;
+    qelem::ParamRef qa, qb, qo;
+    Status st = qelem::stage_qparams(a.quant_params(), rows, stream, a_s, a_z, qa);
+    if (is_ok(st)) {
+        st = qelem::stage_qparams(b.quant_params(), rows, stream, b_s, b_z, qb);
+    }
+    if (is_ok(st)) {
+        st = qelem::stage_qparams(output.quant_params(), rows, stream, o_s, o_z, qo);
+    }
+    if (is_ok(st)) {
+        constexpr int VEC = 16;
+        const int block_size = kCudaBlockSize;
+        const int64_t col_tiles = ceil_div(cols, int64_t(block_size) * VEC);
+        const dim3 grid(static_cast<unsigned>(std::min<int64_t>(col_tiles, 65535)),
+                        static_cast<unsigned>(std::min<int64_t>(rows, 65535)));
+        eltwise_quant_kernel<InT, OutT><<<grid, block_size, 0, stream>>>(
+            a.ptr<InT>(), b.ptr<InT>(), output.ptr<OutT>(), rows, cols, qa, qb, qo, attrs.type);
+        st = cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+    }
+    a_s.release(stream);
+    a_z.release(stream);
+    b_s.release(stream);
+    b_z.release(stream);
+    o_s.release(stream);
+    o_z.release(stream);
+    return st;
+}
+
+template <class InT>
+Status eltwise_quant_pair(const EltwiseAttributes& attrs, TensorView& output,
+                          std::span<const TensorView> inputs, cudaStream_t stream)
+{
+    if (output.data_type() == DataType::s8) {
+        return eltwise_quant_cuda<InT, int8_t>(attrs, output, inputs, stream);
+    }
+    return eltwise_quant_cuda<InT, uint8_t>(attrs, output, inputs, stream);
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 
@@ -878,7 +1015,21 @@ Status eltwise_cuda(const EltwiseAttributes& attrs, TensorView& output,
                     std::span<const TensorView> inputs, const ComputeContext& ctx,
                     void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
+    const DataType dtype = inputs[0].data_type();
+    const DataType out_dtype = output.data_type();
+    const bool in_int = dtype == DataType::s8 || dtype == DataType::u8;
+    const bool out_int = out_dtype == DataType::s8 || out_dtype == DataType::u8;
+    if (in_int || out_int) {
+        // Both inputs and the output must be s8/u8 (no float↔int mixing).
+        if (!in_int || !out_int || inputs[1].data_type() != dtype) {
+            return Status::invalid_argument;
+        }
+        const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
+        if (dtype == DataType::s8) {
+            return eltwise_quant_pair<int8_t>(attrs, output, inputs, stream);
+        }
+        return eltwise_quant_pair<uint8_t>(attrs, output, inputs, stream);
+    }
     switch (dtype) {
     case DataType::f32:
         eltwise_cuda_impl<float>(attrs, output, inputs, ctx);

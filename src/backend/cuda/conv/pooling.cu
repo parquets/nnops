@@ -26,9 +26,18 @@
 /// pitch, which for a channel-last rank-3 tensor is the whole spatial line
 /// (L·C), so its rank-4 strides come out right.
 ///
-/// Supports f32, f16 and bf16. Workspace: not used.
+/// f32, f16 and bf16 run the kernels above. The quantized route takes an s8/u8
+/// input and output and fuses the dequantize and requantize into the window
+/// walk: per-tensor parameters only (the CPU's quantized pooling reads the
+/// scalar pair too), the channel lane 16 bytes wide, Max and Average, and
+/// add_to accumulating in the dequantized domain before the requantize. A
+/// global request is resolved to a full-extent window exactly as the CPU route
+/// resolves it, so no whole-plane kernel is needed.
+///
+/// Workspace: not used.
 
 #include "../cuda_common.cuh"
+#include "../quant_elementwise.cuh"
 #include "nnops/ops/pool1d.hpp"
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
@@ -746,6 +755,208 @@ void pooling_global_impl(const PoolingAttributes& attrs, TensorView& output,
 }
 
 // ============================================================
+// Quantized pooling — dequantize the window, requantize the store
+// ============================================================
+
+template <class T, int Vec>
+__device__ inline void load_quant_channels(const T* ptr, float (&v)[Vec],
+                                           const qelem::RowParam& q) noexcept
+{
+    if constexpr (Vec == 16) {
+        const qelem::pack16<T> r = *reinterpret_cast<const qelem::pack16<T>*>(ptr);
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            v[i] = qelem::dequant(r.data[i], q);
+        }
+    } else {
+        v[0] = qelem::dequant(*ptr, q);
+    }
+}
+
+template <class T, int Vec>
+__device__ inline void store_quant_channels(T* ptr, const float (&v)[Vec],
+                                            const qelem::RowParam& q) noexcept
+{
+    if constexpr (Vec == 16) {
+        qelem::pack16<T> r;
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            r.data[i] = qelem::requant<T>(v[i], q);
+        }
+        *reinterpret_cast<qelem::pack16<T>*>(ptr) = r;
+    } else {
+        *ptr = qelem::requant<T>(v[0], q);
+    }
+}
+
+/// The flat script over the quantized geometry: one thread owns one channel
+/// vector of one output pixel, and the window is walked a tap at a time. A
+/// channel tail runs the same kernel with Vec 1.
+template <class InT, class OutT, int Vec, bool IsMax>
+__global__ void pooling_quant_kernel(const InT* __restrict__ input, OutT* __restrict__ output,
+                                     PoolGeom g, int64_t c_begin, int64_t chunks,
+                                     qelem::RowParam qin, qelem::RowParam qout)
+{
+    const int64_t pix_per_image = g.OD * g.OH * g.OW;
+    const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= g.N * pix_per_image * chunks) {
+        return;
+    }
+
+    const int64_t chunk = t % chunks;
+    const int64_t pix = t / chunks;
+    const int64_t c0 = c_begin + chunk * Vec;
+
+    const int64_t img = pix / pix_per_image;
+    const int64_t sp = pix % pix_per_image;
+    const int64_t od = sp / (g.OH * g.OW);
+    const int64_t oh = (sp / g.OW) % g.OH;
+    const int64_t ow = sp % g.OW;
+
+    const InT* in_img = input + img * (g.ID * g.in_d_stride) + c0;
+    OutT* out_img = output + img * (g.OD * g.out_d_stride) + c0;
+
+    float acc[Vec];
+#pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+        acc[i] = IsMax ? -1e30f : 0.0f;
+    }
+
+    int64_t valid = 0;
+    for (int64_t kd = 0; kd < g.KD; ++kd) {
+        const int64_t id = od * g.SD + kd * g.DD - g.PD;
+        if (id < 0 || id >= g.ID) {
+            continue;
+        }
+        const InT* in_d = in_img + id * g.in_d_stride;
+        for (int64_t kh = 0; kh < g.KH; ++kh) {
+            const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
+            if (ih < 0 || ih >= g.IH) {
+                continue;
+            }
+            const InT* row = in_d + ih * g.in_row_stride;
+            for (int64_t kw = 0; kw < g.KW; ++kw) {
+                const int64_t iw = ow * g.SW + kw * g.DW - g.PW;
+                if (iw < 0 || iw >= g.IW) {
+                    continue;
+                }
+                float v[Vec];
+                load_quant_channels<InT, Vec>(row + iw * g.in_pix_stride, v, qin);
+#pragma unroll
+                for (int i = 0; i < Vec; ++i) {
+                    acc[i] = IsMax ? fmaxf(acc[i], v[i]) : acc[i] + v[i];
+                }
+                ++valid;
+            }
+        }
+    }
+
+    if (IsMax) {
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] = (valid > 0) ? acc[i] : 0.0f;
+        }
+    } else {
+        const int64_t denom = g.exclude_pad ? valid : g.KD * g.KH * g.KW;
+        const float scale = denom > 0 ? 1.0f / static_cast<float>(denom) : 0.0f;
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] *= scale;
+        }
+    }
+
+    OutT* out = out_img + od * g.out_d_stride + oh * g.out_row_stride + ow * g.out_pix_stride;
+    if (g.add_to) {
+        float prev[Vec];
+        load_quant_channels<OutT, Vec>(out, prev, qout);
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            acc[i] += prev[i];
+        }
+    }
+    store_quant_channels<OutT, Vec>(out, acc, qout);
+}
+
+template <class InT, class OutT, int Vec, bool IsMax>
+void pooling_quant_launch(const PoolGeom& g, TensorView& output, const TensorView& input,
+                          int64_t c_begin, int64_t c_count, qelem::RowParam qin,
+                          qelem::RowParam qout, cudaStream_t stream)
+{
+    if (c_count <= 0) {
+        return;
+    }
+    const int64_t chunks = (c_count + Vec - 1) / Vec;
+    const int64_t tasks = g.N * g.OD * g.OH * g.OW * chunks;
+    const int64_t blocks = (tasks + kCudaBlockSize - 1) / kCudaBlockSize;
+    pooling_quant_kernel<InT, OutT, Vec, IsMax>
+        <<<static_cast<unsigned>(blocks), kCudaBlockSize, 0, stream>>>(
+            input.ptr<InT>(), output.ptr<OutT>(), g, c_begin, chunks, qin, qout);
+}
+
+template <class InT, class OutT>
+void pooling_quant_impl(const PoolingAttributes& attrs, TensorView& output,
+                        std::span<const TensorView> inputs, const ComputeContext& ctx)
+{
+    const auto& input = inputs[0];
+    cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
+
+    // A global request is the full-extent window, the CPU route's resolution.
+    PoolingAttributes a = attrs;
+    if (a.global) {
+        const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
+        const size_t first = static_cast<size_t>(3 - srank);
+        for (int64_t d = 0; d < srank; ++d) {
+            a.kernel_shape[first + static_cast<size_t>(d)] = input.shape(2 + d);
+            a.stride[first + static_cast<size_t>(d)] = 1;
+            a.padding[first + static_cast<size_t>(d)] = 0;
+            a.dilation[first + static_cast<size_t>(d)] = 1;
+        }
+        a.global = false;
+    }
+
+    const PoolGeom g = pooling_geom(a, input, output);
+
+    // The CPU's quantized pooling reads the per-tensor scalars; a per-row array
+    // is not consulted there either.
+    const qelem::RowParam qin =
+        qelem::make_row_param(input.quant_params().scale, input.quant_params().zero_point);
+    const qelem::RowParam qout =
+        qelem::make_row_param(output.quant_params().scale, output.quant_params().zero_point);
+
+    constexpr int kVec = 16;
+    const bool vec_ok = g.C % kVec == 0 && g.in_pix_stride % kVec == 0 &&
+                        g.in_row_stride % kVec == 0 && g.out_pix_stride % kVec == 0 &&
+                        g.out_row_stride % kVec == 0;
+    const int64_t full = vec_ok ? (g.C / kVec) * kVec : 0;
+
+    if (g.type == PoolingType::Max) {
+        pooling_quant_launch<InT, OutT, kVec, true>(g, output, input, 0, full, qin, qout, stream);
+        pooling_quant_launch<InT, OutT, 1, true>(g, output, input, full, g.C - full, qin, qout,
+                                                 stream);
+    } else {
+        pooling_quant_launch<InT, OutT, kVec, false>(g, output, input, 0, full, qin, qout, stream);
+        pooling_quant_launch<InT, OutT, 1, false>(g, output, input, full, g.C - full, qin, qout,
+                                                  stream);
+    }
+}
+
+template <class InT>
+Status pooling_quant_run(const PoolingAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs, const ComputeContext& ctx)
+{
+    switch (output.data_type()) {
+    case DataType::s8:
+        pooling_quant_impl<InT, int8_t>(attrs, output, inputs, ctx);
+        return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+    case DataType::u8:
+        pooling_quant_impl<InT, uint8_t>(attrs, output, inputs, ctx);
+        return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+    default:
+        return Status::invalid_argument;
+    }
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 
@@ -764,7 +975,25 @@ Status pooling_cuda(const PoolingAttributes& attrs, TensorView& output,
                     std::span<const TensorView> inputs, const ComputeContext& ctx,
                     void* /*workspace*/)
 {
-    switch (inputs[0].data_type()) {
+    const DataType dtype = inputs[0].data_type();
+    const bool in_int = dtype == DataType::s8 || dtype == DataType::u8;
+    const bool out_int = output.data_type() == DataType::s8 || output.data_type() == DataType::u8;
+    if (in_int || out_int) {
+        if (!in_int || !out_int) {
+            return Status::invalid_argument;
+        }
+        // The quantized lane is the channel, and the window is fixed: adaptive
+        // has no such form, and an NHWC input is what supplies the lane.
+        if (attrs.adaptive() || !is_channel_last(inputs[0].layout())) {
+            return Status::unsupported;
+        }
+        if (dtype == DataType::s8) {
+            return pooling_quant_run<int8_t>(attrs, output, inputs, ctx);
+        }
+        return pooling_quant_run<uint8_t>(attrs, output, inputs, ctx);
+    }
+
+    switch (dtype) {
     case DataType::f32:
         pooling_dispatch<float>(attrs, output, inputs, ctx);
         return Status::ok;
