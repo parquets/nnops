@@ -21,16 +21,22 @@
 /// for the second, exactly as on the CPU. Every launch is on the caller's
 /// stream, so the phase order is the stream's.
 ///
-/// f32, f16 and bf16. An s8 weight (the CPU's W8A8 route) and a prepacked
-/// PackedRecurrent weight are both Status::unsupported here: the first would
-/// need the int8 MMA's per-row scaling and zero-point terms, and the second is
-/// a CPU-packer blob this driver has no reader for.
+/// f32, f16 and bf16 on the fp engine, and the CPU's W8A8 form: an s8 W and R
+/// put both products on the int8 MMA (matmul_i8.cuh), with the activation
+/// quantized per row from its own max — or read from its QuantParams when X
+/// arrives as s8 — and the int32 accumulate dequantized back into the compute
+/// dtype before the same gate pass. The weight scales are per gate row, so a
+/// phase reads the slice of the table its columns came from. A prepacked
+/// PackedRecurrent weight is still Status::unsupported: it is a CPU-packer blob
+/// this driver has no reader for.
 
 #include "backend/cuda/rnn/recurrent.h"
 
 #include "backend/cuda/cuda_common.cuh"
 #include "backend/cuda/matmul/gemm_common.cuh"
+#include "backend/cuda/matmul/matmul_i8.cuh"
 #include "backend/cuda/matmul/matmul_op.cuh"
+#include "backend/cuda/matmul/quant_rows.cuh"
 
 #include <algorithm>
 #include <climits>
@@ -356,29 +362,183 @@ inline AuxChannel& aux_channel()
     return ch;
 }
 
-/// One phase of one timestep: the recurrent product on the dense engine, then
-/// the fused gate pass.
+// =========================================================================
+//  W8A8 — the two products on the int8 MMA
+// =========================================================================
+
+/// A per-row scale table, or its per-tensor scalar (the CPU's RowScales).
+struct RowScales {
+    const float* rows = nullptr;
+    float scalar = 1.0f;
+};
+
+inline RowScales row_scales_of(const QuantParams& q, int64_t rows) noexcept
+{
+    RowScales r;
+    if (q.scale_data != nullptr && rows > 0 && q.num_scales >= rows) {
+        r.rows = q.scale_data;
+    } else {
+        r.scalar = q.scale;
+    }
+    return r;
+}
+
+/// One direction's slice of a weight's per-gate-row table: its own when the
+/// table spans every direction, else the shared one.
+inline RowScales weight_scales(const QuantParams& q, int64_t d, int64_t per_dir) noexcept
+{
+    RowScales r;
+    if (q.scale_data == nullptr) {
+        r.scalar = q.scale;
+    } else {
+        r.rows = (q.num_scales > per_dir) ? q.scale_data + d * per_dir : q.scale_data;
+    }
+    return r;
+}
+
+/// The quantized layer's operands, resolved once per call.
+struct Q8Plan {
+    const int8_t* w = nullptr;
+    const int8_t* r = nullptr;
+    int64_t w_ld = 0;
+    int64_t r_ld = 0;
+    QuantParams wq;
+    QuantParams rq;
+    bool x_s8 = false;
+    const int8_t* x8 = nullptr;
+    RowScales x_scales;
+};
+
+/// The dequantizing epilogue's kind and the storage its A is quantized to.
+template <class T> constexpr I8OutKind q8_kind() noexcept
+{
+    if constexpr (std::is_same_v<T, float>) {
+        return I8OutKind::F32;
+    } else if constexpr (std::is_same_v<T, __half>) {
+        return I8OutKind::F16;
+    } else {
+        return I8OutKind::BF16;
+    }
+}
+
+template <class T> constexpr DataType q8_dtype() noexcept
+{
+    if constexpr (std::is_same_v<T, float>) {
+        return DataType::f32;
+    } else if constexpr (std::is_same_v<T, __half>) {
+        return DataType::f16;
+    } else {
+        return DataType::bf16;
+    }
+}
+
+/// One product: A is the s8 activation at `a8` (row stride `a_ld`) or fp rows
+/// quantized here into `aq` with the dynamic per-row scales `as`; B is the
+/// weight's k-major s8 rows at `b`; the int32 accumulate is dequantized into
+/// `c`. Both parameter pairs are symmetric, as the operator requires.
+template <class T>
+Status q8_gemm(const int8_t* a8, const T* a_fp, int64_t rows, int64_t k, int64_t a_ld,
+               int8_t* aq, float* as, const RowScales& a_scales, const int8_t* b, int64_t n,
+               int64_t ldb, const RowScales& b_scales, T* c, int64_t ldc, cudaStream_t stream)
+{
+    GemmI8Params q;
+    if (a8 != nullptr) {
+        q.g.a = a8;
+        q.g.lda = a_ld;
+        // Host metadata: the engine stages it for the device.
+        q.sc_a = a_scales.rows;
+        q.sc_a_scalar = a_scales.scalar;
+    } else {
+        const Status st = qrows::quantize_dynamic(q8_dtype<T>(), a_fp, rows, k, a_ld, aq, as,
+                                                  stream);
+        if (!is_ok(st)) {
+            return st;
+        }
+        q.g.a = aq;
+        q.g.lda = k;
+        q.sc_a = as;
+        q.sc_a_scalar = 1.0f;
+        q.sc_a_device = true;
+    }
+    q.g.b = b;
+    q.g.c = c;
+    q.g.m = static_cast<int>(rows);
+    q.g.n = static_cast<int>(n);
+    q.g.k = static_cast<int>(k);
+    q.g.ldb = ldb;
+    q.g.ldc = ldc;
+    q.sc_b = b_scales.rows;
+    q.sc_b_scalar = b_scales.scalar;
+    q.out = q8_kind<T>();
+    return dense_gemm_i8_status(q, DataType::s8, /*trans_a=*/false, /*trans_b=*/true, stream);
+}
+
+/// The input projection over one chunk: [nrows·B, I] × [G·H, I]ᵀ.
+template <class T>
+Status q8_project(const Q8Plan& q8, int64_t x_ld, const int8_t* x8, const T* x_fp, int64_t t0,
+                  int64_t nrows, int64_t B, int64_t I, int64_t gate_row, int64_t d, T* proj,
+                  int8_t* aq, float* as, cudaStream_t stream)
+{
+    const int64_t row0 = t0 * B;
+    RowScales xs;
+    if (x8 != nullptr) {
+        xs = q8.x_scales;
+        if (xs.rows != nullptr) {
+            xs.rows += row0;
+        }
+    }
+    const int8_t* w_dir = q8.w + d * gate_row * q8.w_ld;
+    return q8_gemm<T>(x8 != nullptr ? x8 + row0 * x_ld : nullptr,
+                      x_fp != nullptr ? x_fp + row0 * x_ld : nullptr, nrows * B, I, x_ld, aq,
+                      as, xs, w_dir, gate_row, q8.w_ld, weight_scales(q8.wq, d, gate_row), proj,
+                      gate_row, stream);
+}
+
+/// One phase's recurrent product: [B, H] × [gates·H, H]ᵀ into `rec`'s slice.
+template <class T>
+Status q8_rec(const Q8Plan& q8, const T* a, int64_t B, int64_t H, int64_t gate_row,
+              int64_t col_base, int64_t gates, int64_t d, T* rec, int8_t* aq, float* as,
+              cudaStream_t stream)
+{
+    RowScales rs = weight_scales(q8.rq, d, gate_row);
+    if (rs.rows != nullptr) {
+        rs.rows += col_base;
+    }
+    // The recurrent product lands at the phase's own first columns, not at its
+    // slice of the gate row: the step kernel reads `rec[g*H + h]` phase-locally
+    // (only the projection buffer is indexed by the global column).
+    const int8_t* r_dir = q8.r + d * gate_row * q8.r_ld + col_base * q8.r_ld;
+    return q8_gemm<T>(nullptr, a, B, H, H, aq, as, RowScales{}, r_dir, gates * H, q8.r_ld, rs,
+                      rec, gate_row, stream);
+}
+
+/// One phase of one timestep: the recurrent product on the dense engine — fp,
+/// or the int8 one when the layer is quantized — then the fused gate pass.
 template <class T>
 Status run_phase(const cpu::RecurrentParams& p, StepKind kind, int64_t gates, int64_t gate_row,
                  int64_t col_base, const T* a, const T* r_dir, int64_t r_ld, T* rec, int64_t batch,
-                 int64_t hidden, StepParams<T> s, cudaStream_t stream)
+                 int64_t hidden, StepParams<T> s, const Q8Plan* q8, int64_t d, int8_t* aq,
+                 float* as, cudaStream_t stream)
 {
-    GemmParams g;
-    g.a = a;
-    g.b = r_dir + (col_base * r_ld);
-    g.c = rec;
-    g.m = static_cast<int>(batch);
-    g.n = static_cast<int>(gates * hidden);
-    g.k = static_cast<int>(hidden);
-    g.lda = hidden;
-    g.ldb = r_ld;
-    g.ldc = gate_row;
-    g.alpha = 1.0f;
-    g.beta = 0.0f;
-    g.splits_hint = narrow_split_hint(batch, hidden, gates * hidden, p.dtype);
-
-    const Status st = dense_gemm_status(g, p.dtype, /*transpose_a=*/false, /*transpose_b=*/true,
-                                        stream);
+    Status st = Status::ok;
+    if (q8 != nullptr) {
+        st = q8_rec<T>(*q8, a, batch, hidden, gate_row, col_base, gates, d, rec, aq, as, stream);
+    } else {
+        GemmParams g;
+        g.a = a;
+        g.b = r_dir + (col_base * r_ld);
+        g.c = rec;
+        g.m = static_cast<int>(batch);
+        g.n = static_cast<int>(gates * hidden);
+        g.k = static_cast<int>(hidden);
+        g.lda = hidden;
+        g.ldb = r_ld;
+        g.ldc = gate_row;
+        g.alpha = 1.0f;
+        g.beta = 0.0f;
+        g.splits_hint = narrow_split_hint(batch, hidden, gates * hidden, p.dtype);
+        st = dense_gemm_status(g, p.dtype, /*transpose_a=*/false, /*transpose_b=*/true, stream);
+    }
     if (!is_ok(st)) {
         return st;
     }
@@ -466,12 +626,28 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
         return Status::invalid_argument;
     }
 
-    const T* const xp = x.ptr<T>();
-    const T* const wp = w.ptr<T>();
-    const T* const rp = r.ptr<T>();
+    // W8A8: the weights are s8 and both products run on the int8 MMA. X is
+    // float (quantized from its own rows) or s8 with its own scale table.
+    const bool quant = p.weight_dtype == DataType::s8;
+    Q8Plan q8;
+    if (quant) {
+        q8.w = w.ptr<int8_t>();
+        q8.r = r.ptr<int8_t>();
+        q8.w_ld = w.row_stride_elems();
+        q8.r_ld = r.row_stride_elems();
+        q8.wq = w.quant_params();
+        q8.rq = r.quant_params();
+        q8.x_s8 = x.data_type() == DataType::s8;
+        q8.x8 = q8.x_s8 ? x.ptr<int8_t>() : nullptr;
+        q8.x_scales = row_scales_of(x.quant_params(), Tn * B);
+    }
+
+    const T* const xp = q8.x_s8 ? nullptr : x.ptr<T>();
+    const T* const wp = quant ? nullptr : w.ptr<T>();
+    const T* const rp = quant ? nullptr : r.ptr<T>();
     const int64_t x_ld = x.row_stride_elems();
-    const int64_t w_ld = w.row_stride_elems();
-    const int64_t r_ld = r.row_stride_elems();
+    const int64_t w_ld = quant ? q8.w_ld : w.row_stride_elems();
+    const int64_t r_ld = quant ? q8.r_ld : r.row_stride_elems();
 
     const T* const bias_base = bias != nullptr ? bias->ptr<T>() : nullptr;
     const int64_t bias_ld = bias != nullptr ? bias->row_stride_elems() : 0;
@@ -500,9 +676,11 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
         D == 2 && nnops::detail::cuda_rnn_serial.load(std::memory_order_relaxed) == 0;
 
     // The projection buffer follows the CPU's L3 budget: a chunk is however many
-    // timesteps keep [chunk·B, G·H] under the cap. A bidirectional layer splits
-    // the cap between its two running timelines.
-    int64_t chunk = kProjectionBudget / std::max<int64_t>(B * gate_row * esz, 1);
+    // timesteps keep [chunk·B, G·H] under the cap, plus the quantized route's
+    // staged A and its per-row scale table. A bidirectional layer splits the cap
+    // between its two running timelines.
+    const int64_t row_bytes = gate_row * esz + (quant ? I + 4 : 0);
+    int64_t chunk = kProjectionBudget / std::max<int64_t>(B * row_bytes, 1);
     if (concurrent) {
         chunk /= 2;
     }
@@ -520,6 +698,10 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
         T* c_b = nullptr;
         T* zb = nullptr;  ///< GRU (lbr = 0) only
         T* aux = nullptr;
+        int8_t* proj_a = nullptr; ///< W8A8: the chunk's quantized A
+        float* proj_s = nullptr;  ///< W8A8: its per-row scales
+        int8_t* step_a = nullptr; ///< W8A8: the step's quantized A
+        float* step_s = nullptr;  ///< W8A8: its per-row scales
     };
     const int nsets = concurrent ? 2 : 1;
 
@@ -527,6 +709,7 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
     // aligned region sizes — exactly what the carve below consumes.
     int64_t bytes = 0;
     const auto region = [&](int64_t elems) { bytes = align_up(bytes) + elems * esz; };
+    const auto region_bytes = [&](int64_t nbytes) { bytes = align_up(bytes) + nbytes; };
     for (int set = 0; set < nsets; ++set) {
         region(chunk * B * gate_row);
         region(B * gate_row);
@@ -539,6 +722,12 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
         if (grn) {
             region(B * H);
             region(B * H);
+        }
+        if (quant) {
+            region_bytes(chunk * B * I);
+            region_bytes(chunk * B * 4);
+            region_bytes(B * H);
+            region_bytes(B * 4);
         }
     }
 
@@ -555,6 +744,12 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
         used += elems * esz;
         return q;
     };
+    const auto take_bytes = [&](int64_t nbytes, auto* tag) {
+        used = align_up(used);
+        void* q = base + used;
+        used += nbytes;
+        return static_cast<decltype(tag)>(q);
+    };
 
     Bufs bufs[2];
     for (int set = 0; set < nsets; ++set) {
@@ -567,6 +762,12 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
         bu.c_b = lstm ? take(B * H) : nullptr;
         bu.zb = grn ? take(B * H) : nullptr;
         bu.aux = grn ? take(B * H) : nullptr;
+        if (quant) {
+            bu.proj_a = take_bytes(chunk * B * I, static_cast<int8_t*>(nullptr));
+            bu.proj_s = take_bytes(chunk * B * 4, static_cast<float*>(nullptr));
+            bu.step_a = take_bytes(B * H, static_cast<int8_t*>(nullptr));
+            bu.step_s = take_bytes(B * 4, static_cast<float*>(nullptr));
+        }
     }
 
     const int64_t state_total = B * H;
@@ -595,8 +796,8 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
 
         const bool fwd = (D > 1) ? (d == 0) : (p.direction != RnnDirection::Reverse);
         const int64_t nchunks = (Tn + chunk - 1) / chunk;
-        const T* const w_dir = wp + d * gate_row * w_ld;
-        const T* const r_dir = rp + d * gate_row * r_ld;
+        const T* const w_dir = quant ? nullptr : wp + d * gate_row * w_ld;
+        const T* const r_dir = quant ? nullptr : rp + d * gate_row * r_ld;
         const T* const wb_dir = bias_base != nullptr ? bias_base + d * bias_ld : nullptr;
         const T* const rb_dir = wb_dir != nullptr ? wb_dir + gate_row : nullptr;
 
@@ -609,7 +810,13 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
             }
 
             // The projection over the chunk: [nrows·B, I] × [G·H, I]^T.
-            {
+            if (quant) {
+                const Status st = q8_project<T>(q8, x_ld, q8.x8, xp, t0, nrows, B, I, gate_row,
+                                                d, bu.proj, bu.proj_a, bu.proj_s, s);
+                if (!is_ok(st)) {
+                    return st;
+                }
+            } else {
                 GemmParams g;
                 g.a = xp + (t0 * B) * x_ld;
                 g.b = w_dir;
@@ -696,8 +903,12 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
                     step.lbr = lbr ? 1 : 0;
 
                     const T* const a = ph == 1 ? bu.aux : h_prev;
-                    const Status st = run_phase<T>(p, kind, gates, gate_row, col_base, a,
-                                                   r_dir, r_ld, bu.rec, B, H, step, s);
+                    const Status st =
+                        quant ? run_phase<T>(p, kind, gates, gate_row, col_base, a, nullptr, 0,
+                                             bu.rec, B, H, step, &q8, d, bu.step_a, bu.step_s, s)
+                              : run_phase<T>(p, kind, gates, gate_row, col_base, a, r_dir, r_ld,
+                                             bu.rec, B, H, step, nullptr, 0, nullptr, nullptr,
+                                             s);
                     if (!is_ok(st)) {
                         return st;
                     }
@@ -757,20 +968,39 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
 Status recurrent_cuda(const cpu::RecurrentParams& params, std::span<TensorView> outputs,
                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
-    // The compute dtype and the weight dtype coincide on every route this
-    // driver carries; a mismatch is the quantized form (or a bad call).
-    if (params.weight_dtype != params.dtype) {
-        return Status::unsupported;
-    }
     if (inputs.size() < 3 || outputs.empty()) {
         return Status::invalid_argument;
     }
     if (is_packed_recurrent(inputs[1].layout())) {
         return Status::unsupported;
     }
-    if (inputs[0].data_type() != params.dtype || inputs[1].data_type() != params.dtype ||
-        inputs[2].data_type() != params.dtype) {
-        return Status::unsupported;
+
+    const bool quant = params.weight_dtype == DataType::s8;
+    if (quant) {
+        // W8A8: both weights are s8, the activation is the compute dtype or s8
+        // (whose compute dtype the operator resolves to f32), and the int8
+        // engine's dequantize needs a 16-bit or f32 destination.
+        if (params.dtype != DataType::f32 && params.dtype != DataType::f16 &&
+            params.dtype != DataType::bf16) {
+            return Status::unsupported;
+        }
+        if (inputs[1].data_type() != DataType::s8 || inputs[2].data_type() != DataType::s8) {
+            return Status::unsupported;
+        }
+        const DataType xdt = inputs[0].data_type();
+        if (xdt == DataType::s8 ? params.dtype != DataType::f32 : xdt != params.dtype) {
+            return Status::unsupported;
+        }
+    } else {
+        // The plain route: one dtype for the activation, the weights and the
+        // compute.
+        if (params.weight_dtype != params.dtype) {
+            return Status::unsupported;
+        }
+        if (inputs[0].data_type() != params.dtype || inputs[1].data_type() != params.dtype ||
+            inputs[2].data_type() != params.dtype) {
+            return Status::unsupported;
+        }
     }
 
     switch (params.dtype) {

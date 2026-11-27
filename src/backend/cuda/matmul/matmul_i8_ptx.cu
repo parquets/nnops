@@ -516,7 +516,8 @@ bool i8_dense_tile(GemmI8Params q, DataType a_dt, bool trans_a, bool trans_b,
     if (tile >= detail::kI8TileCount) {
         tile = detail::kI8DefaultTile;
     }
-    const bool dequant = q.out == I8OutKind::F32 || q.out == I8OutKind::F16;
+    const bool dequant = q.out == I8OutKind::F32 || q.out == I8OutKind::F16 ||
+                         q.out == I8OutKind::BF16;
     if (a_dt == DataType::u8) {
         return dequant ?
                    detail::i8_run_tile<uint8_t, true>(q, trans_a, trans_b, batch, stream, tile) :

@@ -525,4 +525,92 @@ NNOPS_TEST(cuda_linear_q4_bf16) {
     NNOPS_EXPECT_TRUE(worst <= 2e-2f);
 }
 
+// ============================================================
+// Offline-quantized activations (fp x with QuantParams × s8 weight)
+// ============================================================
+
+NNOPS_TEST(cuda_linear_dq) {
+    // The fused route MatMul gained, through Linear's [N, K] weight pose. x is
+    // float and carries the parameters it is quantized with; w is s8 with
+    // per-channel scales; the output is x's dtype, dequantized.
+    for (bool per_token : {false, true}) {
+        const int64_t M = 9, K = 40, N = 12;
+        HostTensor x = make_host_random(std::vector<int64_t>{M, K}, DataType::f32, false,
+                                        71, -1.0f, 1.0f);
+        test::XorShift128 rng(73);
+        std::vector<int8_t> w(static_cast<size_t>(N * K));
+        for (auto& e : w) {
+            e = static_cast<int8_t>(int32_t(rng.next_u64() % 255) - 127);
+        }
+        std::vector<float> xs(static_cast<size_t>(M));
+        std::vector<int32_t> xz(static_cast<size_t>(M));
+        std::vector<float> ws(static_cast<size_t>(N));
+        for (int64_t i = 0; i < M; ++i) {
+            xs[static_cast<size_t>(i)] = 0.015f + 0.003f * float(i % 5);
+            xz[static_cast<size_t>(i)] = int32_t(i % 7) - 3;
+        }
+        for (int64_t i = 0; i < N; ++i) {
+            ws[static_cast<size_t>(i)] = 0.004f + 0.001f * float(i % 5);
+        }
+        QuantParams qx;
+        qx.scale = 0.02f;
+        qx.zero_point = -3;
+        if (per_token) {
+            qx.granularity = QuantGranularity::PerToken;
+            qx.scale_data = xs.data();
+            qx.zero_point_data = xz.data();
+            qx.num_scales = M;
+        }
+        QuantParams qw;
+        qw.granularity = QuantGranularity::PerChannel;
+        qw.scale_data = ws.data();
+        qw.num_scales = N;
+
+        std::vector<float> bias_bytes(static_cast<size_t>(N));
+        for (auto& b : bias_bytes) { b = rng.next_float(-0.5f, 0.5f); }
+
+        const auto view = [](const std::vector<int64_t>& sh, DataType dt, void* d,
+                             const QuantParams& qp) {
+            return TensorView(std::span<const int64_t>(sh.data(), sh.size()), dt, d,
+                              TensorLayout::Dense, qp);
+        };
+        LinearAttributes attrs;
+        TensorView xv = view({M, K}, DataType::f32, x.bytes.data(), qx);
+        TensorView wv = view({N, K}, DataType::s8, w.data(), qw);
+        TensorView bv = view({N}, DataType::f32, bias_bytes.data(), {});
+        const TensorView ins[] = {xv, wv, bv};
+
+        auto op_cpu = Linear::create(attrs, Backend::CPU);
+        const std::vector<TensorDesc> descs = {xv.desc(), wv.desc(), bv.desc()};
+        const TensorDesc od = op_cpu->getOutputTensorDesc(descs).front();
+        NNOPS_EXPECT_TRUE(od.dtype == DataType::f32);
+        const int64_t n = od.dims[0] * od.dims[1];
+        std::vector<float> out_cpu(static_cast<size_t>(n), 0.0f);
+        std::vector<float> out_dev(static_cast<size_t>(n), 0.0f);
+        TensorView cv = view({M, N}, DataType::f32, out_cpu.data(), {});
+        cpu_run(*op_cpu, cv, ins);
+
+        CudaBuffer dx(x.bytes.size());
+        dx.upload(x.bytes.data(), x.bytes.size());
+        CudaBuffer dw(static_cast<size_t>(w.size()));
+        dw.upload(w.data(), w.size());
+        CudaBuffer db(static_cast<size_t>(N) * sizeof(float));
+        db.upload(bias_bytes.data(), bias_bytes.size() * sizeof(float));
+        CudaBuffer dout(static_cast<size_t>(n) * sizeof(float));
+        dout.zero();
+        const TensorView dins[] = {view({M, K}, DataType::f32, dx.data(), qx),
+                                   view({N, K}, DataType::s8, dw.data(), qw),
+                                   view({N}, DataType::f32, db.data(), {})};
+        TensorView dcv = view({M, N}, DataType::f32, dout.data(), {});
+        auto op_dev = Linear::create(attrs, Backend::CUDA);
+        cuda_run(*op_dev, dcv, dins);
+        dout.download(out_dev.data(), out_dev.size() * sizeof(float));
+
+        for (size_t i = 0; i < out_cpu.size(); ++i) {
+            NNOPS_EXPECT_TRUE(std::fabs(out_dev[i] - out_cpu[i]) <=
+                              2e-4f * std::max(1.0f, std::fabs(out_cpu[i])));
+        }
+    }
+}
+
 #endif  // NNOPS_HAS_CUDA

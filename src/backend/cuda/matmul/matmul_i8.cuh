@@ -337,10 +337,18 @@ inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a, 
         cursor += (bytes + 15) & ~int64_t(15);
     };
     int64_t off_zpa = -1, off_zpb = -1, off_sca = -1, off_scb = -1;
-    stage(q.zp_a, int64_t(p.m) * 4, off_zpa);
+    // A per-row table the caller already staged (or a dynamic one the
+    // quantization kernel wrote) is device memory: neither staged nor replaced.
+    const bool sc_a_dev = q.sc_a != nullptr && q.sc_a_device;
+    const bool zp_a_dev = q.zp_a != nullptr && q.zp_a_device;
+    if (!zp_a_dev) {
+        stage(q.zp_a, int64_t(p.m) * 4, off_zpa);
+    }
     stage(q.zp_b, int64_t(p.n) * 4, off_zpb);
     if (need_scale) {
-        stage(q.sc_a, int64_t(p.m) * 4, off_sca);
+        if (!sc_a_dev) {
+            stage(q.sc_a, int64_t(p.m) * 4, off_sca);
+        }
         stage(q.sc_b, int64_t(p.n) * 4, off_scb);
     }
     const int64_t off_partial = cursor;
@@ -370,9 +378,11 @@ inline Status dense_gemm_i8_status(GemmI8Params q, DataType a_dt, bool trans_a, 
         cudaGetLastError();
         return Status::internal;
     }
-    q.zp_a = off_zpa >= 0 ? reinterpret_cast<const int32_t*>(base + off_zpa) : nullptr;
+    q.zp_a = zp_a_dev ? q.zp_a :
+             (off_zpa >= 0 ? reinterpret_cast<const int32_t*>(base + off_zpa) : nullptr);
     q.zp_b = off_zpb >= 0 ? reinterpret_cast<const int32_t*>(base + off_zpb) : nullptr;
-    q.sc_a = off_sca >= 0 ? reinterpret_cast<const float*>(base + off_sca) : nullptr;
+    q.sc_a = sc_a_dev ? q.sc_a :
+             (off_sca >= 0 ? reinterpret_cast<const float*>(base + off_sca) : nullptr);
     q.sc_b = off_scb >= 0 ? reinterpret_cast<const float*>(base + off_scb) : nullptr;
 
     // ---- reductions ------------------------------------------------------

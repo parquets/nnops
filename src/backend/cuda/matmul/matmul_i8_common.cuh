@@ -22,6 +22,7 @@
 #include "gemm_common.cuh"
 #include "nnops/core/data_type.hpp"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -30,13 +31,17 @@
 
 namespace nnops::backend::cuda {
 
-/// Where the compensated int32 accumulate goes.
+/// Where the compensated int32 accumulate goes. BF16 is the closed set's one
+/// extra: no operator resolves it as an output dtype (MatMul's integer pair
+/// dequantizes to f32/f16), but a recurrent layer's compute dtype may be bf16,
+/// and its gate buffers are in that dtype.
 enum class I8OutKind {
     S32,
     S8,
     U8,
     F32,
-    F16
+    F16,
+    BF16
 };
 
 /// Map an output dtype onto the kind the epilogue switches on.
@@ -95,6 +100,11 @@ struct GemmI8Params {
     float sc_a_scalar = 1.0f;
     const float* sc_b = nullptr;
     float sc_b_scalar = 1.0f;
+    /// `sc_a`/`zp_a` already point at device memory (a per-row table the
+    /// quantization kernel's caller staged or wrote), so the launcher must not
+    /// stage them from the host.
+    bool sc_a_device = false;
+    bool zp_a_device = false;
 
     /// The requant destination's per-tensor parameters (s8/u8 output only).
     float out_scale = 1.0f;
@@ -195,6 +205,11 @@ __device__ inline float i8_fp_value(const GemmI8Params& q, int32_t raw, int m, i
         if (biasf != nullptr) {
             b = biasf[n];
         }
+    } else if (q.out == I8OutKind::BF16) {
+        const __nv_bfloat16* biasb = static_cast<const __nv_bfloat16*>(q.bias);
+        if (biasb != nullptr) {
+            b = __bfloat162float(biasb[n]);
+        }
     } else {
         const __half* biash = static_cast<const __half*>(q.bias);
         if (biash != nullptr) {
@@ -236,6 +251,10 @@ __device__ inline void i8_epilogue_element(GemmI8Params q, int64_t c_off, const 
     case I8OutKind::F16:
         static_cast<__half*>(p.c)[c_off + idx] =
             __float2half(i8_fp_value(q, raw, m, n, r_a_b, r_b_b));
+        return;
+    case I8OutKind::BF16:
+        static_cast<__nv_bfloat16*>(p.c)[c_off + idx] =
+            __float2bfloat16(i8_fp_value(q, raw, m, n, r_a_b, r_b_b));
         return;
     }
 }

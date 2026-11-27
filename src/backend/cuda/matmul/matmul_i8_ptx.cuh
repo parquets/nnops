@@ -33,8 +33,9 @@
 /// Covers A row-major or transposed with B either k-major `[N, K]` or n-major
 /// `[K, N]`, into every destination the operator resolves: s32 with the int32
 /// bias and the Relu stage, s8/u8 with the CPU's exact requant, and f32/f16
-/// dequantized by s_a*s_b with the bias, the clamp and the activation. The two
-/// families are distinct template instantiations (`Dequant`), because the fp
+/// dequantized by s_a*s_b with the bias, the clamp and the activation (bf16 too,
+/// for the recurrent layer's compute dtype). The two families are distinct
+/// template instantiations (`Dequant`), because the fp
 /// epilogue's exp/tanh trees cost register slots that the integer destination
 /// would otherwise spend on a fourth block per SM. Wave quantization and split-K
 /// stay the shared front end's.

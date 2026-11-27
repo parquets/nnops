@@ -8,8 +8,11 @@
 /// overwriting it. There is no alpha or beta on this operator — the activation
 /// is everything the caller asked for. f32, f16 and bf16; an integer pair takes
 /// matmul_i8.cuh's MatMulInteger route (s32, s8/u8, f32/f16 destinations), but
-/// not add_to — an integer residual is not folded there yet.
+/// not add_to — an integer residual is not folded there yet. A floating x with
+/// active QuantParams against the same s8 weight takes matmul_dq.cuh, its add_to
+/// refused for the same reason.
 
+#include "matmul_dq.cuh"
 #include "matmul_i8.cuh"
 #include "matmul_f32_host.hpp"
 #include "matmul_f16_host.hpp"
@@ -89,6 +92,43 @@ Status linear_i8_cuda(const LinearAttributes& attrs, TensorView& output,
                                 static_cast<cudaStream_t>(ctx.cuda_stream));
 }
 
+/// The offline-quantized activation route: x's own parameters quantize it, the
+/// integer engine runs [M, K] × [N, K]ᵀ, and the accumulate dequantizes into x's
+/// dtype. The residual has no fold in the integer engine.
+Status linear_dq_cuda(const LinearAttributes& attrs, TensorView& output,
+                      std::span<const TensorView> inputs, const ComputeContext& ctx)
+{
+    const TensorView& x = inputs[0];
+    const TensorView& w = inputs[1];
+    const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
+
+    if (attrs.add_to) {
+        return Status::unsupported;
+    }
+    const QuantParams& qx = x.quant_params();
+    if (!qx.is_active() || (qx.granularity != QuantGranularity::PerTensor &&
+                            qx.granularity != QuantGranularity::PerToken)) {
+        return Status::invalid_argument;
+    }
+
+    detail::DqCall call;
+    call.a = &x;
+    call.b = &w;
+    call.c = &output;
+    call.bias = bias;
+    call.trans_a = false;
+    call.trans_b = true;
+    // Linear has no act_quant_dtype of its own; the operator's default (s8) is
+    // the only storage this route quantizes into.
+    call.act_dt = DataType::s8;
+    call.epilogue = attrs.epilogue.type;
+    call.ep_alpha = attrs.epilogue.alpha;
+    call.ep_beta = attrs.epilogue.beta;
+    call.min_clip = attrs.epilogue.min_clip;
+    call.max_clip = attrs.epilogue.max_clip;
+    return detail::dense_gemm_dq_status(call, static_cast<cudaStream_t>(ctx.cuda_stream));
+}
+
 /// The w4a16 route: a 16-bit activation against a llama.cpp Q4_0/Q4_1/Q8_0
 /// `[N, K]` weight. add_to is the post-activation residual, as on the dense
 /// path, so it reaches the call as the epilogue's residual rather than beta.
@@ -164,6 +204,14 @@ Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
             return Status::unsupported;
         }
         return linear_i8_cuda(attrs, output, inputs, ctx, kind);
+    }
+    if (w.data_type() == DataType::s8 && (dt == DataType::f32 || dt == DataType::f16)) {
+        if (output.numel() == 0) {
+            return Status::ok;
+        }
+        return x.quant_params().is_active() ?
+                   linear_dq_cuda(attrs, output, inputs, ctx) :
+                   Status::invalid_argument;
     }
     if (is_block_packed_dtype(w.data_type())) {
         if (output.numel() == 0) {

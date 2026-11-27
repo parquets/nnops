@@ -17,8 +17,11 @@
 /// clamp and activation both on the finished sum. f32, f16 and bf16 take that
 /// route; an integer pair (u8|s8 × s8) takes matmul_i8.cuh and writes the
 /// MatMulInteger destinations (s32, s8/u8 requantized, f32/f16 dequantized).
-/// The fp-activation-with-QuantParams form of the integer GEMM stays on the CPU.
+/// A floating A carrying active QuantParams against the same s8 B takes
+/// matmul_dq.cuh: A is quantized with its own parameters, the int8 engine runs,
+/// and the accumulate is dequantized back into A's dtype.
 
+#include "matmul_dq.cuh"
 #include "matmul_i8.cuh"
 #include "matmul_f32_host.hpp"
 #include "matmul_f16_host.hpp"
@@ -94,6 +97,38 @@ Status matmul_i8_cuda(const MatMulAttributes& attrs, TensorView& output,
                                 static_cast<cudaStream_t>(ctx.cuda_stream));
 }
 
+/// The offline-quantized activation route: A's own parameters quantize it into
+/// an s8 buffer, the integer engine runs one product per batch element, and its
+/// dequantizing epilogue writes A's dtype.
+Status matmul_dq_cuda(const MatMulAttributes& attrs, TensorView& output,
+                      std::span<const TensorView> inputs, const ComputeContext& ctx)
+{
+    const TensorView& a = inputs[0];
+    const TensorView& b = inputs[1];
+    const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
+
+    const QuantParams& qa = a.quant_params();
+    if (!qa.is_active() || (qa.granularity != QuantGranularity::PerTensor &&
+                            qa.granularity != QuantGranularity::PerToken)) {
+        return Status::invalid_argument;
+    }
+
+    detail::DqCall call;
+    call.a = &a;
+    call.b = &b;
+    call.c = &output;
+    call.bias = bias;
+    call.trans_a = attrs.transpose_a;
+    call.trans_b = attrs.transpose_b;
+    call.act_dt = attrs.act_quant_dtype;
+    call.epilogue = attrs.epilogue.type;
+    call.ep_alpha = attrs.epilogue.alpha;
+    call.ep_beta = attrs.epilogue.beta;
+    call.min_clip = attrs.epilogue.min_clip;
+    call.max_clip = attrs.epilogue.max_clip;
+    return detail::dense_gemm_dq_status(call, static_cast<cudaStream_t>(ctx.cuda_stream));
+}
+
 /// The w4a16 route: a 16-bit activation against a llama.cpp Q4_0/Q4_1/Q8_0
 /// block stream. The weight's logical dims read the same as a dense one — the
 /// block packing changes the storage, not the shape — and its strides are
@@ -162,6 +197,16 @@ Status matmul_cuda(const MatMulAttributes& attrs, TensorView& output,
             return Status::unsupported;
         }
         return matmul_i8_cuda(attrs, output, inputs, ctx, kind);
+    }
+    if (b.data_type() == DataType::s8 && (dt == DataType::f32 || dt == DataType::f16)) {
+        if (output.numel() == 0) {
+            return Status::ok;
+        }
+        // An inactive parameter set has no defined meaning here (a float A is
+        // not a quantized tensor), which is the CPU's answer too.
+        return a.quant_params().is_active() ?
+                   matmul_dq_cuda(attrs, output, inputs, ctx) :
+                   Status::invalid_argument;
     }
     if (is_block_packed_dtype(b.data_type())) {
         if (output.numel() == 0) {

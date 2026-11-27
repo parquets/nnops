@@ -14,9 +14,12 @@
 /// pipeline, while the gate row is small enough that its launch and read cost is
 /// the step's noise beside the two products.
 ///
-/// The fp route only: f32, f16 and bf16. An s8 W — the CPU's W8A8 route — is
-/// answered with Status::unsupported, as is a prepacked (PackedRecurrent) W,
-/// which the CPU packer produces and this driver never reads.
+/// f32, f16 and bf16 on the fp engine, and the CPU's W8A8 form: an s8 W and R
+/// put both products on the int8 MMA (matmul_i8.cuh), with the activation
+/// quantized per row from its own max — or read from QuantParams when X arrives
+/// as s8 — and the int32 accumulate dequantized into the compute dtype before
+/// the same gate pass. A prepacked (PackedRecurrent) W is refused: it is a
+/// CPU-packer blob this driver has no reader for.
 ///
 /// RecurrentParams is the CPU header's, because the operator dispatch layer
 /// resolves one kernel signature for every backend; this file only adds the

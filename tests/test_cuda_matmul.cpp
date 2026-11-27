@@ -439,32 +439,39 @@ NNOPS_TEST(cuda_matmul_dense_strides) {
 }
 
 NNOPS_TEST(cuda_matmul_i8_rejects_unsupported) {
-    // The fp-activation × s8 pair (quantize-on-the-fly) has no CUDA route: B's
-    // dtype and A's disagree, and the fp engine refuses the mismatch.
+    // The fp-activation × s8 pair is a route now, so the refusals left are the
+    // parameter shapes it does not define: no active QuantParams on A (a float
+    // A is not a quantized tensor), and a per-channel A scale, which the CPU
+    // refuses too. Both answer before anything is launched, so the host
+    // pointers here are never read by a kernel.
     const int64_t ashape[] = {4, 8};
     const int64_t bshape[] = {8, 4};
     std::vector<float> a(32, 1.0f);
     std::vector<int8_t> b(32, 1);
     std::vector<float> a_s(4, 0.01f);
     std::vector<int32_t> a_zp(4, 0);
-    QuantParams qa;
-    qa.scale = 0.01f;
-    qa.zero_point = 3;
-    qa.granularity = QuantGranularity::PerToken;
-    qa.scale_data = a_s.data();
-    qa.zero_point_data = a_zp.data();
-    qa.num_scales = 4;
-
-    TensorView av(ashape, DataType::f32, a.data(), TensorLayout::Dense, qa);
-    TensorView bv(bshape, DataType::s8, b.data());
     const int64_t cshape[] = {4, 4};
     std::vector<float> out(16, 0.0f);
+    TensorView bv(bshape, DataType::s8, b.data());
     TensorView cv(cshape, DataType::f32, out.data());
-
     auto op = MatMul::create(MatMulAttributes{}, Backend::CUDA);
-    const TensorView ins[] = {av, bv};
-    NNOPS_EXPECT_EQ(op->compute({&cv, 1}, ins, cuda_context(), nullptr),
-                    Status::unsupported);
+
+    {
+        TensorView av(ashape, DataType::f32, a.data());
+        const TensorView ins[] = {av, bv};
+        NNOPS_EXPECT_EQ(op->compute({&cv, 1}, ins, cuda_context(), nullptr),
+                        Status::invalid_argument);
+    }
+    {
+        QuantParams qa;
+        qa.granularity = QuantGranularity::PerChannel;
+        qa.scale_data = a_s.data();
+        qa.num_scales = 8;
+        TensorView av(ashape, DataType::f32, a.data(), TensorLayout::Dense, qa);
+        const TensorView ins[] = {av, bv};
+        NNOPS_EXPECT_EQ(op->compute({&cv, 1}, ins, cuda_context(), nullptr),
+                        Status::invalid_argument);
+    }
 }
 
 // ============================================================
@@ -1024,6 +1031,213 @@ NNOPS_TEST(cuda_matmul_rejects_oversized_batch) {
     const TensorView ins[] = {av, bv};
     NNOPS_EXPECT_EQ(op->compute({&cv, 1}, ins, cuda_context(), nullptr),
                     Status::unsupported);
+}
+
+// ============================================================
+// Offline-quantized activations (fp A with QuantParams × s8 B)
+// ============================================================
+
+namespace {
+
+struct DqCase {
+    std::vector<int64_t> ashape, bshape;
+    DataType adt = DataType::f32;
+    DataType act = DataType::s8;
+    bool tb = false;
+    bool bias = false;
+    bool per_token = false;
+    bool per_channel_b = false;
+    bool relu = false;
+    uint64_t seed = 21;
+};
+
+/// One dq call through both backends. The CPU quantizes A with the same
+/// parameters and rides the same integer GEMM, so the outputs agree to the
+/// dequant arithmetic's rounding (the CPU products run in double in places).
+void run_dq_case(const DqCase& c, const char* what)
+{
+    const int64_t ar = static_cast<int64_t>(c.ashape.size());
+    const int64_t br = static_cast<int64_t>(c.bshape.size());
+    const int64_t M = c.ashape[ar - 2];
+    const int64_t K = c.ashape[ar - 1];
+    const int64_t N = c.tb ? c.bshape[br - 2] : c.bshape[br - 1];
+    NNOPS_EXPECT_EQ(K, c.tb ? c.bshape[br - 1] : c.bshape[br - 2]);
+    // A's physical rows: the flattened leading dims and the M axis.
+    const int64_t rows = numel_of(c.ashape) / K;
+
+    test::XorShift128 rng(c.seed);
+    HostTensor a = make_host_random(c.ashape, c.adt, false, c.seed, -1.0f, 1.0f);
+    std::vector<float> a_s(static_cast<size_t>(rows));
+    std::vector<int32_t> a_zp(static_cast<size_t>(rows));
+    for (int64_t i = 0; i < rows; ++i) {
+        a_s[static_cast<size_t>(i)] = 0.015f + 0.003f * float(i % 5);
+        a_zp[static_cast<size_t>(i)] = int32_t(i % 7) - 3;
+    }
+    QuantParams qa;
+    qa.scale = 0.02f;
+    qa.zero_point = -3;
+    if (c.per_token) {
+        qa.granularity = QuantGranularity::PerToken;
+        qa.scale_data = a_s.data();
+        qa.zero_point_data = a_zp.data();
+        qa.num_scales = rows;
+    }
+
+    std::vector<int8_t> b(static_cast<size_t>(numel_of(c.bshape)));
+    for (auto& e : b) {
+        e = static_cast<int8_t>(int32_t(rng.next_u64() % 255) - 127);
+    }
+    std::vector<float> b_s(static_cast<size_t>(N));
+    std::vector<int32_t> b_zp(static_cast<size_t>(N));
+    for (int64_t i = 0; i < N; ++i) {
+        b_s[static_cast<size_t>(i)] = 0.004f + 0.001f * float(i % 5);
+        b_zp[static_cast<size_t>(i)] = int32_t(i % 7) - 3;
+    }
+    QuantParams qb;
+    qb.scale = 0.004f;
+    qb.zero_point = 3;
+    if (c.per_channel_b) {
+        qb.granularity = QuantGranularity::PerChannel;
+        qb.scale_data = b_s.data();
+        qb.zero_point_data = b_zp.data();
+        qb.num_scales = N;
+    }
+
+    std::vector<uint8_t> bias_bytes;
+    if (c.bias) {
+        bias_bytes.resize(static_cast<size_t>(N) * size_t(data_type_size(c.adt)));
+        for (int64_t i = 0; i < N; ++i) {
+            if (c.adt == DataType::f16) {
+                reinterpret_cast<nnops::backend::cpu::half*>(bias_bytes.data())[i] =
+                    nnops::backend::cpu::float_to_half(rng.next_float(-0.5f, 0.5f));
+            } else {
+                reinterpret_cast<float*>(bias_bytes.data())[i] = rng.next_float(-0.5f, 0.5f);
+            }
+        }
+    }
+
+    MatMulAttributes attrs;
+    attrs.transpose_b = c.tb;
+    attrs.act_quant_dtype = c.act;
+    if (c.relu) {
+        attrs.epilogue.type = EpilogueActivateType::Relu;
+    }
+
+    TensorView av = view_of(c.ashape, c.adt, a.bytes.data(), qa);
+    TensorView bv = view_of(c.bshape, DataType::s8, b.data(), qb);
+    TensorView biasv;
+    std::vector<TensorView> ins = {av, bv};
+    std::vector<TensorDesc> descs = {av.desc(), bv.desc()};
+    if (c.bias) {
+        biasv = view_of({N}, c.adt, bias_bytes.data());
+        ins.push_back(biasv);
+        descs.push_back(biasv.desc());
+    }
+
+    auto op_cpu = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc od = op_cpu->getOutputTensorDesc(descs).front();
+    NNOPS_EXPECT_TRUE(od.dtype == c.adt);
+    const std::vector<int64_t> odims(od.dims.begin(), od.dims.begin() + od.rank);
+    const size_t obytes = static_cast<size_t>(numel_of(odims)) *
+                          size_t(data_type_size(od.dtype));
+    std::vector<uint8_t> out_cpu(obytes, 0);
+    std::vector<uint8_t> out_dev(obytes, 0);
+    TensorView cv = view_of(odims, od.dtype, out_cpu.data());
+    cpu_run(*op_cpu, cv, ins);
+
+    CudaBuffer da(a.bytes.size());
+    da.upload(a.bytes.data(), a.bytes.size());
+    CudaBuffer db(static_cast<size_t>(b.size()));
+    db.upload(b.data(), b.size());
+    TensorView dav = view_of(c.ashape, c.adt, da.data(), qa);
+    TensorView dbv = view_of(c.bshape, DataType::s8, db.data(), qb);
+    CudaBuffer dbias;
+    std::vector<TensorView> dins = {dav, dbv};
+    if (c.bias) {
+        dbias = CudaBuffer(bias_bytes.size());
+        dbias.upload(bias_bytes.data(), bias_bytes.size());
+        dins.push_back(view_of({N}, c.adt, dbias.data()));
+    }
+    CudaBuffer dout(obytes);
+    dout.zero();
+    TensorView dcv = view_of(odims, od.dtype, dout.data());
+    auto op_dev = MatMul::create(attrs, Backend::CUDA);
+    cuda_run(*op_dev, dcv, dins);
+    dout.download(out_dev.data(), obytes);
+
+    const size_t n = obytes / size_t(data_type_size(od.dtype));
+    const auto got = to_floats(out_dev.data(), od.dtype, n);
+    const auto want = to_floats(out_cpu.data(), od.dtype, n);
+    for (size_t i = 0; i < n; ++i) {
+        NNOPS_EXPECT_TRUE(std::fabs(got[i] - want[i]) <=
+                          2e-4f * std::max(1.0f, std::fabs(want[i])));
+    }
+}
+
+}  // namespace
+
+NNOPS_TEST(cuda_matmul_dq_per_tensor) {
+    for (bool tb : {false, true}) {
+        DqCase c;
+        c.ashape = {37, 48};
+        c.bshape = tb ? std::vector<int64_t>{91, 48} : std::vector<int64_t>{48, 91};
+        c.tb = tb;
+        c.bias = true;
+        run_dq_case(c, "cuda_matmul_dq_per_tensor");
+
+        DqCase r = c;
+        r.relu = true;
+        run_dq_case(r, "cuda_matmul_dq_per_tensor_relu");
+    }
+}
+
+NNOPS_TEST(cuda_matmul_dq_per_token) {
+    DqCase c;
+    c.ashape = {8, 64};
+    c.bshape = {64, 16};
+    c.per_token = true;
+    c.per_channel_b = true;
+    run_dq_case(c, "cuda_matmul_dq_per_token");
+}
+
+NNOPS_TEST(cuda_matmul_dq_per_token_u8) {
+    DqCase c;
+    c.ashape = {8, 64};
+    c.bshape = {64, 16};
+    c.per_token = true;
+    c.per_channel_b = true;
+    c.act = DataType::u8;
+    c.seed = 23;
+    run_dq_case(c, "cuda_matmul_dq_per_token_u8");
+}
+
+NNOPS_TEST(cuda_matmul_dq_per_token_f16) {
+    DqCase c;
+    c.ashape = {8, 64};
+    c.bshape = {64, 16};
+    c.per_token = true;
+    c.per_channel_b = true;
+    c.adt = DataType::f16;
+    c.bias = true;
+    c.seed = 25;
+    run_dq_case(c, "cuda_matmul_dq_per_token_f16");
+}
+
+NNOPS_TEST(cuda_matmul_dq_batched) {
+    // A carries the batch and the per-token table spans all its rows.
+    DqCase c;
+    c.ashape = {2, 9, 13};
+    c.bshape = {13, 7};
+    c.per_token = true;
+    run_dq_case(c, "cuda_matmul_dq_batched");
+
+    // A broadcast across a three-way batch: every product reads A's own rows.
+    DqCase b;
+    b.ashape = {5, 9};
+    b.bshape = {3, 9, 6};
+    b.per_token = true;
+    b.seed = 27;
+    run_dq_case(b, "cuda_matmul_dq_broadcast_a");
 }
 
 #endif  // NNOPS_HAS_CUDA

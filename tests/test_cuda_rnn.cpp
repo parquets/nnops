@@ -599,21 +599,22 @@ NNOPS_TEST(cuda_lstm_bf16_against_rounded_f32) {
     expect_same(gyc, to_bf16_host(yc, false), kTol, kTol, "lstm bf16 Y_c");
 }
 
-NNOPS_TEST(cuda_rnn_rejects_quantized_and_prepacked) {
-    // The CUDA route carries the fp path only; an s8 weight is the CPU's W8A8
-    // route, and a PackedRecurrent view is a CPU-packer blob. Both are refused
-    // rather than misread.
-    std::vector<int8_t> w8(8 * 2, 0), r8(8 * 2, 0);
+NNOPS_TEST(cuda_rnn_rejects_prepacked) {
+    // A PackedRecurrent view is a CPU-packer blob this driver has no reader
+    // for; it is refused rather than misread. (An s8 weight is the W8A8 route
+    // the cases below cover.)
+    std::vector<float> blob(64, 0.0f);
     std::vector<float> x(2 * 1 * 2, 0.0f);
+    std::vector<float> r(1 * 2 * 2, 0.0f);
     const int64_t xs[] = {2, 1, 2};
-    const int64_t ws[] = {1, 8, 2};
-    const int64_t rs[] = {1, 8, 2};
-    LstmAttributes a;
+    const int64_t ws[] = {64};
+    const int64_t rs[] = {1, 2, 2};
+    RnnAttributes a;
     a.hidden_size = 2;
-    auto op = Lstm::create(a, Backend::CUDA);
+    auto op = Rnn::create(a, Backend::CUDA);
     TensorView xv(xs, DataType::f32, x.data());
-    TensorView wv(ws, DataType::s8, w8.data());
-    TensorView rv(rs, DataType::s8, r8.data());
+    TensorView wv(ws, DataType::f32, blob.data(), TensorLayout::PackedRecurrent);
+    TensorView rv(rs, DataType::f32, r.data());
     const TensorView ins[] = {xv, wv, rv};
     const int64_t ys[] = {2, 1, 1, 2};
     std::vector<float> y(2 * 1 * 1 * 2, 0.0f);
@@ -622,9 +623,197 @@ NNOPS_TEST(cuda_rnn_rejects_quantized_and_prepacked) {
     const int64_t hs[] = {1, 1, 2};
     TensorView hv(hs, DataType::f32, yh.data());
     TensorView outs[] = {yv, hv};
-    NNOPS_EXPECT_EQ(op->compute(outs, ins, cuda_context(), nullptr), Status::unsupported);
+    const Status st = op->compute(outs, ins, cuda_context(), nullptr);
+    if (st != Status::unsupported) {
+        throw std::runtime_error(std::string("prepacked W: status ") + to_string(st));
+    }
 }
 
 }  // namespace
+
+// =========================================================================
+//  W8A8 — s8 weights, the activation quantized per row
+// =========================================================================
+
+/// One quantized layer: s8 W and R with symmetric per-gate-row scales (one
+/// table per direction), the compute dtype's bias and state, and either a
+/// floating X — quantized per row on the fly — or an s8 X with its own
+/// per-token table.
+template <class OpT, class AttrT>
+void run_q8_case(const Geo& g, RecurrentMode mode, const AttrT& attrs, bool x_s8,
+                 const char* what)
+{
+    const int64_t G = recurrent_gates(mode);
+    const int64_t D = rnn_num_directions(g.dir);
+    const bool lstm = mode == RecurrentMode::Lstm;
+    const std::pair<float, float> tol = tolerance(g.dt);
+
+    const std::vector<int64_t> x_shape = {g.T, g.B, g.I};
+    const std::vector<int64_t> w_shape = {D, G * g.H, g.I};
+    const std::vector<int64_t> r_shape = {D, G * g.H, g.H};
+    const std::vector<int64_t> b_shape = {D, 2 * G * g.H};
+    const std::vector<int64_t> h_shape = {D, g.B, g.H};
+    const std::vector<int64_t> y_shape = {g.T, D, g.B, g.H};
+
+    const int64_t rows = g.T * g.B;
+    HostTensor x;
+    QuantParams qx;
+    std::vector<float> x_sc(static_cast<size_t>(rows));
+    if (x_s8) {
+        x = make_host_int(x_shape, DataType::s8, g.seed + 1, -127, 127);
+        for (int64_t i = 0; i < rows; ++i) {
+            x_sc[static_cast<size_t>(i)] = 0.01f + 0.002f * float(i % 5);
+        }
+        qx.granularity = QuantGranularity::PerToken;
+        qx.scale_data = x_sc.data();
+        qx.num_scales = rows;
+        x.view = with_quant_params(x.view, qx);
+    } else {
+        x = make_host_random(x_shape, g.dt, g.padded, g.seed + 1);
+    }
+
+    test::XorShift128 rng(g.seed + 2);
+    std::vector<int8_t> w(static_cast<size_t>(D * G * g.H * g.I));
+    std::vector<int8_t> r(static_cast<size_t>(D * G * g.H * g.H));
+    for (auto& e : w) { e = static_cast<int8_t>(int32_t(rng.next_u64() % 255) - 127); }
+    for (auto& e : r) { e = static_cast<int8_t>(int32_t(rng.next_u64() % 255) - 127); }
+    std::vector<float> w_sc(static_cast<size_t>(D * G * g.H));
+    std::vector<float> r_sc(static_cast<size_t>(D * G * g.H));
+    for (int64_t i = 0; i < D * G * g.H; ++i) {
+        w_sc[static_cast<size_t>(i)] = 0.003f + 0.001f * float(i % 4);
+        r_sc[static_cast<size_t>(i)] = 0.002f + 0.001f * float(i % 5);
+    }
+    QuantParams qw;
+    qw.granularity = QuantGranularity::PerToken;
+    qw.scale_data = w_sc.data();
+    qw.num_scales = D * G * g.H;
+    QuantParams qr;
+    qr.granularity = QuantGranularity::PerToken;
+    qr.scale_data = r_sc.data();
+    qr.num_scales = D * G * g.H;
+
+    HostTensor bias;
+    HostTensor h0;
+    HostTensor c0;
+    if (g.bias) {
+        bias = make_host_random(b_shape, g.dt, false, g.seed + 4, -1.0f, 1.0f);
+    }
+    if (g.h0) { h0 = make_host_random(h_shape, g.dt, false, g.seed + 6, -1.0f, 1.0f); }
+    if (lstm && g.c0) { c0 = make_host_random(h_shape, g.dt, false, g.seed + 7, -1.0f, 1.0f); }
+
+    TensorView wv = TensorView(std::span<const int64_t>(w_shape.data(), 3), DataType::s8,
+                               w.data(), TensorLayout::Dense, qw);
+    TensorView rv = TensorView(std::span<const int64_t>(r_shape.data(), 3), DataType::s8,
+                               r.data(), TensorLayout::Dense, qr);
+    std::vector<TensorView> ins = {x.view, wv, rv};
+    const auto put = [&](size_t i, bool present, const HostTensor& t) {
+        if (i >= ins.size()) { ins.resize(i + 1); }
+        ins[i] = present ? t.view : TensorView{};
+    };
+    put(3, g.bias, bias);
+    put(4, false, bias);
+    put(5, g.h0, h0);
+    if (lstm) { put(6, g.c0, c0); }
+    while (!ins.empty() && ins.back().is_empty()) { ins.pop_back(); }
+
+    HostTensor y = make_host_zeroed(y_shape, g.dt, g.padded);
+    HostTensor yh = make_host_zeroed(h_shape, g.dt, false);
+    HostTensor yc;
+    if (lstm) { yc = make_host_zeroed(h_shape, g.dt, false); }
+    std::vector<TensorView> outs = {y.view, yh.view};
+    if (lstm) { outs.push_back(yc.view); }
+
+    auto op_cpu = OpT::create(attrs, Backend::CPU);
+    if (op_cpu->compute(outs, ins, cpu_context(), nullptr) != Status::ok) {
+        throw std::runtime_error(std::string(what) + ": cpu compute failed");
+    }
+
+    const HostTensor* src[7] = {&x, nullptr, nullptr, g.bias ? &bias : nullptr, nullptr,
+                                g.h0 ? &h0 : nullptr, (lstm && g.c0) ? &c0 : nullptr};
+
+    std::vector<TensorView> dins(ins.size());
+    std::vector<DeviceTensor> store;
+    std::vector<CudaBuffer> wbuf(2);
+    for (size_t i = 0; i < ins.size(); ++i) {
+        if (i == 1 || i == 2) {
+            const std::vector<int8_t>& bytes = (i == 1) ? w : r;
+            wbuf[i - 1] = CudaBuffer(bytes.size());
+            wbuf[i - 1].upload(bytes.data(), bytes.size());
+            const std::vector<int64_t>& sh = (i == 1) ? w_shape : r_shape;
+            dins[i] = TensorView(std::span<const int64_t>(sh.data(), 3), DataType::s8,
+                                 wbuf[i - 1].data(), TensorLayout::Dense,
+                                 (i == 1) ? qw : qr);
+        } else if (src[i] != nullptr) {
+            store.push_back(to_device(*src[i]));
+            TensorView v = store.back().view;
+            if (i == 0 && x_s8) { v = with_quant_params(v, qx); }
+            dins[i] = v;
+        } else {
+            dins[i] = TensorView{};
+        }
+    }
+
+    std::vector<DeviceTensor> douts(outs.size());
+    std::vector<TensorView> dv(outs.size());
+    for (size_t i = 0; i < outs.size(); ++i) {
+        const bool padded = (i == 0 && g.padded);
+        HostTensor zero = make_host_zeroed(outs[i].shape_span(), g.dt, padded);
+        douts[i] = alloc_like(outs[i], zero);
+        dv[i] = douts[i].view;
+    }
+
+    auto op_dev = OpT::create(attrs, Backend::CUDA);
+    const Status st = op_dev->compute(dv, dins, cuda_context(), nullptr);
+    if (st != Status::ok) {
+        throw std::runtime_error(std::string(what) + ": cuda compute returned " +
+                                 to_string(st));
+    }
+    CudaBuffer::sync();
+
+    const HostTensor* want[] = {&y, &yh, lstm ? &yc : nullptr};
+    for (size_t i = 0; i < outs.size(); ++i) {
+        const bool padded = (i == 0 && g.padded);
+        HostTensor got = make_host_zeroed(outs[i].shape_span(), g.dt, padded);
+        from_device(douts[i], got);
+        expect_same(got, *want[i], tol.first, tol.second, what);
+    }
+}
+
+NNOPS_TEST(cuda_rnn_w8a8) {
+    Geo g;
+    g.seed = 91;
+    run_q8_case<Rnn, RnnAttributes>(g, RecurrentMode::Rnn, rnn_attrs(g), false, "rnn w8a8");
+}
+
+NNOPS_TEST(cuda_lstm_w8a8_bidirectional) {
+    Geo g;
+    g.dir = RnnDirection::Bidirectional;
+    g.bias = true;
+    g.h0 = true;
+    g.c0 = true;
+    g.padded = true;
+    g.seed = 93;
+    run_q8_case<Lstm, LstmAttributes>(g, RecurrentMode::Lstm, lstm_attrs(g), false,
+                                      "lstm w8a8 bidirectional");
+}
+
+NNOPS_TEST(cuda_gru_w8a8_f16) {
+    for (bool lbr : {false, true}) {
+        Geo g;
+        g.dt = DataType::f16;
+        g.B = 1;
+        g.T = 3;
+        g.seed = 95 + (lbr ? 1 : 0);
+        run_q8_case<Gru, GruAttributes>(g, RecurrentMode::Gru, gru_attrs(g, lbr), false,
+                                        lbr ? "gru lbr w8a8 f16" : "gru w8a8 f16");
+    }
+}
+
+NNOPS_TEST(cuda_rnn_w8a8_s8_activation) {
+    Geo g;
+    g.seed = 97;
+    run_q8_case<Rnn, RnnAttributes>(g, RecurrentMode::Rnn, rnn_attrs(g), true,
+                                    "rnn w8a8 s8 activation");
+}
 
 #endif  // NNOPS_HAS_CUDA
