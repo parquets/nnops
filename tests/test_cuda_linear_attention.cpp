@@ -5,7 +5,9 @@
 /// conv/beta slots, the value-head-owned state and the in-place state update.
 /// Both routes read identical views — the random gates are drawn in [-2, 0], so
 /// every decay factor is inside (0, 1] and the state stays bounded over the
-/// test's sequence lengths.
+/// test's sequence lengths. The f16 chunked route needs a milder gate than that
+/// (its panels hold 1/L_s in f16) and its own small inputs, so its cases draw
+/// both from the trained range; the steep-gate case checks the fallback.
 ///
 /// The cases follow the kernel's surface: the plain GDN shape, the delta term
 /// with beta, the causal conv (with and without beta, i.e. with an empty
@@ -19,6 +21,8 @@
 /// Only compiled under NNOPS_HAS_CUDA.
 
 #include "nnops/ops/linear_attention.hpp"
+#include "nnops/detail/half.hpp"
+#include "backend/cuda/attention/linear_attention_wy_host.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/cuda_test_helper.hpp"
@@ -49,6 +53,14 @@ struct Case {
     uint64_t seed = 11;
     float atol = 1e-5f;
     float rtol = 1e-4f;
+    // Log-decay range. The default is steep on purpose (a decay of 0.14 to 1 a
+    // token); the chunked route needs the mild range a trained gate produces,
+    // because its panels hold 1/L_s in f16.
+    float glo = -2.0f, ghi = 0.0f;
+    // Q, K and V are drawn from [-xs, xs]. A mild gate barely contracts, so a
+    // unit-scale input drives the state of a long sequence out of f16 — the
+    // route's own copies of the tests draw small inputs to stay inside it.
+    float xs = 1.0f;
 };
 
 int64_t hv_of(const Case& c) { return c.Hv > 0 ? c.Hv : c.Hk; }
@@ -111,10 +123,10 @@ Problem build(const Case& c)
         p.attrs.conv_kernel_size = c.CK;
     }
 
-    p.ins = {make_host_random(sq, c.dt, c.padded, c.seed + 1, -1.0f, 1.0f),
-             make_host_random(sk, c.dt, c.padded, c.seed + 2, -1.0f, 1.0f),
-             make_host_random(sv, c.dt, c.padded, c.seed + 3, -1.0f, 1.0f),
-             make_host_random(sg, c.dt, c.padded, c.seed + 4, -2.0f, 0.0f)};
+    p.ins = {make_host_random(sq, c.dt, c.padded, c.seed + 1, -c.xs, c.xs),
+             make_host_random(sk, c.dt, c.padded, c.seed + 2, -c.xs, c.xs),
+             make_host_random(sv, c.dt, c.padded, c.seed + 3, -c.xs, c.xs),
+             make_host_random(sg, c.dt, c.padded, c.seed + 4, c.glo, c.ghi)};
 
     // Optional slots are positional: conv_w is 4 and beta is 5, so beta needs
     // an empty view in slot 4 when there are no taps.
@@ -462,6 +474,301 @@ NNOPS_TEST(linear_attention_cuda_decode)
     c.Dv = 64;
     c.has_beta = true;
     expect_decode(c, 16, "decode");
+}
+
+// ============================================================
+// The chunked-WY prototype's recurrent kernel (kernel 2)
+// ============================================================
+//
+// The prototype reads the panels a chunk-local pass would have built (W, U,
+// the gated Q and K, and the chunk decay), so the test synthesizes random ones
+// and checks the recurrence against the same algebra in f32. Three roundings
+// the kernel performs are mirrored: X, Aq and the state go through f16.
+
+namespace {
+
+namespace nb = nnops::backend::cpu;
+
+constexpr int64_t kWyC = 64;
+constexpr int64_t kWyDk = 128;
+constexpr int64_t kWyDv = 128;
+
+float rnd16(float x)
+{
+    return nb::half_to_float(nb::float_to_half(x));
+}
+
+struct WyProblem {
+    HostTensor w, u, qe, ka, lc, out, state;
+    int64_t B = 1, Hv = 1, L = 1;
+    float scale = 1.0f;
+};
+
+WyProblem build_wy(int64_t B, int64_t Hv, int64_t L, float scale, uint64_t seed)
+{
+    WyProblem p;
+    p.B = B;
+    p.Hv = Hv;
+    p.L = L;
+    p.scale = scale;
+    const auto f16 = DataType::f16;
+    const auto f32 = DataType::f32;
+    // The panels are drawn small on purpose: the reference emulates the
+    // kernel's f16 roundings, and a state that grows into the hundreds turns
+    // every sum-order flip into a whole f16 ulp (0.5 at 832), swamping the
+    // comparison with quantization noise the kernel cannot avoid either.
+    p.w = make_host_random(std::vector<int64_t>{B, Hv, L, kWyC, kWyDk}, f16, false, seed + 1,
+                           -0.05f, 0.05f);
+    p.u = make_host_random(std::vector<int64_t>{B, Hv, L, kWyC, kWyDv}, f16, false, seed + 2,
+                           -0.05f, 0.05f);
+    p.qe = make_host_random(std::vector<int64_t>{B, Hv, L, kWyC, kWyDk}, f16, false, seed + 3,
+                            -0.05f, 0.05f);
+    p.ka = make_host_random(std::vector<int64_t>{B, Hv, L, kWyC, kWyDk}, f16, false, seed + 4,
+                            -0.05f, 0.05f);
+    p.lc = make_host_random(std::vector<int64_t>{B, Hv, L, kWyDk}, f32, false, seed + 5, 0.5f,
+                            1.0f);
+    p.out = make_host_zeroed(std::vector<int64_t>{B, Hv, kWyC * L, kWyDv}, f16, false);
+    p.state = make_host_random(std::vector<int64_t>{B, Hv, kWyDk, kWyDv}, f16, false, seed + 6,
+                               -0.05f, 0.05f);
+    return p;
+}
+
+void wy_reference(const WyProblem& p, std::vector<float>& out, std::vector<float>& state)
+{
+    const auto f16 = DataType::f16;
+    const std::vector<float> w = to_floats(p.w.bytes.data(), f16, p.w.view.numel());
+    const std::vector<float> u = to_floats(p.u.bytes.data(), f16, p.u.view.numel());
+    const std::vector<float> qe = to_floats(p.qe.bytes.data(), f16, p.qe.view.numel());
+    const std::vector<float> ka = to_floats(p.ka.bytes.data(), f16, p.ka.view.numel());
+    const std::vector<float> lc = to_floats(p.lc.bytes.data(), DataType::f32, p.lc.view.numel());
+    const std::vector<float> st_in = to_floats(p.state.bytes.data(), f16, p.state.view.numel());
+
+    const int64_t S = kWyC * p.L;
+    out.assign(static_cast<size_t>(p.B * p.Hv * S * kWyDv), 0.0f);
+    state.assign(static_cast<size_t>(p.B * p.Hv * kWyDk * kWyDv), 0.0f);
+
+    std::vector<float> x(static_cast<size_t>(kWyC * kWyDv));
+    std::vector<float> aq(static_cast<size_t>(kWyC * kWyC));
+    std::vector<float> sv(static_cast<size_t>(kWyDk * kWyDv));
+
+    for (int64_t b = 0; b < p.B; ++b) {
+        for (int64_t h = 0; h < p.Hv; ++h) {
+            const int64_t bh = b * p.Hv + h;
+            for (int64_t i = 0; i < kWyDk * kWyDv; ++i) {
+                sv[static_cast<size_t>(i)] = st_in[static_cast<size_t>(bh * kWyDk * kWyDv + i)];
+            }
+            for (int64_t c = 0; c < p.L; ++c) {
+                const float* W = &w[static_cast<size_t>((bh * p.L + c) * kWyC * kWyDk)];
+                const float* U = &u[static_cast<size_t>((bh * p.L + c) * kWyC * kWyDv)];
+                const float* QE = &qe[static_cast<size_t>((bh * p.L + c) * kWyC * kWyDk)];
+                const float* KA = &ka[static_cast<size_t>((bh * p.L + c) * kWyC * kWyDk)];
+                const float* LC = &lc[static_cast<size_t>((bh * p.L + c) * kWyDk)];
+
+                for (int64_t r = 0; r < kWyC; ++r) {
+                    for (int64_t j = 0; j < kWyDv; ++j) {
+                        float acc = 0.0f;
+                        for (int64_t i = 0; i < kWyDk; ++i) {
+                            acc += W[r * kWyDk + i] * sv[static_cast<size_t>(i * kWyDv + j)];
+                        }
+                        x[static_cast<size_t>(r * kWyDv + j)] =
+                            rnd16(U[r * kWyDv + j] - acc);
+                    }
+                }
+                for (int64_t r = 0; r < kWyC; ++r) {
+                    for (int64_t s2 = 0; s2 < kWyC; ++s2) {
+                        float acc = 0.0f;
+                        if (s2 <= r) {
+                            for (int64_t i = 0; i < kWyDk; ++i) {
+                                acc += QE[r * kWyDk + i] * KA[s2 * kWyDk + i];
+                            }
+                            acc = rnd16(acc);
+                        }
+                        aq[static_cast<size_t>(r * kWyC + s2)] = acc;
+                    }
+                }
+                float* O = &out[static_cast<size_t>((bh * S + c * kWyC) * kWyDv)];
+                for (int64_t r = 0; r < kWyC; ++r) {
+                    for (int64_t j = 0; j < kWyDv; ++j) {
+                        float acc = 0.0f;
+                        for (int64_t i = 0; i < kWyDk; ++i) {
+                            acc += QE[r * kWyDk + i] * sv[static_cast<size_t>(i * kWyDv + j)];
+                        }
+                        for (int64_t s2 = 0; s2 <= r; ++s2) {
+                            acc += aq[static_cast<size_t>(r * kWyC + s2)] *
+                                   x[static_cast<size_t>(s2 * kWyDv + j)];
+                        }
+                        O[r * kWyDv + j] = rnd16(p.scale * acc);
+                    }
+                }
+                for (int64_t i = 0; i < kWyDk; ++i) {
+                    for (int64_t j = 0; j < kWyDv; ++j) {
+                        float acc = 0.0f;
+                        for (int64_t s2 = 0; s2 < kWyC; ++s2) {
+                            acc += KA[s2 * kWyDk + i] * x[static_cast<size_t>(s2 * kWyDv + j)];
+                        }
+                        sv[static_cast<size_t>(i * kWyDv + j)] =
+                            rnd16(LC[i] * (sv[static_cast<size_t>(i * kWyDv + j)] + acc));
+                    }
+                }
+            }
+            for (int64_t i = 0; i < kWyDk * kWyDv; ++i) {
+                state[static_cast<size_t>(bh * kWyDk * kWyDv + i)] = sv[static_cast<size_t>(i)];
+            }
+        }
+    }
+}
+
+void expect_wy(int64_t B, int64_t Hv, int64_t L, uint64_t seed, float atol, float rtol,
+               const char* what)
+{
+    WyProblem p = build_wy(B, Hv, L, 1.0f / std::sqrt(static_cast<float>(kWyDk)), seed);
+    std::vector<float> out_ref, st_ref;
+    wy_reference(p, out_ref, st_ref);
+
+    std::vector<DeviceTensor> dev;
+    for (const HostTensor* t : {&p.w, &p.u, &p.qe, &p.ka, &p.lc}) {
+        dev.push_back(to_device(*t));
+    }
+    DeviceTensor d_out = alloc_like(p.out.view, p.out);
+    DeviceTensor d_state = alloc_like(p.state.view, p.state);
+
+    nnops::backend::cuda::LaWyParams lp;
+    lp.w = dev[0].view.ptr<void>();
+    lp.u = dev[1].view.ptr<void>();
+    lp.qe = dev[2].view.ptr<void>();
+    lp.ka = dev[3].view.ptr<void>();
+    lp.lc = dev[4].view.ptr<void>();
+    lp.o = d_out.view.ptr<void>();
+    lp.st = d_state.view.ptr<void>();
+    lp.b = B;
+    lp.hv = Hv;
+    lp.s = kWyC * L;
+    lp.l = L;
+    lp.scale = p.scale;
+    NNOPS_EXPECT_TRUE(nnops::backend::cuda::la_wy_recurrent_cuda(lp, nullptr));
+    CudaBuffer::sync();
+
+    HostTensor out_dev =
+        make_host_zeroed(p.out.view.shape_span(), DataType::f16, false);
+    HostTensor st_dev =
+        make_host_zeroed(p.state.view.shape_span(), DataType::f16, false);
+    from_device(d_out, out_dev);
+    from_device(d_state, st_dev);
+    const std::vector<float> out_got =
+        to_floats(out_dev.bytes.data(), DataType::f16, out_dev.view.numel());
+    const std::vector<float> st_got =
+        to_floats(st_dev.bytes.data(), DataType::f16, st_dev.view.numel());
+    expect_close(out_got, out_ref, atol, rtol, (std::string(what) + " output").c_str());
+    expect_close(st_got, st_ref, atol, rtol, (std::string(what) + " state").c_str());
+}
+
+} // namespace
+
+// ============================================================
+// The chunked-WY route as the operator takes it
+// ============================================================
+//
+// The route is only representable while the panels' 1/L_s stays inside f16, so
+// the gates are drawn from a trained layer's range here and nothing like the
+// [-2, 0] the other cases use. The chunk is 64 rows at Dk = Dv = 128, so the
+// shapes are the ones a prefill actually has; the CPU oracle is on its own
+// chunked (C = 16) route at these lengths, which is a different association of
+// the same sum, and the panels and the state are f16 on the GPU side.
+
+namespace {
+
+/// expect_case, plus the only observable the operator offers for which route it
+/// took: the route's own call count.
+void expect_route(const Case& c, bool want_route, const char* what)
+{
+    const int64_t before = nnops::backend::cuda::la_wy_route_runs();
+    expect_case(c, what);
+    const int64_t ran = nnops::backend::cuda::la_wy_route_runs() - before;
+    if (ran != (want_route ? 1 : 0)) {
+        throw std::runtime_error(std::string(what) + ": route runs " + std::to_string(ran) +
+                                 ", wanted " + (want_route ? "1" : "0"));
+    }
+}
+
+Case wy_case(int64_t H, int64_t Hk, int64_t Hv, int64_t S)
+{
+    Case c;
+    c.dt = DataType::f16;
+    c.H = H;
+    c.Hk = Hk;
+    c.Hv = Hv;
+    c.S = S;
+    c.D = 128;
+    c.Dv = 128;
+    c.CK = 4;
+    c.has_beta = true;
+    c.glo = -0.05f;
+    c.ghi = 0.0f;
+    c.xs = 0.2f;
+    return c;
+}
+
+} // namespace
+
+NNOPS_TEST(linear_attention_cuda_wy_route)
+{
+    // Two chunks, the conv and the delta rate: the smallest call the route
+    // takes at all.
+    Case c = wy_case(2, 2, 0, 128);
+    c.atol = 5e-4f;
+    c.rtol = 1e-2f;
+    expect_route(c, true, "wy route");
+}
+
+NNOPS_TEST(linear_attention_cuda_wy_route_qwen)
+{
+    // Qwen3-Next's head geometry (two value heads a key head) over three
+    // chunks, and the optional slots absent: no conv, no beta. A missing beta
+    // is 1.0 and a missing conv is the identity, both on the panel side.
+    Case c = wy_case(4, 2, 4, 192);
+    c.CK = 0;
+    c.has_beta = false;
+    c.atol = 5e-4f;
+    c.rtol = 1e-2f;
+    expect_route(c, true, "wy route qwen3-next");
+}
+
+NNOPS_TEST(linear_attention_cuda_wy_route_qwen_conv)
+{
+    // The head geometry with everything on: the conv channel bases are the
+    // packed Q | K | V blob's, which is where a key head shared by two value
+    // heads can go wrong, and four chunks cross a boundary more than once.
+    Case c = wy_case(4, 2, 4, 256);
+    c.atol = 5e-4f;
+    c.rtol = 1e-2f;
+    expect_route(c, true, "wy route qwen3-next conv");
+}
+
+NNOPS_TEST(linear_attention_cuda_wy_route_falls_back)
+{
+    // The same geometry with a steep gate: the panels would leave f16, so the
+    // operator has to run the per-token kernel and match the oracle anyway.
+    Case c = wy_case(2, 2, 0, 128);
+    c.glo = -2.0f;
+    c.ghi = 0.0f;
+    c.atol = kF16AccumTol;
+    c.rtol = 5e-2f;
+    expect_route(c, false, "wy route fallback");
+}
+
+NNOPS_TEST(linear_attention_cuda_wy_kernel2)
+{
+    // Two heads, four chunks: the chain is what the kernel is about, and a
+    // second head catches a head-offset mistake. A single head and two chunks
+    // is the other extreme (one block, one recurrence step pair).
+    //
+    // The budget is the f16 roundings' own: Aq and X are rounded by both sides,
+    // but the mma's f32 accumulation order is not the reference's, so an entry
+    // sitting on a rounding boundary can flip by one ulp — 5e-4 of a term whose
+    // scale is O(0.25), and a readout that cancels to 4e-3 amplifies it. A
+    // layout error is O(0.1), three orders above this budget.
+    expect_wy(1, 2, 4, 71, 2e-3f, 5e-3f, "wy kernel2");
+    expect_wy(1, 1, 2, 73, 2e-3f, 5e-3f, "wy kernel2 single head");
 }
 
 #endif // NNOPS_HAS_CUDA

@@ -81,8 +81,11 @@
 #include "backend/cuda/cuda_common.cuh"
 #include "nnops/ops/linear_attention.hpp"
 
+#include "linear_attention_wy_host.hpp"
+
 #include <cmath>
 #include <span>
+#include <type_traits>
 
 namespace nnops::backend::cuda {
 namespace {
@@ -760,6 +763,65 @@ Status linear_attention_impl(const LinearAttentionAttributes& attrs,
 
     const bool has_conv = inputs.size() > 4 && !inputs[4].is_empty();
     const bool has_beta = inputs.size() > 5 && !inputs[5].is_empty();
+
+    // The chunked-WY route, when the call fits its pose: f16, the tensor-core
+    // chunk geometry (Dk = Dv = 128, C = 64), one query head per state, and a
+    // whole number of chunks. A long prefill is what it is for. The route
+    // answers false when a chunk's decay range leaves the f16 panel format;
+    // the per-token kernel below is then the answer, unchanged.
+    if constexpr (std::is_same_v<T, __half>) {
+        const int64_t ck = has_conv ? inputs[4].shape(2) : 0;
+        if (Dk == 128 && Dv == 128 && Gqq == 1 && S >= 64 && S % 64 == 0 && Hv % Hk == 0 &&
+            ck <= 8) {
+            LaWyRoute wr{};
+            wr.q = Q.ptr<T>();
+            wr.k = K.ptr<T>();
+            wr.v = V.ptr<T>();
+            wr.g = G.ptr<T>();
+            wr.cw = has_conv ? inputs[4].ptr<T>() : nullptr;
+            wr.beta = has_beta ? inputs[5].ptr<T>() : nullptr;
+            wr.o = O.ptr<T>();
+            wr.st = St.ptr<T>();
+            wr.b = B;
+            wr.hv = Hv;
+            wr.hk = Hk;
+            wr.s = S;
+            wr.dk = Dk;
+            wr.dv = Dv;
+            wr.gvk = Hv / Hk;
+            wr.ck = ck;
+            wr.qs0 = Q.stride_elems(0);
+            wr.qs1 = Q.stride_elems(1);
+            wr.qs2 = Q.stride_elems(2);
+            wr.ks0 = K.stride_elems(0);
+            wr.ks1 = K.stride_elems(1);
+            wr.ks2 = K.stride_elems(2);
+            wr.vs0 = V.stride_elems(0);
+            wr.vs1 = V.stride_elems(1);
+            wr.vs2 = V.stride_elems(2);
+            wr.gs0 = G.stride_elems(0);
+            wr.gs1 = G.stride_elems(1);
+            wr.gs2 = G.stride_elems(2);
+            wr.os0 = O.stride_elems(0);
+            wr.os1 = O.stride_elems(1);
+            wr.os2 = O.stride_elems(2);
+            wr.ts0 = St.stride_elems(0);
+            wr.ts1 = St.stride_elems(1);
+            wr.ts2 = St.stride_elems(2);
+            wr.ts3 = St.stride_elems(3);
+            wr.cws0 = has_conv ? inputs[4].stride_elems(0) : 0;
+            wr.cws2 = has_conv ? inputs[4].stride_elems(2) : 0;
+            wr.bs0 = has_beta ? inputs[5].stride_elems(0) : 0;
+            wr.bs1 = has_beta ? inputs[5].stride_elems(1) : 0;
+            wr.bs2 = has_beta ? inputs[5].stride_elems(2) : 0;
+            wr.k_ch = Hq * Dk;
+            wr.v_ch = Hq * Dk + Hk * Dk;
+            wr.scale = attrs.scale != 0.0f ? attrs.scale : 1.0f / std::sqrt(static_cast<float>(Dk));
+            if (la_wy_route_cuda(wr, static_cast<cudaStream_t>(ctx.cuda_stream))) {
+                return Status::ok;
+            }
+        }
+    }
 
     // 16 rows a thread bounds the key width at 16·rg, and rg at one warp.
     int64_t rg = 1;

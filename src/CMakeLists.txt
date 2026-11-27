@@ -236,8 +236,11 @@ if(NNOPS_BUILD_CUDA)
         # backend/common/attention_config.hpp for the shared description.
         backend/cuda/attention/attention.cu
         # LinearAttention: the gated delta recurrence with the state slab in
-        # registers, one launch for the whole sequence.
+        # registers, one launch for the whole sequence, and the chunked-WY route
+        # the same operator takes on a long f16 prefill (a chunk-local panel
+        # kernel, then the recurrence over them).
         backend/cuda/attention/linear_attention.cu
+        backend/cuda/attention/linear_attention_wy.cu
         # The general elementwise and movement family: conversions, clamp,
         # compare/logical, where, flatten, the pixel-shuffle pair, embedding
         # lookup and the quantize/dequantize pair.
