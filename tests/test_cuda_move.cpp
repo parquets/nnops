@@ -97,6 +97,31 @@ NNOPS_TEST(cuda_permute_general) {
     }
 }
 
+NNOPS_TEST(cuda_permute_int_dtypes) {
+    // A movement op stores no value, so the integer dtypes must move exactly as
+    // the floats do — the shape and index tensors of a quantized graph are s64
+    // and s32. The last-two swap takes the transpose tile, the general
+    // permutation the layout walk, and rank 1 the flat copy.
+    for (DataType dt : {DataType::s8, DataType::u8, DataType::s32, DataType::s64}) {
+        HostTensor a = raw({2, 3, 4, 5}, dt);
+        const HostTensor in[] = {std::move(a)};
+        run_op_both([](Backend be) { return Permute::create(PermuteAttributes{{0, 1, 3, 2}}, be); },
+                 std::span<const HostTensor>(in), "cuda_permute_last_two_int");
+    }
+    {
+        HostTensor a = raw({3, 5, 7}, DataType::s32);
+        const HostTensor in[] = {std::move(a)};
+        run_op_both([](Backend be) { return Permute::create(PermuteAttributes{{2, 0, 1}}, be); },
+                 std::span<const HostTensor>(in), "cuda_permute_general_s32");
+    }
+    {
+        HostTensor a = raw({9}, DataType::u8);
+        const HostTensor in[] = {std::move(a)};
+        run_op_both([](Backend be) { return Permute::create(PermuteAttributes{{0}}, be); },
+                 std::span<const HostTensor>(in), "cuda_permute_rank1_u8");
+    }
+}
+
 NNOPS_TEST(cuda_permute_rank2_and_1) {
     {
         HostTensor a = rnd({3, 5}, DataType::f32, true);
@@ -142,6 +167,24 @@ NNOPS_TEST(cuda_slice_negative_and_clamp) {
     run_op_both([](Backend be) {
         return Slice::create(SliceAttributes{{0, 1}, {50, 4}, {0, 1}, {}}, be);
     }, std::span<const HostTensor>(in), "cuda_slice_clamp");
+}
+
+NNOPS_TEST(cuda_slice_int_dtypes) {
+    for (DataType dt : {DataType::s8, DataType::u8, DataType::s32, DataType::s64}) {
+        HostTensor a = raw({4, 6, 8}, dt);
+        const HostTensor in[] = {std::move(a)};
+        run_op_both([](Backend be) {
+            return Slice::create(SliceAttributes{{1, 2}, {3, 7}, {1, 2}, {}}, be);
+        }, std::span<const HostTensor>(in), "cuda_slice_int");
+    }
+    {
+        // A strided slice leaves the source run non-unit: the scalar walk.
+        HostTensor a = raw({3, 8, 10}, DataType::s64);
+        const HostTensor in[] = {std::move(a)};
+        run_op_both([](Backend be) {
+            return Slice::create(SliceAttributes{{0}, {10}, {2}, {2}}, be);
+        }, std::span<const HostTensor>(in), "cuda_slice_step_s64");
+    }
 }
 
 // ============================================================
@@ -250,6 +293,54 @@ NNOPS_TEST(cuda_concat_negative_axis_and_rank1) {
         const HostTensor in[] = {std::move(a), std::move(b)};
         run_op_both([](Backend be) { return Concat::create(ConcatAttributes{0}, be); },
                  std::span<const HostTensor>(in), "cuda_concat_rank1");
+    }
+}
+
+NNOPS_TEST(cuda_concat_int_dtypes) {
+    for (DataType dt : {DataType::s8, DataType::u8, DataType::s32, DataType::s64}) {
+        HostTensor a = raw({2, 3}, dt);
+        HostTensor b = raw({3, 3}, dt);
+        const HostTensor in[] = {std::move(a), std::move(b)};
+        run_op_both([](Backend be) { return Concat::create(ConcatAttributes{0}, be); },
+                 std::span<const HostTensor>(in), "cuda_concat_int");
+    }
+    {
+        // Last-axis bands keep the copy a run; the rank-1 form is the flat copy.
+        HostTensor a = raw({2, 3, 4}, DataType::s64);
+        HostTensor b = raw({2, 3, 2}, DataType::s64);
+        const HostTensor in[] = {std::move(a), std::move(b)};
+        run_op_both([](Backend be) { return Concat::create(ConcatAttributes{-1}, be); },
+                 std::span<const HostTensor>(in), "cuda_concat_int_last_axis");
+    }
+    {
+        HostTensor a = raw({3}, DataType::s64);
+        HostTensor b = raw({2}, DataType::s64);
+        const HostTensor in[] = {std::move(a), std::move(b)};
+        run_op_both([](Backend be) { return Concat::create(ConcatAttributes{0}, be); },
+                 std::span<const HostTensor>(in), "cuda_concat_rank1_s64");
+    }
+}
+
+NNOPS_TEST(cuda_split_int_dtypes) {
+    for (DataType dt : {DataType::s8, DataType::u8, DataType::s32, DataType::s64}) {
+        HostTensor a = raw({5, 4}, dt);
+        const HostTensor in[] = {std::move(a)};
+        run_op_both([](Backend be) {
+            SplitAttributes attrs;
+            attrs.axis = 0;
+            attrs.split = {2, 3};
+            return Split::create(attrs, be);
+        }, std::span<const HostTensor>(in), "cuda_split_int");
+    }
+    {
+        HostTensor a = raw({2, 6}, DataType::s64);
+        const HostTensor in[] = {std::move(a)};
+        run_op_both([](Backend be) {
+            SplitAttributes attrs;
+            attrs.axis = -1;
+            attrs.split = {1, 2, 3};
+            return Split::create(attrs, be);
+        }, std::span<const HostTensor>(in), "cuda_split_int_last_axis");
     }
 }
 

@@ -14,7 +14,9 @@
 /// batch slice. The tile route needs both operands dense (it indexes slices as
 /// `m*k`), and falls back to the walk when they are not.
 ///
-/// f32, f16 and bf16 in, out at the same dtype.
+/// f32, f16, bf16, s8, u8, s32 and s64 in, out at the same dtype — the
+/// whole-element set the CPU's movement kernels carry. The transpose tile is a
+/// byte move, so the integer types take it as readily as the floats.
 
 #include "move_common.cuh"
 #include "nnops/ops/permute.hpp"
@@ -170,16 +172,10 @@ Status permute_cuda(const PermuteAttributes& attrs, TensorView& output,
                     void* /*workspace*/)
 {
     const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
-    switch (inputs[0].data_type()) {
-    case DataType::f32:
-        return permute_entry<float>(attrs, output, inputs[0], stream);
-    case DataType::f16:
-        return permute_entry<__half>(attrs, output, inputs[0], stream);
-    case DataType::bf16:
-        return permute_entry<__nv_bfloat16>(attrs, output, inputs[0], stream);
-    default:
-        return Status::unsupported;
-    }
+    return dispatch_move_dtype(inputs[0].data_type(), [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        return permute_entry<T>(attrs, output, inputs[0], stream);
+    });
 }
 
 } // namespace nnops::backend::cuda

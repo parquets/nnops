@@ -7,7 +7,8 @@
 /// descriptor. The inputs and outputs are separate tensors here, which is the
 /// only structural difference from Concat.
 ///
-/// f32, f16 and bf16 in, out at the same dtype.
+/// f32, f16, bf16, s8, u8, s32 and s64 in, out at the same dtype — the
+/// whole-element set the CPU's movement kernels carry.
 
 #include "move_common.cuh"
 #include "nnops/ops/split.hpp"
@@ -63,16 +64,10 @@ Status split_cuda(const SplitAttributes& attrs, std::span<TensorView> outputs,
                   void* /*workspace*/)
 {
     const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
-    switch (inputs[0].data_type()) {
-    case DataType::f32:
-        return split_entry<float>(attrs, outputs, inputs[0], stream);
-    case DataType::f16:
-        return split_entry<__half>(attrs, outputs, inputs[0], stream);
-    case DataType::bf16:
-        return split_entry<__nv_bfloat16>(attrs, outputs, inputs[0], stream);
-    default:
-        return Status::unsupported;
-    }
+    return dispatch_move_dtype(inputs[0].data_type(), [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        return split_entry<T>(attrs, outputs, inputs[0], stream);
+    });
 }
 
 } // namespace nnops::backend::cuda

@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 namespace nnops::backend::cuda {
 
@@ -225,6 +226,38 @@ Status launch_move(const T* src, T* dst, const MovePlan& plan, cudaStream_t stre
     const unsigned grid = static_cast<unsigned>(std::min<int64_t>(plan.rows, int64_t(1) << 20));
     move_rows_kernel<T><<<grid, kCudaBlockSize, 0, stream>>>(src, dst, plan);
     return Status::ok;
+}
+
+// ============================================================
+// Dtype dispatch
+// ============================================================
+
+/// Invoke `fn` with a type tag for each whole-element dtype the engine carries,
+/// and return its Status. The set is the CPU's `for_each_data_type` on the nose
+/// — f32, f16, bf16, s8, u8, s32, s64 — because a movement operator stores no
+/// value of its own: a tensor the CPU can concat or transpose is one the device
+/// must move too, integer index and shape tensors included. The packed formats
+/// (f8, s4/u4, q4_1) have no per-element copy and answer unsupported.
+template <typename Fn> Status dispatch_move_dtype(DataType dt, Fn&& fn)
+{
+    switch (dt) {
+    case DataType::f32:
+        return fn(std::type_identity<float>{});
+    case DataType::f16:
+        return fn(std::type_identity<__half>{});
+    case DataType::bf16:
+        return fn(std::type_identity<__nv_bfloat16>{});
+    case DataType::s8:
+        return fn(std::type_identity<int8_t>{});
+    case DataType::u8:
+        return fn(std::type_identity<uint8_t>{});
+    case DataType::s32:
+        return fn(std::type_identity<int32_t>{});
+    case DataType::s64:
+        return fn(std::type_identity<int64_t>{});
+    default:
+        return Status::unsupported;
+    }
 }
 
 } // namespace nnops::backend::cuda

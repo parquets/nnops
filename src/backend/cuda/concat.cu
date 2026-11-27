@@ -9,7 +9,8 @@
 /// with the output's strides — pitch on either side needs no special case, and
 /// a rank-1 concat is a flat copy of each input into the running position.
 ///
-/// f32, f16 and bf16 in, out at the same dtype.
+/// f32, f16, bf16, s8, u8, s32 and s64 in, out at the same dtype — the
+/// whole-element set the CPU's movement kernels carry.
 
 #include "move_common.cuh"
 #include "nnops/ops/concat.hpp"
@@ -82,16 +83,10 @@ Status concat_cuda(const ConcatAttributes& attrs, TensorView& output,
                    void* /*workspace*/)
 {
     const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
-    switch (inputs[0].data_type()) {
-    case DataType::f32:
-        return concat_entry<float>(attrs, output, inputs, stream);
-    case DataType::f16:
-        return concat_entry<__half>(attrs, output, inputs, stream);
-    case DataType::bf16:
-        return concat_entry<__nv_bfloat16>(attrs, output, inputs, stream);
-    default:
-        return Status::unsupported;
-    }
+    return dispatch_move_dtype(inputs[0].data_type(), [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        return concat_entry<T>(attrs, output, inputs, stream);
+    });
 }
 
 } // namespace nnops::backend::cuda

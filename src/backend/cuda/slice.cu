@@ -10,7 +10,8 @@
 /// A strided slice (st > 1) simply leaves the source run non-unit, so the copy
 /// falls to the scalar path; the destination stays contiguous.
 ///
-/// f32, f16 and bf16 in, out at the same dtype.
+/// f32, f16, bf16, s8, u8, s32 and s64 in, out at the same dtype — the
+/// whole-element set the CPU's movement kernels carry.
 
 #include "move_common.cuh"
 #include "nnops/ops/slice.hpp"
@@ -71,16 +72,10 @@ Status slice_cuda(const SliceAttributes& attrs, TensorView& output,
                   void* /*workspace*/)
 {
     const auto stream = static_cast<cudaStream_t>(ctx.cuda_stream);
-    switch (inputs[0].data_type()) {
-    case DataType::f32:
-        return slice_entry<float>(attrs, output, inputs[0], stream);
-    case DataType::f16:
-        return slice_entry<__half>(attrs, output, inputs[0], stream);
-    case DataType::bf16:
-        return slice_entry<__nv_bfloat16>(attrs, output, inputs[0], stream);
-    default:
-        return Status::unsupported;
-    }
+    return dispatch_move_dtype(inputs[0].data_type(), [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        return slice_entry<T>(attrs, output, inputs[0], stream);
+    });
 }
 
 } // namespace nnops::backend::cuda
