@@ -288,12 +288,24 @@ inline void tiled_im2col(T* NNOPS_RESTRICT a, int lda, const T* NNOPS_RESTRICT i
 /// @p kdim4 is zeroed so the direct-A kernel, which reads whole 4-byte groups,
 /// sees a zero product there (the B panel is zero-padded over the same range).
 /// @p p0 / @p flat mean what they do in the fp gather.
+///
+/// @p safe16 is the largest element offset from @p in at which a 16-byte load
+/// still reads inside the source; 0 disables the wide copy. It exists for the
+/// tiny-channel stems, where a filter row's whole tap run is at most a few
+/// dozen bytes and the run is one 16-byte copy instead of two overlapping
+/// 8-byte ones (whose store-then-partial-load on the same address costs a
+/// store-forwarding stall). The bytes a short run's copy spills fall in the
+/// same pixel's *later* filter rows, which this walk rewrites afterwards; the
+/// last row spills past the k tail instead, so a short last run stays exact. A
+/// run of 16 bytes or more reads only from within itself, so the bound only
+/// guards the shorter ones.
 inline void tiled_im2col_i8(int8_t* NNOPS_RESTRICT a, int lda,
                                          const uint8_t* NNOPS_RESTRICT in, int64_t in_row_stride,
                                          int64_t ic_stride, uint8_t xr, uint8_t pad, int64_t p0,
                                          int OW, bool flat, int mc, int IH, int IW, int KH, int KW,
                                          int SH, int SW, int DH, int DW, int PH, int PW, int icnc,
-                                         int karea, int kdim, int kdim4) noexcept
+                                         int karea, int kdim, int kdim4,
+                                         int64_t safe16 = 0) noexcept
 {
     // The channel run of one tap is the whole copy; the 8- and 16-wide blocks
     // take one 8-byte (two for 16) load/xor/store instead of a byte loop, which
@@ -330,42 +342,146 @@ inline void tiled_im2col_i8(int8_t* NNOPS_RESTRICT a, int lda,
         }
     };
 
-    // Same filter-row merge as the fp gather: one XOR copy per row instead of
-    // one per tap, which matters most when icnc is small and each per-tap run
-    // is only a few bytes.
-    const bool tap_run = (DW == 1) && (ic_stride == icnc);
-    const auto xor_span = [xr, xr64, pv](int8_t* dst, const uint8_t* src, int n) noexcept {
+    // One 16-byte XOR copy: two 8-byte halves, so the shift is two XORs and a
+    // 16-lane pair of loads/stores wherever the target has them.
+    const auto copy16 = [xr64](int8_t* dst, const uint8_t* src) noexcept {
+        uint64_t v0 = 0, v1 = 0;
+        std::memcpy(&v0, src, 8);
+        std::memcpy(&v1, src + 8, 8);
+        v0 ^= xr64;
+        v1 ^= xr64;
+        std::memcpy(dst, &v0, 8);
+        std::memcpy(dst + 8, &v1, 8);
+    };
+    // A run copied without overrun: an 8-byte body and a scalar tail.
+    const auto copy_run_exact = [xr, xr64](int8_t* dst, const uint8_t* src, int n) noexcept {
         int j = 0;
-        if (!src) {
-            for (; j + 8 <= n; j += 8) {
-                std::memset(dst + j, pv, 8);
-            }
-            for (; j < n; ++j) {
-                dst[j] = static_cast<int8_t>(pv);
-            }
-            return;
-        }
         for (; j + 8 <= n; j += 8) {
             uint64_t v = 0;
             std::memcpy(&v, src + j, 8);
             v ^= xr64;
             std::memcpy(dst + j, &v, 8);
         }
-        if (j < n) {
-            if (n >= 8) {
-                // The tail rides on one overlapping 8-byte copy.
-                j = n - 8;
-                uint64_t v = 0;
-                std::memcpy(&v, src + j, 8);
-                v ^= xr64;
-                std::memcpy(dst + j, &v, 8);
-            } else {
-                for (; j < n; ++j) {
-                    dst[j] = static_cast<int8_t>(src[j] ^ xr);
-                }
-            }
+        for (; j < n; ++j) {
+            dst[j] = static_cast<int8_t>(src[j] ^ xr);
         }
     };
+
+    const bool tap_run = (DW == 1) && (ic_stride == icnc);
+    if (tap_run) {
+        // One filter row's taps are a fixed stride apart in the input and a
+        // fixed stride apart in the A row, so walk the block in *row segments*
+        // and, inside one, one filter row at a time: the interior columns take
+        // a branch-free copy loop and only the segment's edges fall back to a
+        // per-tap gather. At the three-channel stems the per-pixel tests this
+        // removes cost more than the copies do.
+        //
+        // A pass writes one filter row of every pixel, `lda` apart, so it
+        // cannot be longer than an L1 window: a 576-byte A row (64 channels,
+        // 3x3) would stream 147 KB three times over. `pmax` bounds it, which
+        // keeps the win on the narrow stems where the walk exists and costs
+        // nothing where the block is wider than the cache.
+        const int run = KW * icnc;
+        const int64_t step = static_cast<int64_t>(SW) * ic_stride;
+        const int pmax = std::max(8, 32768 / lda);
+        const int lo_abs = PW == 0 ? 0 : (PW + SW - 1) / SW;
+        const int64_t hi_last = IW - 1 + PW - static_cast<int64_t>(KW - 1) * DW;
+        const int hi_abs = hi_last < 0 ? 0 : static_cast<int>(hi_last / SW) + 1;
+        int m = 0;
+        int64_t oh = p0 / OW;
+        int ow = static_cast<int>(p0 - oh * OW);
+        while (m < mc) {
+            const int n = flat ? std::min(OW - ow, mc - m) : mc - m;
+            const int64_t ih0 = oh * SH - PH;
+            for (int c0 = 0; c0 < n; c0 += pmax) {
+                const int cn = std::min(pmax, n - c0);
+                // Columns of the output row whose whole tap run is in bounds:
+                // c·SW ≥ PW and c·SW ≤ IW-1+PW-(KW-1)·DW. [e0, e1) is that
+                // range relative to this pass's pixel window.
+                const int e0 = std::clamp(lo_abs - (ow + c0), 0, cn);
+                const int e1 = std::clamp(hi_abs - (ow + c0), 0, cn);
+                for (int kh = 0; kh < KH; ++kh) {
+                    const int64_t ih = ih0 + static_cast<int64_t>(kh) * DH;
+                    int8_t* const dbase =
+                        a + static_cast<int64_t>(m + c0) * lda + static_cast<int64_t>(kh) * run;
+                    if (ih < 0 || ih >= IH) {
+                        int8_t* d = dbase;
+                        for (int j = 0; j < cn; ++j, d += lda) {
+                            std::memset(d, pv, static_cast<size_t>(run));
+                        }
+                        continue;
+                    }
+                    const uint8_t* const hbase =
+                        in + ih * in_row_stride +
+                        (static_cast<int64_t>(ow + c0) * SW - PW) * ic_stride;
+                    // Two 16-byte copies cover [0, run) for run in [8, 32]. Every
+                    // filter row but the last spills into its own pixel's later
+                    // rows, which the following passes rewrite; a short run in
+                    // the last row would spill past the k tail instead, so it
+                    // takes exact copies.
+                    const bool wide =
+                        safe16 > 0 && run >= 8 && run <= 32 && (kh + 1 < KH || run >= 16);
+                    bool src_ok = wide;
+                    if (wide && run < 16) {
+                        // The window's last interior column decides: its 16-byte
+                        // read must stay inside the source.
+                        src_ok = e1 <= e0 ||
+                                 (hbase - in) + static_cast<int64_t>(e1 - 1) * step <= safe16;
+                    }
+                    const auto tap = [&](int8_t* d, int j, int kw) {
+                        const int64_t iw = static_cast<int64_t>(ow + c0 + j) * SW - PW +
+                                           static_cast<int64_t>(kw) * DW;
+                        if (iw < 0 || iw >= IW) {
+                            std::memset(d, pv, static_cast<size_t>(icnc));
+                            return;
+                        }
+                        const uint8_t* s = in + ih * in_row_stride + iw * ic_stride;
+                        for (int c = 0; c < icnc; ++c) {
+                            d[c] = static_cast<int8_t>(s[c] ^ xr);
+                        }
+                    };
+                    // Edges: per pixel, per tap.
+                    for (int j = 0; j < e0; ++j) {
+                        int8_t* d = dbase + static_cast<int64_t>(j) * lda;
+                        for (int kw = 0; kw < KW; ++kw, d += icnc) {
+                            tap(d, j, kw);
+                        }
+                    }
+                    for (int j = e1; j < cn; ++j) {
+                        int8_t* d = dbase + static_cast<int64_t>(j) * lda;
+                        for (int kw = 0; kw < KW; ++kw, d += icnc) {
+                            tap(d, j, kw);
+                        }
+                    }
+                    // Interior: the whole run per pixel, no tests.
+                    int8_t* d = dbase + static_cast<int64_t>(e0) * lda;
+                    const uint8_t* s = hbase + static_cast<int64_t>(e0) * step;
+                    if (src_ok) {
+                        for (int j = e0; j < e1; ++j, d += lda, s += step) {
+                            copy16(d, s);
+                            if (run > 16) {
+                                copy16(d + run - 16, s + run - 16);
+                            }
+                        }
+                    } else {
+                        for (int j = e0; j < e1; ++j, d += lda, s += step) {
+                            copy_run_exact(d, s, run);
+                        }
+                    }
+                }
+            }
+            if (kdim4 > kdim) {
+                for (int j = 0; j < n; ++j) {
+                    int8_t* const d = a + (static_cast<int64_t>(m) + j) * lda + kdim;
+                    std::memset(d, 0, static_cast<size_t>(kdim4 - kdim));
+                }
+            }
+            m += n;
+            ow = 0;
+            ++oh;
+        }
+        return;
+    }
 
     int64_t oh = p0 / OW;
     int ow = static_cast<int>(p0 - oh * OW);
@@ -377,30 +493,6 @@ inline void tiled_im2col_i8(int8_t* NNOPS_RESTRICT a, int lda,
         const int64_t ih0 = oh * SH - PH;
         const int64_t iw0 = static_cast<int64_t>(ow) * SW - PW;
         int8_t* row = a + static_cast<int64_t>(m) * lda;
-        if (tap_run) {
-            for (int kh = 0; kh < KH; ++kh) {
-                const int64_t ih = ih0 + static_cast<int64_t>(kh) * DH;
-                int8_t* dst = row + static_cast<int64_t>(kh) * KW * icnc;
-                if (ih < 0 || ih >= IH) {
-                    xor_span(dst, nullptr, KW * icnc);
-                    continue;
-                }
-                const uint8_t* hrow = in + ih * in_row_stride;
-                if (iw0 >= 0 && iw0 + KW <= IW) {
-                    xor_span(dst, hrow + iw0 * ic_stride, KW * icnc);
-                } else {
-                    for (int kw = 0; kw < KW; ++kw) {
-                        const int64_t iw = iw0 + kw;
-                        copy_run(dst + kw * icnc,
-                                 (iw >= 0 && iw < IW) ? hrow + iw * ic_stride : nullptr);
-                    }
-                }
-            }
-            if (kdim4 > kdim) {
-                std::memset(row + kdim, 0, static_cast<size_t>(kdim4 - kdim));
-            }
-            continue;
-        }
         int t = 0;
         for (int kh = 0; kh < KH; ++kh) {
             const int64_t ih = ih0 + static_cast<int64_t>(kh) * DH;

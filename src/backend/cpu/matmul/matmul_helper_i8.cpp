@@ -184,7 +184,7 @@ constexpr std::array<PackI8Fn, 3> pack_copy_i8_lhs = {{
 #endif
 }};
 
-#ifdef NNOPS_ARCH_AARCH64
+#ifdef NNOPS_ARCH_I8MM
 // The SMMLA route's LHS ladder: same rungs, eight-k groups, one 16-byte
 // fragment per row pair.
 constexpr std::array<PackI8Fn, 3> pack_trans_i8_lhs_i8mm = {{
@@ -299,9 +299,13 @@ void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd, const in
     // transposed source is a plain copy; row-major needs the transposing kernel.
 #ifdef NNOPS_ARCH_AARCH64
     const bool i8mm = i8mm_enabled();
+#ifdef NNOPS_ARCH_I8MM
     const PackI8Fn* fns =
         i8mm ? (trans ? pack_copy_i8_lhs_i8mm.data() : pack_trans_i8_lhs_i8mm.data()) :
                (trans ? pack_copy_i8_lhs.data() : pack_trans_i8_lhs.data());
+#else
+    const PackI8Fn* fns = trans ? pack_copy_i8_lhs.data() : pack_trans_i8_lhs.data();
+#endif
     const int kbytes = i8mm ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
 #else
     const PackI8Fn* fns = trans ? pack_copy_i8_lhs.data() : pack_trans_i8_lhs.data();
@@ -332,7 +336,11 @@ void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd, const AT* src,
 #ifdef NNOPS_ARCH_AARCH64
     const bool i8mm = i8mm_enabled();
     const int kbytes = i8mm ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
+#ifdef NNOPS_ARCH_I8MM
     const PackI8Fn* const packers = i8mm ? pack_trans_i8_lhs_i8mm.data() : pack_trans_i8_lhs.data();
+#else
+    const PackI8Fn* const packers = pack_trans_i8_lhs.data();
+#endif
 #else
     const int kbytes = (kc + 3) & ~3;
     const PackI8Fn* const packers = pack_trans_i8_lhs.data();
@@ -408,8 +416,12 @@ void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd, const in
 #ifdef NNOPS_ARCH_AARCH64
     // 8-k groups on the SMMLA route, 4-k on SDOT; the panel width is the same.
     const bool i8mm = i8mm_enabled();
+#ifdef NNOPS_ARCH_I8MM
     const PackI8WideFn fn = i8mm ? (trans ? pack_trans_n12_i8mm : pack_copy_n12_i8mm) :
                                    (trans ? pack_i8_rhs_trans : pack_i8_rhs_copy);
+#else
+    const PackI8WideFn fn = trans ? pack_i8_rhs_trans : pack_i8_rhs_copy;
+#endif
     const int kbytes = i8mm ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
 #else
     const PackI8WideFn fn = trans ? pack_i8_rhs_trans : pack_i8_rhs_copy;
@@ -440,7 +452,7 @@ using MmaDirectI8Fn = void (*)(int, int, int, int32_t*, int, const int8_t*, int,
 /// ladder and the panel width; only the bytes inside a B panel differ.
 inline MmaPackI8Fn mma_pack_i8_fn(int level, bool zero_mode)
 {
-#ifdef NNOPS_ARCH_AARCH64
+#ifdef NNOPS_ARCH_I8MM
     if (i8mm_enabled()) {
         return zero_mode ? mma_pack_fns_i8mm<true>[level] : mma_pack_fns_i8mm<false>[level];
     }
@@ -450,7 +462,7 @@ inline MmaPackI8Fn mma_pack_i8_fn(int level, bool zero_mode)
 
 inline MmaDirectI8Fn mma_direct_i8_fn(int level, bool zero_mode)
 {
-#ifdef NNOPS_ARCH_AARCH64
+#ifdef NNOPS_ARCH_I8MM
     if (i8mm_enabled()) {
         return zero_mode ? mma_direct_fns_i8mm<true>[level] : mma_direct_fns_i8mm<false>[level];
     }

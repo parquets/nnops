@@ -168,6 +168,12 @@ if(NNOPS_ENABLE_SME)
     target_compile_definitions(nnops_cpu PUBLIC NNOPS_ARCH_SME=1)
 endif()
 
+if(NNOPS_ENABLE_I8MM)
+    # Same deal for SMMLA: header-only bodies carrying target("i8mm"). Off, the
+    # two i8mm headers compile to nothing and every route query is SDOT.
+    target_compile_definitions(nnops_cpu PUBLIC NNOPS_ARCH_I8MM=1)
+endif()
+
 # ---- CUDA backend (optional) ----
 if(NNOPS_BUILD_CUDA)
     enable_language(CUDA)

@@ -363,9 +363,35 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
         return;
     }
 
+    // The tiny filter — a square 3x3/5x5/7x7 over at most four channels — is a
+    // route of its own. On NEON the direct plane kernel convolves the raw filter
+    // in place, so a blob would only steer compute() off it. On an SME machine
+    // the same geometry runs the GEMM, whose panels are worth packing once.
+    // The conditions mirror the direct kernel's gate; a shape it will not take
+    // still packs, since a declined pack is a per-call pack at compute time.
+    const int64_t ks = attrs_.kernel_size[0];
+    const bool epi_pass =
+        attrs_.epilogue.type != EpilogueActivateType::None &&
+        !(!attrs_.add_to && (attrs_.epilogue.type == EpilogueActivateType::Relu ||
+                             attrs_.epilogue.type == EpilogueActivateType::Relu6));
+    const bool stem_geo =
+        is_channel_last_weight(weight.layout()) && attrs_.groups == 1 &&
+        (weight.data_type() == DataType::f32 || weight.data_type() == DataType::f16) &&
+        weight.shape(2) <= 4 && weight.shape(3) % 16 == 0 && ks == attrs_.kernel_size[1] &&
+        ks >= 3 && ks <= 7 && (ks & 1) && !attrs_.add_to && !epi_pass;
+
+    // The quantized twin: the direct int8 kernel reads the raw filter too, so
+    // the same "no packed form" answer keeps compute() on it. Its own gate
+    // (conv_i8_stem_geometry) decides — a 7x7 and a non-integer destination
+    // stay on the GEMM and still pack.
+    const bool i8_stem_geo = backend::cpu::conv_i8_stem_geometry(attrs_, weight);
+
     // Two products live behind this one call. Auto keeps producing U exactly
     // where the transform exists — the k3s1 fp geometry its asserts demand —
-    // because that is what an Auto caller will feed back into compute().
+    // because that is what an Auto caller will feed back into compute(). The
+    // tiny filter is the exception: the transform's own floor is 32 channels per
+    // group, so at four or fewer the U is a loss Auto must not choose on the
+    // caller's behalf. An explicit Winograd request still gets its U.
     // The U exists for f32 and f16 only: the Winograd kernel refuses every
     // other dtype (its U panels are the dense fp pack), so neither an Auto nor
     // an explicit Winograd pack may hand back a U the same call would decline.
@@ -374,25 +400,19 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs, std::span<Tensor
     const bool wino_product =
         wino_dtype &&
         (attrs_.algorithm == ConvAlgorithm::Winograd ||
-         (attrs_.algorithm == ConvAlgorithm::Auto && !is_quantized_conv2d(weight.data_type()) &&
+         (attrs_.algorithm == ConvAlgorithm::Auto && !stem_geo &&
+          !is_quantized_conv2d(weight.data_type()) &&
           attrs_.kernel_size[0] == 3 && attrs_.kernel_size[1] == 3 && attrs_.stride[0] == 1 &&
           attrs_.stride[1] == 1 && attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1));
 
     if (!wino_product) {
-        // A square 3x3/5x5/7x7 over at most four channels has no packed form:
-        // the direct route convolves the raw filter in place, and one call per
-        // inference leaves nothing to amortize. The
-        // conditions mirror that route's, so a shape it will not take still
-        // packs (a declined pack is a per-call pack at compute time).
-        const int64_t ks = attrs_.kernel_size[0];
-        const bool epi_pass =
-            attrs_.epilogue.type != EpilogueActivateType::None &&
-            !(!attrs_.add_to && (attrs_.epilogue.type == EpilogueActivateType::Relu ||
-                                 attrs_.epilogue.type == EpilogueActivateType::Relu6));
-        if (is_channel_last_weight(weight.layout()) && attrs_.groups == 1 &&
-            (weight.data_type() == DataType::f32 || weight.data_type() == DataType::f16) &&
-            weight.shape(2) <= 4 && weight.shape(3) % 16 == 0 && ks == attrs_.kernel_size[1] &&
-            ks >= 3 && ks <= 7 && (ks & 1) && !attrs_.add_to && !epi_pass) {
+        // The tiny filter declines a NEON blob (the direct kernel reads the raw
+        // filter); where the GEMM will run it, the ZA panels are what to pack.
+        // The int8 kernel's gate answers the same way, and a filter it declines
+        // (7x7, fp destination) still packs for the GEMM.
+        if ((stem_geo || i8_stem_geo) &&
+            backend::cpu::conv_packed_weight_desc(attrs_, weight.desc()).layout !=
+                TensorLayout::PackedHWIOSme) {
             return;
         }
         // The descriptor comes from the attributes and the filter's own dims, so

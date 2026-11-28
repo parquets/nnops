@@ -210,6 +210,16 @@ TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs, const TensorDe
 void conv_packed_weight_pack(const Conv2DAttributes& attrs, const TensorView& weight,
                              TensorView& packed, const ComputeContext& ctx);
 
+/// Whether a quantized filter takes the direct int8 stem kernel
+/// (simd_kernel/simd_stem_conv.hpp): at most four input channels under a
+/// square 3x3/5x5, an integer destination, no per-channel requant epilogue and
+/// zero weight zero points. A 7x7 keeps the panel GEMM — its 37 k groups make
+/// the GEMM's eight-pixel blocking about 4x the direct kernel at one pixel per
+/// dot. prepackWeights asks the same question: on a NEON answer the blob would
+/// steer compute() off the kernel that reads the raw filter, so it queries no
+/// packed form (the float stem's rule). AArch64-only, like the kernel.
+bool conv_i8_stem_geometry(const Conv2DAttributes& attrs, const TensorView& weight);
+
 /// Byte offsets into the arena (see the file header); the per-slot ones are
 /// relative to the slot.
 struct Conv2DGemmScratch {

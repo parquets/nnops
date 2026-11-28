@@ -11,11 +11,11 @@
 ///    int8 uses the same levels). B packs into uniform nr_max-wide panels with
 ///    the columns past nc zero-filled, one mma_pack_align (64-byte) slot apart.
 ///  - int8 always takes a hardware integer MMA (VNNI u8×s8 on x86, SDOT
-///    s8×s8 on aarch64, SMMLA on aarch64 when FEAT_I8MM is present and not
-///    disabled). Only the pack layout and the A-side signedness shift differ by
-///    arch — see int8_a_pack_bias — and the i8mm switch is runtime, inside this
-///    layer: every plan above it sees the same MR ladder, panel width and
-///    DataTypes.
+///    s8×s8 on aarch64, SMMLA on aarch64 when the build enabled i8mm
+///    — NNOPS_ENABLE_I8MM — and FEAT_I8MM is present and not disabled). Only
+///    the pack layout and the A-side signedness shift differ by arch — see
+///    int8_a_pack_bias — and the i8mm switch is inside this layer: every plan
+///    above it sees the same MR ladder, panel width and DataTypes.
 ///  - kc is capped per dtype. The fp 128 is a precision limit on f16 (that
 ///    kernel accumulates in f16; kc 256 at K=4096 moved the worst deviation
 ///    0.183 -> 0.230), f32 keeping the same cap. int8's 512 is a tuning
@@ -121,9 +121,14 @@ constexpr int NR_MAX_I8 = arch::mma_i8_nr_max;
 /// routes share the MR ladder and the 12-wide B panel, so nothing above this
 /// header forks — only the pack bytes inside a B panel and the kernel that
 /// reads them (see aarch64/pack_i8mm.hpp).
+///
+/// Two gates: the build must have carried the kernels (`NNOPS_ENABLE_I8MM`
+/// defines `NNOPS_ARCH_I8MM`), and the core must report FEAT_I8MM. With the
+/// macro off the function is a false constant, the two i8mm headers compile to
+/// nothing and the binary is SDOT-only — the route a non-i8mm core runs anyway.
 inline bool i8mm_enabled() noexcept
 {
-#ifdef NNOPS_ARCH_AARCH64
+#if defined(NNOPS_ARCH_AARCH64) && defined(NNOPS_ARCH_I8MM)
     return simd::cpu_has_i8mm();
 #else
     return false;

@@ -28,6 +28,12 @@
 /// count, rows past it alias the last live one in A and in C, and only the live
 /// rows are stored. `ldb` (0 = the kernel's own slot) overrides the
 /// panel-to-panel step for a prepacked B pitched for another k length.
+///
+/// The bodies compile only when the build enabled i8mm (`NNOPS_ENABLE_I8MM`
+/// defines `NNOPS_ARCH_I8MM`); without the macro i8mm_enabled() is a false
+/// constant and the whole file is empty, which is the pure-SDOT build.
+
+#if defined(NNOPS_ARCH_I8MM)
 
 #include <algorithm>
 #include <arm_neon.h>
@@ -1043,3 +1049,5 @@ inline constexpr auto mma_direct_fns_i8mm = std::array{
     &mma_direct_mr8_nr12_i8mm<Z>, &mma_direct_mr4_nr12_i8mm<Z>, &mma_direct_mr1_nr12_i8mm<Z>};
 
 } // namespace nnops::backend::cpu::aarch64
+
+#endif // NNOPS_ARCH_I8MM

@@ -144,8 +144,11 @@ WinoU wino_u(int64_t ic_per_group, int64_t oc_per_group, int64_t groups,
 /// Which order a prepack should build. The trade is F(4,3)'s 1.78x fewer
 /// multiplies per output against ~4.5x the transform work per tile, which the
 /// channel count amortizes. The windows are read in place, so the plane alone
-/// decides: F(4,3) from 28x28 up, at any team size, subject to the U still
-/// fitting the last-level cache.
+/// decides — and it decides for the U's traffic too (the blob is streamed once
+/// per tile block, so what it costs is bytes per tile, not bytes): F(4,3) from
+/// 28x28 up at any team size, and from 14x14 on a pool of four or fewer. The
+/// channel counts are carried for the callers and tests that describe a filter
+/// by them; the decision does not read them.
 ///
 /// f16 gets the same choice; its GEMM accumulates in f16, and F(4,3)'s Aᵀ/Bᵀ
 /// amplify that rounding ~8x with the error growing as √IC (measured: 4% of full

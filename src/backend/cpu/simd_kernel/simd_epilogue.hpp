@@ -32,9 +32,12 @@
 /// passes, so integer outputs match the reference byte for byte. The requant
 /// multiplies in f32 like MLAS's requantize — exact below 2^24, never off by
 /// enough to cross a clamp bound — and clamps before the truncating convert,
-/// whose out-of-range value is the integer indefinite. dq_epilogue_row skips a
-/// bias of exactly 0: x + 0 turns -0 into +0, and MatMul outputs are compared
-/// bitwise.
+/// whose out-of-range value is the integer indefinite. The AArch64 vector pass
+/// drops that clamp (and the zero-point add with it) when the destination's zero
+/// point is zero: FCVTAS saturates, so the narrowing lands on the same bytes and
+/// the clamp is dead weight there. x86's cvttps cannot make that trade.
+/// dq_epilogue_row skips a bias of exactly 0: x + 0 turns -0 into +0, and MatMul
+/// outputs are compared bitwise.
 
 #include "nnops/core/epilogue.hpp"
 #include "nnops/core/quant_params.hpp"
@@ -42,6 +45,7 @@
 #include "activation_kernels.hpp"
 
 #include <cmath>
+#include <type_traits>
 #include <cstdint>
 #include <algorithm>
 
@@ -142,8 +146,12 @@ inline TOut matmul_int8_requant(int32_t acc, float requant_scale, int32_t zp_out
     const float zpf = static_cast<float>(zp_out);
     const float x =
         std::min(std::max(static_cast<float>(acc) * requant_scale, kMin - zpf), kMax - zpf);
-    const float r = std::trunc(x + std::copysign(0.5f, x));
-    return static_cast<TOut>(static_cast<int32_t>(r) + zp_out);
+    // std::round, i.e. FCVTAS: nearest, ties away from zero. The
+    // `trunc(x + copysign(0.5, x))` form this used to be is not the same
+    // function — the add rounds, so a value a hair under a `.5` boundary can
+    // come out one higher here than in the vectorised pass, which converts
+    // straight to int. That showed up as a single differing output element.
+    return static_cast<TOut>(std::lround(x) + zp_out);
 }
 
 /// The s8 form, so a call site needs no template argument.
@@ -409,39 +417,58 @@ inline void int8_epilogue_row_quant(const int32_t* c, TOut* out, int64_t n0, int
     const float32x4_t vreq = vdupq_n_f32(row_k * p.s_b_scalar);
     const float32x4_t vmin = vdupq_n_f32(kMin - zpf);
     const float32x4_t vmax = vdupq_n_f32(kMax - zpf);
-    for (; n + 4 <= n1; n += 4) {
-        int32x4_t v = vld1q_s32(c + n);
-        if (p.col_term) {
-            v = vsubq_s32(v, vmulq_s32(vcrb, vld1q_s32(p.r_b + n)));
-        }
-        if (p.compensate) {
-            const int32x4_t zps = p.zp_b ? vld1q_s32(p.zp_b + n) : vdupq_n_s32(p.zp_b_scalar);
-            v = vsubq_s32(v, vmulq_s32(vczp, zps));
-        }
-        if (biased) {
-            v = vaddq_s32(v, vbias);
-        }
-        if (col_biased) {
-            v = vaddq_s32(v, vld1q_s32(p.col_bias + n));
-        }
-        if (p.relu) {
-            v = vmaxq_s32(v, vdupq_n_s32(0));
-        }
+    // With a zero output zero point the store's own saturating narrowing lands
+    // on exactly the clamp's bytes, so the float min/max and the integer add are
+    // dead — the three instructions a requantizing store can drop. FCVTAS
+    // saturates, so an out-of-range product still lands on the destination's
+    // end. The choice is branched once per row: a live branch
+    // inside the loop measured the saving back.
+    const auto rows = [&](auto clamp_tag) {
+        for (int64_t j = n0; j + 4 <= n1; j += 4) {
+            int32x4_t v = vld1q_s32(c + j);
+            if (p.col_term) {
+                v = vsubq_s32(v, vmulq_s32(vcrb, vld1q_s32(p.r_b + j)));
+            }
+            if (p.compensate) {
+                const int32x4_t zps = p.zp_b ? vld1q_s32(p.zp_b + j) : vdupq_n_s32(p.zp_b_scalar);
+                v = vsubq_s32(v, vmulq_s32(vczp, zps));
+            }
+            if (biased) {
+                v = vaddq_s32(v, vbias);
+            }
+            if (col_biased) {
+                v = vaddq_s32(v, vld1q_s32(p.col_bias + j));
+            }
+            if (p.relu) {
+                v = vmaxq_s32(v, vdupq_n_s32(0));
+            }
 
-        float32x4_t f = vcvtq_f32_s32(v);
-        f = vmulq_f32(f, p.s_b ? vmulq_f32(vk, vld1q_f32(p.s_b + n)) : vreq);
-        f = vminq_f32(vmaxq_f32(f, vmin), vmax);
-        // FCVTAS: nearest, ties away from zero — exactly std::round.
-        const int32x4_t q = vaddq_s32(vcvtaq_s32_f32(f), vzp);
-        const int16x4_t i16 = vqmovn_s32(q);
-        if constexpr (kU8) {
-            const uint8x8_t v8 = vqmovun_s16(vcombine_s16(i16, i16));
-            vst1_lane_u32(reinterpret_cast<uint32_t*>(out + n), vreinterpret_u32_u8(v8), 0);
-        } else {
-            const int8x8_t v8 = vqmovn_s16(vcombine_s16(i16, i16));
-            vst1_lane_s32(reinterpret_cast<int32_t*>(out + n), vreinterpret_s32_s8(v8), 0);
+            float32x4_t f = vcvtq_f32_s32(v);
+            f = vmulq_f32(f, p.s_b ? vmulq_f32(vk, vld1q_f32(p.s_b + j)) : vreq);
+            // FCVTAS: nearest, ties away from zero — exactly std::round.
+            int32x4_t q;
+            if constexpr (decltype(clamp_tag)::value) {
+                f = vminq_f32(vmaxq_f32(f, vmin), vmax);
+                q = vaddq_s32(vcvtaq_s32_f32(f), vzp);
+            } else {
+                q = vcvtaq_s32_f32(f);
+            }
+            const int16x4_t i16 = vqmovn_s32(q);
+            if constexpr (kU8) {
+                const uint8x8_t v8 = vqmovun_s16(vcombine_s16(i16, i16));
+                vst1_lane_u32(reinterpret_cast<uint32_t*>(out + j), vreinterpret_u32_u8(v8), 0);
+            } else {
+                const int8x8_t v8 = vqmovn_s16(vcombine_s16(i16, i16));
+                vst1_lane_s32(reinterpret_cast<int32_t*>(out + j), vreinterpret_s32_s8(v8), 0);
+            }
         }
+    };
+    if (p.zp_out != 0) {
+        rows(std::true_type{});
+    } else {
+        rows(std::false_type{});
     }
+    n = n0 + ((n1 - n0) & ~int64_t{3});
 #endif
 
     for (; n < n1; ++n) {

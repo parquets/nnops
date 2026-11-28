@@ -164,7 +164,13 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
                             if (attrs.epilogue.type == EpilogueActivateType::Relu) {
                                 v = std::max(v, 0);
                             }
-                            const float req = matmul_int8_requant_scale(s_w, s_x, oc_out_scale);
+                            // (s_x / s_out) · s_w — the epilogue's own order.
+                            // The other way round is the same number up to a
+                            // ulp, which is enough to move an element sitting on
+                            // a rounding boundary, so the reference has to spell
+                            // it the way int8_epilogue_row_quant does.
+                            const float req =
+                                matmul_int8_requant_scale(s_x, s_w, oc_out_scale);
                             out_ptr[out_idx] = matmul_int8_requant<TOut>(v, req, oc_zp_out);
                         } else {
                             // ---- same tail as dq_epilogue_row -----------------

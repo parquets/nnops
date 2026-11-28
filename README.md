@@ -52,6 +52,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNNOPS_BUILD_VULKAN=ON
 | `NNOPS_BUILD_CUDA` | `OFF` | Build the CUDA backend |
 | `NNOPS_CUTLASS_DIR` | auto-detected | CUTLASS checkout providing `include/cute`, required by the CUDA GEMM kernels (`D:/git/cutlass` and `$CUTLASS_DIR` are tried first) |
 | `NNOPS_BUILD_VULKAN` | `OFF` | Build the Vulkan backend |
+| `NNOPS_ENABLE_SME` | `ON` | Build the AArch64 SME kernels (AArch64 only, ignored elsewhere) |
+| `NNOPS_ENABLE_I8MM` | `ON` | Build the AArch64 FEAT_I8MM (SMMLA) int8 kernels; `OFF` gives a pure-SDOT build (AArch64 only, ignored elsewhere) |
 
 Install as a CMake package:
 

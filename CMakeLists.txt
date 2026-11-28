@@ -45,6 +45,42 @@ elseif(NNOPS_ENABLE_SME)
     set(NNOPS_ENABLE_SME OFF)
 endif()
 
+# AArch64 FEAT_I8MM int8 kernels (SMMLA). Header-only in the same way: each
+# body carries its own target("i8mm"), so the library stays baseline AArch64,
+# and a build that has them still checks FEAT_I8MM at runtime. Turning the
+# option off leaves a pure SDOT build — the route a core without FEAT_I8MM runs
+# anyway — which is what makes that fallback a build one can test and measure
+# on a machine that does have i8mm.
+option(NNOPS_ENABLE_I8MM     "Build the AArch64 FEAT_I8MM (SMMLA) int8 kernels" ON)
+
+if(NNOPS_ENABLE_I8MM AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64)|(arm64)|(ARM64)")
+    message(STATUS "NNOPS_ENABLE_I8MM: i8mm is AArch64-only; disabling")
+    set(NNOPS_ENABLE_I8MM OFF)
+endif()
+if(NNOPS_ENABLE_I8MM AND NOT MSVC)
+    include(CheckCXXSourceCompiles)
+    # The host may be AArch64 while the compile target is not (a macOS
+    # CMAKE_OSX_ARCHITECTURES=x86_64 tree is the one here), so probe the
+    # compiler rather than the processor: arm_neon.h plus the per-function
+    # target is what the kernels need.
+    check_cxx_source_compiles([=[
+        #include <arm_neon.h>
+        #include <cstdint>
+        __attribute__((target("i8mm")))
+        static int32_t i8mm_probe(int8x16_t a, int8x16_t b)
+        { return vgetq_lane_s32(vmmlaq_s32(vdupq_n_s32(0), a, b), 0); }
+        int main() { return static_cast<int>(i8mm_probe(vdupq_n_s8(0), vdupq_n_s8(0))); }
+    ]=]
+        NNOPS_HAS_I8MM_KERNELS)
+    if(NOT NNOPS_HAS_I8MM_KERNELS)
+        message(STATUS "NNOPS_ENABLE_I8MM: the compiler cannot build i8mm function targets; disabling")
+        set(NNOPS_ENABLE_I8MM OFF)
+    endif()
+elseif(NNOPS_ENABLE_I8MM)
+    message(STATUS "NNOPS_ENABLE_I8MM: no i8mm support on MSVC; disabling")
+    set(NNOPS_ENABLE_I8MM OFF)
+endif()
+
 if(NNOPS_BUILD_METAL)
     if(NOT APPLE)
         message(FATAL_ERROR "NNOPS_BUILD_METAL is only supported on Apple platforms")

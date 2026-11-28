@@ -34,10 +34,12 @@
 #include "conv2d_implicit_gemm_internal.h"
 #include "backend/cpu/matmul/matmul_helper.h" // uniform pack/MMA + panel strides
 #if defined(NNOPS_ARCH_SME)
-#include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme + SME tile geometry
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"     // available_sme + SME tile geometry
+#include "backend/cpu/aarch64/sme/im2col_sme.hpp"  // the fused im2col + A pack
 #endif
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"    // dequant / requant epilogues
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"      // tiled im2col gathers
+#include "backend/cpu/simd_kernel/simd_stem_conv.hpp"   // the tiny filter's direct route
 #include "backend/cpu/simd_kernel/simd_int8_reduce.hpp" // int8_row_sum / int8_col_sum_slab
 #include "backend/cpu/simd_kernel/simd_quant.hpp"       // quant_kernel::quantization
 #include "nnops/detail/simd/simd.hpp"
@@ -59,131 +61,6 @@ namespace {
 
 using nnops::simd::s_load;
 using nnops::simd::s_store;
-
-#if defined(NNOPS_ARCH_SME)
-/// The quantized twin of the float gather: a ZA row is one pixel's channel run (four channels a
-/// word), so a tap's 64-byte run per pixel is one `ld1_hor_za32` into that
-/// pixel's row, and the K groups come out of the tile vertically into
-/// [m/16][k/4][64]. The gather and the A pack are one pass, as in the float
-/// form — the source must already be signed (@p xr applied upstream) and four
-/// bytes wide per k group.
-///
-/// A flat 256-pixel tile spans whole output rows, so it contains a row's first
-/// and last column and is rarely fully interior — a tile-wide "interior" flag
-/// made the branch-free path dead for the ResNet18 shapes. Validity is
-/// therefore resolved per *row segment* into a per-pixel source pointer: every
-/// invalid pixel points at @p fill (one input-channel run wide, so `+ c0` stays
-/// in bounds), and the load loop is a plain pointer load with no range tests.
-__arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
-inline void tile_im2col_pack_i8_sme(int8_t* dst, const int8_t* in, int64_t in_row_stride,
-                                    int64_t ic_stride, const int8_t* fill, int64_t p0, int OW,
-                                    int mc, int IH, int IW, int KH, int KW, int SH, int SW,
-                                    int DH, int DW, int PH, int PW, int icnc, int karea) noexcept
-{
-    constexpr int kRows = aarch64::sme_mr;      // 16 pixels: one A panel
-    constexpr int kChanMax = 64;                // bytes one ZA tile row spans
-    constexpr int kMaxPix = 16 * aarch64::sme_mr; // one tile's pixels
-    const int64_t groups = static_cast<int64_t>(karea) * icnc / 4;
-    // Per pixel: this tap's run start, or `fill`.
-    const int8_t* src[kMaxPix];
-    const int64_t oh0 = p0 / OW;
-    const int ow0 = static_cast<int>(p0 - oh0 * OW);
-
-    for (int t = 0; t < karea; ++t) {
-        const int kh = t / KW;
-        const int kw = t - kh * KW;
-        const int trow = kh * DH;
-        const int tcol = kw * DW;
-        // iw = ow*SW + col_off is inside the image for one contiguous column
-        // range: [vlo, vhi).
-        const int col_off = tcol - PW;
-        const int vlo = col_off < 0 ? std::min(OW, (-col_off + SW - 1) / SW) : 0;
-        const int vhi =
-            IW - col_off > 0 ? std::min(OW, (IW - col_off + SW - 1) / SW) : 0;
-        const int64_t col_step = static_cast<int64_t>(SW) * ic_stride;
-
-        int i = 0;
-        int64_t oh = oh0;
-        int ow = ow0;
-        while (i < mc) {
-            const int run = std::min(OW - ow, mc - i);
-            const int ih = static_cast<int>(oh * SH - PH) + trow;
-            if (ih < 0 || ih >= IH) {
-                for (int j = i; j < i + run; ++j) {
-                    src[j] = fill;
-                }
-            } else {
-                const int a = i + std::min(run, std::max(0, vlo - ow));
-                const int b = i + std::min(run, std::max(0, vhi - ow));
-                int j = i;
-                for (; j < a; ++j) {
-                    src[j] = fill;
-                }
-                if (j < b) {
-                    const int64_t base = static_cast<int64_t>(ih) * in_row_stride +
-                                         static_cast<int64_t>(ow + (a - i)) * SW * ic_stride +
-                                         static_cast<int64_t>(col_off) * ic_stride;
-                    const int8_t* p = in + base;
-                    for (; j < b; ++j, p += col_step) {
-                        src[j] = p;
-                    }
-                }
-                for (; j < i + run; ++j) {
-                    src[j] = fill;
-                }
-            }
-            i += run;
-            ow = 0;
-            ++oh;
-        }
-
-        for (int c0 = 0; c0 < icnc; c0 += kChanMax) {
-            const int words = std::min(kChanMax, icnc - c0) / 4;
-            const svbool_t pc = svwhilelt_b32(0, words);
-            for (int pstart = 0; pstart < mc; pstart += kRows) {
-                const int n = std::min(kRows, mc - pstart);
-                if (n == kRows) {
-                    // Constant row indices: the ZA slice folds into the
-                    // instruction instead of a register, and the whole panel
-                    // pipelines.
-#pragma unroll
-                    for (int r = 0; r < kRows; ++r) {
-                        svld1_hor_za32(
-                            0, static_cast<uint32_t>(r), pc,
-                            reinterpret_cast<const uint32_t*>(src[pstart + r] + c0));
-                    }
-                } else {
-                    for (int r = 0; r < n; ++r) {
-                        svld1_hor_za32(
-                            0, static_cast<uint32_t>(r), pc,
-                            reinterpret_cast<const uint32_t*>(src[pstart + r] + c0));
-                    }
-                }
-                const svbool_t pr = svwhilelt_b32(0, n);
-                auto* const dw = reinterpret_cast<int32_t*>(dst);
-                const int64_t blk = static_cast<int64_t>(pstart / kRows) * groups;
-                const int64_t bjat = blk + static_cast<int64_t>(t) * icnc / 4 + c0 / 4;
-                // A vertical ZA store costs about five cycles; reading four
-                // columns at once and storing them as two 128-byte memory
-                // writes is twice as fast over the whole pack. Four columns are
-                // 256 contiguous bytes in the A panel, so the pair stores land
-                // back to back.
-                int j = 0;
-                if (n == kRows) {
-                    for (; j + 4 <= words; j += 4) {
-                        const svint32x4_t g = svread_ver_za32_s32_vg4(0, static_cast<uint32_t>(j));
-                        svst1_s32_x4(svptrue_c32(), dw + (bjat + j) * aarch64::sme_mr, g);
-                    }
-                }
-                for (; j < words; ++j) {
-                    svst1_ver_za32(0, static_cast<uint32_t>(j), pr,
-                                   dw + (bjat + j) * aarch64::sme_mr);
-                }
-            }
-        }
-    }
-}
-#endif  // NNOPS_ARCH_SME
 
 // ---- the quantized route --------------------------------------------------
 //
@@ -796,7 +673,7 @@ I8ATile pick_i8_a(const I8ConvCtx<TAct, TOut>& c, const uint8_t* in_g, const uin
 #endif
     if (fused_pack) {
 #if defined(NNOPS_ARCH_SME)
-        tile_im2col_pack_i8_sme(
+        aarch64::tile_im2col_pack_i8_sme(
             sme_a, reinterpret_cast<const int8_t*>(in_g + icn), c.in_row_stride, c.IC,
             c.fill.data(), p, static_cast<int>(c.OW), mc, static_cast<int>(c.IH),
             static_cast<int>(c.IW), c.KH, c.KW, c.SH, c.SW, c.DH, c.DW, c.PH, c.PW,
@@ -806,11 +683,14 @@ I8ATile pick_i8_a(const I8ConvCtx<TAct, TOut>& c, const uint8_t* in_g, const uin
         a.packed = true;
 #endif
     } else {
+        // The last offset from which a 16-byte read stays inside this image (see
+        // tiled_im2col_i8's `safe16`); the image's own row pitch bounds it.
+        const int64_t safe16 = c.IH * c.in_row_stride - icn - 16;
         tiled_im2col_i8(a_buf, kdim4, in_g + icn, c.in_row_stride, c.IC, c.xr,
                         static_cast<uint8_t>(c.plane ? c.zp_x + c.d : c.zp_x), p,
                         static_cast<int>(c.OW), flat, mc, static_cast<int>(c.IH),
                         static_cast<int>(c.IW), c.KH, c.KW, c.SH, c.SW, c.DH, c.DW, c.PH,
-                        c.PW, static_cast<int>(icnc), c.karea, kdim, kdim4);
+                        c.PW, static_cast<int>(icnc), c.karea, kdim, kdim4, safe16);
         a.ptr = a_buf;
         a.lda = kdim4;
     }
@@ -1139,11 +1019,144 @@ template <class TAct, class TOut> void run_i8_task(const I8ConvCtx<TAct, TOut>& 
 
 // ---- main kernel ----------------------------------------------------------
 
+/// The quantized tiny filter: at most four input channels under a square
+/// 3x3/5x5 takes the direct plane kernel (simd_stem_conv.hpp) — no gather, no
+/// panel, no plan. Like the float route's stem, it is a NEON answer: an SME
+/// machine keeps the ZA GEMM for these shapes, and a 7x7 keeps the panel GEMM
+/// everywhere. Returns true when the call was handled.
+template <class TAct, class TOut>
+bool try_stem_i8(const Conv2DAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx)
+{
+    if constexpr (!I8ConvCtx<TAct, TOut>::kIntOut ||
+                  !(std::is_same_v<TAct, int8_t> || std::is_same_v<TAct, uint8_t>)) {
+        return false;
+#if !defined(NNOPS_ARCH_AARCH64)
+    } else {
+        return false;
+    }
+#else
+    } else {
+        const auto& input = inputs[0];
+        const auto& weight = inputs[1];
+        // A packed blob has no HWIO shape to read, so it is the first question.
+        if (is_packed_conv_weight(weight.layout())) {
+            return false;
+        }
+        // The geometry gate prepackWeights asks too (conv_i8_stem_geometry).
+        // A 7x7 is not in it: 37 k groups at one pixel per dot leave the
+        // direct row about 4x behind the panel GEMM's eight-pixel blocking
+        // (261 vs 67 GOP/s at 1T on 224^2 k7s2 C3->64).
+        if (!conv_i8_stem_geometry(attrs, weight)) {
+            return false;
+        }
+        const int64_t IC = input.shape(3);
+        const int64_t OC = weight.shape(3);
+        const int K = static_cast<int>(attrs.kernel_size[0]);
+        const auto ep = attrs.epilogue.type;
+#if defined(NNOPS_ARCH_SME)
+        // The ZA GEMM is 3-5x the NEON kernel on these shapes (as on the float
+        // side), so a machine that has SME keeps it.
+        if (aarch64::available_sme() && OC >= aarch64::sme_nr_max) {
+            return false;
+        }
+#endif
+
+        const int64_t N = input.shape(0);
+        const int64_t IH = input.shape(1), IW = input.shape(2);
+        const int64_t OH = output.shape(1), OW = output.shape(2);
+        const int64_t in_rs = input.row_stride_elems();
+        const int64_t out_rs = output.row_stride_elems();
+        const int SH = static_cast<int>(attrs.stride[0]);
+        const int SW = static_cast<int>(attrs.stride[1]);
+        const int PH = static_cast<int>(attrs.padding[0]);
+        const int PW = static_cast<int>(attrs.padding[1]);
+        const int DH = static_cast<int>(attrs.dilation[0]);
+        const int DW = static_cast<int>(attrs.dilation[1]);
+        // HWIO: one (tap, input channel) is one OC-length run.
+        const int64_t w_ic_stride = weight.shape(3);
+        const int64_t w_tap_stride = weight.shape(2) * w_ic_stride;
+        const int8_t* const w = weight.ptr<int8_t>();
+        const int32_t* const bias = inputs.size() > 2 ? inputs[2].ptr<int32_t>() : nullptr;
+        const QuantParams& qw = weight.quant_params();
+        const float* const s_b = qw.scale_data;
+        const float s_b_scalar = qw.scale;
+        const float s_x = quant_scale_at(input.quant_params(), 0);
+        const int32_t zp_x = quant_zp_at(input.quant_params(), 0);
+        // The byte the kernel accumulates is the one the gather would feed: a
+        // u8 input is shifted to signed, so its zero point moves by -128.
+        const int32_t coef = (std::is_same_v<TAct, uint8_t> ? -128 : 0) + zp_x;
+        const int8_t pad = static_cast<int8_t>(coef);
+        float out_scale = quant_scale_at(output.quant_params(), 0);
+        int32_t zp_out = quant_zp_at(output.quant_params(), 0);
+        if (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+            attrs.epilogue.quant_param_count > 0) {
+            out_scale = epilogue_quant_scale(attrs.epilogue, 0);
+            zp_out = epilogue_quant_zero(attrs.epilogue, 0);
+        }
+        const float row_k = static_cast<float>(s_x) / static_cast<float>(out_scale);
+        const bool relu = ep == EpilogueActivateType::Relu;
+
+        const TAct* const in = input.ptr<TAct>();
+        TOut* const out = output.ptr<TOut>();
+        const int64_t ib_step = IH * in_rs;
+        const int64_t ob_step = OH * out_rs;
+
+        const auto run = [&](auto icc, auto kkc) {
+            constexpr int ICc = decltype(icc)::value;
+            constexpr int Kc = decltype(kkc)::value;
+            constexpr int kG = k::stem_i8_groups<ICc, Kc>();
+            // The dot layout, once per call: kG k groups of OC columns of four.
+            std::vector<int8_t> wpack(static_cast<size_t>(kG) * static_cast<size_t>(OC) * 4);
+            std::vector<int32_t> r_b(static_cast<size_t>(OC));
+            k::stem_pack_w_i8<ICc, Kc>(wpack.data(), w, w_tap_stride, w_ic_stride, OC,
+                                       r_b.data());
+            // The per-channel epilogue constants, once per call: the bias and
+            // the zero-point withdrawal combine into one int32 vector, and the
+            // row scale is the same `row_k·s_b` product the GEMM epilogue
+            // forms per vector. Integer adds are associative here and the
+            // float product is formed in the same order, so folding is exact.
+            std::vector<int32_t> bias_adj(static_cast<size_t>(OC));
+            std::vector<float> scale(static_cast<size_t>(OC));
+            for (int64_t oc = 0; oc < OC; ++oc) {
+                const size_t o = static_cast<size_t>(oc);
+                bias_adj[o] = (bias != nullptr ? bias[oc] : 0) - coef * r_b[o];
+                scale[o] = row_k * (s_b != nullptr ? s_b[oc] : s_b_scalar);
+            }
+            ctx.cpu.run(0, N * OH, [&](int64_t t) {
+                const int64_t n = t / OH;
+                const int64_t oh = t - n * OH;
+                k::stem_conv_row_i8<TAct, TOut, ICc, Kc>(
+                    out + n * ob_step + oh * out_rs, in + n * ib_step, in_rs, wpack.data(),
+                    bias_adj.data(), scale.data(), IH, IW, OW, OC, oh, SH, SW, PH, PW, DH, DW,
+                    pad, zp_out, relu);
+            });
+        };
+        const auto run_k = [&](auto kkc) {
+            switch (IC) {
+            case 1: run(std::integral_constant<int, 1>{}, kkc); return;
+            case 2: run(std::integral_constant<int, 2>{}, kkc); return;
+            case 3: run(std::integral_constant<int, 3>{}, kkc); return;
+            default: run(std::integral_constant<int, 4>{}, kkc); return;
+            }
+        };
+        switch (K) {
+        case 3: run_k(std::integral_constant<int, 3>{}); return true;
+        case 5: run_k(std::integral_constant<int, 5>{}); return true;
+        default: return false; // the gate admits 3 and 5 only
+        }
+    }
+#endif // NNOPS_ARCH_AARCH64
+}
+
 template <class TAct, class TOut>
 void conv2d_int8_impl(const Conv2DAttributes& attrs, TensorView& output,
                       std::span<const TensorView> inputs, const ComputeContext& ctx,
                       const Conv2DGemmPlan& plan, void* workspace)
 {
+    if (try_stem_i8<TAct, TOut>(attrs, output, inputs, ctx)) {
+        return;
+    }
     I8ConvCtx<TAct, TOut> c;
     init_i8_ctx(c, attrs, output, inputs, ctx, plan, workspace);
     ctx.cpu.run(0, c.total, [&](int64_t t) { run_i8_task(c, t); });
@@ -1232,6 +1245,38 @@ Status conv2d_quant_impl(const Conv2DAttributes& attrs, TensorView& output,
 }
 
 } // namespace impl
+
+bool conv_i8_stem_geometry(const Conv2DAttributes& attrs, const TensorView& weight)
+{
+#if !defined(NNOPS_ARCH_AARCH64)
+    (void)attrs;
+    (void)weight;
+    return false;
+#else
+    // Everything the direct kernel needs is readable from the filter and the
+    // attributes alone — no activation — which is what lets prepackWeights give
+    // the same answer the compute-time gate does. The one thing the weight
+    // cannot say is whether the activation arrives as fp (the plane route) or
+    // pre-quantized; an fp activation declines the stem at compute time, and
+    // then the per-call pack of a filter this small is cheap.
+    if (weight.rank() != 4 || weight.data_type() != DataType::s8 ||
+        !is_channel_last_weight(weight.layout())) {
+        return false;
+    }
+    const int64_t IC = weight.shape(2);
+    const int64_t OC = weight.shape(3);
+    const int64_t K = attrs.kernel_size[0];
+    const auto ep = attrs.epilogue.type;
+    return attrs.groups == 1 && IC >= 1 && IC <= 4 && OC % 4 == 0 &&
+           attrs.kernel_size[0] == attrs.kernel_size[1] && (K == 3 || K == 5) &&
+           !attrs.add_to &&
+           (ep == EpilogueActivateType::None || ep == EpilogueActivateType::Relu) &&
+           (attrs.output_dtype == DataType::s8 || attrs.output_dtype == DataType::u8) &&
+           !(attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+             attrs.epilogue.quant_param_count > 0) &&
+           !impl::any_zp_nonzero(weight.quant_params(), OC);
+#endif
+}
 
 // =========================================================================
 //  The prepacked filter — the s8 panels and the R_b table

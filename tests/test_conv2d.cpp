@@ -172,12 +172,24 @@ struct FpResult {
 /// the returned view, which keeps the source filter's quantization parameters —
 /// a packed quantized filter is only half the operand.
 template <class T>
-TensorView prepack_filter(const TensorView& w, Conv2D& op, std::vector<T>& blob)
+// @p act is the activation descriptor an Auto prepack weighs the plane with;
+// without it Auto cannot choose either Winograd order and takes the safe one.
+TensorView prepack_filter(const TensorView& w, Conv2D& op, std::vector<T>& blob,
+                          const TensorView* act = nullptr)
 {
     TensorView q;
-    const TensorView wq[] = {w};
+    // Inputs[1] only exists when the caller supplied an activation; building
+    // the pair unconditionally would dereference a null pointer for the plain
+    // weight-only prepack.
+    TensorView wq[2];
+    wq[0] = w;
+    if (act != nullptr) {
+        wq[1] = *act;
+    }
+    const std::span<const TensorView> wq_span =
+        act != nullptr ? std::span<const TensorView>(wq, 2) : std::span<const TensorView>(wq, 1);
     TensorView oq[] = {q};
-    op.prepackWeights(wq, oq);
+    op.prepackWeights(wq_span, oq);
     q = oq[0];
     // The query view has no data pointer; rank is what says a packed form exists.
     NNOPS_EXPECT_TRUE(q.rank() > 0);
@@ -185,9 +197,15 @@ TensorView prepack_filter(const TensorView& w, Conv2D& op, std::vector<T>& blob)
     blob.assign(q.storage_bytes() / sizeof(T), T{});
     TensorView v(q.shape_span(), q.data_type(), blob.data(), q.pitch(), q.layout(),
                  q.quant_params());
-    const TensorView wf[] = {w};
+    TensorView wf[2];
+    wf[0] = w;
+    if (act != nullptr) {
+        wf[1] = *act;
+    }
     TensorView of[] = {v};
-    op.prepackWeights(wf, of);
+    op.prepackWeights(act != nullptr ? std::span<const TensorView>(wf, 2)
+                                     : std::span<const TensorView>(wf, 1),
+                      of);
     return v;
 }
 
@@ -204,7 +222,8 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
                      bool pre_act = false,
                      bool allow_sme = false,
                      float min_clip = -std::numeric_limits<float>::infinity(),
-                     float max_clip = std::numeric_limits<float>::infinity())
+                     float max_clip = std::numeric_limits<float>::infinity(),
+                     bool prepack_auto = false)
 {
     const int64_t N = c.ishape[0], IC = c.ishape[1];
     const int64_t IH = c.ishape[2], IW = c.ishape[3];
@@ -324,8 +343,10 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
             // own panels the same way.
             std::vector<T> u_buf;
             TensorView u_v;
-            if (alg == ConvAlgorithm::Winograd || packed_filter) {
-                u_v = prepack_filter<T>(w_v, *op, u_buf);
+            if (alg == ConvAlgorithm::Winograd || packed_filter || prepack_auto) {
+                // Only an Auto prepack is told the plane: a pinned order must not
+                // start depending on the policy.
+                u_v = prepack_filter<T>(w_v, *op, u_buf, prepack_auto ? &in_v : nullptr);
                 // The wide fp cases are the ones the SME prepack serves; the
                 // narrow ones stay on PackedHWIO.
                 if (allow_sme && packed_filter && alg != ConvAlgorithm::Winograd) {
@@ -334,7 +355,8 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
             }
 
             std::vector<TensorView> ins = {in_v};
-            ins.push_back((alg == ConvAlgorithm::Winograd || packed_filter) ? u_v : w_v);
+            ins.push_back((alg == ConvAlgorithm::Winograd || packed_filter || prepack_auto) ? u_v
+                                                                                           : w_v);
             std::vector<T> b_buf;
             if (c.bias) {
                 b_buf.resize(static_cast<size_t>(c.oc));
@@ -354,7 +376,8 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
             const std::vector<T> out_seed = out_buf;
             op->compute(out_v, ins, {}, nullptr);
 
-            if (packed_filter && !allow_sme && alg != ConvAlgorithm::Winograd) {
+            if (packed_filter && !allow_sme && alg != ConvAlgorithm::Winograd &&
+                !prepack_auto) {
                 std::vector<T> raw_buf = out_seed;
                 TensorView raw_v(std::span<const int64_t>(osh, 4), dtt,
                                  raw_buf.data(), TensorLayout::NHWC);
@@ -634,6 +657,44 @@ NNOPS_TEST(conv2d_f16_matches_ref) {
     }
 }
 
+NNOPS_TEST(conv2d_tiny_filter_neon_route_matches_ref) {
+    // The tiny filter is a NEON answer: an SME host hands the shape to the ZA
+    // GEMM before the direct plane kernel is even considered, so pin SME off to
+    // keep the kernel covered here. Both dtype arms are pinned: f32 runs the
+    // widened lanes, f16 the native eight-channel ones (which is a different
+    // accumulator type and a different error budget from the staged route), and
+    // IC 4 / OC 16 / no-pad-dilated / one-axis-pad cover the block and pass
+    // tails.
+    const int prev = nnops::detail::disable_sme.exchange(1, std::memory_order_relaxed);
+    struct SmeRestore {
+        int previous;
+        ~SmeRestore() { nnops::detail::disable_sme.store(previous, std::memory_order_relaxed); }
+    } restore{prev};
+
+    struct Case { FpCase c; uint64_t seed; };
+    const Case cases[] = {
+        {{{1, 3, 32, 32}, 32, 3, 3, 2, 2, 1, 1, 1, 1, 1, true},  71},  // MobileNetV2 stem
+        {{{1, 1, 17, 19}, 16, 3, 3, 1, 1, 1, 1, 1, 1, 1, false}, 72},  // IC 1, odd plane
+        {{{1, 4, 11, 13}, 48, 3, 3, 1, 1, 0, 0, 2, 1, 1, true},  73},  // no pad, dilation
+        {{{1, 3, 32, 32}, 64, 7, 7, 2, 2, 3, 3, 1, 1, 1, true},  74},  // the ResNet stem
+        {{{1, 2, 15, 18}, 16, 5, 5, 1, 1, 2, 1, 1, 1, 1, false}, 75},  // one-axis pad, OC 16
+        {{{1, 4, 16, 16}, 32, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  76},  // 32 = one full pass
+    };
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        expect_fp_close(cases[i].c, DataType::f32, 2e-4f, EpilogueActivateType::None, false,
+                        cases[i].seed, static_cast<int>(i), ConvAlgorithm::Auto, false, false,
+                        false);
+        expect_fp_close(cases[i].c, DataType::f16, nnops::test::kF16AccumTol,
+                        EpilogueActivateType::None, false, cases[i].seed,
+                        static_cast<int>(i) + 100);
+    }
+    // The clamp folds into the half-lane store on the f16 arm; the seed is the
+    // bias, which is also the arm's only f32 input.
+    expect_fp_close(cases[5].c, DataType::f16, nnops::test::kF16AccumTol,
+                    EpilogueActivateType::Relu6, false, 77, 200, ConvAlgorithm::Auto, false,
+                    false, false, 0.0f, 6.0f);
+}
+
 NNOPS_TEST(conv2d_fp_epilogues) {
     // The finish pass is per column here (a tile's rows are pixels).
     const FpCase c = {{1, 6, 11, 11}, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, true};
@@ -801,6 +862,167 @@ NNOPS_TEST(conv2d_prepack_query) {
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out_v, paired)));
 }
 
+// Auto's answer for the tiny filter is not a U. The transform's own floor is 32
+// channels per group; at four or fewer the route is the direct kernel (NEON,
+// raw filter, no blob) or the GEMM (SME, the ZA panels), and a caller sizes its
+// buffer from this query, so the answer is the contract. Above the floor the
+// transform is still Auto's product.
+NNOPS_TEST(conv2d_prepack_auto_tiny_filter_is_not_winograd) {
+    auto query = [](int64_t ic, int64_t oc) {
+        const int64_t wsh[] = {3, 3, ic, oc};
+        std::vector<float> w_buf(static_cast<size_t>(9 * ic * oc), 0.0f);
+        TensorView w_v(std::span<const int64_t>(wsh, 4), DataType::f32, w_buf.data(),
+                       TensorLayout::HWIO);
+        Conv2DAttributes attrs;  // Auto, k3s1
+        attrs.kernel_size = {3, 3};
+        attrs.padding = {1, 1};
+        auto op = Conv2D::create(attrs, Backend::CPU);
+        TensorView q;
+        const TensorView wi[] = {w_v};
+        TensorView wo[] = {q};
+        op->prepackWeights(wi, wo);
+        return wo[0];
+    };
+
+    const TensorView tiny = query(3, 64);
+    NNOPS_EXPECT_TRUE(!is_wino_weight(tiny.layout()));
+    // NEON declines the blob (the direct kernel convolves the raw filter); SME
+    // answers with the panels its GEMM reads.
+    NNOPS_EXPECT_TRUE(tiny.rank() == 0 || tiny.layout() == TensorLayout::PackedHWIOSme);
+    if (nnops::backend::cpu::aarch64::available_sme()) {
+        NNOPS_EXPECT_EQ(tiny.layout(), TensorLayout::PackedHWIOSme);
+    }
+
+    const TensorView wide = query(32, 64);
+    NNOPS_EXPECT_TRUE(is_wino_weight(wide.layout()));
+}
+
+// Auto's order is baked into the U's leading dimension at prepack, so the
+// decision is observable through prepackWeights itself — the path an Auto
+// caller actually takes, and the one the blob-size cap used to get wrong. The
+// U is streamed once per tile block, so what F(4,3) costs is bytes per tile;
+// the plane says how many tiles there are. Four hundred million bytes of U
+// amortized over a 14x14 plane measured 1.3x faster than F(2,3)'s smaller blob
+// (see wino_pick_order), so there is no channel fence left: only the plane.
+NNOPS_TEST(conv2d_auto_prepack_follows_the_order_policy) {
+    struct Case {
+        int64_t ic, oc, h, w;
+        int team;
+        int64_t want_pos;   // 36 = F(4,3), 16 = F(2,3), 0 = no U at all
+    };
+    const Case cases[] = {
+        // A 37.7 MB F(4,3) U (2.4x the L3) on planes that amortize it. Under the
+        // old 16 MB cap every one of these came back as F(2,3).
+        {512, 512, 14, 14, 1, 36},
+        {512, 512, 14, 14, 4, 36},
+        {512, 512, 28, 28, 10, 36},
+        {512, 512, 56, 56, 10, 36},
+        {512, 256, 28, 28, 4, 36},
+        {256, 128, 28, 28, 4, 36},
+        // Below the plane floor F(2,3) keeps it: the padded last tile wastes
+        // part of a 10x10 plane and the transform has too few tiles.
+        {512, 512, 10, 10, 1, 16},
+        {512, 512, 7, 7, 1, 16},
+        // The floor itself climbs with the team, so the same 14x14 layer takes
+        // F(4,3) on four workers and F(2,3) on ten.
+        {512, 512, 14, 14, 10, 16},
+        {512, 512, 20, 20, 10, 16},
+        // Auto's own product is not gated on the caller-side channel floor
+        // (winograd_applicable's IC >= 32): only the tiny filter is excluded
+        // there, so 16 channels still gets F(4,3) and the caller reads that off
+        // the blob. That asymmetry is older than this rule; the case is here so
+        // a change to it is deliberate.
+        {16, 64, 28, 28, 1, 36},
+        // The tiny filter is the exclusion: under five channels Auto answers
+        // with no U at all (a NEON caller convolves the raw filter in place).
+        {3, 64, 28, 28, 1, 0},
+    };
+    for (const auto& c : cases) {
+        const int64_t wsh[] = {3, 3, c.ic, c.oc};
+        std::vector<float> w_buf(static_cast<size_t>(9 * c.ic * c.oc), 0.0f);
+        TensorView w_v(std::span<const int64_t>(wsh, 4), DataType::f32, w_buf.data(),
+                       TensorLayout::HWIO);
+        const int64_t ish[] = {1, c.h, c.w, c.ic};
+        std::vector<float> in_buf(static_cast<size_t>(c.h * c.w * c.ic), 0.0f);
+        TensorView in_v(std::span<const int64_t>(ish, 4), DataType::f32, in_buf.data(),
+                        TensorLayout::NHWC);
+
+        Conv2DAttributes attrs;   // Auto, k3s1
+        attrs.kernel_size = {3, 3};
+        attrs.padding = {1, 1};
+        auto op = Conv2D::create(attrs, Backend::CPU);
+
+        // The team the order is chosen for is the caller's worker count.
+        SimplePool pool(c.team);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        ctx.cpu.num_threads = [c] { return c.team; };
+        ctx.cpu.thread_slots = [c] { return c.team; };
+
+        TensorView q;
+        const TensorView wi[] = {w_v, in_v};
+        TensorView wo[] = {q};
+        op->prepackWeights(wi, wo, ctx);
+        const TensorView out = wo[0];
+        if (c.want_pos == 0) {
+            NNOPS_EXPECT_TRUE(!is_wino_weight(out.layout()));
+            continue;
+        }
+        NNOPS_EXPECT_TRUE(is_wino_weight(out.layout()));
+        NNOPS_EXPECT_EQ(out.shape(0), c.want_pos);
+    }
+}
+
+// The Auto → U → Winograd chain end to end, which no case covered before: every
+// numeric case either pinned the order or handed prepack no plane (so Auto
+// could only answer F(2,3)). A 28x28 plane is past the floor at any team size.
+NNOPS_TEST(conv2d_auto_prepack_matches_ref) {
+    struct Case { FpCase c; uint64_t seed; };
+    const Case cases[] = {
+        {{{1, 32, 28, 28}, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true,  0}, 951},
+        {{{1, 64, 28, 28}, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, false, 0}, 952},
+    };
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        // The route the case is here for: Auto builds a 36-position U for this
+        // plane, so compute runs F(4,3) — 28x28 clears the floor at any team.
+        {
+            const FpCase& fc = cases[i].c;
+            const int64_t wsh[] = {fc.kh, fc.kw, fc.ishape[1], fc.oc};
+            std::vector<float> w_buf(static_cast<size_t>(9 * fc.ishape[1] * fc.oc), 0.0f);
+            TensorView w_v(std::span<const int64_t>(wsh, 4), DataType::f32, w_buf.data(),
+                           TensorLayout::HWIO);
+            const int64_t ish[] = {fc.ishape[0], fc.ishape[2], fc.ishape[3], fc.ishape[1]};
+            std::vector<float> in_buf(static_cast<size_t>(fc.ishape[1] * fc.ishape[2] *
+                                                          fc.ishape[3]), 0.0f);
+            TensorView in_v(std::span<const int64_t>(ish, 4), DataType::f32, in_buf.data(),
+                            TensorLayout::NHWC);
+            Conv2DAttributes attrs;
+            attrs.kernel_size = {fc.kh, fc.kw};
+            attrs.padding = {fc.ph, fc.pw};
+            auto q = Conv2D::create(attrs, Backend::CPU);
+            TensorView qo;
+            const TensorView wi[] = {w_v, in_v};
+            TensorView wo[] = {qo};
+            q->prepackWeights(wi, wo);
+            NNOPS_EXPECT_TRUE(is_wino_weight(wo[0].layout()));
+            NNOPS_EXPECT_EQ(wo[0].shape(0), int64_t{36});
+        }
+        // Auto, prepacked by the op itself, compared against the OIHW reference.
+        const FpResult r = run_fp_case(cases[i].c, DataType::f32, EpilogueActivateType::None,
+                                       false, cases[i].seed, ConvAlgorithm::Auto,
+                                       /*packed_filter=*/false, /*pre_act=*/false,
+                                       /*allow_sme=*/false,
+                                       -std::numeric_limits<float>::infinity(),
+                                       std::numeric_limits<float>::infinity(),
+                                       /*prepack_auto=*/true);
+        if (r.worst > 1e-3f) {
+            throw std::runtime_error("conv2d Auto prepack vs reference (case " +
+                                     std::to_string(i) + "): worst " +
+                                     std::to_string(double(r.worst)));
+        }
+    }
+}
+
 NNOPS_TEST(conv2d_fp_prepacked_filter) {
     // One case per path the pack has: the panel ladder (icn_block 16/8/2/1),
     // an ic tail, several oc blocks, the wide-K pointwise rule, a filter that
@@ -955,21 +1177,24 @@ NNOPS_TEST(conv2d_wino_matches_ref) {
     // multiplies are saved.
     const Case f43_cases[] = {
         // An extent odd on both axes, and a last tile column 3 outputs wide.
-        {{{1, 64, 15, 17},  96, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   86},
+        {{{1, 64, 15, 17},  96, 3, 3, 1, 1, 1, 1, 1, 1, 1, true, 4}, 86},
         // groups 2 (IC/G 64, OC/G 32) and pad 0.
-        {{{1, 128, 16, 16}, 64, 3, 3, 1, 1, 0, 0, 1, 1, 2, false},  87},
+        {{{1, 128, 16, 16}, 64, 3, 3, 1, 1, 0, 0, 1, 1, 2, false, 4}, 87},
         // Over the 256 k-block cap: two K passes, and a plane barely one tile
         // row of tiles tall (9x9 is 3x3 tiles, the window running past the edge).
-        {{{1, 512, 9, 9},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   89},
+        {{{1, 512, 9, 9},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true, 4}, 89},
         // The case that set the tolerance above: 512 channels and 3x3 tiles.
-        {{{1, 512, 8, 8},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   88},
+        {{{1, 512, 8, 8},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true, 4}, 88},
         // OC 48 leaves a partial 16-wide GEMM panel on both sides of the tile
         // split; the plane is just over the F(4,3) floor.
-        {{{1, 64, 14, 16},  48, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},  97},
+        {{{1, 64, 14, 16},  48, 3, 3, 1, 1, 1, 1, 1, 1, 1, false, 4}, 97},
         // groups 2 with IC/G 48 and OC/G 16, so the per-group panel set is
         // narrower than one tile.
-        {{{1, 96, 20, 20},  32, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},  98},
+        {{{1, 96, 20, 20},  32, 3, 3, 1, 1, 1, 1, 1, 1, 2, false, 4}, 98},
     };
+    // The order is pinned: prepack is handed no activation descriptor here, so
+    // the policy's plane fence would otherwise send every one of these back to
+    // F(2,3) and leave the F(4,3) route with no end-to-end f32 coverage.
     for (size_t i = 0; i < std::size(f43_cases); ++i) {
         expect_fp_close(f43_cases[i].c, DataType::f32, 1e-3f,
                         EpilogueActivateType::None, false, f43_cases[i].seed,
@@ -1608,30 +1833,34 @@ std::string run_q_case(const QCase& c, const ComputeContext& ctx = {},
         TensorView oq[] = {q};
         op->prepackWeights(wq, oq);
         q = oq[0];
-        // The ZA route takes a wide enough filter into its own blob; the rest
-        // keeps the NEON panels. Both are valid answers for this filter.
-        if (q.layout() != TensorLayout::PackedHWIO &&
-            q.layout() != TensorLayout::PackedHWIOSme) {
-            return "a quantized HWIO filter did not query a packed conv layout";
-        }
-        std::vector<int8_t> blob(q.storage_bytes());
-        TensorView pv(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
-                      q.layout(), q.quant_params());
-        const TensorView wf[] = {op_w};
-        TensorView of[] = {pv};
-        op->prepackWeights(wf, of);
+        // The direct stem kernel reads the raw filter, so the tiny filter
+        // queries no blob on a NEON backend — the raw call above covers that
+        // route. The ZA route takes a wide enough filter into its own blob;
+        // the rest keeps the NEON panels.
+        if (q.rank() != 0) {
+            if (q.layout() != TensorLayout::PackedHWIO &&
+                q.layout() != TensorLayout::PackedHWIOSme) {
+                return "a quantized HWIO filter did not query a packed conv layout";
+            }
+            std::vector<int8_t> blob(q.storage_bytes());
+            TensorView pv(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                          q.layout(), q.quant_params());
+            const TensorView wf[] = {op_w};
+            TensorView of[] = {pv};
+            op->prepackWeights(wf, of);
 
-        std::vector<TensorView> p_ins = op_ins;
-        p_ins[1] = pv;
-        std::vector<uint8_t> p_buf(od2[0].nbytes(), 0);
-        auto p_out = TensorView(std::span<const int64_t>(od2[0].dims.data(), 4), odt,
-                                p_buf.data(), TensorLayout::NHWC, qo);
-        const Status st = op->compute(p_out, p_ins, ctx, nullptr);
-        if (!is_ok(st)) {
-            return std::string("packed kernel returned ") + to_string(st);
-        }
-        if (std::memcmp(op_buf.data(), p_buf.data(), op_buf.size()) != 0) {
-            return "the prepacked filter's output differs from the raw filter's";
+            std::vector<TensorView> p_ins = op_ins;
+            p_ins[1] = pv;
+            std::vector<uint8_t> p_buf(od2[0].nbytes(), 0);
+            auto p_out = TensorView(std::span<const int64_t>(od2[0].dims.data(), 4), odt,
+                                    p_buf.data(), TensorLayout::NHWC, qo);
+            const Status st = op->compute(p_out, p_ins, ctx, nullptr);
+            if (!is_ok(st)) {
+                return std::string("packed kernel returned ") + to_string(st);
+            }
+            if (std::memcmp(op_buf.data(), p_buf.data(), op_buf.size()) != 0) {
+                return "the prepacked filter's output differs from the raw filter's";
+            }
         }
     }
 
@@ -1944,6 +2173,61 @@ NNOPS_TEST(conv2d_i8_neon_route_matches_ref) {
     }
 }
 
+// The quantized tiny filter: at most four input channels under a square
+// 3x3/5x5/7x7 runs the direct plane kernel (simd_stem_conv.hpp) instead of the
+// gather plus MMA — no gather, no panel, and the requantizing store fused in.
+// SME is pinned off, since an SME machine keeps the ZA GEMM for these shapes
+// (as the float stem does). The cases are the float stem list, quantized:
+// every one crosses the kernel's tap, stride, dilation and OC-block tails, and
+// an s8 destination has to agree with the reference bit for bit.
+NNOPS_TEST(conv2d_i8_stem_matches_ref) {
+    const int prev = nnops::detail::disable_sme.exchange(1, std::memory_order_relaxed);
+    struct SmeRestore {
+        int previous;
+        ~SmeRestore() { nnops::detail::disable_sme.store(previous, std::memory_order_relaxed); }
+    } restore{prev};
+
+    struct Case {
+        int64_t IC, IH, IW, OC, K, S, P, D;
+        bool u8, bias, u8out;
+        EpilogueActivateType ep;
+    };
+    const Case cases[] = {
+        {3, 32, 32, 32, 3, 2, 1, 1, false, true, false, EpilogueActivateType::None},
+        // The ResNet stem, 7x7 over three channels: 37 k groups of twelve.
+        {3, 32, 32, 64, 7, 2, 3, 1, false, true, false, EpilogueActivateType::None},
+        // u8 in (the +128 shift is the zero point's, not a term), OC 32 = two
+        // full sixteen-channel blocks, bias and Relu.
+        {4, 16, 16, 32, 3, 1, 1, 1, true, true, true, EpilogueActivateType::Relu},
+        // IC 1 and no bias at all.
+        {1, 17, 19, 16, 3, 1, 1, 1, false, false, false, EpilogueActivateType::None},
+        // One-axis padding and a 5x5.
+        {2, 15, 18, 16, 5, 1, 1, 1, false, true, false, EpilogueActivateType::None},
+        // No padding with dilation, and OC 24 leaves three groups in the tail.
+        {4, 11, 13, 24, 3, 1, 0, 2, false, true, false, EpilogueActivateType::None},
+        // One four-channel group only.
+        {3, 9, 9, 4, 3, 1, 1, 1, true, true, true, EpilogueActivateType::Relu},
+    };
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        const Case& s = cases[i];
+        QCase c;
+        c.ishape = {1, s.IC, s.IH, s.IW};
+        c.wshape = {s.OC, s.IC, s.K, s.K};
+        c.kh = c.kw = s.K;
+        c.sh = c.sw = s.S;
+        c.ph = c.pw = s.P;
+        c.dh = c.dw = s.D;
+        c.act = s.u8 ? DataType::u8 : DataType::s8;
+        c.zp_x = s.u8 ? 128 : 0;
+        c.out = s.u8out ? DataType::u8 : DataType::s8;
+        c.zp_out = s.u8out ? 128 : 0;
+        c.bias = s.bias;
+        c.ep = s.ep;
+        c.seed = 7300 + i;
+        expect_q_match(c, static_cast<int>(i), {}, /*exact=*/true);
+    }
+}
+
 NNOPS_TEST(conv2d_i8_prepacked_filter) {
     // Every compensation term reads the packed per-channel sums on a different
     // path, so each gets a case.
@@ -1987,6 +2271,47 @@ NNOPS_TEST(conv2d_i8_prepacked_filter) {
         expect_q_match(cases[i], static_cast<int>(i), {}, /*exact=*/true,
                        /*packed_w=*/true);
     }
+}
+
+NNOPS_TEST(conv2d_i8_stem_prepack_query) {
+#if defined(NNOPS_ARCH_AARCH64)
+    // The direct int8 kernel reads the raw filter, so a stem-shaped quantized
+    // filter must query no blob on a NEON backend — a blob would steer
+    // compute() off the kernel. A 7x7 and an fp destination keep the GEMM and
+    // still query one.
+    const int prev = nnops::detail::disable_sme.exchange(1, std::memory_order_relaxed);
+    struct SmeRestore {
+        int previous;
+        ~SmeRestore() { nnops::detail::disable_sme.store(previous, std::memory_order_relaxed); }
+    } restore{prev};
+
+    auto packed_rank = [](int64_t k, int64_t ic, int64_t oc, DataType out) {
+        const int64_t wsh[] = {k, k, ic, oc};
+        std::vector<int8_t> wt(static_cast<size_t>(k * k * ic * oc), 1);
+        std::vector<float> ws(static_cast<size_t>(oc), 0.5f);
+        std::vector<int32_t> wz(static_cast<size_t>(oc), 0);
+        TensorView weight(wsh, DataType::s8, wt.data(), TensorLayout::HWIO,
+                          per_channel(ws.data(), wz.data(), oc));
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {k, k};
+        attrs.stride = {1, 1};
+        attrs.padding = {k / 2, k / 2};
+        attrs.output_dtype = out;
+        auto op = Conv2D::create(attrs, Backend::CPU);
+        const TensorView wq[] = {weight};
+        TensorView q;
+        TensorView oq[] = {q};
+        op->prepackWeights(wq, oq);
+        return oq[0].rank();
+    };
+
+    NNOPS_EXPECT_EQ(packed_rank(3, 3, 64, DataType::s8), int64_t{0});
+    NNOPS_EXPECT_EQ(packed_rank(5, 4, 32, DataType::u8), int64_t{0});
+    NNOPS_EXPECT_TRUE(packed_rank(7, 3, 64, DataType::s8) != 0);
+    // An fp destination leaves the int8 GEMM in place, so the blob is worth
+    // building even under a square 3x3.
+    NNOPS_EXPECT_TRUE(packed_rank(3, 3, 64, DataType::f32) != 0);
+#endif
 }
 
 NNOPS_TEST(conv2d_i8_epilogues) {

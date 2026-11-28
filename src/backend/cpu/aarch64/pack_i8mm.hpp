@@ -30,6 +30,11 @@
 /// Pure data movement: `scale` exists for signature parity with the other
 /// packs. Two k groups are handled per iteration wherever a 16-byte load feeds
 /// two 16-byte groups.
+///
+/// Compiled only when the build enabled i8mm (`NNOPS_ARCH_I8MM`), like
+/// mma_i8mm.hpp: off, the SDOT packers are the only ones in the binary.
+
+#if defined(NNOPS_ARCH_I8MM)
 
 #include <algorithm>
 #include <arm_neon.h>
@@ -475,3 +480,5 @@ inline void pack_copy_n12_i8mm(void* NNOPS_RESTRICT output, const void* NNOPS_RE
 }
 
 } // namespace nnops::backend::cpu::aarch64
+
+#endif // NNOPS_ARCH_I8MM

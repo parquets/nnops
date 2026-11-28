@@ -71,7 +71,8 @@
 #include "conv2d_implicit_gemm_internal.h"
 #include "backend/cpu/matmul/matmul_helper.h" // uniform pack/MMA + panel strides
 #if defined(NNOPS_ARCH_SME)
-#include "backend/cpu/aarch64/sme/mma_sme.hpp" // available_sme + SME tile geometry
+#include "backend/cpu/aarch64/sme/mma_sme.hpp"     // available_sme + SME tile geometry
+#include "backend/cpu/aarch64/sme/im2col_sme.hpp"  // the fused im2col + A pack
 #endif
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"  // epilogue pass
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"    // tiled im2col gathers
@@ -219,85 +220,6 @@ void stem_conv_plane(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in, const T*
     });
 }
 
-// ---- the fused im2col + A pack (SME) ---------------------------------------
-
-#if defined(NNOPS_ARCH_SME)
-/// The im2col gather written straight into the ZA A layout. A ZA row is one
-/// pixel's channel run (NHWC, so it is contiguous) and the K columns come out
-/// of the tile vertically, so the gather and the transpose are one pass
-/// instead of a dense write, a ZA re-read and a second write.
-///
-/// f32 holds one K per lane. f16 packs a channel's K pair into one word, which
-/// needs an even channel count so a pair never straddles a tap — the caller
-/// checks that and falls back to the dense gather plus pack_a_f16_sme.
-template <class T>
-__arm_locally_streaming __arm_new("za") __attribute__((target("+sme2")))
-inline void tile_im2col_pack_sme(T* dst, const T* in, int64_t in_row_stride, int64_t ic_stride,
-                                 int64_t p0, int OW, int mc, int IH, int IW, int KH, int KW,
-                                 int SH, int SW, int DH, int DW, int PH, int PW, int icnc,
-                                 int karea) noexcept
-{
-    constexpr bool f32 = std::is_same_v<T, float>;
-    constexpr int kRows = 2 * aarch64::sme_mr; // 32 pixels: one A block
-    constexpr int kChanStep = f32 ? 16 : 32;   // channels one ZA tile row spans
-    const svfloat32_t vzero = svdup_n_f32(0.0f);
-    int64_t base[kRows];
-    bool live[kRows];
-
-    for (int t = 0; t < karea; ++t) {
-        const int kh = t / KW;
-        const int kw = t - kh * KW;
-        for (int i = 0; i < mc; ++i) {
-            const int64_t p = p0 + i;
-            const int64_t oh = p / OW;
-            const int64_t ow = p - oh * OW;
-            const int64_t ih = oh * SH - PH + static_cast<int64_t>(kh) * DH;
-            const int64_t iw = ow * SW - PW + static_cast<int64_t>(kw) * DW;
-            live[i] = ih >= 0 && ih < IH && iw >= 0 && iw < IW;
-            base[i] = live[i] ? ih * in_row_stride + iw * ic_stride : 0;
-        }
-        for (int c0 = 0; c0 < icnc; c0 += kChanStep) {
-            const int lanes = f32 ? std::min(16, icnc - c0) :
-                                    std::min(16, (icnc - c0) / 2);
-            const svbool_t pc = svwhilelt_b32(0, lanes);
-            const int k0 = t * icnc + c0;
-            for (int pstart = 0; pstart < mc; pstart += aarch64::sme_mr) {
-                const int n = std::min(aarch64::sme_mr, mc - pstart);
-                for (int i = 0; i < n; ++i) {
-                    if (live[pstart + i]) {
-                        if constexpr (f32) {
-                            svld1_hor_za32(0, static_cast<uint32_t>(i), pc,
-                                           in + base[pstart + i] + c0);
-                        } else {
-                            svld1_hor_za32(0, static_cast<uint32_t>(i), pc,
-                                           reinterpret_cast<const uint32_t*>(in) +
-                                               (base[pstart + i] + c0) / 2);
-                        }
-                    } else {
-                        svwrite_hor_za32_f32_m(0, static_cast<uint32_t>(i), pc, vzero);
-                    }
-                }
-                const svbool_t pr = svwhilelt_b32(0, n);
-                if constexpr (f32) {
-                    for (int j = 0; j < lanes; ++j) {
-                        svst1_ver_za32(0, static_cast<uint32_t>(j), pr,
-                                       dst + static_cast<int64_t>(k0 + j) * kRows + pstart);
-                    }
-                } else {
-                    auto* const dw = reinterpret_cast<uint32_t*>(dst);
-                    for (int j = 0; j < lanes; ++j) {
-                        svst1_ver_za32(0, static_cast<uint32_t>(j), pr,
-                                       dw + static_cast<int64_t>(k0 / 2 + j) * kRows +
-                                           pstart);
-                    }
-                }
-            }
-        }
-    }
-}
-
-#endif
-
 // ---- the per-call context -------------------------------------------------
 //
 // Everything the task grid reads, resolved once per call. The task and its
@@ -418,13 +340,18 @@ inline FpFinish fp_finish(const Conv2DAttributes& attrs, bool has_bias) noexcept
 }
 
 /// The tiny filter: at most four input channels under a square 3x3/5x5/7x7
-/// takes the direct plane kernel — no gather, no panel, no plan. prepackWeights
-/// declines this shape too, so the filter arrives raw. Returns true when the
-/// call was handled.
+/// takes the direct plane kernel — no gather, no panel, no plan. It is a NEON
+/// answer: the kernel is already at the NEON FMA ceiling, and the same shape on
+/// the SME GEMM runs 3-5x faster (a 3-channel 7x7 stem measured 240 against
+/// 100 GFLOPS at one thread), so an SME machine keeps the GEMM. A raw filter
+/// arrives here only when the machine has no SME; otherwise prepackWeights has
+/// already handed compute() the ZA panels. Returns true when the call was
+/// handled.
 template <class T> bool try_stem(const FpConvCtx<T>& c)
 {
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
-        if (c.G == 1 && !c.prepacked && c.ic_per_group <= 4 && c.oc_per_group % 16 == 0 &&
+        if (!c.use_sme && c.G == 1 && !c.prepacked &&
+            c.ic_per_group <= 4 && c.oc_per_group % 16 == 0 &&
             c.KH == c.KW && c.KH >= 3 && c.KH <= 7 && (c.KH & 1) && !c.attrs->add_to &&
             !c.epi_pass) {
             constexpr float kInf = std::numeric_limits<float>::infinity();
@@ -492,9 +419,8 @@ template <class T> void pack_sme_filter_shared(FpConvCtx<T>& c, SmeFpShared<T>& 
         s.num_ic_blocks = (c.ic_per_group + c.icn_block - 1) / c.icn_block;
         s.start_prefix.assign(static_cast<size_t>(c.oc_chunks) + 1, 0);
         for (int64_t chunk = 0; chunk < c.oc_chunks; ++chunk) {
-            const int64_t lo = chunk * c.pg.panels_oc / c.oc_chunks * FpConvCtx<T>::nr_max;
-            const int64_t hi = std::min((chunk + 1) * c.pg.panels_oc / c.oc_chunks *
-                                            FpConvCtx<T>::nr_max,
+            const int64_t lo = chunk * c.pg.panels_oc / c.oc_chunks * c.pg.nr;
+            const int64_t hi = std::min((chunk + 1) * c.pg.panels_oc / c.oc_chunks * c.pg.nr,
                                         c.oc_per_group);
             const int64_t starts = (hi - lo + c.ocn_block - 1) / c.ocn_block;
             s.start_prefix[static_cast<size_t>(chunk) + 1] =
@@ -513,10 +439,9 @@ template <class T> void pack_sme_filter_shared(FpConvCtx<T>& c, SmeFpShared<T>& 
             const T* const w_group = c.w_ptr + g * c.oc_per_group;
             for (int64_t chunk = 0; chunk < c.oc_chunks; ++chunk) {
                 const int64_t oc_lo =
-                    chunk * c.pg.panels_oc / c.oc_chunks * FpConvCtx<T>::nr_max;
+                    chunk * c.pg.panels_oc / c.oc_chunks * c.pg.nr;
                 const int64_t oc_hi =
-                    std::min((chunk + 1) * c.pg.panels_oc / c.oc_chunks *
-                                 FpConvCtx<T>::nr_max,
+                    std::min((chunk + 1) * c.pg.panels_oc / c.oc_chunks * c.pg.nr,
                              c.oc_per_group);
                 int64_t si = 0;
                 for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += c.ocn_block, ++si) {
@@ -656,14 +581,19 @@ bool init_fp_ctx(FpConvCtx<T>& c, const Conv2DAttributes& attrs, TensorView& out
     }
 
     // ---- block geometry ----------------------------------------------------
-    // Same function prepackWeights built the blob with; it must never disagree.
-    c.pg = c.sme_blob ? conv_packed_weight_sme(attrs, c.ic_per_group, c.oc_per_group,
-                                               weight.data_type()) :
-                        conv_packed_weight(attrs, c.ic_per_group, c.oc_per_group,
-                                           weight.data_type());
+    // Same function the plan read its blocks from; it must never disagree. The
+    // choice tracks the engine, exactly as the plan's does.
+    c.pg = c.use_sme ? conv_packed_weight_sme(attrs, c.ic_per_group, c.oc_per_group,
+                                              weight.data_type()) :
+                       conv_packed_weight(attrs, c.ic_per_group, c.oc_per_group,
+                                          weight.data_type());
     if (!c.sme_blob) {
-        NNOPS_ASSERT(c.pg.icn_block == c.icn_block && c.pg.ocn_block == c.ocn_block &&
-                     c.pg.nr == FpConvCtx<T>::nr_max);
+        NNOPS_ASSERT(c.pg.icn_block == c.icn_block && c.pg.ocn_block == c.ocn_block);
+#if defined(NNOPS_ARCH_SME)
+        NNOPS_ASSERT(c.pg.nr == (c.use_sme ? aarch64::sme_fp_nr : FpConvCtx<T>::nr_max));
+#else
+        NNOPS_ASSERT(c.pg.nr == FpConvCtx<T>::nr_max);
+#endif
     }
     c.num_ic_blocks = c.pg.nfull_ic + (c.pg.tail_ic ? 1 : 0);
     c.kdim_max = c.pg.kdim_max;
@@ -735,7 +665,7 @@ FpBPanel<T> fp_pick_b(const FpConvCtx<T>& c, int64_t g, int64_t icn, int64_t icn
                 // The shared prepack's slice for this task's (group, oc start,
                 // ic block); its first block is the task's own `ocn`.
                 const int64_t oc_lo_chunk =
-                    oc_chunk * c.pg.panels_oc / c.oc_chunks * FpConvCtx<T>::nr_max;
+                    oc_chunk * c.pg.panels_oc / c.oc_chunks * c.pg.nr;
                 const int64_t starts_before =
                     c.sme.start_prefix[static_cast<size_t>(oc_chunk)];
                 const int64_t si_local = (ocn - oc_lo_chunk) / c.ocn_block;
@@ -803,7 +733,7 @@ FpATile<T> fp_pick_a(const FpConvCtx<T>& c, const T* in_g, int64_t icn, int64_t 
 #if defined(NNOPS_ARCH_SME)
         // The ZA route's gather writes the packed A layout directly, so it needs
         // no separate transpose pass.
-        tile_im2col_pack_sme<T>(sme_a, in_g + icn, c.in_row_stride, c.IC, p,
+        aarch64::tile_im2col_pack_sme<T>(sme_a, in_g + icn, c.in_row_stride, c.IC, p,
                                 static_cast<int>(c.OW), mc, static_cast<int>(c.IH),
                                 static_cast<int>(c.IW), c.KH, c.KW, c.SH, c.SW, c.DH, c.DW,
                                 c.PH, c.PW, static_cast<int>(icnc), c.karea);
@@ -929,11 +859,10 @@ template <class T> void run_fp_task(const FpConvCtx<T>& c, int64_t t)
     // An SME blob keeps the whole group on the filter axis (its plan sets
     // oc_chunks 1): starts and the 64-column blocks then agree.
     const int64_t oc_lo =
-        c.sme_blob ? 0 : oc_chunk * c.pg.panels_oc / c.oc_chunks * FpConvCtx<T>::nr_max;
+        c.sme_blob ? 0 : oc_chunk * c.pg.panels_oc / c.oc_chunks * c.pg.nr;
     const int64_t oc_hi =
         c.sme_blob ? c.oc_per_group :
-                     std::min((oc_chunk + 1) * c.pg.panels_oc / c.oc_chunks *
-                                  FpConvCtx<T>::nr_max,
+                     std::min((oc_chunk + 1) * c.pg.panels_oc / c.oc_chunks * c.pg.nr,
                               c.oc_per_group);
 
     // Dense rows make a pixel tile one contiguous run, so it may cross a row
@@ -1097,16 +1026,6 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     plan.pointwise = (karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
                       attrs.padding[0] == 0 && attrs.padding[1] == 0);
 
-    // The block sizes are the prepacked filter's geometry: conv_packed_weight
-    // resolves them from the attributes and the filter's dims alone, and a plan
-    // choosing again would size panels the blob does not hold.
-    const ConvPackedWeight pg = sme_blob ?
-                                    conv_packed_weight_sme(attrs, ic_per_group, oc_per_group,
-                                                           wt.dtype) :
-                                    conv_packed_weight(attrs, ic_per_group, oc_per_group, wt.dtype);
-    plan.icn_block = pg.icn_block;
-    plan.ocn_block = pg.ocn_block;
-    const int64_t nr_for_split = pg.nr;
 #if defined(NNOPS_ARCH_SME)
     // The SME route's tile is two 16-row ZA faces: 32 pixels. A 24-row kMBlock
     // would leave a quarter of every tile's rows dead and take the masked
@@ -1114,6 +1033,25 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     const bool sme_route = !quant &&
                            (sme_blob || (!prepacked && aarch64::available_sme() &&
                                          oc_per_group >= aarch64::sme_fp_nr));
+#else
+    constexpr bool sme_route = false;
+#endif
+
+    // The block sizes are the prepacked filter's geometry: conv_packed_weight
+    // resolves them from the attributes and the filter's dims alone, and a plan
+    // choosing again would size panels the blob does not hold. The geometry
+    // follows the engine that will run it: an fp filter the ZA route takes gets
+    // the ZA blocking whether it arrives as the blob or raw (the raw path packs
+    // its own B into the same layout), and everything else keeps the NEON
+    // panels.
+    const ConvPackedWeight pg = (sme_blob || sme_route) ?
+                                    conv_packed_weight_sme(attrs, ic_per_group, oc_per_group,
+                                                           wt.dtype) :
+                                    conv_packed_weight(attrs, ic_per_group, oc_per_group, wt.dtype);
+    plan.icn_block = pg.icn_block;
+    plan.ocn_block = pg.ocn_block;
+    const int64_t nr_for_split = pg.nr;
+#if defined(NNOPS_ARCH_SME)
     // The int8 route's A tile is 256 pixels whatever the row width. Width was
     // once the gate here, on the theory that a narrow row cannot fill the tile;
     // measured, the opposite holds — the tile is what the kernel wants, and a
@@ -1136,25 +1074,34 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs, std::span<const TensorDe
     const int64_t esz = quant ? 1 : static_cast<int64_t>(data_type_size(dt));
 
     // Rows first (the axis every task shares), then the filter axis when the
-    // rows cannot fill the pool — with the nearest-round rule.
+    // rows cannot fill the pool.
     //
     // A row chunk must still be worth a micro-kernel tile: split a 7x7 plane to
-    // one row and each task is seven pixels against a 24-row tile. So the row
-    // split stops at the chunk count that keeps `kTaskMinPixels` in each.
-    const int64_t ow_at_least = std::max<int64_t>(OW, 1);
-    const int64_t rows_min = std::max<int64_t>(1, (kTaskMinPixels + ow_at_least - 1) / ow_at_least);
-    const int64_t max_row_chunks = std::max<int64_t>(1, OH / rows_min);
-    plan.oh_chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1,
-                                         std::min(std::max<int64_t>(OH, 1), max_row_chunks));
+    // one row and each task is seven pixels against a 24-row tile. The cap is
+    // therefore on *pixels* per chunk, not rows — `kTaskMinPixels / OW` rows
+    // rounded up, which for a 14x14 plane allows exactly the four chunks that
+    // fill four threads and for a 7x7 plane allows one.
+    const int64_t plane_pixels = std::max<int64_t>(OH, 1) * std::max<int64_t>(OW, 1);
+    const int64_t max_row_chunks = std::max<int64_t>(1, plane_pixels / kTaskMinPixels);
+    const int64_t rows_wanted = std::clamp<int64_t>((nt + NG - 1) / NG, 1,
+                                                    std::max<int64_t>(OH, 1));
+    plan.oh_chunks = std::min(rows_wanted, max_row_chunks);
     const int64_t plane_tasks = NG * plan.oh_chunks;
-    // An SME blob's OC blocks are 64-aligned; its tasks keep one whole group on
-    // the filter axis rather than starting mid-block.
-    if (!sme_blob && 2 * plane_tasks < nt) {
+    // The ZA routes keep one whole group on the filter axis: their task tile is
+    // the group's whole oc width, so a chunk would start mid-tile and re-gather
+    // the same pixels for a slice of it.
+    //
+    // A thread with no task costs far more than the gather a filter split
+    // duplicates, so the split starts as soon as the plane axis alone leaves the
+    // pool short — not at 2x oversubscription, which left a 14x14 plane's row
+    // chunks on four threads (14x14 512->512 sat at 2.3x on 4T against the 4x
+    // the kernel itself scales by; it reads 3.9x once the split fires).
+    if (!sme_blob && !sme_route && plane_tasks < nt) {
         // The filter split divides N, so its granularity is a panel (`nr`): two
         // panels per chunk is the smallest split that fills a micro-kernel tile.
         // Splitting 96 oc seven ways leaves 14 live lanes of a 16-wide panel.
         const int64_t max_chunks = std::max<int64_t>(1, oc_per_group / (2 * nr_for_split));
-        const int64_t want = (nt + plane_tasks / 2) / plane_tasks;
+        const int64_t want = (nt + plane_tasks - 1) / plane_tasks;
         plan.oc_chunks = std::clamp<int64_t>(want, 1, max_chunks);
     }
 
@@ -1512,7 +1459,6 @@ ConvPackedWeight conv_packed_weight_sme(const Conv2DAttributes& attrs, int64_t i
     }
 
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
-    const bool unit_1x1 = karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1;
     // The ZA n tile: 32 columns for the float 2x2 face pair, 64 for the int8
     // SMOPA kernel's four 16-column groups. Constants here so this geometry
     // stays buildable without the SME headers.
@@ -1520,26 +1466,21 @@ ConvPackedWeight conv_packed_weight_sme(const Conv2DAttributes& attrs, int64_t i
     constexpr int64_t kSmeBlockN_i8 = 64;
     g.sme = true;
     g.nr = q8 ? kSmeBlockN_i8 : kSmeBlockN_f32;
-    // The ZA tiles cover 32x32, so a short ic block leaves the kernel's K loop
-    // (kdim = icn * karea groups of four) too short to amortise the per-call
-    // store and setup: 16 channels of a 3x3 is 144, and the tile ran at
-    // 1050 GFLOPS against 1560 at 576.
-    constexpr int64_t kSmeIcMin = 32;
-    // int8 runs the group's whole K in one pass: the SMOPA tile wants a long K
-    // loop, and every k block is another gather, another A pack and another
-    // read-modify-write of the whole accumulator tile set.
-    g.icn_block =
-        (unit_1x1 || q8) ?
-            ic_per_group :
-            std::min<int64_t>(
-                std::max<int64_t>(impl::get_ic_block(karea, ic_per_group), kSmeIcMin),
-                ic_per_group);
-    // The task N tile is a whole number of 32-column ZA blocks. The int8 route
-    // takes the group's whole width: its A panel is gathered once per task and
-    // every extra oc block re-gathers the same tile, so a 512-channel group
-    // packed as four 128-column blocks paid for the im2col four times.
-    const int64_t oc_tile = q8 ? oc_per_group : std::min<int64_t>(oc_per_group, impl::kOcnBlock);
-    g.ocn_block = ((oc_tile + g.nr - 1) / g.nr) * g.nr;
+    // One k block: the group's whole K. Every further block is another gather,
+    // another A pack and another read-modify-write of the whole accumulator
+    // tile set, and on the ZA engine the packed filter already streams the
+    // whole k column per panel, so a split buys nothing. Measured on an M4
+    // (interleaved A/B, 1T/4T, against the 32-channel ladder block this used
+    // to take): 28x28 k3s2 C512->512 1.98x/1.23x, 14x14 k3s2 C256->512
+    // 1.49x/1.48x, 56x56 k5s1 C128->128 1.15x/1.00x, 7x7 k1s1 C512->512
+    // 1.24x/1.15x — with whole-width oc, below, as the other half.
+    g.icn_block = ic_per_group;
+    // The task N tile is the group's whole width, rounded to a whole number of
+    // 32-column ZA blocks: a task's A is gathered once and every extra oc block
+    // re-gathers the same pixels, so a 512-channel group as four 128-column
+    // blocks paid for the im2col four times. The accumulator is the output
+    // tile itself, so a wide N costs nothing per row.
+    g.ocn_block = ((oc_per_group + g.nr - 1) / g.nr) * g.nr;
     g.kdim_max = g.icn_block * karea;
     g.nfull_ic = ic_per_group / g.icn_block;
     g.tail_ic = ic_per_group - g.nfull_ic * g.icn_block;

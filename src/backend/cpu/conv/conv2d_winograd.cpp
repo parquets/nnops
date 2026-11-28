@@ -50,18 +50,23 @@ WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_grou
     // magnitude. That is the caller's trade to make — pin winograd_order = 2 on
     // a layer that needs the accuracy.
 
-    // The U is streamed on every call, and F(4,3)'s is 2.25x the blob — 36
-    // transform positions against 16 for the same filter. Past a 32 MB-class L3
-    // (16 MB here, leaving room for the activations) that stream is the wall: a
-    // 512x512 f32 filter is 37.7 MB and measured 1.62x F(2,3) at 7x7 and 0.92x at
-    // 28x28 at 1 thread, 1.72x and 1.38x at 20 — the one shape where the wider
-    // tile stops paying for itself. Below the fence it pays. The budget counts
-    // the blob's own element size, so f16 reaches twice as far as f32.
-    constexpr int64_t u_budget = 16 << 20;
-    const int64_t esz = static_cast<int64_t>(data_type_size(dt));
-    if (wino_pos(WinoOrder::F43) * ic_per_group * oc_per_group * esz > u_budget) {
-        return WinoOrder::F23;
-    }
+    // What the wider order costs in traffic is the U *per tile it amortizes
+    // over* — esz / tiles₄₃ — because the blob is streamed once per tile-block
+    // pass; what it saves is a quarter of the multiplies per useful output.
+    // The blob's absolute size is therefore the wrong test: it is blind to the
+    // plane, and at 512x512 f32 (a 37.7 MB U, 2.4x the L3) F(4,3) measured
+    // faster than F(2,3)'s 16.8 MB blob at 12x12 (1.3-1.5x), 14x14 (1.0-1.3x)
+    // and 16x16 up (1.3-2.1x, 1/4/8/10 workers). An earlier 16 MB cap demoted
+    // exactly those to F(2,3) and cost 14x14 C512->512 1.27-1.33x. What the cap
+    // does catch is the 7-10x7-10 corner, where the padded last tile wastes
+    // part of the plane and there are too few tiles to amortize the transform —
+    // and those planes are under the floor below anyway. (A 20-worker datum once
+    // put F(4,3) 1.38x behind at 28x28 on that filter; it does not reproduce at
+    // ten workers, and if it ever does the fence to move is the floor's team
+    // term, not a blob-size cap.)
+    (void)dt;
+    (void)ic_per_group;
+    (void)oc_per_group;
 
     // The windows are read out of the packed panel in place, so the dearer
     // transform is the only cost the order adds: 0.61-0.92x of F(2,3) at 1
@@ -271,6 +276,12 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
         for (int64_t b = b0; b < b1; ++b) {
             const int64_t ocn0 = b * ocn_block;
             const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn0);
+            // The GEMM runs whole panels: the U's oc axis is padded to them (with
+            // zeros, which is what keeps the pad columns' M at zero), and the
+            // panel tail inside the last block would otherwise be a partial panel
+            // the packed-B kernel cannot read. The write-back below still stops at
+            // the real channels.
+            const int64_t ocn_gemm = ((ocnc + ug.nr - 1) / ug.nr) * ug.nr;
 
             // M_p zeroes on the first k-block and accumulates after; bias is
             // added at write-back, never here (Aᵀ(·)A would distort it).
@@ -290,7 +301,7 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
                         tile_pack_lhs_sme(false, static_cast<int>(ntl), static_cast<int>(kc),
                                           a_packed, v_p, static_cast<int>(v_lda));
                         tile_mma_pack_sme(
-                            static_cast<int>(ntl), static_cast<int>(ocnc),
+                            static_cast<int>(ntl), static_cast<int>(ocn_gemm),
                             static_cast<int>(kc), m_p, static_cast<int>(m_oc_stride), a_packed,
                             u_p, ug.ldd, -std::numeric_limits<float>::infinity(),
                             std::numeric_limits<float>::infinity(), /*zero_mode=*/kb == 0,
@@ -298,7 +309,7 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs, TensorView& output,
                         continue;
                     }
 #endif
-                    tile_mma_direct(static_cast<int>(ntl), static_cast<int>(ocnc),
+                    tile_mma_direct(static_cast<int>(ntl), static_cast<int>(ocn_gemm),
                                     static_cast<int>(kc), m_p, static_cast<int>(m_oc_stride),
                                     v_p, static_cast<int>(v_lda), u_p, /*ldb=*/-1,
                                     /*stage=*/nullptr, -std::numeric_limits<float>::infinity(),
@@ -433,11 +444,19 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs, std::span<const Tens
     plan.num_tiles = tiles;
     plan.icn_block = ug.kc;
 
-    // Whole panels: the U's oc axis is padded to them, and a GEMM's N start must
-    // land on one so its B pointer is a panel boundary.
+    // Whole panels, and an even number of them per block: the U's oc axis is
+    // padded to panels, so a block boundary that lands inside one either drops
+    // columns or forces a second pass over them. Snapping the cap *down* to a
+    // panel is what turned OC 64 into a 60 + 4 pair of passes — the 4-wide pass
+    // re-reads the whole V and costs about as much as a full one, and on a
+    // 4-worker grid it pairs a nearly idle worker with a busy one. Rounding the
+    // cap up (64 -> 72 at nr 12) and splitting the panels evenly instead gives
+    // one 6-panel block for OC 64 and two for OC 128.
     const int64_t nr = ug.nr;
-    const int64_t ocn_raw = std::min<int64_t>(kOcnBlock, ((oc_per_group + nr - 1) / nr) * nr);
-    plan.ocn_block = std::max<int64_t>(nr, (ocn_raw / nr) * nr);
+    const int64_t panels = (oc_per_group + nr - 1) / nr;
+    const int64_t max_panels = std::max<int64_t>(1, (kOcnBlock + nr - 1) / nr);
+    const int64_t nblk = std::max<int64_t>(1, (panels + max_panels - 1) / max_panels);
+    plan.ocn_block = nr * ((panels + nblk - 1) / nblk);
 
     // V: one [tile][ic] plane per position, tiles contiguous inside a position
     // (that is the GEMM's A, so lda is a tile row). The row is padded to the

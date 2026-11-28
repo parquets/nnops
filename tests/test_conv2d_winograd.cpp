@@ -329,12 +329,15 @@ NNOPS_TEST(wino_pick_order_fences) {
                       WinoOrder::F43);
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 256, 256, 14, 14, 4) ==
                       WinoOrder::F43);
-    // ... and F(2,3) below the plane floor, or where the U stream no longer
-    // fits (36 * 512 * 512 * 2 B = 18.9 MB; 256 channels is 4.7 MB and wins).
+    // ... and F(2,3) below the plane floor. A 512x512 f16 filter is an 18.9 MB
+    // U and still takes F(4,3) where the plane can amortize it: the blob size
+    // is not the test, the plane is.
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 64, 64, 7, 7) ==
                       WinoOrder::F23);
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56) ==
-                      WinoOrder::F23);
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 14, 14, 4) ==
+                      WinoOrder::F43);
     // The floor moves with the team: a 14x14 plane is one
     // whole-plane block on a small pool (1.47x of F(2,3) at 1 thread on
     // 256->256), and past four workers that block stops filling the pool
@@ -366,17 +369,39 @@ NNOPS_TEST(wino_pick_order_fences) {
     // An unknown plane takes the safe order.
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 0, 0) ==
                       WinoOrder::F23);
-    // The U fence: 36 positions x IC x OC x 4 B under 16 MB. 512x512 is 37.7 MB
-    // and loses; 256x256 is 9.4 MB and wins.
+    // There is no U-size fence: 36 positions x IC x OC x 4 B is 37.7 MB at
+    // 512x512 (2.4x the L3) and F(4,3) still beats F(2,3)'s 16.8 MB blob from a
+    // 12x12 plane up — 1.3x at 12x12 and 14x14, 1.5-2.1x from 16x16, measured
+    // at 1, 4, 8 and 10 workers. The blob is streamed once per tile block, so
+    // what it costs is bytes per tile, and the plane is the thing that says how
+    // many tiles there are. Every channel count takes the same decision.
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 56, 56) ==
-                      WinoOrder::F23);
+                      WinoOrder::F43);
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 28, 28) ==
-                      WinoOrder::F23);
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 14, 14, 4) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 256, 28, 28) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 128, 28, 28) ==
+                      WinoOrder::F43);
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 28, 28) ==
                       WinoOrder::F43);
-    // 18.9 MB is over the line, 9.4 MB is under it.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 256, 28, 28) ==
+    // The plane floor is what still fences the huge-U cases: under it the
+    // padded last tile wastes part of the plane and the transform has too few
+    // tiles to amortize (10x10 measured a wash at 8-10 workers, 7x7 a loss).
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 13, 56) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 128, 28, 28) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 10, 10, 8) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 7, 7, 1) ==
+                      WinoOrder::F23);
+    // ... and it climbs with the team, so the same 14x14 huge-U layer takes
+    // F(4,3) on four workers and F(2,3) on ten.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 14, 14, 10) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 20, 20, 10) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 28, 28, 10) ==
                       WinoOrder::F43);
 }
