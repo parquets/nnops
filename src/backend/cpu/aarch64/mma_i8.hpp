@@ -1691,58 +1691,114 @@ inline void mma_direct_mr1_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNO
 // SDOT's accumulators are already one row's four columns, so the store is a
 // straight requantize — no transpose step. One call covers the whole K and the
 // accumulators go to the 8-bit destination; no int32 tile reaches memory.
+//
+// Every index into the accumulator, scale and bias blocks is a literal: the
+// group walk and the store are written out at the panel's three widths instead
+// of looping to a template bound. A loop costs nothing where the compiler
+// unrolls it and everything where it does not — the array is then indexed at
+// run time and the whole block moves to the stack (GCC 14 does exactly that on
+// the narrow path, and turns the ragged byte copy into a memcpy call).
 
-/// One k group of a panel: MR rows against NG four-column groups.
+/// One four-column group: MR rows (as one or two 16-byte A registers) against
+/// one B vector, into that column's MR accumulators.
+template <int MR>
+__attribute__((always_inline)) inline void
+i8_sdot_col(int8x16_t va0, int8x16_t va1, int8x16_t vb, int32x4_t (&col)[MR]) noexcept
+{
+    if constexpr (MR == 1) {
+        col[0] = vdotq_s32(col[0], vb, va0);
+    } else if constexpr (MR == 4) {
+        col[0] = vdotq_laneq_s32(col[0], vb, va0, 0);
+        col[1] = vdotq_laneq_s32(col[1], vb, va0, 1);
+        col[2] = vdotq_laneq_s32(col[2], vb, va0, 2);
+        col[3] = vdotq_laneq_s32(col[3], vb, va0, 3);
+    } else {
+        static_assert(MR == 8, "an int8 A panel is 1, 4 or 8 rows");
+        col[0] = vdotq_laneq_s32(col[0], vb, va0, 0);
+        col[1] = vdotq_laneq_s32(col[1], vb, va0, 1);
+        col[2] = vdotq_laneq_s32(col[2], vb, va0, 2);
+        col[3] = vdotq_laneq_s32(col[3], vb, va0, 3);
+        col[4] = vdotq_laneq_s32(col[4], vb, va1, 0);
+        col[5] = vdotq_laneq_s32(col[5], vb, va1, 1);
+        col[6] = vdotq_laneq_s32(col[6], vb, va1, 2);
+        col[7] = vdotq_laneq_s32(col[7], vb, va1, 3);
+    }
+}
+
+/// Zero one column's accumulators.
+template <int MR>
+__attribute__((always_inline)) inline void
+i8_sdot_col_zero(int32x4_t (&col)[MR]) noexcept
+{
+    const int32x4_t vz = vdupq_n_s32(0);
+    col[0] = vz;
+    if constexpr (MR > 1) {
+        col[1] = vz;
+    }
+    if constexpr (MR > 2) {
+        col[2] = vz;
+    }
+    if constexpr (MR > 3) {
+        col[3] = vz;
+    }
+    if constexpr (MR > 4) {
+        col[4] = vz;
+    }
+    if constexpr (MR > 5) {
+        col[5] = vz;
+    }
+    if constexpr (MR > 6) {
+        col[6] = vz;
+    }
+    if constexpr (MR > 7) {
+        col[7] = vz;
+    }
+}
+
+/// One k group of a panel: MR rows of packed A against NG four-column groups.
 template <int MR, int NG>
 __attribute__((always_inline)) inline void
-i8_sdot_group(const int8_t*& a_ptr, const int8_t* b_ptr, int32x4_t (&acc)[MR][NG]) noexcept
+i8_sdot_group(const int8_t*& a_ptr, const int8_t* b_ptr, int32x4_t (&acc)[NG][MR]) noexcept
 {
+    static_assert(NG >= 1 && NG <= 3, "a panel is one to three column groups");
+    int8x16_t va0;
+    int8x16_t va1;
     if constexpr (MR == 1) {
         // The row's four bytes are splatted into every lane; each B lane is a
         // column, so one plain dot covers the group.
-        const int8x16_t va = mma_i8_bcast_group(a_ptr);
+        va0 = mma_i8_bcast_group(a_ptr);
+        va1 = va0;
         a_ptr += 4;
-        for (int g = 0; g < NG; ++g) {
-            acc[0][g] = vdotq_s32(acc[0][g], vld1q_s8(b_ptr + g * 16), va);
-        }
     } else if constexpr (MR == 4) {
-        const int8x16_t va = vld1q_s8(a_ptr);
+        va0 = vld1q_s8(a_ptr);
+        va1 = va0;
         a_ptr += 16;
-        for (int g = 0; g < NG; ++g) {
-            const int8x16_t vb = vld1q_s8(b_ptr + g * 16);
-            acc[0][g] = vdotq_laneq_s32(acc[0][g], vb, va, 0);
-            acc[1][g] = vdotq_laneq_s32(acc[1][g], vb, va, 1);
-            acc[2][g] = vdotq_laneq_s32(acc[2][g], vb, va, 2);
-            acc[3][g] = vdotq_laneq_s32(acc[3][g], vb, va, 3);
-        }
     } else {
         static_assert(MR == 8, "an int8 A panel is 1, 4 or 8 rows");
-        const int8x16_t va0 = vld1q_s8(a_ptr + 0 * 16);
-        const int8x16_t va1 = vld1q_s8(a_ptr + 1 * 16);
+        va0 = vld1q_s8(a_ptr + 0 * 16);
+        va1 = vld1q_s8(a_ptr + 1 * 16);
         a_ptr += 32;
-        for (int g = 0; g < NG; ++g) {
-            const int8x16_t vb = vld1q_s8(b_ptr + g * 16);
-            acc[0][g] = vdotq_laneq_s32(acc[0][g], vb, va0, 0);
-            acc[1][g] = vdotq_laneq_s32(acc[1][g], vb, va0, 1);
-            acc[2][g] = vdotq_laneq_s32(acc[2][g], vb, va0, 2);
-            acc[3][g] = vdotq_laneq_s32(acc[3][g], vb, va0, 3);
-            acc[4][g] = vdotq_laneq_s32(acc[4][g], vb, va1, 0);
-            acc[5][g] = vdotq_laneq_s32(acc[5][g], vb, va1, 1);
-            acc[6][g] = vdotq_laneq_s32(acc[6][g], vb, va1, 2);
-            acc[7][g] = vdotq_laneq_s32(acc[7][g], vb, va1, 3);
-        }
+    }
+    i8_sdot_col<MR>(va0, va1, vld1q_s8(b_ptr + 0 * 16), acc[0]);
+    if constexpr (NG > 1) {
+        i8_sdot_col<MR>(va0, va1, vld1q_s8(b_ptr + 1 * 16), acc[1]);
+    }
+    if constexpr (NG > 2) {
+        i8_sdot_col<MR>(va0, va1, vld1q_s8(b_ptr + 2 * 16), acc[2]);
     }
 }
 
 /// The panel's whole K into a zeroed `acc`.
 template <int MR, int NG>
 __attribute__((always_inline)) inline void
-i8_sdot_mma(const int8_t* A, const int8_t* B, int kg, int32x4_t (&acc)[MR][NG]) noexcept
+i8_sdot_mma(const int8_t* A, const int8_t* B, int kg, int32x4_t (&acc)[NG][MR]) noexcept
 {
-    for (int r = 0; r < MR; ++r) {
-        for (int g = 0; g < NG; ++g) {
-            acc[r][g] = vdupq_n_s32(0);
-        }
+    i8_sdot_col_zero<MR>(acc[0]);
+    if constexpr (NG > 1) {
+        i8_sdot_col_zero<MR>(acc[1]);
+    }
+    if constexpr (NG > 2) {
+        i8_sdot_col_zero<MR>(acc[2]);
     }
     const int8_t* a_ptr = A;
     const int8_t* b_ptr = B;
@@ -1751,23 +1807,107 @@ i8_sdot_mma(const int8_t* A, const int8_t* B, int kg, int32x4_t (&acc)[MR][NG]) 
     }
 }
 
+/// Requantize and write one group of a panel: MR rows, `live` columns left in
+/// the panel from this group's first column.
+template <int MR, class TOut>
+__attribute__((always_inline)) inline void
+i8_sdot_store_col(TOut* const (&row)[MR], int col0, int col, int live,
+                  const int32x4_t (&col_acc)[MR], float32x4_t sc, int32x4_t bi, int32x4_t vlo,
+                  int32x4_t vzp) noexcept
+{
+    const int l = live - col;
+    if (l >= 4) {
+        i8_store4q<TOut>(row[0] + col0 + col, col_acc[0], sc, bi, vlo, vzp);
+        if constexpr (MR > 1) {
+            i8_store4q<TOut>(row[1] + col0 + col, col_acc[1], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 2) {
+            i8_store4q<TOut>(row[2] + col0 + col, col_acc[2], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 3) {
+            i8_store4q<TOut>(row[3] + col0 + col, col_acc[3], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 4) {
+            i8_store4q<TOut>(row[4] + col0 + col, col_acc[4], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 5) {
+            i8_store4q<TOut>(row[5] + col0 + col, col_acc[5], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 6) {
+            i8_store4q<TOut>(row[6] + col0 + col, col_acc[6], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 7) {
+            i8_store4q<TOut>(row[7] + col0 + col, col_acc[7], sc, bi, vlo, vzp);
+        }
+    } else if (l > 0) {
+        i8_store4q_lanes<TOut>(row[0] + col0 + col, l, col_acc[0], sc, bi, vlo, vzp);
+        if constexpr (MR > 1) {
+            i8_store4q_lanes<TOut>(row[1] + col0 + col, l, col_acc[1], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 2) {
+            i8_store4q_lanes<TOut>(row[2] + col0 + col, l, col_acc[2], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 3) {
+            i8_store4q_lanes<TOut>(row[3] + col0 + col, l, col_acc[3], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 4) {
+            i8_store4q_lanes<TOut>(row[4] + col0 + col, l, col_acc[4], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 5) {
+            i8_store4q_lanes<TOut>(row[5] + col0 + col, l, col_acc[5], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 6) {
+            i8_store4q_lanes<TOut>(row[6] + col0 + col, l, col_acc[6], sc, bi, vlo, vzp);
+        }
+        if constexpr (MR > 7) {
+            i8_store4q_lanes<TOut>(row[7] + col0 + col, l, col_acc[7], sc, bi, vlo, vzp);
+        }
+    }
+}
+
 /// Requantize and write the live columns of NG groups, starting at `col0`.
 template <int MR, int NG, class TOut>
 __attribute__((always_inline)) inline void
-i8_sdot_store(TOut* const (&row)[MR], int col0, int live, int32x4_t (&acc)[MR][NG],
+i8_sdot_store(TOut* const (&row)[MR], int col0, int live, int32x4_t (&acc)[NG][MR],
               const float32x4_t (&sc)[NG], const int32x4_t (&bi)[NG], int32x4_t vlo,
               int32x4_t vzp) noexcept
 {
-    for (int r = 0; r < MR; ++r) {
-        for (int g = 0; g < NG; ++g) {
-            const int col = 4 * g;
-            if (col + 4 <= live) {
-                i8_store4q<TOut>(row[r] + col0 + col, acc[r][g], sc[g], bi[g], vlo, vzp);
-            } else if (col < live) {
-                i8_store4q_lanes<TOut>(row[r] + col0 + col, live - col, acc[r][g], sc[g], bi[g],
-                                       vlo, vzp);
-            }
-        }
+    static_assert(NG >= 1 && NG <= 3, "a panel is one to three column groups");
+    i8_sdot_store_col<MR, TOut>(row, col0, 0, live, acc[0], sc[0], bi[0], vlo, vzp);
+    if constexpr (NG > 1) {
+        i8_sdot_store_col<MR, TOut>(row, col0, 4, live, acc[1], sc[1], bi[1], vlo, vzp);
+    }
+    if constexpr (NG > 2) {
+        i8_sdot_store_col<MR, TOut>(row, col0, 8, live, acc[2], sc[2], bi[2], vlo, vzp);
+    }
+}
+
+/// The panel's output rows, aliasing the last live one past `mr`.
+template <int MR, class TOut>
+__attribute__((always_inline)) inline void
+i8_sdot_row_ptrs(TOut* C, int64_t ldm, int mr, TOut* (&row)[MR]) noexcept
+{
+    row[0] = C;
+    if constexpr (MR > 1) {
+        row[1] = C + std::min<int64_t>(1, mr - 1) * ldm;
+    }
+    if constexpr (MR > 2) {
+        row[2] = C + std::min<int64_t>(2, mr - 1) * ldm;
+    }
+    if constexpr (MR > 3) {
+        row[3] = C + std::min<int64_t>(3, mr - 1) * ldm;
+    }
+    if constexpr (MR > 4) {
+        row[4] = C + std::min<int64_t>(4, mr - 1) * ldm;
+    }
+    if constexpr (MR > 5) {
+        row[5] = C + std::min<int64_t>(5, mr - 1) * ldm;
+    }
+    if constexpr (MR > 6) {
+        row[6] = C + std::min<int64_t>(6, mr - 1) * ldm;
+    }
+    if constexpr (MR > 7) {
+        row[7] = C + std::min<int64_t>(7, mr - 1) * ldm;
     }
 }
 
@@ -1778,7 +1918,7 @@ i8_sdot_tail(TOut* const (&row)[MR], int n, int live, int kg, const int8_t* A, c
              float32x4_t vk, float32x4_t vreq, const float* s_b, const int32_t* col_bias,
              int32x4_t vlo, int32x4_t vzp) noexcept
 {
-    int32x4_t acc[MR][NG];
+    int32x4_t acc[NG][MR];
     i8_sdot_mma<MR, NG>(A, B, kg, acc);
     float32x4_t sc[NG];
     int32x4_t bi[NG];
@@ -1795,10 +1935,7 @@ mma_pack_mr_nr12_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t 
                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
 {
     TOut* row[MR];
-    for (int r = 0; r < MR; ++r) {
-        // Rows past the live count alias the last live one, as the int32 store does.
-        row[r] = C + std::min(r, mr - 1) * ldm;
-    }
+    i8_sdot_row_ptrs<MR, TOut>(C, ldm, mr, row);
     const int kbytes = (kc + 3) & ~3;
     const int kg = kbytes >> 2;
     const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
@@ -1809,7 +1946,7 @@ mma_pack_mr_nr12_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t 
 
     int n = 0;
     for (; n + mma_i8_nr_max <= nc; n += mma_i8_nr_max) {
-        int32x4_t acc[MR][3];
+        int32x4_t acc[3][MR];
         i8_sdot_mma<MR, 3>(A, B, kg, acc);
         float32x4_t sc[3];
         int32x4_t bi[3];

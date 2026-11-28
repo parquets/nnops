@@ -15,6 +15,11 @@
 /// shift ((a_bias_offset + zp_a) * r_b[n], see the callers), so one vector add
 /// is the whole per-element correction. Everything here is baseline NEON: the
 /// SDOT and SMMLA routes share it.
+///
+/// Every index into the column blocks is a literal — the three-group wider
+/// forms are written out instead of looping to a template bound. A loop costs
+/// nothing on a compiler that unrolls it and everything on one that does not:
+/// the arrays would be indexed at run time and stay in memory.
 
 #include <arm_neon.h>
 #include <cstdint>
@@ -27,48 +32,87 @@ template <class TOut>
 using MmaI8EpiFn = void (*)(int, int, int, TOut*, int64_t, const int8_t*, const int8_t*, int,
                             const float*, float, float, const int32_t*, int32_t, bool);
 
-/// The per-column scale and bias of one four-column group. Hoisted out of the
-/// row pairs: without it a panel reloads and re-multiplies them once per row.
+/// One four-column group's scale and bias. Hoisted out of the row pairs: without
+/// it a panel reloads and re-multiplies them once per row.
 template <int NG>
 __attribute__((always_inline)) inline void
 i8_col_q(float32x4_t (&sc)[NG], int32x4_t (&bi)[NG], float32x4_t vk, float32x4_t vreq,
          const float* s_b, const int32_t* col_bias) noexcept
 {
+    static_assert(NG >= 1 && NG <= 3, "a panel is one to three column groups");
     const int32x4_t vz = vdupq_n_s32(0);
-    for (int g = 0; g < NG; ++g) {
-        sc[g] = s_b ? vmulq_f32(vk, vld1q_f32(s_b + 4 * g)) : vreq;
-        bi[g] = col_bias ? vld1q_s32(col_bias + 4 * g) : vz;
+    sc[0] = s_b ? vmulq_f32(vk, vld1q_f32(s_b + 0)) : vreq;
+    bi[0] = col_bias ? vld1q_s32(col_bias + 0) : vz;
+    if constexpr (NG > 1) {
+        sc[1] = s_b ? vmulq_f32(vk, vld1q_f32(s_b + 4)) : vreq;
+        bi[1] = col_bias ? vld1q_s32(col_bias + 4) : vz;
+    }
+    if constexpr (NG > 2) {
+        sc[2] = s_b ? vmulq_f32(vk, vld1q_f32(s_b + 8)) : vreq;
+        bi[2] = col_bias ? vld1q_s32(col_bias + 8) : vz;
     }
 }
 
-/// The same for the tail, where the last group can be narrower than four
-/// columns: the dead lanes are zeroed rather than read past the table's end.
-/// Only the live lanes are ever stored, so their values do not matter.
+/// One group at `BASE` columns of a tail, where the last group can be narrower
+/// than four columns: only the live lanes are read, and the dead ones stay zero
+/// rather than reading past the table's end. Only live lanes are ever stored,
+/// so their values do not matter. No local buffer: the lanes are assembled with
+/// vector lane inserts, so nothing here is a stack object.
+template <int BASE>
+__attribute__((always_inline)) inline void
+i8_col_group_live(float32x4_t& sc, int32x4_t& bi, float32x4_t vk, float32x4_t vreq,
+                  const float* s_b, const int32_t* col_bias, int live) noexcept
+{
+    const int32x4_t vz = vdupq_n_s32(0);
+    if (live >= BASE + 4) {
+        sc = s_b ? vmulq_f32(vk, vld1q_f32(s_b + BASE)) : vreq;
+        bi = col_bias ? vld1q_s32(col_bias + BASE) : vz;
+        return;
+    }
+    const int lanes = live - BASE;
+    float32x4_t s4 = vdupq_n_f32(0.0f);
+    int32x4_t b4 = vz;
+    if (lanes > 0) {
+        if (s_b) {
+            s4 = vsetq_lane_f32(s_b[BASE + 0], s4, 0);
+        }
+        if (col_bias) {
+            b4 = vsetq_lane_s32(col_bias[BASE + 0], b4, 0);
+        }
+    }
+    if (lanes > 1) {
+        if (s_b) {
+            s4 = vsetq_lane_f32(s_b[BASE + 1], s4, 1);
+        }
+        if (col_bias) {
+            b4 = vsetq_lane_s32(col_bias[BASE + 1], b4, 1);
+        }
+    }
+    if (lanes > 2) {
+        if (s_b) {
+            s4 = vsetq_lane_f32(s_b[BASE + 2], s4, 2);
+        }
+        if (col_bias) {
+            b4 = vsetq_lane_s32(col_bias[BASE + 2], b4, 2);
+        }
+    }
+    sc = s_b ? vmulq_f32(vk, s4) : vreq;
+    bi = col_bias ? b4 : vz;
+}
+
+/// The tail's per-column scale and bias: one call per group, literals only.
 template <int NG>
 __attribute__((always_inline)) inline void
 i8_col_q_live(float32x4_t (&sc)[NG], int32x4_t (&bi)[NG], float32x4_t vk, float32x4_t vreq,
               const float* s_b, const int32_t* col_bias, int live) noexcept
 {
-    const int32x4_t vz = vdupq_n_s32(0);
-    for (int g = 0; g < NG; ++g) {
-        const int base = 4 * g;
-        if (base + 4 <= live) {
-            sc[g] = s_b ? vmulq_f32(vk, vld1q_f32(s_b + base)) : vreq;
-            bi[g] = col_bias ? vld1q_s32(col_bias + base) : vz;
-            continue;
-        }
-        alignas(16) float sv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        alignas(16) int32_t bv[4] = {0, 0, 0, 0};
-        for (int c = 0; c < 4 && base + c < live; ++c) {
-            if (s_b) {
-                sv[c] = s_b[base + c];
-            }
-            if (col_bias) {
-                bv[c] = col_bias[base + c];
-            }
-        }
-        sc[g] = s_b ? vmulq_f32(vk, vld1q_f32(sv)) : vreq;
-        bi[g] = col_bias ? vld1q_s32(bv) : vz;
+    static_assert(NG >= 1 && NG <= 3, "a panel is one to three column groups");
+    i8_col_group_live<0>(sc[0], bi[0], vk, vreq, s_b, col_bias, live);
+    if constexpr (NG > 1) {
+        i8_col_group_live<4>(sc[1], bi[1], vk, vreq, s_b, col_bias, live);
+    }
+    if constexpr (NG > 2) {
+        i8_col_group_live<8>(sc[2], bi[2], vk, vreq, s_b, col_bias, live);
     }
 }
 
@@ -91,7 +135,9 @@ i8_store4q(TOut* dst, int32x4_t v, float32x4_t vscale, int32x4_t vbias, int32x4_
     }
 }
 
-/// The same for a ragged group: `live` (1-3) bytes are written.
+/// The same for a ragged group: `live` (1-3) bytes are written, one lane at a
+/// time — no buffer and no run-time loop, so the tail's accumulators stay in
+/// registers on a compiler that would otherwise leave this block in memory.
 template <class TOut>
 __attribute__((always_inline)) inline void
 i8_store4q_lanes(TOut* dst, int live, int32x4_t v, float32x4_t vscale, int32x4_t vbias,
@@ -101,18 +147,19 @@ i8_store4q_lanes(TOut* dst, int live, int32x4_t v, float32x4_t vscale, int32x4_t
     v = vmaxq_s32(v, vlo);
     const int32x4_t q = vqaddq_s32(vcvtaq_s32_f32(vmulq_f32(vcvtq_f32_s32(v), vscale)), vzp);
     const int16x4_t i16 = vqmovn_s32(q);
+    uint8x8_t bytes;
     if constexpr (std::is_same_v<TOut, uint8_t>) {
-        uint8_t buf[8];
-        vst1_u8(buf, vqmovun_s16(vcombine_s16(i16, i16)));
-        for (int c = 0; c < live; ++c) {
-            dst[c] = buf[c];
-        }
+        bytes = vqmovun_s16(vcombine_s16(i16, i16));
     } else {
-        int8_t buf[8];
-        vst1_s8(buf, vqmovn_s16(vcombine_s16(i16, i16)));
-        for (int c = 0; c < live; ++c) {
-            dst[c] = buf[c];
-        }
+        bytes = vreinterpret_u8_s8(vqmovn_s16(vcombine_s16(i16, i16)));
+    }
+    uint8_t* const p = reinterpret_cast<uint8_t*>(dst);
+    vst1_lane_u8(p + 0, bytes, 0);
+    if (live > 1) {
+        vst1_lane_u8(p + 1, bytes, 1);
+    }
+    if (live > 2) {
+        vst1_lane_u8(p + 2, bytes, 2);
     }
 }
 
