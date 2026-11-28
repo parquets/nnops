@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 #include "backend/cpu/aarch64/i8_requant_store.hpp"
 #include "backend/cpu/common/common_utils.hpp"
 
@@ -599,23 +600,317 @@ i8mm_tail_epi(TOut* C, int64_t ldm, int mr, int live, int kg, const int8_t* A, c
 }
 
 // =========================================================================
-//  packed A + packed B  (mr = 8, 4, 1)
+//  one walk: packed A (int32 and requantized) and row-major A
+// =========================================================================
+//
+// One template per route and height. A panel is six two-column blocks per row
+// pair, so the accumulators are [pairs][6] and every index into them is a
+// literal: a loop to a template bound costs nothing where the compiler unrolls
+// it and everything where it does not — the array is then indexed at run time
+// and the whole block moves to the stack.
+
+/// The C rows, aliasing the last live one past `mr`.
+template <int MR, class T>
+__attribute__((always_inline)) inline void
+i8mm_rows(T* C, int64_t ldm, int mr, T* (&row)[MR]) noexcept
+{
+    row[0] = C;
+    if constexpr (MR > 1) {
+        row[1] = C + std::min<int64_t>(1, mr - 1) * ldm;
+    }
+    if constexpr (MR > 2) {
+        row[2] = C + std::min<int64_t>(2, mr - 1) * ldm;
+    }
+    if constexpr (MR > 3) {
+        row[3] = C + std::min<int64_t>(3, mr - 1) * ldm;
+    }
+    if constexpr (MR > 4) {
+        row[4] = C + std::min<int64_t>(4, mr - 1) * ldm;
+    }
+    if constexpr (MR > 5) {
+        row[5] = C + std::min<int64_t>(5, mr - 1) * ldm;
+    }
+    if constexpr (MR > 6) {
+        row[6] = C + std::min<int64_t>(6, mr - 1) * ldm;
+    }
+    if constexpr (MR > 7) {
+        row[7] = C + std::min<int64_t>(7, mr - 1) * ldm;
+    }
+}
+
+/// The row-major A rows, aliasing the last live one.
+template <int MR>
+__attribute__((always_inline)) inline void
+i8mm_a_rows(const int8_t* A, int lda, int mr, const int8_t* (&a)[MR]) noexcept
+{
+    a[0] = A;
+    if constexpr (MR > 1) {
+        a[1] = A + std::min(1, mr - 1) * lda;
+    }
+    if constexpr (MR > 2) {
+        a[2] = A + std::min(2, mr - 1) * lda;
+    }
+    if constexpr (MR > 3) {
+        a[3] = A + std::min(3, mr - 1) * lda;
+    }
+    if constexpr (MR > 4) {
+        a[4] = A + std::min(4, mr - 1) * lda;
+    }
+    if constexpr (MR > 5) {
+        a[5] = A + std::min(5, mr - 1) * lda;
+    }
+    if constexpr (MR > 6) {
+        a[6] = A + std::min(6, mr - 1) * lda;
+    }
+    if constexpr (MR > 7) {
+        a[7] = A + std::min(7, mr - 1) * lda;
+    }
+}
+
+/// The odd row of pair `P`: a pair whose second row is past `MR` folds onto
+/// the last live row (the one-row rung's fragment has no second row at all).
+template <int MR, int P>
+inline constexpr int i8mm_odd_row = (2 * P + 1 < MR) ? 2 * P + 1 : MR - 1;
+
+/// One two-column block against every row pair's fragment.
+template <int P, int J>
+__attribute__((target("i8mm"), always_inline)) inline void
+i8mm_fma_block(const int8x16_t (&va)[P], const int8_t* b_ptr,
+               int32x4_t (&acc)[P][6]) noexcept
+{
+    const int8x16_t vb = vld1q_s8(b_ptr + J * 16);
+    acc[0][J] = vmmlaq_s32(acc[0][J], va[0], vb);
+    if constexpr (P > 1) {
+        acc[1][J] = vmmlaq_s32(acc[1][J], va[1], vb);
+    }
+    if constexpr (P > 2) {
+        acc[2][J] = vmmlaq_s32(acc[2][J], va[2], vb);
+        acc[3][J] = vmmlaq_s32(acc[3][J], va[3], vb);
+    }
+}
+
+/// One k group of a packed-A panel.
+template <int MR>
+__attribute__((target("i8mm"), always_inline)) inline void
+i8mm_group(const int8_t*& a_ptr, const int8_t* b_ptr,
+           int32x4_t (&acc)[i8mm_tail_pairs<MR>][6]) noexcept
+{
+    constexpr int P = i8mm_tail_pairs<MR>;
+    int8x16_t va[P];
+    if constexpr (MR == 1) {
+        // The fragment's second row is zero, so the odd lanes stay dead.
+        va[0] = vcombine_s8(vld1_s8(a_ptr), vdup_n_s8(0));
+        a_ptr += 8;
+    } else {
+        va[0] = vld1q_s8(a_ptr + 0 * 16);
+        if constexpr (MR > 2) {
+            va[1] = vld1q_s8(a_ptr + 1 * 16);
+        }
+        if constexpr (MR > 4) {
+            va[2] = vld1q_s8(a_ptr + 2 * 16);
+            va[3] = vld1q_s8(a_ptr + 3 * 16);
+        }
+        a_ptr += MR * 8;
+    }
+    i8mm_fma_block<P, 0>(va, b_ptr, acc);
+    i8mm_fma_block<P, 1>(va, b_ptr, acc);
+    i8mm_fma_block<P, 2>(va, b_ptr, acc);
+    i8mm_fma_block<P, 3>(va, b_ptr, acc);
+    i8mm_fma_block<P, 4>(va, b_ptr, acc);
+    i8mm_fma_block<P, 5>(va, b_ptr, acc);
+}
+
+/// Zero every accumulator of a panel.
+template <int MR, std::size_t... I>
+__attribute__((target("i8mm"), always_inline)) inline void
+i8mm_acc_zero(int32x4_t (&acc)[i8mm_tail_pairs<MR>][6], std::index_sequence<I...>) noexcept
+{
+    const int32x4_t vz = vdupq_n_s32(0);
+    ((acc[I / 6][I % 6] = vz), ...);
+}
+
+/// The panel's whole K from packed A into zeroed `acc`.
+template <int MR>
+__attribute__((target("i8mm"), always_inline)) inline void
+i8mm_mma(const int8_t* A, const int8_t* B, int kg,
+         int32x4_t (&acc)[i8mm_tail_pairs<MR>][6]) noexcept
+{
+    i8mm_acc_zero<MR>(acc, std::make_index_sequence<i8mm_tail_pairs<MR> * 6>{});
+    const int8_t* a = A;
+    const int8_t* b = B;
+    for (int k = 0; k < kg; ++k, b += mma_i8mm_group_bytes) {
+        i8mm_group<MR>(a, b, acc);
+    }
+}
+
+/// The row pairs' fragments out of a caller's matrix. A short final k group is
+/// staged through a zeroed row per A row — a row holds exactly `kc` bytes — and
+/// the pointers do not advance on it.
+template <int MR>
+__attribute__((target("i8mm"), always_inline)) inline void
+i8mm_frags(const int8_t* (&a)[MR], int k, int kg, int kc,
+           int8x16_t (&va)[i8mm_tail_pairs<MR>]) noexcept
+{
+    if (k + 1 < kg || (kc & 7) == 0) {
+        if constexpr (MR == 1) {
+            va[0] = vcombine_s8(vld1_s8(a[0]), vdup_n_s8(0));
+        } else {
+            va[0] = vcombine_s8(vld1_s8(a[0]), vld1_s8(a[1]));
+            if constexpr (MR > 2) {
+                va[1] = vcombine_s8(vld1_s8(a[2]), vld1_s8(a[3]));
+            }
+            if constexpr (MR > 4) {
+                va[2] = vcombine_s8(vld1_s8(a[4]), vld1_s8(a[5]));
+                va[3] = vcombine_s8(vld1_s8(a[6]), vld1_s8(a[7]));
+            }
+        }
+        if constexpr (MR == 1) {
+            a[0] += 8;
+        } else {
+            for (int r = 0; r < MR; ++r) {
+                a[r] += 8;
+            }
+        }
+    } else {
+        const int live = kc - 8 * k;
+        int8_t t[MR][8] = {};
+        for (int r = 0; r < MR; ++r) {
+            std::memcpy(t[r], a[r], static_cast<size_t>(live));
+        }
+        if constexpr (MR == 1) {
+            va[0] = vcombine_s8(vld1_s8(t[0]), vdup_n_s8(0));
+        } else {
+            va[0] = vcombine_s8(vld1_s8(t[0]), vld1_s8(t[1]));
+            if constexpr (MR > 2) {
+                va[1] = vcombine_s8(vld1_s8(t[2]), vld1_s8(t[3]));
+            }
+            if constexpr (MR > 4) {
+                va[2] = vcombine_s8(vld1_s8(t[4]), vld1_s8(t[5]));
+                va[3] = vcombine_s8(vld1_s8(t[6]), vld1_s8(t[7]));
+            }
+        }
+    }
+}
+
+/// The panel's whole K from row-major rows into zeroed `acc`.
+template <int MR>
+__attribute__((target("i8mm"), always_inline)) inline void
+i8mm_mma_rows(const int8_t* const (&A)[MR], const int8_t* B, int kg, int kc,
+              int32x4_t (&acc)[i8mm_tail_pairs<MR>][6]) noexcept
+{
+    constexpr int P = i8mm_tail_pairs<MR>;
+    i8mm_acc_zero<MR>(acc, std::make_index_sequence<P * 6>{});
+    const int8_t* a[MR];
+    for (int r = 0; r < MR; ++r) {
+        a[r] = A[r];
+    }
+    const int8_t* b = B;
+    for (int k = 0; k < kg; ++k, b += mma_i8mm_group_bytes) {
+        int8x16_t va[P];
+        i8mm_frags<MR>(a, k, kg, kc, va);
+        i8mm_fma_block<P, 0>(va, b, acc);
+        i8mm_fma_block<P, 1>(va, b, acc);
+        i8mm_fma_block<P, 2>(va, b, acc);
+        i8mm_fma_block<P, 3>(va, b, acc);
+        i8mm_fma_block<P, 4>(va, b, acc);
+        i8mm_fma_block<P, 5>(va, b, acc);
+    }
+}
+
+/// Store one panel of int32 accumulators: a row pair at a time, every row's C
+/// read before that pair is written.
+template <int MR, bool zero_mode>
+__attribute__((target("i8mm"), always_inline)) inline void
+i8mm_store_all(int32_t* const (&row)[MR], int col0, int mr,
+               const int32x4_t (&acc)[i8mm_tail_pairs<MR>][6], int32x4_t vmin,
+               int32x4_t vmax) noexcept
+{
+    i8mm_store12<zero_mode>(row[0] + col0, row[i8mm_odd_row<MR, 0>] + col0, MR > 1 && mr > 1,
+                            acc[0][0], acc[0][1], acc[0][2], acc[0][3], acc[0][4], acc[0][5],
+                            vmin, vmax);
+    if constexpr (MR > 2) {
+        i8mm_store12<zero_mode>(row[2] + col0, row[i8mm_odd_row<MR, 1>] + col0, mr > 3,
+                                acc[1][0], acc[1][1], acc[1][2], acc[1][3], acc[1][4], acc[1][5],
+                                vmin, vmax);
+    }
+    if constexpr (MR > 4) {
+        i8mm_store12<zero_mode>(row[4] + col0, row[i8mm_odd_row<MR, 2>] + col0, mr > 5,
+                                acc[2][0], acc[2][1], acc[2][2], acc[2][3], acc[2][4], acc[2][5],
+                                vmin, vmax);
+    }
+    if constexpr (MR > 6) {
+        i8mm_store12<zero_mode>(row[6] + col0, row[i8mm_odd_row<MR, 3>] + col0, mr > 7,
+                                acc[3][0], acc[3][1], acc[3][2], acc[3][3], acc[3][4], acc[3][5],
+                                vmin, vmax);
+    }
+}
+
+/// The same for a panel whose live width is short of twelve: lane stores only.
+template <int MR, bool zero_mode>
+__attribute__((target("i8mm"), always_inline)) inline void
+i8mm_store_all_tail(int32_t* const (&row)[MR], int col0, int rem, int mr,
+                    const int32x4_t (&acc)[i8mm_tail_pairs<MR>][6], int32_t clamp_min,
+                    int32_t clamp_max) noexcept
+{
+    i8mm_store12_tail<zero_mode>(row[0] + col0, row[i8mm_odd_row<MR, 0>] + col0,
+                                 MR > 1 && mr > 1, rem, acc[0][0], acc[0][1], acc[0][2],
+                                 acc[0][3], acc[0][4], acc[0][5], clamp_min, clamp_max);
+    if constexpr (MR > 2) {
+        i8mm_store12_tail<zero_mode>(row[2] + col0, row[i8mm_odd_row<MR, 1>] + col0, mr > 3, rem,
+                                     acc[1][0], acc[1][1], acc[1][2], acc[1][3], acc[1][4],
+                                     acc[1][5], clamp_min, clamp_max);
+    }
+    if constexpr (MR > 4) {
+        i8mm_store12_tail<zero_mode>(row[4] + col0, row[i8mm_odd_row<MR, 2>] + col0, mr > 5, rem,
+                                     acc[2][0], acc[2][1], acc[2][2], acc[2][3], acc[2][4],
+                                     acc[2][5], clamp_min, clamp_max);
+    }
+    if constexpr (MR > 6) {
+        i8mm_store12_tail<zero_mode>(row[6] + col0, row[i8mm_odd_row<MR, 3>] + col0, mr > 7, rem,
+                                     acc[3][0], acc[3][1], acc[3][2], acc[3][3], acc[3][4],
+                                     acc[3][5], clamp_min, clamp_max);
+    }
+}
+
+/// Store one panel of accumulators, requantized.
+template <int MR, class TOut>
+__attribute__((target("i8mm"), always_inline)) inline void
+i8mm_store_all_epi(TOut* const (&row)[MR], int col0,
+                   const int32x4_t (&acc)[i8mm_tail_pairs<MR>][6], const float32x4_t (&sc)[3],
+                   const int32x4_t (&bi)[3], int32x4_t vlo, int32x4_t vzp) noexcept
+{
+    i8mm_store12_epi<MR, TOut>(row[0] + col0, row[i8mm_odd_row<MR, 0>] + col0, acc[0][0],
+                               acc[0][1], acc[0][2], acc[0][3], acc[0][4], acc[0][5], sc, bi,
+                               vlo, vzp);
+    if constexpr (MR > 2) {
+        i8mm_store12_epi<MR, TOut>(row[2] + col0, row[i8mm_odd_row<MR, 1>] + col0, acc[1][0],
+                                   acc[1][1], acc[1][2], acc[1][3], acc[1][4], acc[1][5], sc, bi,
+                                   vlo, vzp);
+    }
+    if constexpr (MR > 4) {
+        i8mm_store12_epi<MR, TOut>(row[4] + col0, row[i8mm_odd_row<MR, 2>] + col0, acc[2][0],
+                                   acc[2][1], acc[2][2], acc[2][3], acc[2][4], acc[2][5], sc, bi,
+                                   vlo, vzp);
+    }
+    if constexpr (MR > 6) {
+        i8mm_store12_epi<MR, TOut>(row[6] + col0, row[i8mm_odd_row<MR, 3>] + col0, acc[3][0],
+                                   acc[3][1], acc[3][2], acc[3][3], acc[3][4], acc[3][5], sc, bi,
+                                   vlo, vzp);
+    }
+}
+
+// =========================================================================
+//  packed A + packed B  (MR = 8, 4, 1)
 // =========================================================================
 
-template <bool zero_mode = false>
+template <int MR, bool zero_mode = false>
 __attribute__((target("i8mm"))) inline void
-mma_pack_mr8_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                       const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B, int ldb,
-                       int32_t clamp_min, int32_t clamp_max) noexcept
+mma_pack_mr_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
+                      const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B, int ldb,
+                      int32_t clamp_min, int32_t clamp_max) noexcept
 {
-    int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-    int32_t* NNOPS_RESTRICT c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
-    int32_t* NNOPS_RESTRICT c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
-    int32_t* NNOPS_RESTRICT c6_ptr = (mr > 6) ? C + 6 * ldc : c5_ptr;
-    int32_t* NNOPS_RESTRICT c7_ptr = (mr > 7) ? C + 7 * ldc : c6_ptr;
+    int32_t* row[MR];
+    i8mm_rows<MR>(C, ldc, mr, row);
 
     const int kbytes = (kc + 7) & ~7;
     const int kg = kbytes >> 3;
@@ -625,222 +920,17 @@ mma_pack_mr8_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ld
 
     int n = 0;
     for (; n + mma_i8mm_nr_max <= nc; n += mma_i8mm_nr_max) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c03 = v_c00, v_c04 = v_c00, v_c05 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c13 = v_c10, v_c14 = v_c10, v_c15 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c23 = v_c20, v_c24 = v_c20, v_c25 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-        int32x4_t v_c33 = v_c30, v_c34 = v_c30, v_c35 = v_c30;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a0 = vld1q_s8(a_ptr + 0 * 16); // rows 0,1
-            const int8x16_t v_a1 = vld1q_s8(a_ptr + 1 * 16); // rows 2,3
-            const int8x16_t v_a2 = vld1q_s8(a_ptr + 2 * 16); // rows 4,5
-            const int8x16_t v_a3 = vld1q_s8(a_ptr + 3 * 16); // rows 6,7
-            a_ptr += 4 * 16;
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16); // columns 0,1
-            v_c00 = vmmlaq_s32(v_c00, v_a0, v_b0);
-            v_c10 = vmmlaq_s32(v_c10, v_a1, v_b0);
-            v_c20 = vmmlaq_s32(v_c20, v_a2, v_b0);
-            v_c30 = vmmlaq_s32(v_c30, v_a3, v_b0);
-
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16); // columns 2,3
-            v_c01 = vmmlaq_s32(v_c01, v_a0, v_b1);
-            v_c11 = vmmlaq_s32(v_c11, v_a1, v_b1);
-            v_c21 = vmmlaq_s32(v_c21, v_a2, v_b1);
-            v_c31 = vmmlaq_s32(v_c31, v_a3, v_b1);
-
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16); // columns 4,5
-            v_c02 = vmmlaq_s32(v_c02, v_a0, v_b2);
-            v_c12 = vmmlaq_s32(v_c12, v_a1, v_b2);
-            v_c22 = vmmlaq_s32(v_c22, v_a2, v_b2);
-            v_c32 = vmmlaq_s32(v_c32, v_a3, v_b2);
-
-            const int8x16_t v_b3 = vld1q_s8(b_ptr + 3 * 16); // columns 6,7
-            v_c03 = vmmlaq_s32(v_c03, v_a0, v_b3);
-            v_c13 = vmmlaq_s32(v_c13, v_a1, v_b3);
-            v_c23 = vmmlaq_s32(v_c23, v_a2, v_b3);
-            v_c33 = vmmlaq_s32(v_c33, v_a3, v_b3);
-
-            const int8x16_t v_b4 = vld1q_s8(b_ptr + 4 * 16); // columns 8,9
-            v_c04 = vmmlaq_s32(v_c04, v_a0, v_b4);
-            v_c14 = vmmlaq_s32(v_c14, v_a1, v_b4);
-            v_c24 = vmmlaq_s32(v_c24, v_a2, v_b4);
-            v_c34 = vmmlaq_s32(v_c34, v_a3, v_b4);
-
-            const int8x16_t v_b5 = vld1q_s8(b_ptr + 5 * 16); // columns 10,11
-            v_c05 = vmmlaq_s32(v_c05, v_a0, v_b5);
-            v_c15 = vmmlaq_s32(v_c15, v_a1, v_b5);
-            v_c25 = vmmlaq_s32(v_c25, v_a2, v_b5);
-            v_c35 = vmmlaq_s32(v_c35, v_a3, v_b5);
-
-            b_ptr += mma_i8mm_group_bytes;
-        }
-
-        i8mm_store12<zero_mode>(c0_ptr, c1_ptr, mr > 1, v_c00, v_c01, v_c02, v_c03, v_c04, v_c05,
-                               vmin, vmax);
-        i8mm_store12<zero_mode>(c2_ptr, c3_ptr, mr > 3, v_c10, v_c11, v_c12, v_c13, v_c14, v_c15,
-                               vmin, vmax);
-        i8mm_store12<zero_mode>(c4_ptr, c5_ptr, mr > 5, v_c20, v_c21, v_c22, v_c23, v_c24, v_c25,
-                               vmin, vmax);
-        i8mm_store12<zero_mode>(c6_ptr, c7_ptr, mr > 7, v_c30, v_c31, v_c32, v_c33, v_c34, v_c35,
-                               vmin, vmax);
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-        c4_ptr += 12;
-        c5_ptr += 12;
-        c6_ptr += 12;
-        c7_ptr += 12;
+        int32x4_t acc[i8mm_tail_pairs<MR>][6];
+        i8mm_mma<MR>(A, B, kg, acc);
+        i8mm_store_all<MR, zero_mode>(row, n, mr, acc, vmin, vmax);
         B += ldb_panel;
     }
-    i8mm_tail<zero_mode, 8>(c0_ptr, ldc, mr, nc - n, kg, A, B, clamp_min, clamp_max);
-}
-
-template <bool zero_mode = false>
-__attribute__((target("i8mm"))) inline void
-mma_pack_mr4_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                       const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B, int ldb,
-                       int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-
-    const int kbytes = (kc + 7) & ~7;
-    const int kg = kbytes >> 3;
-    const int ldb_panel = mma_i8mm_panel_stride(ldb, kbytes);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-
-    int n = 0;
-    for (; n + mma_i8mm_nr_max <= nc; n += mma_i8mm_nr_max) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c03 = v_c00, v_c04 = v_c00, v_c05 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c13 = v_c10, v_c14 = v_c10, v_c15 = v_c10;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a0 = vld1q_s8(a_ptr + 0 * 16); // rows 0,1
-            const int8x16_t v_a1 = vld1q_s8(a_ptr + 1 * 16); // rows 2,3
-            a_ptr += 2 * 16;
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-            v_c00 = vmmlaq_s32(v_c00, v_a0, v_b0);
-            v_c10 = vmmlaq_s32(v_c10, v_a1, v_b0);
-
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-            v_c01 = vmmlaq_s32(v_c01, v_a0, v_b1);
-            v_c11 = vmmlaq_s32(v_c11, v_a1, v_b1);
-
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-            v_c02 = vmmlaq_s32(v_c02, v_a0, v_b2);
-            v_c12 = vmmlaq_s32(v_c12, v_a1, v_b2);
-
-            const int8x16_t v_b3 = vld1q_s8(b_ptr + 3 * 16);
-            v_c03 = vmmlaq_s32(v_c03, v_a0, v_b3);
-            v_c13 = vmmlaq_s32(v_c13, v_a1, v_b3);
-
-            const int8x16_t v_b4 = vld1q_s8(b_ptr + 4 * 16);
-            v_c04 = vmmlaq_s32(v_c04, v_a0, v_b4);
-            v_c14 = vmmlaq_s32(v_c14, v_a1, v_b4);
-
-            const int8x16_t v_b5 = vld1q_s8(b_ptr + 5 * 16);
-            v_c05 = vmmlaq_s32(v_c05, v_a0, v_b5);
-            v_c15 = vmmlaq_s32(v_c15, v_a1, v_b5);
-
-            b_ptr += mma_i8mm_group_bytes;
-        }
-
-        i8mm_store12<zero_mode>(c0_ptr, c1_ptr, mr > 1, v_c00, v_c01, v_c02, v_c03, v_c04, v_c05,
-                               vmin, vmax);
-        i8mm_store12<zero_mode>(c2_ptr, c3_ptr, mr > 3, v_c10, v_c11, v_c12, v_c13, v_c14, v_c15,
-                               vmin, vmax);
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-        B += ldb_panel;
-    }
-    i8mm_tail<zero_mode, 4>(c0_ptr, ldc, mr, nc - n, kg, A, B, clamp_min, clamp_max);
-}
-
-template <bool zero_mode = false>
-__attribute__((target("i8mm"))) inline void
-mma_pack_mr1_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                       const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B, int ldb,
-                       int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    (void)mr;  // one row, so the row count never varies
-    (void)ldc; // one row, so the C row stride never applies
-
-    int32_t* NNOPS_RESTRICT c0_ptr = C;
-
-    const int kbytes = (kc + 7) & ~7;
-    const int kg = kbytes >> 3;
-    const int ldb_panel = mma_i8mm_panel_stride(ldb, kbytes);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-    const int8x8_t vz = vdup_n_s8(0);
-
-    int n = 0;
-    for (; n + mma_i8mm_nr_max <= nc; n += mma_i8mm_nr_max) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c03 = v_c00, v_c04 = v_c00, v_c05 = v_c00;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            // The second row of the fragment is zero: the odd lanes of every
-            // accumulator are dead and only the low 64 bits are stored.
-            const int8x16_t v_a = vcombine_s8(vld1_s8(a_ptr), vz);
-            a_ptr += 8;
-
-            v_c00 = vmmlaq_s32(v_c00, v_a, vld1q_s8(b_ptr + 0 * 16));
-            v_c01 = vmmlaq_s32(v_c01, v_a, vld1q_s8(b_ptr + 1 * 16));
-            v_c02 = vmmlaq_s32(v_c02, v_a, vld1q_s8(b_ptr + 2 * 16));
-            v_c03 = vmmlaq_s32(v_c03, v_a, vld1q_s8(b_ptr + 3 * 16));
-            v_c04 = vmmlaq_s32(v_c04, v_a, vld1q_s8(b_ptr + 4 * 16));
-            v_c05 = vmmlaq_s32(v_c05, v_a, vld1q_s8(b_ptr + 5 * 16));
-
-            b_ptr += mma_i8mm_group_bytes;
-        }
-
-        int32x4_t v = vcombine_s32(vget_low_s32(v_c00), vget_low_s32(v_c01));
-        if constexpr (!zero_mode) {
-            v = vaddq_s32(v, vld1q_s32(c0_ptr + 0));
-        }
-        vst1q_s32(c0_ptr + 0, vminq_s32(vmaxq_s32(v, vmin), vmax));
-        v = vcombine_s32(vget_low_s32(v_c02), vget_low_s32(v_c03));
-        if constexpr (!zero_mode) {
-            v = vaddq_s32(v, vld1q_s32(c0_ptr + 4));
-        }
-        vst1q_s32(c0_ptr + 4, vminq_s32(vmaxq_s32(v, vmin), vmax));
-        v = vcombine_s32(vget_low_s32(v_c04), vget_low_s32(v_c05));
-        if constexpr (!zero_mode) {
-            v = vaddq_s32(v, vld1q_s32(c0_ptr + 8));
-        }
-        vst1q_s32(c0_ptr + 8, vminq_s32(vmaxq_s32(v, vmin), vmax));
-
-        c0_ptr += 12;
-        B += ldb_panel;
-    }
-    i8mm_tail<zero_mode, 1>(c0_ptr, 0, 1, nc - n, kg, A, B, clamp_min, clamp_max);
+    i8mm_tail<zero_mode, MR>(row[0] + n, ldc, std::min(mr, MR), nc - n, kg, A, B, clamp_min,
+                             clamp_max);
 }
 
 // =========================================================================
-//  the requantizing variants (packed A + packed B)
+//  the requantizing variant (packed A + packed B)
 // =========================================================================
 //
 // One MMA call covers the whole K, so the accumulators go straight to the
@@ -849,21 +939,15 @@ mma_pack_mr1_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ld
 // `col_bias` the per-column int32 bias with the A-side shift already folded in.
 // Relu is a floor of zero before the scale; nothing else is fused.
 
-template <class TOut>
+template <int MR, class TOut>
 __attribute__((target("i8mm"))) inline void
-mma_pack_mr8_nr12_i8mm_epi(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldc,
-                           const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                           int ldb, const float* s_b, float s_b_scalar, float row_k,
-                           const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
+mma_pack_mr_nr12_i8mm_epi(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldc,
+                          const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B, int ldb,
+                          const float* s_b, float s_b_scalar, float row_k,
+                          const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
 {
-    TOut* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    TOut* NNOPS_RESTRICT c1_ptr = C + 1 * ldc;
-    TOut* NNOPS_RESTRICT c2_ptr = C + 2 * ldc;
-    TOut* NNOPS_RESTRICT c3_ptr = C + 3 * ldc;
-    TOut* NNOPS_RESTRICT c4_ptr = C + 4 * ldc;
-    TOut* NNOPS_RESTRICT c5_ptr = C + 5 * ldc;
-    TOut* NNOPS_RESTRICT c6_ptr = C + 6 * ldc;
-    TOut* NNOPS_RESTRICT c7_ptr = C + 7 * ldc;
+    TOut* row[MR];
+    i8mm_rows<MR>(C, ldc, mr, row);
 
     const int kbytes = (kc + 7) & ~7;
     const int kg = kbytes >> 3;
@@ -875,262 +959,44 @@ mma_pack_mr8_nr12_i8mm_epi(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64
 
     int n = 0;
     for (; n + mma_i8mm_nr_max <= nc; n += mma_i8mm_nr_max) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c03 = v_c00, v_c04 = v_c00, v_c05 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c13 = v_c10, v_c14 = v_c10, v_c15 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c23 = v_c20, v_c24 = v_c20, v_c25 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-        int32x4_t v_c33 = v_c30, v_c34 = v_c30, v_c35 = v_c30;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a0 = vld1q_s8(a_ptr + 0 * 16); // rows 0,1
-            const int8x16_t v_a1 = vld1q_s8(a_ptr + 1 * 16); // rows 2,3
-            const int8x16_t v_a2 = vld1q_s8(a_ptr + 2 * 16); // rows 4,5
-            const int8x16_t v_a3 = vld1q_s8(a_ptr + 3 * 16); // rows 6,7
-            a_ptr += 4 * 16;
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16); // columns 0,1
-            v_c00 = vmmlaq_s32(v_c00, v_a0, v_b0);
-            v_c10 = vmmlaq_s32(v_c10, v_a1, v_b0);
-            v_c20 = vmmlaq_s32(v_c20, v_a2, v_b0);
-            v_c30 = vmmlaq_s32(v_c30, v_a3, v_b0);
-
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16); // columns 2,3
-            v_c01 = vmmlaq_s32(v_c01, v_a0, v_b1);
-            v_c11 = vmmlaq_s32(v_c11, v_a1, v_b1);
-            v_c21 = vmmlaq_s32(v_c21, v_a2, v_b1);
-            v_c31 = vmmlaq_s32(v_c31, v_a3, v_b1);
-
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16); // columns 4,5
-            v_c02 = vmmlaq_s32(v_c02, v_a0, v_b2);
-            v_c12 = vmmlaq_s32(v_c12, v_a1, v_b2);
-            v_c22 = vmmlaq_s32(v_c22, v_a2, v_b2);
-            v_c32 = vmmlaq_s32(v_c32, v_a3, v_b2);
-
-            const int8x16_t v_b3 = vld1q_s8(b_ptr + 3 * 16); // columns 6,7
-            v_c03 = vmmlaq_s32(v_c03, v_a0, v_b3);
-            v_c13 = vmmlaq_s32(v_c13, v_a1, v_b3);
-            v_c23 = vmmlaq_s32(v_c23, v_a2, v_b3);
-            v_c33 = vmmlaq_s32(v_c33, v_a3, v_b3);
-
-            const int8x16_t v_b4 = vld1q_s8(b_ptr + 4 * 16); // columns 8,9
-            v_c04 = vmmlaq_s32(v_c04, v_a0, v_b4);
-            v_c14 = vmmlaq_s32(v_c14, v_a1, v_b4);
-            v_c24 = vmmlaq_s32(v_c24, v_a2, v_b4);
-            v_c34 = vmmlaq_s32(v_c34, v_a3, v_b4);
-
-            const int8x16_t v_b5 = vld1q_s8(b_ptr + 5 * 16); // columns 10,11
-            v_c05 = vmmlaq_s32(v_c05, v_a0, v_b5);
-            v_c15 = vmmlaq_s32(v_c15, v_a1, v_b5);
-            v_c25 = vmmlaq_s32(v_c25, v_a2, v_b5);
-            v_c35 = vmmlaq_s32(v_c35, v_a3, v_b5);
-
-            b_ptr += mma_i8mm_group_bytes;
-        }
-
+        int32x4_t acc[i8mm_tail_pairs<MR>][6];
+        i8mm_mma<MR>(A, B, kg, acc);
         float32x4_t sc[3];
         int32x4_t bi[3];
         i8_col_q<3>(sc, bi, vk, vreq, s_b ? s_b + n : nullptr,
-                      col_bias ? col_bias + n : nullptr);
-        i8mm_store12_epi<8, TOut>(c0_ptr, c1_ptr, v_c00, v_c01, v_c02, v_c03, v_c04, v_c05, sc,
-                                  bi, vlo, vzp);
-        i8mm_store12_epi<8, TOut>(c2_ptr, c3_ptr, v_c10, v_c11, v_c12, v_c13, v_c14, v_c15, sc,
-                                  bi, vlo, vzp);
-        i8mm_store12_epi<8, TOut>(c4_ptr, c5_ptr, v_c20, v_c21, v_c22, v_c23, v_c24, v_c25, sc,
-                                  bi, vlo, vzp);
-        i8mm_store12_epi<8, TOut>(c6_ptr, c7_ptr, v_c30, v_c31, v_c32, v_c33, v_c34, v_c35, sc,
-                                  bi, vlo, vzp);
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-        c4_ptr += 12;
-        c5_ptr += 12;
-        c6_ptr += 12;
-        c7_ptr += 12;
+                    col_bias ? col_bias + n : nullptr);
+        i8mm_store_all_epi<MR, TOut>(row, n, acc, sc, bi, vlo, vzp);
         B += ldb_panel;
     }
-    i8mm_tail_epi<8, TOut>(c0_ptr, ldc, mr, nc - n, kg, A, B, vk, vreq,
-                           s_b ? s_b + n : nullptr, col_bias ? col_bias + n : nullptr, vlo, vzp);
+    i8mm_tail_epi<MR, TOut>(row[0] + n, ldc, std::min(mr, MR), nc - n, kg, A, B, vk, vreq,
+                            s_b ? s_b + n : nullptr, col_bias ? col_bias + n : nullptr, vlo, vzp);
 }
 
-template <class TOut>
-__attribute__((target("i8mm"))) inline void
-mma_pack_mr4_nr12_i8mm_epi(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldc,
-                           const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                           int ldb, const float* s_b, float s_b_scalar, float row_k,
-                           const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
-{
-    TOut* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    TOut* NNOPS_RESTRICT c1_ptr = C + 1 * ldc;
-    TOut* NNOPS_RESTRICT c2_ptr = C + 2 * ldc;
-    TOut* NNOPS_RESTRICT c3_ptr = C + 3 * ldc;
-
-    const int kbytes = (kc + 7) & ~7;
-    const int kg = kbytes >> 3;
-    const int ldb_panel = mma_i8mm_panel_stride(ldb, kbytes);
-    const float32x4_t vk = vdupq_n_f32(row_k);
-    const float32x4_t vreq = vdupq_n_f32(row_k * s_b_scalar);
-    const int32x4_t vlo = vdupq_n_s32(relu ? 0 : INT32_MIN);
-    const int32x4_t vzp = vdupq_n_s32(zp_out);
-
-    int n = 0;
-    for (; n + mma_i8mm_nr_max <= nc; n += mma_i8mm_nr_max) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c03 = v_c00, v_c04 = v_c00, v_c05 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c13 = v_c10, v_c14 = v_c10, v_c15 = v_c10;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a0 = vld1q_s8(a_ptr + 0 * 16); // rows 0,1
-            const int8x16_t v_a1 = vld1q_s8(a_ptr + 1 * 16); // rows 2,3
-            a_ptr += 2 * 16;
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-            v_c00 = vmmlaq_s32(v_c00, v_a0, v_b0);
-            v_c10 = vmmlaq_s32(v_c10, v_a1, v_b0);
-
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-            v_c01 = vmmlaq_s32(v_c01, v_a0, v_b1);
-            v_c11 = vmmlaq_s32(v_c11, v_a1, v_b1);
-
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-            v_c02 = vmmlaq_s32(v_c02, v_a0, v_b2);
-            v_c12 = vmmlaq_s32(v_c12, v_a1, v_b2);
-
-            const int8x16_t v_b3 = vld1q_s8(b_ptr + 3 * 16);
-            v_c03 = vmmlaq_s32(v_c03, v_a0, v_b3);
-            v_c13 = vmmlaq_s32(v_c13, v_a1, v_b3);
-
-            const int8x16_t v_b4 = vld1q_s8(b_ptr + 4 * 16);
-            v_c04 = vmmlaq_s32(v_c04, v_a0, v_b4);
-            v_c14 = vmmlaq_s32(v_c14, v_a1, v_b4);
-
-            const int8x16_t v_b5 = vld1q_s8(b_ptr + 5 * 16);
-            v_c05 = vmmlaq_s32(v_c05, v_a0, v_b5);
-            v_c15 = vmmlaq_s32(v_c15, v_a1, v_b5);
-
-            b_ptr += mma_i8mm_group_bytes;
-        }
-
-        float32x4_t sc[3];
-        int32x4_t bi[3];
-        i8_col_q<3>(sc, bi, vk, vreq, s_b ? s_b + n : nullptr,
-                      col_bias ? col_bias + n : nullptr);
-        i8mm_store12_epi<4, TOut>(c0_ptr, c1_ptr, v_c00, v_c01, v_c02, v_c03, v_c04, v_c05, sc,
-                                  bi, vlo, vzp);
-        i8mm_store12_epi<4, TOut>(c2_ptr, c3_ptr, v_c10, v_c11, v_c12, v_c13, v_c14, v_c15, sc,
-                                  bi, vlo, vzp);
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-        B += ldb_panel;
-    }
-    i8mm_tail_epi<4, TOut>(c0_ptr, ldc, mr, nc - n, kg, A, B, vk, vreq,
-                           s_b ? s_b + n : nullptr, col_bias ? col_bias + n : nullptr, vlo, vzp);
-}
-
-template <class TOut>
-__attribute__((target("i8mm"))) inline void
-mma_pack_mr1_nr12_i8mm_epi(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldc,
-                           const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                           int ldb, const float* s_b, float s_b_scalar, float row_k,
-                           const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
-{
-    (void)mr;  // one row, so the row count never varies
-    (void)ldc; // one row, so the output pitch never applies
-    TOut* NNOPS_RESTRICT c0_ptr = C;
-
-    const int kbytes = (kc + 7) & ~7;
-    const int kg = kbytes >> 3;
-    const int ldb_panel = mma_i8mm_panel_stride(ldb, kbytes);
-    const float32x4_t vk = vdupq_n_f32(row_k);
-    const float32x4_t vreq = vdupq_n_f32(row_k * s_b_scalar);
-    const int32x4_t vlo = vdupq_n_s32(relu ? 0 : INT32_MIN);
-    const int32x4_t vzp = vdupq_n_s32(zp_out);
-    const int8x8_t vz = vdup_n_s8(0);
-
-    int n = 0;
-    for (; n + mma_i8mm_nr_max <= nc; n += mma_i8mm_nr_max) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c03 = v_c00, v_c04 = v_c00, v_c05 = v_c00;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a = vcombine_s8(vld1_s8(a_ptr), vz);
-            a_ptr += 8;
-
-            v_c00 = vmmlaq_s32(v_c00, v_a, vld1q_s8(b_ptr + 0 * 16));
-            v_c01 = vmmlaq_s32(v_c01, v_a, vld1q_s8(b_ptr + 1 * 16));
-            v_c02 = vmmlaq_s32(v_c02, v_a, vld1q_s8(b_ptr + 2 * 16));
-            v_c03 = vmmlaq_s32(v_c03, v_a, vld1q_s8(b_ptr + 3 * 16));
-            v_c04 = vmmlaq_s32(v_c04, v_a, vld1q_s8(b_ptr + 4 * 16));
-            v_c05 = vmmlaq_s32(v_c05, v_a, vld1q_s8(b_ptr + 5 * 16));
-
-            b_ptr += mma_i8mm_group_bytes;
-        }
-
-        float32x4_t sc[3];
-        int32x4_t bi[3];
-        i8_col_q<3>(sc, bi, vk, vreq, s_b ? s_b + n : nullptr,
-                      col_bias ? col_bias + n : nullptr);
-        i8mm_store12_epi<1, TOut>(c0_ptr, c0_ptr, v_c00, v_c01, v_c02, v_c03, v_c04, v_c05, sc,
-                                  bi, vlo, vzp);
-        c0_ptr += 12;
-        B += ldb_panel;
-    }
-    i8mm_tail_epi<1, TOut>(c0_ptr, 1, 1, nc - n, kg, A, B, vk, vreq,
-                           s_b ? s_b + n : nullptr, col_bias ? col_bias + n : nullptr, vlo, vzp);
-}
-
-/// Dispatch tables for the requantizing kernels, rows are the MR levels {8,4,1}.
+/// The requantizing rungs, consumed by matmul_helper.cpp; rows are {8,4,1}.
 template <class TOut>
 inline constexpr std::array<MmaI8EpiFn<TOut>, 3> mma_pack_epi_fns_i8mm = {
-    &mma_pack_mr8_nr12_i8mm_epi<TOut>,
-    &mma_pack_mr4_nr12_i8mm_epi<TOut>,
-    &mma_pack_mr1_nr12_i8mm_epi<TOut>,
+    &mma_pack_mr_nr12_i8mm_epi<8, TOut>,
+    &mma_pack_mr_nr12_i8mm_epi<4, TOut>,
+    &mma_pack_mr_nr12_i8mm_epi<1, TOut>,
 };
 
 // =========================================================================
-//  row-major A + packed B  (mr = 8, 4, 1)
+//  row-major A + packed B  (MR = 8, 4, 1)
 // =========================================================================
 //
 // The fragment is two 8-byte loads and a combine; a short final k group is
 // staged through a zeroed 8-byte row per A row, since a row holds kc bytes.
 
-template <bool zero_mode = false>
+template <int MR, bool zero_mode = false>
 __attribute__((target("i8mm"))) inline void
-mma_direct_mr8_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                         const int8_t* NNOPS_RESTRICT A, int lda, const int8_t* NNOPS_RESTRICT B,
-                         int ldb, int32_t clamp_min, int32_t clamp_max) noexcept
+mma_direct_mr_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
+                        const int8_t* NNOPS_RESTRICT A, int lda, const int8_t* NNOPS_RESTRICT B,
+                        int ldb, int32_t clamp_min, int32_t clamp_max) noexcept
 {
-    int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-    int32_t* NNOPS_RESTRICT c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
-    int32_t* NNOPS_RESTRICT c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
-    int32_t* NNOPS_RESTRICT c6_ptr = (mr > 6) ? C + 6 * ldc : c5_ptr;
-    int32_t* NNOPS_RESTRICT c7_ptr = (mr > 7) ? C + 7 * ldc : c6_ptr;
-
-    // Rows past the live count read the last live row's bytes.
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-    const int r4 = (mr > 4) ? 4 : r3;
-    const int r5 = (mr > 5) ? 5 : r4;
-    const int r6 = (mr > 6) ? 6 : r5;
-    const int r7 = (mr > 7) ? 7 : r6;
+    int32_t* row[MR];
+    i8mm_rows<MR>(C, ldc, mr, row);
+    const int8_t* ar[MR];
+    i8mm_a_rows<MR>(A, lda, mr, ar);
 
     const int kbytes = (kc + 7) & ~7;
     const int kg = kbytes >> 3;
@@ -1139,382 +1005,14 @@ mma_direct_mr8_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int 
     const int32x4_t vmax = vdupq_n_s32(clamp_max);
 
     for (int n = 0; n < nc; n += mma_i8mm_nr_max) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c03 = v_c00, v_c04 = v_c00, v_c05 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c13 = v_c10, v_c14 = v_c10, v_c15 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c23 = v_c20, v_c24 = v_c20, v_c25 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-        int32x4_t v_c33 = v_c30, v_c34 = v_c30, v_c35 = v_c30;
-
-        const int8_t* NNOPS_RESTRICT a0 = A + 0 * lda;
-        const int8_t* NNOPS_RESTRICT a1 = A + r1 * lda;
-        const int8_t* NNOPS_RESTRICT a2 = A + r2 * lda;
-        const int8_t* NNOPS_RESTRICT a3 = A + r3 * lda;
-        const int8_t* NNOPS_RESTRICT a4 = A + r4 * lda;
-        const int8_t* NNOPS_RESTRICT a5 = A + r5 * lda;
-        const int8_t* NNOPS_RESTRICT a6 = A + r6 * lda;
-        const int8_t* NNOPS_RESTRICT a7 = A + r7 * lda;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-
-        for (int k = 0; k < kg; ++k) {
-            int8x16_t v_a0, v_a1, v_a2, v_a3;
-            if (k + 1 < kg || (kc & 7) == 0) {
-                v_a0 = vcombine_s8(vld1_s8(a0), vld1_s8(a1));
-                v_a1 = vcombine_s8(vld1_s8(a2), vld1_s8(a3));
-                v_a2 = vcombine_s8(vld1_s8(a4), vld1_s8(a5));
-                v_a3 = vcombine_s8(vld1_s8(a6), vld1_s8(a7));
-                a0 += 8;
-                a1 += 8;
-                a2 += 8;
-                a3 += 8;
-                a4 += 8;
-                a5 += 8;
-                a6 += 8;
-                a7 += 8;
-            } else {
-                const int live = kc - 8 * k;
-                int8_t t[8][8] = {};
-                std::memcpy(t[0], a0, static_cast<size_t>(live));
-                std::memcpy(t[1], a1, static_cast<size_t>(live));
-                std::memcpy(t[2], a2, static_cast<size_t>(live));
-                std::memcpy(t[3], a3, static_cast<size_t>(live));
-                std::memcpy(t[4], a4, static_cast<size_t>(live));
-                std::memcpy(t[5], a5, static_cast<size_t>(live));
-                std::memcpy(t[6], a6, static_cast<size_t>(live));
-                std::memcpy(t[7], a7, static_cast<size_t>(live));
-                v_a0 = vcombine_s8(vld1_s8(t[0]), vld1_s8(t[1]));
-                v_a1 = vcombine_s8(vld1_s8(t[2]), vld1_s8(t[3]));
-                v_a2 = vcombine_s8(vld1_s8(t[4]), vld1_s8(t[5]));
-                v_a3 = vcombine_s8(vld1_s8(t[6]), vld1_s8(t[7]));
-            }
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-            v_c00 = vmmlaq_s32(v_c00, v_a0, v_b0);
-            v_c10 = vmmlaq_s32(v_c10, v_a1, v_b0);
-            v_c20 = vmmlaq_s32(v_c20, v_a2, v_b0);
-            v_c30 = vmmlaq_s32(v_c30, v_a3, v_b0);
-
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-            v_c01 = vmmlaq_s32(v_c01, v_a0, v_b1);
-            v_c11 = vmmlaq_s32(v_c11, v_a1, v_b1);
-            v_c21 = vmmlaq_s32(v_c21, v_a2, v_b1);
-            v_c31 = vmmlaq_s32(v_c31, v_a3, v_b1);
-
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-            v_c02 = vmmlaq_s32(v_c02, v_a0, v_b2);
-            v_c12 = vmmlaq_s32(v_c12, v_a1, v_b2);
-            v_c22 = vmmlaq_s32(v_c22, v_a2, v_b2);
-            v_c32 = vmmlaq_s32(v_c32, v_a3, v_b2);
-
-            const int8x16_t v_b3 = vld1q_s8(b_ptr + 3 * 16);
-            v_c03 = vmmlaq_s32(v_c03, v_a0, v_b3);
-            v_c13 = vmmlaq_s32(v_c13, v_a1, v_b3);
-            v_c23 = vmmlaq_s32(v_c23, v_a2, v_b3);
-            v_c33 = vmmlaq_s32(v_c33, v_a3, v_b3);
-
-            const int8x16_t v_b4 = vld1q_s8(b_ptr + 4 * 16);
-            v_c04 = vmmlaq_s32(v_c04, v_a0, v_b4);
-            v_c14 = vmmlaq_s32(v_c14, v_a1, v_b4);
-            v_c24 = vmmlaq_s32(v_c24, v_a2, v_b4);
-            v_c34 = vmmlaq_s32(v_c34, v_a3, v_b4);
-
-            const int8x16_t v_b5 = vld1q_s8(b_ptr + 5 * 16);
-            v_c05 = vmmlaq_s32(v_c05, v_a0, v_b5);
-            v_c15 = vmmlaq_s32(v_c15, v_a1, v_b5);
-            v_c25 = vmmlaq_s32(v_c25, v_a2, v_b5);
-            v_c35 = vmmlaq_s32(v_c35, v_a3, v_b5);
-
-            b_ptr += mma_i8mm_group_bytes;
-        }
-
-        if (n + mma_i8mm_nr_max <= nc) {
-            i8mm_store12<zero_mode>(c0_ptr, c1_ptr, mr > 1, v_c00, v_c01, v_c02, v_c03, v_c04,
-                                    v_c05, vmin, vmax);
-            i8mm_store12<zero_mode>(c2_ptr, c3_ptr, mr > 3, v_c10, v_c11, v_c12, v_c13, v_c14,
-                                    v_c15, vmin, vmax);
-            i8mm_store12<zero_mode>(c4_ptr, c5_ptr, mr > 5, v_c20, v_c21, v_c22, v_c23, v_c24,
-                                    v_c25, vmin, vmax);
-            i8mm_store12<zero_mode>(c6_ptr, c7_ptr, mr > 7, v_c30, v_c31, v_c32, v_c33, v_c34,
-                                    v_c35, vmin, vmax);
-        } else {
-            const int rem = nc - n;
-            i8mm_store12_tail<zero_mode>(c0_ptr, c1_ptr, mr > 1, rem, v_c00, v_c01, v_c02, v_c03,
-                                         v_c04, v_c05, clamp_min, clamp_max);
-            i8mm_store12_tail<zero_mode>(c2_ptr, c3_ptr, mr > 3, rem, v_c10, v_c11, v_c12, v_c13,
-                                         v_c14, v_c15, clamp_min, clamp_max);
-            i8mm_store12_tail<zero_mode>(c4_ptr, c5_ptr, mr > 5, rem, v_c20, v_c21, v_c22, v_c23,
-                                         v_c24, v_c25, clamp_min, clamp_max);
-            i8mm_store12_tail<zero_mode>(c6_ptr, c7_ptr, mr > 7, rem, v_c30, v_c31, v_c32, v_c33,
-                                         v_c34, v_c35, clamp_min, clamp_max);
-        }
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-        c4_ptr += 12;
-        c5_ptr += 12;
-        c6_ptr += 12;
-        c7_ptr += 12;
-        B += ldb_panel;
-    }
-}
-
-template <bool zero_mode = false>
-__attribute__((target("i8mm"))) inline void
-mma_direct_mr4_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                         const int8_t* NNOPS_RESTRICT A, int lda, const int8_t* NNOPS_RESTRICT B,
-                         int ldb, int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-
-    const int kbytes = (kc + 7) & ~7;
-    const int kg = kbytes >> 3;
-    const int ldb_panel = mma_i8mm_panel_stride(ldb, kbytes);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-
-    for (int n = 0; n < nc; n += mma_i8mm_nr_max) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c03 = v_c00, v_c04 = v_c00, v_c05 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c13 = v_c10, v_c14 = v_c10, v_c15 = v_c10;
-
-        const int8_t* NNOPS_RESTRICT a0 = A + 0 * lda;
-        const int8_t* NNOPS_RESTRICT a1 = A + r1 * lda;
-        const int8_t* NNOPS_RESTRICT a2 = A + r2 * lda;
-        const int8_t* NNOPS_RESTRICT a3 = A + r3 * lda;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-
-        for (int k = 0; k < kg; ++k) {
-            int8x16_t v_a0, v_a1;
-            if (k + 1 < kg || (kc & 7) == 0) {
-                v_a0 = vcombine_s8(vld1_s8(a0), vld1_s8(a1));
-                v_a1 = vcombine_s8(vld1_s8(a2), vld1_s8(a3));
-                a0 += 8;
-                a1 += 8;
-                a2 += 8;
-                a3 += 8;
-            } else {
-                const int live = kc - 8 * k;
-                int8_t t[4][8] = {};
-                std::memcpy(t[0], a0, static_cast<size_t>(live));
-                std::memcpy(t[1], a1, static_cast<size_t>(live));
-                std::memcpy(t[2], a2, static_cast<size_t>(live));
-                std::memcpy(t[3], a3, static_cast<size_t>(live));
-                v_a0 = vcombine_s8(vld1_s8(t[0]), vld1_s8(t[1]));
-                v_a1 = vcombine_s8(vld1_s8(t[2]), vld1_s8(t[3]));
-            }
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-            v_c00 = vmmlaq_s32(v_c00, v_a0, v_b0);
-            v_c10 = vmmlaq_s32(v_c10, v_a1, v_b0);
-
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-            v_c01 = vmmlaq_s32(v_c01, v_a0, v_b1);
-            v_c11 = vmmlaq_s32(v_c11, v_a1, v_b1);
-
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-            v_c02 = vmmlaq_s32(v_c02, v_a0, v_b2);
-            v_c12 = vmmlaq_s32(v_c12, v_a1, v_b2);
-
-            const int8x16_t v_b3 = vld1q_s8(b_ptr + 3 * 16);
-            v_c03 = vmmlaq_s32(v_c03, v_a0, v_b3);
-            v_c13 = vmmlaq_s32(v_c13, v_a1, v_b3);
-
-            const int8x16_t v_b4 = vld1q_s8(b_ptr + 4 * 16);
-            v_c04 = vmmlaq_s32(v_c04, v_a0, v_b4);
-            v_c14 = vmmlaq_s32(v_c14, v_a1, v_b4);
-
-            const int8x16_t v_b5 = vld1q_s8(b_ptr + 5 * 16);
-            v_c05 = vmmlaq_s32(v_c05, v_a0, v_b5);
-            v_c15 = vmmlaq_s32(v_c15, v_a1, v_b5);
-
-            b_ptr += mma_i8mm_group_bytes;
-        }
-
-        if (n + mma_i8mm_nr_max <= nc) {
-            i8mm_store12<zero_mode>(c0_ptr, c1_ptr, mr > 1, v_c00, v_c01, v_c02, v_c03, v_c04,
-                                    v_c05, vmin, vmax);
-            i8mm_store12<zero_mode>(c2_ptr, c3_ptr, mr > 3, v_c10, v_c11, v_c12, v_c13, v_c14,
-                                    v_c15, vmin, vmax);
-        } else {
-            const int rem = nc - n;
-            i8mm_store12_tail<zero_mode>(c0_ptr, c1_ptr, mr > 1, rem, v_c00, v_c01, v_c02, v_c03,
-                                         v_c04, v_c05, clamp_min, clamp_max);
-            i8mm_store12_tail<zero_mode>(c2_ptr, c3_ptr, mr > 3, rem, v_c10, v_c11, v_c12, v_c13,
-                                         v_c14, v_c15, clamp_min, clamp_max);
-        }
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-        B += ldb_panel;
-    }
-}
-
-template <bool zero_mode = false>
-__attribute__((target("i8mm"))) inline void
-mma_direct_mr1_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                         const int8_t* NNOPS_RESTRICT A, int lda, const int8_t* NNOPS_RESTRICT B,
-                         int ldb, int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    (void)mr;
-    (void)ldc;
-    (void)lda; // one row: A is read consecutively
-
-    int32_t* NNOPS_RESTRICT c0_ptr = C;
-
-    const int kbytes = (kc + 7) & ~7;
-    const int kg = kbytes >> 3;
-    const int ldb_panel = mma_i8mm_panel_stride(ldb, kbytes);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-    const int8x8_t vz = vdup_n_s8(0);
-
-    for (int n = 0; n < nc; n += mma_i8mm_nr_max) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c03 = v_c00, v_c04 = v_c00, v_c05 = v_c00;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            int8x8_t v_row;
-            if (k + 1 < kg || (kc & 7) == 0) {
-                v_row = vld1_s8(a_ptr);
-                a_ptr += 8;
-            } else {
-                int8_t t[8] = {};
-                std::memcpy(t, a_ptr, static_cast<size_t>(kc - 8 * k));
-                v_row = vld1_s8(t);
-            }
-            const int8x16_t v_a = vcombine_s8(v_row, vz);
-
-            v_c00 = vmmlaq_s32(v_c00, v_a, vld1q_s8(b_ptr + 0 * 16));
-            v_c01 = vmmlaq_s32(v_c01, v_a, vld1q_s8(b_ptr + 1 * 16));
-            v_c02 = vmmlaq_s32(v_c02, v_a, vld1q_s8(b_ptr + 2 * 16));
-            v_c03 = vmmlaq_s32(v_c03, v_a, vld1q_s8(b_ptr + 3 * 16));
-            v_c04 = vmmlaq_s32(v_c04, v_a, vld1q_s8(b_ptr + 4 * 16));
-            v_c05 = vmmlaq_s32(v_c05, v_a, vld1q_s8(b_ptr + 5 * 16));
-
-            b_ptr += mma_i8mm_group_bytes;
-        }
-
+        int32x4_t acc[i8mm_tail_pairs<MR>][6];
+        i8mm_mma_rows<MR>(ar, B, kg, kc, acc);
         const int rem = nc - n;
         if (rem >= mma_i8mm_nr_max) {
-            int32x4_t v = vcombine_s32(vget_low_s32(v_c00), vget_low_s32(v_c01));
-            if constexpr (!zero_mode) {
-                v = vaddq_s32(v, vld1q_s32(c0_ptr + 0));
-            }
-            vst1q_s32(c0_ptr + 0, vminq_s32(vmaxq_s32(v, vmin), vmax));
-            v = vcombine_s32(vget_low_s32(v_c02), vget_low_s32(v_c03));
-            if constexpr (!zero_mode) {
-                v = vaddq_s32(v, vld1q_s32(c0_ptr + 4));
-            }
-            vst1q_s32(c0_ptr + 4, vminq_s32(vmaxq_s32(v, vmin), vmax));
-            v = vcombine_s32(vget_low_s32(v_c04), vget_low_s32(v_c05));
-            if constexpr (!zero_mode) {
-                v = vaddq_s32(v, vld1q_s32(c0_ptr + 8));
-            }
-            vst1q_s32(c0_ptr + 8, vminq_s32(vmaxq_s32(v, vmin), vmax));
+            i8mm_store_all<MR, zero_mode>(row, n, mr, acc, vmin, vmax);
         } else {
-            if (rem > 0) {
-                int32_t x = vgetq_lane_s32(v_c00, 0);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[0];
-                }
-                c0_ptr[0] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 1) {
-                int32_t x = vgetq_lane_s32(v_c00, 1);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[1];
-                }
-                c0_ptr[1] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 2) {
-                int32_t x = vgetq_lane_s32(v_c01, 0);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[2];
-                }
-                c0_ptr[2] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 3) {
-                int32_t x = vgetq_lane_s32(v_c01, 1);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[3];
-                }
-                c0_ptr[3] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 4) {
-                int32_t x = vgetq_lane_s32(v_c02, 0);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[4];
-                }
-                c0_ptr[4] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 5) {
-                int32_t x = vgetq_lane_s32(v_c02, 1);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[5];
-                }
-                c0_ptr[5] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 6) {
-                int32_t x = vgetq_lane_s32(v_c03, 0);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[6];
-                }
-                c0_ptr[6] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 7) {
-                int32_t x = vgetq_lane_s32(v_c03, 1);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[7];
-                }
-                c0_ptr[7] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 8) {
-                int32_t x = vgetq_lane_s32(v_c04, 0);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[8];
-                }
-                c0_ptr[8] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 9) {
-                int32_t x = vgetq_lane_s32(v_c04, 1);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[9];
-                }
-                c0_ptr[9] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 10) {
-                int32_t x = vgetq_lane_s32(v_c05, 0);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[10];
-                }
-                c0_ptr[10] = std::min(std::max(x, clamp_min), clamp_max);
-            }
-            if (rem > 11) {
-                int32_t x = vgetq_lane_s32(v_c05, 1);
-                if constexpr (!zero_mode) {
-                    x += c0_ptr[11];
-                }
-                c0_ptr[11] = std::min(std::max(x, clamp_min), clamp_max);
-            }
+            i8mm_store_all_tail<MR, zero_mode>(row, n, rem, mr, acc, clamp_min, clamp_max);
         }
-
-        c0_ptr += 12;
         B += ldb_panel;
     }
 }
@@ -1522,11 +1020,13 @@ mma_direct_mr1_nr12_i8mm(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int 
 // Dispatch tables, consumed by matmul_helper.cpp; rows are the MR levels {8,4,1}.
 template <bool Z>
 inline constexpr auto mma_pack_fns_i8mm =
-    std::array{&mma_pack_mr8_nr12_i8mm<Z>, &mma_pack_mr4_nr12_i8mm<Z>, &mma_pack_mr1_nr12_i8mm<Z>};
+    std::array{&mma_pack_mr_nr12_i8mm<8, Z>, &mma_pack_mr_nr12_i8mm<4, Z>,
+               &mma_pack_mr_nr12_i8mm<1, Z>};
 
 template <bool Z>
 inline constexpr auto mma_direct_fns_i8mm = std::array{
-    &mma_direct_mr8_nr12_i8mm<Z>, &mma_direct_mr4_nr12_i8mm<Z>, &mma_direct_mr1_nr12_i8mm<Z>};
+    &mma_direct_mr_nr12_i8mm<8, Z>, &mma_direct_mr_nr12_i8mm<4, Z>,
+    &mma_direct_mr_nr12_i8mm<1, Z>};
 
 } // namespace nnops::backend::cpu::aarch64
 
