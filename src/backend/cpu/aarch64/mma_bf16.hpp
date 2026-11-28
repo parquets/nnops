@@ -2,10 +2,10 @@
 /// @file mma_bf16.hpp
 /// @brief AArch64 bfloat16 MMA kernels over uniform 16-wide B panels.
 ///
-/// The tile is the same runtime-M shape as mma_f16.hpp: one kernel per row-pair
-/// count (the {8, 4, 1} rungs are 4, 2 and 1 pairs), `nc` columns in 16-wide
-/// panels, and rows past `mr` alias the last live row in both A and C, so a
-/// partial-M tile needs no guards.
+/// The tile is the same runtime-M shape as mma_f16.hpp: one templated rung per
+/// 2-row pair count (`PAIRS` ∈ {4, 2, 1} is the {8, 4, 1}-row rungs), `nc`
+/// columns in 16-wide panels, and rows past `mr` alias the last live row in
+/// both A and C, so a partial-M tile needs no guards.
 ///
 /// A is dense rows `lda` apart (the packed route's panel stride is its `kc`,
 /// the direct route's is the caller's), read as row pairs: the BFMMLA A operand
@@ -26,13 +26,14 @@
 /// share their address with the last live row, and their accumulators are that
 /// row's, so the repeated write is idempotent instead of a second C add.
 ///
-/// Shape of each kernel, mirroring mma_f16.hpp: named accumulators and the
-/// whole k-group body written out. mr8 runs one 8-column block of 4×4
-/// accumulators — 16 vectors, MLAS's Sbgemm tile — while mr4 and mr1 take a
-/// full 16-column panel (2×8 and 1×8 accumulators) so a panel costs one pass.
-/// The k-group loop itself stays a loop: BFMMLA threads every multiply-add into
-/// one accumulator, so there is no independent work to interleave and
-/// unrolling only lengthens the dependent chain.
+/// Shape of each kernel: one rung serves both block widths — eight columns (4
+/// column pairs) for the 8-row rung, a whole 16-column panel (8 pairs) for the
+/// narrower ones — and the k-group body is written out once with literal
+/// indices into `acc[PAIRS][pairs]`. The last k-group, short of four, goes
+/// through the same body with the zero-padded operand builders. The k-group
+/// loop itself stays a loop: BFMMLA threads every multiply-add into one
+/// accumulator, so there is no independent work to interleave and unrolling
+/// only lengthens the dependent chain.
 ///
 /// Reference: onnxruntime MLAS SbgemmKernelNeon.S (8 rows × 8 columns of
 /// 2×2 BFMMLA accumulators, bfcvtn on the A side).
@@ -40,6 +41,7 @@
 #include <algorithm>
 #include <array>
 #include <arm_neon.h>
+#include <utility>
 
 #include "nnops/detail/bf16.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -101,19 +103,36 @@ __attribute__((target("bf16"))) inline bfloat16x8_t bf16_b_stride(const bfloat16
 }
 
 /// The same gather with the bounds checks: rows past @p kc and columns past
-/// @p nc read as zero.
+/// @p nloc read as zero.
 __attribute__((target("bf16"))) inline bfloat16x8_t
-bf16_b_stride_tail(const bfloat16* b, int64_t ldb, int g, int cp, int kc, int nc) noexcept
+bf16_b_stride_tail(const bfloat16* b, int64_t ldb, int g, int cp, int kc, int nloc) noexcept
 {
     uint16_t tmp[8] = {};
     for (int lane = 0; lane < 8; ++lane) {
         const int k = g * 4 + (lane & 3);
         const int col = 2 * cp + (lane >> 2);
-        if (k < kc && col < nc) {
+        if (k < kc && col < nloc) {
             tmp[lane] = b[static_cast<int64_t>(k) * ldb + col].bits;
         }
     }
     return vreinterpretq_bf16_u16(vld1q_u16(tmp));
+}
+
+/// One k-group's B operand, out of the packed panel or the caller's matrix.
+template <bool Strided, bool TAIL>
+__attribute__((target("bf16"))) __attribute__((always_inline)) inline bfloat16x8_t
+bf16_bop(const bfloat16* b, int64_t ldb, int g, int cp, [[maybe_unused]] int kc,
+         [[maybe_unused]] int nloc) noexcept
+{
+    if constexpr (Strided) {
+        if constexpr (TAIL) {
+            return bf16_b_stride_tail(b, ldb, g, cp, kc, nloc);
+        } else {
+            return bf16_b_stride(b, ldb, g, cp);
+        }
+    } else {
+        return bf16_b_panel(b, g, cp);
+    }
 }
 
 // =========================================================================
@@ -169,6 +188,142 @@ bf16_put8(bfloat16* NNOPS_RESTRICT p, sims::v_f32x8 v, const sims::v_f32x8& cur,
     }
     sims::v_cvt_f32_to_bf16(reinterpret_cast<uint16_t*>(p),
                             sims::v_min(sims::v_max(v, vmin), vmax));
+}
+
+/// The alias index of every row: rows past `mr` reuse the last live one.
+template <int PAIRS>
+__attribute__((always_inline)) inline void
+bf16_row_alias(int mr, int (&rr)[2 * PAIRS]) noexcept
+{
+    rr[0] = 0;
+    rr[1] = std::min(1, mr - 1);
+    if constexpr (PAIRS > 1) {
+        rr[2] = std::min(2, mr - 1);
+        rr[3] = std::min(3, mr - 1);
+    }
+    if constexpr (PAIRS > 2) {
+        rr[4] = std::min(4, mr - 1);
+        rr[5] = std::min(5, mr - 1);
+    }
+    if constexpr (PAIRS > 3) {
+        rr[6] = std::min(6, mr - 1);
+        rr[7] = std::min(7, mr - 1);
+    }
+}
+
+// =========================================================================
+//  One k group, the seed and the store — literal indices throughout
+// =========================================================================
+
+/// Seed every accumulator of a block: pair `p` holds rows 2p and 2p+1, column
+/// pair `cp` the columns n + 2cp and n + 2cp + 1.
+template <int PAIRS, int NCP, int seed, std::size_t... I>
+__attribute__((target("bf16"))) __attribute__((always_inline)) inline void
+bf16_seed_all(float32x4_t (&acc)[PAIRS][NCP], const bfloat16* bias, const int (&rr)[2 * PAIRS],
+              int n, std::index_sequence<I...>) noexcept
+{
+    ((acc[I / NCP][I % NCP] =
+          bf16_seed<seed>(bias, rr[2 * (I / NCP)], rr[2 * (I / NCP) + 1], n + 2 * (I % NCP))),
+     ...);
+}
+
+/// One row pair's BFMMLAs against all of the block's column pairs.
+template <int NCP>
+__attribute__((target("bf16"))) __attribute__((always_inline)) inline void
+bf16_fma_row(float32x4_t (&acc)[NCP], bfloat16x8_t aop,
+             const bfloat16x8_t (&bop)[NCP]) noexcept
+{
+    acc[0] = vbfmmlaq_f32(acc[0], aop, bop[0]);
+    acc[1] = vbfmmlaq_f32(acc[1], aop, bop[1]);
+    acc[2] = vbfmmlaq_f32(acc[2], aop, bop[2]);
+    acc[3] = vbfmmlaq_f32(acc[3], aop, bop[3]);
+    if constexpr (NCP > 4) {
+        acc[4] = vbfmmlaq_f32(acc[4], aop, bop[4]);
+        acc[5] = vbfmmlaq_f32(acc[5], aop, bop[5]);
+        acc[6] = vbfmmlaq_f32(acc[6], aop, bop[6]);
+        acc[7] = vbfmmlaq_f32(acc[7], aop, bop[7]);
+    }
+}
+
+/// One k group of a block: @p TAIL selects the zero-padded A operand for the
+/// short final group (which does not advance the row pointers).
+template <int PAIRS, bool Strided, int NCP, bool TAIL>
+__attribute__((target("bf16"))) __attribute__((always_inline)) inline void
+bf16_kstep(const bfloat16* (&a)[2 * PAIRS], const bfloat16* b, int64_t ldb, int g, int blk,
+           int kc, int nloc, [[maybe_unused]] int ktail, float32x4_t (&acc)[PAIRS][NCP]) noexcept
+{
+    bfloat16x8_t bop[NCP];
+    bop[0] = bf16_bop<Strided, TAIL>(b, ldb, g, blk * 4 + 0, kc, nloc);
+    bop[1] = bf16_bop<Strided, TAIL>(b, ldb, g, blk * 4 + 1, kc, nloc);
+    bop[2] = bf16_bop<Strided, TAIL>(b, ldb, g, blk * 4 + 2, kc, nloc);
+    bop[3] = bf16_bop<Strided, TAIL>(b, ldb, g, blk * 4 + 3, kc, nloc);
+    if constexpr (NCP > 4) {
+        bop[4] = bf16_bop<Strided, TAIL>(b, ldb, g, blk * 4 + 4, kc, nloc);
+        bop[5] = bf16_bop<Strided, TAIL>(b, ldb, g, blk * 4 + 5, kc, nloc);
+        bop[6] = bf16_bop<Strided, TAIL>(b, ldb, g, blk * 4 + 6, kc, nloc);
+        bop[7] = bf16_bop<Strided, TAIL>(b, ldb, g, blk * 4 + 7, kc, nloc);
+    }
+    if constexpr (TAIL) {
+        bf16_fma_row<NCP>(acc[0], bf16_a_pair_tail(a[0], a[1], ktail), bop);
+        if constexpr (PAIRS > 1) {
+            bf16_fma_row<NCP>(acc[1], bf16_a_pair_tail(a[2], a[3], ktail), bop);
+        }
+        if constexpr (PAIRS > 2) {
+            bf16_fma_row<NCP>(acc[2], bf16_a_pair_tail(a[4], a[5], ktail), bop);
+        }
+        if constexpr (PAIRS > 3) {
+            bf16_fma_row<NCP>(acc[3], bf16_a_pair_tail(a[6], a[7], ktail), bop);
+        }
+    } else {
+        bf16_fma_row<NCP>(acc[0], bf16_a_pair(a[0], a[1]), bop);
+        if constexpr (PAIRS > 1) {
+            bf16_fma_row<NCP>(acc[1], bf16_a_pair(a[2], a[3]), bop);
+        }
+        if constexpr (PAIRS > 2) {
+            bf16_fma_row<NCP>(acc[2], bf16_a_pair(a[4], a[5]), bop);
+        }
+        if constexpr (PAIRS > 3) {
+            bf16_fma_row<NCP>(acc[3], bf16_a_pair(a[6], a[7]), bop);
+        }
+        a[0] += 4;
+        a[1] += 4;
+        if constexpr (PAIRS > 1) {
+            a[2] += 4;
+            a[3] += 4;
+        }
+        if constexpr (PAIRS > 2) {
+            a[4] += 4;
+            a[5] += 4;
+        }
+        if constexpr (PAIRS > 3) {
+            a[6] += 4;
+            a[7] += 4;
+        }
+    }
+}
+
+/// Store a full block: every row's C read before any of them is written.
+/// `I` walks (row, 8-column half) pairs, `NH` the halves per row.
+template <int PAIRS, int NCP, bool zero_mode, std::size_t... I>
+__attribute__((target("bf16"))) __attribute__((always_inline)) inline void
+bf16_store_full_impl(int n, bfloat16* const (&c)[2 * PAIRS],
+                     const float32x4_t (&acc)[PAIRS][NCP],
+                     sims::v_f32x8 (&cur)[2 * PAIRS][NCP / 4], float lo, float hi,
+                     std::index_sequence<I...>) noexcept
+{
+    constexpr int NH = NCP / 4;
+    const sims::v_f32x8 vmin = sims::v_set1_f32x8(lo);
+    const sims::v_f32x8 vmax = sims::v_set1_f32x8(hi);
+    if constexpr (!zero_mode) {
+        ((cur[I / NH][I % NH] = bf16_get8(c[I / NH] + n + 8 * (I % NH))), ...);
+    }
+    ((bf16_put8<zero_mode>(c[I / NH] + n + 8 * (I % NH),
+                           bf16_gather(((I / NH) & 1) != 0, acc[(I / NH) / 2][4 * (I % NH) + 0],
+                                       acc[(I / NH) / 2][4 * (I % NH) + 1],
+                                       acc[(I / NH) / 2][4 * (I % NH) + 2],
+                                       acc[(I / NH) / 2][4 * (I % NH) + 3]),
+                           cur[I / NH][I % NH], vmin, vmax)),
+     ...);
 }
 
 // =========================================================================
@@ -253,8 +408,8 @@ inline void bf16_rows(const bfloat16* a, int lda, int mr, bfloat16* c, int ldc,
     }
 }
 
-/// One 8-column block, array form. The unrolled kernels hand their leftover
-/// columns (fewer than 8 for mr8, fewer than 16 for mr4/mr1) to this.
+/// One 8-column block, array form. The kernels hand their leftover columns
+/// (fewer than 8 for the 8-row rung, fewer than 16 for the narrow ones) to this.
 template <int PAIRS, bool Strided, bool zero_mode, int seed>
 __attribute__((target("bf16"))) inline void
 bf16_block8(int mr, int n, int nc, int kc, bfloat16* c, int ldc, const bfloat16* a, int lda,
@@ -347,385 +502,75 @@ bf16_tail(int mr, int n, int nc, int kc, bfloat16* c, int ldc, const bfloat16* a
 }
 
 // =========================================================================
-//  mr8 — 8 rows × 8 columns, 16 accumulators
+//  One rung: 8 columns per pass at 8 rows, a 16-column panel below that
 // =========================================================================
 
-template <bool Strided, bool zero_mode, int seed>
-__attribute__((target("bf16"))) inline void
-bf16_kernel_mr8(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C, int ldc,
-                const bfloat16* NNOPS_RESTRICT A, int lda, const bfloat16* NNOPS_RESTRICT B,
-                int64_t ldb, float lo, float hi, const bfloat16* NNOPS_RESTRICT bias) noexcept
-{
-    bfloat16* NNOPS_RESTRICT c0 = C + 0 * ldc;
-    bfloat16* NNOPS_RESTRICT c1 = (mr > 1) ? C + 1 * ldc : c0;
-    bfloat16* NNOPS_RESTRICT c2 = (mr > 2) ? C + 2 * ldc : c1;
-    bfloat16* NNOPS_RESTRICT c3 = (mr > 3) ? C + 3 * ldc : c2;
-    bfloat16* NNOPS_RESTRICT c4 = (mr > 4) ? C + 4 * ldc : c3;
-    bfloat16* NNOPS_RESTRICT c5 = (mr > 5) ? C + 5 * ldc : c4;
-    bfloat16* NNOPS_RESTRICT c6 = (mr > 6) ? C + 6 * ldc : c5;
-    bfloat16* NNOPS_RESTRICT c7 = (mr > 7) ? C + 7 * ldc : c6;
-
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-    const int r4 = (mr > 4) ? 4 : r3;
-    const int r5 = (mr > 5) ? 5 : r4;
-    const int r6 = (mr > 6) ? 6 : r5;
-    const int r7 = (mr > 7) ? 7 : r6;
-
-    const int kgroups = kc >> 2;
-    const int ktail = kc & 3;
-    const int64_t advance = Strided ? 16 : bf16_panel_step(ldb, kc);
-    const sims::v_f32x8 vmin = sims::v_set1_f32x8(lo);
-    const sims::v_f32x8 vmax = sims::v_set1_f32x8(hi);
-
-    int n = 0;
-    for (; n + 8 <= nc; n += 8) {
-        const int blk = (n & 8) ? 1 : 0;
-
-        float32x4_t c00 = bf16_seed<seed>(bias, 0, r1, n + 0);
-        float32x4_t c01 = bf16_seed<seed>(bias, 0, r1, n + 2);
-        float32x4_t c02 = bf16_seed<seed>(bias, 0, r1, n + 4);
-        float32x4_t c03 = bf16_seed<seed>(bias, 0, r1, n + 6);
-        float32x4_t c10 = bf16_seed<seed>(bias, r2, r3, n + 0);
-        float32x4_t c11 = bf16_seed<seed>(bias, r2, r3, n + 2);
-        float32x4_t c12 = bf16_seed<seed>(bias, r2, r3, n + 4);
-        float32x4_t c13 = bf16_seed<seed>(bias, r2, r3, n + 6);
-        float32x4_t c20 = bf16_seed<seed>(bias, r4, r5, n + 0);
-        float32x4_t c21 = bf16_seed<seed>(bias, r4, r5, n + 2);
-        float32x4_t c22 = bf16_seed<seed>(bias, r4, r5, n + 4);
-        float32x4_t c23 = bf16_seed<seed>(bias, r4, r5, n + 6);
-        float32x4_t c30 = bf16_seed<seed>(bias, r6, r7, n + 0);
-        float32x4_t c31 = bf16_seed<seed>(bias, r6, r7, n + 2);
-        float32x4_t c32 = bf16_seed<seed>(bias, r6, r7, n + 4);
-        float32x4_t c33 = bf16_seed<seed>(bias, r6, r7, n + 6);
-
-        const bfloat16* NNOPS_RESTRICT b = B;
-        const bfloat16* NNOPS_RESTRICT p0 = A + 0 * lda;
-        const bfloat16* NNOPS_RESTRICT p1 = A + r1 * lda;
-        const bfloat16* NNOPS_RESTRICT p2 = A + r2 * lda;
-        const bfloat16* NNOPS_RESTRICT p3 = A + r3 * lda;
-        const bfloat16* NNOPS_RESTRICT p4 = A + r4 * lda;
-        const bfloat16* NNOPS_RESTRICT p5 = A + r5 * lda;
-        const bfloat16* NNOPS_RESTRICT p6 = A + r6 * lda;
-        const bfloat16* NNOPS_RESTRICT p7 = A + r7 * lda;
-
-        for (int g = 0; g < kgroups; ++g) {
-            bfloat16x8_t b0, b1, b2, b3;
-            if constexpr (Strided) {
-                b0 = bf16_b_stride(b, ldb, g, blk * 4 + 0);
-                b1 = bf16_b_stride(b, ldb, g, blk * 4 + 1);
-                b2 = bf16_b_stride(b, ldb, g, blk * 4 + 2);
-                b3 = bf16_b_stride(b, ldb, g, blk * 4 + 3);
-            } else {
-                b0 = bf16_b_panel(b, g, blk * 4 + 0);
-                b1 = bf16_b_panel(b, g, blk * 4 + 1);
-                b2 = bf16_b_panel(b, g, blk * 4 + 2);
-                b3 = bf16_b_panel(b, g, blk * 4 + 3);
-            }
-
-            const bfloat16x8_t a01 = bf16_a_pair(p0, p1);
-            c00 = vbfmmlaq_f32(c00, a01, b0);
-            c01 = vbfmmlaq_f32(c01, a01, b1);
-            c02 = vbfmmlaq_f32(c02, a01, b2);
-            c03 = vbfmmlaq_f32(c03, a01, b3);
-
-            const bfloat16x8_t a23 = bf16_a_pair(p2, p3);
-            c10 = vbfmmlaq_f32(c10, a23, b0);
-            c11 = vbfmmlaq_f32(c11, a23, b1);
-            c12 = vbfmmlaq_f32(c12, a23, b2);
-            c13 = vbfmmlaq_f32(c13, a23, b3);
-
-            const bfloat16x8_t a45 = bf16_a_pair(p4, p5);
-            c20 = vbfmmlaq_f32(c20, a45, b0);
-            c21 = vbfmmlaq_f32(c21, a45, b1);
-            c22 = vbfmmlaq_f32(c22, a45, b2);
-            c23 = vbfmmlaq_f32(c23, a45, b3);
-
-            const bfloat16x8_t a67 = bf16_a_pair(p6, p7);
-            c30 = vbfmmlaq_f32(c30, a67, b0);
-            c31 = vbfmmlaq_f32(c31, a67, b1);
-            c32 = vbfmmlaq_f32(c32, a67, b2);
-            c33 = vbfmmlaq_f32(c33, a67, b3);
-
-            p0 += 4;
-            p1 += 4;
-            p2 += 4;
-            p3 += 4;
-            p4 += 4;
-            p5 += 4;
-            p6 += 4;
-            p7 += 4;
-        }
-
-        if (ktail) {
-            bfloat16x8_t b0, b1, b2, b3;
-            if constexpr (Strided) {
-                b0 = bf16_b_stride_tail(b, ldb, kgroups, blk * 4 + 0, kc, nc);
-                b1 = bf16_b_stride_tail(b, ldb, kgroups, blk * 4 + 1, kc, nc);
-                b2 = bf16_b_stride_tail(b, ldb, kgroups, blk * 4 + 2, kc, nc);
-                b3 = bf16_b_stride_tail(b, ldb, kgroups, blk * 4 + 3, kc, nc);
-            } else {
-                b0 = bf16_b_panel(b, kgroups, blk * 4 + 0);
-                b1 = bf16_b_panel(b, kgroups, blk * 4 + 1);
-                b2 = bf16_b_panel(b, kgroups, blk * 4 + 2);
-                b3 = bf16_b_panel(b, kgroups, blk * 4 + 3);
-            }
-
-            const bfloat16x8_t a01 = bf16_a_pair_tail(p0, p1, ktail);
-            c00 = vbfmmlaq_f32(c00, a01, b0);
-            c01 = vbfmmlaq_f32(c01, a01, b1);
-            c02 = vbfmmlaq_f32(c02, a01, b2);
-            c03 = vbfmmlaq_f32(c03, a01, b3);
-
-            const bfloat16x8_t a23 = bf16_a_pair_tail(p2, p3, ktail);
-            c10 = vbfmmlaq_f32(c10, a23, b0);
-            c11 = vbfmmlaq_f32(c11, a23, b1);
-            c12 = vbfmmlaq_f32(c12, a23, b2);
-            c13 = vbfmmlaq_f32(c13, a23, b3);
-
-            const bfloat16x8_t a45 = bf16_a_pair_tail(p4, p5, ktail);
-            c20 = vbfmmlaq_f32(c20, a45, b0);
-            c21 = vbfmmlaq_f32(c21, a45, b1);
-            c22 = vbfmmlaq_f32(c22, a45, b2);
-            c23 = vbfmmlaq_f32(c23, a45, b3);
-
-            const bfloat16x8_t a67 = bf16_a_pair_tail(p6, p7, ktail);
-            c30 = vbfmmlaq_f32(c30, a67, b0);
-            c31 = vbfmmlaq_f32(c31, a67, b1);
-            c32 = vbfmmlaq_f32(c32, a67, b2);
-            c33 = vbfmmlaq_f32(c33, a67, b3);
-        }
-
-        // Every live row's C is read before the first store: the rows past
-        // `mr` share the last live row's address and write its value back.
-        sims::v_f32x8 k0 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 k1 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 k2 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 k3 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 k4 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 k5 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 k6 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 k7 = sims::v_set1_f32x8(0.0f);
-        if constexpr (!zero_mode) {
-            k0 = bf16_get8(c0 + n);
-            k1 = bf16_get8(c1 + n);
-            k2 = bf16_get8(c2 + n);
-            k3 = bf16_get8(c3 + n);
-            k4 = bf16_get8(c4 + n);
-            k5 = bf16_get8(c5 + n);
-            k6 = bf16_get8(c6 + n);
-            k7 = bf16_get8(c7 + n);
-        }
-
-        bf16_put8<zero_mode>(c0 + n, bf16_gather(false, c00, c01, c02, c03), k0, vmin, vmax);
-        bf16_put8<zero_mode>(c1 + n, bf16_gather(true, c00, c01, c02, c03), k1, vmin, vmax);
-        bf16_put8<zero_mode>(c2 + n, bf16_gather(false, c10, c11, c12, c13), k2, vmin, vmax);
-        bf16_put8<zero_mode>(c3 + n, bf16_gather(true, c10, c11, c12, c13), k3, vmin, vmax);
-        bf16_put8<zero_mode>(c4 + n, bf16_gather(false, c20, c21, c22, c23), k4, vmin, vmax);
-        bf16_put8<zero_mode>(c5 + n, bf16_gather(true, c20, c21, c22, c23), k5, vmin, vmax);
-        bf16_put8<zero_mode>(c6 + n, bf16_gather(false, c30, c31, c32, c33), k6, vmin, vmax);
-        bf16_put8<zero_mode>(c7 + n, bf16_gather(true, c30, c31, c32, c33), k7, vmin, vmax);
-
-        if (blk) {
-            B += advance;
-        }
-    }
-
-    if (n < nc) {
-        bf16_tail<4, Strided, zero_mode, seed>(mr, n, nc, kc, C, ldc, A, lda, B, ldb, lo, hi, bias);
-    }
-}
-
-// =========================================================================
-//  mr4 / mr1 — a whole 16-column panel per pass, 16 and 8 accumulators
-// =========================================================================
-
-/// Shared body of the two narrow-M kernels: @p PAIRS row pairs over all 8
-/// column pairs of a panel. mr1 keeps one pair and stores one row.
 template <int PAIRS, bool Strided, bool zero_mode, int seed>
 __attribute__((target("bf16"))) inline void
-bf16_kernel_wide(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C, int ldc,
-                 const bfloat16* NNOPS_RESTRICT A, int lda, const bfloat16* NNOPS_RESTRICT B,
-                 int64_t ldb, float lo, float hi, const bfloat16* NNOPS_RESTRICT bias) noexcept
+bf16_kernel(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C, int ldc,
+            const bfloat16* NNOPS_RESTRICT A, int lda, const bfloat16* NNOPS_RESTRICT B,
+            int64_t ldb, float lo, float hi, const bfloat16* NNOPS_RESTRICT bias) noexcept
 {
-    // A row past `mr` aliases the last live row, so a pair's second half is
-    // that row's own value and its store repeats it.
-    bfloat16* NNOPS_RESTRICT c0 = C;
-    bfloat16* NNOPS_RESTRICT c1 = (mr > 1) ? C + 1 * ldc : c0;
-    bfloat16* NNOPS_RESTRICT c2 = (mr > 2) ? C + 2 * ldc : c1;
-    bfloat16* NNOPS_RESTRICT c3 = (mr > 3) ? C + 3 * ldc : c2;
+    // Four column pairs (eight columns) keep the 8-row rung's 16 accumulators
+    // and their A operands in registers; the narrow rungs have room for a whole
+    // 16-column panel, which halves the number of passes.
+    constexpr int NCP = (PAIRS == 4) ? 4 : 8;
+    constexpr int BLK = 2 * NCP;
 
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
+    int rr[2 * PAIRS];
+    bf16_row_alias<PAIRS>(mr, rr);
+    const bfloat16* a_rows[2 * PAIRS];
+    bfloat16* c_rows[2 * PAIRS];
+    bf16_rows<PAIRS>(A, lda, mr, C, ldc, a_rows, c_rows);
 
     const int kgroups = kc >> 2;
     const int ktail = kc & 3;
     const int64_t advance = Strided ? 16 : bf16_panel_step(ldb, kc);
-    const sims::v_f32x8 vmin = sims::v_set1_f32x8(lo);
-    const sims::v_f32x8 vmax = sims::v_set1_f32x8(hi);
 
     int n = 0;
-    for (; n + 16 <= nc; n += 16) {
-        float32x4_t c00 = bf16_seed<seed>(bias, 0, r1, n + 0);
-        float32x4_t c01 = bf16_seed<seed>(bias, 0, r1, n + 2);
-        float32x4_t c02 = bf16_seed<seed>(bias, 0, r1, n + 4);
-        float32x4_t c03 = bf16_seed<seed>(bias, 0, r1, n + 6);
-        float32x4_t c04 = bf16_seed<seed>(bias, 0, r1, n + 8);
-        float32x4_t c05 = bf16_seed<seed>(bias, 0, r1, n + 10);
-        float32x4_t c06 = bf16_seed<seed>(bias, 0, r1, n + 12);
-        float32x4_t c07 = bf16_seed<seed>(bias, 0, r1, n + 14);
-        // The second pair is mr1's dead weight: the store branch discards it.
-        [[maybe_unused]] float32x4_t c10 = bf16_seed<seed>(bias, r2, r3, n + 0);
-        [[maybe_unused]] float32x4_t c11 = bf16_seed<seed>(bias, r2, r3, n + 2);
-        [[maybe_unused]] float32x4_t c12 = bf16_seed<seed>(bias, r2, r3, n + 4);
-        [[maybe_unused]] float32x4_t c13 = bf16_seed<seed>(bias, r2, r3, n + 6);
-        [[maybe_unused]] float32x4_t c14 = bf16_seed<seed>(bias, r2, r3, n + 8);
-        [[maybe_unused]] float32x4_t c15 = bf16_seed<seed>(bias, r2, r3, n + 10);
-        [[maybe_unused]] float32x4_t c16 = bf16_seed<seed>(bias, r2, r3, n + 12);
-        [[maybe_unused]] float32x4_t c17 = bf16_seed<seed>(bias, r2, r3, n + 14);
+    for (; n + BLK <= nc; n += BLK) {
+        // A 16-column panel is two 8-column blocks for the 8-row rung; the
+        // narrow ones take it whole.
+        const int blk = (n & 8) ? 1 : 0;
 
-        const bfloat16* NNOPS_RESTRICT b = B;
-        const bfloat16* NNOPS_RESTRICT p0 = A;
-        const bfloat16* NNOPS_RESTRICT p1 = A + static_cast<int64_t>(r1) * lda;
-        [[maybe_unused]] const bfloat16* NNOPS_RESTRICT p2 = A + static_cast<int64_t>(r2) * lda;
-        [[maybe_unused]] const bfloat16* NNOPS_RESTRICT p3 = A + static_cast<int64_t>(r3) * lda;
+        float32x4_t acc[PAIRS][NCP];
+        bf16_seed_all<PAIRS, NCP, seed>(acc, bias, rr, n,
+                                        std::make_index_sequence<PAIRS * NCP>{});
+
+        const bfloat16* a[2 * PAIRS];
+        a[0] = a_rows[0];
+        a[1] = a_rows[1];
+        if constexpr (PAIRS > 1) {
+            a[2] = a_rows[2];
+            a[3] = a_rows[3];
+        }
+        if constexpr (PAIRS > 2) {
+            a[4] = a_rows[4];
+            a[5] = a_rows[5];
+        }
+        if constexpr (PAIRS > 3) {
+            a[6] = a_rows[6];
+            a[7] = a_rows[7];
+        }
 
         for (int g = 0; g < kgroups; ++g) {
-            bfloat16x8_t b0, b1, b2, b3, b4, b5, b6, b7;
-            if constexpr (Strided) {
-                b0 = bf16_b_stride(b, ldb, g, 0);
-                b1 = bf16_b_stride(b, ldb, g, 1);
-                b2 = bf16_b_stride(b, ldb, g, 2);
-                b3 = bf16_b_stride(b, ldb, g, 3);
-                b4 = bf16_b_stride(b, ldb, g, 4);
-                b5 = bf16_b_stride(b, ldb, g, 5);
-                b6 = bf16_b_stride(b, ldb, g, 6);
-                b7 = bf16_b_stride(b, ldb, g, 7);
-            } else {
-                b0 = bf16_b_panel(b, g, 0);
-                b1 = bf16_b_panel(b, g, 1);
-                b2 = bf16_b_panel(b, g, 2);
-                b3 = bf16_b_panel(b, g, 3);
-                b4 = bf16_b_panel(b, g, 4);
-                b5 = bf16_b_panel(b, g, 5);
-                b6 = bf16_b_panel(b, g, 6);
-                b7 = bf16_b_panel(b, g, 7);
-            }
-
-            const bfloat16x8_t a01 = bf16_a_pair(p0, p1);
-            c00 = vbfmmlaq_f32(c00, a01, b0);
-            c01 = vbfmmlaq_f32(c01, a01, b1);
-            c02 = vbfmmlaq_f32(c02, a01, b2);
-            c03 = vbfmmlaq_f32(c03, a01, b3);
-            c04 = vbfmmlaq_f32(c04, a01, b4);
-            c05 = vbfmmlaq_f32(c05, a01, b5);
-            c06 = vbfmmlaq_f32(c06, a01, b6);
-            c07 = vbfmmlaq_f32(c07, a01, b7);
-
-            if constexpr (PAIRS > 1) {
-                const bfloat16x8_t a23 = bf16_a_pair(p2, p3);
-                c10 = vbfmmlaq_f32(c10, a23, b0);
-                c11 = vbfmmlaq_f32(c11, a23, b1);
-                c12 = vbfmmlaq_f32(c12, a23, b2);
-                c13 = vbfmmlaq_f32(c13, a23, b3);
-                c14 = vbfmmlaq_f32(c14, a23, b4);
-                c15 = vbfmmlaq_f32(c15, a23, b5);
-                c16 = vbfmmlaq_f32(c16, a23, b6);
-                c17 = vbfmmlaq_f32(c17, a23, b7);
-            }
-
-            p0 += 4;
-            p1 += 4;
-            if constexpr (PAIRS > 1) {
-                p2 += 4;
-                p3 += 4;
-            }
+            bf16_kstep<PAIRS, Strided, NCP, false>(a, B, ldb, g, blk, kc, nc, ktail, acc);
         }
-
         if (ktail) {
-            bfloat16x8_t b0, b1, b2, b3, b4, b5, b6, b7;
-            if constexpr (Strided) {
-                b0 = bf16_b_stride_tail(b, ldb, kgroups, 0, kc, nc);
-                b1 = bf16_b_stride_tail(b, ldb, kgroups, 1, kc, nc);
-                b2 = bf16_b_stride_tail(b, ldb, kgroups, 2, kc, nc);
-                b3 = bf16_b_stride_tail(b, ldb, kgroups, 3, kc, nc);
-                b4 = bf16_b_stride_tail(b, ldb, kgroups, 4, kc, nc);
-                b5 = bf16_b_stride_tail(b, ldb, kgroups, 5, kc, nc);
-                b6 = bf16_b_stride_tail(b, ldb, kgroups, 6, kc, nc);
-                b7 = bf16_b_stride_tail(b, ldb, kgroups, 7, kc, nc);
-            } else {
-                b0 = bf16_b_panel(b, kgroups, 0);
-                b1 = bf16_b_panel(b, kgroups, 1);
-                b2 = bf16_b_panel(b, kgroups, 2);
-                b3 = bf16_b_panel(b, kgroups, 3);
-                b4 = bf16_b_panel(b, kgroups, 4);
-                b5 = bf16_b_panel(b, kgroups, 5);
-                b6 = bf16_b_panel(b, kgroups, 6);
-                b7 = bf16_b_panel(b, kgroups, 7);
-            }
-
-            const bfloat16x8_t a01 = bf16_a_pair_tail(p0, p1, ktail);
-            c00 = vbfmmlaq_f32(c00, a01, b0);
-            c01 = vbfmmlaq_f32(c01, a01, b1);
-            c02 = vbfmmlaq_f32(c02, a01, b2);
-            c03 = vbfmmlaq_f32(c03, a01, b3);
-            c04 = vbfmmlaq_f32(c04, a01, b4);
-            c05 = vbfmmlaq_f32(c05, a01, b5);
-            c06 = vbfmmlaq_f32(c06, a01, b6);
-            c07 = vbfmmlaq_f32(c07, a01, b7);
-
-            if constexpr (PAIRS > 1) {
-                const bfloat16x8_t a23 = bf16_a_pair_tail(p2, p3, ktail);
-                c10 = vbfmmlaq_f32(c10, a23, b0);
-                c11 = vbfmmlaq_f32(c11, a23, b1);
-                c12 = vbfmmlaq_f32(c12, a23, b2);
-                c13 = vbfmmlaq_f32(c13, a23, b3);
-                c14 = vbfmmlaq_f32(c14, a23, b4);
-                c15 = vbfmmlaq_f32(c15, a23, b5);
-                c16 = vbfmmlaq_f32(c16, a23, b6);
-                c17 = vbfmmlaq_f32(c17, a23, b7);
-            }
+            bf16_kstep<PAIRS, Strided, NCP, true>(a, B, ldb, kgroups, blk, kc, nc, ktail, acc);
         }
 
-        // Both halves of every row read before any store: alias rows share
-        // the live row's address and write its value back.
-        sims::v_f32x8 ka0 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 ka1 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 kb0 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 kb1 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 kc0 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 kc1 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 kd0 = sims::v_set1_f32x8(0.0f);
-        sims::v_f32x8 kd1 = sims::v_set1_f32x8(0.0f);
-        if constexpr (!zero_mode) {
-            ka0 = bf16_get8(c0 + n);
-            ka1 = bf16_get8(c0 + n + 8);
-            kb0 = bf16_get8(c1 + n);
-            kb1 = bf16_get8(c1 + n + 8);
-            if constexpr (PAIRS > 1) {
-                kc0 = bf16_get8(c2 + n);
-                kc1 = bf16_get8(c2 + n + 8);
-                kd0 = bf16_get8(c3 + n);
-                kd1 = bf16_get8(c3 + n + 8);
-            }
-        }
+        sims::v_f32x8 cur[2 * PAIRS][NCP / 4];
+        bf16_store_full_impl<PAIRS, NCP, zero_mode>(
+            n, c_rows, acc, cur, lo, hi, std::make_index_sequence<2 * PAIRS * (NCP / 4)>{});
 
-        bf16_put8<zero_mode>(c0 + n, bf16_gather(false, c00, c01, c02, c03), ka0, vmin, vmax);
-        bf16_put8<zero_mode>(c0 + n + 8, bf16_gather(false, c04, c05, c06, c07), ka1, vmin, vmax);
-        bf16_put8<zero_mode>(c1 + n, bf16_gather(true, c00, c01, c02, c03), kb0, vmin, vmax);
-        bf16_put8<zero_mode>(c1 + n + 8, bf16_gather(true, c04, c05, c06, c07), kb1, vmin, vmax);
-        if constexpr (PAIRS > 1) {
-            bf16_put8<zero_mode>(c2 + n, bf16_gather(false, c10, c11, c12, c13), kc0, vmin, vmax);
-            bf16_put8<zero_mode>(c2 + n + 8, bf16_gather(false, c14, c15, c16, c17), kc1, vmin,
-                                 vmax);
-            bf16_put8<zero_mode>(c3 + n, bf16_gather(true, c10, c11, c12, c13), kd0, vmin, vmax);
-            bf16_put8<zero_mode>(c3 + n + 8, bf16_gather(true, c14, c15, c16, c17), kd1, vmin,
-                                 vmax);
+        // The 8-row rung takes half a panel per pass, the narrow ones a whole
+        // panel, so only the former steps B every other block.
+        if constexpr (BLK == 16) {
+            B += advance;
+        } else if (blk) {
+            B += advance;
         }
-
-        B += advance;
     }
 
     if (n < nc) {
@@ -807,30 +652,12 @@ inline void bf16_gemm(int mr, int nc, int kc, bfloat16* c, int ldc, const bfloat
                       const bfloat16* bias) noexcept
 {
     if (sims::cpu_has_bf16() && !bf16_force_wide) {
-        if constexpr (PAIRS == 4) {
-            if (ldb > 0) {
-                bf16_kernel_mr8<true, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo, hi,
-                                                       bias);
-            } else {
-                bf16_kernel_mr8<false, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo, hi,
-                                                        bias);
-            }
-        } else if constexpr (PAIRS == 2) {
-            if (ldb > 0) {
-                bf16_kernel_wide<2, true, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo,
-                                                           hi, bias);
-            } else {
-                bf16_kernel_wide<2, false, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo,
-                                                            hi, bias);
-            }
+        if (ldb > 0) {
+            bf16_kernel<PAIRS, true, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo, hi,
+                                                      bias);
         } else {
-            if (ldb > 0) {
-                bf16_kernel_wide<1, true, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo,
-                                                           hi, bias);
-            } else {
-                bf16_kernel_wide<1, false, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo,
-                                                            hi, bias);
-            }
+            bf16_kernel<PAIRS, false, zero_mode, seed>(mr, nc, kc, c, ldc, a, lda, b, ldb, lo, hi,
+                                                       bias);
         }
     } else {
         if (ldb > 0) {

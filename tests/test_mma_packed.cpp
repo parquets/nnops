@@ -134,50 +134,50 @@ auto ab_fn(int level, bool zero_mode, int seed) {
                         : seed == 2 ? mma_pack_mr6_nr16_mrxncxkc_f16<true, 2>
                         : zero_mode ? mma_pack_mr6_nr16_mrxncxkc_f16<true>
                         : mma_pack_mr6_nr16_mrxncxkc_f16<false>;
-        case 4: return seed == 1 ? mma_pack_mr4_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_pack_mr4_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_pack_mr4_nr16_mrxncxkc_f16<true>
-                        : mma_pack_mr4_nr16_mrxncxkc_f16<false>;
+        case 4: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f16<4, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f16<4, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f16<4, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f16<4, false>;
         case 2: return seed == 1 ? mma_pack_mr2_nr16_mrxncxkc_f16<true, 1>
                         : seed == 2 ? mma_pack_mr2_nr16_mrxncxkc_f16<true, 2>
                         : zero_mode ? mma_pack_mr2_nr16_mrxncxkc_f16<true>
                         : mma_pack_mr2_nr16_mrxncxkc_f16<false>;
-        default: return seed == 1 ? mma_pack_mr1_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_pack_mr1_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_pack_mr1_nr16_mrxncxkc_f16<true>
-                        : mma_pack_mr1_nr16_mrxncxkc_f16<false>;
+        default: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f16<1, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f16<1, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f16<1, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f16<1, false>;
         }
     }
 #else
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 8: return seed == 1 ? mma_pack_mr8_nr12_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_pack_mr8_nr12_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_pack_mr8_nr12_mrxncxkc_f32<true>
-                        : mma_pack_mr8_nr12_mrxncxkc_f32<false>;
-        case 4: return seed == 1 ? mma_pack_mr4_nr12_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_pack_mr4_nr12_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_pack_mr4_nr12_mrxncxkc_f32<true>
-                        : mma_pack_mr4_nr12_mrxncxkc_f32<false>;
-        default: return seed == 1 ? mma_pack_mr1_nr12_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_pack_mr1_nr12_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_pack_mr1_nr12_mrxncxkc_f32<true>
-                        : mma_pack_mr1_nr12_mrxncxkc_f32<false>;
+        case 8: return seed == 1 ? mma_pack_mr_nr12_mrxncxkc_f32<8, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr12_mrxncxkc_f32<8, true, 2>
+                        : zero_mode ? mma_pack_mr_nr12_mrxncxkc_f32<8, true>
+                        : mma_pack_mr_nr12_mrxncxkc_f32<8, false>;
+        case 4: return seed == 1 ? mma_pack_mr_nr12_mrxncxkc_f32<4, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr12_mrxncxkc_f32<4, true, 2>
+                        : zero_mode ? mma_pack_mr_nr12_mrxncxkc_f32<4, true>
+                        : mma_pack_mr_nr12_mrxncxkc_f32<4, false>;
+        default: return seed == 1 ? mma_pack_mr_nr12_mrxncxkc_f32<1, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr12_mrxncxkc_f32<1, true, 2>
+                        : zero_mode ? mma_pack_mr_nr12_mrxncxkc_f32<1, true>
+                        : mma_pack_mr_nr12_mrxncxkc_f32<1, false>;
         }
     } else {
         switch (level) {
-        case 8: return seed == 1 ? mma_pack_mr8_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_pack_mr8_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_pack_mr8_nr16_mrxncxkc_f16<true>
-                        : mma_pack_mr8_nr16_mrxncxkc_f16<false>;
-        case 4: return seed == 1 ? mma_pack_mr4_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_pack_mr4_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_pack_mr4_nr16_mrxncxkc_f16<true>
-                        : mma_pack_mr4_nr16_mrxncxkc_f16<false>;
-        default: return seed == 1 ? mma_pack_mr1_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_pack_mr1_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_pack_mr1_nr16_mrxncxkc_f16<true>
-                        : mma_pack_mr1_nr16_mrxncxkc_f16<false>;
+        case 8: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f16<8, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f16<8, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f16<8, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f16<8, false>;
+        case 4: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f16<4, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f16<4, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f16<4, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f16<4, false>;
+        default: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f16<1, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f16<1, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f16<1, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f16<1, false>;
         }
     }
 #endif
@@ -206,41 +206,41 @@ auto b_fn(int level, bool zero_mode, bool with_bias) {
         case 6: return with_bias ? mma_direct_mr6_nr16_mrxncxkc_f16<true, true>
                                  : zero_mode ? mma_direct_mr6_nr16_mrxncxkc_f16<true, false>
                                  : mma_direct_mr6_nr16_mrxncxkc_f16<false, false>;
-        case 4: return with_bias ? mma_direct_mr4_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_direct_mr4_nr16_mrxncxkc_f16<true, false>
-                                 : mma_direct_mr4_nr16_mrxncxkc_f16<false, false>;
+        case 4: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f16<4, true, true>
+                                 : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f16<4, true, false>
+                                 : mma_direct_mr_nr16_mrxncxkc_f16<4, false, false>;
         case 2: return with_bias ? mma_direct_mr2_nr16_mrxncxkc_f16<true, true>
                                  : zero_mode ? mma_direct_mr2_nr16_mrxncxkc_f16<true, false>
                                  : mma_direct_mr2_nr16_mrxncxkc_f16<false, false>;
-        default: return with_bias ? mma_direct_mr1_nr16_mrxncxkc_f16<true, true>
-                                  : zero_mode ? mma_direct_mr1_nr16_mrxncxkc_f16<true, false>
-                                  : mma_direct_mr1_nr16_mrxncxkc_f16<false, false>;
+        default: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f16<1, true, true>
+                                  : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f16<1, true, false>
+                                  : mma_direct_mr_nr16_mrxncxkc_f16<1, false, false>;
         }
     }
 #else
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 8: return with_bias ? mma_direct_mr8_nr12_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_direct_mr8_nr12_mrxncxkc_f32<true, false>
-                                 : mma_direct_mr8_nr12_mrxncxkc_f32<false, false>;
-        case 4: return with_bias ? mma_direct_mr4_nr12_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_direct_mr4_nr12_mrxncxkc_f32<true, false>
-                                 : mma_direct_mr4_nr12_mrxncxkc_f32<false, false>;
-        default: return with_bias ? mma_direct_mr1_nr12_mrxncxkc_f32<true, true>
-                                  : zero_mode ? mma_direct_mr1_nr12_mrxncxkc_f32<true, false>
-                                  : mma_direct_mr1_nr12_mrxncxkc_f32<false, false>;
+        case 8: return with_bias ? mma_direct_mr_nr12_mrxncxkc_f32<8, true, true>
+                                 : zero_mode ? mma_direct_mr_nr12_mrxncxkc_f32<8, true, false>
+                                 : mma_direct_mr_nr12_mrxncxkc_f32<8, false, false>;
+        case 4: return with_bias ? mma_direct_mr_nr12_mrxncxkc_f32<4, true, true>
+                                 : zero_mode ? mma_direct_mr_nr12_mrxncxkc_f32<4, true, false>
+                                 : mma_direct_mr_nr12_mrxncxkc_f32<4, false, false>;
+        default: return with_bias ? mma_direct_mr_nr12_mrxncxkc_f32<1, true, true>
+                                  : zero_mode ? mma_direct_mr_nr12_mrxncxkc_f32<1, true, false>
+                                  : mma_direct_mr_nr12_mrxncxkc_f32<1, false, false>;
         }
     } else {
         switch (level) {
-        case 8: return with_bias ? mma_direct_mr8_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_direct_mr8_nr16_mrxncxkc_f16<true, false>
-                                 : mma_direct_mr8_nr16_mrxncxkc_f16<false, false>;
-        case 4: return with_bias ? mma_direct_mr4_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_direct_mr4_nr16_mrxncxkc_f16<true, false>
-                                 : mma_direct_mr4_nr16_mrxncxkc_f16<false, false>;
-        default: return with_bias ? mma_direct_mr1_nr16_mrxncxkc_f16<true, true>
-                                  : zero_mode ? mma_direct_mr1_nr16_mrxncxkc_f16<true, false>
-                                  : mma_direct_mr1_nr16_mrxncxkc_f16<false, false>;
+        case 8: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f16<8, true, true>
+                                 : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f16<8, true, false>
+                                 : mma_direct_mr_nr16_mrxncxkc_f16<8, false, false>;
+        case 4: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f16<4, true, true>
+                                 : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f16<4, true, false>
+                                 : mma_direct_mr_nr16_mrxncxkc_f16<4, false, false>;
+        default: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f16<1, true, true>
+                                  : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f16<1, true, false>
+                                  : mma_direct_mr_nr16_mrxncxkc_f16<1, false, false>;
         }
     }
 #endif
