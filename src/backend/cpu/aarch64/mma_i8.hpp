@@ -69,12 +69,6 @@
 
 namespace nnops::backend::cpu::aarch64 {
 
-/// One row's four k bytes splatted into every 4-byte lane; the raw-A kernels only.
-inline int8x16_t mma_i8_bcast_group(const int8_t* p) noexcept
-{
-    return vreinterpretq_s8_s32(vdupq_n_s32(*reinterpret_cast<const int32_t*>(p)));
-}
-
 /// Packed-B panel width: the kernels' uniform nr.
 inline constexpr int mma_i8_nr_max = 12;
 
@@ -95,1609 +89,16 @@ inline constexpr bool mma_i8_folds_a_bias = false;
 inline void mma_i8_b_panel_sums(int8_t* /*panel*/, int /*kbytes*/, bool /*a_biased*/) noexcept {}
 
 // =========================================================================
-//  packed A + packed B  (mr = 8, 4, 1)
-// =========================================================================
-
-template <bool zero_mode = false>
-inline void mma_pack_mr8_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
-                                          int ldc, const int8_t* NNOPS_RESTRICT A,
-                                          const int8_t* NNOPS_RESTRICT B, int ldb,
-                                          int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-    int32_t* NNOPS_RESTRICT c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
-    int32_t* NNOPS_RESTRICT c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
-    int32_t* NNOPS_RESTRICT c6_ptr = (mr > 6) ? C + 6 * ldc : c5_ptr;
-    int32_t* NNOPS_RESTRICT c7_ptr = (mr > 7) ? C + 7 * ldc : c6_ptr;
-
-    const int kbytes = (kc + 3) & ~3;
-    const int kg = kbytes >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-
-    int n = 0;
-    for (; n < nc - 11; n += 12) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-        int32x4_t v_c40 = vdupq_n_s32(0), v_c41 = v_c40, v_c42 = v_c40;
-        int32x4_t v_c50 = vdupq_n_s32(0), v_c51 = v_c50, v_c52 = v_c50;
-        int32x4_t v_c60 = vdupq_n_s32(0), v_c61 = v_c60, v_c62 = v_c60;
-        int32x4_t v_c70 = vdupq_n_s32(0), v_c71 = v_c70, v_c72 = v_c70;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a0 = vld1q_s8(a_ptr + 0 * 16);
-            const int8x16_t v_a1 = vld1q_s8(a_ptr + 1 * 16);
-            a_ptr += 32;
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-
-            v_c00 = vdotq_laneq_s32(v_c00, v_b0, v_a0, 0);
-            v_c10 = vdotq_laneq_s32(v_c10, v_b0, v_a0, 1);
-            v_c20 = vdotq_laneq_s32(v_c20, v_b0, v_a0, 2);
-            v_c30 = vdotq_laneq_s32(v_c30, v_b0, v_a0, 3);
-
-            v_c40 = vdotq_laneq_s32(v_c40, v_b0, v_a1, 0);
-            v_c50 = vdotq_laneq_s32(v_c50, v_b0, v_a1, 1);
-            v_c60 = vdotq_laneq_s32(v_c60, v_b0, v_a1, 2);
-            v_c70 = vdotq_laneq_s32(v_c70, v_b0, v_a1, 3);
-
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-
-            v_c01 = vdotq_laneq_s32(v_c01, v_b1, v_a0, 0);
-            v_c11 = vdotq_laneq_s32(v_c11, v_b1, v_a0, 1);
-            v_c21 = vdotq_laneq_s32(v_c21, v_b1, v_a0, 2);
-            v_c31 = vdotq_laneq_s32(v_c31, v_b1, v_a0, 3);
-
-            v_c41 = vdotq_laneq_s32(v_c41, v_b1, v_a1, 0);
-            v_c51 = vdotq_laneq_s32(v_c51, v_b1, v_a1, 1);
-            v_c61 = vdotq_laneq_s32(v_c61, v_b1, v_a1, 2);
-            v_c71 = vdotq_laneq_s32(v_c71, v_b1, v_a1, 3);
-
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-
-            v_c02 = vdotq_laneq_s32(v_c02, v_b2, v_a0, 0);
-            v_c12 = vdotq_laneq_s32(v_c12, v_b2, v_a0, 1);
-            v_c22 = vdotq_laneq_s32(v_c22, v_b2, v_a0, 2);
-            v_c32 = vdotq_laneq_s32(v_c32, v_b2, v_a0, 3);
-
-            v_c42 = vdotq_laneq_s32(v_c42, v_b2, v_a1, 0);
-            v_c52 = vdotq_laneq_s32(v_c52, v_b2, v_a1, 1);
-            v_c62 = vdotq_laneq_s32(v_c62, v_b2, v_a1, 2);
-            v_c72 = vdotq_laneq_s32(v_c72, v_b2, v_a1, 3);
-
-            b_ptr += 48;
-        }
-
-        if constexpr (!zero_mode) {
-            v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr + 0 * 4));
-            v_c01 = vaddq_s32(v_c01, vld1q_s32(c0_ptr + 1 * 4));
-            v_c02 = vaddq_s32(v_c02, vld1q_s32(c0_ptr + 2 * 4));
-            v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr + 0 * 4));
-            v_c11 = vaddq_s32(v_c11, vld1q_s32(c1_ptr + 1 * 4));
-            v_c12 = vaddq_s32(v_c12, vld1q_s32(c1_ptr + 2 * 4));
-            v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr + 0 * 4));
-            v_c21 = vaddq_s32(v_c21, vld1q_s32(c2_ptr + 1 * 4));
-            v_c22 = vaddq_s32(v_c22, vld1q_s32(c2_ptr + 2 * 4));
-            v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr + 0 * 4));
-            v_c31 = vaddq_s32(v_c31, vld1q_s32(c3_ptr + 1 * 4));
-            v_c32 = vaddq_s32(v_c32, vld1q_s32(c3_ptr + 2 * 4));
-            v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr + 0 * 4));
-            v_c41 = vaddq_s32(v_c41, vld1q_s32(c4_ptr + 1 * 4));
-            v_c42 = vaddq_s32(v_c42, vld1q_s32(c4_ptr + 2 * 4));
-            v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr + 0 * 4));
-            v_c51 = vaddq_s32(v_c51, vld1q_s32(c5_ptr + 1 * 4));
-            v_c52 = vaddq_s32(v_c52, vld1q_s32(c5_ptr + 2 * 4));
-            v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr + 0 * 4));
-            v_c61 = vaddq_s32(v_c61, vld1q_s32(c6_ptr + 1 * 4));
-            v_c62 = vaddq_s32(v_c62, vld1q_s32(c6_ptr + 2 * 4));
-            v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr + 0 * 4));
-            v_c71 = vaddq_s32(v_c71, vld1q_s32(c7_ptr + 1 * 4));
-            v_c72 = vaddq_s32(v_c72, vld1q_s32(c7_ptr + 2 * 4));
-        }
-
-        vst1q_s32(c0_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-        vst1q_s32(c0_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c01, vmin), vmax));
-        vst1q_s32(c0_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c02, vmin), vmax));
-        vst1q_s32(c1_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-        vst1q_s32(c1_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c11, vmin), vmax));
-        vst1q_s32(c1_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c12, vmin), vmax));
-        vst1q_s32(c2_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-        vst1q_s32(c2_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c21, vmin), vmax));
-        vst1q_s32(c2_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c22, vmin), vmax));
-        vst1q_s32(c3_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-        vst1q_s32(c3_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c31, vmin), vmax));
-        vst1q_s32(c3_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c32, vmin), vmax));
-        vst1q_s32(c4_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
-        vst1q_s32(c4_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c41, vmin), vmax));
-        vst1q_s32(c4_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c42, vmin), vmax));
-        vst1q_s32(c5_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
-        vst1q_s32(c5_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c51, vmin), vmax));
-        vst1q_s32(c5_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c52, vmin), vmax));
-        vst1q_s32(c6_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
-        vst1q_s32(c6_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c61, vmin), vmax));
-        vst1q_s32(c6_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c62, vmin), vmax));
-        vst1q_s32(c7_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
-        vst1q_s32(c7_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c71, vmin), vmax));
-        vst1q_s32(c7_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c72, vmin), vmax));
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-        c4_ptr += 12;
-        c5_ptr += 12;
-        c6_ptr += 12;
-        c7_ptr += 12;
-
-        B += ldb_panel;
-    }
-
-    const int rem = nc - n;
-    if (rem > 0) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-        int32x4_t v_c40 = vdupq_n_s32(0), v_c41 = v_c40, v_c42 = v_c40;
-        int32x4_t v_c50 = vdupq_n_s32(0), v_c51 = v_c50, v_c52 = v_c50;
-        int32x4_t v_c60 = vdupq_n_s32(0), v_c61 = v_c60, v_c62 = v_c60;
-        int32x4_t v_c70 = vdupq_n_s32(0), v_c71 = v_c70, v_c72 = v_c70;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_a0 = vld1q_s8(a_ptr + 0 * 16);
-                const int8x16_t v_a1 = vld1q_s8(a_ptr + 1 * 16);
-                a_ptr += 32;
-
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-
-                v_c00 = vdotq_laneq_s32(v_c00, v_b0, v_a0, 0);
-                v_c10 = vdotq_laneq_s32(v_c10, v_b0, v_a0, 1);
-                v_c20 = vdotq_laneq_s32(v_c20, v_b0, v_a0, 2);
-                v_c30 = vdotq_laneq_s32(v_c30, v_b0, v_a0, 3);
-                v_c40 = vdotq_laneq_s32(v_c40, v_b0, v_a1, 0);
-                v_c50 = vdotq_laneq_s32(v_c50, v_b0, v_a1, 1);
-                v_c60 = vdotq_laneq_s32(v_c60, v_b0, v_a1, 2);
-                v_c70 = vdotq_laneq_s32(v_c70, v_b0, v_a1, 3);
-
-                const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-
-                v_c01 = vdotq_laneq_s32(v_c01, v_b1, v_a0, 0);
-                v_c11 = vdotq_laneq_s32(v_c11, v_b1, v_a0, 1);
-                v_c21 = vdotq_laneq_s32(v_c21, v_b1, v_a0, 2);
-                v_c31 = vdotq_laneq_s32(v_c31, v_b1, v_a0, 3);
-                v_c41 = vdotq_laneq_s32(v_c41, v_b1, v_a1, 0);
-                v_c51 = vdotq_laneq_s32(v_c51, v_b1, v_a1, 1);
-                v_c61 = vdotq_laneq_s32(v_c61, v_b1, v_a1, 2);
-                v_c71 = vdotq_laneq_s32(v_c71, v_b1, v_a1, 3);
-
-                const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-
-                v_c02 = vdotq_laneq_s32(v_c02, v_b2, v_a0, 0);
-                v_c12 = vdotq_laneq_s32(v_c12, v_b2, v_a0, 1);
-                v_c22 = vdotq_laneq_s32(v_c22, v_b2, v_a0, 2);
-                v_c32 = vdotq_laneq_s32(v_c32, v_b2, v_a0, 3);
-                v_c42 = vdotq_laneq_s32(v_c42, v_b2, v_a1, 0);
-                v_c52 = vdotq_laneq_s32(v_c52, v_b2, v_a1, 1);
-                v_c62 = vdotq_laneq_s32(v_c62, v_b2, v_a1, 2);
-                v_c72 = vdotq_laneq_s32(v_c72, v_b2, v_a1, 3);
-
-                b_ptr += 48;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_a0 = vld1q_s8(a_ptr + 0 * 16);
-                const int8x16_t v_a1 = vld1q_s8(a_ptr + 1 * 16);
-                a_ptr += 32;
-
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-
-                v_c00 = vdotq_laneq_s32(v_c00, v_b0, v_a0, 0);
-                v_c10 = vdotq_laneq_s32(v_c10, v_b0, v_a0, 1);
-                v_c20 = vdotq_laneq_s32(v_c20, v_b0, v_a0, 2);
-                v_c30 = vdotq_laneq_s32(v_c30, v_b0, v_a0, 3);
-                v_c40 = vdotq_laneq_s32(v_c40, v_b0, v_a1, 0);
-                v_c50 = vdotq_laneq_s32(v_c50, v_b0, v_a1, 1);
-                v_c60 = vdotq_laneq_s32(v_c60, v_b0, v_a1, 2);
-                v_c70 = vdotq_laneq_s32(v_c70, v_b0, v_a1, 3);
-
-                b_ptr += 48;
-            }
-        }
-
-        if (rem >= 4) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
-                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
-                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
-                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
-            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
-            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
-            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            c4_ptr += 4;
-            c5_ptr += 4;
-            c6_ptr += 4;
-            c7_ptr += 4;
-            v_c00 = v_c01;
-            v_c10 = v_c11;
-            v_c20 = v_c21;
-            v_c30 = v_c31;
-            v_c40 = v_c41;
-            v_c50 = v_c51;
-            v_c60 = v_c61;
-            v_c70 = v_c71;
-        }
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
-                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
-                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
-                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
-            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
-            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
-            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            c4_ptr += 4;
-            c5_ptr += 4;
-            c6_ptr += 4;
-            c7_ptr += 4;
-            v_c00 = v_c02;
-            v_c10 = v_c12;
-            v_c20 = v_c22;
-            v_c30 = v_c32;
-            v_c40 = v_c42;
-            v_c50 = v_c52;
-            v_c60 = v_c62;
-            v_c70 = v_c72;
-        }
-        if (rem >= 12) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
-                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
-                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
-                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
-            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
-            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
-            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            c4_ptr += 4;
-            c5_ptr += 4;
-            c6_ptr += 4;
-            c7_ptr += 4;
-        }
-        const int rl = rem & 3;
-        if (rl & 2) {
-            const int32x2_t vmin2 = vget_low_s32(vmin);
-            const int32x2_t vmax2 = vget_low_s32(vmax);
-            int32x2_t v0 = vget_low_s32(v_c00);
-            int32x2_t v1 = vget_low_s32(v_c10);
-            int32x2_t v2 = vget_low_s32(v_c20);
-            int32x2_t v3 = vget_low_s32(v_c30);
-            int32x2_t v4 = vget_low_s32(v_c40);
-            int32x2_t v5 = vget_low_s32(v_c50);
-            int32x2_t v6 = vget_low_s32(v_c60);
-            int32x2_t v7 = vget_low_s32(v_c70);
-            if constexpr (!zero_mode) {
-                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
-                v1 = vadd_s32(v1, vld1_s32(c1_ptr));
-                v2 = vadd_s32(v2, vld1_s32(c2_ptr));
-                v3 = vadd_s32(v3, vld1_s32(c3_ptr));
-                v4 = vadd_s32(v4, vld1_s32(c4_ptr));
-                v5 = vadd_s32(v5, vld1_s32(c5_ptr));
-                v6 = vadd_s32(v6, vld1_s32(c6_ptr));
-                v7 = vadd_s32(v7, vld1_s32(c7_ptr));
-            }
-            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
-            vst1_s32(c1_ptr, vmin_s32(vmax_s32(v1, vmin2), vmax2));
-            vst1_s32(c2_ptr, vmin_s32(vmax_s32(v2, vmin2), vmax2));
-            vst1_s32(c3_ptr, vmin_s32(vmax_s32(v3, vmin2), vmax2));
-            vst1_s32(c4_ptr, vmin_s32(vmax_s32(v4, vmin2), vmax2));
-            vst1_s32(c5_ptr, vmin_s32(vmax_s32(v5, vmin2), vmax2));
-            vst1_s32(c6_ptr, vmin_s32(vmax_s32(v6, vmin2), vmax2));
-            vst1_s32(c7_ptr, vmin_s32(vmax_s32(v7, vmin2), vmax2));
-            c0_ptr += 2;
-            c1_ptr += 2;
-            c2_ptr += 2;
-            c3_ptr += 2;
-            c4_ptr += 2;
-            c5_ptr += 2;
-            c6_ptr += 2;
-            c7_ptr += 2;
-        }
-        if (rl & 1) {
-            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
-            int32_t x1 = (rl & 2) ? vgetq_lane_s32(v_c10, 2) : vgetq_lane_s32(v_c10, 0);
-            int32_t x2 = (rl & 2) ? vgetq_lane_s32(v_c20, 2) : vgetq_lane_s32(v_c20, 0);
-            int32_t x3 = (rl & 2) ? vgetq_lane_s32(v_c30, 2) : vgetq_lane_s32(v_c30, 0);
-            int32_t x4 = (rl & 2) ? vgetq_lane_s32(v_c40, 2) : vgetq_lane_s32(v_c40, 0);
-            int32_t x5 = (rl & 2) ? vgetq_lane_s32(v_c50, 2) : vgetq_lane_s32(v_c50, 0);
-            int32_t x6 = (rl & 2) ? vgetq_lane_s32(v_c60, 2) : vgetq_lane_s32(v_c60, 0);
-            int32_t x7 = (rl & 2) ? vgetq_lane_s32(v_c70, 2) : vgetq_lane_s32(v_c70, 0);
-            if constexpr (!zero_mode) {
-                x0 += c0_ptr[0];
-                x1 += c1_ptr[0];
-                x2 += c2_ptr[0];
-                x3 += c3_ptr[0];
-                x4 += c4_ptr[0];
-                x5 += c5_ptr[0];
-                x6 += c6_ptr[0];
-                x7 += c7_ptr[0];
-            }
-            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
-            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
-            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
-            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
-            c4_ptr[0] = std::min(std::max(x4, clamp_min), clamp_max);
-            c5_ptr[0] = std::min(std::max(x5, clamp_min), clamp_max);
-            c6_ptr[0] = std::min(std::max(x6, clamp_min), clamp_max);
-            c7_ptr[0] = std::min(std::max(x7, clamp_min), clamp_max);
-        }
-    }
-}
-
-template <bool zero_mode = false>
-inline void mma_pack_mr4_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
-                                          int ldc, const int8_t* NNOPS_RESTRICT A,
-                                          const int8_t* NNOPS_RESTRICT B, int ldb,
-                                          int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-
-    const int kbytes = (kc + 3) & ~3;
-    const int kg = kbytes >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-
-    int n = 0;
-    for (; n < nc - 11; n += 12) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a = vld1q_s8(a_ptr);
-            a_ptr += 16;
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-
-            v_c00 = vdotq_laneq_s32(v_c00, v_b0, v_a, 0);
-            v_c10 = vdotq_laneq_s32(v_c10, v_b0, v_a, 1);
-            v_c20 = vdotq_laneq_s32(v_c20, v_b0, v_a, 2);
-            v_c30 = vdotq_laneq_s32(v_c30, v_b0, v_a, 3);
-
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-
-            v_c01 = vdotq_laneq_s32(v_c01, v_b1, v_a, 0);
-            v_c11 = vdotq_laneq_s32(v_c11, v_b1, v_a, 1);
-            v_c21 = vdotq_laneq_s32(v_c21, v_b1, v_a, 2);
-            v_c31 = vdotq_laneq_s32(v_c31, v_b1, v_a, 3);
-
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-
-            v_c02 = vdotq_laneq_s32(v_c02, v_b2, v_a, 0);
-            v_c12 = vdotq_laneq_s32(v_c12, v_b2, v_a, 1);
-            v_c22 = vdotq_laneq_s32(v_c22, v_b2, v_a, 2);
-            v_c32 = vdotq_laneq_s32(v_c32, v_b2, v_a, 3);
-
-            b_ptr += 48;
-        }
-
-        if constexpr (!zero_mode) {
-            v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr + 0 * 4));
-            v_c01 = vaddq_s32(v_c01, vld1q_s32(c0_ptr + 1 * 4));
-            v_c02 = vaddq_s32(v_c02, vld1q_s32(c0_ptr + 2 * 4));
-            v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr + 0 * 4));
-            v_c11 = vaddq_s32(v_c11, vld1q_s32(c1_ptr + 1 * 4));
-            v_c12 = vaddq_s32(v_c12, vld1q_s32(c1_ptr + 2 * 4));
-            v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr + 0 * 4));
-            v_c21 = vaddq_s32(v_c21, vld1q_s32(c2_ptr + 1 * 4));
-            v_c22 = vaddq_s32(v_c22, vld1q_s32(c2_ptr + 2 * 4));
-            v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr + 0 * 4));
-            v_c31 = vaddq_s32(v_c31, vld1q_s32(c3_ptr + 1 * 4));
-            v_c32 = vaddq_s32(v_c32, vld1q_s32(c3_ptr + 2 * 4));
-        }
-
-        vst1q_s32(c0_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-        vst1q_s32(c0_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c01, vmin), vmax));
-        vst1q_s32(c0_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c02, vmin), vmax));
-        vst1q_s32(c1_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-        vst1q_s32(c1_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c11, vmin), vmax));
-        vst1q_s32(c1_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c12, vmin), vmax));
-        vst1q_s32(c2_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-        vst1q_s32(c2_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c21, vmin), vmax));
-        vst1q_s32(c2_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c22, vmin), vmax));
-        vst1q_s32(c3_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-        vst1q_s32(c3_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c31, vmin), vmax));
-        vst1q_s32(c3_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c32, vmin), vmax));
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-
-        B += ldb_panel;
-    }
-
-    const int rem = nc - n;
-    if (rem > 0) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_a = vld1q_s8(a_ptr);
-                a_ptr += 16;
-
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-
-                v_c00 = vdotq_laneq_s32(v_c00, v_b0, v_a, 0);
-                v_c10 = vdotq_laneq_s32(v_c10, v_b0, v_a, 1);
-                v_c20 = vdotq_laneq_s32(v_c20, v_b0, v_a, 2);
-                v_c30 = vdotq_laneq_s32(v_c30, v_b0, v_a, 3);
-
-                const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-
-                v_c01 = vdotq_laneq_s32(v_c01, v_b1, v_a, 0);
-                v_c11 = vdotq_laneq_s32(v_c11, v_b1, v_a, 1);
-                v_c21 = vdotq_laneq_s32(v_c21, v_b1, v_a, 2);
-                v_c31 = vdotq_laneq_s32(v_c31, v_b1, v_a, 3);
-
-                const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-
-                v_c02 = vdotq_laneq_s32(v_c02, v_b2, v_a, 0);
-                v_c12 = vdotq_laneq_s32(v_c12, v_b2, v_a, 1);
-                v_c22 = vdotq_laneq_s32(v_c22, v_b2, v_a, 2);
-                v_c32 = vdotq_laneq_s32(v_c32, v_b2, v_a, 3);
-
-                b_ptr += 48;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_a = vld1q_s8(a_ptr);
-                a_ptr += 16;
-
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-
-                v_c00 = vdotq_laneq_s32(v_c00, v_b0, v_a, 0);
-                v_c10 = vdotq_laneq_s32(v_c10, v_b0, v_a, 1);
-                v_c20 = vdotq_laneq_s32(v_c20, v_b0, v_a, 2);
-                v_c30 = vdotq_laneq_s32(v_c30, v_b0, v_a, 3);
-
-                b_ptr += 48;
-            }
-        }
-
-        if (rem >= 4) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            v_c00 = v_c01;
-            v_c10 = v_c11;
-            v_c20 = v_c21;
-            v_c30 = v_c31;
-        }
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            v_c00 = v_c02;
-            v_c10 = v_c12;
-            v_c20 = v_c22;
-            v_c30 = v_c32;
-        }
-        if (rem >= 12) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-        }
-        const int rl = rem & 3;
-        if (rl & 2) {
-            const int32x2_t vmin2 = vget_low_s32(vmin);
-            const int32x2_t vmax2 = vget_low_s32(vmax);
-            int32x2_t v0 = vget_low_s32(v_c00);
-            int32x2_t v1 = vget_low_s32(v_c10);
-            int32x2_t v2 = vget_low_s32(v_c20);
-            int32x2_t v3 = vget_low_s32(v_c30);
-            if constexpr (!zero_mode) {
-                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
-                v1 = vadd_s32(v1, vld1_s32(c1_ptr));
-                v2 = vadd_s32(v2, vld1_s32(c2_ptr));
-                v3 = vadd_s32(v3, vld1_s32(c3_ptr));
-            }
-            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
-            vst1_s32(c1_ptr, vmin_s32(vmax_s32(v1, vmin2), vmax2));
-            vst1_s32(c2_ptr, vmin_s32(vmax_s32(v2, vmin2), vmax2));
-            vst1_s32(c3_ptr, vmin_s32(vmax_s32(v3, vmin2), vmax2));
-            c0_ptr += 2;
-            c1_ptr += 2;
-            c2_ptr += 2;
-            c3_ptr += 2;
-        }
-        if (rl & 1) {
-            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
-            int32_t x1 = (rl & 2) ? vgetq_lane_s32(v_c10, 2) : vgetq_lane_s32(v_c10, 0);
-            int32_t x2 = (rl & 2) ? vgetq_lane_s32(v_c20, 2) : vgetq_lane_s32(v_c20, 0);
-            int32_t x3 = (rl & 2) ? vgetq_lane_s32(v_c30, 2) : vgetq_lane_s32(v_c30, 0);
-            if constexpr (!zero_mode) {
-                x0 += c0_ptr[0];
-                x1 += c1_ptr[0];
-                x2 += c2_ptr[0];
-                x3 += c3_ptr[0];
-            }
-            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
-            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
-            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
-            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
-        }
-    }
-}
-
-template <bool zero_mode = false>
-inline void mma_pack_mr1_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
-                                          int ldc, const int8_t* NNOPS_RESTRICT A,
-                                          const int8_t* NNOPS_RESTRICT B, int ldb,
-                                          int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    (void)mr;  // one row, so the row count never varies
-    (void)ldc; // one row, so the C row stride never applies
-
-    int32_t* NNOPS_RESTRICT c0_ptr = C;
-
-    const int kbytes = (kc + 3) & ~3;
-    const int kg = kbytes >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-
-    int n = 0;
-    for (; n < nc - 11; n += 12) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a = mma_i8_bcast_group(a_ptr);
-            a_ptr += 4;
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-
-            v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-            v_c01 = vdotq_s32(v_c01, v_b1, v_a);
-            v_c02 = vdotq_s32(v_c02, v_b2, v_a);
-
-            b_ptr += 48;
-        }
-
-        if constexpr (!zero_mode) {
-            v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr + 0 * 4));
-            v_c01 = vaddq_s32(v_c01, vld1q_s32(c0_ptr + 1 * 4));
-            v_c02 = vaddq_s32(v_c02, vld1q_s32(c0_ptr + 2 * 4));
-        }
-
-        vst1q_s32(c0_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-        vst1q_s32(c0_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c01, vmin), vmax));
-        vst1q_s32(c0_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c02, vmin), vmax));
-
-        c0_ptr += 12;
-        B += ldb_panel;
-    }
-
-    const int rem = nc - n;
-    if (rem > 0) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_a = mma_i8_bcast_group(a_ptr);
-                a_ptr += 4;
-
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-                const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-                const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-
-                v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-                v_c01 = vdotq_s32(v_c01, v_b1, v_a);
-                v_c02 = vdotq_s32(v_c02, v_b2, v_a);
-
-                b_ptr += 48;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_a = mma_i8_bcast_group(a_ptr);
-                a_ptr += 4;
-
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-
-                v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-
-                b_ptr += 48;
-            }
-        }
-
-        if (rem >= 4) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            c0_ptr += 4;
-            v_c00 = v_c01;
-        }
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            c0_ptr += 4;
-            v_c00 = v_c02;
-        }
-        if (rem >= 12) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            c0_ptr += 4;
-        }
-        const int rl = rem & 3;
-        if (rl & 2) {
-            const int32x2_t vmin2 = vget_low_s32(vmin);
-            const int32x2_t vmax2 = vget_low_s32(vmax);
-            int32x2_t v0 = vget_low_s32(v_c00);
-            if constexpr (!zero_mode) {
-                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
-            }
-            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
-            c0_ptr += 2;
-        }
-        if (rl & 1) {
-            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
-            if constexpr (!zero_mode) {
-                x0 += c0_ptr[0];
-            }
-            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
-        }
-    }
-}
-
-// =========================================================================
-//  raw A + packed B  (mr = 8, 4, 1)
-// =========================================================================
-
-template <bool zero_mode = false>
-inline void mma_direct_mr8_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
-                                            int ldc, const int8_t* NNOPS_RESTRICT A, int lda,
-                                            const int8_t* NNOPS_RESTRICT B, int ldb,
-                                            int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-    const int r4 = (mr > 4) ? 4 : r3;
-    const int r5 = (mr > 5) ? 5 : r4;
-    const int r6 = (mr > 6) ? 6 : r5;
-    const int r7 = (mr > 7) ? 7 : r6;
-
-    int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-    int32_t* NNOPS_RESTRICT c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
-    int32_t* NNOPS_RESTRICT c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
-    int32_t* NNOPS_RESTRICT c6_ptr = (mr > 6) ? C + 6 * ldc : c5_ptr;
-    int32_t* NNOPS_RESTRICT c7_ptr = (mr > 7) ? C + 7 * ldc : c6_ptr;
-
-    const int kg = kc >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kc);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-
-    int n = 0;
-    for (; n < nc - 11; n += 12) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-        int32x4_t v_c40 = vdupq_n_s32(0), v_c41 = v_c40, v_c42 = v_c40;
-        int32x4_t v_c50 = vdupq_n_s32(0), v_c51 = v_c50, v_c52 = v_c50;
-        int32x4_t v_c60 = vdupq_n_s32(0), v_c61 = v_c60, v_c62 = v_c60;
-        int32x4_t v_c70 = vdupq_n_s32(0), v_c71 = v_c70, v_c72 = v_c70;
-
-        const int8_t* NNOPS_RESTRICT a0 = A + 0 * lda;
-        const int8_t* NNOPS_RESTRICT a1 = A + r1 * lda;
-        const int8_t* NNOPS_RESTRICT a2 = A + r2 * lda;
-        const int8_t* NNOPS_RESTRICT a3 = A + r3 * lda;
-        const int8_t* NNOPS_RESTRICT a4 = A + r4 * lda;
-        const int8_t* NNOPS_RESTRICT a5 = A + r5 * lda;
-        const int8_t* NNOPS_RESTRICT a6 = A + r6 * lda;
-        const int8_t* NNOPS_RESTRICT a7 = A + r7 * lda;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-            b_ptr += 48;
-
-            int8x16_t v_a = mma_i8_bcast_group(a0);
-            v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-            v_c01 = vdotq_s32(v_c01, v_b1, v_a);
-            v_c02 = vdotq_s32(v_c02, v_b2, v_a);
-            a0 += 4;
-
-            v_a = mma_i8_bcast_group(a1);
-            v_c10 = vdotq_s32(v_c10, v_b0, v_a);
-            v_c11 = vdotq_s32(v_c11, v_b1, v_a);
-            v_c12 = vdotq_s32(v_c12, v_b2, v_a);
-            a1 += 4;
-
-            v_a = mma_i8_bcast_group(a2);
-            v_c20 = vdotq_s32(v_c20, v_b0, v_a);
-            v_c21 = vdotq_s32(v_c21, v_b1, v_a);
-            v_c22 = vdotq_s32(v_c22, v_b2, v_a);
-            a2 += 4;
-
-            v_a = mma_i8_bcast_group(a3);
-            v_c30 = vdotq_s32(v_c30, v_b0, v_a);
-            v_c31 = vdotq_s32(v_c31, v_b1, v_a);
-            v_c32 = vdotq_s32(v_c32, v_b2, v_a);
-            a3 += 4;
-
-            v_a = mma_i8_bcast_group(a4);
-            v_c40 = vdotq_s32(v_c40, v_b0, v_a);
-            v_c41 = vdotq_s32(v_c41, v_b1, v_a);
-            v_c42 = vdotq_s32(v_c42, v_b2, v_a);
-            a4 += 4;
-
-            v_a = mma_i8_bcast_group(a5);
-            v_c50 = vdotq_s32(v_c50, v_b0, v_a);
-            v_c51 = vdotq_s32(v_c51, v_b1, v_a);
-            v_c52 = vdotq_s32(v_c52, v_b2, v_a);
-            a5 += 4;
-
-            v_a = mma_i8_bcast_group(a6);
-            v_c60 = vdotq_s32(v_c60, v_b0, v_a);
-            v_c61 = vdotq_s32(v_c61, v_b1, v_a);
-            v_c62 = vdotq_s32(v_c62, v_b2, v_a);
-            a6 += 4;
-
-            v_a = mma_i8_bcast_group(a7);
-            v_c70 = vdotq_s32(v_c70, v_b0, v_a);
-            v_c71 = vdotq_s32(v_c71, v_b1, v_a);
-            v_c72 = vdotq_s32(v_c72, v_b2, v_a);
-            a7 += 4;
-        }
-
-        if constexpr (!zero_mode) {
-            v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr + 0 * 4));
-            v_c01 = vaddq_s32(v_c01, vld1q_s32(c0_ptr + 1 * 4));
-            v_c02 = vaddq_s32(v_c02, vld1q_s32(c0_ptr + 2 * 4));
-            v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr + 0 * 4));
-            v_c11 = vaddq_s32(v_c11, vld1q_s32(c1_ptr + 1 * 4));
-            v_c12 = vaddq_s32(v_c12, vld1q_s32(c1_ptr + 2 * 4));
-            v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr + 0 * 4));
-            v_c21 = vaddq_s32(v_c21, vld1q_s32(c2_ptr + 1 * 4));
-            v_c22 = vaddq_s32(v_c22, vld1q_s32(c2_ptr + 2 * 4));
-            v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr + 0 * 4));
-            v_c31 = vaddq_s32(v_c31, vld1q_s32(c3_ptr + 1 * 4));
-            v_c32 = vaddq_s32(v_c32, vld1q_s32(c3_ptr + 2 * 4));
-            v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr + 0 * 4));
-            v_c41 = vaddq_s32(v_c41, vld1q_s32(c4_ptr + 1 * 4));
-            v_c42 = vaddq_s32(v_c42, vld1q_s32(c4_ptr + 2 * 4));
-            v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr + 0 * 4));
-            v_c51 = vaddq_s32(v_c51, vld1q_s32(c5_ptr + 1 * 4));
-            v_c52 = vaddq_s32(v_c52, vld1q_s32(c5_ptr + 2 * 4));
-            v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr + 0 * 4));
-            v_c61 = vaddq_s32(v_c61, vld1q_s32(c6_ptr + 1 * 4));
-            v_c62 = vaddq_s32(v_c62, vld1q_s32(c6_ptr + 2 * 4));
-            v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr + 0 * 4));
-            v_c71 = vaddq_s32(v_c71, vld1q_s32(c7_ptr + 1 * 4));
-            v_c72 = vaddq_s32(v_c72, vld1q_s32(c7_ptr + 2 * 4));
-        }
-
-        vst1q_s32(c0_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-        vst1q_s32(c0_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c01, vmin), vmax));
-        vst1q_s32(c0_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c02, vmin), vmax));
-        vst1q_s32(c1_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-        vst1q_s32(c1_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c11, vmin), vmax));
-        vst1q_s32(c1_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c12, vmin), vmax));
-        vst1q_s32(c2_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-        vst1q_s32(c2_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c21, vmin), vmax));
-        vst1q_s32(c2_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c22, vmin), vmax));
-        vst1q_s32(c3_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-        vst1q_s32(c3_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c31, vmin), vmax));
-        vst1q_s32(c3_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c32, vmin), vmax));
-        vst1q_s32(c4_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
-        vst1q_s32(c4_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c41, vmin), vmax));
-        vst1q_s32(c4_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c42, vmin), vmax));
-        vst1q_s32(c5_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
-        vst1q_s32(c5_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c51, vmin), vmax));
-        vst1q_s32(c5_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c52, vmin), vmax));
-        vst1q_s32(c6_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
-        vst1q_s32(c6_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c61, vmin), vmax));
-        vst1q_s32(c6_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c62, vmin), vmax));
-        vst1q_s32(c7_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
-        vst1q_s32(c7_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c71, vmin), vmax));
-        vst1q_s32(c7_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c72, vmin), vmax));
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-        c4_ptr += 12;
-        c5_ptr += 12;
-        c6_ptr += 12;
-        c7_ptr += 12;
-
-        B += ldb_panel;
-    }
-
-    const int rem = nc - n;
-    if (rem > 0) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-        int32x4_t v_c40 = vdupq_n_s32(0), v_c41 = v_c40, v_c42 = v_c40;
-        int32x4_t v_c50 = vdupq_n_s32(0), v_c51 = v_c50, v_c52 = v_c50;
-        int32x4_t v_c60 = vdupq_n_s32(0), v_c61 = v_c60, v_c62 = v_c60;
-        int32x4_t v_c70 = vdupq_n_s32(0), v_c71 = v_c70, v_c72 = v_c70;
-
-        const int8_t* NNOPS_RESTRICT a0 = A + 0 * lda;
-        const int8_t* NNOPS_RESTRICT a1 = A + r1 * lda;
-        const int8_t* NNOPS_RESTRICT a2 = A + r2 * lda;
-        const int8_t* NNOPS_RESTRICT a3 = A + r3 * lda;
-        const int8_t* NNOPS_RESTRICT a4 = A + r4 * lda;
-        const int8_t* NNOPS_RESTRICT a5 = A + r5 * lda;
-        const int8_t* NNOPS_RESTRICT a6 = A + r6 * lda;
-        const int8_t* NNOPS_RESTRICT a7 = A + r7 * lda;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-                const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-                const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-                b_ptr += 48;
-
-                int8x16_t v_a = mma_i8_bcast_group(a0);
-                v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-                v_c01 = vdotq_s32(v_c01, v_b1, v_a);
-                v_c02 = vdotq_s32(v_c02, v_b2, v_a);
-                a0 += 4;
-
-                v_a = mma_i8_bcast_group(a1);
-                v_c10 = vdotq_s32(v_c10, v_b0, v_a);
-                v_c11 = vdotq_s32(v_c11, v_b1, v_a);
-                v_c12 = vdotq_s32(v_c12, v_b2, v_a);
-                a1 += 4;
-
-                v_a = mma_i8_bcast_group(a2);
-                v_c20 = vdotq_s32(v_c20, v_b0, v_a);
-                v_c21 = vdotq_s32(v_c21, v_b1, v_a);
-                v_c22 = vdotq_s32(v_c22, v_b2, v_a);
-                a2 += 4;
-
-                v_a = mma_i8_bcast_group(a3);
-                v_c30 = vdotq_s32(v_c30, v_b0, v_a);
-                v_c31 = vdotq_s32(v_c31, v_b1, v_a);
-                v_c32 = vdotq_s32(v_c32, v_b2, v_a);
-                a3 += 4;
-
-                v_a = mma_i8_bcast_group(a4);
-                v_c40 = vdotq_s32(v_c40, v_b0, v_a);
-                v_c41 = vdotq_s32(v_c41, v_b1, v_a);
-                v_c42 = vdotq_s32(v_c42, v_b2, v_a);
-                a4 += 4;
-
-                v_a = mma_i8_bcast_group(a5);
-                v_c50 = vdotq_s32(v_c50, v_b0, v_a);
-                v_c51 = vdotq_s32(v_c51, v_b1, v_a);
-                v_c52 = vdotq_s32(v_c52, v_b2, v_a);
-                a5 += 4;
-
-                v_a = mma_i8_bcast_group(a6);
-                v_c60 = vdotq_s32(v_c60, v_b0, v_a);
-                v_c61 = vdotq_s32(v_c61, v_b1, v_a);
-                v_c62 = vdotq_s32(v_c62, v_b2, v_a);
-                a6 += 4;
-
-                v_a = mma_i8_bcast_group(a7);
-                v_c70 = vdotq_s32(v_c70, v_b0, v_a);
-                v_c71 = vdotq_s32(v_c71, v_b1, v_a);
-                v_c72 = vdotq_s32(v_c72, v_b2, v_a);
-                a7 += 4;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-                b_ptr += 48;
-
-                v_c00 = vdotq_s32(v_c00, v_b0, mma_i8_bcast_group(a0));
-                v_c10 = vdotq_s32(v_c10, v_b0, mma_i8_bcast_group(a1));
-                v_c20 = vdotq_s32(v_c20, v_b0, mma_i8_bcast_group(a2));
-                v_c30 = vdotq_s32(v_c30, v_b0, mma_i8_bcast_group(a3));
-                v_c40 = vdotq_s32(v_c40, v_b0, mma_i8_bcast_group(a4));
-                v_c50 = vdotq_s32(v_c50, v_b0, mma_i8_bcast_group(a5));
-                v_c60 = vdotq_s32(v_c60, v_b0, mma_i8_bcast_group(a6));
-                v_c70 = vdotq_s32(v_c70, v_b0, mma_i8_bcast_group(a7));
-
-                a0 += 4;
-                a1 += 4;
-                a2 += 4;
-                a3 += 4;
-                a4 += 4;
-                a5 += 4;
-                a6 += 4;
-                a7 += 4;
-            }
-        }
-
-        if (rem >= 4) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
-                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
-                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
-                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
-            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
-            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
-            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            c4_ptr += 4;
-            c5_ptr += 4;
-            c6_ptr += 4;
-            c7_ptr += 4;
-            v_c00 = v_c01;
-            v_c10 = v_c11;
-            v_c20 = v_c21;
-            v_c30 = v_c31;
-            v_c40 = v_c41;
-            v_c50 = v_c51;
-            v_c60 = v_c61;
-            v_c70 = v_c71;
-        }
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
-                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
-                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
-                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
-            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
-            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
-            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            c4_ptr += 4;
-            c5_ptr += 4;
-            c6_ptr += 4;
-            c7_ptr += 4;
-            v_c00 = v_c02;
-            v_c10 = v_c12;
-            v_c20 = v_c22;
-            v_c30 = v_c32;
-            v_c40 = v_c42;
-            v_c50 = v_c52;
-            v_c60 = v_c62;
-            v_c70 = v_c72;
-        }
-        if (rem >= 12) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-                v_c40 = vaddq_s32(v_c40, vld1q_s32(c4_ptr));
-                v_c50 = vaddq_s32(v_c50, vld1q_s32(c5_ptr));
-                v_c60 = vaddq_s32(v_c60, vld1q_s32(c6_ptr));
-                v_c70 = vaddq_s32(v_c70, vld1q_s32(c7_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            vst1q_s32(c4_ptr, vminq_s32(vmaxq_s32(v_c40, vmin), vmax));
-            vst1q_s32(c5_ptr, vminq_s32(vmaxq_s32(v_c50, vmin), vmax));
-            vst1q_s32(c6_ptr, vminq_s32(vmaxq_s32(v_c60, vmin), vmax));
-            vst1q_s32(c7_ptr, vminq_s32(vmaxq_s32(v_c70, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            c4_ptr += 4;
-            c5_ptr += 4;
-            c6_ptr += 4;
-            c7_ptr += 4;
-        }
-        const int rl = rem & 3;
-        if (rl & 2) {
-            const int32x2_t vmin2 = vget_low_s32(vmin);
-            const int32x2_t vmax2 = vget_low_s32(vmax);
-            int32x2_t v0 = vget_low_s32(v_c00);
-            int32x2_t v1 = vget_low_s32(v_c10);
-            int32x2_t v2 = vget_low_s32(v_c20);
-            int32x2_t v3 = vget_low_s32(v_c30);
-            int32x2_t v4 = vget_low_s32(v_c40);
-            int32x2_t v5 = vget_low_s32(v_c50);
-            int32x2_t v6 = vget_low_s32(v_c60);
-            int32x2_t v7 = vget_low_s32(v_c70);
-            if constexpr (!zero_mode) {
-                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
-                v1 = vadd_s32(v1, vld1_s32(c1_ptr));
-                v2 = vadd_s32(v2, vld1_s32(c2_ptr));
-                v3 = vadd_s32(v3, vld1_s32(c3_ptr));
-                v4 = vadd_s32(v4, vld1_s32(c4_ptr));
-                v5 = vadd_s32(v5, vld1_s32(c5_ptr));
-                v6 = vadd_s32(v6, vld1_s32(c6_ptr));
-                v7 = vadd_s32(v7, vld1_s32(c7_ptr));
-            }
-            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
-            vst1_s32(c1_ptr, vmin_s32(vmax_s32(v1, vmin2), vmax2));
-            vst1_s32(c2_ptr, vmin_s32(vmax_s32(v2, vmin2), vmax2));
-            vst1_s32(c3_ptr, vmin_s32(vmax_s32(v3, vmin2), vmax2));
-            vst1_s32(c4_ptr, vmin_s32(vmax_s32(v4, vmin2), vmax2));
-            vst1_s32(c5_ptr, vmin_s32(vmax_s32(v5, vmin2), vmax2));
-            vst1_s32(c6_ptr, vmin_s32(vmax_s32(v6, vmin2), vmax2));
-            vst1_s32(c7_ptr, vmin_s32(vmax_s32(v7, vmin2), vmax2));
-            c0_ptr += 2;
-            c1_ptr += 2;
-            c2_ptr += 2;
-            c3_ptr += 2;
-            c4_ptr += 2;
-            c5_ptr += 2;
-            c6_ptr += 2;
-            c7_ptr += 2;
-        }
-        if (rl & 1) {
-            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
-            int32_t x1 = (rl & 2) ? vgetq_lane_s32(v_c10, 2) : vgetq_lane_s32(v_c10, 0);
-            int32_t x2 = (rl & 2) ? vgetq_lane_s32(v_c20, 2) : vgetq_lane_s32(v_c20, 0);
-            int32_t x3 = (rl & 2) ? vgetq_lane_s32(v_c30, 2) : vgetq_lane_s32(v_c30, 0);
-            int32_t x4 = (rl & 2) ? vgetq_lane_s32(v_c40, 2) : vgetq_lane_s32(v_c40, 0);
-            int32_t x5 = (rl & 2) ? vgetq_lane_s32(v_c50, 2) : vgetq_lane_s32(v_c50, 0);
-            int32_t x6 = (rl & 2) ? vgetq_lane_s32(v_c60, 2) : vgetq_lane_s32(v_c60, 0);
-            int32_t x7 = (rl & 2) ? vgetq_lane_s32(v_c70, 2) : vgetq_lane_s32(v_c70, 0);
-            if constexpr (!zero_mode) {
-                x0 += c0_ptr[0];
-                x1 += c1_ptr[0];
-                x2 += c2_ptr[0];
-                x3 += c3_ptr[0];
-                x4 += c4_ptr[0];
-                x5 += c5_ptr[0];
-                x6 += c6_ptr[0];
-                x7 += c7_ptr[0];
-            }
-            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
-            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
-            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
-            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
-            c4_ptr[0] = std::min(std::max(x4, clamp_min), clamp_max);
-            c5_ptr[0] = std::min(std::max(x5, clamp_min), clamp_max);
-            c6_ptr[0] = std::min(std::max(x6, clamp_min), clamp_max);
-            c7_ptr[0] = std::min(std::max(x7, clamp_min), clamp_max);
-        }
-    }
-}
-
-template <bool zero_mode = false>
-inline void mma_direct_mr4_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
-                                            int ldc, const int8_t* NNOPS_RESTRICT A, int lda,
-                                            const int8_t* NNOPS_RESTRICT B, int ldb,
-                                            int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-
-    int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
-    int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-
-    const int kg = kc >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kc);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-
-    int n = 0;
-    for (; n < nc - 11; n += 12) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-
-        const int8_t* NNOPS_RESTRICT a0 = A + 0 * lda;
-        const int8_t* NNOPS_RESTRICT a1 = A + r1 * lda;
-        const int8_t* NNOPS_RESTRICT a2 = A + r2 * lda;
-        const int8_t* NNOPS_RESTRICT a3 = A + r3 * lda;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-            b_ptr += 48;
-
-            int8x16_t v_a = mma_i8_bcast_group(a0);
-            v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-            v_c01 = vdotq_s32(v_c01, v_b1, v_a);
-            v_c02 = vdotq_s32(v_c02, v_b2, v_a);
-            a0 += 4;
-
-            v_a = mma_i8_bcast_group(a1);
-            v_c10 = vdotq_s32(v_c10, v_b0, v_a);
-            v_c11 = vdotq_s32(v_c11, v_b1, v_a);
-            v_c12 = vdotq_s32(v_c12, v_b2, v_a);
-            a1 += 4;
-
-            v_a = mma_i8_bcast_group(a2);
-            v_c20 = vdotq_s32(v_c20, v_b0, v_a);
-            v_c21 = vdotq_s32(v_c21, v_b1, v_a);
-            v_c22 = vdotq_s32(v_c22, v_b2, v_a);
-            a2 += 4;
-
-            v_a = mma_i8_bcast_group(a3);
-            v_c30 = vdotq_s32(v_c30, v_b0, v_a);
-            v_c31 = vdotq_s32(v_c31, v_b1, v_a);
-            v_c32 = vdotq_s32(v_c32, v_b2, v_a);
-            a3 += 4;
-        }
-
-        if constexpr (!zero_mode) {
-            v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr + 0 * 4));
-            v_c01 = vaddq_s32(v_c01, vld1q_s32(c0_ptr + 1 * 4));
-            v_c02 = vaddq_s32(v_c02, vld1q_s32(c0_ptr + 2 * 4));
-            v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr + 0 * 4));
-            v_c11 = vaddq_s32(v_c11, vld1q_s32(c1_ptr + 1 * 4));
-            v_c12 = vaddq_s32(v_c12, vld1q_s32(c1_ptr + 2 * 4));
-            v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr + 0 * 4));
-            v_c21 = vaddq_s32(v_c21, vld1q_s32(c2_ptr + 1 * 4));
-            v_c22 = vaddq_s32(v_c22, vld1q_s32(c2_ptr + 2 * 4));
-            v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr + 0 * 4));
-            v_c31 = vaddq_s32(v_c31, vld1q_s32(c3_ptr + 1 * 4));
-            v_c32 = vaddq_s32(v_c32, vld1q_s32(c3_ptr + 2 * 4));
-        }
-
-        vst1q_s32(c0_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-        vst1q_s32(c0_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c01, vmin), vmax));
-        vst1q_s32(c0_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c02, vmin), vmax));
-        vst1q_s32(c1_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-        vst1q_s32(c1_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c11, vmin), vmax));
-        vst1q_s32(c1_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c12, vmin), vmax));
-        vst1q_s32(c2_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-        vst1q_s32(c2_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c21, vmin), vmax));
-        vst1q_s32(c2_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c22, vmin), vmax));
-        vst1q_s32(c3_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-        vst1q_s32(c3_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c31, vmin), vmax));
-        vst1q_s32(c3_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c32, vmin), vmax));
-
-        c0_ptr += 12;
-        c1_ptr += 12;
-        c2_ptr += 12;
-        c3_ptr += 12;
-
-        B += ldb_panel;
-    }
-
-    const int rem = nc - n;
-    if (rem > 0) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-        int32x4_t v_c10 = vdupq_n_s32(0), v_c11 = v_c10, v_c12 = v_c10;
-        int32x4_t v_c20 = vdupq_n_s32(0), v_c21 = v_c20, v_c22 = v_c20;
-        int32x4_t v_c30 = vdupq_n_s32(0), v_c31 = v_c30, v_c32 = v_c30;
-
-        const int8_t* NNOPS_RESTRICT a0 = A + 0 * lda;
-        const int8_t* NNOPS_RESTRICT a1 = A + r1 * lda;
-        const int8_t* NNOPS_RESTRICT a2 = A + r2 * lda;
-        const int8_t* NNOPS_RESTRICT a3 = A + r3 * lda;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-                const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-                const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-                b_ptr += 48;
-
-                int8x16_t v_a = mma_i8_bcast_group(a0);
-                v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-                v_c01 = vdotq_s32(v_c01, v_b1, v_a);
-                v_c02 = vdotq_s32(v_c02, v_b2, v_a);
-                a0 += 4;
-
-                v_a = mma_i8_bcast_group(a1);
-                v_c10 = vdotq_s32(v_c10, v_b0, v_a);
-                v_c11 = vdotq_s32(v_c11, v_b1, v_a);
-                v_c12 = vdotq_s32(v_c12, v_b2, v_a);
-                a1 += 4;
-
-                v_a = mma_i8_bcast_group(a2);
-                v_c20 = vdotq_s32(v_c20, v_b0, v_a);
-                v_c21 = vdotq_s32(v_c21, v_b1, v_a);
-                v_c22 = vdotq_s32(v_c22, v_b2, v_a);
-                a2 += 4;
-
-                v_a = mma_i8_bcast_group(a3);
-                v_c30 = vdotq_s32(v_c30, v_b0, v_a);
-                v_c31 = vdotq_s32(v_c31, v_b1, v_a);
-                v_c32 = vdotq_s32(v_c32, v_b2, v_a);
-                a3 += 4;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-                b_ptr += 48;
-
-                v_c00 = vdotq_s32(v_c00, v_b0, mma_i8_bcast_group(a0));
-                v_c10 = vdotq_s32(v_c10, v_b0, mma_i8_bcast_group(a1));
-                v_c20 = vdotq_s32(v_c20, v_b0, mma_i8_bcast_group(a2));
-                v_c30 = vdotq_s32(v_c30, v_b0, mma_i8_bcast_group(a3));
-
-                a0 += 4;
-                a1 += 4;
-                a2 += 4;
-                a3 += 4;
-            }
-        }
-
-        if (rem >= 4) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            v_c00 = v_c01;
-            v_c10 = v_c11;
-            v_c20 = v_c21;
-            v_c30 = v_c31;
-        }
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-            v_c00 = v_c02;
-            v_c10 = v_c12;
-            v_c20 = v_c22;
-            v_c30 = v_c32;
-        }
-        if (rem >= 12) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-                v_c10 = vaddq_s32(v_c10, vld1q_s32(c1_ptr));
-                v_c20 = vaddq_s32(v_c20, vld1q_s32(c2_ptr));
-                v_c30 = vaddq_s32(v_c30, vld1q_s32(c3_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            vst1q_s32(c1_ptr, vminq_s32(vmaxq_s32(v_c10, vmin), vmax));
-            vst1q_s32(c2_ptr, vminq_s32(vmaxq_s32(v_c20, vmin), vmax));
-            vst1q_s32(c3_ptr, vminq_s32(vmaxq_s32(v_c30, vmin), vmax));
-            c0_ptr += 4;
-            c1_ptr += 4;
-            c2_ptr += 4;
-            c3_ptr += 4;
-        }
-        const int rl = rem & 3;
-        if (rl & 2) {
-            const int32x2_t vmin2 = vget_low_s32(vmin);
-            const int32x2_t vmax2 = vget_low_s32(vmax);
-            int32x2_t v0 = vget_low_s32(v_c00);
-            int32x2_t v1 = vget_low_s32(v_c10);
-            int32x2_t v2 = vget_low_s32(v_c20);
-            int32x2_t v3 = vget_low_s32(v_c30);
-            if constexpr (!zero_mode) {
-                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
-                v1 = vadd_s32(v1, vld1_s32(c1_ptr));
-                v2 = vadd_s32(v2, vld1_s32(c2_ptr));
-                v3 = vadd_s32(v3, vld1_s32(c3_ptr));
-            }
-            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
-            vst1_s32(c1_ptr, vmin_s32(vmax_s32(v1, vmin2), vmax2));
-            vst1_s32(c2_ptr, vmin_s32(vmax_s32(v2, vmin2), vmax2));
-            vst1_s32(c3_ptr, vmin_s32(vmax_s32(v3, vmin2), vmax2));
-            c0_ptr += 2;
-            c1_ptr += 2;
-            c2_ptr += 2;
-            c3_ptr += 2;
-        }
-        if (rl & 1) {
-            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
-            int32_t x1 = (rl & 2) ? vgetq_lane_s32(v_c10, 2) : vgetq_lane_s32(v_c10, 0);
-            int32_t x2 = (rl & 2) ? vgetq_lane_s32(v_c20, 2) : vgetq_lane_s32(v_c20, 0);
-            int32_t x3 = (rl & 2) ? vgetq_lane_s32(v_c30, 2) : vgetq_lane_s32(v_c30, 0);
-            if constexpr (!zero_mode) {
-                x0 += c0_ptr[0];
-                x1 += c1_ptr[0];
-                x2 += c2_ptr[0];
-                x3 += c3_ptr[0];
-            }
-            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
-            c1_ptr[0] = std::min(std::max(x1, clamp_min), clamp_max);
-            c2_ptr[0] = std::min(std::max(x2, clamp_min), clamp_max);
-            c3_ptr[0] = std::min(std::max(x3, clamp_min), clamp_max);
-        }
-    }
-}
-
-template <bool zero_mode = false>
-inline void mma_direct_mr1_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
-                                            int ldc, const int8_t* NNOPS_RESTRICT A, int lda,
-                                            const int8_t* NNOPS_RESTRICT B, int ldb,
-                                            int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    (void)mr;  // one row, so the row count never varies
-    (void)lda; // A is read consecutively along its single row
-    (void)ldc; // one row, so the C row stride never applies
-
-    int32_t* NNOPS_RESTRICT c0_ptr = C;
-
-    const int kg = kc >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kc);
-    const int32x4_t vmin = vdupq_n_s32(clamp_min);
-    const int32x4_t vmax = vdupq_n_s32(clamp_max);
-
-    int n = 0;
-    for (; n < nc - 11; n += 12) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a = mma_i8_bcast_group(a_ptr);
-            a_ptr += 4;
-
-            const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-            const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-            const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-
-            v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-            v_c01 = vdotq_s32(v_c01, v_b1, v_a);
-            v_c02 = vdotq_s32(v_c02, v_b2, v_a);
-
-            b_ptr += 48;
-        }
-
-        if constexpr (!zero_mode) {
-            v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr + 0 * 4));
-            v_c01 = vaddq_s32(v_c01, vld1q_s32(c0_ptr + 1 * 4));
-            v_c02 = vaddq_s32(v_c02, vld1q_s32(c0_ptr + 2 * 4));
-        }
-
-        vst1q_s32(c0_ptr + 0 * 4, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-        vst1q_s32(c0_ptr + 1 * 4, vminq_s32(vmaxq_s32(v_c01, vmin), vmax));
-        vst1q_s32(c0_ptr + 2 * 4, vminq_s32(vmaxq_s32(v_c02, vmin), vmax));
-
-        c0_ptr += 12;
-        B += ldb_panel;
-    }
-
-    const int rem = nc - n;
-    if (rem > 0) {
-        int32x4_t v_c00 = vdupq_n_s32(0), v_c01 = v_c00, v_c02 = v_c00;
-
-        const int8_t* NNOPS_RESTRICT a_ptr = A;
-        const int8_t* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_a = mma_i8_bcast_group(a_ptr);
-                a_ptr += 4;
-
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-                const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
-                const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
-
-                v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-                v_c01 = vdotq_s32(v_c01, v_b1, v_a);
-                v_c02 = vdotq_s32(v_c02, v_b2, v_a);
-
-                b_ptr += 48;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const int8x16_t v_a = mma_i8_bcast_group(a_ptr);
-                a_ptr += 4;
-
-                const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
-
-                v_c00 = vdotq_s32(v_c00, v_b0, v_a);
-
-                b_ptr += 48;
-            }
-        }
-
-        if (rem >= 4) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            c0_ptr += 4;
-            v_c00 = v_c01;
-        }
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            c0_ptr += 4;
-            v_c00 = v_c02;
-        }
-        if (rem >= 12) {
-            if constexpr (!zero_mode) {
-                v_c00 = vaddq_s32(v_c00, vld1q_s32(c0_ptr));
-            }
-            vst1q_s32(c0_ptr, vminq_s32(vmaxq_s32(v_c00, vmin), vmax));
-            c0_ptr += 4;
-        }
-        const int rl = rem & 3;
-        if (rl & 2) {
-            const int32x2_t vmin2 = vget_low_s32(vmin);
-            const int32x2_t vmax2 = vget_low_s32(vmax);
-            int32x2_t v0 = vget_low_s32(v_c00);
-            if constexpr (!zero_mode) {
-                v0 = vadd_s32(v0, vld1_s32(c0_ptr));
-            }
-            vst1_s32(c0_ptr, vmin_s32(vmax_s32(v0, vmin2), vmax2));
-            c0_ptr += 2;
-        }
-        if (rl & 1) {
-            int32_t x0 = (rl & 2) ? vgetq_lane_s32(v_c00, 2) : vgetq_lane_s32(v_c00, 0);
-            if constexpr (!zero_mode) {
-                x0 += c0_ptr[0];
-            }
-            c0_ptr[0] = std::min(std::max(x0, clamp_min), clamp_max);
-        }
-    }
-}
-
-// =========================================================================
-//  the requantizing variants (packed A + packed B)
+//  one walk: the group, the K loop, the stores
 // =========================================================================
 //
-// SDOT's accumulators are already one row's four columns, so the store is a
-// straight requantize — no transpose step. One call covers the whole K and the
-// accumulators go to the 8-bit destination; no int32 tile reaches memory.
-//
-// Every index into the accumulator, scale and bias blocks is a literal: the
-// group walk and the store are written out at the panel's three widths instead
-// of looping to a template bound. A loop costs nothing where the compiler
-// unrolls it and everything where it does not — the array is then indexed at
-// run time and the whole block moves to the stack (GCC 14 does exactly that on
-// the narrow path, and turns the ragged byte copy into a memcpy call).
+// Every int8 rung — int32 accumulators or requantized, packed A or row-major —
+// is the same walk: one k group of MR rows against NG four-column groups, then
+// a store. The accumulators are laid out [NG][MR] so a column is contiguous,
+// and every index into them (and into the per-column scale and bias) is a
+// literal. A loop to a template bound costs nothing where the compiler unrolls
+// it and everything where it does not: the array is then indexed at run time
+// and the whole block moves to the stack.
 
 /// One four-column group: MR rows (as one or two 16-byte A registers) against
 /// one B vector, into that column's MR accumulators.
@@ -1755,7 +156,7 @@ i8_sdot_col_zero(int32x4_t (&col)[MR]) noexcept
     }
 }
 
-/// One k group of a panel: MR rows of packed A against NG four-column groups.
+/// One k group of a packed-A panel: MR rows against NG four-column groups.
 template <int MR, int NG>
 __attribute__((always_inline)) inline void
 i8_sdot_group(const int8_t*& a_ptr, const int8_t* b_ptr, int32x4_t (&acc)[NG][MR]) noexcept
@@ -1766,7 +167,7 @@ i8_sdot_group(const int8_t*& a_ptr, const int8_t* b_ptr, int32x4_t (&acc)[NG][MR
     if constexpr (MR == 1) {
         // The row's four bytes are splatted into every lane; each B lane is a
         // column, so one plain dot covers the group.
-        va0 = mma_i8_bcast_group(a_ptr);
+        va0 = vreinterpretq_s8_s32(vdupq_n_s32(*reinterpret_cast<const int32_t*>(a_ptr)));
         va1 = va0;
         a_ptr += 4;
     } else if constexpr (MR == 4) {
@@ -1806,6 +207,468 @@ i8_sdot_mma(const int8_t* A, const int8_t* B, int kg, int32x4_t (&acc)[NG][MR]) 
         i8_sdot_group<MR, NG>(a_ptr, b_ptr, acc);
     }
 }
+
+/// The output rows, aliasing the last live one past `mr` (the ladder emits a
+/// rung at its own height, so in practice `mr == MR`).
+template <int MR, class T>
+__attribute__((always_inline)) inline void
+i8_sdot_row_ptrs(T* C, int64_t ldm, int mr, T* (&row)[MR]) noexcept
+{
+    row[0] = C;
+    if constexpr (MR > 1) {
+        row[1] = C + std::min<int64_t>(1, mr - 1) * ldm;
+    }
+    if constexpr (MR > 2) {
+        row[2] = C + std::min<int64_t>(2, mr - 1) * ldm;
+    }
+    if constexpr (MR > 3) {
+        row[3] = C + std::min<int64_t>(3, mr - 1) * ldm;
+    }
+    if constexpr (MR > 4) {
+        row[4] = C + std::min<int64_t>(4, mr - 1) * ldm;
+    }
+    if constexpr (MR > 5) {
+        row[5] = C + std::min<int64_t>(5, mr - 1) * ldm;
+    }
+    if constexpr (MR > 6) {
+        row[6] = C + std::min<int64_t>(6, mr - 1) * ldm;
+    }
+    if constexpr (MR > 7) {
+        row[7] = C + std::min<int64_t>(7, mr - 1) * ldm;
+    }
+}
+
+/// Advance every row pointer by `step` elements.
+template <int MR, class T>
+__attribute__((always_inline)) inline void
+i8_sdot_advance(T* (&row)[MR], int64_t step) noexcept
+{
+    row[0] += step;
+    if constexpr (MR > 1) {
+        row[1] += step;
+    }
+    if constexpr (MR > 2) {
+        row[2] += step;
+    }
+    if constexpr (MR > 3) {
+        row[3] += step;
+    }
+    if constexpr (MR > 4) {
+        row[4] += step;
+    }
+    if constexpr (MR > 5) {
+        row[5] += step;
+    }
+    if constexpr (MR > 6) {
+        row[6] += step;
+    }
+    if constexpr (MR > 7) {
+        row[7] += step;
+    }
+}
+
+// ---- the int32 store ------------------------------------------------------
+
+/// Four int32 columns of one row: add C unless zero-mode, clamp, store.
+template <bool zero_mode>
+__attribute__((always_inline)) inline void
+i8_store4q_i32(int32_t* p, int32x4_t v, int32x4_t vmin, int32x4_t vmax) noexcept
+{
+    if constexpr (!zero_mode) {
+        v = vaddq_s32(v, vld1q_s32(p));
+    }
+    vst1q_s32(p, vminq_s32(vmaxq_s32(v, vmin), vmax));
+}
+
+/// 1-3 int32 columns: the C correction is read scalarly (a 16-byte load would
+/// read past the tile) and written back with lane stores.
+template <bool zero_mode>
+__attribute__((always_inline)) inline void
+i8_store4q_i32_lanes(int32_t* p, int lanes, int32x4_t v, int32x4_t vmin,
+                     int32x4_t vmax) noexcept
+{
+    if constexpr (!zero_mode) {
+        int32x4_t c = vdupq_n_s32(p[0]);
+        if (lanes > 1) {
+            c = vsetq_lane_s32(p[1], c, 1);
+        }
+        if (lanes > 2) {
+            c = vsetq_lane_s32(p[2], c, 2);
+        }
+        v = vaddq_s32(v, c);
+    }
+    v = vminq_s32(vmaxq_s32(v, vmin), vmax);
+    vst1q_lane_s32(p + 0, v, 0);
+    if (lanes > 1) {
+        vst1q_lane_s32(p + 1, v, 1);
+    }
+    if (lanes > 2) {
+        vst1q_lane_s32(p + 2, v, 2);
+    }
+}
+
+/// Write one column group of an int32 panel: MR rows, `live` columns left in
+/// the panel from this group's first column.
+template <int MR, bool zero_mode>
+__attribute__((always_inline)) inline void
+i8_sdot_store_col_i32(int32_t* const (&row)[MR], int col0, int col, int live,
+                      const int32x4_t (&col_acc)[MR], int32x4_t vmin,
+                      int32x4_t vmax) noexcept
+{
+    const int l = live - col;
+    if (l >= 4) {
+        i8_store4q_i32<zero_mode>(row[0] + col0 + col, col_acc[0], vmin, vmax);
+        if constexpr (MR > 1) {
+            i8_store4q_i32<zero_mode>(row[1] + col0 + col, col_acc[1], vmin, vmax);
+        }
+        if constexpr (MR > 2) {
+            i8_store4q_i32<zero_mode>(row[2] + col0 + col, col_acc[2], vmin, vmax);
+        }
+        if constexpr (MR > 3) {
+            i8_store4q_i32<zero_mode>(row[3] + col0 + col, col_acc[3], vmin, vmax);
+        }
+        if constexpr (MR > 4) {
+            i8_store4q_i32<zero_mode>(row[4] + col0 + col, col_acc[4], vmin, vmax);
+        }
+        if constexpr (MR > 5) {
+            i8_store4q_i32<zero_mode>(row[5] + col0 + col, col_acc[5], vmin, vmax);
+        }
+        if constexpr (MR > 6) {
+            i8_store4q_i32<zero_mode>(row[6] + col0 + col, col_acc[6], vmin, vmax);
+        }
+        if constexpr (MR > 7) {
+            i8_store4q_i32<zero_mode>(row[7] + col0 + col, col_acc[7], vmin, vmax);
+        }
+    } else if (l > 0) {
+        i8_store4q_i32_lanes<zero_mode>(row[0] + col0 + col, l, col_acc[0], vmin, vmax);
+        if constexpr (MR > 1) {
+            i8_store4q_i32_lanes<zero_mode>(row[1] + col0 + col, l, col_acc[1], vmin, vmax);
+        }
+        if constexpr (MR > 2) {
+            i8_store4q_i32_lanes<zero_mode>(row[2] + col0 + col, l, col_acc[2], vmin, vmax);
+        }
+        if constexpr (MR > 3) {
+            i8_store4q_i32_lanes<zero_mode>(row[3] + col0 + col, l, col_acc[3], vmin, vmax);
+        }
+        if constexpr (MR > 4) {
+            i8_store4q_i32_lanes<zero_mode>(row[4] + col0 + col, l, col_acc[4], vmin, vmax);
+        }
+        if constexpr (MR > 5) {
+            i8_store4q_i32_lanes<zero_mode>(row[5] + col0 + col, l, col_acc[5], vmin, vmax);
+        }
+        if constexpr (MR > 6) {
+            i8_store4q_i32_lanes<zero_mode>(row[6] + col0 + col, l, col_acc[6], vmin, vmax);
+        }
+        if constexpr (MR > 7) {
+            i8_store4q_i32_lanes<zero_mode>(row[7] + col0 + col, l, col_acc[7], vmin, vmax);
+        }
+    }
+}
+
+/// Write the live columns of NG groups, starting at `col0`.
+template <int MR, int NG, bool zero_mode>
+__attribute__((always_inline)) inline void
+i8_sdot_store_i32(int32_t* const (&row)[MR], int col0, int live, int32x4_t (&acc)[NG][MR],
+                  int32x4_t vmin, int32x4_t vmax) noexcept
+{
+    static_assert(NG >= 1 && NG <= 3, "a panel is one to three column groups");
+    i8_sdot_store_col_i32<MR, zero_mode>(row, col0, 0, live, acc[0], vmin, vmax);
+    if constexpr (NG > 1) {
+        i8_sdot_store_col_i32<MR, zero_mode>(row, col0, 4, live, acc[1], vmin, vmax);
+    }
+    if constexpr (NG > 2) {
+        i8_sdot_store_col_i32<MR, zero_mode>(row, col0, 8, live, acc[2], vmin, vmax);
+    }
+}
+
+/// One narrow remainder panel through NG groups, int32 destination.
+template <int MR, int NG, bool zero_mode>
+__attribute__((always_inline)) inline void
+i8_sdot_tail_i32(int32_t* const (&row)[MR], int n, int live, int kg, const int8_t* A,
+                 const int8_t* B, int32x4_t vmin, int32x4_t vmax) noexcept
+{
+    int32x4_t acc[NG][MR];
+    i8_sdot_mma<MR, NG>(A, B, kg, acc);
+    i8_sdot_store_i32<MR, NG, zero_mode>(row, n, live, acc, vmin, vmax);
+}
+
+// =========================================================================
+//  packed A + packed B  (mr = 8, 4, 1)
+// =========================================================================
+
+/// One packed-A rung: the whole N side into int32 C.
+template <int MR, bool zero_mode>
+inline void mma_pack_mr_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                         int ldc, const int8_t* NNOPS_RESTRICT A,
+                                         const int8_t* NNOPS_RESTRICT B, int ldb,
+                                         int32_t clamp_min, int32_t clamp_max) noexcept
+{
+    int32_t* row[MR];
+    i8_sdot_row_ptrs<MR, int32_t>(C, ldc, mr, row);
+    const int kbytes = (kc + 3) & ~3;
+    const int kg = kbytes >> 2;
+    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
+    const int32x4_t vmin = vdupq_n_s32(clamp_min);
+    const int32x4_t vmax = vdupq_n_s32(clamp_max);
+
+    int n = 0;
+    for (; n + mma_i8_nr_max <= nc; n += mma_i8_nr_max) {
+        int32x4_t acc[3][MR];
+        i8_sdot_mma<MR, 3>(A, B, kg, acc);
+        i8_sdot_store_i32<MR, 3, zero_mode>(row, n, 12, acc, vmin, vmax);
+        B += ldb_panel;
+    }
+
+    // The live remainder narrows to the groups it needs: 4, 8 or 12 columns.
+    const int live = nc - n;
+    if (live > 8) {
+        i8_sdot_tail_i32<MR, 3, zero_mode>(row, n, live, kg, A, B, vmin, vmax);
+    } else if (live > 4) {
+        i8_sdot_tail_i32<MR, 2, zero_mode>(row, n, live, kg, A, B, vmin, vmax);
+    } else if (live > 0) {
+        i8_sdot_tail_i32<MR, 1, zero_mode>(row, n, live, kg, A, B, vmin, vmax);
+    }
+}
+
+// =========================================================================
+//  raw A + packed B  (mr = 8, 4, 1) — kc % 4 == 0
+// =========================================================================
+//
+// The same walk with each row's four k bytes broadcast instead of a shared
+// 16-byte panel load, so the rung reads A through `lda`. The A fragment of the
+// next group is loaded at the end of the k loop body, which keeps the MMA at
+// the top of an iteration off the load's latency.
+
+/// The rung's A rows, aliasing the last live one past `mr`.
+template <int MR>
+__attribute__((always_inline)) inline void
+i8_sdot_a_ptrs(const int8_t* A, int lda, int mr, const int8_t* (&a)[MR]) noexcept
+{
+    a[0] = A;
+    if constexpr (MR > 1) {
+        a[1] = A + std::min(1, mr - 1) * lda;
+    }
+    if constexpr (MR > 2) {
+        a[2] = A + std::min(2, mr - 1) * lda;
+    }
+    if constexpr (MR > 3) {
+        a[3] = A + std::min(3, mr - 1) * lda;
+    }
+    if constexpr (MR > 4) {
+        a[4] = A + std::min(4, mr - 1) * lda;
+    }
+    if constexpr (MR > 5) {
+        a[5] = A + std::min(5, mr - 1) * lda;
+    }
+    if constexpr (MR > 6) {
+        a[6] = A + std::min(6, mr - 1) * lda;
+    }
+    if constexpr (MR > 7) {
+        a[7] = A + std::min(7, mr - 1) * lda;
+    }
+}
+
+/// One k group of a row-major panel: MR rows against NG column groups. The
+/// row's four bytes are splatted per group — this route has no shared 16-byte A
+/// load to amortise them from — and nothing but the accumulators is live across
+/// the K loop.
+template <int MR, int NG>
+__attribute__((always_inline)) inline void
+i8_sdot_step_rows(const int8_t* const (&a)[MR], const int8_t* b_ptr,
+                  int32x4_t (&acc)[NG][MR]) noexcept
+{
+    static_assert(NG >= 1 && NG <= 3, "a panel is one to three column groups");
+    const int8x16_t vb0 = vld1q_s8(b_ptr + 0 * 16);
+    int8x16_t vb1 = vb0;
+    int8x16_t vb2 = vb0;
+    if constexpr (NG > 1) {
+        vb1 = vld1q_s8(b_ptr + 1 * 16);
+    }
+    if constexpr (NG > 2) {
+        vb2 = vld1q_s8(b_ptr + 2 * 16);
+    }
+    const auto bcast = [](const int8_t* p) {
+        return vreinterpretq_s8_s32(vdupq_n_s32(*reinterpret_cast<const int32_t*>(p)));
+    };
+    const int8x16_t va0 = bcast(a[0]);
+    acc[0][0] = vdotq_s32(acc[0][0], vb0, va0);
+    if constexpr (NG > 1) {
+        acc[1][0] = vdotq_s32(acc[1][0], vb1, va0);
+    }
+    if constexpr (NG > 2) {
+        acc[2][0] = vdotq_s32(acc[2][0], vb2, va0);
+    }
+    if constexpr (MR > 1) {
+        const int8x16_t va = bcast(a[1]);
+        acc[0][1] = vdotq_s32(acc[0][1], vb0, va);
+        if constexpr (NG > 1) {
+            acc[1][1] = vdotq_s32(acc[1][1], vb1, va);
+        }
+        if constexpr (NG > 2) {
+            acc[2][1] = vdotq_s32(acc[2][1], vb2, va);
+        }
+    }
+    if constexpr (MR > 2) {
+        const int8x16_t va = bcast(a[2]);
+        acc[0][2] = vdotq_s32(acc[0][2], vb0, va);
+        if constexpr (NG > 1) {
+            acc[1][2] = vdotq_s32(acc[1][2], vb1, va);
+        }
+        if constexpr (NG > 2) {
+            acc[2][2] = vdotq_s32(acc[2][2], vb2, va);
+        }
+    }
+    if constexpr (MR > 3) {
+        const int8x16_t va = bcast(a[3]);
+        acc[0][3] = vdotq_s32(acc[0][3], vb0, va);
+        if constexpr (NG > 1) {
+            acc[1][3] = vdotq_s32(acc[1][3], vb1, va);
+        }
+        if constexpr (NG > 2) {
+            acc[2][3] = vdotq_s32(acc[2][3], vb2, va);
+        }
+    }
+    if constexpr (MR > 4) {
+        const int8x16_t va = bcast(a[4]);
+        acc[0][4] = vdotq_s32(acc[0][4], vb0, va);
+        if constexpr (NG > 1) {
+            acc[1][4] = vdotq_s32(acc[1][4], vb1, va);
+        }
+        if constexpr (NG > 2) {
+            acc[2][4] = vdotq_s32(acc[2][4], vb2, va);
+        }
+    }
+    if constexpr (MR > 5) {
+        const int8x16_t va = bcast(a[5]);
+        acc[0][5] = vdotq_s32(acc[0][5], vb0, va);
+        if constexpr (NG > 1) {
+            acc[1][5] = vdotq_s32(acc[1][5], vb1, va);
+        }
+        if constexpr (NG > 2) {
+            acc[2][5] = vdotq_s32(acc[2][5], vb2, va);
+        }
+    }
+    if constexpr (MR > 6) {
+        const int8x16_t va = bcast(a[6]);
+        acc[0][6] = vdotq_s32(acc[0][6], vb0, va);
+        if constexpr (NG > 1) {
+            acc[1][6] = vdotq_s32(acc[1][6], vb1, va);
+        }
+        if constexpr (NG > 2) {
+            acc[2][6] = vdotq_s32(acc[2][6], vb2, va);
+        }
+    }
+    if constexpr (MR > 7) {
+        const int8x16_t va = bcast(a[7]);
+        acc[0][7] = vdotq_s32(acc[0][7], vb0, va);
+        if constexpr (NG > 1) {
+            acc[1][7] = vdotq_s32(acc[1][7], vb1, va);
+        }
+        if constexpr (NG > 2) {
+            acc[2][7] = vdotq_s32(acc[2][7], vb2, va);
+        }
+    }
+}
+
+/// The panel's whole K from row-major rows into zeroed `acc`.
+template <int MR, int NG>
+__attribute__((always_inline)) inline void
+i8_sdot_mma_rows(const int8_t* const (&A)[MR], const int8_t* B, int kg,
+                 int32x4_t (&acc)[NG][MR]) noexcept
+{
+    i8_sdot_col_zero<MR>(acc[0]);
+    if constexpr (NG > 1) {
+        i8_sdot_col_zero<MR>(acc[1]);
+    }
+    if constexpr (NG > 2) {
+        i8_sdot_col_zero<MR>(acc[2]);
+    }
+    const int8_t* a[MR];
+    a[0] = A[0];
+    if constexpr (MR > 1) {
+        a[1] = A[1];
+    }
+    if constexpr (MR > 2) {
+        a[2] = A[2];
+    }
+    if constexpr (MR > 3) {
+        a[3] = A[3];
+    }
+    if constexpr (MR > 4) {
+        a[4] = A[4];
+    }
+    if constexpr (MR > 5) {
+        a[5] = A[5];
+    }
+    if constexpr (MR > 6) {
+        a[6] = A[6];
+    }
+    if constexpr (MR > 7) {
+        a[7] = A[7];
+    }
+    const int8_t* b_ptr = B;
+    for (int k = 0; k < kg; ++k, b_ptr += 48) {
+        i8_sdot_step_rows<MR, NG>(a, b_ptr, acc);
+        i8_sdot_advance<MR>(a, 4);
+    }
+}
+
+/// One row-major-A rung: the whole N side into int32 C.
+template <int MR, bool zero_mode>
+inline void mma_direct_mr_nr12_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                           int ldc, const int8_t* NNOPS_RESTRICT A, int lda,
+                                           const int8_t* NNOPS_RESTRICT B, int ldb,
+                                           int32_t clamp_min, int32_t clamp_max) noexcept
+{
+    int32_t* row[MR];
+    i8_sdot_row_ptrs<MR, int32_t>(C, ldc, mr, row);
+    const int8_t* a0[MR];
+    i8_sdot_a_ptrs<MR>(A, lda, mr, a0);
+    const int kg = kc >> 2;
+    const int ldb_panel = mma_i8_panel_stride(ldb, kc);
+    const int32x4_t vmin = vdupq_n_s32(clamp_min);
+    const int32x4_t vmax = vdupq_n_s32(clamp_max);
+
+    int n = 0;
+    for (; n + mma_i8_nr_max <= nc; n += mma_i8_nr_max) {
+        int32x4_t acc[3][MR];
+        i8_sdot_mma_rows<MR, 3>(a0, B, kg, acc);
+        i8_sdot_store_i32<MR, 3, zero_mode>(row, n, 12, acc, vmin, vmax);
+        B += ldb_panel;
+    }
+
+    // The live remainder narrows to the groups it needs, as the packed rung's
+    // does; only a full panel pays for all three.
+    const int live = nc - n;
+    if (live > 8) {
+        int32x4_t acc[3][MR];
+        i8_sdot_mma_rows<MR, 3>(a0, B, kg, acc);
+        i8_sdot_store_i32<MR, 3, zero_mode>(row, n, live, acc, vmin, vmax);
+    } else if (live > 4) {
+        int32x4_t acc[2][MR];
+        i8_sdot_mma_rows<MR, 2>(a0, B, kg, acc);
+        i8_sdot_store_i32<MR, 2, zero_mode>(row, n, live, acc, vmin, vmax);
+    } else if (live > 0) {
+        int32x4_t acc[1][MR];
+        i8_sdot_mma_rows<MR, 1>(a0, B, kg, acc);
+        i8_sdot_store_i32<MR, 1, zero_mode>(row, n, live, acc, vmin, vmax);
+    }
+}
+
+// =========================================================================
+//  the requantizing variants (packed A + packed B)
+// =========================================================================
+//
+// SDOT's accumulators are already one row's four columns, so the store is a
+// straight requantize — no transpose step. One call covers the whole K and the
+// accumulators go to the 8-bit destination; no int32 tile reaches memory.
+//
+// Every index into the accumulator, scale and bias blocks is a literal: the
+// group walk and the store are written out at the panel's three widths instead
+// of looping to a template bound. A loop costs nothing where the compiler
+// unrolls it and everything where it does not — the array is then indexed at
+// run time and the whole block moves to the stack (GCC 14 does exactly that on
+// the narrow path, and turns the ragged byte copy into a memcpy call).
 
 /// Requantize and write one group of a panel: MR rows, `live` columns left in
 /// the panel from this group's first column.
@@ -1882,35 +745,6 @@ i8_sdot_store(TOut* const (&row)[MR], int col0, int live, int32x4_t (&acc)[NG][M
     }
 }
 
-/// The panel's output rows, aliasing the last live one past `mr`.
-template <int MR, class TOut>
-__attribute__((always_inline)) inline void
-i8_sdot_row_ptrs(TOut* C, int64_t ldm, int mr, TOut* (&row)[MR]) noexcept
-{
-    row[0] = C;
-    if constexpr (MR > 1) {
-        row[1] = C + std::min<int64_t>(1, mr - 1) * ldm;
-    }
-    if constexpr (MR > 2) {
-        row[2] = C + std::min<int64_t>(2, mr - 1) * ldm;
-    }
-    if constexpr (MR > 3) {
-        row[3] = C + std::min<int64_t>(3, mr - 1) * ldm;
-    }
-    if constexpr (MR > 4) {
-        row[4] = C + std::min<int64_t>(4, mr - 1) * ldm;
-    }
-    if constexpr (MR > 5) {
-        row[5] = C + std::min<int64_t>(5, mr - 1) * ldm;
-    }
-    if constexpr (MR > 6) {
-        row[6] = C + std::min<int64_t>(6, mr - 1) * ldm;
-    }
-    if constexpr (MR > 7) {
-        row[7] = C + std::min<int64_t>(7, mr - 1) * ldm;
-    }
-}
-
 /// One narrow remainder panel through NG groups, requantized.
 template <int MR, int NG, class TOut>
 __attribute__((always_inline)) inline void
@@ -1966,57 +800,24 @@ mma_pack_mr_nr12_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t 
     }
 }
 
-template <class TOut>
-__attribute__((always_inline)) inline void
-mma_pack_mr8_nr12_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
-                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                         int ldb, const float* s_b, float s_b_scalar, float row_k,
-                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
-{
-    mma_pack_mr_nr12_epi_i8<8, TOut>(mr, nc, kc, C, ldm, A, B, ldb, s_b, s_b_scalar, row_k,
-                                     col_bias, zp_out, relu);
-}
-
-template <class TOut>
-__attribute__((always_inline)) inline void
-mma_pack_mr4_nr12_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
-                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                         int ldb, const float* s_b, float s_b_scalar, float row_k,
-                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
-{
-    mma_pack_mr_nr12_epi_i8<4, TOut>(mr, nc, kc, C, ldm, A, B, ldb, s_b, s_b_scalar, row_k,
-                                     col_bias, zp_out, relu);
-}
-
-template <class TOut>
-__attribute__((always_inline)) inline void
-mma_pack_mr1_nr12_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
-                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                         int ldb, const float* s_b, float s_b_scalar, float row_k,
-                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
-{
-    mma_pack_mr_nr12_epi_i8<1, TOut>(mr, nc, kc, C, ldm, A, B, ldb, s_b, s_b_scalar, row_k,
-                                     col_bias, zp_out, relu);
-}
-
 /// The requantizing rungs, consumed by matmul_helper.cpp; rows are {8,4,1}.
 template <class TOut>
 inline constexpr std::array<MmaI8EpiFn<TOut>, 3> mma_pack_epi_fns_i8 = {
-    &mma_pack_mr8_nr12_epi_i8<TOut>,
-    &mma_pack_mr4_nr12_epi_i8<TOut>,
-    &mma_pack_mr1_nr12_epi_i8<TOut>,
+    &mma_pack_mr_nr12_epi_i8<8, TOut>,
+    &mma_pack_mr_nr12_epi_i8<4, TOut>,
+    &mma_pack_mr_nr12_epi_i8<1, TOut>,
 };
 
 // Dispatch tables, consumed by matmul_helper.cpp; rows are the MR levels {8,4,1}.
 template <bool Z>
 inline constexpr auto mma_pack_fns_i8 =
-    std::array{&mma_pack_mr8_nr12_mrxncxkc_i8<Z>, &mma_pack_mr4_nr12_mrxncxkc_i8<Z>,
-               &mma_pack_mr1_nr12_mrxncxkc_i8<Z>};
+    std::array{&mma_pack_mr_nr12_mrxncxkc_i8<8, Z>, &mma_pack_mr_nr12_mrxncxkc_i8<4, Z>,
+               &mma_pack_mr_nr12_mrxncxkc_i8<1, Z>};
 
 // Row-major A (`lda` in int8 elements, kc % 4 == 0), same MR levels.
 template <bool Z>
 inline constexpr auto mma_direct_fns_i8 =
-    std::array{&mma_direct_mr8_nr12_mrxncxkc_i8<Z>, &mma_direct_mr4_nr12_mrxncxkc_i8<Z>,
-               &mma_direct_mr1_nr12_mrxncxkc_i8<Z>};
+    std::array{&mma_direct_mr_nr12_mrxncxkc_i8<8, Z>, &mma_direct_mr_nr12_mrxncxkc_i8<4, Z>,
+               &mma_direct_mr_nr12_mrxncxkc_i8<1, Z>};
 
 } // namespace nnops::backend::cpu::aarch64
