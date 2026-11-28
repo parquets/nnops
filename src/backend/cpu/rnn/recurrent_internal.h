@@ -18,6 +18,8 @@
 
 #include "backend/cpu/rnn/recurrent.h"
 
+#include "backend/common/row_scales.hpp"
+
 #include "backend/cpu/common/common_utils.hpp"
 #include "backend/cpu/common/memory_pool.hpp"
 #include "backend/cpu/matmul/matmul.h"
@@ -430,23 +432,6 @@ struct Q8Regions {
     float* rh = nullptr;
 };
 
-/// A quantized activation's per-row scales: a caller table when the tensor
-/// carries one per row, else its per-tensor scalar.
-struct RowScales {
-    const float* rows = nullptr;
-    float scalar = 1.0f;
-};
-
-inline RowScales row_scales_of(const QuantParams& q, int64_t rows) noexcept
-{
-    RowScales r;
-    if (q.scale_data != nullptr && q.num_scales >= rows && rows > 0) {
-        r.rows = q.scale_data;
-    } else {
-        r.scalar = q.scale;
-    }
-    return r;
-}
 
 /// Interleave, pack and scale one direction's s8 weights. `raw` stages the
 /// interleaved byte matrix (total_cols × max(I, H)) and `bias_f32` holds one

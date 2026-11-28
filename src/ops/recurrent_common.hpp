@@ -3,10 +3,10 @@
 /// @brief The part RNN, GRU and LSTM share: ONNX's shape rules, the
 /// attribute → RecurrentParams mapping, and the optional-input presence rules.
 ///
-/// One kernel entry point serves all three (backend/cpu/rnn/recurrent.h)
-/// because the gate interleave, the packed weights, the chunked input
-/// projection and the per-step tile epilogue are the same code — what differs is
-/// the arithmetic inside the epilogue, which is a template argument there.
+/// One kernel entry point serves all three per backend because the gate
+/// interleave, the chunked input projection and the per-step epilogue are the
+/// same code — what differs is the arithmetic inside the epilogue. The parameter
+/// block the entry takes is shared (backend/common/recurrent_config.hpp).
 ///
 /// Input order is ONNX's for all three; the optional ones are absent when their
 /// view is empty, and a caller that stops early simply passes fewer:
@@ -46,7 +46,7 @@ struct RecurrentSpec {
 
 /// The kernel an op's Impl resolves for its backend. `nullptr` is "no kernel on
 /// this backend", which compute() reports as Status::unsupported.
-using RecurrentKernelFn = Status (*)(const backend::cpu::RecurrentParams&, std::span<TensorView>,
+using RecurrentKernelFn = Status (*)(const backend::RecurrentParams&, std::span<TensorView>,
                                      std::span<const TensorView>, const ComputeContext&);
 
 /// Hidden width: the attribute when set, else R's last axis.
@@ -253,11 +253,11 @@ inline Status recurrent_check(Backend be, const RecurrentSpec& s,
 
 /// The kernel's parameter block: the attributes plus the geometry, which the
 /// caller reads off X (the sequence) or off W (the pack).
-inline backend::cpu::RecurrentParams recurrent_params(const RecurrentSpec& s, int64_t seq,
+inline backend::RecurrentParams recurrent_params(const RecurrentSpec& s, int64_t seq,
                                                       int64_t batch, int64_t input, int64_t hidden,
                                                       DataType dtype, DataType weight_dtype)
 {
-    backend::cpu::RecurrentParams p;
+    backend::RecurrentParams p;
     p.mode = s.mode;
     p.seq = seq;
     p.batch = batch;

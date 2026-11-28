@@ -32,6 +32,7 @@
 
 #include "backend/cuda/rnn/recurrent.h"
 
+#include "backend/common/row_scales.hpp"
 #include "backend/cuda/cuda_common.cuh"
 #include "backend/cuda/matmul/gemm_common.cuh"
 #include "backend/cuda/matmul/matmul_i8.cuh"
@@ -366,23 +367,6 @@ inline AuxChannel& aux_channel()
 //  W8A8 — the two products on the int8 MMA
 // =========================================================================
 
-/// A per-row scale table, or its per-tensor scalar (the CPU's RowScales).
-struct RowScales {
-    const float* rows = nullptr;
-    float scalar = 1.0f;
-};
-
-inline RowScales row_scales_of(const QuantParams& q, int64_t rows) noexcept
-{
-    RowScales r;
-    if (q.scale_data != nullptr && rows > 0 && q.num_scales >= rows) {
-        r.rows = q.scale_data;
-    } else {
-        r.scalar = q.scale;
-    }
-    return r;
-}
-
 /// One direction's slice of a weight's per-gate-row table: its own when the
 /// table spans every direction, else the shared one.
 inline RowScales weight_scales(const QuantParams& q, int64_t d, int64_t per_dir) noexcept
@@ -515,7 +499,7 @@ Status q8_rec(const Q8Plan& q8, const T* a, int64_t B, int64_t H, int64_t gate_r
 /// One phase of one timestep: the recurrent product on the dense engine — fp,
 /// or the int8 one when the layer is quantized — then the fused gate pass.
 template <class T>
-Status run_phase(const cpu::RecurrentParams& p, StepKind kind, int64_t gates, int64_t gate_row,
+Status run_phase(const RecurrentParams& p, StepKind kind, int64_t gates, int64_t gate_row,
                  int64_t col_base, const T* a, const T* r_dir, int64_t r_ld, T* rec, int64_t batch,
                  int64_t hidden, StepParams<T> s, const Q8Plan* q8, int64_t d, int8_t* aq,
                  float* as, cudaStream_t stream)
@@ -572,7 +556,7 @@ Status run_phase(const cpu::RecurrentParams& p, StepKind kind, int64_t gates, in
 /// The whole layer for one element type: resolve the views, carve one scratch
 /// block, and walk every direction's timeline.
 template <class T>
-Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outputs,
+Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const int64_t B = p.batch;
@@ -965,7 +949,7 @@ Status recurrent_impl(const cpu::RecurrentParams& p, std::span<TensorView> outpu
 
 } // namespace
 
-Status recurrent_cuda(const cpu::RecurrentParams& params, std::span<TensorView> outputs,
+Status recurrent_cuda(const RecurrentParams& params, std::span<TensorView> outputs,
                       std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     if (inputs.size() < 3 || outputs.empty()) {

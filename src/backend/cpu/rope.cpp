@@ -30,6 +30,7 @@
 /// wavelength, scaling only the long end and blending the band between. All
 /// four follow the HuggingFace rope_scaling formulas.
 
+#include "backend/common/rope_plan.hpp"
 #include "nnops/ops/rope.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
@@ -48,155 +49,10 @@ using namespace nnops::simd;
 
 namespace {
 
-struct RoPESection {
-    int64_t dim_start; // inclusive
-    int64_t dim_end;   // exclusive (must be even)
-    float base;
-};
-
-std::vector<RoPESection> build_sections(const RoPEAttributes& attrs, int64_t head_dim)
-{
-    std::vector<RoPESection> secs;
-    if (attrs.mrope_section_dims.empty()) {
-        secs.push_back({0, head_dim, attrs.base});
-    } else {
-        int64_t off = 0;
-        for (size_t i = 0; i < attrs.mrope_section_dims.size(); ++i) {
-            float b =
-                (i < attrs.mrope_section_bases.size()) ? attrs.mrope_section_bases[i] : attrs.base;
-            secs.push_back({off, off + attrs.mrope_section_dims[i], b});
-            off += attrs.mrope_section_dims[i];
-        }
-    }
-    return secs;
-}
-
-/// Per-section constants the angle loop needs: the base already adjusted for
-/// Dynamic NTK, and the YaRN ramp bounds in dim units.
-struct SectionPlan {
-    int64_t dim;
-    int64_t pairs;
-    float base;
-    float low;
-    float high;
-};
-
-constexpr float kTwoPi = 6.28318530717958647692528677f;
-
-/// Inverse of the "which dim rotates this many times per context window"
-/// relation: a pair rotating `rotations` times over the pretraining window
-/// sits at this dim. Both HF and llama.cpp spell it this way.
-float correction_dim(int64_t dim, float rotations, float base, int64_t orig)
-{
-    return static_cast<float>(dim) * std::log(static_cast<float>(orig) / (rotations * kTwoPi)) /
-           (2.0f * std::log(base));
-}
-
-std::vector<SectionPlan> plan_sections(const RoPEAttributes& attrs,
-                                       const std::vector<RoPESection>& sections, int64_t seq_len,
-                                       int64_t start)
-{
-    std::vector<SectionPlan> plans;
-    plans.reserve(sections.size());
-
-    // Dynamic NTK pivots on the run's end position: the chunk ends at
-    // start + seq_len, which is the seq_len HF derives from
-    // max(position_ids) + 1.
-    const double end_pos = static_cast<double>(start) + static_cast<double>(seq_len);
-    const double orig = static_cast<double>(attrs.original_max_position);
-
-    for (const auto& sec : sections) {
-        const int64_t sec_len = sec.dim_end - sec.dim_start;
-        SectionPlan p{sec_len, sec_len / 2, sec.base, 0.0f, 0.0f};
-
-        if (attrs.scaling_type == RoPEScalingType::Dynamic) {
-            const double len = std::max(end_pos, orig);
-            const double exp =
-                sec_len > 2 ? static_cast<double>(sec_len) / static_cast<double>(sec_len - 2) : 1.0;
-            const double mult = attrs.scaling_factor * len / orig - (attrs.scaling_factor - 1.0);
-            p.base = static_cast<float>(sec.base * std::pow(mult, exp));
-        } else if (attrs.scaling_type == RoPEScalingType::YaRN) {
-            // Same truncation llama.cpp always applies: floor the fast bound,
-            // ceil the slow one, then clamp into the dimension range.
-            p.low =
-                std::max(0.0f, std::floor(correction_dim(sec_len, attrs.yarn_beta_fast, sec.base,
-                                                         attrs.original_max_position)));
-            p.high = std::min(static_cast<float>(sec_len - 1),
-                              std::ceil(correction_dim(sec_len, attrs.yarn_beta_slow, sec.base,
-                                                       attrs.original_max_position)));
-        }
-        plans.push_back(p);
-    }
-    return plans;
-}
-
-float yarn_attention_scale(const RoPEAttributes& attrs)
-{
-    if (attrs.attention_factor > 0.0f) {
-        return attrs.attention_factor;
-    }
-    return attrs.scaling_factor > 1.0f ? 1.0f + 0.1f * std::log(attrs.scaling_factor) : 1.0f;
-}
-
-/// What one (pair index) costs per position, split into the part that does not
-/// depend on the position: the wavelength `ratio` and the scaling blend.
-///
-/// Every scaling mode ends up as a pair of blends of `extrap` and `interp`, and
-/// both ramps depend only on the pair — so the `pow` and the two clamps move out
-/// of the position loop. The table used to re-evaluate `base^(2p/dim)` for every
-/// (position, pair), which at S=2048, half=64 was 131k `pow` calls per RoPE call
-/// and dominated the op once the rotation pass was parallel.
-struct PairPlan {
-    float ratio;    ///< base^(2p/section_dim): the angle is pos / ratio
-    float ramp;     ///< YaRN: 0 keeps the extrapolated angle, 1 the interpolated one
-    float smooth;   ///< Llama3 band blend, -1 when the pair sits outside the band
-    bool long_wl;   ///< Llama3: wavelength past the short end, so it is divided
-};
-
-void build_pair_plans(PoolArray<PairPlan>& pairs, const std::vector<SectionPlan>& plans,
-                      const RoPEAttributes& attrs, int64_t half)
-{
-    pairs.reset(static_cast<size_t>(half));
-
-    const bool yarn = attrs.scaling_type == RoPEScalingType::YaRN;
-    const bool llama3 = attrs.scaling_type == RoPEScalingType::Llama3;
-
-    // Llama3's two wavelength bands, both divisors of the pretraining window.
-    const float orig = static_cast<float>(attrs.original_max_position);
-    const float low_wavelen = orig / attrs.llama3_low_freq_factor;
-    const float high_wavelen = orig / attrs.llama3_high_freq_factor;
-    const float band = attrs.llama3_high_freq_factor - attrs.llama3_low_freq_factor;
-
-    size_t pair_idx = 0;
-    for (const auto& plan : plans) {
-        const float sec_dim_f = static_cast<float>(plan.dim);
-
-        for (int64_t p = 0; p < plan.pairs; ++p) {
-            const float ratio = std::pow(plan.base, 2.0f * static_cast<float>(p) / sec_dim_f);
-            PairPlan pp{ratio, 0.0f, 0.0f, false};
-            if (yarn) {
-                pp.ramp = std::clamp((static_cast<float>(p) - plan.low) /
-                                         std::max(0.001f, plan.high - plan.low),
-                                     0.0f, 1.0f);
-            } else if (llama3) {
-                const float wavelen = kTwoPi * ratio;
-                pp.long_wl = wavelen > low_wavelen;
-                if (!pp.long_wl && wavelen >= high_wavelen) {
-                    pp.smooth = std::clamp(
-                        (orig / wavelen - attrs.llama3_low_freq_factor) / band, 0.0f, 1.0f);
-                } else {
-                    pp.smooth = -1.0f;
-                }
-            }
-            pairs[pair_idx++] = pp;
-        }
-    }
-}
-
 void compute_cos_sin_tables(PoolArray<float>& cos_table, PoolArray<float>& sin_table,
                             int64_t blocks, int64_t seq_len, int64_t rotary_dim,
-                            const std::vector<RoPESection>& sections, const int64_t* starts,
-                            const RoPEAttributes& attrs, const ComputeContext& ctx)
+                            const int64_t* starts, const RoPEAttributes& attrs,
+                            const ComputeContext& ctx)
 {
     const int64_t half = rotary_dim / 2;
     const int64_t rows = blocks * seq_len;
@@ -210,9 +66,8 @@ void compute_cos_sin_tables(PoolArray<float>& cos_table, PoolArray<float>& sin_t
     for (int64_t blk = 1; blk < blocks; ++blk) {
         max_start = std::max(max_start, starts[blk]);
     }
-    const auto plans = plan_sections(attrs, sections, seq_len, max_start);
-    PoolArray<PairPlan> pairs;
-    build_pair_plans(pairs, plans, attrs, half);
+    const auto plans = plan_rope_sections(attrs, rotary_dim, seq_len, max_start);
+    const auto pairs = build_rope_pair_plans(plans, attrs, half);
 
     const bool linear = attrs.scaling_type == RoPEScalingType::Linear;
     const bool yarn = attrs.scaling_type == RoPEScalingType::YaRN;
@@ -230,7 +85,7 @@ void compute_cos_sin_tables(PoolArray<float>& cos_table, PoolArray<float>& sin_t
         float* sin_row = sin_table.data() + i * half;
 
         for (int64_t p = 0; p < half; ++p) {
-            const PairPlan& pp = pairs[static_cast<size_t>(p)];
+            const RopePairPlan& pp = pairs[static_cast<size_t>(p)];
             const float extrap = pos_f / pp.ratio;
 
             float theta = extrap;
@@ -348,9 +203,8 @@ void rope_impl(const RoPEAttributes& attrs, TensorView& output, std::span<const 
             sin_src = sin_table.data();
         }
     } else {
-        auto sections = build_sections(attrs, rotary_dim);
-        compute_cos_sin_tables(cos_table, sin_table, blocks, seq_len, rotary_dim, sections,
-                               starts.data(), attrs, ctx);
+        compute_cos_sin_tables(cos_table, sin_table, blocks, seq_len, rotary_dim, starts.data(),
+                               attrs, ctx);
         cos_src = cos_table.data();
         sin_src = sin_table.data();
     }

@@ -44,6 +44,7 @@
 ///   4 sequence_lens [B] int32  5 initial_h [D,B,H]  6 initial_c [D,B,H]
 /// Outputs: 0 Y [T,D,B,H]  1 Y_h [D,B,H]  2 Y_c [D,B,H]
 
+#include "backend/common/recurrent_config.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -53,42 +54,6 @@
 #include <span>
 
 namespace nnops::backend::cpu {
-
-/// A recurrent layer fully resolved: no attributes, no inference, just the
-/// numbers the kernel needs. The dispatch unit guarantees the inputs match.
-struct RecurrentParams {
-    RecurrentMode mode = RecurrentMode::Rnn;
-
-    int64_t seq = 0;        ///< T
-    int64_t batch = 0;      ///< B
-    int64_t input = 0;      ///< I
-    int64_t hidden = 0;     ///< H
-    int64_t directions = 1; ///< D
-    /// Only one direction is ambiguous about its timeline: with D = 2 the first
-    /// is forward and the second reverse by ONNX's rule, but with D = 1 this is
-    /// the answer.
-    RnnDirection direction = RnnDirection::Forward;
-    /// The compute dtype: the gate buffer, the cell and hidden state and the
-    /// outputs. f32 or f16.
-    DataType dtype = DataType::f32;
-    /// W's and R's storage. s8 selects the quantized route, whose activations
-    /// are still `dtype` (see the header note); anything else must equal
-    /// `dtype`.
-    DataType weight_dtype = DataType::f32;
-
-    RnnActivation act_f = RnnActivation::Sigmoid;
-    RnnActivation act_g = RnnActivation::Tanh;
-    RnnActivation act_h = RnnActivation::Tanh;
-    float alpha_f = 0.0f, beta_f = 0.0f;
-    float alpha_g = 0.0f, beta_g = 0.0f;
-    float alpha_h = 0.0f, beta_h = 0.0f;
-
-    /// Bounds every gate's pre-activation; 0 disables it.
-    float clip = 0.0f;
-
-    bool input_forget = false;        ///< LSTM: f = 1 - i
-    bool linear_before_reset = false; ///< GRU: see gru.hpp
-};
 
 Status recurrent_cpu(const RecurrentParams& params, std::span<TensorView> outputs,
                      std::span<const TensorView> inputs, const ComputeContext& ctx);

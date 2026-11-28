@@ -607,24 +607,25 @@ Status launch_typed(const AttentionConfig& cfg, TensorView& out,
     const bool v_is_k = cfg.v_is_k;
     const TensorView& V = v_is_k ? in[1] : in[2];
 
-    const HeadLayout ql = q_layout_of(cfg, Q);
-    const HeadLayout kl = kv_layout_of(cfg, K);
+    // The head geometry is the CPU core's (backend/common/attention_geometry.hpp):
+    // same layouts, same widths, same past-segment count.
+    const HeadShape hs = resolve_head_shape(cfg, in);
+    const HeadLayout ql = hs.q_layout;
+    const HeadLayout kl = hs.kv_layout;
+    const int64_t B = hs.B;
+    const int64_t H = hs.H;
+    const int64_t Hkv = hs.Hkv;
+    const int64_t Sq = hs.Sq;
+    const int64_t Dqk = hs.Dqk;
+    const int64_t Dv = hs.Dv;
 
-    const int64_t B = Q.shape(0);
-    const int64_t H = cfg.num_heads;
-    const int64_t Hkv = cfg.kv_heads();
-    const int64_t Sq = Q.shape(head_seq_dim(ql));
-    const int64_t Dqk = ql == HeadLayout::Merged ? Q.shape(2) / H : Q.shape(3);
-    const int64_t Dv = cfg.v_head_dim > 0 ? cfg.v_head_dim : Dqk;
-    const int64_t Sk_new = K.shape(head_seq_dim(kl));
-
-    const bool has_past = slot_present(cfg, cfg.past_k_slot, in);
+    const bool has_past = has_past_view(cfg, in);
     const TensorView* P = has_past ? &in[static_cast<size_t>(cfg.past_k_slot)] : nullptr;
     const TensorView* PV = has_past && !v_is_k
                                ? &in[static_cast<size_t>(cfg.past_v_slot)]
                                : P;
-    const int64_t Sk_past = has_past ? P->shape(head_seq_dim(kl)) : 0;
-    const int64_t Sk = Sk_new + Sk_past;
+    const int64_t Sk_past = hs.Sk_past;
+    const int64_t Sk = hs.Sk + hs.Sk_past;
 
     if (B <= 0 || H <= 0 || Hkv <= 0 || Sq <= 0 || Dqk <= 0 || Dv <= 0 || Sk <= 0) {
         return Status::invalid_argument;
@@ -665,39 +666,39 @@ Status launch_typed(const AttentionConfig& cfg, TensorView& out,
     p.bc = bc;
 
     p.q_b = Q.stride_elems(0);
-    p.q_h = head_step_of(Q, ql, Dqk);
-    p.q_s = seq_step_of(Q, ql);
+    p.q_h = head_step(Q, ql, Dqk);
+    p.q_s = head_seq_step(Q, ql);
 
     p.k_b = K.stride_elems(0);
-    p.k_h = head_step_of(K, kl, Dqk);
-    p.k_s = seq_step_of(K, kl);
+    p.k_h = head_step(K, kl, Dqk);
+    p.k_s = head_seq_step(K, kl);
     if (v_is_k) {
         p.v_b = p.k_b;
         p.v_h = p.k_h;
         p.v_s = p.k_s;
     } else {
         p.v_b = V.stride_elems(0);
-        p.v_h = head_step_of(V, kl, Dv);
-        p.v_s = seq_step_of(V, kl);
+        p.v_h = head_step(V, kl, Dv);
+        p.v_s = head_seq_step(V, kl);
     }
     if (has_past) {
         p.pk_b = P->stride_elems(0);
-        p.pk_h = head_step_of(*P, kl, Dqk);
-        p.pk_s = seq_step_of(*P, kl);
+        p.pk_h = head_step(*P, kl, Dqk);
+        p.pk_s = head_seq_step(*P, kl);
         if (v_is_k) {
             p.pv_b = p.pk_b;
             p.pv_h = p.pk_h;
             p.pv_s = p.pk_s;
         } else {
             p.pv_b = PV->stride_elems(0);
-            p.pv_h = head_step_of(*PV, kl, Dv);
-            p.pv_s = seq_step_of(*PV, kl);
+            p.pv_h = head_step(*PV, kl, Dv);
+            p.pv_s = head_seq_step(*PV, kl);
         }
     }
 
     p.o_b = out.stride_elems(0);
-    p.o_h = head_step_of(out, ql, Dv);
-    p.o_s = seq_step_of(out, ql);
+    p.o_h = head_step(out, ql, Dv);
+    p.o_s = head_seq_step(out, ql);
 
     // ---- masks ----
     if (slot_present(cfg, cfg.bias_slot, in)) {
@@ -782,8 +783,8 @@ Status launch_typed(const AttentionConfig& cfg, TensorView& out,
         p.gate = gv.ptr<T>();
         p.has_gate = true;
         p.g_b = gv.stride_elems(0);
-        p.g_h = head_step_of(gv, ql, Dv);
-        p.g_s = seq_step_of(gv, ql);
+        p.g_h = head_step(gv, ql, Dv);
+        p.g_s = head_seq_step(gv, ql);
         p.gate_act = int(cfg.output_gate);
     }
 
@@ -1046,7 +1047,7 @@ Status attention_cuda(const AttentionConfig& cfg, std::span<TensorView> outputs,
     }
     const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
     TensorView& out = outputs[0];
-    return attn::slot_present(cfg, cfg.cu_q_slot, inputs)
+    return slot_present(cfg, cfg.cu_q_slot, inputs)
                ? attn::attention_varlen(cfg, out, inputs, stream)
                : attn::attention_launch(cfg, out, inputs, stream);
 }

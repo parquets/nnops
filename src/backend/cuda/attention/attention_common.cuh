@@ -9,7 +9,7 @@
 /// prefill kernel) and attention_decode.cuh (the one-row decode kernel) read the
 /// same description and the same mask semantics.
 
-#include "backend/common/attention_config.hpp"
+#include "backend/common/attention_geometry.hpp"
 #include "backend/cuda/cuda_common.cuh"
 #include "backend/cuda/matmul/ptx.h" // PTX_SM80_ENABLED gates the mma wrappers below
 #include "nnops/core/status.hpp"
@@ -37,48 +37,13 @@ constexpr float kNegInf = -FLT_MAX;
 __host__ __device__ inline int64_t pad_stride(int64_t n) { return n + ((n & 1) == 0 ? 1 : 0); }
 
 // ============================================================
-// Layout: the same three orders the CPU core addresses
+// Layout
 // ============================================================
-
-enum class HeadLayout { Merged, BHSD, BSHD };
-
-inline int64_t head_seq_dim(HeadLayout l) { return l == HeadLayout::BHSD ? 2 : 1; }
-
-inline HeadLayout q_layout_of(const AttentionConfig& cfg, const TensorView& q)
-{
-    if (q.rank() == 3) {
-        return HeadLayout::Merged;
-    }
-    return cfg.bshd ? HeadLayout::BSHD : HeadLayout::BHSD;
-}
-
-inline HeadLayout kv_layout_of(const AttentionConfig& cfg, const TensorView& k)
-{
-    if (k.rank() == 3) {
-        return HeadLayout::Merged;
-    }
-    return cfg.kv_bshd ? HeadLayout::BSHD : HeadLayout::BHSD;
-}
-
-/// One sequence position forward within one head. Merged and BNSH rows are the
-/// head's own row, so the row pitch; BSHD steps a whole head block.
-inline int64_t seq_step_of(const TensorView& v, HeadLayout l)
-{
-    return l == HeadLayout::BSHD ? v.stride_elems(1) : v.row_stride_elems();
-}
-
-/// One head forward. A merged row packs the heads, so the step is the head
-/// width; the rank-4 forms carry their own axis.
-inline int64_t head_step_of(const TensorView& v, HeadLayout l, int64_t d)
-{
-    return l == HeadLayout::Merged ? d
-                                   : (l == HeadLayout::BHSD ? v.stride_elems(1) : v.stride_elems(2));
-}
-
-inline bool slot_present(const AttentionConfig& cfg, int slot, std::span<const TensorView> in)
-{
-    return slot >= 0 && in.size() > static_cast<size_t>(slot) && !in[static_cast<size_t>(slot)].is_empty();
-}
+//
+// HeadLayout, head_seq_dim, head_layout_of / kv_layout_of, the head and
+// sequence steps, and slot_present are shared with the CPU core
+// (backend/common/attention_geometry.hpp): the three storage orders and their
+// strides are one description, not a per-backend one.
 
 // ============================================================
 // Kernel parameters

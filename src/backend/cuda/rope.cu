@@ -21,6 +21,7 @@
 /// f32, f16 and bf16.
 
 #include "cuda_common.cuh"
+#include "backend/common/rope_plan.hpp"
 #include "nnops/ops/rope.hpp"
 
 #include <algorithm>
@@ -33,110 +34,6 @@ namespace nnops::backend::cuda {
 namespace {
 
 constexpr int kThreads = 128;
-constexpr float kTwoPi = 6.28318530717958647692528677f;
-
-// ---- host-side pair planning (the CPU route's arithmetic) ----------------
-
-struct PairPlan {
-    float ratio = 1.0f; ///< base^(2p/section_dim): the angle is pos / ratio
-    float ramp = 0.0f;  ///< YaRN: 1 keeps the interpolated angle
-    float smooth = 0.0f;
-    float long_wl = 0.0f; ///< Llama3: 1 when the wavelength is past the band
-};
-
-inline float correction_dim(int64_t dim, float rotations, float base, int64_t orig)
-{
-    return static_cast<float>(dim) * std::log(static_cast<float>(orig) / (rotations * kTwoPi)) /
-           (2.0f * std::log(base));
-}
-
-struct Section {
-    int64_t dim = 0;
-    int64_t pairs = 0;
-    float base = 10000.0f;
-    float low = 0.0f;
-    float high = 0.0f;
-};
-
-inline std::vector<Section> plan_sections(const RoPEAttributes& attrs, int64_t rotary_dim,
-                                          int64_t seq_len, int64_t max_start)
-{
-    std::vector<Section> out;
-    std::vector<std::pair<int64_t, float>> raw; // (dim, base)
-    if (attrs.mrope_section_dims.empty()) {
-        raw.push_back({rotary_dim, attrs.base});
-    } else {
-        for (size_t i = 0; i < attrs.mrope_section_dims.size(); ++i) {
-            const float b = i < attrs.mrope_section_bases.size() ? attrs.mrope_section_bases[i]
-                                                                 : attrs.base;
-            raw.push_back({attrs.mrope_section_dims[i], b});
-        }
-    }
-
-    const double end_pos = static_cast<double>(max_start) + static_cast<double>(seq_len);
-    const double orig = static_cast<double>(attrs.original_max_position);
-    for (const auto& [sec_dim, sec_base] : raw) {
-        Section s;
-        s.dim = sec_dim;
-        s.pairs = sec_dim / 2;
-        s.base = sec_base;
-        if (attrs.scaling_type == RoPEScalingType::Dynamic) {
-            const double len = std::max(end_pos, orig);
-            const double exp = sec_dim > 2 ? static_cast<double>(sec_dim) /
-                                                 static_cast<double>(sec_dim - 2)
-                                           : 1.0;
-            const double mult = attrs.scaling_factor * len / orig - (attrs.scaling_factor - 1.0);
-            s.base = static_cast<float>(sec_base * std::pow(mult, exp));
-        } else if (attrs.scaling_type == RoPEScalingType::YaRN) {
-            s.low = std::max(0.0f, std::floor(correction_dim(
-                                       sec_dim, attrs.yarn_beta_fast, sec_base,
-                                       attrs.original_max_position)));
-            s.high = std::min(static_cast<float>(sec_dim - 1),
-                              std::ceil(correction_dim(sec_dim, attrs.yarn_beta_slow, sec_base,
-                                                       attrs.original_max_position)));
-        }
-        out.push_back(s);
-    }
-    return out;
-}
-
-inline std::vector<PairPlan> build_pair_plans(const std::vector<Section>& sections,
-                                              const RoPEAttributes& attrs, int64_t half)
-{
-    std::vector<PairPlan> pairs(static_cast<size_t>(half));
-    const bool yarn = attrs.scaling_type == RoPEScalingType::YaRN;
-    const bool llama3 = attrs.scaling_type == RoPEScalingType::Llama3;
-    const float orig = static_cast<float>(attrs.original_max_position);
-    const float low_wavelen = orig / attrs.llama3_low_freq_factor;
-    const float high_wavelen = orig / attrs.llama3_high_freq_factor;
-    const float band = attrs.llama3_high_freq_factor - attrs.llama3_low_freq_factor;
-
-    size_t idx = 0;
-    for (const Section& sec : sections) {
-        const float dim_f = static_cast<float>(sec.dim);
-        for (int64_t p = 0; p < sec.pairs && idx < pairs.size(); ++p, ++idx) {
-            PairPlan pp;
-            pp.ratio = std::pow(sec.base, 2.0f * static_cast<float>(p) / dim_f);
-            if (yarn) {
-                pp.ramp = std::clamp((static_cast<float>(p) - sec.low) /
-                                         std::max(0.001f, sec.high - sec.low),
-                                     0.0f, 1.0f);
-            } else if (llama3) {
-                const float wavelen = kTwoPi * pp.ratio;
-                pp.long_wl = wavelen > low_wavelen ? 1.0f : 0.0f;
-                if (pp.long_wl == 0.0f && wavelen >= high_wavelen) {
-                    pp.smooth = std::clamp(
-                        (orig / wavelen - attrs.llama3_low_freq_factor) / band, 0.0f, 1.0f);
-                } else {
-                    pp.smooth = -1.0f;
-                }
-            }
-            pairs[idx] = pp;
-        }
-    }
-    return pairs;
-}
-
 // ---- device -------------------------------------------------------------
 
 /// The table: one row per (block, position), `half` pairs each.
@@ -466,8 +363,8 @@ Status rope_entry(const RoPEAttributes& attrs, TensorView& output,
             max_start = std::max(max_start, s);
         }
         outer_per_block = blocks > 1 ? outer_count / batch : outer_count;
-        const auto sections = plan_sections(attrs, rotary_dim, seq_len, max_start);
-        const auto pairs = build_pair_plans(sections, attrs, half);
+        const auto sections = plan_rope_sections(attrs, rotary_dim, seq_len, max_start);
+        const auto pairs = build_rope_pair_plans(sections, attrs, half);
         const int64_t pair_bytes = half * int64_t(sizeof(float4));
         const int64_t start_bytes = int64_t(starts.size()) * int64_t(sizeof(int64_t));
         if (!plan.alloc(pair_bytes + start_bytes, stream)) {
@@ -479,7 +376,7 @@ Status rope_entry(const RoPEAttributes& attrs, TensorView& output,
         int64_t* dstarts = reinterpret_cast<int64_t*>(static_cast<char*>(plan.ptr) + pair_bytes);
         std::vector<float4> host_pairs(static_cast<size_t>(half));
         for (int64_t p = 0; p < half; ++p) {
-            const PairPlan& pp = pairs[static_cast<size_t>(p)];
+            const RopePairPlan& pp = pairs[static_cast<size_t>(p)];
             host_pairs[static_cast<size_t>(p)] =
                 make_float4(pp.ratio, pp.ramp, pp.smooth, pp.long_wl);
         }
@@ -496,12 +393,7 @@ Status rope_entry(const RoPEAttributes& attrs, TensorView& output,
         float* sbuf = cbuf + table_elems;
         const bool yarn = attrs.scaling_type == RoPEScalingType::YaRN;
         const float magnitude =
-            yarn ? (attrs.attention_factor > 0.0f
-                        ? attrs.attention_factor
-                        : (attrs.scaling_factor > 1.0f
-                               ? 1.0f + 0.1f * std::log(attrs.scaling_factor)
-                               : 1.0f))
-                 : 1.0f;
+            yarn ? yarn_attention_scale(attrs) : 1.0f;
         rope_table_kernel<<<grid_for((table_elems + kCudaBlockSize - 1) / kCudaBlockSize),
                             kCudaBlockSize, 0, stream>>>(
             cbuf, sbuf, dpairs, dstarts, blocks * seq_len, seq_len, half,

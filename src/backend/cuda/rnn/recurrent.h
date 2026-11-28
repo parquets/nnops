@@ -21,11 +21,14 @@
 /// the same gate pass. A prepacked (PackedRecurrent) W is refused: it is a
 /// CPU-packer blob this driver has no reader for.
 ///
-/// RecurrentParams is the CPU header's, because the operator dispatch layer
-/// resolves one kernel signature for every backend; this file only adds the
-/// device entry point.
+/// RecurrentParams is backend/common/recurrent_config.hpp's, because the
+/// operator dispatch layer resolves one kernel signature for every backend;
+/// this file only adds the device entry point.
 
-#include "backend/cpu/rnn/recurrent.h"
+#include "backend/common/recurrent_config.hpp"
+#include "nnops/core/compute_context.hpp"
+#include "nnops/core/status.hpp"
+#include "nnops/core/tensor_view.hpp"
 
 #include <span>
 
@@ -34,7 +37,7 @@ namespace nnops::backend::cuda {
 /// Run one recurrent layer over device-resident views. Every optional input is
 /// absent as an empty view; the outputs may be empty individually, as the
 /// operator documents.
-Status recurrent_cuda(const backend::cpu::RecurrentParams& params, std::span<TensorView> outputs,
+Status recurrent_cuda(const RecurrentParams& params, std::span<TensorView> outputs,
                       std::span<const TensorView> inputs, const ComputeContext& ctx);
 
 } // namespace nnops::backend::cuda
