@@ -256,6 +256,9 @@ template <class TAct, class TOut> struct I8ConvCtx {
     bool per_thread = false;
 
     bool epi_fused = false, epi_i8 = false;
+    /// The requantizing store inside the MMA kernel (SMMLA/SDOT on aarch64,
+    /// VNNI on x86), gated separately from the SME route's.
+    bool epi_i8_kern = false;
     float out_scale = 0.0f;
     int32_t out_zp = 0;
     float epi_lo = 0.0f, epi_hi = 0.0f;
@@ -578,6 +581,19 @@ void init_i8_ctx(I8ConvCtx<TAct, TOut>& c, const Conv2DAttributes& attrs, Tensor
     c.epi_fused = false;
     c.epi_i8 = false;
 #endif
+    // The same requantizing store on the NEON route. The column term does not
+    // disqualify it — it is a per-column constant that folds into the bias the
+    // kernel reads — but the per-pixel compensation (a weight zero point) does.
+#if defined(NNOPS_ARCH_AARCH64) || defined(NNOPS_ARCH_X86_64)
+    c.epi_i8_kern = !c.use_sme && I8ConvCtx<TAct, TOut>::kIntOut && !c.comp &&
+                    plan.orig_size == 0 && c.icn_block >= c.ic_per_group &&
+                    (attrs.epilogue.quant != EpilogueQuantType::Requantize ||
+                     attrs.epilogue.quant_param_count == 0) &&
+                    (attrs.epilogue.type == EpilogueActivateType::None ||
+                     attrs.epilogue.type == EpilogueActivateType::Relu);
+#else
+    c.epi_i8_kern = false;
+#endif
     // The requantize scale: s_a / s_out, and the destination's zero point —
     // what int8_epilogue_row_quant forms per row when nothing overrides it.
     c.out_scale = (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
@@ -703,7 +719,7 @@ template <class TAct, class TOut>
 bool i8_mma(const I8ConvCtx<TAct, TOut>& c, int64_t g, int64_t icn, int mc, int64_t ocn,
             int64_t ocnc, int kdim4, int32_t* acc_tile, int8_t* a_pack, const I8ATile& a,
             const int8_t* b_panel, int8_t* sme_a, TOut* fdst, const float* sb_ptr,
-            const float* col_bias_f)
+            const float* col_bias_f, const int32_t* col_bias_i32)
 {
 #if defined(NNOPS_ARCH_SME)
     if (c.use_sme) {
@@ -732,6 +748,22 @@ bool i8_mma(const I8ConvCtx<TAct, TOut>& c, int64_t g, int64_t icn, int mc, int6
                              static_cast<int>(c.ocn_block), sme_a, b_panel, c.sme.slot_max,
                              INT32_MIN, INT32_MAX, /*zero_mode=*/icn == 0);
         return false;
+    }
+#endif
+#if defined(NNOPS_ARCH_AARCH64) || defined(NNOPS_ARCH_X86_64)
+    if constexpr (I8ConvCtx<TAct, TOut>::kIntOut) {
+        if (c.epi_i8_kern) {
+            // The requantizing store: the whole K in one call, the epilogue's
+            // bias, scale, zero point and Relu fused into the write-back.
+            const int64_t ldd_a = geom_ldd_i8_a(kdim4);
+            tile_pack_lhs_i8(false, mc, kdim4, a_pack, static_cast<int>(ldd_a), a.ptr, a.lda,
+                             c.a_biased);
+            tile_mma_pack_i8_epi(mc, static_cast<int>(ocnc), kdim4, fdst,
+                                 static_cast<int64_t>(c.OC), a_pack, b_panel, /*ldb=*/0, sb_ptr,
+                                 c.qw->scale, c.s_x / c.out_scale, col_bias_i32, c.out_zp,
+                                 c.attrs->epilogue.type == EpilogueActivateType::Relu);
+            return true;
+        }
     }
 #endif
     const int64_t ldd_a = geom_ldd_i8_a(kdim4);
@@ -923,6 +955,8 @@ template <class TAct, class TOut> void run_i8_task(const I8ConvCtx<TAct, TOut>& 
         c.out_row_stride == c.OW * c.OC && (!c.pointwise || c.in_row_stride == c.IW * c.IC);
 
     [[maybe_unused]] std::vector<float> bias_f;
+    // The fused int8 store's per-column bias, rebuilt per oc block.
+    [[maybe_unused]] std::vector<int32_t> epi_bias;
     // Same block-end clamp and step as the fp route: the blob holds one oc
     // block at a time and the kernel walks its panels at `slot` apart.
     const auto block_end = [&](int64_t ocn) {
@@ -957,6 +991,25 @@ template <class TAct, class TOut> void run_i8_task(const I8ConvCtx<TAct, TOut>& 
             }
         }
 #endif
+        // The fused int8 store's per-column bias, with the column term folded:
+        // bias[n] − (a_bias_offset + zp_a)·r_b[n]. A per-column constant across
+        // the tile and across pixels, so it is built once per oc block.
+        const int32_t* col_bias_i32 = nullptr;
+        if (c.epi_i8_kern) {
+            if (epi_bias.size() < static_cast<size_t>(ocnc)) {
+                epi_bias.resize(static_cast<size_t>(ocnc));
+            }
+            const int64_t off = g * c.oc_per_group + ocn;
+            const int32_t coef_rb = c.d + c.zp_x;
+            for (int64_t j = 0; j < ocnc; ++j) {
+                int32_t bv = ibias_g ? ibias_g[ocn + j] : 0;
+                if (c.col_term) {
+                    bv -= coef_rb * c.r_b_all[static_cast<size_t>(off + j)];
+                }
+                epi_bias[static_cast<size_t>(j)] = bv;
+            }
+            col_bias_i32 = epi_bias.data();
+        }
 
         for (int64_t pr = r0; pr < r1; pr += c.ph_block) {
             const int64_t pr1 = std::min(r1, pr + c.ph_block);
@@ -1000,7 +1053,7 @@ template <class TAct, class TOut> void run_i8_task(const I8ConvCtx<TAct, TOut>& 
 
                     const bool epi_done =
                         i8_mma(c, g, icn, mc, ocn, ocnc, kdim4, acc_tile, a_pack, a, b_panel,
-                               sme_a.data(), dst, sb_ptr, col_bias_f);
+                               sme_a.data(), dst, sb_ptr, col_bias_f, col_bias_i32);
                     if (!is_last_icn) {
                         continue;
                     }

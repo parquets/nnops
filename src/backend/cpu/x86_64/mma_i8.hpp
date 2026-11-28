@@ -72,6 +72,7 @@
 #include <array>
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 #include <immintrin.h>
 #include "backend/cpu/common/common_utils.hpp"
 
@@ -1846,6 +1847,244 @@ void mma_direct_mr1_nr16_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_REST
         }
     }
 }
+
+// =========================================================================
+//  the requantizing variants (packed A + packed B)
+// =========================================================================
+//
+// The same accumulators written as the destination's bytes instead of int32:
+//
+//   out = sat(round_away((acc + bias[n]) * (s_a/s_out * s_b[n])) + zp_out)
+//
+// One call covers the whole K, so no int32 tile reaches memory. The math is
+// int8_epilogue_row_quant's x86 path verbatim — clamp the float to the
+// destination's range first, round away from zero by adding ±0.5 before a
+// truncating convert, then the two saturating packs — so a fused store and a
+// separate row pass agree bit for bit. `col_bias` is the per-column int32 bias
+// with the caller's shift folded in; on this arch the panel's `-128·Σb` seed is
+// already the whole A-side correction, so nothing else joins it here.
+
+/// std::round semantics in f32 — nearest, ties away from zero (AVX2 only has
+/// ties-to-even).
+inline __m256 i8_round_away_ps(__m256 x) noexcept
+{
+    const __m256 half = _mm256_or_ps(_mm256_and_ps(x, _mm256_set1_ps(-0.0f)),
+                                     _mm256_set1_ps(0.5f));
+    return _mm256_add_ps(x, half);
+}
+
+/// The per-column scale and bias of one eight-column group, zeroing the dead
+/// lanes of a ragged last group instead of reading past the table.
+template <int NG>
+__attribute__((always_inline)) inline void
+i8_col_q_x86(__m256 (&sc)[NG], __m256i (&bi)[NG], __m256 vk, __m256 vreq, const float* s_b,
+             const int32_t* col_bias, int live) noexcept
+{
+    for (int g = 0; g < NG; ++g) {
+        const int col = 8 * g;
+        if (s_b == nullptr) {
+            sc[g] = vreq;
+        } else if (col + 8 <= live) {
+            sc[g] = _mm256_mul_ps(vk, _mm256_loadu_ps(s_b + col));
+        } else {
+            alignas(32) float sv[8] = {};
+            for (int c = 0; c < 8 && col + c < live; ++c) {
+                sv[c] = s_b[col + c];
+            }
+            sc[g] = _mm256_mul_ps(vk, _mm256_loadu_ps(sv));
+        }
+        if (col_bias == nullptr) {
+            bi[g] = _mm256_setzero_si256();
+        } else if (col + 8 <= live) {
+            bi[g] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(col_bias + col));
+        } else {
+            alignas(32) int32_t bv[8] = {};
+            for (int c = 0; c < 8 && col + c < live; ++c) {
+                bv[c] = col_bias[col + c];
+            }
+            bi[g] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bv));
+        }
+    }
+}
+
+/// Eight columns of one row: bias, Relu, scale, clamp, round, offset, narrow,
+/// store — or the `live` leading bytes of it.
+template <class TOut>
+__attribute__((always_inline)) inline void
+i8_storeq_x86(TOut* dst, int live, __m256i v, __m256 vscale, __m256i vbias, __m256i vlo,
+              __m256i vzp, __m256 vfmin, __m256 vfmax) noexcept
+{
+    v = _mm256_add_epi32(v, vbias);
+    v = _mm256_max_epi32(v, vlo);
+    __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(v), vscale);
+    f = _mm256_min_ps(_mm256_max_ps(f, vfmin), vfmax);
+    const __m256i q = _mm256_add_epi32(_mm256_cvttps_epi32(i8_round_away_ps(f)), vzp);
+    const __m128i i16 =
+        _mm_packs_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+    const __m128i v8 = std::is_same_v<TOut, uint8_t> ? _mm_packus_epi16(i16, i16)
+                                                     : _mm_packs_epi16(i16, i16);
+    if (live >= 8) {
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(dst), v8);
+    } else {
+        alignas(16) TOut buf[16];
+        _mm_store_si128(reinterpret_cast<__m128i*>(buf), v8);
+        for (int c = 0; c < live; ++c) {
+            dst[c] = buf[c];
+        }
+    }
+}
+
+/// The panel's whole K into `acc`, seeded from the B panel's column sums.
+template <int MR, int NH>
+__attribute__((always_inline)) inline void
+i8_x86_mma(const int8_t* A, const int8_t* B, int kbytes, int kg,
+           __m256i (&acc)[MR][NH]) noexcept
+{
+    const __m256i seed0 = mma_i8_bias_fix(B, kbytes, 0);
+    __m256i seed1 = seed0;
+    if constexpr (NH == 2) {
+        seed1 = mma_i8_bias_fix(B, kbytes, 32);
+    }
+    for (int r = 0; r < MR; ++r) {
+        acc[r][0] = seed0;
+        if constexpr (NH == 2) {
+            acc[r][1] = seed1;
+        }
+    }
+    const int32_t* a_i32 = reinterpret_cast<const int32_t*>(A);
+    const int8_t* b_ptr = B;
+    for (int k = 0; k < kg; ++k) {
+        const __m256i vb0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
+        __m256i vb1 = vb0;
+        if constexpr (NH == 2) {
+            vb1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
+        }
+        b_ptr += 64;
+        for (int r = 0; r < MR; ++r) {
+            const __m256i va = _mm256_set1_epi32(a_i32[r]);
+            acc[r][0] = mma_i8_dp256(acc[r][0], va, vb0);
+            if constexpr (NH == 2) {
+                acc[r][1] = mma_i8_dp256(acc[r][1], va, vb1);
+            }
+        }
+        a_i32 += MR;
+    }
+}
+
+template <int MR, class TOut>
+__attribute__((always_inline)) inline void
+mma_pack_mr_nr16_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
+                        const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B, int ldb,
+                        const float* s_b, float s_b_scalar, float row_k,
+                        const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
+{
+    TOut* row[MR];
+    for (int r = 0; r < MR; ++r) {
+        // Rows past the live count alias the last live one, as the int32 store does.
+        row[r] = C + std::min(r, mr - 1) * ldm;
+    }
+    const int kbytes = (kc + 3) & ~3;
+    const int kg = kbytes >> 2;
+    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
+    constexpr float kLo = std::is_same_v<TOut, uint8_t> ? 0.0f : -128.0f;
+    constexpr float kHi = std::is_same_v<TOut, uint8_t> ? 255.0f : 127.0f;
+    const __m256 vk = _mm256_set1_ps(row_k);
+    const __m256 vreq = _mm256_set1_ps(row_k * s_b_scalar);
+    const float zpf = static_cast<float>(zp_out);
+    const __m256 vfmin = _mm256_set1_ps(kLo - zpf);
+    const __m256 vfmax = _mm256_set1_ps(kHi - zpf);
+    const __m256i vlo = _mm256_set1_epi32(relu ? 0 : INT32_MIN);
+    const __m256i vzp = _mm256_set1_epi32(zp_out);
+
+    int n = 0;
+    for (; n + mma_i8_nr_max <= nc; n += mma_i8_nr_max) {
+        __m256i acc[MR][2];
+        i8_x86_mma<MR, 2>(A, B, kbytes, kg, acc);
+        __m256 sc[2];
+        __m256i bi[2];
+        i8_col_q_x86<2>(sc, bi, vk, vreq, s_b ? s_b + n : nullptr,
+                        col_bias ? col_bias + n : nullptr, 16);
+        for (int r = 0; r < MR; ++r) {
+            i8_storeq_x86<TOut>(row[r] + n, 8, acc[r][0], sc[0], bi[0], vlo, vzp, vfmin, vfmax);
+            i8_storeq_x86<TOut>(row[r] + n + 8, 8, acc[r][1], sc[1], bi[1], vlo, vzp, vfmin,
+                                vfmax);
+        }
+        B += ldb_panel;
+    }
+
+    const int live = nc - n;
+    if (live > 8) {
+        __m256i acc[MR][2];
+        i8_x86_mma<MR, 2>(A, B, kbytes, kg, acc);
+        __m256 sc[2];
+        __m256i bi[2];
+        i8_col_q_x86<2>(sc, bi, vk, vreq, s_b ? s_b + n : nullptr,
+                        col_bias ? col_bias + n : nullptr, live);
+        for (int r = 0; r < MR; ++r) {
+            i8_storeq_x86<TOut>(row[r] + n, 8, acc[r][0], sc[0], bi[0], vlo, vzp, vfmin, vfmax);
+            i8_storeq_x86<TOut>(row[r] + n + 8, live - 8, acc[r][1], sc[1], bi[1], vlo, vzp,
+                                vfmin, vfmax);
+        }
+    } else if (live > 0) {
+        // One eight-column half is all the remainder can use.
+        __m256i acc[MR][1];
+        i8_x86_mma<MR, 1>(A, B, kbytes, kg, acc);
+        __m256 sc[1];
+        __m256i bi[1];
+        i8_col_q_x86<1>(sc, bi, vk, vreq, s_b ? s_b + n : nullptr,
+                        col_bias ? col_bias + n : nullptr, live);
+        for (int r = 0; r < MR; ++r) {
+            i8_storeq_x86<TOut>(row[r] + n, live, acc[r][0], sc[0], bi[0], vlo, vzp, vfmin,
+                                vfmax);
+        }
+    }
+}
+
+template <class TOut>
+__attribute__((always_inline)) inline void
+mma_pack_mr6_nr16_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
+                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
+                         int ldb, const float* s_b, float s_b_scalar, float row_k,
+                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
+{
+    mma_pack_mr_nr16_epi_i8<6, TOut>(mr, nc, kc, C, ldm, A, B, ldb, s_b, s_b_scalar, row_k,
+                                     col_bias, zp_out, relu);
+}
+
+template <class TOut>
+__attribute__((always_inline)) inline void
+mma_pack_mr4_nr16_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
+                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
+                         int ldb, const float* s_b, float s_b_scalar, float row_k,
+                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
+{
+    mma_pack_mr_nr16_epi_i8<4, TOut>(mr, nc, kc, C, ldm, A, B, ldb, s_b, s_b_scalar, row_k,
+                                     col_bias, zp_out, relu);
+}
+
+template <class TOut>
+__attribute__((always_inline)) inline void
+mma_pack_mr1_nr16_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
+                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
+                         int ldb, const float* s_b, float s_b_scalar, float row_k,
+                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
+{
+    mma_pack_mr_nr16_epi_i8<1, TOut>(mr, nc, kc, C, ldm, A, B, ldb, s_b, s_b_scalar, row_k,
+                                     col_bias, zp_out, relu);
+}
+
+/// The kernel signature the requantizing rungs are dispatched through.
+template <class TOut>
+using MmaI8EpiFn = void (*)(int, int, int, TOut*, int64_t, const int8_t*, const int8_t*, int,
+                            const float*, float, float, const int32_t*, int32_t, bool);
+
+/// The requantizing rungs, consumed by matmul_helper.cpp; rows are {6,4,1}.
+template <class TOut>
+inline constexpr std::array<MmaI8EpiFn<TOut>, 3> mma_pack_epi_fns_i8 = {
+    &mma_pack_mr6_nr16_epi_i8<TOut>,
+    &mma_pack_mr4_nr16_epi_i8<TOut>,
+    &mma_pack_mr1_nr16_epi_i8<TOut>,
+};
 
 /// MR levels {6,4,1} (MR_I8); a remainder panel runs through the level above it.
 template <bool Z>

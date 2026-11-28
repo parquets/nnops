@@ -497,4 +497,49 @@ void tile_mma_direct_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_
     });
 }
 
+#if defined(NNOPS_ARCH_AARCH64) || defined(NNOPS_ARCH_X86_64)
+namespace {
+template <class TOut>
+void tile_mma_pack_i8_epi_impl(int mc, int nc, int kc, TOut* out, int64_t ldm,
+                               const int8_t* packed_a, const int8_t* packed_b, int ldb,
+                               const float* s_b, float s_b_scalar, float row_k,
+                               const int32_t* col_bias, int32_t zp_out, bool relu)
+{
+#ifdef NNOPS_ARCH_I8MM
+    // Both aarch64 routes carry the requantizing store; the SMMLA one is the
+    // faster engine when the CPU has it.
+    const auto& fns =
+        i8mm_enabled() ? mma_pack_epi_fns_i8mm<TOut> : mma_pack_epi_fns_i8<TOut>;
+#else
+    const auto& fns = mma_pack_epi_fns_i8<TOut>;
+#endif
+    const int ldd_a = static_cast<int>(GEOM_I8.ldd_a(kc));
+    int m = 0;
+    walk_levels_exact(m, mc, MR_I8, [&](int level, int s) {
+        fns[level](s, nc, kc, out + m * ldm, ldm, packed_a, packed_b, ldb, s_b, s_b_scalar,
+                   row_k, col_bias, zp_out, relu);
+        packed_a += ldd_a;
+    });
+}
+} // namespace
+
+void tile_mma_pack_i8_epi(int mc, int nc, int kc, int8_t* out, int64_t ldm,
+                          const int8_t* packed_a, const int8_t* packed_b, int ldb,
+                          const float* s_b, float s_b_scalar, float row_k,
+                          const int32_t* col_bias, int32_t zp_out, bool relu)
+{
+    tile_mma_pack_i8_epi_impl<int8_t>(mc, nc, kc, out, ldm, packed_a, packed_b, ldb, s_b,
+                                      s_b_scalar, row_k, col_bias, zp_out, relu);
+}
+
+void tile_mma_pack_i8_epi(int mc, int nc, int kc, uint8_t* out, int64_t ldm,
+                          const int8_t* packed_a, const int8_t* packed_b, int ldb,
+                          const float* s_b, float s_b_scalar, float row_k,
+                          const int32_t* col_bias, int32_t zp_out, bool relu)
+{
+    tile_mma_pack_i8_epi_impl<uint8_t>(mc, nc, kc, out, ldm, packed_a, packed_b, ldb, s_b,
+                                       s_b_scalar, row_k, col_bias, zp_out, relu);
+}
+#endif
+
 } // namespace nnops::backend::cpu

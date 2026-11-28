@@ -2361,6 +2361,60 @@ NNOPS_TEST(conv2d_i8_int_out) {
     }
 }
 
+// The NEON requantizing store: s8/u8 output straight out of the SMMLA
+// accumulators. SME is pinned off so the fused path is the one that runs; the
+// weights stay symmetric (a zero point would need the per-pixel r_a sweep,
+// which is a separate gate). Column term, bias, Relu and the OC tail widths are
+// all live here, and an integer destination has to agree bit for bit.
+NNOPS_TEST(conv2d_i8_fused_store_matches_ref) {
+    const int prev = nnops::detail::disable_sme.exchange(1, std::memory_order_relaxed);
+    struct SmeRestore {
+        int previous;
+        ~SmeRestore() { nnops::detail::disable_sme.store(previous, std::memory_order_relaxed); }
+    } restore{prev};
+
+    struct Case {
+        int64_t IC, IH, IW, OC, K;
+        bool u8in, u8out, bias, relu;
+        int32_t zp_x;
+    };
+    const Case cases[] = {
+        // 16 output channels: one full panel plus a four-column tail.
+        {8, 9, 9, 16, 3, false, false, true, false, 0},
+        // u8 activation and destination, the zero point cancelling the shift.
+        {16, 8, 8, 64, 3, true, true, true, true, 128},
+        // u8 whose zero point does not cancel (the column term folds in).
+        {8, 7, 7, 40, 3, true, true, false, false, 117},
+        // 13 channels: a one-column tail.
+        {4, 10, 10, 13, 3, false, true, true, true, 0},
+        // Exactly one panel: no tail at all.
+        {8, 6, 6, 12, 3, false, false, true, false, 0},
+        // A whole-K 1x1 on the materialized plane, and Relu.
+        {32, 5, 5, 24, 1, true, false, true, true, 130},
+        // The benchmark geometry: 64 -> 128 over a 3x3.
+        {64, 7, 7, 128, 3, false, false, true, false, 0},
+        // A wide-K tail with a non-multiple-of-8 kdim (33 channels).
+        {33, 6, 6, 20, 3, true, true, true, true, 128},
+    };
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        const Case& s = cases[i];
+        QCase c;
+        c.ishape = {1, s.IC, s.IH, s.IW};
+        c.wshape = {s.OC, s.IC, s.K, s.K};
+        c.kh = c.kw = s.K;
+        c.ph = c.pw = (s.K == 1) ? 0 : 1;
+        c.act = s.u8in ? DataType::u8 : DataType::s8;
+        c.zp_x = s.zp_x;
+        c.out = s.u8out ? DataType::u8 : DataType::s8;
+        c.zp_out = s.u8out ? 91 : -19;
+        c.s_out = 0.0625f;
+        c.bias = s.bias;
+        c.ep = s.relu ? EpilogueActivateType::Relu : EpilogueActivateType::None;
+        c.seed = 8100 + i;
+        expect_q_match(c, static_cast<int>(i), {}, /*exact=*/true);
+    }
+}
+
 NNOPS_TEST(conv2d_i8_threaded_matches_serial) {
     // Two shapes: a narrow-oc 20x20 plane, and a wide-output one on a plane too
     // small to fill the pool — 64 channels into 512, where the filter axis has

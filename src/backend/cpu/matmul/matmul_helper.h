@@ -790,6 +790,23 @@ void tile_mma_direct_i8(int mc, int nc, int kc, int32_t* c, int ldc, const int8_
                         const int8_t* packed_b, int ldb, int32_t clamp_min, int32_t clamp_max,
                         bool zero_mode);
 
+#if defined(NNOPS_ARCH_AARCH64) || defined(NNOPS_ARCH_X86_64)
+// The requantizing store fused into the int8 kernels (SMMLA when the CPU has
+// i8mm, SDOT otherwise, or VNNI on x86): one MMA call covers the whole K and the
+// accumulators go straight to the 8-bit destination, so no int32 tile reaches
+// memory. `row_k` is s_a / s_out, `s_b` (or `s_b_scalar`) the per-column weight
+// scale, `col_bias` the per-column int32 bias with the A-side shift already
+// folded in, and `relu` a floor of zero before the scale.
+void tile_mma_pack_i8_epi(int mc, int nc, int kc, int8_t* out, int64_t ldm,
+                          const int8_t* packed_a, const int8_t* packed_b, int ldb,
+                          const float* s_b, float s_b_scalar, float row_k,
+                          const int32_t* col_bias, int32_t zp_out, bool relu);
+void tile_mma_pack_i8_epi(int mc, int nc, int kc, uint8_t* out, int64_t ldm,
+                          const int8_t* packed_a, const int8_t* packed_b, int ldb,
+                          const float* s_b, float s_b_scalar, float row_k,
+                          const int32_t* col_bias, int32_t zp_out, bool relu);
+#endif
+
 #if defined(NNOPS_ARCH_SME)
 // ---- SME tiles -----------------------------------------------------------
 //
