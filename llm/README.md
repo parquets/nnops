@@ -92,7 +92,7 @@ estimate of the kernel's own cost.
     --bench --threads 4
 ```
 
-qwen2.5-0.5b on an i5-13600KF (6P+8E, 4 OpenMP workers), 2026-11-28:
+qwen2.5-0.5b on an i5-13600KF (6P+8E), 2026-11-28. Four OpenMP workers:
 
 | seq | f32 prefill ms | f32 tok/s | f32 decode ms/token | f16 prefill ms | f16 tok/s | f16 decode ms/token |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -103,14 +103,67 @@ qwen2.5-0.5b on an i5-13600KF (6P+8E, 4 OpenMP workers), 2026-11-28:
 | 512 | 881.5 | 580.8 | 12.31 | 1534.6 | 333.6 | 11.37 |
 
 Prefill throughput rises with the block because the q4_1 GEMM stays the same
-per token while the fixed per-call cost amortizes; decode is ~11-14 ms a token
+per token while the fixed per-call cost amortizes; decode is ~8-13 ms a token
 and nearly flat in context length here because 512 rows of a 2-head, 64-wide
-q8 cache are still small beside the 0.5B weights. f16 prefill is ~1.7x slower
-than f32 on this shape: the q4_1 kernel decodes weights into f32 registers
-either way, so f16 only adds activation converts and narrowing; decode, which
-is weight-bandwidth bound, is within noise of f32. The 20-worker run barely
-improves on this (512-row f32 prefill ~0.8 s, decode ~11 ms), which is the
-other sign the route is stream-bound rather than compute-scaled.
+q8 cache are still small beside the 0.5B weights.
+
+Six workers — the P-core count — is the best configuration on this host:
+
+| seq | f32 prefill ms | f32 tok/s | f32 decode ms/token | f16 prefill ms | f16 tok/s | f16 decode ms/token |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 102.9 | 621.9 | 7.76 | 177.9 | 359.7 | 8.27 |
+| 128 | 177.8 | 719.9 | 7.73 | 292.8 | 437.2 | 8.21 |
+| 256 | 308.3 | 830.5 | 7.79 | 557.6 | 459.2 | 8.29 |
+| 384 | 447.4 | 858.3 | 7.94 | 828.4 | 463.6 | 8.41 |
+| 512 | 604.2 | 847.5 | 8.14 | 1110.3 | 461.2 | 8.46 |
+
+4T -> 6T is 1.47x overall, but 1.59x on the FFN gate and only 1.32-1.40x on
+qkv/down: the narrow-N projections are the ones that stop scaling. Twenty
+workers is *slower* than six (682.6 ms at 512, decode 10.1 ms) — the static
+block split hands whole n-blocks to E-core workers, and a block is the
+scheduling quantum.
+
+### Headroom
+
+Per-phase throughput at 6 threads (2 FLOP per MAC):
+
+| phase | GFLOP | ms | GFLOPS |
+| --- | ---: | ---: | ---: |
+| ffn gate | 107.1 | 144.4 | 742 |
+| ffn up | 107.1 | 142.1 | 754 |
+| ffn down | 107.1 | 185.0 | 579 |
+| qkv | 25.4 | 45.1 | 563 |
+| o_proj | 19.7 | 32.9 | 600 |
+| whole prefill | 366 | 602.8 | 607 |
+
+Measured against the rest of the operator set, in order of what it is worth:
+
+1. **The f16 activation route runs 1.84x f32** (1110 vs 603 ms at 512), and
+   every phase pays it: gate 295.9 vs 144.4, qkv 76.1 vs 45.1, attention 49.8
+   vs 26.8. This is not bandwidth. `f16_a_bcast`
+   (`src/backend/cpu/x86_64/mma_f16.hpp`) converts one half per (row, k) with
+   `vcvtph2ps`, and a per-element convert costs ~2.3 FMA slots on this host —
+   the A broadcast doubles the inner loop. Converting a k-run of eight halves
+   once and broadcasting f32 lanes should land f16 at f32's rate; the same
+   shape appears in attention's f16 query over an s8 cache.
+2. **The narrow-N projections leave 20-30% on the table.** down (N=896), qkv
+   (N=1152) and o_proj (N=896) reach 563-600 GFLOPS where the 4864-wide gate
+   reaches 742-754. A 512-row down_proj is ten n-blocks over six workers — a
+   two-wave split — and each kernel call streams six B panels per A load
+   instead of nine. Split-K (the reduction is a 2 MB f32 pass) or an nc that
+   yields an even two blocks per worker would recover part of it: ~5-8% of a
+   prefill.
+3. **Decode is DRAM-bound at 36 GB/s** — 309 MB of q4_1 weights a token in
+   8.6 ms, against DDR5-4800's 76.8 GB/s — and flat: 4T -> 6T is 1.44x, 20T is
+   worse. The 20-byte block straddles cache lines, but the prefetchers already
+   cover it; the remaining lever is weight layout, not compute.
+4. **FFN fusion does not pay.** Sending gate+up as one [2I, H] q4_1 weight
+   through `Linear`'s gated form (after letting its validation accept a
+   block-packed weight) measured 614.8 ms vs 599.8 at 512, 6T — 2.5% slower in
+   three interleaved A/B pairs, decode unchanged. Nothing redundant is
+   removed: the same MACs and the same weight stream, plus an [S, 2I] fp
+   temporary and a combine pass. Folding silu*up into down's A pack would save
+   one [S, I] write and read, ~2% of a prefill, for a new operator.
 
 ### Where the time goes
 
@@ -140,8 +193,9 @@ other sign the route is stream-bound rather than compute-scaled.
   throughput is the only lever that moves the total materially.
 - **Decode is weight-stream bound, not compute bound.** One token reads every
   q4_1 weight once: 224 MB of layer matrices (196 MB of that is FFN) plus the
-  85 MB tied lm_head, ~309 MB in 11.8 ms ≈ 26 GB/s. That is why 20 threads
-  barely beat 4 and why f16 decode is within noise of f32.
+  85 MB tied lm_head, ~309 MB in 11.8 ms ≈ 26 GB/s at four threads (8.6 ms ≈
+  36 GB/s at six). That is why extra workers stop helping past the P cores and
+  why f16 decode is within noise of f32.
 - **The lm_head is 23% of a decode step** at the 151936 vocabulary — a single
   GEMV over the whole embedding table. Prefill amortizes it across the block
   (0.3%), and only the last row is computed in either case.
