@@ -13,9 +13,10 @@
 /// matrix read in place. `zero_mode` drops the C read-add. Packed
 /// B is uniform: ceil(nc / 12) panels, every one a full 12 columns wide, each
 /// in a mma_pack_align(12*kc*sizeof(float))-byte slot (12*kc floats). The
-/// columns past `nc` are padding the tail's store discards, so the tail always
-/// works one panel wide: a tail wider than 4 reuses the full-panel body, a
-/// narrower one reads its first vector only.
+/// columns past `nc` are padding the tail's store discards, so the tail works
+/// one panel wide and runs only the groups it stores: three for a 9-12 column
+/// remainder, two for 5-8, one for 1-4. The dead lanes past `nc` are never
+/// accumulated at all rather than computed and thrown away.
 ///
 /// Rows past `mr` alias the last live row in A and C -- the convention the
 /// packers fill on the A side and the C row pointers repeat -- so a partial-M
@@ -204,7 +205,7 @@ inline void mma_pack_mr8_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
+        if (rem > 8) {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
@@ -239,6 +240,33 @@ inline void mma_pack_mr8_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_
                 c70 = vfmaq_laneq_f32(c70, b0, a1, 3);
                 c71 = vfmaq_laneq_f32(c71, b1, a1, 3);
                 c72 = vfmaq_laneq_f32(c72, b2, a1, 3);
+            }
+        } else if (rem > 4) {
+            for (int k = 0; k < kc; ++k) {
+                const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
+                const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
+                b_ptr += 12;
+
+                const float32x4_t a0 = vld1q_f32(a_ptr + 0 * 4);
+                const float32x4_t a1 = vld1q_f32(a_ptr + 1 * 4);
+                a_ptr += 8;
+
+                c00 = vfmaq_laneq_f32(c00, b0, a0, 0);
+                c01 = vfmaq_laneq_f32(c01, b1, a0, 0);
+                c10 = vfmaq_laneq_f32(c10, b0, a0, 1);
+                c11 = vfmaq_laneq_f32(c11, b1, a0, 1);
+                c20 = vfmaq_laneq_f32(c20, b0, a0, 2);
+                c21 = vfmaq_laneq_f32(c21, b1, a0, 2);
+                c30 = vfmaq_laneq_f32(c30, b0, a0, 3);
+                c31 = vfmaq_laneq_f32(c31, b1, a0, 3);
+                c40 = vfmaq_laneq_f32(c40, b0, a1, 0);
+                c41 = vfmaq_laneq_f32(c41, b1, a1, 0);
+                c50 = vfmaq_laneq_f32(c50, b0, a1, 1);
+                c51 = vfmaq_laneq_f32(c51, b1, a1, 1);
+                c60 = vfmaq_laneq_f32(c60, b0, a1, 2);
+                c61 = vfmaq_laneq_f32(c61, b1, a1, 2);
+                c70 = vfmaq_laneq_f32(c70, b0, a1, 3);
+                c71 = vfmaq_laneq_f32(c71, b1, a1, 3);
             }
         } else {
             for (int k = 0; k < kc; ++k) {
@@ -539,7 +567,7 @@ inline void mma_pack_mr4_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
+        if (rem > 8) {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
@@ -561,6 +589,24 @@ inline void mma_pack_mr4_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_
                 c30 = vfmaq_laneq_f32(c30, b0, a0, 3);
                 c31 = vfmaq_laneq_f32(c31, b1, a0, 3);
                 c32 = vfmaq_laneq_f32(c32, b2, a0, 3);
+            }
+        } else if (rem > 4) {
+            for (int k = 0; k < kc; ++k) {
+                const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
+                const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
+                b_ptr += 12;
+
+                const float32x4_t a0 = vld1q_f32(a_ptr);
+                a_ptr += 4;
+
+                c00 = vfmaq_laneq_f32(c00, b0, a0, 0);
+                c01 = vfmaq_laneq_f32(c01, b1, a0, 0);
+                c10 = vfmaq_laneq_f32(c10, b0, a0, 1);
+                c11 = vfmaq_laneq_f32(c11, b1, a0, 1);
+                c20 = vfmaq_laneq_f32(c20, b0, a0, 2);
+                c21 = vfmaq_laneq_f32(c21, b1, a0, 2);
+                c30 = vfmaq_laneq_f32(c30, b0, a0, 3);
+                c31 = vfmaq_laneq_f32(c31, b1, a0, 3);
             }
         } else {
             for (int k = 0; k < kc; ++k) {
@@ -738,7 +784,7 @@ inline void mma_pack_mr1_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
+        if (rem > 8) {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
@@ -750,6 +796,17 @@ inline void mma_pack_mr1_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOPS_
                 c00 = vfmaq_n_f32(c00, b0, a);
                 c01 = vfmaq_n_f32(c01, b1, a);
                 c02 = vfmaq_n_f32(c02, b2, a);
+            }
+        } else if (rem > 4) {
+            for (int k = 0; k < kc; ++k) {
+                const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
+                const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
+                b_ptr += 12;
+
+                const float a = *a_ptr++;
+
+                c00 = vfmaq_n_f32(c00, b0, a);
+                c01 = vfmaq_n_f32(c01, b1, a);
             }
         } else {
             for (int k = 0; k < kc; ++k) {
@@ -992,7 +1049,7 @@ inline void mma_direct_mr8_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOP
         const float* NNOPS_RESTRICT a6 = A + r6 * lda;
         const float* NNOPS_RESTRICT a7 = A + r7 * lda;
         const float* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
+        if (rem > 8) {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
@@ -1032,6 +1089,38 @@ inline void mma_direct_mr8_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOP
                 c70 = vfmaq_n_f32(c70, b0, v7);
                 c71 = vfmaq_n_f32(c71, b1, v7);
                 c72 = vfmaq_n_f32(c72, b2, v7);
+            }
+        } else if (rem > 4) {
+            for (int k = 0; k < kc; ++k) {
+                const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
+                const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
+                b_ptr += row_step;
+
+                const float v0 = *a0++;
+                const float v1 = *a1++;
+                const float v2 = *a2++;
+                const float v3 = *a3++;
+                const float v4 = *a4++;
+                const float v5 = *a5++;
+                const float v6 = *a6++;
+                const float v7 = *a7++;
+
+                c00 = vfmaq_n_f32(c00, b0, v0);
+                c01 = vfmaq_n_f32(c01, b1, v0);
+                c10 = vfmaq_n_f32(c10, b0, v1);
+                c11 = vfmaq_n_f32(c11, b1, v1);
+                c20 = vfmaq_n_f32(c20, b0, v2);
+                c21 = vfmaq_n_f32(c21, b1, v2);
+                c30 = vfmaq_n_f32(c30, b0, v3);
+                c31 = vfmaq_n_f32(c31, b1, v3);
+                c40 = vfmaq_n_f32(c40, b0, v4);
+                c41 = vfmaq_n_f32(c41, b1, v4);
+                c50 = vfmaq_n_f32(c50, b0, v5);
+                c51 = vfmaq_n_f32(c51, b1, v5);
+                c60 = vfmaq_n_f32(c60, b0, v6);
+                c61 = vfmaq_n_f32(c61, b1, v6);
+                c70 = vfmaq_n_f32(c70, b0, v7);
+                c71 = vfmaq_n_f32(c71, b1, v7);
             }
         } else {
             for (int k = 0; k < kc; ++k) {
@@ -1344,7 +1433,7 @@ inline void mma_direct_mr4_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOP
         const float* NNOPS_RESTRICT a2 = A + r2 * lda;
         const float* NNOPS_RESTRICT a3 = A + r3 * lda;
         const float* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
+        if (rem > 8) {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
@@ -1368,6 +1457,26 @@ inline void mma_direct_mr4_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOP
                 c30 = vfmaq_n_f32(c30, b0, v3);
                 c31 = vfmaq_n_f32(c31, b1, v3);
                 c32 = vfmaq_n_f32(c32, b2, v3);
+            }
+        } else if (rem > 4) {
+            for (int k = 0; k < kc; ++k) {
+                const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
+                const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
+                b_ptr += row_step;
+
+                const float v0 = *a0++;
+                const float v1 = *a1++;
+                const float v2 = *a2++;
+                const float v3 = *a3++;
+
+                c00 = vfmaq_n_f32(c00, b0, v0);
+                c01 = vfmaq_n_f32(c01, b1, v0);
+                c10 = vfmaq_n_f32(c10, b0, v1);
+                c11 = vfmaq_n_f32(c11, b1, v1);
+                c20 = vfmaq_n_f32(c20, b0, v2);
+                c21 = vfmaq_n_f32(c21, b1, v2);
+                c30 = vfmaq_n_f32(c30, b0, v3);
+                c31 = vfmaq_n_f32(c31, b1, v3);
             }
         } else {
             for (int k = 0; k < kc; ++k) {
@@ -1604,7 +1713,7 @@ inline void mma_direct_mr1_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOP
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
-        if (rem > 4) {
+        if (rem > 8) {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
@@ -1616,6 +1725,17 @@ inline void mma_direct_mr1_nr12_mrxncxkc_f32(int mr, int nc, int kc, float* NNOP
                 c00 = vfmaq_n_f32(c00, b0, a);
                 c01 = vfmaq_n_f32(c01, b1, a);
                 c02 = vfmaq_n_f32(c02, b2, a);
+            }
+        } else if (rem > 4) {
+            for (int k = 0; k < kc; ++k) {
+                const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
+                const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
+                b_ptr += row_step;
+
+                const float a = *a_ptr++;
+
+                c00 = vfmaq_n_f32(c00, b0, a);
+                c01 = vfmaq_n_f32(c01, b1, a);
             }
         } else {
             for (int k = 0; k < kc; ++k) {
