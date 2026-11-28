@@ -128,16 +128,16 @@ AbKernel<T> ab_fn(int level) {
 #ifdef NNOPS_ARCH_X86_64
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 6: return mma_pack_mr6_nr16_mrxncxkc_f32<false>;
-        case 4: return mma_pack_mr4_nr16_mrxncxkc_f32<false>;
-        case 2: return mma_pack_mr2_nr16_mrxncxkc_f32<false>;
-        default: return mma_pack_mr1_nr16_mrxncxkc_f32<false>;
+        case 6: return mma_pack_mr_nr16_mrxncxkc_f32<6, false>;
+        case 4: return mma_pack_mr_nr16_mrxncxkc_f32<4, false>;
+        case 2: return mma_pack_mr_nr16_mrxncxkc_f32<2, false>;
+        default: return mma_pack_mr_nr16_mrxncxkc_f32<1, false>;
         }
     } else {
         switch (level) {
-        case 6: return mma_pack_mr6_nr16_mrxncxkc_f16<false>;
+        case 6: return mma_pack_mr_nr16_mrxncxkc_f16<6, false>;
         case 4: return mma_pack_mr_nr16_mrxncxkc_f16<4, false>;
-        case 2: return mma_pack_mr2_nr16_mrxncxkc_f16<false>;
+        case 2: return mma_pack_mr_nr16_mrxncxkc_f16<2, false>;
         default: return mma_pack_mr_nr16_mrxncxkc_f16<1, false>;
         }
     }
@@ -185,16 +185,16 @@ BKernel<T> b_fn(int level) {
 #ifdef NNOPS_ARCH_X86_64
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 6: return mma_direct_mr6_nr16_mrxncxkc_f32<false, false>;
-        case 4: return mma_direct_mr4_nr16_mrxncxkc_f32<false, false>;
-        case 2: return mma_direct_mr2_nr16_mrxncxkc_f32<false, false>;
-        default: return mma_direct_mr1_nr16_mrxncxkc_f32<false, false>;
+        case 6: return mma_direct_mr_nr16_mrxncxkc_f32<6, false, false>;
+        case 4: return mma_direct_mr_nr16_mrxncxkc_f32<4, false, false>;
+        case 2: return mma_direct_mr_nr16_mrxncxkc_f32<2, false, false>;
+        default: return mma_direct_mr_nr16_mrxncxkc_f32<1, false, false>;
         }
     } else {
         switch (level) {
-        case 6: return mma_direct_mr6_nr16_mrxncxkc_f16<false, false>;
+        case 6: return mma_direct_mr_nr16_mrxncxkc_f16<6, false, false>;
         case 4: return mma_direct_mr_nr16_mrxncxkc_f16<4, false, false>;
-        case 2: return mma_direct_mr2_nr16_mrxncxkc_f16<false, false>;
+        case 2: return mma_direct_mr_nr16_mrxncxkc_f16<2, false, false>;
         default: return mma_direct_mr_nr16_mrxncxkc_f16<1, false, false>;
         }
     }

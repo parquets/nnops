@@ -2,34 +2,44 @@
 /// @file mma_f16.hpp
 /// @brief x86_64 F16C/FMA float16 MMA (matrix micro-accumulate) kernels.
 ///
+/// One templated rung per A presentation, with the height a template parameter:
+/// `MR` ∈ {6, 4, 2, 1} is the panel's row count, while the calls' `mr` (1..MR)
+/// is the live height the M decomposition emits, so each level serves every
+/// panel the largest-first walk produces instead of needing a kernel per
+/// height. A and B may both be packed (`mma_pack_*`) or only B packed while A
+/// is read row-major through `lda` (`mma_direct_*`), whose `ldb` is B's k-row
+/// step: negative selects the packed layout (rows 16 apart), any other value is
+/// a caller's matrix read in place. `zero_mode` drops the C read-add.
 /// Storage is fp16; accumulation, clamping and the C add are fp32, rounded back
-/// on store. A and B may both be packed (`mma_pack_*`) or only B packed
-/// with A read row-major (`mma_direct_*`); `zero_mode` drops the C read-add.
-/// `ldb` is B's k-row step: negative selects the packed layout (rows 16 apart),
-/// any other value is a raw caller matrix read in place.
-/// Tiles: M {6, 4, 2, 1} x N {16, 8, 1}; the dispatch tables wire up 6/4/1
-/// only, so the mr2 kernels are unreachable from them.
+/// on store.
 ///
-/// Packed B is uniform: ceil(nc/16) full-width panels, the columns past `nc`
-/// zero-filled, each in an mma_pack_align(16*kc*sizeof(half))-byte slot. The
-/// padding is free at pack time and lets the kernel read 16 halves per k at
-/// every column, so a tail wider than 8 costs one k-loop, not two.
+/// Packed B is uniform: ceil(nc / 16) panels, every one a full 16 columns wide
+/// with the columns past `nc` zero-filled, each in a
+/// mma_pack_align(16*kc*sizeof(half))-byte slot. That lets the kernel read 16
+/// halfs per k at every column, so a tail wider than 8 costs one k-loop instead
+/// of two; a tail of 8 or less takes the single-vector loop, and only the lanes
+/// it stores are written.
 ///
-/// Two conventions the kernels rely on:
-///  - Partial M: rows past `mr` alias the last live row in A and C, so they
-///    recompute it and store to the same place -- no per-row guards (XNNPACK).
-///  - N tail below 8: lane j holds column j, so the 4/2/1 ladder is a lo/hi
-///    split of one accumulator and the partial C stores are 8/4/2-byte stores
-///    of converted lanes; the 2-wide clamp keeps lanes 2,3 for the 1-wide step.
+/// Rows past `mr` alias the last live row — the convention pack_trans_* fills on
+/// the A side and the C row pointers repeat here — so a partial-M tile needs no
+/// per-row guards. Aliased rows share an address, so every stage adds C for all
+/// rows before it stores any of them.
 ///
 /// Bias seed: 1 is per-row (a dense row is an output channel), 2 is per-column
-/// (NHWC, rows are pixels, so the bias lands on the panel's 16 lanes). Seed 2 reads all 16 lanes, so the caller's bias
-/// buffer must be padded to the panel width. Seeding is two loads per row per
-/// panel against a full output write and read-back if the tile were primed
-/// first. The mr1 kernels ignore `mr` and `ldc` (the packed-B ones `lda` too).
+/// (NHWC, rows are pixels, so the bias lands on the panel's 16 lanes). Seed 2
+/// reads all 16 lanes, so the caller's bias buffer must be padded to the panel
+/// width. The row seed goes through the same alias index as A and C, so a
+/// partial M stays in range.
+///
+/// Every index into the accumulator block is a literal: the group walk and the
+/// store are written out at the panel's two widths instead of looping to a
+/// template bound. A loop costs nothing where the compiler unrolls it and
+/// everything where it does not -- the array is then indexed at run time and
+/// the whole block moves to the stack.
 
 #include <array>
 #include <immintrin.h>
+#include <algorithm>
 #include <cstdint>
 #include "nnops/detail/half.hpp"
 #include "backend/cpu/common/common_utils.hpp"
@@ -40,2748 +50,830 @@ using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
 
-template <bool zero_mode = false, int seed = 0>
-void mma_pack_mr6_nr16_mrxncxkc_f16(int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
-                                    const half* NNOPS_RESTRICT A, const half* NNOPS_RESTRICT B,
-                                    float clamp_min, float clamp_max,
-                                    const half* NNOPS_RESTRICT bias = nullptr) noexcept
+// =========================================================================
+//  one walk: the seed, the K loop, the stores
+// =========================================================================
+//
+// Every rung -- packed A or row-major, any height -- is the same walk: one k
+// step of MR rows against NG eight-column groups, then a store. The
+// accumulator is fp32, laid out [NG][MR] so a group's rows are contiguous, and
+// every index into it is a literal (see the header).
+
+/// The alias index of each row: rows past `mr` reuse the last live one.
+template <int MR>
+NNOPS_FORCEINLINE void f16_row_alias(int mr, int (&rr)[MR]) noexcept
 {
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-    const int r4 = (mr > 4) ? 4 : r3;
-    const int r5 = (mr > 5) ? 5 : r4;
+    rr[0] = 0;
+    if constexpr (MR > 1) {
+        rr[1] = std::min(1, mr - 1);
+    }
+    if constexpr (MR > 2) {
+        rr[2] = std::min(2, mr - 1);
+    }
+    if constexpr (MR > 3) {
+        rr[3] = std::min(3, mr - 1);
+    }
+    if constexpr (MR > 4) {
+        rr[4] = std::min(4, mr - 1);
+    }
+    if constexpr (MR > 5) {
+        rr[5] = std::min(5, mr - 1);
+    }
+}
 
-    half* c0_ptr = C + 0 * ldc;
-    half* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    half* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    half* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-    half* c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
-    half* c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
+/// The C rows, aliasing the last live one.
+template <int MR>
+NNOPS_FORCEINLINE void f16_row_ptrs(half* C, int ldc, const int (&rr)[MR],
+                                    half* (&row)[MR]) noexcept
+{
+    row[0] = C;
+    if constexpr (MR > 1) {
+        row[1] = C + rr[1] * ldc;
+    }
+    if constexpr (MR > 2) {
+        row[2] = C + rr[2] * ldc;
+    }
+    if constexpr (MR > 3) {
+        row[3] = C + rr[3] * ldc;
+    }
+    if constexpr (MR > 4) {
+        row[4] = C + rr[4] * ldc;
+    }
+    if constexpr (MR > 5) {
+        row[5] = C + rr[5] * ldc;
+    }
+}
 
-    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
+/// The row-major A rows, aliasing the last live one.
+template <int MR>
+NNOPS_FORCEINLINE void f16_a_ptrs(const half* A, int lda, const int (&rr)[MR],
+                                  const half* (&a)[MR]) noexcept
+{
+    a[0] = A;
+    if constexpr (MR > 1) {
+        a[1] = A + rr[1] * lda;
+    }
+    if constexpr (MR > 2) {
+        a[2] = A + rr[2] * lda;
+    }
+    if constexpr (MR > 3) {
+        a[3] = A + rr[3] * lda;
+    }
+    if constexpr (MR > 4) {
+        a[4] = A + rr[4] * lda;
+    }
+    if constexpr (MR > 5) {
+        a[5] = A + rr[5] * lda;
+    }
+}
 
-    int n = 0;
+/// One seed accumulator: the row's bias (`r`), the panel column's (`col`) or
+/// zero. The row index is already aliased, so `bias[r]` stays in range.
+template <int seed>
+NNOPS_FORCEINLINE __m256 f16_seed([[maybe_unused]] const half* bias,
+                                  [[maybe_unused]] int r,
+                                  [[maybe_unused]] int col) noexcept
+{
+    if constexpr (seed == 1) {
+        return _mm256_set1_ps(half_to_float(bias[r]));
+    } else if constexpr (seed == 2) {
+        return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + col)));
+    } else {
+        return _mm256_setzero_ps();
+    }
+}
 
-    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
-    const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) {
-            return _mm256_set1_ps(half_to_float(bias[r]));
-        } else if constexpr (seed == 2) {
-            return _mm256_cvtph_ps(
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
-        } else {
-            return _mm256_setzero_ps();
-        }
-    };
+/// The bias a panel starting at column `n` seeds from (seed 2 steps with it).
+template <int seed>
+NNOPS_FORCEINLINE const half* f16_panel_bias(const half* bias, int n) noexcept
+{
+    if constexpr (seed == 2) {
+        return bias + n;
+    } else {
+        return bias;
+    }
+}
 
-    for (; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-        __m256 v_acc2x01234567 = init(r2, 0);
-        __m256 v_acc2x89abcdef = init(r2, 8);
-        __m256 v_acc3x01234567 = init(r3, 0);
-        __m256 v_acc3x89abcdef = init(r3, 8);
-        __m256 v_acc4x01234567 = init(r4, 0);
-        __m256 v_acc4x89abcdef = init(r4, 8);
-        __m256 v_acc5x01234567 = init(r5, 0);
-        __m256 v_acc5x89abcdef = init(r5, 8);
+/// Seed one group's accumulators from the bias (or zero).
+template <int MR, int seed>
+NNOPS_FORCEINLINE void f16_col_init(__m256 (&col)[MR], const half* bias, const int (&rr)[MR],
+                                    int col0) noexcept
+{
+    col[0] = f16_seed<seed>(bias, rr[0], col0);
+    if constexpr (MR > 1) {
+        col[1] = f16_seed<seed>(bias, rr[1], col0);
+    }
+    if constexpr (MR > 2) {
+        col[2] = f16_seed<seed>(bias, rr[2], col0);
+    }
+    if constexpr (MR > 3) {
+        col[3] = f16_seed<seed>(bias, rr[3], col0);
+    }
+    if constexpr (MR > 4) {
+        col[4] = f16_seed<seed>(bias, rr[4], col0);
+    }
+    if constexpr (MR > 5) {
+        col[5] = f16_seed<seed>(bias, rr[5], col0);
+    }
+}
 
-        const half* a_ptr = A;
-        const half* b_ptr = B;
-        for (int k = 0; k < kc; ++k) {
-            const __m256 v_b0 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-            const __m256 v_b1 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-            b_ptr += 16;
+/// One half of a row's A value: the packed panel holds every row's half for
+/// this k, in alias order.
+NNOPS_FORCEINLINE __m256 f16_a_bcast(half a) noexcept
+{
+    return _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a.bits)));
+}
 
-            __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits)));
-            __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r1].bits)));
-            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-            v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-            v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
+NNOPS_FORCEINLINE __m256 f16_b_load(const half* b) noexcept
+{
+    return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b)));
+}
 
-            v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r2].bits)));
-            v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r3].bits)));
-            v_acc2x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc2x01234567);
-            v_acc2x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc2x89abcdef);
-            v_acc3x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc3x01234567);
-            v_acc3x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc3x89abcdef);
-
-            v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r4].bits)));
-            v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r5].bits)));
-            v_acc4x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc4x01234567);
-            v_acc4x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc4x89abcdef);
-            v_acc5x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc5x01234567);
-            v_acc5x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc5x89abcdef);
-
-            a_ptr += 6;
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_ps(
-                v_acc0x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 0))));
-            v_acc0x89abcdef = _mm256_add_ps(
-                v_acc0x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 8))));
-            v_acc1x01234567 = _mm256_add_ps(
-                v_acc1x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 0))));
-            v_acc1x89abcdef = _mm256_add_ps(
-                v_acc1x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 8))));
-            v_acc2x01234567 = _mm256_add_ps(
-                v_acc2x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr + 0))));
-            v_acc2x89abcdef = _mm256_add_ps(
-                v_acc2x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr + 8))));
-            v_acc3x01234567 = _mm256_add_ps(
-                v_acc3x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr + 0))));
-            v_acc3x89abcdef = _mm256_add_ps(
-                v_acc3x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr + 8))));
-            v_acc4x01234567 = _mm256_add_ps(
-                v_acc4x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c4_ptr + 0))));
-            v_acc4x89abcdef = _mm256_add_ps(
-                v_acc4x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c4_ptr + 8))));
-            v_acc5x01234567 = _mm256_add_ps(
-                v_acc5x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c5_ptr + 0))));
-            v_acc5x89abcdef = _mm256_add_ps(
-                v_acc5x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c5_ptr + 8))));
-        }
-        const __m256 v_min = _mm256_set1_ps(clamp_min);
-        const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
-        v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-        v_acc1x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc1x89abcdef, v_max), v_min);
-        v_acc2x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc2x01234567, v_max), v_min);
-        v_acc2x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc2x89abcdef, v_max), v_min);
-        v_acc3x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc3x01234567, v_max), v_min);
-        v_acc3x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc3x89abcdef, v_max), v_min);
-        v_acc4x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc4x01234567, v_max), v_min);
-        v_acc4x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc4x89abcdef, v_max), v_min);
-        v_acc5x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc5x01234567, v_max), v_min);
-        v_acc5x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc5x89abcdef, v_max), v_min);
-
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 0),
-                         _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 8),
-                         _mm256_cvtps_ph(v_acc0x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 0),
-                         _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 8),
-                         _mm256_cvtps_ph(v_acc1x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr + 0),
-                         _mm256_cvtps_ph(v_acc2x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr + 8),
-                         _mm256_cvtps_ph(v_acc2x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr + 0),
-                         _mm256_cvtps_ph(v_acc3x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr + 8),
-                         _mm256_cvtps_ph(v_acc3x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c4_ptr + 0),
-                         _mm256_cvtps_ph(v_acc4x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c4_ptr + 8),
-                         _mm256_cvtps_ph(v_acc4x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c5_ptr + 0),
-                         _mm256_cvtps_ph(v_acc5x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c5_ptr + 8),
-                         _mm256_cvtps_ph(v_acc5x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-        c2_ptr += 16;
-        c3_ptr += 16;
-        c4_ptr += 16;
-        c5_ptr += 16;
-
-        B += ldb_panel;
+/// One k step of a packed-A panel: MR rows against NG eight-column groups.
+template <int MR, int NG>
+NNOPS_FORCEINLINE void f16_group(const half*& a_ptr, const half* b_ptr,
+                                 const int (&rr)[MR], __m256 (&acc)[NG][MR]) noexcept
+{
+    // The advance is hoisted above the reads on purpose: MSVC then emits the
+    // pointer add at the top of the k loop, which measured ~10% faster than
+    // letting it fold the loads and add after them.
+    const half* const a_cur = a_ptr;
+    a_ptr += MR;
+    const __m256 vb0 = f16_b_load(b_ptr + 0 * 8);
+    __m256 vb1 = vb0;
+    if constexpr (NG > 1) {
+        vb1 = f16_b_load(b_ptr + 1 * 8);
     }
 
-    int rem = nc - n;
-
-    if (rem > 0) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-        __m256 v_acc2x01234567 = init(r2, 0);
-        __m256 v_acc2x89abcdef = init(r2, 8);
-        __m256 v_acc3x01234567 = init(r3, 0);
-        __m256 v_acc3x89abcdef = init(r3, 8);
-        __m256 v_acc4x01234567 = init(r4, 0);
-        __m256 v_acc4x89abcdef = init(r4, 8);
-        __m256 v_acc5x01234567 = init(r5, 0);
-        __m256 v_acc5x89abcdef = init(r5, 8);
-
-        const half* a_ptr = A;
-        const half* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-                const __m256 v_b1 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-                b_ptr += 16;
-
-                __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits)));
-                __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r1].bits)));
-                v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-                v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-                v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-                v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-
-                v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r2].bits)));
-                v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r3].bits)));
-                v_acc2x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc2x01234567);
-                v_acc2x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc2x89abcdef);
-                v_acc3x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc3x01234567);
-                v_acc3x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc3x89abcdef);
-
-                v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r4].bits)));
-                v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r5].bits)));
-                v_acc4x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc4x01234567);
-                v_acc4x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc4x89abcdef);
-                v_acc5x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc5x01234567);
-                v_acc5x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc5x89abcdef);
-
-                a_ptr += 6;
-            }
-        } else {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 =
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr)));
-                b_ptr += 16;
-                v_acc0x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits))), v_b0,
-                    v_acc0x01234567);
-                v_acc1x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r1].bits))), v_b0,
-                    v_acc1x01234567);
-                v_acc2x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r2].bits))), v_b0,
-                    v_acc2x01234567);
-                v_acc3x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r3].bits))), v_b0,
-                    v_acc3x01234567);
-                v_acc4x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r4].bits))), v_b0,
-                    v_acc4x01234567);
-                v_acc5x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r5].bits))), v_b0,
-                    v_acc5x01234567);
-                a_ptr += 6;
-            }
+    const __m256 va0 = f16_a_bcast(a_cur[rr[0]]);
+    acc[0][0] = _mm256_fmadd_ps(va0, vb0, acc[0][0]);
+    if constexpr (NG > 1) {
+        acc[1][0] = _mm256_fmadd_ps(va0, vb1, acc[1][0]);
+    }
+    if constexpr (MR > 1) {
+        const __m256 va1 = f16_a_bcast(a_cur[rr[1]]);
+        acc[0][1] = _mm256_fmadd_ps(va1, vb0, acc[0][1]);
+        if constexpr (NG > 1) {
+            acc[1][1] = _mm256_fmadd_ps(va1, vb1, acc[1][1]);
         }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_ps(
-                    v_acc0x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr))));
-                v_acc1x01234567 = _mm256_add_ps(
-                    v_acc1x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr))));
-                v_acc2x01234567 = _mm256_add_ps(
-                    v_acc2x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr))));
-                v_acc3x01234567 = _mm256_add_ps(
-                    v_acc3x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr))));
-                v_acc4x01234567 = _mm256_add_ps(
-                    v_acc4x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c4_ptr))));
-                v_acc5x01234567 = _mm256_add_ps(
-                    v_acc5x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c5_ptr))));
-            }
-
-            const __m256 v_min = _mm256_set1_ps(clamp_min);
-            const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-            v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-            v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-            v_acc2x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc2x01234567, v_max), v_min);
-            v_acc3x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc3x01234567, v_max), v_min);
-            v_acc4x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc4x01234567, v_max), v_min);
-            v_acc5x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc5x01234567, v_max), v_min);
-
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr),
-                             _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr),
-                             _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr),
-                             _mm256_cvtps_ph(v_acc2x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr),
-                             _mm256_cvtps_ph(v_acc3x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c4_ptr),
-                             _mm256_cvtps_ph(v_acc4x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c5_ptr),
-                             _mm256_cvtps_ph(v_acc5x01234567, _MM_FROUND_TO_NEAREST_INT));
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-            c2_ptr += 8;
-            c3_ptr += 8;
-            c4_ptr += 8;
-            c5_ptr += 8;
-
-            if (rem > 8) {
-                v_acc0x01234567 = v_acc0x89abcdef;
-                v_acc1x01234567 = v_acc1x89abcdef;
-                v_acc2x01234567 = v_acc2x89abcdef;
-                v_acc3x01234567 = v_acc3x89abcdef;
-                v_acc4x01234567 = v_acc4x89abcdef;
-                v_acc5x01234567 = v_acc5x89abcdef;
-            }
-            rem -= 8;
+    }
+    if constexpr (MR > 2) {
+        const __m256 va2 = f16_a_bcast(a_cur[rr[2]]);
+        acc[0][2] = _mm256_fmadd_ps(va2, vb0, acc[0][2]);
+        if constexpr (NG > 1) {
+            acc[1][2] = _mm256_fmadd_ps(va2, vb1, acc[1][2]);
         }
-
-        if (rem > 0) {
-            __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
-            __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
-            __m128 v_acc2x0123 = _mm256_castps256_ps128(v_acc2x01234567);
-            __m128 v_acc3x0123 = _mm256_castps256_ps128(v_acc3x01234567);
-            __m128 v_acc4x0123 = _mm256_castps256_ps128(v_acc4x01234567);
-            __m128 v_acc5x0123 = _mm256_castps256_ps128(v_acc5x01234567);
-
-            const __m128 v_min = _mm_set1_ps(clamp_min);
-            const __m128 v_max = _mm_set1_ps(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr))));
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr))));
-                    v_acc2x0123 = _mm_add_ps(
-                        v_acc2x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c2_ptr))));
-                    v_acc3x0123 = _mm_add_ps(
-                        v_acc3x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c3_ptr))));
-                    v_acc4x0123 = _mm_add_ps(
-                        v_acc4x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c4_ptr))));
-                    v_acc5x0123 = _mm_add_ps(
-                        v_acc5x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c5_ptr))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ps(_mm_min_ps(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ps(_mm_min_ps(v_acc3x0123, v_max), v_min);
-                v_acc4x0123 = _mm_max_ps(_mm_min_ps(v_acc4x0123, v_max), v_min);
-                v_acc5x0123 = _mm_max_ps(_mm_min_ps(v_acc5x0123, v_max), v_min);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr),
-                                 _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr),
-                                 _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c2_ptr),
-                                 _mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c3_ptr),
-                                 _mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c4_ptr),
-                                 _mm_cvtps_ph(v_acc4x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c5_ptr),
-                                 _mm_cvtps_ph(v_acc5x0123, _MM_FROUND_TO_NEAREST_INT));
-
-                c0_ptr += 4;
-                c1_ptr += 4;
-                c2_ptr += 4;
-                c3_ptr += 4;
-                c4_ptr += 4;
-                c5_ptr += 4;
-
-                v_acc0x0123 = _mm256_extractf128_ps(v_acc0x01234567, 1);
-                v_acc1x0123 = _mm256_extractf128_ps(v_acc1x01234567, 1);
-                v_acc2x0123 = _mm256_extractf128_ps(v_acc2x01234567, 1);
-                v_acc3x0123 = _mm256_extractf128_ps(v_acc3x01234567, 1);
-                v_acc4x0123 = _mm256_extractf128_ps(v_acc4x01234567, 1);
-                v_acc5x0123 = _mm256_extractf128_ps(v_acc5x01234567, 1);
-            }
-
-            if (rem & 2) {
-                const __m128 v_rest0 = v_acc0x0123;
-                const __m128 v_rest1 = v_acc1x0123;
-                const __m128 v_rest2 = v_acc2x0123;
-                const __m128 v_rest3 = v_acc3x0123;
-                const __m128 v_rest4 = v_acc4x0123;
-                const __m128 v_rest5 = v_acc5x0123;
-
-                if constexpr (!zero_mode) {
-                    uint32_t c_bits;
-                    c_bits = static_cast<uint32_t>(c0_ptr[0].bits) |
-                             (static_cast<uint32_t>(c0_ptr[1].bits) << 16);
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c1_ptr[0].bits) |
-                             (static_cast<uint32_t>(c1_ptr[1].bits) << 16);
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c2_ptr[0].bits) |
-                             (static_cast<uint32_t>(c2_ptr[1].bits) << 16);
-                    v_acc2x0123 = _mm_add_ps(
-                        v_acc2x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c3_ptr[0].bits) |
-                             (static_cast<uint32_t>(c3_ptr[1].bits) << 16);
-                    v_acc3x0123 = _mm_add_ps(
-                        v_acc3x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c4_ptr[0].bits) |
-                             (static_cast<uint32_t>(c4_ptr[1].bits) << 16);
-                    v_acc4x0123 = _mm_add_ps(
-                        v_acc4x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c5_ptr[0].bits) |
-                             (static_cast<uint32_t>(c5_ptr[1].bits) << 16);
-                    v_acc5x0123 = _mm_add_ps(
-                        v_acc5x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ps(_mm_min_ps(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ps(_mm_min_ps(v_acc3x0123, v_max), v_min);
-                v_acc4x0123 = _mm_max_ps(_mm_min_ps(v_acc4x0123, v_max), v_min);
-                v_acc5x0123 = _mm_max_ps(_mm_min_ps(v_acc5x0123, v_max), v_min);
-
-                {
-                    const __m128i v_h0 = _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c0_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 0));
-                    c0_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 1));
-                    const __m128i v_h1 = _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c1_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 0));
-                    c1_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 1));
-                    const __m128i v_h2 = _mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c2_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h2, 0));
-                    c2_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h2, 1));
-                    const __m128i v_h3 = _mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c3_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h3, 0));
-                    c3_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h3, 1));
-                    const __m128i v_h4 = _mm_cvtps_ph(v_acc4x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c4_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h4, 0));
-                    c4_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h4, 1));
-                    const __m128i v_h5 = _mm_cvtps_ph(v_acc5x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c5_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h5, 0));
-                    c5_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h5, 1));
-                }
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-                c2_ptr += 2;
-                c3_ptr += 2;
-                c4_ptr += 2;
-                c5_ptr += 2;
-
-                v_acc0x0123 = _mm_movehl_ps(v_rest0, v_rest0);
-                v_acc1x0123 = _mm_movehl_ps(v_rest1, v_rest1);
-                v_acc2x0123 = _mm_movehl_ps(v_rest2, v_rest2);
-                v_acc3x0123 = _mm_movehl_ps(v_rest3, v_rest3);
-                v_acc4x0123 = _mm_movehl_ps(v_rest4, v_rest4);
-                v_acc5x0123 = _mm_movehl_ps(v_rest5, v_rest5);
-            }
-
-            if (rem & 1) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ss(v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c0_ptr->bits))));
-                    v_acc1x0123 = _mm_add_ss(v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c1_ptr->bits))));
-                    v_acc2x0123 = _mm_add_ss(v_acc2x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c2_ptr->bits))));
-                    v_acc3x0123 = _mm_add_ss(v_acc3x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c3_ptr->bits))));
-                    v_acc4x0123 = _mm_add_ss(v_acc4x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c4_ptr->bits))));
-                    v_acc5x0123 = _mm_add_ss(v_acc5x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c5_ptr->bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ss(_mm_min_ss(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ss(_mm_min_ss(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ss(_mm_min_ss(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ss(_mm_min_ss(v_acc3x0123, v_max), v_min);
-                v_acc4x0123 = _mm_max_ss(_mm_min_ss(v_acc4x0123, v_max), v_min);
-                v_acc5x0123 = _mm_max_ss(_mm_min_ss(v_acc5x0123, v_max), v_min);
-
-                c0_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c1_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c2_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c3_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c4_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc4x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c5_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc5x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-            }
+    }
+    if constexpr (MR > 3) {
+        const __m256 va3 = f16_a_bcast(a_cur[rr[3]]);
+        acc[0][3] = _mm256_fmadd_ps(va3, vb0, acc[0][3]);
+        if constexpr (NG > 1) {
+            acc[1][3] = _mm256_fmadd_ps(va3, vb1, acc[1][3]);
+        }
+    }
+    if constexpr (MR > 4) {
+        const __m256 va4 = f16_a_bcast(a_cur[rr[4]]);
+        acc[0][4] = _mm256_fmadd_ps(va4, vb0, acc[0][4]);
+        if constexpr (NG > 1) {
+            acc[1][4] = _mm256_fmadd_ps(va4, vb1, acc[1][4]);
+        }
+    }
+    if constexpr (MR > 5) {
+        const __m256 va5 = f16_a_bcast(a_cur[rr[5]]);
+        acc[0][5] = _mm256_fmadd_ps(va5, vb0, acc[0][5]);
+        if constexpr (NG > 1) {
+            acc[1][5] = _mm256_fmadd_ps(va5, vb1, acc[1][5]);
         }
     }
 }
 
-template <bool zero_mode = false, int seed = 0>
-void mma_pack_mr4_nr16_mrxncxkc_f16(int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
-                                    const half* NNOPS_RESTRICT A, const half* NNOPS_RESTRICT B,
-                                    float clamp_min, float clamp_max,
-                                    const half* NNOPS_RESTRICT bias = nullptr) noexcept
+/// One k step of a row-major panel: MR rows against NG eight-column groups.
+/// Each row's scalar is its own load, and the row pointers walk with k.
+template <int MR, int NG>
+NNOPS_FORCEINLINE void f16_step_rows(const half* (&a)[MR], const half* b_ptr,
+                                     __m256 (&acc)[NG][MR]) noexcept
 {
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-
-    half* c0_ptr = C + 0 * ldc;
-    half* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    half* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    half* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-
-    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
-
-    int n = 0;
-
-    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
-    const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) {
-            return _mm256_set1_ps(half_to_float(bias[r]));
-        } else if constexpr (seed == 2) {
-            return _mm256_cvtph_ps(
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
-        } else {
-            return _mm256_setzero_ps();
-        }
-    };
-
-    for (; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-        __m256 v_acc2x01234567 = init(r2, 0);
-        __m256 v_acc2x89abcdef = init(r2, 8);
-        __m256 v_acc3x01234567 = init(r3, 0);
-        __m256 v_acc3x89abcdef = init(r3, 8);
-
-        const half* a_ptr = A;
-        const half* b_ptr = B;
-        for (int k = 0; k < kc; ++k) {
-            const __m256 v_b0 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-            const __m256 v_b1 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-            b_ptr += 16;
-
-            __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits)));
-            __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r1].bits)));
-            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-            v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-            v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-
-            v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r2].bits)));
-            v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r3].bits)));
-            v_acc2x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc2x01234567);
-            v_acc2x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc2x89abcdef);
-            v_acc3x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc3x01234567);
-            v_acc3x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc3x89abcdef);
-
-            a_ptr += 4;
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_ps(
-                v_acc0x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 0))));
-            v_acc0x89abcdef = _mm256_add_ps(
-                v_acc0x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 8))));
-            v_acc1x01234567 = _mm256_add_ps(
-                v_acc1x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 0))));
-            v_acc1x89abcdef = _mm256_add_ps(
-                v_acc1x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 8))));
-            v_acc2x01234567 = _mm256_add_ps(
-                v_acc2x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr + 0))));
-            v_acc2x89abcdef = _mm256_add_ps(
-                v_acc2x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr + 8))));
-            v_acc3x01234567 = _mm256_add_ps(
-                v_acc3x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr + 0))));
-            v_acc3x89abcdef = _mm256_add_ps(
-                v_acc3x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr + 8))));
-        }
-        const __m256 v_min = _mm256_set1_ps(clamp_min);
-        const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
-        v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-        v_acc1x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc1x89abcdef, v_max), v_min);
-        v_acc2x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc2x01234567, v_max), v_min);
-        v_acc2x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc2x89abcdef, v_max), v_min);
-        v_acc3x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc3x01234567, v_max), v_min);
-        v_acc3x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc3x89abcdef, v_max), v_min);
-
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 0),
-                         _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 8),
-                         _mm256_cvtps_ph(v_acc0x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 0),
-                         _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 8),
-                         _mm256_cvtps_ph(v_acc1x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr + 0),
-                         _mm256_cvtps_ph(v_acc2x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr + 8),
-                         _mm256_cvtps_ph(v_acc2x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr + 0),
-                         _mm256_cvtps_ph(v_acc3x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr + 8),
-                         _mm256_cvtps_ph(v_acc3x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-        c2_ptr += 16;
-        c3_ptr += 16;
-
-        B += ldb_panel;
+    const __m256 vb0 = f16_b_load(b_ptr + 0 * 8);
+    __m256 vb1 = vb0;
+    if constexpr (NG > 1) {
+        vb1 = f16_b_load(b_ptr + 1 * 8);
     }
 
-    int rem = nc - n;
+    const half* const p0 = a[0];
 
-    if (rem > 0) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-        __m256 v_acc2x01234567 = init(r2, 0);
-        __m256 v_acc2x89abcdef = init(r2, 8);
-        __m256 v_acc3x01234567 = init(r3, 0);
-        __m256 v_acc3x89abcdef = init(r3, 8);
 
-        const half* a_ptr = A;
-        const half* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-                const __m256 v_b1 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-                b_ptr += 16;
+    const __m256 va0 = f16_a_bcast(*p0);
 
-                __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits)));
-                __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r1].bits)));
-                v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-                v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-                v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-                v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
 
-                v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r2].bits)));
-                v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r3].bits)));
-                v_acc2x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc2x01234567);
-                v_acc2x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc2x89abcdef);
-                v_acc3x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc3x01234567);
-                v_acc3x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc3x89abcdef);
+    a[0] = p0 + 1;
+    acc[0][0] = _mm256_fmadd_ps(va0, vb0, acc[0][0]);
+    if constexpr (NG > 1) {
+        acc[1][0] = _mm256_fmadd_ps(va0, vb1, acc[1][0]);
+    }
+    if constexpr (MR > 1) {
+        const half* const p1 = a[1];
 
-                a_ptr += 4;
-            }
-        } else {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 =
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr)));
-                b_ptr += 16;
-                v_acc0x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits))), v_b0,
-                    v_acc0x01234567);
-                v_acc1x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r1].bits))), v_b0,
-                    v_acc1x01234567);
-                v_acc2x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r2].bits))), v_b0,
-                    v_acc2x01234567);
-                v_acc3x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r3].bits))), v_b0,
-                    v_acc3x01234567);
-                a_ptr += 4;
-            }
+        const __m256 va1 = f16_a_bcast(*p1);
+
+        a[1] = p1 + 1;
+        acc[0][1] = _mm256_fmadd_ps(va1, vb0, acc[0][1]);
+        if constexpr (NG > 1) {
+            acc[1][1] = _mm256_fmadd_ps(va1, vb1, acc[1][1]);
         }
+    }
+    if constexpr (MR > 2) {
+        const half* const p2 = a[2];
 
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_ps(
-                    v_acc0x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr))));
-                v_acc1x01234567 = _mm256_add_ps(
-                    v_acc1x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr))));
-                v_acc2x01234567 = _mm256_add_ps(
-                    v_acc2x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr))));
-                v_acc3x01234567 = _mm256_add_ps(
-                    v_acc3x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr))));
-            }
+        const __m256 va2 = f16_a_bcast(*p2);
 
-            const __m256 v_min = _mm256_set1_ps(clamp_min);
-            const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-            v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-            v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-            v_acc2x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc2x01234567, v_max), v_min);
-            v_acc3x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc3x01234567, v_max), v_min);
-
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr),
-                             _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr),
-                             _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr),
-                             _mm256_cvtps_ph(v_acc2x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr),
-                             _mm256_cvtps_ph(v_acc3x01234567, _MM_FROUND_TO_NEAREST_INT));
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-            c2_ptr += 8;
-            c3_ptr += 8;
-
-            if (rem > 8) {
-                v_acc0x01234567 = v_acc0x89abcdef;
-                v_acc1x01234567 = v_acc1x89abcdef;
-                v_acc2x01234567 = v_acc2x89abcdef;
-                v_acc3x01234567 = v_acc3x89abcdef;
-            }
-            rem -= 8;
+        a[2] = p2 + 1;
+        acc[0][2] = _mm256_fmadd_ps(va2, vb0, acc[0][2]);
+        if constexpr (NG > 1) {
+            acc[1][2] = _mm256_fmadd_ps(va2, vb1, acc[1][2]);
         }
+    }
+    if constexpr (MR > 3) {
+        const half* const p3 = a[3];
 
-        if (rem > 0) {
-            __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
-            __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
-            __m128 v_acc2x0123 = _mm256_castps256_ps128(v_acc2x01234567);
-            __m128 v_acc3x0123 = _mm256_castps256_ps128(v_acc3x01234567);
+        const __m256 va3 = f16_a_bcast(*p3);
 
-            const __m128 v_min = _mm_set1_ps(clamp_min);
-            const __m128 v_max = _mm_set1_ps(clamp_max);
+        a[3] = p3 + 1;
+        acc[0][3] = _mm256_fmadd_ps(va3, vb0, acc[0][3]);
+        if constexpr (NG > 1) {
+            acc[1][3] = _mm256_fmadd_ps(va3, vb1, acc[1][3]);
+        }
+    }
+    if constexpr (MR > 4) {
+        const half* const p4 = a[4];
 
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr))));
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr))));
-                    v_acc2x0123 = _mm_add_ps(
-                        v_acc2x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c2_ptr))));
-                    v_acc3x0123 = _mm_add_ps(
-                        v_acc3x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c3_ptr))));
-                }
+        const __m256 va4 = f16_a_bcast(*p4);
 
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ps(_mm_min_ps(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ps(_mm_min_ps(v_acc3x0123, v_max), v_min);
+        a[4] = p4 + 1;
+        acc[0][4] = _mm256_fmadd_ps(va4, vb0, acc[0][4]);
+        if constexpr (NG > 1) {
+            acc[1][4] = _mm256_fmadd_ps(va4, vb1, acc[1][4]);
+        }
+    }
+    if constexpr (MR > 5) {
+        const half* const p5 = a[5];
 
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr),
-                                 _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr),
-                                 _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c2_ptr),
-                                 _mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c3_ptr),
-                                 _mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT));
+        const __m256 va5 = f16_a_bcast(*p5);
 
-                c0_ptr += 4;
-                c1_ptr += 4;
-                c2_ptr += 4;
-                c3_ptr += 4;
-
-                v_acc0x0123 = _mm256_extractf128_ps(v_acc0x01234567, 1);
-                v_acc1x0123 = _mm256_extractf128_ps(v_acc1x01234567, 1);
-                v_acc2x0123 = _mm256_extractf128_ps(v_acc2x01234567, 1);
-                v_acc3x0123 = _mm256_extractf128_ps(v_acc3x01234567, 1);
-            }
-
-            if (rem & 2) {
-                const __m128 v_rest0 = v_acc0x0123;
-                const __m128 v_rest1 = v_acc1x0123;
-                const __m128 v_rest2 = v_acc2x0123;
-                const __m128 v_rest3 = v_acc3x0123;
-
-                if constexpr (!zero_mode) {
-                    uint32_t c_bits;
-                    c_bits = static_cast<uint32_t>(c0_ptr[0].bits) |
-                             (static_cast<uint32_t>(c0_ptr[1].bits) << 16);
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c1_ptr[0].bits) |
-                             (static_cast<uint32_t>(c1_ptr[1].bits) << 16);
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c2_ptr[0].bits) |
-                             (static_cast<uint32_t>(c2_ptr[1].bits) << 16);
-                    v_acc2x0123 = _mm_add_ps(
-                        v_acc2x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c3_ptr[0].bits) |
-                             (static_cast<uint32_t>(c3_ptr[1].bits) << 16);
-                    v_acc3x0123 = _mm_add_ps(
-                        v_acc3x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ps(_mm_min_ps(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ps(_mm_min_ps(v_acc3x0123, v_max), v_min);
-
-                {
-                    const __m128i v_h0 = _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c0_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 0));
-                    c0_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 1));
-                    const __m128i v_h1 = _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c1_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 0));
-                    c1_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 1));
-                    const __m128i v_h2 = _mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c2_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h2, 0));
-                    c2_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h2, 1));
-                    const __m128i v_h3 = _mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c3_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h3, 0));
-                    c3_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h3, 1));
-                }
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-                c2_ptr += 2;
-                c3_ptr += 2;
-
-                v_acc0x0123 = _mm_movehl_ps(v_rest0, v_rest0);
-                v_acc1x0123 = _mm_movehl_ps(v_rest1, v_rest1);
-                v_acc2x0123 = _mm_movehl_ps(v_rest2, v_rest2);
-                v_acc3x0123 = _mm_movehl_ps(v_rest3, v_rest3);
-            }
-
-            if (rem & 1) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ss(v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c0_ptr->bits))));
-                    v_acc1x0123 = _mm_add_ss(v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c1_ptr->bits))));
-                    v_acc2x0123 = _mm_add_ss(v_acc2x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c2_ptr->bits))));
-                    v_acc3x0123 = _mm_add_ss(v_acc3x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c3_ptr->bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ss(_mm_min_ss(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ss(_mm_min_ss(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ss(_mm_min_ss(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ss(_mm_min_ss(v_acc3x0123, v_max), v_min);
-
-                c0_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c1_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c2_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c3_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-            }
+        a[5] = p5 + 1;
+        acc[0][5] = _mm256_fmadd_ps(va5, vb0, acc[0][5]);
+        if constexpr (NG > 1) {
+            acc[1][5] = _mm256_fmadd_ps(va5, vb1, acc[1][5]);
         }
     }
 }
 
-template <bool zero_mode = false, int seed = 0>
-void mma_pack_mr2_nr16_mrxncxkc_f16(int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
-                                    const half* NNOPS_RESTRICT A, const half* NNOPS_RESTRICT B,
-                                    float clamp_min, float clamp_max,
-                                    const half* NNOPS_RESTRICT bias = nullptr) noexcept
+/// The panel's whole K from packed A into seeded `acc`.
+template <int MR, int NG, int seed>
+NNOPS_FORCEINLINE void f16_mma(const half* A, const half* B, int kc, int bstep,
+                               const half* bias, const int (&rr)[MR],
+                               __m256 (&acc)[NG][MR]) noexcept
 {
-    const int r1 = (mr > 1) ? 1 : 0;
+    f16_col_init<MR, seed>(acc[0], bias, rr, 0);
+    if constexpr (NG > 1) {
+        f16_col_init<MR, seed>(acc[1], bias, rr, 8);
+    }
+    const half* a_ptr = A;
+    const half* b_ptr = B;
+    for (int k = 0; k < kc; ++k) {
+        f16_group<MR, NG>(a_ptr, b_ptr, rr, acc);
+        b_ptr += bstep;
+    }
+}
 
-    half* c0_ptr = C + 0 * ldc;
-    half* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
+/// The panel's whole K from row-major rows into seeded `acc`.
+template <int MR, int NG, int seed>
+NNOPS_FORCEINLINE void f16_mma_rows(const half* (&a)[MR], const half* B, int kc,
+                                    int bstep, const half* bias, const int (&rr)[MR],
+                                    __m256 (&acc)[NG][MR]) noexcept
+{
+    f16_col_init<MR, seed>(acc[0], bias, rr, 0);
+    if constexpr (NG > 1) {
+        f16_col_init<MR, seed>(acc[1], bias, rr, 8);
+    }
+    const half* b_ptr = B;
+    for (int k = 0; k < kc; ++k, b_ptr += bstep) {
+        f16_step_rows<MR, NG>(a, b_ptr, acc);
+    }
+}
 
-    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
+// ---- the store ------------------------------------------------------------
+//
+// A group of eight columns is written in two passes: every row's C is folded
+// into its accumulator first, then the rows are stored. Aliased rows share an
+// address, so a row-at-a-time add would have the second duplicate reading C
+// with the first one's result already in it.
 
-    int n = 0;
+NNOPS_FORCEINLINE __m128 f16_clamp4(__m128 v, __m128 vmin, __m128 vmax) noexcept
+{
+    return _mm_max_ps(_mm_min_ps(v, vmax), vmin);
+}
 
-    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
-    const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) {
-            return _mm256_set1_ps(half_to_float(bias[r]));
-        } else if constexpr (seed == 2) {
-            return _mm256_cvtph_ps(
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
-        } else {
-            return _mm256_setzero_ps();
-        }
-    };
+/// Fold C into one group's accumulators, every row before any store.
+template <int MR>
+NNOPS_FORCEINLINE void f16_add_c(half* const (&row)[MR], int off, __m256 (&col)[MR]) noexcept
+{
+    col[0] = _mm256_add_ps(col[0], f16_b_load(row[0] + off));
+    if constexpr (MR > 1) {
+        col[1] = _mm256_add_ps(col[1], f16_b_load(row[1] + off));
+    }
+    if constexpr (MR > 2) {
+        col[2] = _mm256_add_ps(col[2], f16_b_load(row[2] + off));
+    }
+    if constexpr (MR > 3) {
+        col[3] = _mm256_add_ps(col[3], f16_b_load(row[3] + off));
+    }
+    if constexpr (MR > 4) {
+        col[4] = _mm256_add_ps(col[4], f16_b_load(row[4] + off));
+    }
+    if constexpr (MR > 5) {
+        col[5] = _mm256_add_ps(col[5], f16_b_load(row[5] + off));
+    }
+}
 
-    for (; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
+/// Clamp and store one full group, no C add.
+template <int MR>
+NNOPS_FORCEINLINE void f16_store_c(half* const (&row)[MR], int off, __m256 (&col)[MR],
+                                   __m256 vmin, __m256 vmax) noexcept
+{
+    col[0] = _mm256_max_ps(_mm256_min_ps(col[0], vmax), vmin);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(row[0] + off),
+                     _mm256_cvtps_ph(col[0], _MM_FROUND_TO_NEAREST_INT));
+    if constexpr (MR > 1) {
+        col[1] = _mm256_max_ps(_mm256_min_ps(col[1], vmax), vmin);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(row[1] + off),
+                         _mm256_cvtps_ph(col[1], _MM_FROUND_TO_NEAREST_INT));
+    }
+    if constexpr (MR > 2) {
+        col[2] = _mm256_max_ps(_mm256_min_ps(col[2], vmax), vmin);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(row[2] + off),
+                         _mm256_cvtps_ph(col[2], _MM_FROUND_TO_NEAREST_INT));
+    }
+    if constexpr (MR > 3) {
+        col[3] = _mm256_max_ps(_mm256_min_ps(col[3], vmax), vmin);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(row[3] + off),
+                         _mm256_cvtps_ph(col[3], _MM_FROUND_TO_NEAREST_INT));
+    }
+    if constexpr (MR > 4) {
+        col[4] = _mm256_max_ps(_mm256_min_ps(col[4], vmax), vmin);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(row[4] + off),
+                         _mm256_cvtps_ph(col[4], _MM_FROUND_TO_NEAREST_INT));
+    }
+    if constexpr (MR > 5) {
+        col[5] = _mm256_max_ps(_mm256_min_ps(col[5], vmax), vmin);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(row[5] + off),
+                         _mm256_cvtps_ph(col[5], _MM_FROUND_TO_NEAREST_INT));
+    }
+}
 
-        const half* a_ptr = A;
-        const half* b_ptr = B;
-        for (int k = 0; k < kc; ++k) {
-            const __m256 v_b0 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-            const __m256 v_b1 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-            b_ptr += 16;
+/// Two halfs of a row as one tuple: the 2-wide C read.
+NNOPS_FORCEINLINE __m128 f16_load2(const half* p) noexcept
+{
+    const uint32_t bits = static_cast<uint32_t>(p[0].bits) |
+                          (static_cast<uint32_t>(p[1].bits) << 16);
+    return _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(bits)));
+}
 
-            const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits)));
-            const __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r1].bits)));
-            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-            v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-            v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-
-            a_ptr += 2;
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_ps(
-                v_acc0x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 0))));
-            v_acc0x89abcdef = _mm256_add_ps(
-                v_acc0x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 8))));
-            v_acc1x01234567 = _mm256_add_ps(
-                v_acc1x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 0))));
-            v_acc1x89abcdef = _mm256_add_ps(
-                v_acc1x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 8))));
-        }
-        const __m256 v_min = _mm256_set1_ps(clamp_min);
-        const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
-        v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-        v_acc1x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc1x89abcdef, v_max), v_min);
-
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 0),
-                         _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 8),
-                         _mm256_cvtps_ph(v_acc0x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 0),
-                         _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 8),
-                         _mm256_cvtps_ph(v_acc1x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-
-        B += ldb_panel;
+/// The live lanes of a group: one stage (four halfs, then two, then one) for
+/// every row before that stage's stores, so duplicate (aliased) rows all read
+/// the same C.
+template <int MR, bool zero_mode>
+NNOPS_FORCEINLINE void f16_store_lanes(half* const (&row)[MR], int off, int lanes,
+                                       __m256 (&col)[MR], __m256 vmin, __m256 vmax) noexcept
+{
+    const __m128 vmin4 = _mm256_castps256_ps128(vmin);
+    const __m128 vmax4 = _mm256_castps256_ps128(vmax);
+    __m128 lo[MR];
+    lo[0] = _mm256_castps256_ps128(col[0]);
+    if constexpr (MR > 1) {
+        lo[1] = _mm256_castps256_ps128(col[1]);
+    }
+    if constexpr (MR > 2) {
+        lo[2] = _mm256_castps256_ps128(col[2]);
+    }
+    if constexpr (MR > 3) {
+        lo[3] = _mm256_castps256_ps128(col[3]);
+    }
+    if constexpr (MR > 4) {
+        lo[4] = _mm256_castps256_ps128(col[4]);
+    }
+    if constexpr (MR > 5) {
+        lo[5] = _mm256_castps256_ps128(col[5]);
     }
 
-    int rem = nc - n;
-
-    if (rem > 0) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-
-        const half* a_ptr = A;
-        const half* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-                const __m256 v_b1 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-                b_ptr += 16;
-
-                const __m256 v_a0 =
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits)));
-                const __m256 v_a1 =
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r1].bits)));
-                v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-                v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-                v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-                v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-
-                a_ptr += 2;
+    if (lanes & 4) {
+        if constexpr (!zero_mode) {
+            lo[0] = _mm_add_ps(
+                lo[0], _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[0] + off))));
+            if constexpr (MR > 1) {
+                lo[1] = _mm_add_ps(
+                    lo[1],
+                    _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[1] + off))));
             }
-        } else {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 =
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr)));
-                b_ptr += 16;
-                v_acc0x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits))), v_b0,
-                    v_acc0x01234567);
-                v_acc1x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[r1].bits))), v_b0,
-                    v_acc1x01234567);
-                a_ptr += 2;
+            if constexpr (MR > 2) {
+                lo[2] = _mm_add_ps(
+                    lo[2],
+                    _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[2] + off))));
+            }
+            if constexpr (MR > 3) {
+                lo[3] = _mm_add_ps(
+                    lo[3],
+                    _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[3] + off))));
+            }
+            if constexpr (MR > 4) {
+                lo[4] = _mm_add_ps(
+                    lo[4],
+                    _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[4] + off))));
+            }
+            if constexpr (MR > 5) {
+                lo[5] = _mm_add_ps(
+                    lo[5],
+                    _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[5] + off))));
             }
         }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_ps(
-                    v_acc0x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr))));
-                v_acc1x01234567 = _mm256_add_ps(
-                    v_acc1x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr))));
-            }
-
-            const __m256 v_min = _mm256_set1_ps(clamp_min);
-            const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-            v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-            v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr),
-                             _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr),
-                             _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-
-            if (rem > 8) {
-                v_acc0x01234567 = v_acc0x89abcdef;
-                v_acc1x01234567 = v_acc1x89abcdef;
-            }
-            rem -= 8;
+        lo[0] = f16_clamp4(lo[0], vmin4, vmax4);
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(row[0] + off),
+                         _mm_cvtps_ph(lo[0], _MM_FROUND_TO_NEAREST_INT));
+        if constexpr (MR > 1) {
+            lo[1] = f16_clamp4(lo[1], vmin4, vmax4);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[1] + off),
+                             _mm_cvtps_ph(lo[1], _MM_FROUND_TO_NEAREST_INT));
         }
+        if constexpr (MR > 2) {
+            lo[2] = f16_clamp4(lo[2], vmin4, vmax4);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[2] + off),
+                             _mm_cvtps_ph(lo[2], _MM_FROUND_TO_NEAREST_INT));
+        }
+        if constexpr (MR > 3) {
+            lo[3] = f16_clamp4(lo[3], vmin4, vmax4);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[3] + off),
+                             _mm_cvtps_ph(lo[3], _MM_FROUND_TO_NEAREST_INT));
+        }
+        if constexpr (MR > 4) {
+            lo[4] = f16_clamp4(lo[4], vmin4, vmax4);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[4] + off),
+                             _mm_cvtps_ph(lo[4], _MM_FROUND_TO_NEAREST_INT));
+        }
+        if constexpr (MR > 5) {
+            lo[5] = f16_clamp4(lo[5], vmin4, vmax4);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[5] + off),
+                             _mm_cvtps_ph(lo[5], _MM_FROUND_TO_NEAREST_INT));
+        }
+        off += 4;
+        lo[0] = _mm256_extractf128_ps(col[0], 1);
+        if constexpr (MR > 1) {
+            lo[1] = _mm256_extractf128_ps(col[1], 1);
+        }
+        if constexpr (MR > 2) {
+            lo[2] = _mm256_extractf128_ps(col[2], 1);
+        }
+        if constexpr (MR > 3) {
+            lo[3] = _mm256_extractf128_ps(col[3], 1);
+        }
+        if constexpr (MR > 4) {
+            lo[4] = _mm256_extractf128_ps(col[4], 1);
+        }
+        if constexpr (MR > 5) {
+            lo[5] = _mm256_extractf128_ps(col[5], 1);
+        }
+    }
 
-        if (rem > 0) {
-            __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
-            __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
-
-            const __m128 v_min = _mm_set1_ps(clamp_min);
-            const __m128 v_max = _mm_set1_ps(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr))));
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr),
-                                 _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr),
-                                 _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT));
-
-                c0_ptr += 4;
-                c1_ptr += 4;
-
-                v_acc0x0123 = _mm256_extractf128_ps(v_acc0x01234567, 1);
-                v_acc1x0123 = _mm256_extractf128_ps(v_acc1x01234567, 1);
+    if (lanes & 2) {
+        __m128 rest[MR];
+        rest[0] = lo[0];
+        if constexpr (MR > 1) {
+            rest[1] = lo[1];
+        }
+        if constexpr (MR > 2) {
+            rest[2] = lo[2];
+        }
+        if constexpr (MR > 3) {
+            rest[3] = lo[3];
+        }
+        if constexpr (MR > 4) {
+            rest[4] = lo[4];
+        }
+        if constexpr (MR > 5) {
+            rest[5] = lo[5];
+        }
+        if constexpr (!zero_mode) {
+            lo[0] = _mm_add_ps(lo[0], f16_load2(row[0] + off));
+            if constexpr (MR > 1) {
+                lo[1] = _mm_add_ps(lo[1], f16_load2(row[1] + off));
             }
-
-            if (rem & 2) {
-                const __m128 v_rest0 = v_acc0x0123;
-                const __m128 v_rest1 = v_acc1x0123;
-
-                if constexpr (!zero_mode) {
-                    uint32_t c_bits;
-                    c_bits = static_cast<uint32_t>(c0_ptr[0].bits) |
-                             (static_cast<uint32_t>(c0_ptr[1].bits) << 16);
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c1_ptr[0].bits) |
-                             (static_cast<uint32_t>(c1_ptr[1].bits) << 16);
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-
-                {
-                    const __m128i v_h0 = _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c0_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 0));
-                    c0_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 1));
-                    const __m128i v_h1 = _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c1_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 0));
-                    c1_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 1));
-                }
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-
-                v_acc0x0123 = _mm_movehl_ps(v_rest0, v_rest0);
-                v_acc1x0123 = _mm_movehl_ps(v_rest1, v_rest1);
+            if constexpr (MR > 2) {
+                lo[2] = _mm_add_ps(lo[2], f16_load2(row[2] + off));
             }
-
-            if (rem & 1) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ss(v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c0_ptr->bits))));
-                    v_acc1x0123 = _mm_add_ss(v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c1_ptr->bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ss(_mm_min_ss(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ss(_mm_min_ss(v_acc1x0123, v_max), v_min);
-
-                c0_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c1_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT), 0));
+            if constexpr (MR > 3) {
+                lo[3] = _mm_add_ps(lo[3], f16_load2(row[3] + off));
             }
+            if constexpr (MR > 4) {
+                lo[4] = _mm_add_ps(lo[4], f16_load2(row[4] + off));
+            }
+            if constexpr (MR > 5) {
+                lo[5] = _mm_add_ps(lo[5], f16_load2(row[5] + off));
+            }
+        }
+        {
+            const __m128i h0 =
+                _mm_cvtps_ph(f16_clamp4(lo[0], vmin4, vmax4), _MM_FROUND_TO_NEAREST_INT);
+            row[0][off + 0].bits = static_cast<uint16_t>(_mm_extract_epi16(h0, 0));
+            row[0][off + 1].bits = static_cast<uint16_t>(_mm_extract_epi16(h0, 1));
+            if constexpr (MR > 1) {
+                const __m128i h1 =
+                    _mm_cvtps_ph(f16_clamp4(lo[1], vmin4, vmax4), _MM_FROUND_TO_NEAREST_INT);
+                row[1][off + 0].bits = static_cast<uint16_t>(_mm_extract_epi16(h1, 0));
+                row[1][off + 1].bits = static_cast<uint16_t>(_mm_extract_epi16(h1, 1));
+            }
+            if constexpr (MR > 2) {
+                const __m128i h2 =
+                    _mm_cvtps_ph(f16_clamp4(lo[2], vmin4, vmax4), _MM_FROUND_TO_NEAREST_INT);
+                row[2][off + 0].bits = static_cast<uint16_t>(_mm_extract_epi16(h2, 0));
+                row[2][off + 1].bits = static_cast<uint16_t>(_mm_extract_epi16(h2, 1));
+            }
+            if constexpr (MR > 3) {
+                const __m128i h3 =
+                    _mm_cvtps_ph(f16_clamp4(lo[3], vmin4, vmax4), _MM_FROUND_TO_NEAREST_INT);
+                row[3][off + 0].bits = static_cast<uint16_t>(_mm_extract_epi16(h3, 0));
+                row[3][off + 1].bits = static_cast<uint16_t>(_mm_extract_epi16(h3, 1));
+            }
+            if constexpr (MR > 4) {
+                const __m128i h4 =
+                    _mm_cvtps_ph(f16_clamp4(lo[4], vmin4, vmax4), _MM_FROUND_TO_NEAREST_INT);
+                row[4][off + 0].bits = static_cast<uint16_t>(_mm_extract_epi16(h4, 0));
+                row[4][off + 1].bits = static_cast<uint16_t>(_mm_extract_epi16(h4, 1));
+            }
+            if constexpr (MR > 5) {
+                const __m128i h5 =
+                    _mm_cvtps_ph(f16_clamp4(lo[5], vmin4, vmax4), _MM_FROUND_TO_NEAREST_INT);
+                row[5][off + 0].bits = static_cast<uint16_t>(_mm_extract_epi16(h5, 0));
+                row[5][off + 1].bits = static_cast<uint16_t>(_mm_extract_epi16(h5, 1));
+            }
+        }
+        off += 2;
+        lo[0] = _mm_movehl_ps(rest[0], rest[0]);
+        if constexpr (MR > 1) {
+            lo[1] = _mm_movehl_ps(rest[1], rest[1]);
+        }
+        if constexpr (MR > 2) {
+            lo[2] = _mm_movehl_ps(rest[2], rest[2]);
+        }
+        if constexpr (MR > 3) {
+            lo[3] = _mm_movehl_ps(rest[3], rest[3]);
+        }
+        if constexpr (MR > 4) {
+            lo[4] = _mm_movehl_ps(rest[4], rest[4]);
+        }
+        if constexpr (MR > 5) {
+            lo[5] = _mm_movehl_ps(rest[5], rest[5]);
+        }
+    }
+
+    if (lanes & 1) {
+        if constexpr (!zero_mode) {
+            lo[0] = _mm_add_ss(
+                lo[0], _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(row[0][off].bits))));
+            if constexpr (MR > 1) {
+                lo[1] = _mm_add_ss(
+                    lo[1], _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(row[1][off].bits))));
+            }
+            if constexpr (MR > 2) {
+                lo[2] = _mm_add_ss(
+                    lo[2], _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(row[2][off].bits))));
+            }
+            if constexpr (MR > 3) {
+                lo[3] = _mm_add_ss(
+                    lo[3], _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(row[3][off].bits))));
+            }
+            if constexpr (MR > 4) {
+                lo[4] = _mm_add_ss(
+                    lo[4], _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(row[4][off].bits))));
+            }
+            if constexpr (MR > 5) {
+                lo[5] = _mm_add_ss(
+                    lo[5], _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(row[5][off].bits))));
+            }
+        }
+        row[0][off].bits = static_cast<uint16_t>(_mm_extract_epi16(
+            _mm_cvtps_ph(_mm_max_ss(_mm_min_ss(lo[0], vmax4), vmin4), _MM_FROUND_TO_NEAREST_INT),
+            0));
+        if constexpr (MR > 1) {
+            row[1][off].bits = static_cast<uint16_t>(_mm_extract_epi16(
+                _mm_cvtps_ph(_mm_max_ss(_mm_min_ss(lo[1], vmax4), vmin4),
+                             _MM_FROUND_TO_NEAREST_INT),
+                0));
+        }
+        if constexpr (MR > 2) {
+            row[2][off].bits = static_cast<uint16_t>(_mm_extract_epi16(
+                _mm_cvtps_ph(_mm_max_ss(_mm_min_ss(lo[2], vmax4), vmin4),
+                             _MM_FROUND_TO_NEAREST_INT),
+                0));
+        }
+        if constexpr (MR > 3) {
+            row[3][off].bits = static_cast<uint16_t>(_mm_extract_epi16(
+                _mm_cvtps_ph(_mm_max_ss(_mm_min_ss(lo[3], vmax4), vmin4),
+                             _MM_FROUND_TO_NEAREST_INT),
+                0));
+        }
+        if constexpr (MR > 4) {
+            row[4][off].bits = static_cast<uint16_t>(_mm_extract_epi16(
+                _mm_cvtps_ph(_mm_max_ss(_mm_min_ss(lo[4], vmax4), vmin4),
+                             _MM_FROUND_TO_NEAREST_INT),
+                0));
+        }
+        if constexpr (MR > 5) {
+            row[5][off].bits = static_cast<uint16_t>(_mm_extract_epi16(
+                _mm_cvtps_ph(_mm_max_ss(_mm_min_ss(lo[5], vmax4), vmin4),
+                             _MM_FROUND_TO_NEAREST_INT),
+                0));
         }
     }
 }
 
-template <bool zero_mode = false, int seed = 0>
-void mma_pack_mr1_nr16_mrxncxkc_f16(int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
-                                    const half* NNOPS_RESTRICT A, const half* NNOPS_RESTRICT B,
-                                    float clamp_min, float clamp_max,
-                                    const half* NNOPS_RESTRICT bias = nullptr) noexcept
+/// Write one group of a panel: MR rows, `live` columns left in the panel from
+/// this group's first column.
+template <int MR, bool zero_mode>
+NNOPS_FORCEINLINE void f16_store_col(half* const (&row)[MR], int col0, int col, int live,
+                                     __m256 (&col_acc)[MR], __m256 vmin, __m256 vmax) noexcept
 {
-    (void)mr;
-    (void)ldc;
-
-    half* c0_ptr = C;
-
-    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
-
-    int n = 0;
-
-    const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) {
-            return _mm256_set1_ps(half_to_float(bias[r]));
-        } else if constexpr (seed == 2) {
-            return _mm256_cvtph_ps(
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
-        } else {
-            return _mm256_setzero_ps();
-        }
-    };
-
-    for (; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-
-        const half* a_ptr = A;
-        const half* b_ptr = B;
-        for (int k = 0; k < kc; ++k) {
-            const __m256 v_b0 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-            const __m256 v_b1 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-            b_ptr += 16;
-
-            const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits)));
-            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-
-            a_ptr += 1;
-        }
+    const int l = live - col;
+    if (l >= 8) {
         if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_ps(
-                v_acc0x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 0))));
-            v_acc0x89abcdef = _mm256_add_ps(
-                v_acc0x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 8))));
+            f16_add_c<MR>(row, col0 + col, col_acc);
         }
-        const __m256 v_min = _mm256_set1_ps(clamp_min);
-        const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
-
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 0),
-                         _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 8),
-                         _mm256_cvtps_ph(v_acc0x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-
-        c0_ptr += 16;
-
-        B += ldb_panel;
-    }
-
-    int rem = nc - n;
-
-    if (rem > 0) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-
-        const half* a_ptr = A;
-        const half* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-                const __m256 v_b1 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-                b_ptr += 16;
-
-                const __m256 v_a0 =
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits)));
-                v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-                v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-
-                a_ptr += 1;
-            }
-        } else {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 =
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr)));
-                b_ptr += 16;
-                v_acc0x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a_ptr[0].bits))), v_b0,
-                    v_acc0x01234567);
-                a_ptr += 1;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_ps(
-                    v_acc0x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr))));
-            }
-
-            const __m256 v_min = _mm256_set1_ps(clamp_min);
-            const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-            v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr),
-                             _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-
-            c0_ptr += 8;
-
-            if (rem > 8) {
-                v_acc0x01234567 = v_acc0x89abcdef;
-            }
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
-
-            const __m128 v_min = _mm_set1_ps(clamp_min);
-            const __m128 v_max = _mm_set1_ps(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr),
-                                 _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT));
-
-                c0_ptr += 4;
-
-                v_acc0x0123 = _mm256_extractf128_ps(v_acc0x01234567, 1);
-            }
-
-            if (rem & 2) {
-                const __m128 v_rest0 = v_acc0x0123;
-
-                if constexpr (!zero_mode) {
-                    uint32_t c_bits;
-                    c_bits = static_cast<uint32_t>(c0_ptr[0].bits) |
-                             (static_cast<uint32_t>(c0_ptr[1].bits) << 16);
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-
-                {
-                    const __m128i v_h0 = _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c0_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 0));
-                    c0_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 1));
-                }
-
-                c0_ptr += 2;
-
-                v_acc0x0123 = _mm_movehl_ps(v_rest0, v_rest0);
-            }
-
-            if (rem & 1) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ss(v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c0_ptr->bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ss(_mm_min_ss(v_acc0x0123, v_max), v_min);
-
-                c0_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-            }
-        }
+        f16_store_c<MR>(row, col0 + col, col_acc, vmin, vmax);
+    } else if (l > 0) {
+        f16_store_lanes<MR, zero_mode>(row, col0 + col, l, col_acc, vmin, vmax);
     }
 }
 
-template <bool zero_mode = false, int seed = 0>
-void mma_direct_mr6_nr16_mrxncxkc_f16(int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
-                                      const half* NNOPS_RESTRICT A, int lda,
-                                      const half* NNOPS_RESTRICT B, int ldb, float clamp_min,
-                                      float clamp_max,
-                                      const half* NNOPS_RESTRICT bias = nullptr) noexcept
+/// Write the live columns of NG groups, starting at `col0`.
+template <int MR, int NG, bool zero_mode>
+NNOPS_FORCEINLINE void f16_store(half* const (&row)[MR], int col0, int live,
+                                 __m256 (&acc)[NG][MR], __m256 vmin, __m256 vmax) noexcept
 {
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-    const int r4 = (mr > 4) ? 4 : r3;
-    const int r5 = (mr > 5) ? 5 : r4;
+    f16_store_col<MR, zero_mode>(row, col0, 0, live, acc[0], vmin, vmax);
+    if constexpr (NG > 1) {
+        f16_store_col<MR, zero_mode>(row, col0, 8, live, acc[1], vmin, vmax);
+    }
+    if constexpr (NG > 2) {
+        f16_store_col<MR, zero_mode>(row, col0, 16, live, acc[2], vmin, vmax);
+    }
+    if constexpr (NG > 3) {
+        f16_store_col<MR, zero_mode>(row, col0, 24, live, acc[3], vmin, vmax);
+    }
+}
 
-    half* c0_ptr = C + 0 * ldc;
-    half* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    half* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    half* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-    half* c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
-    half* c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
+// =========================================================================
+//  packed A + packed B  (MR = 6, 4, 2, 1)
+// =========================================================================
 
-    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
+/// One packed-A rung: the whole N side into C.
+template <int MR, bool zero_mode = false, int seed = 0>
+inline void mma_pack_mr_nr16_mrxncxkc_f16(int mr, int nc, int kc, half* NNOPS_RESTRICT C,
+                                          int ldc, const half* NNOPS_RESTRICT A,
+                                          const half* NNOPS_RESTRICT B, float clamp_min,
+                                          float clamp_max,
+                                          const half* NNOPS_RESTRICT bias = nullptr) noexcept
+{
+    int rr[MR];
+    f16_row_alias<MR>(mr, rr);
+    half* row[MR];
+    f16_row_ptrs<MR>(C, ldc, rr, row);
+    const int ldb_panel =
+        static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
+    const __m256 vmin = _mm256_set1_ps(clamp_min);
+    const __m256 vmax = _mm256_set1_ps(clamp_max);
+
+    int n = 0;
+    for (; n < nc - 15; n += 16) {
+        __m256 acc[2][MR];
+        f16_mma<MR, 2, seed>(A, B, kc, 16, f16_panel_bias<seed>(bias, n), rr, acc);
+        f16_store<MR, 2, zero_mode>(row, n, 16, acc, vmin, vmax);
+        B += ldb_panel;
+    }
+
+    const int live = nc - n;
+    if (live > 8) {
+        __m256 acc[2][MR];
+        f16_mma<MR, 2, seed>(A, B, kc, 16, f16_panel_bias<seed>(bias, n), rr, acc);
+        f16_store<MR, 2, zero_mode>(row, n, live, acc, vmin, vmax);
+    } else if (live > 0) {
+        __m256 acc[1][MR];
+        f16_mma<MR, 1, seed>(A, B, kc, 16, f16_panel_bias<seed>(bias, n), rr, acc);
+        f16_store<MR, 1, zero_mode>(row, n, live, acc, vmin, vmax);
+    }
+}
+
+// =========================================================================
+//  raw A + packed B  (MR = 6, 4, 2, 1)
+// =========================================================================
+//
+// The same walk with each row's scalar loaded per k instead of a shared panel
+// element, so the rung reads A through `lda`.
+
+/// One row-major-A rung: the whole N side into C.
+template <int MR, bool zero_mode = false, int seed = 0>
+inline void mma_direct_mr_nr16_mrxncxkc_f16(
+    int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
+    const half* NNOPS_RESTRICT A, int lda, const half* NNOPS_RESTRICT B, int ldb,
+    float clamp_min, float clamp_max,
+    const half* NNOPS_RESTRICT bias = nullptr) noexcept
+{
+    int rr[MR];
+    f16_row_alias<MR>(mr, rr);
+    half* row[MR];
+    f16_row_ptrs<MR>(C, ldc, rr, row);
+    const int ldb_panel =
+        static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
+    const __m256 vmin = _mm256_set1_ps(clamp_min);
+    const __m256 vmax = _mm256_set1_ps(clamp_max);
     const int row_step = (ldb < 0) ? 16 : ldb;
+    int panel_step = ldb_panel;
+    if constexpr (MR == 1) {
+        // Below -1 a negative ldb is how far apart the caller's packed panels
+        // sit; without one the panels are this call's own and the slot is right.
+        if (ldb < -1) {
+            panel_step = -ldb;
+        }
+    }
 
     int n = 0;
-
-    const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) {
-            return _mm256_set1_ps(half_to_float(bias[r]));
-        } else if constexpr (seed == 2) {
-            return _mm256_cvtph_ps(
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
-        } else {
-            return _mm256_setzero_ps();
-        }
-    };
-
-    for (; n < nc - 15; n += 16) {
-        const half* a0_ptr = A + 0 * lda;
-        const half* a1_ptr = A + r1 * lda;
-        const half* a2_ptr = A + r2 * lda;
-        const half* a3_ptr = A + r3 * lda;
-        const half* a4_ptr = A + r4 * lda;
-        const half* a5_ptr = A + r5 * lda;
-
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-        __m256 v_acc2x01234567 = init(r2, 0);
-        __m256 v_acc2x89abcdef = init(r2, 8);
-        __m256 v_acc3x01234567 = init(r3, 0);
-        __m256 v_acc3x89abcdef = init(r3, 8);
-        __m256 v_acc4x01234567 = init(r4, 0);
-        __m256 v_acc4x89abcdef = init(r4, 8);
-        __m256 v_acc5x01234567 = init(r5, 0);
-        __m256 v_acc5x89abcdef = init(r5, 8);
-
-        const half* b_ptr = B;
-        for (int k = 0; k < kc; ++k) {
-            const __m256 v_b0 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-            const __m256 v_b1 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-            b_ptr += row_step;
-
-            __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits)));
-            a0_ptr += 1;
-            __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a1_ptr[0].bits)));
-            a1_ptr += 1;
-            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-            v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-            v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-
-            v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a2_ptr[0].bits)));
-            a2_ptr += 1;
-            v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a3_ptr[0].bits)));
-            a3_ptr += 1;
-            v_acc2x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc2x01234567);
-            v_acc2x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc2x89abcdef);
-            v_acc3x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc3x01234567);
-            v_acc3x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc3x89abcdef);
-
-            v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a4_ptr[0].bits)));
-            a4_ptr += 1;
-            v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a5_ptr[0].bits)));
-            a5_ptr += 1;
-            v_acc4x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc4x01234567);
-            v_acc4x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc4x89abcdef);
-            v_acc5x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc5x01234567);
-            v_acc5x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc5x89abcdef);
-        }
-
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_ps(
-                v_acc0x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 0))));
-            v_acc0x89abcdef = _mm256_add_ps(
-                v_acc0x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 8))));
-            v_acc1x01234567 = _mm256_add_ps(
-                v_acc1x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 0))));
-            v_acc1x89abcdef = _mm256_add_ps(
-                v_acc1x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 8))));
-            v_acc2x01234567 = _mm256_add_ps(
-                v_acc2x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr + 0))));
-            v_acc2x89abcdef = _mm256_add_ps(
-                v_acc2x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr + 8))));
-            v_acc3x01234567 = _mm256_add_ps(
-                v_acc3x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr + 0))));
-            v_acc3x89abcdef = _mm256_add_ps(
-                v_acc3x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr + 8))));
-            v_acc4x01234567 = _mm256_add_ps(
-                v_acc4x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c4_ptr + 0))));
-            v_acc4x89abcdef = _mm256_add_ps(
-                v_acc4x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c4_ptr + 8))));
-            v_acc5x01234567 = _mm256_add_ps(
-                v_acc5x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c5_ptr + 0))));
-            v_acc5x89abcdef = _mm256_add_ps(
-                v_acc5x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c5_ptr + 8))));
-        }
-        const __m256 v_min = _mm256_set1_ps(clamp_min);
-        const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
-        v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-        v_acc1x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc1x89abcdef, v_max), v_min);
-        v_acc2x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc2x01234567, v_max), v_min);
-        v_acc2x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc2x89abcdef, v_max), v_min);
-        v_acc3x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc3x01234567, v_max), v_min);
-        v_acc3x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc3x89abcdef, v_max), v_min);
-        v_acc4x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc4x01234567, v_max), v_min);
-        v_acc4x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc4x89abcdef, v_max), v_min);
-        v_acc5x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc5x01234567, v_max), v_min);
-        v_acc5x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc5x89abcdef, v_max), v_min);
-
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 0),
-                         _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 8),
-                         _mm256_cvtps_ph(v_acc0x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 0),
-                         _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 8),
-                         _mm256_cvtps_ph(v_acc1x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr + 0),
-                         _mm256_cvtps_ph(v_acc2x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr + 8),
-                         _mm256_cvtps_ph(v_acc2x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr + 0),
-                         _mm256_cvtps_ph(v_acc3x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr + 8),
-                         _mm256_cvtps_ph(v_acc3x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c4_ptr + 0),
-                         _mm256_cvtps_ph(v_acc4x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c4_ptr + 8),
-                         _mm256_cvtps_ph(v_acc4x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c5_ptr + 0),
-                         _mm256_cvtps_ph(v_acc5x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c5_ptr + 8),
-                         _mm256_cvtps_ph(v_acc5x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-        c2_ptr += 16;
-        c3_ptr += 16;
-        c4_ptr += 16;
-        c5_ptr += 16;
-
-        B += ldb_panel;
-    }
-
-    int rem = nc - n;
-
-    if (rem > 0) {
-        const half* a0_ptr = A + 0 * lda;
-        const half* a1_ptr = A + r1 * lda;
-        const half* a2_ptr = A + r2 * lda;
-        const half* a3_ptr = A + r3 * lda;
-        const half* a4_ptr = A + r4 * lda;
-        const half* a5_ptr = A + r5 * lda;
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-        __m256 v_acc2x01234567 = init(r2, 0);
-        __m256 v_acc2x89abcdef = init(r2, 8);
-        __m256 v_acc3x01234567 = init(r3, 0);
-        __m256 v_acc3x89abcdef = init(r3, 8);
-        __m256 v_acc4x01234567 = init(r4, 0);
-        __m256 v_acc4x89abcdef = init(r4, 8);
-        __m256 v_acc5x01234567 = init(r5, 0);
-        __m256 v_acc5x89abcdef = init(r5, 8);
-
-        const half* b_ptr = B;
-        if (rem > 8) {
+    if constexpr (MR == 1) {
+        // Two packed panels per pass: at one row the loop is nothing but weight
+        // stream, and its scalar A load costs a whole load slot of its own, so
+        // one scalar over 32 columns is the margin.
+        for (; ldb < 0 && n <= nc - 32; n += 32) {
+            const half* const bp = f16_panel_bias<seed>(bias, n);
+            __m256 acc[4][1];
+            f16_col_init<1, seed>(acc[0], bp, rr, 0);
+            f16_col_init<1, seed>(acc[1], bp, rr, 8);
+            f16_col_init<1, seed>(acc[2], bp, rr, 16);
+            f16_col_init<1, seed>(acc[3], bp, rr, 24);
+            const half* ap = A;
+            const half* b0_ptr = B;
+            const half* b1_ptr = B + panel_step;
             for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-                const __m256 v_b1 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-                b_ptr += row_step;
-
-                __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits)));
-                a0_ptr += 1;
-                __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a1_ptr[0].bits)));
-                a1_ptr += 1;
-                v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-                v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-                v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-                v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-
-                v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a2_ptr[0].bits)));
-                a2_ptr += 1;
-                v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a3_ptr[0].bits)));
-                a3_ptr += 1;
-                v_acc2x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc2x01234567);
-                v_acc2x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc2x89abcdef);
-                v_acc3x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc3x01234567);
-                v_acc3x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc3x89abcdef);
-
-                v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a4_ptr[0].bits)));
-                a4_ptr += 1;
-                v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a5_ptr[0].bits)));
-                a5_ptr += 1;
-                v_acc4x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc4x01234567);
-                v_acc4x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc4x89abcdef);
-                v_acc5x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc5x01234567);
-                v_acc5x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc5x89abcdef);
+                const __m256 d0 = f16_b_load(b0_ptr + 0 * 8);
+                const __m256 d1 = f16_b_load(b0_ptr + 1 * 8);
+                const __m256 d2 = f16_b_load(b1_ptr + 0 * 8);
+                const __m256 d3 = f16_b_load(b1_ptr + 1 * 8);
+                b0_ptr += row_step;
+                b1_ptr += row_step;
+                const __m256 va = f16_a_bcast(*ap++);
+                acc[0][0] = _mm256_fmadd_ps(va, d0, acc[0][0]);
+                acc[1][0] = _mm256_fmadd_ps(va, d1, acc[1][0]);
+                acc[2][0] = _mm256_fmadd_ps(va, d2, acc[2][0]);
+                acc[3][0] = _mm256_fmadd_ps(va, d3, acc[3][0]);
             }
-        } else {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 =
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr)));
-                b_ptr += row_step;
-                v_acc0x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits))), v_b0,
-                    v_acc0x01234567);
-                v_acc1x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a1_ptr[0].bits))), v_b0,
-                    v_acc1x01234567);
-                v_acc2x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a2_ptr[0].bits))), v_b0,
-                    v_acc2x01234567);
-                v_acc3x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a3_ptr[0].bits))), v_b0,
-                    v_acc3x01234567);
-                v_acc4x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a4_ptr[0].bits))), v_b0,
-                    v_acc4x01234567);
-                v_acc5x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a5_ptr[0].bits))), v_b0,
-                    v_acc5x01234567);
-                a0_ptr += 1;
-                a1_ptr += 1;
-                a2_ptr += 1;
-                a3_ptr += 1;
-                a4_ptr += 1;
-                a5_ptr += 1;
-            }
+            f16_store<1, 4, zero_mode>(row, n, 32, acc, vmin, vmax);
+            B += 2 * panel_step;
         }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_ps(
-                    v_acc0x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr))));
-                v_acc1x01234567 = _mm256_add_ps(
-                    v_acc1x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr))));
-                v_acc2x01234567 = _mm256_add_ps(
-                    v_acc2x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr))));
-                v_acc3x01234567 = _mm256_add_ps(
-                    v_acc3x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr))));
-                v_acc4x01234567 = _mm256_add_ps(
-                    v_acc4x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c4_ptr))));
-                v_acc5x01234567 = _mm256_add_ps(
-                    v_acc5x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c5_ptr))));
-            }
-
-            const __m256 v_min = _mm256_set1_ps(clamp_min);
-            const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-            v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-            v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-            v_acc2x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc2x01234567, v_max), v_min);
-            v_acc3x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc3x01234567, v_max), v_min);
-            v_acc4x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc4x01234567, v_max), v_min);
-            v_acc5x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc5x01234567, v_max), v_min);
-
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr),
-                             _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr),
-                             _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr),
-                             _mm256_cvtps_ph(v_acc2x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr),
-                             _mm256_cvtps_ph(v_acc3x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c4_ptr),
-                             _mm256_cvtps_ph(v_acc4x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c5_ptr),
-                             _mm256_cvtps_ph(v_acc5x01234567, _MM_FROUND_TO_NEAREST_INT));
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-            c2_ptr += 8;
-            c3_ptr += 8;
-            c4_ptr += 8;
-            c5_ptr += 8;
-
-            if (rem > 8) {
-                v_acc0x01234567 = v_acc0x89abcdef;
-                v_acc1x01234567 = v_acc1x89abcdef;
-                v_acc2x01234567 = v_acc2x89abcdef;
-                v_acc3x01234567 = v_acc3x89abcdef;
-                v_acc4x01234567 = v_acc4x89abcdef;
-                v_acc5x01234567 = v_acc5x89abcdef;
-            }
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
-            __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
-            __m128 v_acc2x0123 = _mm256_castps256_ps128(v_acc2x01234567);
-            __m128 v_acc3x0123 = _mm256_castps256_ps128(v_acc3x01234567);
-            __m128 v_acc4x0123 = _mm256_castps256_ps128(v_acc4x01234567);
-            __m128 v_acc5x0123 = _mm256_castps256_ps128(v_acc5x01234567);
-
-            const __m128 v_min = _mm_set1_ps(clamp_min);
-            const __m128 v_max = _mm_set1_ps(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr))));
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr))));
-                    v_acc2x0123 = _mm_add_ps(
-                        v_acc2x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c2_ptr))));
-                    v_acc3x0123 = _mm_add_ps(
-                        v_acc3x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c3_ptr))));
-                    v_acc4x0123 = _mm_add_ps(
-                        v_acc4x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c4_ptr))));
-                    v_acc5x0123 = _mm_add_ps(
-                        v_acc5x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c5_ptr))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ps(_mm_min_ps(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ps(_mm_min_ps(v_acc3x0123, v_max), v_min);
-                v_acc4x0123 = _mm_max_ps(_mm_min_ps(v_acc4x0123, v_max), v_min);
-                v_acc5x0123 = _mm_max_ps(_mm_min_ps(v_acc5x0123, v_max), v_min);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr),
-                                 _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr),
-                                 _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c2_ptr),
-                                 _mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c3_ptr),
-                                 _mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c4_ptr),
-                                 _mm_cvtps_ph(v_acc4x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c5_ptr),
-                                 _mm_cvtps_ph(v_acc5x0123, _MM_FROUND_TO_NEAREST_INT));
-
-                c0_ptr += 4;
-                c1_ptr += 4;
-                c2_ptr += 4;
-                c3_ptr += 4;
-                c4_ptr += 4;
-                c5_ptr += 4;
-
-                v_acc0x0123 = _mm256_extractf128_ps(v_acc0x01234567, 1);
-                v_acc1x0123 = _mm256_extractf128_ps(v_acc1x01234567, 1);
-                v_acc2x0123 = _mm256_extractf128_ps(v_acc2x01234567, 1);
-                v_acc3x0123 = _mm256_extractf128_ps(v_acc3x01234567, 1);
-                v_acc4x0123 = _mm256_extractf128_ps(v_acc4x01234567, 1);
-                v_acc5x0123 = _mm256_extractf128_ps(v_acc5x01234567, 1);
-            }
-
-            if (rem & 2) {
-                const __m128 v_rest0 = v_acc0x0123;
-                const __m128 v_rest1 = v_acc1x0123;
-                const __m128 v_rest2 = v_acc2x0123;
-                const __m128 v_rest3 = v_acc3x0123;
-                const __m128 v_rest4 = v_acc4x0123;
-                const __m128 v_rest5 = v_acc5x0123;
-
-                if constexpr (!zero_mode) {
-                    uint32_t c_bits;
-                    c_bits = static_cast<uint32_t>(c0_ptr[0].bits) |
-                             (static_cast<uint32_t>(c0_ptr[1].bits) << 16);
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c1_ptr[0].bits) |
-                             (static_cast<uint32_t>(c1_ptr[1].bits) << 16);
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c2_ptr[0].bits) |
-                             (static_cast<uint32_t>(c2_ptr[1].bits) << 16);
-                    v_acc2x0123 = _mm_add_ps(
-                        v_acc2x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c3_ptr[0].bits) |
-                             (static_cast<uint32_t>(c3_ptr[1].bits) << 16);
-                    v_acc3x0123 = _mm_add_ps(
-                        v_acc3x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c4_ptr[0].bits) |
-                             (static_cast<uint32_t>(c4_ptr[1].bits) << 16);
-                    v_acc4x0123 = _mm_add_ps(
-                        v_acc4x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c5_ptr[0].bits) |
-                             (static_cast<uint32_t>(c5_ptr[1].bits) << 16);
-                    v_acc5x0123 = _mm_add_ps(
-                        v_acc5x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ps(_mm_min_ps(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ps(_mm_min_ps(v_acc3x0123, v_max), v_min);
-                v_acc4x0123 = _mm_max_ps(_mm_min_ps(v_acc4x0123, v_max), v_min);
-                v_acc5x0123 = _mm_max_ps(_mm_min_ps(v_acc5x0123, v_max), v_min);
-
-                {
-                    const __m128i v_h0 = _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c0_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 0));
-                    c0_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 1));
-                    const __m128i v_h1 = _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c1_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 0));
-                    c1_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 1));
-                    const __m128i v_h2 = _mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c2_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h2, 0));
-                    c2_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h2, 1));
-                    const __m128i v_h3 = _mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c3_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h3, 0));
-                    c3_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h3, 1));
-                    const __m128i v_h4 = _mm_cvtps_ph(v_acc4x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c4_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h4, 0));
-                    c4_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h4, 1));
-                    const __m128i v_h5 = _mm_cvtps_ph(v_acc5x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c5_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h5, 0));
-                    c5_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h5, 1));
-                }
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-                c2_ptr += 2;
-                c3_ptr += 2;
-                c4_ptr += 2;
-                c5_ptr += 2;
-
-                v_acc0x0123 = _mm_movehl_ps(v_rest0, v_rest0);
-                v_acc1x0123 = _mm_movehl_ps(v_rest1, v_rest1);
-                v_acc2x0123 = _mm_movehl_ps(v_rest2, v_rest2);
-                v_acc3x0123 = _mm_movehl_ps(v_rest3, v_rest3);
-                v_acc4x0123 = _mm_movehl_ps(v_rest4, v_rest4);
-                v_acc5x0123 = _mm_movehl_ps(v_rest5, v_rest5);
-            }
-
-            if (rem & 1) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ss(v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c0_ptr->bits))));
-                    v_acc1x0123 = _mm_add_ss(v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c1_ptr->bits))));
-                    v_acc2x0123 = _mm_add_ss(v_acc2x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c2_ptr->bits))));
-                    v_acc3x0123 = _mm_add_ss(v_acc3x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c3_ptr->bits))));
-                    v_acc4x0123 = _mm_add_ss(v_acc4x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c4_ptr->bits))));
-                    v_acc5x0123 = _mm_add_ss(v_acc5x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c5_ptr->bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ss(_mm_min_ss(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ss(_mm_min_ss(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ss(_mm_min_ss(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ss(_mm_min_ss(v_acc3x0123, v_max), v_min);
-                v_acc4x0123 = _mm_max_ss(_mm_min_ss(v_acc4x0123, v_max), v_min);
-                v_acc5x0123 = _mm_max_ss(_mm_min_ss(v_acc5x0123, v_max), v_min);
-
-                c0_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c1_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c2_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c3_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c4_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc4x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c5_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc5x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-            }
-        }
-    }
-}
-
-template <bool zero_mode = false, int seed = 0>
-void mma_direct_mr4_nr16_mrxncxkc_f16(int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
-                                      const half* NNOPS_RESTRICT A, int lda,
-                                      const half* NNOPS_RESTRICT B, int ldb, float clamp_min,
-                                      float clamp_max,
-                                      const half* NNOPS_RESTRICT bias = nullptr) noexcept
-{
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-
-    half* c0_ptr = C + 0 * ldc;
-    half* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    half* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    half* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-
-    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
-    const int row_step = (ldb < 0) ? 16 : ldb;
-
-    int n = 0;
-
-    const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) {
-            return _mm256_set1_ps(half_to_float(bias[r]));
-        } else if constexpr (seed == 2) {
-            return _mm256_cvtph_ps(
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
-        } else {
-            return _mm256_setzero_ps();
-        }
-    };
-
-    for (; n < nc - 15; n += 16) {
-        const half* a0_ptr = A + 0 * lda;
-        const half* a1_ptr = A + r1 * lda;
-        const half* a2_ptr = A + r2 * lda;
-        const half* a3_ptr = A + r3 * lda;
-
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-        __m256 v_acc2x01234567 = init(r2, 0);
-        __m256 v_acc2x89abcdef = init(r2, 8);
-        __m256 v_acc3x01234567 = init(r3, 0);
-        __m256 v_acc3x89abcdef = init(r3, 8);
-
-        const half* b_ptr = B;
-        for (int k = 0; k < kc; ++k) {
-            const __m256 v_b0 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-            const __m256 v_b1 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-            b_ptr += row_step;
-
-            __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits)));
-            a0_ptr += 1;
-            __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a1_ptr[0].bits)));
-            a1_ptr += 1;
-            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-            v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-            v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-
-            v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a2_ptr[0].bits)));
-            a2_ptr += 1;
-            v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a3_ptr[0].bits)));
-            a3_ptr += 1;
-            v_acc2x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc2x01234567);
-            v_acc2x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc2x89abcdef);
-            v_acc3x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc3x01234567);
-            v_acc3x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc3x89abcdef);
-        }
-
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_ps(
-                v_acc0x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 0))));
-            v_acc0x89abcdef = _mm256_add_ps(
-                v_acc0x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 8))));
-            v_acc1x01234567 = _mm256_add_ps(
-                v_acc1x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 0))));
-            v_acc1x89abcdef = _mm256_add_ps(
-                v_acc1x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 8))));
-            v_acc2x01234567 = _mm256_add_ps(
-                v_acc2x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr + 0))));
-            v_acc2x89abcdef = _mm256_add_ps(
-                v_acc2x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr + 8))));
-            v_acc3x01234567 = _mm256_add_ps(
-                v_acc3x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr + 0))));
-            v_acc3x89abcdef = _mm256_add_ps(
-                v_acc3x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr + 8))));
-        }
-        const __m256 v_min = _mm256_set1_ps(clamp_min);
-        const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
-        v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-        v_acc1x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc1x89abcdef, v_max), v_min);
-        v_acc2x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc2x01234567, v_max), v_min);
-        v_acc2x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc2x89abcdef, v_max), v_min);
-        v_acc3x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc3x01234567, v_max), v_min);
-        v_acc3x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc3x89abcdef, v_max), v_min);
-
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 0),
-                         _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 8),
-                         _mm256_cvtps_ph(v_acc0x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 0),
-                         _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 8),
-                         _mm256_cvtps_ph(v_acc1x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr + 0),
-                         _mm256_cvtps_ph(v_acc2x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr + 8),
-                         _mm256_cvtps_ph(v_acc2x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr + 0),
-                         _mm256_cvtps_ph(v_acc3x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr + 8),
-                         _mm256_cvtps_ph(v_acc3x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-        c2_ptr += 16;
-        c3_ptr += 16;
-
-        B += ldb_panel;
-    }
-
-    int rem = nc - n;
-
-    if (rem > 0) {
-        const half* a0_ptr = A + 0 * lda;
-        const half* a1_ptr = A + r1 * lda;
-        const half* a2_ptr = A + r2 * lda;
-        const half* a3_ptr = A + r3 * lda;
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-        __m256 v_acc2x01234567 = init(r2, 0);
-        __m256 v_acc2x89abcdef = init(r2, 8);
-        __m256 v_acc3x01234567 = init(r3, 0);
-        __m256 v_acc3x89abcdef = init(r3, 8);
-
-        const half* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-                const __m256 v_b1 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-                b_ptr += row_step;
-
-                __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits)));
-                a0_ptr += 1;
-                __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a1_ptr[0].bits)));
-                a1_ptr += 1;
-                v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-                v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-                v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-                v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-
-                v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a2_ptr[0].bits)));
-                a2_ptr += 1;
-                v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a3_ptr[0].bits)));
-                a3_ptr += 1;
-                v_acc2x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc2x01234567);
-                v_acc2x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc2x89abcdef);
-                v_acc3x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc3x01234567);
-                v_acc3x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc3x89abcdef);
-            }
-        } else {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 =
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr)));
-                b_ptr += row_step;
-                v_acc0x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits))), v_b0,
-                    v_acc0x01234567);
-                v_acc1x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a1_ptr[0].bits))), v_b0,
-                    v_acc1x01234567);
-                v_acc2x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a2_ptr[0].bits))), v_b0,
-                    v_acc2x01234567);
-                v_acc3x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a3_ptr[0].bits))), v_b0,
-                    v_acc3x01234567);
-                a0_ptr += 1;
-                a1_ptr += 1;
-                a2_ptr += 1;
-                a3_ptr += 1;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_ps(
-                    v_acc0x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr))));
-                v_acc1x01234567 = _mm256_add_ps(
-                    v_acc1x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr))));
-                v_acc2x01234567 = _mm256_add_ps(
-                    v_acc2x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr))));
-                v_acc3x01234567 = _mm256_add_ps(
-                    v_acc3x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr))));
-            }
-
-            const __m256 v_min = _mm256_set1_ps(clamp_min);
-            const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-            v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-            v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-            v_acc2x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc2x01234567, v_max), v_min);
-            v_acc3x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc3x01234567, v_max), v_min);
-
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr),
-                             _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr),
-                             _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr),
-                             _mm256_cvtps_ph(v_acc2x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr),
-                             _mm256_cvtps_ph(v_acc3x01234567, _MM_FROUND_TO_NEAREST_INT));
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-            c2_ptr += 8;
-            c3_ptr += 8;
-
-            if (rem > 8) {
-                v_acc0x01234567 = v_acc0x89abcdef;
-                v_acc1x01234567 = v_acc1x89abcdef;
-                v_acc2x01234567 = v_acc2x89abcdef;
-                v_acc3x01234567 = v_acc3x89abcdef;
-            }
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
-            __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
-            __m128 v_acc2x0123 = _mm256_castps256_ps128(v_acc2x01234567);
-            __m128 v_acc3x0123 = _mm256_castps256_ps128(v_acc3x01234567);
-
-            const __m128 v_min = _mm_set1_ps(clamp_min);
-            const __m128 v_max = _mm_set1_ps(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr))));
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr))));
-                    v_acc2x0123 = _mm_add_ps(
-                        v_acc2x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c2_ptr))));
-                    v_acc3x0123 = _mm_add_ps(
-                        v_acc3x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c3_ptr))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ps(_mm_min_ps(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ps(_mm_min_ps(v_acc3x0123, v_max), v_min);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr),
-                                 _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr),
-                                 _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c2_ptr),
-                                 _mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c3_ptr),
-                                 _mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT));
-
-                c0_ptr += 4;
-                c1_ptr += 4;
-                c2_ptr += 4;
-                c3_ptr += 4;
-
-                v_acc0x0123 = _mm256_extractf128_ps(v_acc0x01234567, 1);
-                v_acc1x0123 = _mm256_extractf128_ps(v_acc1x01234567, 1);
-                v_acc2x0123 = _mm256_extractf128_ps(v_acc2x01234567, 1);
-                v_acc3x0123 = _mm256_extractf128_ps(v_acc3x01234567, 1);
-            }
-
-            if (rem & 2) {
-                const __m128 v_rest0 = v_acc0x0123;
-                const __m128 v_rest1 = v_acc1x0123;
-                const __m128 v_rest2 = v_acc2x0123;
-                const __m128 v_rest3 = v_acc3x0123;
-
-                if constexpr (!zero_mode) {
-                    uint32_t c_bits;
-                    c_bits = static_cast<uint32_t>(c0_ptr[0].bits) |
-                             (static_cast<uint32_t>(c0_ptr[1].bits) << 16);
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c1_ptr[0].bits) |
-                             (static_cast<uint32_t>(c1_ptr[1].bits) << 16);
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c2_ptr[0].bits) |
-                             (static_cast<uint32_t>(c2_ptr[1].bits) << 16);
-                    v_acc2x0123 = _mm_add_ps(
-                        v_acc2x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c3_ptr[0].bits) |
-                             (static_cast<uint32_t>(c3_ptr[1].bits) << 16);
-                    v_acc3x0123 = _mm_add_ps(
-                        v_acc3x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ps(_mm_min_ps(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ps(_mm_min_ps(v_acc3x0123, v_max), v_min);
-
-                {
-                    const __m128i v_h0 = _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c0_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 0));
-                    c0_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 1));
-                    const __m128i v_h1 = _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c1_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 0));
-                    c1_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 1));
-                    const __m128i v_h2 = _mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c2_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h2, 0));
-                    c2_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h2, 1));
-                    const __m128i v_h3 = _mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c3_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h3, 0));
-                    c3_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h3, 1));
-                }
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-                c2_ptr += 2;
-                c3_ptr += 2;
-
-                v_acc0x0123 = _mm_movehl_ps(v_rest0, v_rest0);
-                v_acc1x0123 = _mm_movehl_ps(v_rest1, v_rest1);
-                v_acc2x0123 = _mm_movehl_ps(v_rest2, v_rest2);
-                v_acc3x0123 = _mm_movehl_ps(v_rest3, v_rest3);
-            }
-
-            if (rem & 1) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ss(v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c0_ptr->bits))));
-                    v_acc1x0123 = _mm_add_ss(v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c1_ptr->bits))));
-                    v_acc2x0123 = _mm_add_ss(v_acc2x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c2_ptr->bits))));
-                    v_acc3x0123 = _mm_add_ss(v_acc3x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c3_ptr->bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ss(_mm_min_ss(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ss(_mm_min_ss(v_acc1x0123, v_max), v_min);
-                v_acc2x0123 = _mm_max_ss(_mm_min_ss(v_acc2x0123, v_max), v_min);
-                v_acc3x0123 = _mm_max_ss(_mm_min_ss(v_acc3x0123, v_max), v_min);
-
-                c0_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c1_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c2_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc2x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c3_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc3x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-            }
-        }
-    }
-}
-
-template <bool zero_mode = false, int seed = 0>
-void mma_direct_mr2_nr16_mrxncxkc_f16(int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
-                                      const half* NNOPS_RESTRICT A, int lda,
-                                      const half* NNOPS_RESTRICT B, int ldb, float clamp_min,
-                                      float clamp_max,
-                                      const half* NNOPS_RESTRICT bias = nullptr) noexcept
-{
-    const int r1 = (mr > 1) ? 1 : 0;
-
-    half* c0_ptr = C + 0 * ldc;
-    half* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-
-    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
-    const int row_step = (ldb < 0) ? 16 : ldb;
-
-    int n = 0;
-
-    const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) {
-            return _mm256_set1_ps(half_to_float(bias[r]));
-        } else if constexpr (seed == 2) {
-            return _mm256_cvtph_ps(
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
-        } else {
-            return _mm256_setzero_ps();
-        }
-    };
-
-    for (; n < nc - 15; n += 16) {
-        const half* a0_ptr = A + 0 * lda;
-        const half* a1_ptr = A + r1 * lda;
-
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-
-        const half* b_ptr = B;
-        for (int k = 0; k < kc; ++k) {
-            const __m256 v_b0 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-            const __m256 v_b1 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-            b_ptr += row_step;
-
-            const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr->bits)));
-            a0_ptr += 1;
-            const __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a1_ptr->bits)));
-            a1_ptr += 1;
-            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-            v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-            v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-        }
-
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_ps(
-                v_acc0x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 0))));
-            v_acc0x89abcdef = _mm256_add_ps(
-                v_acc0x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 8))));
-            v_acc1x01234567 = _mm256_add_ps(
-                v_acc1x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 0))));
-            v_acc1x89abcdef = _mm256_add_ps(
-                v_acc1x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr + 8))));
-        }
-        const __m256 v_min = _mm256_set1_ps(clamp_min);
-        const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
-        v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-        v_acc1x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc1x89abcdef, v_max), v_min);
-
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 0),
-                         _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 8),
-                         _mm256_cvtps_ph(v_acc0x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 0),
-                         _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr + 8),
-                         _mm256_cvtps_ph(v_acc1x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-
-        B += ldb_panel;
-    }
-
-    int rem = nc - n;
-
-    if (rem > 0) {
-        const half* a0_ptr = A + 0 * lda;
-        const half* a1_ptr = A + r1 * lda;
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc1x01234567 = init(r1, 0);
-        __m256 v_acc1x89abcdef = init(r1, 8);
-
-        const half* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-                const __m256 v_b1 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-                b_ptr += row_step;
-
-                const __m256 v_a0 =
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr->bits)));
-                a0_ptr += 1;
-                const __m256 v_a1 =
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a1_ptr->bits)));
-                a1_ptr += 1;
-                v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-                v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-                v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
-                v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
-            }
-        } else {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 =
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr)));
-                b_ptr += row_step;
-                v_acc0x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr->bits))), v_b0,
-                    v_acc0x01234567);
-                v_acc1x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a1_ptr->bits))), v_b0,
-                    v_acc1x01234567);
-                a0_ptr += 1;
-                a1_ptr += 1;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_ps(
-                    v_acc0x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr))));
-                v_acc1x01234567 = _mm256_add_ps(
-                    v_acc1x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr))));
-            }
-
-            const __m256 v_min = _mm256_set1_ps(clamp_min);
-            const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-            v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-            v_acc1x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc1x01234567, v_max), v_min);
-
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr),
-                             _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr),
-                             _mm256_cvtps_ph(v_acc1x01234567, _MM_FROUND_TO_NEAREST_INT));
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-
-            if (rem > 8) {
-                v_acc0x01234567 = v_acc0x89abcdef;
-                v_acc1x01234567 = v_acc1x89abcdef;
-            }
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
-            __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
-
-            const __m128 v_min = _mm_set1_ps(clamp_min);
-            const __m128 v_max = _mm_set1_ps(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr))));
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr),
-                                 _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr),
-                                 _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT));
-
-                c0_ptr += 4;
-                c1_ptr += 4;
-
-                v_acc0x0123 = _mm256_extractf128_ps(v_acc0x01234567, 1);
-                v_acc1x0123 = _mm256_extractf128_ps(v_acc1x01234567, 1);
-            }
-
-            if (rem & 2) {
-                const __m128 v_rest0 = v_acc0x0123;
-                const __m128 v_rest1 = v_acc1x0123;
-
-                if constexpr (!zero_mode) {
-                    uint32_t c_bits;
-                    c_bits = static_cast<uint32_t>(c0_ptr[0].bits) |
-                             (static_cast<uint32_t>(c0_ptr[1].bits) << 16);
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                    c_bits = static_cast<uint32_t>(c1_ptr[0].bits) |
-                             (static_cast<uint32_t>(c1_ptr[1].bits) << 16);
-                    v_acc1x0123 = _mm_add_ps(
-                        v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ps(_mm_min_ps(v_acc1x0123, v_max), v_min);
-
-                {
-                    const __m128i v_h0 = _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c0_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 0));
-                    c0_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 1));
-                    const __m128i v_h1 = _mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c1_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 0));
-                    c1_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h1, 1));
-                }
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-
-                v_acc0x0123 = _mm_movehl_ps(v_rest0, v_rest0);
-                v_acc1x0123 = _mm_movehl_ps(v_rest1, v_rest1);
-            }
-
-            if (rem & 1) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ss(v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c0_ptr->bits))));
-                    v_acc1x0123 = _mm_add_ss(v_acc1x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c1_ptr->bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ss(_mm_min_ss(v_acc0x0123, v_max), v_min);
-                v_acc1x0123 = _mm_max_ss(_mm_min_ss(v_acc1x0123, v_max), v_min);
-
-                c0_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-                c1_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc1x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-            }
-        }
-    }
-}
-
-template <bool zero_mode = false, int seed = 0>
-void mma_direct_mr1_nr16_mrxncxkc_f16(int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
-                                      const half* NNOPS_RESTRICT A, int lda,
-                                      const half* NNOPS_RESTRICT B, int ldb, float clamp_min,
-                                      float clamp_max,
-                                      const half* NNOPS_RESTRICT bias = nullptr) noexcept
-{
-    (void)mr;
-    (void)ldc;
-    (void)lda;
-
-    half* c0_ptr = C;
-
-    const int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
-    const int row_step = (ldb < 0) ? 16 : ldb;
-    // Below -1 a negative ldb is how far apart the caller's packed panels sit;
-    // without one the panels are this call's own and the aligned slot is right.
-    const int panel_step = (ldb < -1) ? -ldb : ldb_panel;
-
-    int n = 0;
-
-    const auto init = [&](int r, int off) {
-        if constexpr (seed == 1) {
-            return _mm256_set1_ps(half_to_float(bias[r]));
-        } else if constexpr (seed == 2) {
-            return _mm256_cvtph_ps(
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
-        } else {
-            return _mm256_setzero_ps();
-        }
-    };
-
-    // Two packed panels per pass: at one row the loop is nothing but weight
-    // stream, and the per-k A broadcast costs a load and a convert of its own,
-    // so one scalar over 32 columns halves both.
-    for (; ldb < 0 && n <= nc - 32; n += 32) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-        __m256 v_acc0x01234567_hi = init(0, 16);
-        __m256 v_acc0x89abcdef_hi = init(0, 24);
-
-        const half* a0_ptr = A;
-        const half* b_ptr = B;
-        const half* b1_ptr = B + panel_step;
-        for (int k = 0; k < kc; ++k) {
-            const __m256 v_b0 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-            const __m256 v_b1 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-            const __m256 v_b2 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b1_ptr + 0 * 8)));
-            const __m256 v_b3 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b1_ptr + 1 * 8)));
-            b_ptr += row_step;
-            b1_ptr += row_step;
-
-            const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits)));
-            a0_ptr += 1;
-            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-            v_acc0x01234567_hi = _mm256_fmadd_ps(v_a0, v_b2, v_acc0x01234567_hi);
-            v_acc0x89abcdef_hi = _mm256_fmadd_ps(v_a0, v_b3, v_acc0x89abcdef_hi);
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_ps(
-                v_acc0x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 0))));
-            v_acc0x89abcdef = _mm256_add_ps(
-                v_acc0x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 8))));
-            v_acc0x01234567_hi = _mm256_add_ps(
-                v_acc0x01234567_hi,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 16))));
-            v_acc0x89abcdef_hi = _mm256_add_ps(
-                v_acc0x89abcdef_hi,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 24))));
-        }
-        const __m256 v_min = _mm256_set1_ps(clamp_min);
-        const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
-        v_acc0x01234567_hi = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567_hi, v_max), v_min);
-        v_acc0x89abcdef_hi = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef_hi, v_max), v_min);
-
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 0),
-                         _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 8),
-                         _mm256_cvtps_ph(v_acc0x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 16),
-                         _mm256_cvtps_ph(v_acc0x01234567_hi, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 24),
-                         _mm256_cvtps_ph(v_acc0x89abcdef_hi, _MM_FROUND_TO_NEAREST_INT));
-
-        c0_ptr += 32;
-
-        B += 2 * panel_step;
     }
 
     for (; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-
-        const half* a0_ptr = A;
-        const half* b_ptr = B;
-        for (int k = 0; k < kc; ++k) {
-            const __m256 v_b0 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-            const __m256 v_b1 =
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-            b_ptr += row_step;
-
-            const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits)));
-            a0_ptr += 1;
-            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_ps(
-                v_acc0x01234567,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 0))));
-            v_acc0x89abcdef = _mm256_add_ps(
-                v_acc0x89abcdef,
-                _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr + 8))));
-        }
-        const __m256 v_min = _mm256_set1_ps(clamp_min);
-        const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
-
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 0),
-                         _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr + 8),
-                         _mm256_cvtps_ph(v_acc0x89abcdef, _MM_FROUND_TO_NEAREST_INT));
-
-        c0_ptr += 16;
-
+        const half* a0[MR];
+        f16_a_ptrs<MR>(A, lda, rr, a0);
+        __m256 acc[2][MR];
+        f16_mma_rows<MR, 2, seed>(a0, B, kc, row_step, f16_panel_bias<seed>(bias, n), rr, acc);
+        f16_store<MR, 2, zero_mode>(row, n, 16, acc, vmin, vmax);
         B += panel_step;
     }
 
-    int rem = nc - n;
-
-    if (rem > 0) {
-        const half* a0_ptr = A + 0 * lda;
-        __m256 v_acc0x01234567 = init(0, 0);
-        __m256 v_acc0x89abcdef = init(0, 8);
-
-        const half* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 0 * 8)));
-                const __m256 v_b1 = _mm256_cvtph_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + 1 * 8)));
-                b_ptr += row_step;
-
-                const __m256 v_a0 =
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits)));
-                a0_ptr += 1;
-                v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
-                v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
-            }
-        } else {
-            for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 =
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr)));
-                b_ptr += row_step;
-                v_acc0x01234567 = _mm256_fmadd_ps(
-                    _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(a0_ptr[0].bits))), v_b0,
-                    v_acc0x01234567);
-                a0_ptr += 1;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_ps(
-                    v_acc0x01234567,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr))));
-            }
-
-            const __m256 v_min = _mm256_set1_ps(clamp_min);
-            const __m256 v_max = _mm256_set1_ps(clamp_max);
-
-            v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
-
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr),
-                             _mm256_cvtps_ph(v_acc0x01234567, _MM_FROUND_TO_NEAREST_INT));
-
-            c0_ptr += 8;
-
-            if (rem > 8) {
-                v_acc0x01234567 = v_acc0x89abcdef;
-            }
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
-
-            const __m128 v_min = _mm_set1_ps(clamp_min);
-            const __m128 v_max = _mm_set1_ps(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123,
-                        _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr),
-                                 _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT));
-
-                c0_ptr += 4;
-
-                v_acc0x0123 = _mm256_extractf128_ps(v_acc0x01234567, 1);
-            }
-
-            if (rem & 2) {
-                const __m128 v_rest0 = v_acc0x0123;
-
-                if constexpr (!zero_mode) {
-                    uint32_t c_bits;
-                    c_bits = static_cast<uint32_t>(c0_ptr[0].bits) |
-                             (static_cast<uint32_t>(c0_ptr[1].bits) << 16);
-                    v_acc0x0123 = _mm_add_ps(
-                        v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(c_bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ps(_mm_min_ps(v_acc0x0123, v_max), v_min);
-
-                {
-                    const __m128i v_h0 = _mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT);
-                    c0_ptr[0].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 0));
-                    c0_ptr[1].bits = static_cast<uint16_t>(_mm_extract_epi16(v_h0, 1));
-                }
-
-                c0_ptr += 2;
-
-                v_acc0x0123 = _mm_movehl_ps(v_rest0, v_rest0);
-            }
-
-            if (rem & 1) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_ss(v_acc0x0123, _mm_cvtph_ps(_mm_cvtsi32_si128(
-                                                              static_cast<short>(c0_ptr->bits))));
-                }
-
-                v_acc0x0123 = _mm_max_ss(_mm_min_ss(v_acc0x0123, v_max), v_min);
-
-                c0_ptr->bits = static_cast<uint16_t>(
-                    _mm_extract_epi16(_mm_cvtps_ph(v_acc0x0123, _MM_FROUND_TO_NEAREST_INT), 0));
-            }
-        }
+    const int live = nc - n;
+    if (live > 8) {
+        const half* a0[MR];
+        f16_a_ptrs<MR>(A, lda, rr, a0);
+        __m256 acc[2][MR];
+        f16_mma_rows<MR, 2, seed>(a0, B, kc, row_step, f16_panel_bias<seed>(bias, n), rr, acc);
+        f16_store<MR, 2, zero_mode>(row, n, live, acc, vmin, vmax);
+    } else if (live > 0) {
+        const half* a0[MR];
+        f16_a_ptrs<MR>(A, lda, rr, a0);
+        __m256 acc[1][MR];
+        f16_mma_rows<MR, 1, seed>(a0, B, kc, row_step, f16_panel_bias<seed>(bias, n), rr, acc);
+        f16_store<MR, 1, zero_mode>(row, n, live, acc, vmin, vmax);
     }
 }
 
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
-template <bool Z, int Seed = 0>
-inline constexpr auto mma_pack_fns_f16 =
-    std::array{&mma_pack_mr6_nr16_mrxncxkc_f16<Z, Seed>, &mma_pack_mr4_nr16_mrxncxkc_f16<Z, Seed>,
-               &mma_pack_mr2_nr16_mrxncxkc_f16<Z, Seed>, &mma_pack_mr1_nr16_mrxncxkc_f16<Z, Seed>};
 
 template <bool Z, int Seed = 0>
-inline constexpr auto mma_direct_fns_f16 = std::array{
-    &mma_direct_mr6_nr16_mrxncxkc_f16<Z, Seed>, &mma_direct_mr4_nr16_mrxncxkc_f16<Z, Seed>,
-    &mma_direct_mr2_nr16_mrxncxkc_f16<Z, Seed>, &mma_direct_mr1_nr16_mrxncxkc_f16<Z, Seed>};
+inline constexpr auto mma_pack_fns_f16 =
+    std::array{&mma_pack_mr_nr16_mrxncxkc_f16<6, Z, Seed>,
+               &mma_pack_mr_nr16_mrxncxkc_f16<4, Z, Seed>,
+               &mma_pack_mr_nr16_mrxncxkc_f16<2, Z, Seed>,
+               &mma_pack_mr_nr16_mrxncxkc_f16<1, Z, Seed>};
+
+template <bool Z, int Seed = 0>
+inline constexpr auto mma_direct_fns_f16 =
+    std::array{&mma_direct_mr_nr16_mrxncxkc_f16<6, Z, Seed>,
+               &mma_direct_mr_nr16_mrxncxkc_f16<4, Z, Seed>,
+               &mma_direct_mr_nr16_mrxncxkc_f16<2, Z, Seed>,
+               &mma_direct_mr_nr16_mrxncxkc_f16<1, Z, Seed>};
 
 } // namespace nnops::backend::cpu::x86_64

@@ -111,37 +111,37 @@ auto ab_fn(int level, bool zero_mode, int seed) {
 #if defined(NNOPS_ARCH_X86_64)
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 6: return seed == 1 ? mma_pack_mr6_nr16_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_pack_mr6_nr16_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_pack_mr6_nr16_mrxncxkc_f32<true>
-                        : mma_pack_mr6_nr16_mrxncxkc_f32<false>;
-        case 4: return seed == 1 ? mma_pack_mr4_nr16_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_pack_mr4_nr16_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_pack_mr4_nr16_mrxncxkc_f32<true>
-                        : mma_pack_mr4_nr16_mrxncxkc_f32<false>;
-        case 2: return seed == 1 ? mma_pack_mr2_nr16_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_pack_mr2_nr16_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_pack_mr2_nr16_mrxncxkc_f32<true>
-                        : mma_pack_mr2_nr16_mrxncxkc_f32<false>;
-        default: return seed == 1 ? mma_pack_mr1_nr16_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_pack_mr1_nr16_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_pack_mr1_nr16_mrxncxkc_f32<true>
-                        : mma_pack_mr1_nr16_mrxncxkc_f32<false>;
+        case 6: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f32<6, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f32<6, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f32<6, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f32<6, false>;
+        case 4: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f32<4, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f32<4, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f32<4, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f32<4, false>;
+        case 2: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f32<2, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f32<2, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f32<2, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f32<2, false>;
+        default: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f32<1, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f32<1, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f32<1, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f32<1, false>;
         }
     } else {
         switch (level) {
-        case 6: return seed == 1 ? mma_pack_mr6_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_pack_mr6_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_pack_mr6_nr16_mrxncxkc_f16<true>
-                        : mma_pack_mr6_nr16_mrxncxkc_f16<false>;
+        case 6: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f16<6, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f16<6, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f16<6, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f16<6, false>;
         case 4: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f16<4, true, 1>
                         : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f16<4, true, 2>
                         : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f16<4, true>
                         : mma_pack_mr_nr16_mrxncxkc_f16<4, false>;
-        case 2: return seed == 1 ? mma_pack_mr2_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_pack_mr2_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_pack_mr2_nr16_mrxncxkc_f16<true>
-                        : mma_pack_mr2_nr16_mrxncxkc_f16<false>;
+        case 2: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f16<2, true, 1>
+                        : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f16<2, true, 2>
+                        : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f16<2, true>
+                        : mma_pack_mr_nr16_mrxncxkc_f16<2, false>;
         default: return seed == 1 ? mma_pack_mr_nr16_mrxncxkc_f16<1, true, 1>
                         : seed == 2 ? mma_pack_mr_nr16_mrxncxkc_f16<1, true, 2>
                         : zero_mode ? mma_pack_mr_nr16_mrxncxkc_f16<1, true>
@@ -188,30 +188,30 @@ auto b_fn(int level, bool zero_mode, bool with_bias) {
 #if defined(NNOPS_ARCH_X86_64)
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 6: return with_bias ? mma_direct_mr6_nr16_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_direct_mr6_nr16_mrxncxkc_f32<true, false>
-                                 : mma_direct_mr6_nr16_mrxncxkc_f32<false, false>;
-        case 4: return with_bias ? mma_direct_mr4_nr16_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_direct_mr4_nr16_mrxncxkc_f32<true, false>
-                                 : mma_direct_mr4_nr16_mrxncxkc_f32<false, false>;
-        case 2: return with_bias ? mma_direct_mr2_nr16_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_direct_mr2_nr16_mrxncxkc_f32<true, false>
-                                 : mma_direct_mr2_nr16_mrxncxkc_f32<false, false>;
-        default: return with_bias ? mma_direct_mr1_nr16_mrxncxkc_f32<true, true>
-                                  : zero_mode ? mma_direct_mr1_nr16_mrxncxkc_f32<true, false>
-                                  : mma_direct_mr1_nr16_mrxncxkc_f32<false, false>;
+        case 6: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f32<6, true, true>
+                                 : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f32<6, true, false>
+                                 : mma_direct_mr_nr16_mrxncxkc_f32<6, false, false>;
+        case 4: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f32<4, true, true>
+                                 : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f32<4, true, false>
+                                 : mma_direct_mr_nr16_mrxncxkc_f32<4, false, false>;
+        case 2: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f32<2, true, true>
+                                 : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f32<2, true, false>
+                                 : mma_direct_mr_nr16_mrxncxkc_f32<2, false, false>;
+        default: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f32<1, true, true>
+                                  : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f32<1, true, false>
+                                  : mma_direct_mr_nr16_mrxncxkc_f32<1, false, false>;
         }
     } else {
         switch (level) {
-        case 6: return with_bias ? mma_direct_mr6_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_direct_mr6_nr16_mrxncxkc_f16<true, false>
-                                 : mma_direct_mr6_nr16_mrxncxkc_f16<false, false>;
+        case 6: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f16<6, true, true>
+                                 : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f16<6, true, false>
+                                 : mma_direct_mr_nr16_mrxncxkc_f16<6, false, false>;
         case 4: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f16<4, true, true>
                                  : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f16<4, true, false>
                                  : mma_direct_mr_nr16_mrxncxkc_f16<4, false, false>;
-        case 2: return with_bias ? mma_direct_mr2_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_direct_mr2_nr16_mrxncxkc_f16<true, false>
-                                 : mma_direct_mr2_nr16_mrxncxkc_f16<false, false>;
+        case 2: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f16<2, true, true>
+                                 : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f16<2, true, false>
+                                 : mma_direct_mr_nr16_mrxncxkc_f16<2, false, false>;
         default: return with_bias ? mma_direct_mr_nr16_mrxncxkc_f16<1, true, true>
                                   : zero_mode ? mma_direct_mr_nr16_mrxncxkc_f16<1, true, false>
                                   : mma_direct_mr_nr16_mrxncxkc_f16<1, false, false>;

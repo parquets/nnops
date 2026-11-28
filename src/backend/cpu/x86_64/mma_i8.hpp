@@ -1,53 +1,33 @@
 #pragma once
 /// @file mma_i8.hpp
-/// @brief x86_64 VNNI int8×int8 → int32 mrxncxkc MMA (matrix micro-accumulate)
-///        kernels.
+/// @brief x86_64 VNNI int8×int8 → int32 mrxncxkc MMA kernels over uniform
+///        16-wide B.
 ///
-/// One call covers the whole N side of one M panel: C[mr][nc] += A[mr][kc] ×
-/// B[kc][nc] panel by panel, every int32 result clamped to [clamp_min, clamp_max]
-/// once the sum is finished. The int8 sibling of mma_f32.hpp / mma_f16.hpp,
-/// taking the same runtime panel height `mr` and the same partial-M convention:
-/// rows past `mr` reuse the last live row's index and C row (they compute a
-/// duplicate and store it back to the same place; the XNNPACK broadcast
-/// convention), so a short panel needs no per-row guards. `zero_mode` false
-/// accumulates into C, true overwrites it; there is no bias seed argument -- the
-/// panel's column sums are the only seed.
+/// One templated rung per A presentation, with the height a template parameter:
+/// `MR` ∈ {6, 4, 1} is the panel's row count, while the calls' `mr` (1..MR) is
+/// the live height the M decomposition emits, so each level serves every panel
+/// the largest-first walk produces instead of needing a kernel per height.
+/// A and B may both be packed (`mma_pack_*`) or only B packed while A is read
+/// row-major through `lda` (`mma_direct_*`, kc % 4 == 0). `zero_mode` drops the
+/// C read-add. A packed-A panel is [ceil(kbytes/4)][MR] int32s — four
+/// consecutive k per element, one MR-wide slot per k group.
 ///
-/// Two A routes, as in the float files; B is always packed, always VNNI order.
-///   - `mma_pack_*` takes a packed A: four consecutive k per int32, with
-///     the kernel's MR row slots interleaved inside each k group --
-///     [ceil(kc/4)][MR] int32s, in a mma_pack_align(MR*kbytes)-byte slot; only
-///     the first `mr` slots of a short panel are read.
-///   - `mma_direct_*` reads A row-major through `lda` (in int8 elements): the
-///     four consecutive k of one row are already the dword dpbusd wants, so the
-///     broadcast is one unaligned 4-byte load (no penalty on x86) rather than a
-///     packed panel -- but a row-major row has no zero-filled final group, so
-///     these require kc % 4 == 0.
-///   - B is ceil(nc/16) uniform 16-column panels, each byte-group
-///     [ceil(kc/4)][16][4] -- one int32 per column per k group -- followed by
-///     16 int32 of column sums. The data half is 16*ceil(kc/4)*4 =
-///     64*ceil(kc/4) bytes, itself a multiple of the 64-byte mma_pack_align
-///     slot, so the sums block starts at panel + 64*ceil(kc/4) and the panel's
-///     slot is mma_pack_align(64*ceil(kc/4) + 64) (see mma_i8_b_panel_tail).
+/// B is ceil(nc/16) uniform 16-column panels, each byte-group
+/// [ceil(kbytes/4)][16][4] followed by 16 int32 of column sums, in a
+/// mma_i8_panel_stride(ldb, kbytes)-byte slot. Each k group is two 8-column
+/// halves, which is why the accumulators are [NG][MR] with NG ∈ {1, 2}: a tail
+/// wider than 8 runs both halves in one k loop, a tail of 8 or less the single
+/// half, and only the lanes it stores are written.
 ///
-/// `ldb` (0 = the natural slot above), the B-side argument that follows the
-/// operand it strides, overrides the panel-to-panel step in bytes: a prepacked B
-/// need not be one uniform pitch, because its panels can be cut into k-block
-/// segments -- [block 0 data][block 0 sums][block 1 data][block 1 sums]... --
-/// whose total is the caller's, not the kernel's. What stays fixed is the sums'
-/// position *within* a call: each panel's sums are read at that panel's own
-/// start + 16*ceil(kc/4), so the segment's sums land where a per-call pack would
-/// have put them.
+/// After the whole panels the N tail splits 8/4/2/1 lanes out of the same
+/// accumulators -- lane j is column j, so it is a lo/hi split; the 2-wide step
+/// keeps an unclamped copy of lanes 2,3 because the 1-wide step still stores
+/// them.
 ///
-/// Panels past `nc` in the last one are zero-filled by the packer, so the tail
-/// can always read all 16 columns at the uniform stride and discard the dead
-/// ones. `kc` is the number of int8 elements; on the packed route a final
-/// partial group (1..3) is consumed as a whole zero-padded group, matching what
-/// the packers write. After the whole panels the N tail splits 8/4/2/1 lanes
-/// out of the same accumulators -- lane j is column j, so it is a lo/hi split;
-/// a tail wider than 8 runs both 8-lane halves in one k loop instead of two,
-/// and the 2-wide step keeps an unclamped copy of lanes 2,3 because the 1-wide
-/// step still stores them.
+/// Rows past `mr` alias the last live row: the A panel repeats the last live
+/// row's slot (the packer's convention, and the kernel indexes A by the alias
+/// index for it), and the C row pointers repeat here, so a partial-M tile needs
+/// no per-row guards.
 ///
 /// Operand contract: B is int8; A is int8 or uint8, and the kernels return the
 /// exact integer dot product either way (what MatMulInteger wants, before
@@ -68,6 +48,12 @@
 /// CMake defines __AVXVNNI__ by hand.
 ///
 /// Tile sizes (x86_64-optimised): M ∈ {6, 4, 1}    N: 16 plus an in-kernel tail.
+///
+/// Every index into the accumulator block is a literal: the group walk and the
+/// store are written out at the panel's two widths instead of looping to a
+/// template bound. A loop costs nothing where the compiler unrolls it and
+/// everything where it does not -- the array is then indexed at run time and
+/// the whole block moves to the stack.
 
 #include <array>
 #include <algorithm>
@@ -93,7 +79,7 @@ inline __m256i mma_i8_dp256(__m256i acc, __m256i a, __m256i b) noexcept
 #endif
 
 /// A row-major A row's 4-k group, biased into vpdpbusd's unsigned operand.
-inline __m256i mma_i8_bcast_group(const int8_t* p) noexcept
+NNOPS_FORCEINLINE __m256i mma_i8_bcast_group(const int8_t* p) noexcept
 {
     return _mm256_set1_epi32(*reinterpret_cast<const int32_t*>(p) ^ 0x80808080);
 }
@@ -140,1713 +126,710 @@ inline __m256i mma_i8_bias_fix(const int8_t* panel, int kbytes, int off) noexcep
     return _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_slli_epi32(sums, 7));
 }
 
-template <bool zero_mode = false>
-void mma_pack_mr6_nr16_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                                   const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                                   int ldb, int32_t clamp_min, int32_t clamp_max) noexcept
+// =========================================================================
+//  one walk: the seed, the K loop, the stores
+// =========================================================================
+//
+// Every rung -- packed A or row-major, any height -- is the same walk: one k
+// group of MR rows against NG eight-column halves, then a store. The
+// accumulators are laid out [NG][MR] so a half's rows are contiguous, and every
+// index into them is a literal (see the header).
+
+/// The alias index of each row: rows past `mr` reuse the last live one.
+template <int MR>
+NNOPS_FORCEINLINE void i8_row_alias(int mr, int (&rr)[MR]) noexcept
 {
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-    const int r4 = (mr > 4) ? 4 : r3;
-    const int r5 = (mr > 5) ? 5 : r4;
+    rr[0] = 0;
+    if constexpr (MR > 1) {
+        rr[1] = std::min(1, mr - 1);
+    }
+    if constexpr (MR > 2) {
+        rr[2] = std::min(2, mr - 1);
+    }
+    if constexpr (MR > 3) {
+        rr[3] = std::min(3, mr - 1);
+    }
+    if constexpr (MR > 4) {
+        rr[4] = std::min(4, mr - 1);
+    }
+    if constexpr (MR > 5) {
+        rr[5] = std::min(5, mr - 1);
+    }
+}
 
-    int32_t* c0_ptr = C + 0 * ldc;
-    int32_t* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-    int32_t* c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
-    int32_t* c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
+/// The C rows, aliasing the last live one.
+template <int MR>
+NNOPS_FORCEINLINE void i8_row_ptrs(int32_t* C, int ldc, const int (&rr)[MR],
+                                   int32_t* (&row)[MR]) noexcept
+{
+    row[0] = C;
+    if constexpr (MR > 1) {
+        row[1] = C + rr[1] * ldc;
+    }
+    if constexpr (MR > 2) {
+        row[2] = C + rr[2] * ldc;
+    }
+    if constexpr (MR > 3) {
+        row[3] = C + rr[3] * ldc;
+    }
+    if constexpr (MR > 4) {
+        row[4] = C + rr[4] * ldc;
+    }
+    if constexpr (MR > 5) {
+        row[5] = C + rr[5] * ldc;
+    }
+}
 
+/// The row-major A rows, aliasing the last live one.
+template <int MR>
+NNOPS_FORCEINLINE void i8_a_ptrs(const int8_t* A, int lda, const int (&rr)[MR],
+                                 const int8_t* (&a)[MR]) noexcept
+{
+    a[0] = A;
+    if constexpr (MR > 1) {
+        a[1] = A + rr[1] * lda;
+    }
+    if constexpr (MR > 2) {
+        a[2] = A + rr[2] * lda;
+    }
+    if constexpr (MR > 3) {
+        a[3] = A + rr[3] * lda;
+    }
+    if constexpr (MR > 4) {
+        a[4] = A + rr[4] * lda;
+    }
+    if constexpr (MR > 5) {
+        a[5] = A + rr[5] * lda;
+    }
+}
+
+/// Seed NG halves from the B panel's column sums (the A-side bias fold).
+template <int MR, int NG>
+NNOPS_FORCEINLINE void i8_col_init(__m256i (&acc)[NG][MR], const int8_t* B,
+                                   int klen) noexcept
+{
+    const __m256i s0 = mma_i8_bias_fix(B, klen, 0);
+    acc[0][0] = s0;
+    if constexpr (MR > 1) {
+        acc[0][1] = s0;
+    }
+    if constexpr (MR > 2) {
+        acc[0][2] = s0;
+    }
+    if constexpr (MR > 3) {
+        acc[0][3] = s0;
+    }
+    if constexpr (MR > 4) {
+        acc[0][4] = s0;
+    }
+    if constexpr (MR > 5) {
+        acc[0][5] = s0;
+    }
+    if constexpr (NG > 1) {
+        const __m256i s1 = mma_i8_bias_fix(B, klen, 32);
+        acc[1][0] = s1;
+        if constexpr (MR > 1) {
+            acc[1][1] = s1;
+        }
+        if constexpr (MR > 2) {
+            acc[1][2] = s1;
+        }
+        if constexpr (MR > 3) {
+            acc[1][3] = s1;
+        }
+        if constexpr (MR > 4) {
+            acc[1][4] = s1;
+        }
+        if constexpr (MR > 5) {
+            acc[1][5] = s1;
+        }
+    }
+}
+
+/// One k group of a packed-A panel: MR rows against NG eight-column halves.
+template <int MR, int NG>
+NNOPS_FORCEINLINE void i8_group(const int32_t*& a_i32, const int8_t* b_ptr, const int (&rr)[MR],
+                                __m256i (&acc)[NG][MR]) noexcept
+{
+    // The advance is hoisted above the reads on purpose: MSVC then emits the
+    // pointer add at the top of the k loop (see mma_f32.hpp).
+    const int32_t* const a_cur = a_i32;
+    a_i32 += MR;
+    const __m256i vb0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
+    __m256i vb1 = vb0;
+    if constexpr (NG > 1) {
+        vb1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
+    }
+
+    const __m256i va0 = _mm256_set1_epi32(a_cur[rr[0]]);
+    acc[0][0] = mma_i8_dp256(acc[0][0], va0, vb0);
+    if constexpr (NG > 1) {
+        acc[1][0] = mma_i8_dp256(acc[1][0], va0, vb1);
+    }
+    if constexpr (MR > 1) {
+        const __m256i va1 = _mm256_set1_epi32(a_cur[rr[1]]);
+        acc[0][1] = mma_i8_dp256(acc[0][1], va1, vb0);
+        if constexpr (NG > 1) {
+            acc[1][1] = mma_i8_dp256(acc[1][1], va1, vb1);
+        }
+    }
+    if constexpr (MR > 2) {
+        const __m256i va2 = _mm256_set1_epi32(a_cur[rr[2]]);
+        acc[0][2] = mma_i8_dp256(acc[0][2], va2, vb0);
+        if constexpr (NG > 1) {
+            acc[1][2] = mma_i8_dp256(acc[1][2], va2, vb1);
+        }
+    }
+    if constexpr (MR > 3) {
+        const __m256i va3 = _mm256_set1_epi32(a_cur[rr[3]]);
+        acc[0][3] = mma_i8_dp256(acc[0][3], va3, vb0);
+        if constexpr (NG > 1) {
+            acc[1][3] = mma_i8_dp256(acc[1][3], va3, vb1);
+        }
+    }
+    if constexpr (MR > 4) {
+        const __m256i va4 = _mm256_set1_epi32(a_cur[rr[4]]);
+        acc[0][4] = mma_i8_dp256(acc[0][4], va4, vb0);
+        if constexpr (NG > 1) {
+            acc[1][4] = mma_i8_dp256(acc[1][4], va4, vb1);
+        }
+    }
+    if constexpr (MR > 5) {
+        const __m256i va5 = _mm256_set1_epi32(a_cur[rr[5]]);
+        acc[0][5] = mma_i8_dp256(acc[0][5], va5, vb0);
+        if constexpr (NG > 1) {
+            acc[1][5] = mma_i8_dp256(acc[1][5], va5, vb1);
+        }
+    }
+}
+
+/// One k group of a row-major panel: MR rows against NG eight-column halves.
+/// Each row's four bytes are splatted with the s8→u8 bias, and the row pointers
+/// walk with k.
+template <int MR, int NG>
+NNOPS_FORCEINLINE void i8_step_rows(const int8_t* (&a)[MR], const int8_t* b_ptr,
+                                    __m256i (&acc)[NG][MR]) noexcept
+{
+    const __m256i vb0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
+    __m256i vb1 = vb0;
+    if constexpr (NG > 1) {
+        vb1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
+    }
+
+    const int8_t* const p0 = a[0];
+    a[0] = p0 + 4;
+    const __m256i va0 = mma_i8_bcast_group(p0);
+    acc[0][0] = mma_i8_dp256(acc[0][0], va0, vb0);
+    if constexpr (NG > 1) {
+        acc[1][0] = mma_i8_dp256(acc[1][0], va0, vb1);
+    }
+    if constexpr (MR > 1) {
+        const int8_t* const p1 = a[1];
+        a[1] = p1 + 4;
+        const __m256i va1 = mma_i8_bcast_group(p1);
+        acc[0][1] = mma_i8_dp256(acc[0][1], va1, vb0);
+        if constexpr (NG > 1) {
+            acc[1][1] = mma_i8_dp256(acc[1][1], va1, vb1);
+        }
+    }
+    if constexpr (MR > 2) {
+        const int8_t* const p2 = a[2];
+        a[2] = p2 + 4;
+        const __m256i va2 = mma_i8_bcast_group(p2);
+        acc[0][2] = mma_i8_dp256(acc[0][2], va2, vb0);
+        if constexpr (NG > 1) {
+            acc[1][2] = mma_i8_dp256(acc[1][2], va2, vb1);
+        }
+    }
+    if constexpr (MR > 3) {
+        const int8_t* const p3 = a[3];
+        a[3] = p3 + 4;
+        const __m256i va3 = mma_i8_bcast_group(p3);
+        acc[0][3] = mma_i8_dp256(acc[0][3], va3, vb0);
+        if constexpr (NG > 1) {
+            acc[1][3] = mma_i8_dp256(acc[1][3], va3, vb1);
+        }
+    }
+    if constexpr (MR > 4) {
+        const int8_t* const p4 = a[4];
+        a[4] = p4 + 4;
+        const __m256i va4 = mma_i8_bcast_group(p4);
+        acc[0][4] = mma_i8_dp256(acc[0][4], va4, vb0);
+        if constexpr (NG > 1) {
+            acc[1][4] = mma_i8_dp256(acc[1][4], va4, vb1);
+        }
+    }
+    if constexpr (MR > 5) {
+        const int8_t* const p5 = a[5];
+        a[5] = p5 + 4;
+        const __m256i va5 = mma_i8_bcast_group(p5);
+        acc[0][5] = mma_i8_dp256(acc[0][5], va5, vb0);
+        if constexpr (NG > 1) {
+            acc[1][5] = mma_i8_dp256(acc[1][5], va5, vb1);
+        }
+    }
+}
+
+/// The panel's whole K from packed A into seeded `acc`.
+template <int MR, int NG>
+NNOPS_FORCEINLINE void i8_mma(const int8_t* A, const int8_t* B, int klen, int kg,
+                              const int (&rr)[MR], __m256i (&acc)[NG][MR]) noexcept
+{
+    i8_col_init<MR, NG>(acc, B, klen);
+    const int32_t* a_i32 = reinterpret_cast<const int32_t*>(A);
+    const int8_t* b_ptr = B;
+    for (int k = 0; k < kg; ++k) {
+        i8_group<MR, NG>(a_i32, b_ptr, rr, acc);
+        b_ptr += 64;
+    }
+}
+
+/// The panel's whole K from row-major rows into seeded `acc`.
+template <int MR, int NG>
+NNOPS_FORCEINLINE void i8_mma_rows(const int8_t* (&a)[MR], const int8_t* B, int klen, int kg,
+                                   __m256i (&acc)[NG][MR]) noexcept
+{
+    i8_col_init<MR, NG>(acc, B, klen);
+    const int8_t* b_ptr = B;
+    for (int k = 0; k < kg; ++k) {
+        i8_step_rows<MR, NG>(a, b_ptr, acc);
+        b_ptr += 64;
+    }
+}
+
+// ---- the store ------------------------------------------------------------
+//
+// A half is written in two passes: every row's C is folded into its accumulator
+// first, then the rows are stored. Aliased rows share an address, so a
+// row-at-a-time add would have the second duplicate reading C with the first
+// one's result already in it.
+
+/// Fold C into one half's accumulators, every row before any store.
+template <int MR>
+NNOPS_FORCEINLINE void i8_add_c(int32_t* const (&row)[MR], int off, __m256i (&col)[MR]) noexcept
+{
+    col[0] = _mm256_add_epi32(
+        col[0], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row[0] + off)));
+    if constexpr (MR > 1) {
+        col[1] = _mm256_add_epi32(
+            col[1], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row[1] + off)));
+    }
+    if constexpr (MR > 2) {
+        col[2] = _mm256_add_epi32(
+            col[2], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row[2] + off)));
+    }
+    if constexpr (MR > 3) {
+        col[3] = _mm256_add_epi32(
+            col[3], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row[3] + off)));
+    }
+    if constexpr (MR > 4) {
+        col[4] = _mm256_add_epi32(
+            col[4], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row[4] + off)));
+    }
+    if constexpr (MR > 5) {
+        col[5] = _mm256_add_epi32(
+            col[5], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row[5] + off)));
+    }
+}
+
+/// Clamp and store one full half, no C add.
+template <int MR>
+NNOPS_FORCEINLINE void i8_store_c(int32_t* const (&row)[MR], int off, __m256i (&col)[MR],
+                                  __m256i vmin, __m256i vmax) noexcept
+{
+    col[0] = _mm256_min_epi32(_mm256_max_epi32(col[0], vmin), vmax);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(row[0] + off), col[0]);
+    if constexpr (MR > 1) {
+        col[1] = _mm256_min_epi32(_mm256_max_epi32(col[1], vmin), vmax);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(row[1] + off), col[1]);
+    }
+    if constexpr (MR > 2) {
+        col[2] = _mm256_min_epi32(_mm256_max_epi32(col[2], vmin), vmax);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(row[2] + off), col[2]);
+    }
+    if constexpr (MR > 3) {
+        col[3] = _mm256_min_epi32(_mm256_max_epi32(col[3], vmin), vmax);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(row[3] + off), col[3]);
+    }
+    if constexpr (MR > 4) {
+        col[4] = _mm256_min_epi32(_mm256_max_epi32(col[4], vmin), vmax);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(row[4] + off), col[4]);
+    }
+    if constexpr (MR > 5) {
+        col[5] = _mm256_min_epi32(_mm256_max_epi32(col[5], vmin), vmax);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(row[5] + off), col[5]);
+    }
+}
+
+/// The live lanes of a half: one stage (four int32, then two, then one) for
+/// every row before that stage's stores, so duplicate (aliased) rows all read
+/// the same C.
+template <int MR, bool zero_mode>
+NNOPS_FORCEINLINE void i8_store_lanes(int32_t* const (&row)[MR], int off, int lanes,
+                                      __m256i (&col)[MR], int32_t clamp_min,
+                                      int32_t clamp_max) noexcept
+{
+    const __m128i vmin = _mm_set1_epi32(clamp_min);
+    const __m128i vmax = _mm_set1_epi32(clamp_max);
+    __m128i lo[MR];
+    lo[0] = _mm256_castsi256_si128(col[0]);
+    if constexpr (MR > 1) {
+        lo[1] = _mm256_castsi256_si128(col[1]);
+    }
+    if constexpr (MR > 2) {
+        lo[2] = _mm256_castsi256_si128(col[2]);
+    }
+    if constexpr (MR > 3) {
+        lo[3] = _mm256_castsi256_si128(col[3]);
+    }
+    if constexpr (MR > 4) {
+        lo[4] = _mm256_castsi256_si128(col[4]);
+    }
+    if constexpr (MR > 5) {
+        lo[5] = _mm256_castsi256_si128(col[5]);
+    }
+
+    if (lanes & 4) {
+        if constexpr (!zero_mode) {
+            lo[0] = _mm_add_epi32(
+                lo[0], _mm_loadu_si128(reinterpret_cast<const __m128i*>(row[0] + off)));
+            if constexpr (MR > 1) {
+                lo[1] = _mm_add_epi32(
+                    lo[1], _mm_loadu_si128(reinterpret_cast<const __m128i*>(row[1] + off)));
+            }
+            if constexpr (MR > 2) {
+                lo[2] = _mm_add_epi32(
+                    lo[2], _mm_loadu_si128(reinterpret_cast<const __m128i*>(row[2] + off)));
+            }
+            if constexpr (MR > 3) {
+                lo[3] = _mm_add_epi32(
+                    lo[3], _mm_loadu_si128(reinterpret_cast<const __m128i*>(row[3] + off)));
+            }
+            if constexpr (MR > 4) {
+                lo[4] = _mm_add_epi32(
+                    lo[4], _mm_loadu_si128(reinterpret_cast<const __m128i*>(row[4] + off)));
+            }
+            if constexpr (MR > 5) {
+                lo[5] = _mm_add_epi32(
+                    lo[5], _mm_loadu_si128(reinterpret_cast<const __m128i*>(row[5] + off)));
+            }
+        }
+        lo[0] = _mm_min_epi32(_mm_max_epi32(lo[0], vmin), vmax);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(row[0] + off), lo[0]);
+        if constexpr (MR > 1) {
+            lo[1] = _mm_min_epi32(_mm_max_epi32(lo[1], vmin), vmax);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(row[1] + off), lo[1]);
+        }
+        if constexpr (MR > 2) {
+            lo[2] = _mm_min_epi32(_mm_max_epi32(lo[2], vmin), vmax);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(row[2] + off), lo[2]);
+        }
+        if constexpr (MR > 3) {
+            lo[3] = _mm_min_epi32(_mm_max_epi32(lo[3], vmin), vmax);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(row[3] + off), lo[3]);
+        }
+        if constexpr (MR > 4) {
+            lo[4] = _mm_min_epi32(_mm_max_epi32(lo[4], vmin), vmax);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(row[4] + off), lo[4]);
+        }
+        if constexpr (MR > 5) {
+            lo[5] = _mm_min_epi32(_mm_max_epi32(lo[5], vmin), vmax);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(row[5] + off), lo[5]);
+        }
+        off += 4;
+        lo[0] = _mm256_extracti128_si256(col[0], 1);
+        if constexpr (MR > 1) {
+            lo[1] = _mm256_extracti128_si256(col[1], 1);
+        }
+        if constexpr (MR > 2) {
+            lo[2] = _mm256_extracti128_si256(col[2], 1);
+        }
+        if constexpr (MR > 3) {
+            lo[3] = _mm256_extracti128_si256(col[3], 1);
+        }
+        if constexpr (MR > 4) {
+            lo[4] = _mm256_extracti128_si256(col[4], 1);
+        }
+        if constexpr (MR > 5) {
+            lo[5] = _mm256_extracti128_si256(col[5], 1);
+        }
+    }
+
+    if (lanes & 2) {
+        // The 4-wide clamp above would corrupt lanes 2,3 that the 1-wide step
+        // stores, so the shifted-down copy comes from the pre-clamp vector.
+        __m128i rest[MR];
+        rest[0] = lo[0];
+        if constexpr (MR > 1) {
+            rest[1] = lo[1];
+        }
+        if constexpr (MR > 2) {
+            rest[2] = lo[2];
+        }
+        if constexpr (MR > 3) {
+            rest[3] = lo[3];
+        }
+        if constexpr (MR > 4) {
+            rest[4] = lo[4];
+        }
+        if constexpr (MR > 5) {
+            rest[5] = lo[5];
+        }
+        if constexpr (!zero_mode) {
+            lo[0] = _mm_add_epi32(lo[0],
+                                  _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[0] + off)));
+            if constexpr (MR > 1) {
+                lo[1] = _mm_add_epi32(
+                    lo[1], _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[1] + off)));
+            }
+            if constexpr (MR > 2) {
+                lo[2] = _mm_add_epi32(
+                    lo[2], _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[2] + off)));
+            }
+            if constexpr (MR > 3) {
+                lo[3] = _mm_add_epi32(
+                    lo[3], _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[3] + off)));
+            }
+            if constexpr (MR > 4) {
+                lo[4] = _mm_add_epi32(
+                    lo[4], _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[4] + off)));
+            }
+            if constexpr (MR > 5) {
+                lo[5] = _mm_add_epi32(
+                    lo[5], _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row[5] + off)));
+            }
+        }
+        lo[0] = _mm_min_epi32(_mm_max_epi32(lo[0], vmin), vmax);
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(row[0] + off), lo[0]);
+        if constexpr (MR > 1) {
+            lo[1] = _mm_min_epi32(_mm_max_epi32(lo[1], vmin), vmax);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[1] + off), lo[1]);
+        }
+        if constexpr (MR > 2) {
+            lo[2] = _mm_min_epi32(_mm_max_epi32(lo[2], vmin), vmax);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[2] + off), lo[2]);
+        }
+        if constexpr (MR > 3) {
+            lo[3] = _mm_min_epi32(_mm_max_epi32(lo[3], vmin), vmax);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[3] + off), lo[3]);
+        }
+        if constexpr (MR > 4) {
+            lo[4] = _mm_min_epi32(_mm_max_epi32(lo[4], vmin), vmax);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[4] + off), lo[4]);
+        }
+        if constexpr (MR > 5) {
+            lo[5] = _mm_min_epi32(_mm_max_epi32(lo[5], vmin), vmax);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(row[5] + off), lo[5]);
+        }
+        off += 2;
+        lo[0] = _mm_srli_si128(rest[0], 8);
+        if constexpr (MR > 1) {
+            lo[1] = _mm_srli_si128(rest[1], 8);
+        }
+        if constexpr (MR > 2) {
+            lo[2] = _mm_srli_si128(rest[2], 8);
+        }
+        if constexpr (MR > 3) {
+            lo[3] = _mm_srli_si128(rest[3], 8);
+        }
+        if constexpr (MR > 4) {
+            lo[4] = _mm_srli_si128(rest[4], 8);
+        }
+        if constexpr (MR > 5) {
+            lo[5] = _mm_srli_si128(rest[5], 8);
+        }
+    }
+
+    if (lanes & 1) {
+        int v[MR];
+        v[0] = _mm_cvtsi128_si32(lo[0]);
+        if constexpr (MR > 1) {
+            v[1] = _mm_cvtsi128_si32(lo[1]);
+        }
+        if constexpr (MR > 2) {
+            v[2] = _mm_cvtsi128_si32(lo[2]);
+        }
+        if constexpr (MR > 3) {
+            v[3] = _mm_cvtsi128_si32(lo[3]);
+        }
+        if constexpr (MR > 4) {
+            v[4] = _mm_cvtsi128_si32(lo[4]);
+        }
+        if constexpr (MR > 5) {
+            v[5] = _mm_cvtsi128_si32(lo[5]);
+        }
+        if constexpr (!zero_mode) {
+            v[0] += row[0][off];
+            if constexpr (MR > 1) {
+                v[1] += row[1][off];
+            }
+            if constexpr (MR > 2) {
+                v[2] += row[2][off];
+            }
+            if constexpr (MR > 3) {
+                v[3] += row[3][off];
+            }
+            if constexpr (MR > 4) {
+                v[4] += row[4][off];
+            }
+            if constexpr (MR > 5) {
+                v[5] += row[5][off];
+            }
+        }
+        row[0][off] = std::min(std::max(v[0], clamp_min), clamp_max);
+        if constexpr (MR > 1) {
+            row[1][off] = std::min(std::max(v[1], clamp_min), clamp_max);
+        }
+        if constexpr (MR > 2) {
+            row[2][off] = std::min(std::max(v[2], clamp_min), clamp_max);
+        }
+        if constexpr (MR > 3) {
+            row[3][off] = std::min(std::max(v[3], clamp_min), clamp_max);
+        }
+        if constexpr (MR > 4) {
+            row[4][off] = std::min(std::max(v[4], clamp_min), clamp_max);
+        }
+        if constexpr (MR > 5) {
+            row[5][off] = std::min(std::max(v[5], clamp_min), clamp_max);
+        }
+    }
+}
+
+/// Write one half of a panel: MR rows, `live` columns left from this half's
+/// first column.
+template <int MR, bool zero_mode>
+NNOPS_FORCEINLINE void i8_store_col(int32_t* const (&row)[MR], int col0, int col, int live,
+                                    __m256i (&col_acc)[MR], __m256i vmin, __m256i vmax,
+                                    int32_t clamp_min, int32_t clamp_max) noexcept
+{
+    const int l = live - col;
+    if (l >= 8) {
+        if constexpr (!zero_mode) {
+            i8_add_c<MR>(row, col0 + col, col_acc);
+        }
+        i8_store_c<MR>(row, col0 + col, col_acc, vmin, vmax);
+    } else if (l > 0) {
+        i8_store_lanes<MR, zero_mode>(row, col0 + col, l, col_acc, clamp_min, clamp_max);
+    }
+}
+
+/// Write the live columns of NG halves, starting at `col0`.
+template <int MR, int NG, bool zero_mode>
+NNOPS_FORCEINLINE void i8_store(int32_t* const (&row)[MR], int col0, int live,
+                                __m256i (&acc)[NG][MR], __m256i vmin, __m256i vmax,
+                                int32_t clamp_min, int32_t clamp_max) noexcept
+{
+    i8_store_col<MR, zero_mode>(row, col0, 0, live, acc[0], vmin, vmax, clamp_min, clamp_max);
+    if constexpr (NG > 1) {
+        i8_store_col<MR, zero_mode>(row, col0, 8, live, acc[1], vmin, vmax, clamp_min,
+                                    clamp_max);
+    }
+}
+
+// =========================================================================
+//  packed A + packed B  (MR = 6, 4, 1)
+// =========================================================================
+
+/// One packed-A rung: the whole N side into int32 C.
+template <int MR, bool zero_mode = false>
+inline void mma_pack_mr_nr16_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                         int ldc, const int8_t* NNOPS_RESTRICT A,
+                                         const int8_t* NNOPS_RESTRICT B, int ldb,
+                                         int32_t clamp_min, int32_t clamp_max) noexcept
+{
+    int rr[MR];
+    i8_row_alias<MR>(mr, rr);
+    int32_t* row[MR];
+    i8_row_ptrs<MR>(C, ldc, rr, row);
     const int kbytes = (kc + 3) & ~3;
     const int kg = kbytes >> 2;
     const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
+    const __m256i vmin = _mm256_set1_epi32(clamp_min);
+    const __m256i vmax = _mm256_set1_epi32(clamp_max);
 
     int n = 0;
-    for (; n < nc - 15; n += 16) {
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kbytes, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kbytes, 32);
-        __m256i v_acc1x01234567 = v_acc0x01234567;
-        __m256i v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc2x01234567 = v_acc0x01234567;
-        __m256i v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc3x01234567 = v_acc0x01234567;
-        __m256i v_acc3x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc4x01234567 = v_acc0x01234567;
-        __m256i v_acc4x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc5x01234567 = v_acc0x01234567;
-        __m256i v_acc5x89abcdef = v_acc0x89abcdef;
-
-        const int32_t* a_i32 = reinterpret_cast<const int32_t*>(A);
-        const int8_t* b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const __m256i v_b0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-            const __m256i v_b1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-            b_ptr += 64;
-
-            __m256i v_a0 = _mm256_set1_epi32(a_i32[0]);
-            __m256i v_a1 = _mm256_set1_epi32(a_i32[r1]);
-            v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-            v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-            v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, v_a1, v_b0);
-            v_acc1x89abcdef = mma_i8_dp256(v_acc1x89abcdef, v_a1, v_b1);
-
-            v_a0 = _mm256_set1_epi32(a_i32[r2]);
-            v_a1 = _mm256_set1_epi32(a_i32[r3]);
-            v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, v_a0, v_b0);
-            v_acc2x89abcdef = mma_i8_dp256(v_acc2x89abcdef, v_a0, v_b1);
-            v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, v_a1, v_b0);
-            v_acc3x89abcdef = mma_i8_dp256(v_acc3x89abcdef, v_a1, v_b1);
-
-            v_a0 = _mm256_set1_epi32(a_i32[r4]);
-            v_a1 = _mm256_set1_epi32(a_i32[r5]);
-            v_acc4x01234567 = mma_i8_dp256(v_acc4x01234567, v_a0, v_b0);
-            v_acc4x89abcdef = mma_i8_dp256(v_acc4x89abcdef, v_a0, v_b1);
-            v_acc5x01234567 = mma_i8_dp256(v_acc5x01234567, v_a1, v_b0);
-            v_acc5x89abcdef = mma_i8_dp256(v_acc5x89abcdef, v_a1, v_b1);
-
-            a_i32 += 6;
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_epi32(
-                v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 0)));
-            v_acc0x89abcdef = _mm256_add_epi32(
-                v_acc0x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 8)));
-            v_acc1x01234567 = _mm256_add_epi32(
-                v_acc1x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr + 0)));
-            v_acc1x89abcdef = _mm256_add_epi32(
-                v_acc1x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr + 8)));
-            v_acc2x01234567 = _mm256_add_epi32(
-                v_acc2x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr + 0)));
-            v_acc2x89abcdef = _mm256_add_epi32(
-                v_acc2x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr + 8)));
-            v_acc3x01234567 = _mm256_add_epi32(
-                v_acc3x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr + 0)));
-            v_acc3x89abcdef = _mm256_add_epi32(
-                v_acc3x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr + 8)));
-            v_acc4x01234567 = _mm256_add_epi32(
-                v_acc4x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c4_ptr + 0)));
-            v_acc4x89abcdef = _mm256_add_epi32(
-                v_acc4x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c4_ptr + 8)));
-            v_acc5x01234567 = _mm256_add_epi32(
-                v_acc5x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c5_ptr + 0)));
-            v_acc5x89abcdef = _mm256_add_epi32(
-                v_acc5x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c5_ptr + 8)));
-        }
-        const __m256i v_min = _mm256_set1_epi32(clamp_min);
-        const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-        v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-        v_acc0x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc0x89abcdef, v_min), v_max);
-        v_acc1x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc1x01234567, v_min), v_max);
-        v_acc1x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc1x89abcdef, v_min), v_max);
-        v_acc2x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc2x01234567, v_min), v_max);
-        v_acc2x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc2x89abcdef, v_min), v_max);
-        v_acc3x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc3x01234567, v_min), v_max);
-        v_acc3x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc3x89abcdef, v_min), v_max);
-        v_acc4x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc4x01234567, v_min), v_max);
-        v_acc4x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc4x89abcdef, v_min), v_max);
-        v_acc5x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc5x01234567, v_min), v_max);
-        v_acc5x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc5x89abcdef, v_min), v_max);
-
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 0), v_acc0x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 8), v_acc0x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr + 0), v_acc1x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr + 8), v_acc1x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr + 0), v_acc2x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr + 8), v_acc2x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr + 0), v_acc3x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr + 8), v_acc3x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c4_ptr + 0), v_acc4x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c4_ptr + 8), v_acc4x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c5_ptr + 0), v_acc5x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c5_ptr + 8), v_acc5x89abcdef);
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-        c2_ptr += 16;
-        c3_ptr += 16;
-        c4_ptr += 16;
-        c5_ptr += 16;
-
+    for (; n + mma_i8_nr_max <= nc; n += mma_i8_nr_max) {
+        __m256i acc[2][MR];
+        i8_mma<MR, 2>(A, B, kbytes, kg, rr, acc);
+        i8_store<MR, 2, zero_mode>(row, n, 16, acc, vmin, vmax, clamp_min, clamp_max);
         B += ldb_panel;
     }
 
-    int rem = nc - n;
-    const bool tail_hi = rem > 8;
-
-    if (rem > 0) {
-        // A tail wider than 8 reads both halves in one k loop instead of two.
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kbytes, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kbytes, 32);
-        __m256i v_acc1x01234567 = v_acc0x01234567;
-        __m256i v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc2x01234567 = v_acc0x01234567;
-        __m256i v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc3x01234567 = v_acc0x01234567;
-        __m256i v_acc3x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc4x01234567 = v_acc0x01234567;
-        __m256i v_acc4x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc5x01234567 = v_acc0x01234567;
-        __m256i v_acc5x89abcdef = v_acc0x89abcdef;
-
-        const int32_t* a_i32 = reinterpret_cast<const int32_t*>(A);
-        const int8_t* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                const __m256i v_b1 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-                b_ptr += 64;
-
-                __m256i v_a0 = _mm256_set1_epi32(a_i32[0]);
-                __m256i v_a1 = _mm256_set1_epi32(a_i32[r1]);
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-                v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-                v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, v_a1, v_b0);
-                v_acc1x89abcdef = mma_i8_dp256(v_acc1x89abcdef, v_a1, v_b1);
-
-                v_a0 = _mm256_set1_epi32(a_i32[r2]);
-                v_a1 = _mm256_set1_epi32(a_i32[r3]);
-                v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, v_a0, v_b0);
-                v_acc2x89abcdef = mma_i8_dp256(v_acc2x89abcdef, v_a0, v_b1);
-                v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, v_a1, v_b0);
-                v_acc3x89abcdef = mma_i8_dp256(v_acc3x89abcdef, v_a1, v_b1);
-
-                v_a0 = _mm256_set1_epi32(a_i32[r4]);
-                v_a1 = _mm256_set1_epi32(a_i32[r5]);
-                v_acc4x01234567 = mma_i8_dp256(v_acc4x01234567, v_a0, v_b0);
-                v_acc4x89abcdef = mma_i8_dp256(v_acc4x89abcdef, v_a0, v_b1);
-                v_acc5x01234567 = mma_i8_dp256(v_acc5x01234567, v_a1, v_b0);
-                v_acc5x89abcdef = mma_i8_dp256(v_acc5x89abcdef, v_a1, v_b1);
-
-                a_i32 += 6;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                b_ptr += 64;
-
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, _mm256_set1_epi32(a_i32[0]), v_b0);
-                v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, _mm256_set1_epi32(a_i32[r1]), v_b0);
-                v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, _mm256_set1_epi32(a_i32[r2]), v_b0);
-                v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, _mm256_set1_epi32(a_i32[r3]), v_b0);
-                v_acc4x01234567 = mma_i8_dp256(v_acc4x01234567, _mm256_set1_epi32(a_i32[r4]), v_b0);
-                v_acc5x01234567 = mma_i8_dp256(v_acc5x01234567, _mm256_set1_epi32(a_i32[r5]), v_b0);
-
-                a_i32 += 6;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_epi32(
-                    v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr)));
-                v_acc1x01234567 = _mm256_add_epi32(
-                    v_acc1x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr)));
-                v_acc2x01234567 = _mm256_add_epi32(
-                    v_acc2x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr)));
-                v_acc3x01234567 = _mm256_add_epi32(
-                    v_acc3x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr)));
-                v_acc4x01234567 = _mm256_add_epi32(
-                    v_acc4x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c4_ptr)));
-                v_acc5x01234567 = _mm256_add_epi32(
-                    v_acc5x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c5_ptr)));
-            }
-
-            const __m256i v_min = _mm256_set1_epi32(clamp_min);
-            const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-            v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-            v_acc1x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc1x01234567, v_min), v_max);
-            v_acc2x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc2x01234567, v_min), v_max);
-            v_acc3x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc3x01234567, v_min), v_max);
-            v_acc4x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc4x01234567, v_min), v_max);
-            v_acc5x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc5x01234567, v_min), v_max);
-
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr), v_acc0x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr), v_acc1x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr), v_acc2x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr), v_acc3x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c4_ptr), v_acc4x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c5_ptr), v_acc5x01234567);
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-            c2_ptr += 8;
-            c3_ptr += 8;
-            c4_ptr += 8;
-            c5_ptr += 8;
-
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            // Lane j is column j, so the 4/2/1 ladder is a lo/hi split of one
-            // accumulator; a tail wider than 8 accumulated in the high half.
-            const __m256i v_acc0 = tail_hi ? v_acc0x89abcdef : v_acc0x01234567;
-            const __m256i v_acc1 = tail_hi ? v_acc1x89abcdef : v_acc1x01234567;
-            const __m256i v_acc2 = tail_hi ? v_acc2x89abcdef : v_acc2x01234567;
-            const __m256i v_acc3 = tail_hi ? v_acc3x89abcdef : v_acc3x01234567;
-            const __m256i v_acc4 = tail_hi ? v_acc4x89abcdef : v_acc4x01234567;
-            const __m256i v_acc5 = tail_hi ? v_acc5x89abcdef : v_acc5x01234567;
-
-            __m128i v_acc0x0123 = _mm256_castsi256_si128(v_acc0);
-            __m128i v_acc1x0123 = _mm256_castsi256_si128(v_acc1);
-            __m128i v_acc2x0123 = _mm256_castsi256_si128(v_acc2);
-            __m128i v_acc3x0123 = _mm256_castsi256_si128(v_acc3);
-            __m128i v_acc4x0123 = _mm256_castsi256_si128(v_acc4);
-            __m128i v_acc5x0123 = _mm256_castsi256_si128(v_acc5);
-
-            const __m128i v_min = _mm_set1_epi32(clamp_min);
-            const __m128i v_max = _mm_set1_epi32(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr)));
-                    v_acc1x0123 = _mm_add_epi32(
-                        v_acc1x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr)));
-                    v_acc2x0123 = _mm_add_epi32(
-                        v_acc2x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr)));
-                    v_acc3x0123 = _mm_add_epi32(
-                        v_acc3x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr)));
-                    v_acc4x0123 = _mm_add_epi32(
-                        v_acc4x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c4_ptr)));
-                    v_acc5x0123 = _mm_add_epi32(
-                        v_acc5x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c5_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-                v_acc1x0123 = _mm_min_epi32(_mm_max_epi32(v_acc1x0123, v_min), v_max);
-                v_acc2x0123 = _mm_min_epi32(_mm_max_epi32(v_acc2x0123, v_min), v_max);
-                v_acc3x0123 = _mm_min_epi32(_mm_max_epi32(v_acc3x0123, v_min), v_max);
-                v_acc4x0123 = _mm_min_epi32(_mm_max_epi32(v_acc4x0123, v_min), v_max);
-                v_acc5x0123 = _mm_min_epi32(_mm_max_epi32(v_acc5x0123, v_min), v_max);
-
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr), v_acc1x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr), v_acc2x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr), v_acc3x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c4_ptr), v_acc4x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c5_ptr), v_acc5x0123);
-
-                c0_ptr += 4;
-                c1_ptr += 4;
-                c2_ptr += 4;
-                c3_ptr += 4;
-                c4_ptr += 4;
-                c5_ptr += 4;
-
-                v_acc0x0123 = _mm256_extracti128_si256(v_acc0, 1);
-                v_acc1x0123 = _mm256_extracti128_si256(v_acc1, 1);
-                v_acc2x0123 = _mm256_extracti128_si256(v_acc2, 1);
-                v_acc3x0123 = _mm256_extracti128_si256(v_acc3, 1);
-                v_acc4x0123 = _mm256_extracti128_si256(v_acc4, 1);
-                v_acc5x0123 = _mm256_extracti128_si256(v_acc5, 1);
-            }
-
-            if (rem & 2) {
-                // The 4-wide clamp below would corrupt lanes 2,3 that the 1-wide step stores.
-                const __m128i v_rest0 = v_acc0x0123;
-                const __m128i v_rest1 = v_acc1x0123;
-                const __m128i v_rest2 = v_acc2x0123;
-                const __m128i v_rest3 = v_acc3x0123;
-                const __m128i v_rest4 = v_acc4x0123;
-                const __m128i v_rest5 = v_acc5x0123;
-
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr)));
-                    v_acc1x0123 = _mm_add_epi32(
-                        v_acc1x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr)));
-                    v_acc2x0123 = _mm_add_epi32(
-                        v_acc2x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c2_ptr)));
-                    v_acc3x0123 = _mm_add_epi32(
-                        v_acc3x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c3_ptr)));
-                    v_acc4x0123 = _mm_add_epi32(
-                        v_acc4x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c4_ptr)));
-                    v_acc5x0123 = _mm_add_epi32(
-                        v_acc5x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c5_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-                v_acc1x0123 = _mm_min_epi32(_mm_max_epi32(v_acc1x0123, v_min), v_max);
-                v_acc2x0123 = _mm_min_epi32(_mm_max_epi32(v_acc2x0123, v_min), v_max);
-                v_acc3x0123 = _mm_min_epi32(_mm_max_epi32(v_acc3x0123, v_min), v_max);
-                v_acc4x0123 = _mm_min_epi32(_mm_max_epi32(v_acc4x0123, v_min), v_max);
-                v_acc5x0123 = _mm_min_epi32(_mm_max_epi32(v_acc5x0123, v_min), v_max);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr), v_acc1x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c2_ptr), v_acc2x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c3_ptr), v_acc3x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c4_ptr), v_acc4x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c5_ptr), v_acc5x0123);
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-                c2_ptr += 2;
-                c3_ptr += 2;
-                c4_ptr += 2;
-                c5_ptr += 2;
-
-                v_acc0x0123 = _mm_srli_si128(v_rest0, 8);
-                v_acc1x0123 = _mm_srli_si128(v_rest1, 8);
-                v_acc2x0123 = _mm_srli_si128(v_rest2, 8);
-                v_acc3x0123 = _mm_srli_si128(v_rest3, 8);
-                v_acc4x0123 = _mm_srli_si128(v_rest4, 8);
-                v_acc5x0123 = _mm_srli_si128(v_rest5, 8);
-            }
-
-            if (rem & 1) {
-                int c0 = _mm_cvtsi128_si32(v_acc0x0123);
-                int c1 = _mm_cvtsi128_si32(v_acc1x0123);
-                int c2 = _mm_cvtsi128_si32(v_acc2x0123);
-                int c3 = _mm_cvtsi128_si32(v_acc3x0123);
-                int c4 = _mm_cvtsi128_si32(v_acc4x0123);
-                int c5 = _mm_cvtsi128_si32(v_acc5x0123);
-                if constexpr (!zero_mode) {
-                    c0 += c0_ptr[0];
-                    c1 += c1_ptr[0];
-                    c2 += c2_ptr[0];
-                    c3 += c3_ptr[0];
-                    c4 += c4_ptr[0];
-                    c5 += c5_ptr[0];
-                }
-                c0_ptr[0] = std::min(std::max(c0, clamp_min), clamp_max);
-                c1_ptr[0] = std::min(std::max(c1, clamp_min), clamp_max);
-                c2_ptr[0] = std::min(std::max(c2, clamp_min), clamp_max);
-                c3_ptr[0] = std::min(std::max(c3, clamp_min), clamp_max);
-                c4_ptr[0] = std::min(std::max(c4, clamp_min), clamp_max);
-                c5_ptr[0] = std::min(std::max(c5, clamp_min), clamp_max);
-            }
-        }
+    // The live remainder narrows to the halves it needs: 8 or 16 columns.
+    const int live = nc - n;
+    if (live > 8) {
+        __m256i acc[2][MR];
+        i8_mma<MR, 2>(A, B, kbytes, kg, rr, acc);
+        i8_store<MR, 2, zero_mode>(row, n, live, acc, vmin, vmax, clamp_min, clamp_max);
+    } else if (live > 0) {
+        __m256i acc[1][MR];
+        i8_mma<MR, 1>(A, B, kbytes, kg, rr, acc);
+        i8_store<MR, 1, zero_mode>(row, n, live, acc, vmin, vmax, clamp_min, clamp_max);
     }
 }
 
-template <bool zero_mode = false>
-void mma_pack_mr4_nr16_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                                   const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                                   int ldb, int32_t clamp_min, int32_t clamp_max) noexcept
+// =========================================================================
+//  raw A + packed B  (MR = 6, 4, 1) — kc % 4 == 0
+// =========================================================================
+//
+// The same walk with each row's four bytes broadcast instead of a shared
+// 16-byte panel slot, so the rung reads A through `lda`.
+
+/// One row-major-A rung: the whole N side into int32 C.
+template <int MR, bool zero_mode = false>
+inline void mma_direct_mr_nr16_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C,
+                                           int ldc, const int8_t* NNOPS_RESTRICT A, int lda,
+                                           const int8_t* NNOPS_RESTRICT B, int ldb,
+                                           int32_t clamp_min, int32_t clamp_max) noexcept
 {
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-
-    int32_t* c0_ptr = C + 0 * ldc;
-    int32_t* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-
-    const int kbytes = (kc + 3) & ~3;
-    const int kg = kbytes >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
-
-    int n = 0;
-    for (; n < nc - 15; n += 16) {
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kbytes, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kbytes, 32);
-        __m256i v_acc1x01234567 = v_acc0x01234567;
-        __m256i v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc2x01234567 = v_acc0x01234567;
-        __m256i v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc3x01234567 = v_acc0x01234567;
-        __m256i v_acc3x89abcdef = v_acc0x89abcdef;
-
-        const int32_t* a_i32 = reinterpret_cast<const int32_t*>(A);
-        const int8_t* b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const __m256i v_b0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-            const __m256i v_b1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-            b_ptr += 64;
-
-            __m256i v_a0 = _mm256_set1_epi32(a_i32[0]);
-            __m256i v_a1 = _mm256_set1_epi32(a_i32[r1]);
-            v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-            v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-            v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, v_a1, v_b0);
-            v_acc1x89abcdef = mma_i8_dp256(v_acc1x89abcdef, v_a1, v_b1);
-
-            v_a0 = _mm256_set1_epi32(a_i32[r2]);
-            v_a1 = _mm256_set1_epi32(a_i32[r3]);
-            v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, v_a0, v_b0);
-            v_acc2x89abcdef = mma_i8_dp256(v_acc2x89abcdef, v_a0, v_b1);
-            v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, v_a1, v_b0);
-            v_acc3x89abcdef = mma_i8_dp256(v_acc3x89abcdef, v_a1, v_b1);
-
-            a_i32 += 4;
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_epi32(
-                v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 0)));
-            v_acc0x89abcdef = _mm256_add_epi32(
-                v_acc0x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 8)));
-            v_acc1x01234567 = _mm256_add_epi32(
-                v_acc1x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr + 0)));
-            v_acc1x89abcdef = _mm256_add_epi32(
-                v_acc1x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr + 8)));
-            v_acc2x01234567 = _mm256_add_epi32(
-                v_acc2x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr + 0)));
-            v_acc2x89abcdef = _mm256_add_epi32(
-                v_acc2x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr + 8)));
-            v_acc3x01234567 = _mm256_add_epi32(
-                v_acc3x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr + 0)));
-            v_acc3x89abcdef = _mm256_add_epi32(
-                v_acc3x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr + 8)));
-        }
-        const __m256i v_min = _mm256_set1_epi32(clamp_min);
-        const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-        v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-        v_acc0x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc0x89abcdef, v_min), v_max);
-        v_acc1x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc1x01234567, v_min), v_max);
-        v_acc1x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc1x89abcdef, v_min), v_max);
-        v_acc2x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc2x01234567, v_min), v_max);
-        v_acc2x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc2x89abcdef, v_min), v_max);
-        v_acc3x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc3x01234567, v_min), v_max);
-        v_acc3x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc3x89abcdef, v_min), v_max);
-
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 0), v_acc0x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 8), v_acc0x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr + 0), v_acc1x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr + 8), v_acc1x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr + 0), v_acc2x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr + 8), v_acc2x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr + 0), v_acc3x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr + 8), v_acc3x89abcdef);
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-        c2_ptr += 16;
-        c3_ptr += 16;
-
-        B += ldb_panel;
-    }
-
-    int rem = nc - n;
-    const bool tail_hi = rem > 8;
-
-    if (rem > 0) {
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kbytes, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kbytes, 32);
-        __m256i v_acc1x01234567 = v_acc0x01234567;
-        __m256i v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc2x01234567 = v_acc0x01234567;
-        __m256i v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc3x01234567 = v_acc0x01234567;
-        __m256i v_acc3x89abcdef = v_acc0x89abcdef;
-
-        const int32_t* a_i32 = reinterpret_cast<const int32_t*>(A);
-        const int8_t* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                const __m256i v_b1 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-                b_ptr += 64;
-
-                __m256i v_a0 = _mm256_set1_epi32(a_i32[0]);
-                __m256i v_a1 = _mm256_set1_epi32(a_i32[r1]);
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-                v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-                v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, v_a1, v_b0);
-                v_acc1x89abcdef = mma_i8_dp256(v_acc1x89abcdef, v_a1, v_b1);
-
-                v_a0 = _mm256_set1_epi32(a_i32[r2]);
-                v_a1 = _mm256_set1_epi32(a_i32[r3]);
-                v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, v_a0, v_b0);
-                v_acc2x89abcdef = mma_i8_dp256(v_acc2x89abcdef, v_a0, v_b1);
-                v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, v_a1, v_b0);
-                v_acc3x89abcdef = mma_i8_dp256(v_acc3x89abcdef, v_a1, v_b1);
-
-                a_i32 += 4;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                b_ptr += 64;
-
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, _mm256_set1_epi32(a_i32[0]), v_b0);
-                v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, _mm256_set1_epi32(a_i32[r1]), v_b0);
-                v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, _mm256_set1_epi32(a_i32[r2]), v_b0);
-                v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, _mm256_set1_epi32(a_i32[r3]), v_b0);
-
-                a_i32 += 4;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_epi32(
-                    v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr)));
-                v_acc1x01234567 = _mm256_add_epi32(
-                    v_acc1x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr)));
-                v_acc2x01234567 = _mm256_add_epi32(
-                    v_acc2x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr)));
-                v_acc3x01234567 = _mm256_add_epi32(
-                    v_acc3x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr)));
-            }
-
-            const __m256i v_min = _mm256_set1_epi32(clamp_min);
-            const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-            v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-            v_acc1x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc1x01234567, v_min), v_max);
-            v_acc2x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc2x01234567, v_min), v_max);
-            v_acc3x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc3x01234567, v_min), v_max);
-
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr), v_acc0x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr), v_acc1x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr), v_acc2x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr), v_acc3x01234567);
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-            c2_ptr += 8;
-            c3_ptr += 8;
-
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            const __m256i v_acc0 = tail_hi ? v_acc0x89abcdef : v_acc0x01234567;
-            const __m256i v_acc1 = tail_hi ? v_acc1x89abcdef : v_acc1x01234567;
-            const __m256i v_acc2 = tail_hi ? v_acc2x89abcdef : v_acc2x01234567;
-            const __m256i v_acc3 = tail_hi ? v_acc3x89abcdef : v_acc3x01234567;
-
-            __m128i v_acc0x0123 = _mm256_castsi256_si128(v_acc0);
-            __m128i v_acc1x0123 = _mm256_castsi256_si128(v_acc1);
-            __m128i v_acc2x0123 = _mm256_castsi256_si128(v_acc2);
-            __m128i v_acc3x0123 = _mm256_castsi256_si128(v_acc3);
-
-            const __m128i v_min = _mm_set1_epi32(clamp_min);
-            const __m128i v_max = _mm_set1_epi32(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr)));
-                    v_acc1x0123 = _mm_add_epi32(
-                        v_acc1x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr)));
-                    v_acc2x0123 = _mm_add_epi32(
-                        v_acc2x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr)));
-                    v_acc3x0123 = _mm_add_epi32(
-                        v_acc3x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-                v_acc1x0123 = _mm_min_epi32(_mm_max_epi32(v_acc1x0123, v_min), v_max);
-                v_acc2x0123 = _mm_min_epi32(_mm_max_epi32(v_acc2x0123, v_min), v_max);
-                v_acc3x0123 = _mm_min_epi32(_mm_max_epi32(v_acc3x0123, v_min), v_max);
-
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr), v_acc1x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr), v_acc2x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr), v_acc3x0123);
-
-                c0_ptr += 4;
-                c1_ptr += 4;
-                c2_ptr += 4;
-                c3_ptr += 4;
-
-                v_acc0x0123 = _mm256_extracti128_si256(v_acc0, 1);
-                v_acc1x0123 = _mm256_extracti128_si256(v_acc1, 1);
-                v_acc2x0123 = _mm256_extracti128_si256(v_acc2, 1);
-                v_acc3x0123 = _mm256_extracti128_si256(v_acc3, 1);
-            }
-
-            if (rem & 2) {
-                const __m128i v_rest0 = v_acc0x0123;
-                const __m128i v_rest1 = v_acc1x0123;
-                const __m128i v_rest2 = v_acc2x0123;
-                const __m128i v_rest3 = v_acc3x0123;
-
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr)));
-                    v_acc1x0123 = _mm_add_epi32(
-                        v_acc1x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr)));
-                    v_acc2x0123 = _mm_add_epi32(
-                        v_acc2x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c2_ptr)));
-                    v_acc3x0123 = _mm_add_epi32(
-                        v_acc3x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c3_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-                v_acc1x0123 = _mm_min_epi32(_mm_max_epi32(v_acc1x0123, v_min), v_max);
-                v_acc2x0123 = _mm_min_epi32(_mm_max_epi32(v_acc2x0123, v_min), v_max);
-                v_acc3x0123 = _mm_min_epi32(_mm_max_epi32(v_acc3x0123, v_min), v_max);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr), v_acc1x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c2_ptr), v_acc2x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c3_ptr), v_acc3x0123);
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-                c2_ptr += 2;
-                c3_ptr += 2;
-
-                v_acc0x0123 = _mm_srli_si128(v_rest0, 8);
-                v_acc1x0123 = _mm_srli_si128(v_rest1, 8);
-                v_acc2x0123 = _mm_srli_si128(v_rest2, 8);
-                v_acc3x0123 = _mm_srli_si128(v_rest3, 8);
-            }
-
-            if (rem & 1) {
-                int c0 = _mm_cvtsi128_si32(v_acc0x0123);
-                int c1 = _mm_cvtsi128_si32(v_acc1x0123);
-                int c2 = _mm_cvtsi128_si32(v_acc2x0123);
-                int c3 = _mm_cvtsi128_si32(v_acc3x0123);
-                if constexpr (!zero_mode) {
-                    c0 += c0_ptr[0];
-                    c1 += c1_ptr[0];
-                    c2 += c2_ptr[0];
-                    c3 += c3_ptr[0];
-                }
-                c0_ptr[0] = std::min(std::max(c0, clamp_min), clamp_max);
-                c1_ptr[0] = std::min(std::max(c1, clamp_min), clamp_max);
-                c2_ptr[0] = std::min(std::max(c2, clamp_min), clamp_max);
-                c3_ptr[0] = std::min(std::max(c3, clamp_min), clamp_max);
-            }
-        }
-    }
-}
-
-template <bool zero_mode = false>
-void mma_pack_mr1_nr16_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                                   const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                                   int ldb, int32_t clamp_min, int32_t clamp_max) noexcept
-{
-    (void)mr;
-
-    int32_t* c0_ptr = C;
-
-    const int kbytes = (kc + 3) & ~3;
-    const int kg = kbytes >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
-
-    int n = 0;
-    for (; n < nc - 15; n += 16) {
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kbytes, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kbytes, 32);
-
-        const int32_t* a_i32 = reinterpret_cast<const int32_t*>(A);
-        const int8_t* b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const __m256i v_b0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-            const __m256i v_b1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-            b_ptr += 64;
-
-            const __m256i v_a0 = _mm256_set1_epi32(a_i32[0]);
-            v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-            v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-
-            a_i32 += 1;
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_epi32(
-                v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 0)));
-            v_acc0x89abcdef = _mm256_add_epi32(
-                v_acc0x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 8)));
-        }
-        const __m256i v_min = _mm256_set1_epi32(clamp_min);
-        const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-        v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-        v_acc0x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc0x89abcdef, v_min), v_max);
-
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 0), v_acc0x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 8), v_acc0x89abcdef);
-
-        c0_ptr += 16;
-
-        B += ldb_panel;
-    }
-
-    int rem = nc - n;
-    const bool tail_hi = rem > 8;
-
-    if (rem > 0) {
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kbytes, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kbytes, 32);
-
-        const int32_t* a_i32 = reinterpret_cast<const int32_t*>(A);
-        const int8_t* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                const __m256i v_b1 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-                b_ptr += 64;
-
-                const __m256i v_a0 = _mm256_set1_epi32(a_i32[0]);
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-                v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-
-                a_i32 += 1;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                b_ptr += 64;
-
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, _mm256_set1_epi32(a_i32[0]), v_b0);
-
-                a_i32 += 1;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_epi32(
-                    v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr)));
-            }
-
-            const __m256i v_min = _mm256_set1_epi32(clamp_min);
-            const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-            v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr), v_acc0x01234567);
-
-            c0_ptr += 8;
-
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            const __m256i v_acc0 = tail_hi ? v_acc0x89abcdef : v_acc0x01234567;
-
-            __m128i v_acc0x0123 = _mm256_castsi256_si128(v_acc0);
-
-            const __m128i v_min = _mm_set1_epi32(clamp_min);
-            const __m128i v_max = _mm_set1_epi32(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-
-                c0_ptr += 4;
-
-                v_acc0x0123 = _mm256_extracti128_si256(v_acc0, 1);
-            }
-
-            if (rem & 2) {
-                const __m128i v_rest0 = v_acc0x0123;
-
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-
-                c0_ptr += 2;
-
-                v_acc0x0123 = _mm_srli_si128(v_rest0, 8);
-            }
-
-            if (rem & 1) {
-                int c0 = _mm_cvtsi128_si32(v_acc0x0123);
-                if constexpr (!zero_mode) {
-                    c0 += c0_ptr[0];
-                }
-                c0_ptr[0] = std::min(std::max(c0, clamp_min), clamp_max);
-            }
-        }
-    }
-}
-
-template <bool zero_mode = false>
-void mma_direct_mr6_nr16_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                                     const int8_t* NNOPS_RESTRICT A, int lda,
-                                     const int8_t* NNOPS_RESTRICT B, int ldb, int32_t clamp_min,
-                                     int32_t clamp_max) noexcept
-{
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-    const int r4 = (mr > 4) ? 4 : r3;
-    const int r5 = (mr > 5) ? 5 : r4;
-
-    int32_t* c0_ptr = C + 0 * ldc;
-    int32_t* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-    int32_t* c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
-    int32_t* c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
-
+    int rr[MR];
+    i8_row_alias<MR>(mr, rr);
+    int32_t* row[MR];
+    i8_row_ptrs<MR>(C, ldc, rr, row);
     const int kg = kc >> 2;
     const int ldb_panel = mma_i8_panel_stride(ldb, kc);
+    const __m256i vmin = _mm256_set1_epi32(clamp_min);
+    const __m256i vmax = _mm256_set1_epi32(clamp_max);
 
     int n = 0;
-    for (; n < nc - 15; n += 16) {
-        const int8_t* a0_ptr = A + 0 * lda;
-        const int8_t* a1_ptr = A + r1 * lda;
-        const int8_t* a2_ptr = A + r2 * lda;
-        const int8_t* a3_ptr = A + r3 * lda;
-        const int8_t* a4_ptr = A + r4 * lda;
-        const int8_t* a5_ptr = A + r5 * lda;
-
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kc, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kc, 32);
-        __m256i v_acc1x01234567 = v_acc0x01234567;
-        __m256i v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc2x01234567 = v_acc0x01234567;
-        __m256i v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc3x01234567 = v_acc0x01234567;
-        __m256i v_acc3x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc4x01234567 = v_acc0x01234567;
-        __m256i v_acc4x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc5x01234567 = v_acc0x01234567;
-        __m256i v_acc5x89abcdef = v_acc0x89abcdef;
-
-        const int8_t* b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const __m256i v_b0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-            const __m256i v_b1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-            b_ptr += 64;
-
-            __m256i v_a0 = mma_i8_bcast_group(a0_ptr);
-            __m256i v_a1 = mma_i8_bcast_group(a1_ptr);
-            v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-            v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-            v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, v_a1, v_b0);
-            v_acc1x89abcdef = mma_i8_dp256(v_acc1x89abcdef, v_a1, v_b1);
-
-            v_a0 = mma_i8_bcast_group(a2_ptr);
-            v_a1 = mma_i8_bcast_group(a3_ptr);
-            v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, v_a0, v_b0);
-            v_acc2x89abcdef = mma_i8_dp256(v_acc2x89abcdef, v_a0, v_b1);
-            v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, v_a1, v_b0);
-            v_acc3x89abcdef = mma_i8_dp256(v_acc3x89abcdef, v_a1, v_b1);
-
-            v_a0 = mma_i8_bcast_group(a4_ptr);
-            v_a1 = mma_i8_bcast_group(a5_ptr);
-            v_acc4x01234567 = mma_i8_dp256(v_acc4x01234567, v_a0, v_b0);
-            v_acc4x89abcdef = mma_i8_dp256(v_acc4x89abcdef, v_a0, v_b1);
-            v_acc5x01234567 = mma_i8_dp256(v_acc5x01234567, v_a1, v_b0);
-            v_acc5x89abcdef = mma_i8_dp256(v_acc5x89abcdef, v_a1, v_b1);
-
-            a0_ptr += 4;
-            a1_ptr += 4;
-            a2_ptr += 4;
-            a3_ptr += 4;
-            a4_ptr += 4;
-            a5_ptr += 4;
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_epi32(
-                v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 0)));
-            v_acc0x89abcdef = _mm256_add_epi32(
-                v_acc0x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 8)));
-            v_acc1x01234567 = _mm256_add_epi32(
-                v_acc1x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr + 0)));
-            v_acc1x89abcdef = _mm256_add_epi32(
-                v_acc1x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr + 8)));
-            v_acc2x01234567 = _mm256_add_epi32(
-                v_acc2x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr + 0)));
-            v_acc2x89abcdef = _mm256_add_epi32(
-                v_acc2x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr + 8)));
-            v_acc3x01234567 = _mm256_add_epi32(
-                v_acc3x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr + 0)));
-            v_acc3x89abcdef = _mm256_add_epi32(
-                v_acc3x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr + 8)));
-            v_acc4x01234567 = _mm256_add_epi32(
-                v_acc4x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c4_ptr + 0)));
-            v_acc4x89abcdef = _mm256_add_epi32(
-                v_acc4x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c4_ptr + 8)));
-            v_acc5x01234567 = _mm256_add_epi32(
-                v_acc5x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c5_ptr + 0)));
-            v_acc5x89abcdef = _mm256_add_epi32(
-                v_acc5x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c5_ptr + 8)));
-        }
-        const __m256i v_min = _mm256_set1_epi32(clamp_min);
-        const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-        v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-        v_acc0x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc0x89abcdef, v_min), v_max);
-        v_acc1x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc1x01234567, v_min), v_max);
-        v_acc1x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc1x89abcdef, v_min), v_max);
-        v_acc2x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc2x01234567, v_min), v_max);
-        v_acc2x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc2x89abcdef, v_min), v_max);
-        v_acc3x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc3x01234567, v_min), v_max);
-        v_acc3x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc3x89abcdef, v_min), v_max);
-        v_acc4x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc4x01234567, v_min), v_max);
-        v_acc4x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc4x89abcdef, v_min), v_max);
-        v_acc5x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc5x01234567, v_min), v_max);
-        v_acc5x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc5x89abcdef, v_min), v_max);
-
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 0), v_acc0x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 8), v_acc0x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr + 0), v_acc1x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr + 8), v_acc1x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr + 0), v_acc2x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr + 8), v_acc2x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr + 0), v_acc3x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr + 8), v_acc3x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c4_ptr + 0), v_acc4x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c4_ptr + 8), v_acc4x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c5_ptr + 0), v_acc5x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c5_ptr + 8), v_acc5x89abcdef);
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-        c2_ptr += 16;
-        c3_ptr += 16;
-        c4_ptr += 16;
-        c5_ptr += 16;
-
+    for (; n + mma_i8_nr_max <= nc; n += mma_i8_nr_max) {
+        const int8_t* a0[MR];
+        i8_a_ptrs<MR>(A, lda, rr, a0);
+        __m256i acc[2][MR];
+        i8_mma_rows<MR, 2>(a0, B, kc, kg, acc);
+        i8_store<MR, 2, zero_mode>(row, n, 16, acc, vmin, vmax, clamp_min, clamp_max);
         B += ldb_panel;
     }
 
-    int rem = nc - n;
-    const bool tail_hi = rem > 8;
-
-    if (rem > 0) {
-        const int8_t* a0_ptr = A + 0 * lda;
-        const int8_t* a1_ptr = A + r1 * lda;
-        const int8_t* a2_ptr = A + r2 * lda;
-        const int8_t* a3_ptr = A + r3 * lda;
-        const int8_t* a4_ptr = A + r4 * lda;
-        const int8_t* a5_ptr = A + r5 * lda;
-
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kc, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kc, 32);
-        __m256i v_acc1x01234567 = v_acc0x01234567;
-        __m256i v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc2x01234567 = v_acc0x01234567;
-        __m256i v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc3x01234567 = v_acc0x01234567;
-        __m256i v_acc3x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc4x01234567 = v_acc0x01234567;
-        __m256i v_acc4x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc5x01234567 = v_acc0x01234567;
-        __m256i v_acc5x89abcdef = v_acc0x89abcdef;
-
-        const int8_t* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                const __m256i v_b1 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-                b_ptr += 64;
-
-                __m256i v_a0 = mma_i8_bcast_group(a0_ptr);
-                __m256i v_a1 = mma_i8_bcast_group(a1_ptr);
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-                v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-                v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, v_a1, v_b0);
-                v_acc1x89abcdef = mma_i8_dp256(v_acc1x89abcdef, v_a1, v_b1);
-
-                v_a0 = mma_i8_bcast_group(a2_ptr);
-                v_a1 = mma_i8_bcast_group(a3_ptr);
-                v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, v_a0, v_b0);
-                v_acc2x89abcdef = mma_i8_dp256(v_acc2x89abcdef, v_a0, v_b1);
-                v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, v_a1, v_b0);
-                v_acc3x89abcdef = mma_i8_dp256(v_acc3x89abcdef, v_a1, v_b1);
-
-                v_a0 = mma_i8_bcast_group(a4_ptr);
-                v_a1 = mma_i8_bcast_group(a5_ptr);
-                v_acc4x01234567 = mma_i8_dp256(v_acc4x01234567, v_a0, v_b0);
-                v_acc4x89abcdef = mma_i8_dp256(v_acc4x89abcdef, v_a0, v_b1);
-                v_acc5x01234567 = mma_i8_dp256(v_acc5x01234567, v_a1, v_b0);
-                v_acc5x89abcdef = mma_i8_dp256(v_acc5x89abcdef, v_a1, v_b1);
-
-                a0_ptr += 4;
-                a1_ptr += 4;
-                a2_ptr += 4;
-                a3_ptr += 4;
-                a4_ptr += 4;
-                a5_ptr += 4;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                b_ptr += 64;
-
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, mma_i8_bcast_group(a0_ptr), v_b0);
-                v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, mma_i8_bcast_group(a1_ptr), v_b0);
-                v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, mma_i8_bcast_group(a2_ptr), v_b0);
-                v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, mma_i8_bcast_group(a3_ptr), v_b0);
-                v_acc4x01234567 = mma_i8_dp256(v_acc4x01234567, mma_i8_bcast_group(a4_ptr), v_b0);
-                v_acc5x01234567 = mma_i8_dp256(v_acc5x01234567, mma_i8_bcast_group(a5_ptr), v_b0);
-
-                a0_ptr += 4;
-                a1_ptr += 4;
-                a2_ptr += 4;
-                a3_ptr += 4;
-                a4_ptr += 4;
-                a5_ptr += 4;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_epi32(
-                    v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr)));
-                v_acc1x01234567 = _mm256_add_epi32(
-                    v_acc1x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr)));
-                v_acc2x01234567 = _mm256_add_epi32(
-                    v_acc2x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr)));
-                v_acc3x01234567 = _mm256_add_epi32(
-                    v_acc3x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr)));
-                v_acc4x01234567 = _mm256_add_epi32(
-                    v_acc4x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c4_ptr)));
-                v_acc5x01234567 = _mm256_add_epi32(
-                    v_acc5x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c5_ptr)));
-            }
-
-            const __m256i v_min = _mm256_set1_epi32(clamp_min);
-            const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-            v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-            v_acc1x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc1x01234567, v_min), v_max);
-            v_acc2x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc2x01234567, v_min), v_max);
-            v_acc3x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc3x01234567, v_min), v_max);
-            v_acc4x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc4x01234567, v_min), v_max);
-            v_acc5x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc5x01234567, v_min), v_max);
-
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr), v_acc0x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr), v_acc1x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr), v_acc2x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr), v_acc3x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c4_ptr), v_acc4x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c5_ptr), v_acc5x01234567);
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-            c2_ptr += 8;
-            c3_ptr += 8;
-            c4_ptr += 8;
-            c5_ptr += 8;
-
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            const __m256i v_acc0 = tail_hi ? v_acc0x89abcdef : v_acc0x01234567;
-            const __m256i v_acc1 = tail_hi ? v_acc1x89abcdef : v_acc1x01234567;
-            const __m256i v_acc2 = tail_hi ? v_acc2x89abcdef : v_acc2x01234567;
-            const __m256i v_acc3 = tail_hi ? v_acc3x89abcdef : v_acc3x01234567;
-            const __m256i v_acc4 = tail_hi ? v_acc4x89abcdef : v_acc4x01234567;
-            const __m256i v_acc5 = tail_hi ? v_acc5x89abcdef : v_acc5x01234567;
-
-            __m128i v_acc0x0123 = _mm256_castsi256_si128(v_acc0);
-            __m128i v_acc1x0123 = _mm256_castsi256_si128(v_acc1);
-            __m128i v_acc2x0123 = _mm256_castsi256_si128(v_acc2);
-            __m128i v_acc3x0123 = _mm256_castsi256_si128(v_acc3);
-            __m128i v_acc4x0123 = _mm256_castsi256_si128(v_acc4);
-            __m128i v_acc5x0123 = _mm256_castsi256_si128(v_acc5);
-
-            const __m128i v_min = _mm_set1_epi32(clamp_min);
-            const __m128i v_max = _mm_set1_epi32(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr)));
-                    v_acc1x0123 = _mm_add_epi32(
-                        v_acc1x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr)));
-                    v_acc2x0123 = _mm_add_epi32(
-                        v_acc2x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr)));
-                    v_acc3x0123 = _mm_add_epi32(
-                        v_acc3x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr)));
-                    v_acc4x0123 = _mm_add_epi32(
-                        v_acc4x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c4_ptr)));
-                    v_acc5x0123 = _mm_add_epi32(
-                        v_acc5x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c5_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-                v_acc1x0123 = _mm_min_epi32(_mm_max_epi32(v_acc1x0123, v_min), v_max);
-                v_acc2x0123 = _mm_min_epi32(_mm_max_epi32(v_acc2x0123, v_min), v_max);
-                v_acc3x0123 = _mm_min_epi32(_mm_max_epi32(v_acc3x0123, v_min), v_max);
-                v_acc4x0123 = _mm_min_epi32(_mm_max_epi32(v_acc4x0123, v_min), v_max);
-                v_acc5x0123 = _mm_min_epi32(_mm_max_epi32(v_acc5x0123, v_min), v_max);
-
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr), v_acc1x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr), v_acc2x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr), v_acc3x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c4_ptr), v_acc4x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c5_ptr), v_acc5x0123);
-
-                c0_ptr += 4;
-                c1_ptr += 4;
-                c2_ptr += 4;
-                c3_ptr += 4;
-                c4_ptr += 4;
-                c5_ptr += 4;
-
-                v_acc0x0123 = _mm256_extracti128_si256(v_acc0, 1);
-                v_acc1x0123 = _mm256_extracti128_si256(v_acc1, 1);
-                v_acc2x0123 = _mm256_extracti128_si256(v_acc2, 1);
-                v_acc3x0123 = _mm256_extracti128_si256(v_acc3, 1);
-                v_acc4x0123 = _mm256_extracti128_si256(v_acc4, 1);
-                v_acc5x0123 = _mm256_extracti128_si256(v_acc5, 1);
-            }
-
-            if (rem & 2) {
-                const __m128i v_rest0 = v_acc0x0123;
-                const __m128i v_rest1 = v_acc1x0123;
-                const __m128i v_rest2 = v_acc2x0123;
-                const __m128i v_rest3 = v_acc3x0123;
-                const __m128i v_rest4 = v_acc4x0123;
-                const __m128i v_rest5 = v_acc5x0123;
-
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr)));
-                    v_acc1x0123 = _mm_add_epi32(
-                        v_acc1x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr)));
-                    v_acc2x0123 = _mm_add_epi32(
-                        v_acc2x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c2_ptr)));
-                    v_acc3x0123 = _mm_add_epi32(
-                        v_acc3x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c3_ptr)));
-                    v_acc4x0123 = _mm_add_epi32(
-                        v_acc4x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c4_ptr)));
-                    v_acc5x0123 = _mm_add_epi32(
-                        v_acc5x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c5_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-                v_acc1x0123 = _mm_min_epi32(_mm_max_epi32(v_acc1x0123, v_min), v_max);
-                v_acc2x0123 = _mm_min_epi32(_mm_max_epi32(v_acc2x0123, v_min), v_max);
-                v_acc3x0123 = _mm_min_epi32(_mm_max_epi32(v_acc3x0123, v_min), v_max);
-                v_acc4x0123 = _mm_min_epi32(_mm_max_epi32(v_acc4x0123, v_min), v_max);
-                v_acc5x0123 = _mm_min_epi32(_mm_max_epi32(v_acc5x0123, v_min), v_max);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr), v_acc1x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c2_ptr), v_acc2x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c3_ptr), v_acc3x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c4_ptr), v_acc4x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c5_ptr), v_acc5x0123);
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-                c2_ptr += 2;
-                c3_ptr += 2;
-                c4_ptr += 2;
-                c5_ptr += 2;
-
-                v_acc0x0123 = _mm_srli_si128(v_rest0, 8);
-                v_acc1x0123 = _mm_srli_si128(v_rest1, 8);
-                v_acc2x0123 = _mm_srli_si128(v_rest2, 8);
-                v_acc3x0123 = _mm_srli_si128(v_rest3, 8);
-                v_acc4x0123 = _mm_srli_si128(v_rest4, 8);
-                v_acc5x0123 = _mm_srli_si128(v_rest5, 8);
-            }
-
-            if (rem & 1) {
-                int c0 = _mm_cvtsi128_si32(v_acc0x0123);
-                int c1 = _mm_cvtsi128_si32(v_acc1x0123);
-                int c2 = _mm_cvtsi128_si32(v_acc2x0123);
-                int c3 = _mm_cvtsi128_si32(v_acc3x0123);
-                int c4 = _mm_cvtsi128_si32(v_acc4x0123);
-                int c5 = _mm_cvtsi128_si32(v_acc5x0123);
-                if constexpr (!zero_mode) {
-                    c0 += c0_ptr[0];
-                    c1 += c1_ptr[0];
-                    c2 += c2_ptr[0];
-                    c3 += c3_ptr[0];
-                    c4 += c4_ptr[0];
-                    c5 += c5_ptr[0];
-                }
-                c0_ptr[0] = std::min(std::max(c0, clamp_min), clamp_max);
-                c1_ptr[0] = std::min(std::max(c1, clamp_min), clamp_max);
-                c2_ptr[0] = std::min(std::max(c2, clamp_min), clamp_max);
-                c3_ptr[0] = std::min(std::max(c3, clamp_min), clamp_max);
-                c4_ptr[0] = std::min(std::max(c4, clamp_min), clamp_max);
-                c5_ptr[0] = std::min(std::max(c5, clamp_min), clamp_max);
-            }
-        }
+    const int live = nc - n;
+    if (live > 8) {
+        const int8_t* a0[MR];
+        i8_a_ptrs<MR>(A, lda, rr, a0);
+        __m256i acc[2][MR];
+        i8_mma_rows<MR, 2>(a0, B, kc, kg, acc);
+        i8_store<MR, 2, zero_mode>(row, n, live, acc, vmin, vmax, clamp_min, clamp_max);
+    } else if (live > 0) {
+        const int8_t* a0[MR];
+        i8_a_ptrs<MR>(A, lda, rr, a0);
+        __m256i acc[1][MR];
+        i8_mma_rows<MR, 1>(a0, B, kc, kg, acc);
+        i8_store<MR, 1, zero_mode>(row, n, live, acc, vmin, vmax, clamp_min, clamp_max);
     }
 }
 
-template <bool zero_mode = false>
-void mma_direct_mr4_nr16_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                                     const int8_t* NNOPS_RESTRICT A, int lda,
-                                     const int8_t* NNOPS_RESTRICT B, int ldb, int32_t clamp_min,
-                                     int32_t clamp_max) noexcept
-{
-    const int r1 = (mr > 1) ? 1 : 0;
-    const int r2 = (mr > 2) ? 2 : r1;
-    const int r3 = (mr > 3) ? 3 : r2;
-
-    int32_t* c0_ptr = C + 0 * ldc;
-    int32_t* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
-    int32_t* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
-    int32_t* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
-
-    const int kg = kc >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kc);
-
-    int n = 0;
-    for (; n < nc - 15; n += 16) {
-        const int8_t* a0_ptr = A + 0 * lda;
-        const int8_t* a1_ptr = A + r1 * lda;
-        const int8_t* a2_ptr = A + r2 * lda;
-        const int8_t* a3_ptr = A + r3 * lda;
-
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kc, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kc, 32);
-        __m256i v_acc1x01234567 = v_acc0x01234567;
-        __m256i v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc2x01234567 = v_acc0x01234567;
-        __m256i v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc3x01234567 = v_acc0x01234567;
-        __m256i v_acc3x89abcdef = v_acc0x89abcdef;
-
-        const int8_t* b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const __m256i v_b0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-            const __m256i v_b1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-            b_ptr += 64;
-
-            __m256i v_a0 = mma_i8_bcast_group(a0_ptr);
-            __m256i v_a1 = mma_i8_bcast_group(a1_ptr);
-            v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-            v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-            v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, v_a1, v_b0);
-            v_acc1x89abcdef = mma_i8_dp256(v_acc1x89abcdef, v_a1, v_b1);
-
-            v_a0 = mma_i8_bcast_group(a2_ptr);
-            v_a1 = mma_i8_bcast_group(a3_ptr);
-            v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, v_a0, v_b0);
-            v_acc2x89abcdef = mma_i8_dp256(v_acc2x89abcdef, v_a0, v_b1);
-            v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, v_a1, v_b0);
-            v_acc3x89abcdef = mma_i8_dp256(v_acc3x89abcdef, v_a1, v_b1);
-
-            a0_ptr += 4;
-            a1_ptr += 4;
-            a2_ptr += 4;
-            a3_ptr += 4;
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_epi32(
-                v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 0)));
-            v_acc0x89abcdef = _mm256_add_epi32(
-                v_acc0x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 8)));
-            v_acc1x01234567 = _mm256_add_epi32(
-                v_acc1x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr + 0)));
-            v_acc1x89abcdef = _mm256_add_epi32(
-                v_acc1x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr + 8)));
-            v_acc2x01234567 = _mm256_add_epi32(
-                v_acc2x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr + 0)));
-            v_acc2x89abcdef = _mm256_add_epi32(
-                v_acc2x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr + 8)));
-            v_acc3x01234567 = _mm256_add_epi32(
-                v_acc3x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr + 0)));
-            v_acc3x89abcdef = _mm256_add_epi32(
-                v_acc3x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr + 8)));
-        }
-        const __m256i v_min = _mm256_set1_epi32(clamp_min);
-        const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-        v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-        v_acc0x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc0x89abcdef, v_min), v_max);
-        v_acc1x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc1x01234567, v_min), v_max);
-        v_acc1x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc1x89abcdef, v_min), v_max);
-        v_acc2x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc2x01234567, v_min), v_max);
-        v_acc2x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc2x89abcdef, v_min), v_max);
-        v_acc3x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc3x01234567, v_min), v_max);
-        v_acc3x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc3x89abcdef, v_min), v_max);
-
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 0), v_acc0x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 8), v_acc0x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr + 0), v_acc1x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr + 8), v_acc1x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr + 0), v_acc2x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr + 8), v_acc2x89abcdef);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr + 0), v_acc3x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr + 8), v_acc3x89abcdef);
-
-        c0_ptr += 16;
-        c1_ptr += 16;
-        c2_ptr += 16;
-        c3_ptr += 16;
-
-        B += ldb_panel;
-    }
-
-    int rem = nc - n;
-    const bool tail_hi = rem > 8;
-
-    if (rem > 0) {
-        const int8_t* a0_ptr = A + 0 * lda;
-        const int8_t* a1_ptr = A + r1 * lda;
-        const int8_t* a2_ptr = A + r2 * lda;
-        const int8_t* a3_ptr = A + r3 * lda;
-
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kc, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kc, 32);
-        __m256i v_acc1x01234567 = v_acc0x01234567;
-        __m256i v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc2x01234567 = v_acc0x01234567;
-        __m256i v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256i v_acc3x01234567 = v_acc0x01234567;
-        __m256i v_acc3x89abcdef = v_acc0x89abcdef;
-
-        const int8_t* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                const __m256i v_b1 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-                b_ptr += 64;
-
-                __m256i v_a0 = mma_i8_bcast_group(a0_ptr);
-                __m256i v_a1 = mma_i8_bcast_group(a1_ptr);
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-                v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-                v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, v_a1, v_b0);
-                v_acc1x89abcdef = mma_i8_dp256(v_acc1x89abcdef, v_a1, v_b1);
-
-                v_a0 = mma_i8_bcast_group(a2_ptr);
-                v_a1 = mma_i8_bcast_group(a3_ptr);
-                v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, v_a0, v_b0);
-                v_acc2x89abcdef = mma_i8_dp256(v_acc2x89abcdef, v_a0, v_b1);
-                v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, v_a1, v_b0);
-                v_acc3x89abcdef = mma_i8_dp256(v_acc3x89abcdef, v_a1, v_b1);
-
-                a0_ptr += 4;
-                a1_ptr += 4;
-                a2_ptr += 4;
-                a3_ptr += 4;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                b_ptr += 64;
-
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, mma_i8_bcast_group(a0_ptr), v_b0);
-                v_acc1x01234567 = mma_i8_dp256(v_acc1x01234567, mma_i8_bcast_group(a1_ptr), v_b0);
-                v_acc2x01234567 = mma_i8_dp256(v_acc2x01234567, mma_i8_bcast_group(a2_ptr), v_b0);
-                v_acc3x01234567 = mma_i8_dp256(v_acc3x01234567, mma_i8_bcast_group(a3_ptr), v_b0);
-
-                a0_ptr += 4;
-                a1_ptr += 4;
-                a2_ptr += 4;
-                a3_ptr += 4;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_epi32(
-                    v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr)));
-                v_acc1x01234567 = _mm256_add_epi32(
-                    v_acc1x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c1_ptr)));
-                v_acc2x01234567 = _mm256_add_epi32(
-                    v_acc2x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c2_ptr)));
-                v_acc3x01234567 = _mm256_add_epi32(
-                    v_acc3x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c3_ptr)));
-            }
-
-            const __m256i v_min = _mm256_set1_epi32(clamp_min);
-            const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-            v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-            v_acc1x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc1x01234567, v_min), v_max);
-            v_acc2x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc2x01234567, v_min), v_max);
-            v_acc3x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc3x01234567, v_min), v_max);
-
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr), v_acc0x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c1_ptr), v_acc1x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c2_ptr), v_acc2x01234567);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c3_ptr), v_acc3x01234567);
-
-            c0_ptr += 8;
-            c1_ptr += 8;
-            c2_ptr += 8;
-            c3_ptr += 8;
-
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            const __m256i v_acc0 = tail_hi ? v_acc0x89abcdef : v_acc0x01234567;
-            const __m256i v_acc1 = tail_hi ? v_acc1x89abcdef : v_acc1x01234567;
-            const __m256i v_acc2 = tail_hi ? v_acc2x89abcdef : v_acc2x01234567;
-            const __m256i v_acc3 = tail_hi ? v_acc3x89abcdef : v_acc3x01234567;
-
-            __m128i v_acc0x0123 = _mm256_castsi256_si128(v_acc0);
-            __m128i v_acc1x0123 = _mm256_castsi256_si128(v_acc1);
-            __m128i v_acc2x0123 = _mm256_castsi256_si128(v_acc2);
-            __m128i v_acc3x0123 = _mm256_castsi256_si128(v_acc3);
-
-            const __m128i v_min = _mm_set1_epi32(clamp_min);
-            const __m128i v_max = _mm_set1_epi32(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr)));
-                    v_acc1x0123 = _mm_add_epi32(
-                        v_acc1x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c1_ptr)));
-                    v_acc2x0123 = _mm_add_epi32(
-                        v_acc2x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c2_ptr)));
-                    v_acc3x0123 = _mm_add_epi32(
-                        v_acc3x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c3_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-                v_acc1x0123 = _mm_min_epi32(_mm_max_epi32(v_acc1x0123, v_min), v_max);
-                v_acc2x0123 = _mm_min_epi32(_mm_max_epi32(v_acc2x0123, v_min), v_max);
-                v_acc3x0123 = _mm_min_epi32(_mm_max_epi32(v_acc3x0123, v_min), v_max);
-
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c1_ptr), v_acc1x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c2_ptr), v_acc2x0123);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c3_ptr), v_acc3x0123);
-
-                c0_ptr += 4;
-                c1_ptr += 4;
-                c2_ptr += 4;
-                c3_ptr += 4;
-
-                v_acc0x0123 = _mm256_extracti128_si256(v_acc0, 1);
-                v_acc1x0123 = _mm256_extracti128_si256(v_acc1, 1);
-                v_acc2x0123 = _mm256_extracti128_si256(v_acc2, 1);
-                v_acc3x0123 = _mm256_extracti128_si256(v_acc3, 1);
-            }
-
-            if (rem & 2) {
-                const __m128i v_rest0 = v_acc0x0123;
-                const __m128i v_rest1 = v_acc1x0123;
-                const __m128i v_rest2 = v_acc2x0123;
-                const __m128i v_rest3 = v_acc3x0123;
-
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr)));
-                    v_acc1x0123 = _mm_add_epi32(
-                        v_acc1x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c1_ptr)));
-                    v_acc2x0123 = _mm_add_epi32(
-                        v_acc2x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c2_ptr)));
-                    v_acc3x0123 = _mm_add_epi32(
-                        v_acc3x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c3_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-                v_acc1x0123 = _mm_min_epi32(_mm_max_epi32(v_acc1x0123, v_min), v_max);
-                v_acc2x0123 = _mm_min_epi32(_mm_max_epi32(v_acc2x0123, v_min), v_max);
-                v_acc3x0123 = _mm_min_epi32(_mm_max_epi32(v_acc3x0123, v_min), v_max);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c1_ptr), v_acc1x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c2_ptr), v_acc2x0123);
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c3_ptr), v_acc3x0123);
-
-                c0_ptr += 2;
-                c1_ptr += 2;
-                c2_ptr += 2;
-                c3_ptr += 2;
-
-                v_acc0x0123 = _mm_srli_si128(v_rest0, 8);
-                v_acc1x0123 = _mm_srli_si128(v_rest1, 8);
-                v_acc2x0123 = _mm_srli_si128(v_rest2, 8);
-                v_acc3x0123 = _mm_srli_si128(v_rest3, 8);
-            }
-
-            if (rem & 1) {
-                int c0 = _mm_cvtsi128_si32(v_acc0x0123);
-                int c1 = _mm_cvtsi128_si32(v_acc1x0123);
-                int c2 = _mm_cvtsi128_si32(v_acc2x0123);
-                int c3 = _mm_cvtsi128_si32(v_acc3x0123);
-                if constexpr (!zero_mode) {
-                    c0 += c0_ptr[0];
-                    c1 += c1_ptr[0];
-                    c2 += c2_ptr[0];
-                    c3 += c3_ptr[0];
-                }
-                c0_ptr[0] = std::min(std::max(c0, clamp_min), clamp_max);
-                c1_ptr[0] = std::min(std::max(c1, clamp_min), clamp_max);
-                c2_ptr[0] = std::min(std::max(c2, clamp_min), clamp_max);
-                c3_ptr[0] = std::min(std::max(c3, clamp_min), clamp_max);
-            }
-        }
-    }
-}
-
-template <bool zero_mode = false>
-void mma_direct_mr1_nr16_mrxncxkc_i8(int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
-                                     const int8_t* NNOPS_RESTRICT A, int lda,
-                                     const int8_t* NNOPS_RESTRICT B, int ldb, int32_t clamp_min,
-                                     int32_t clamp_max) noexcept
-{
-    (void)mr;
-
-    int32_t* c0_ptr = C;
-
-    const int kg = kc >> 2;
-    const int ldb_panel = mma_i8_panel_stride(ldb, kc);
-
-    int n = 0;
-    for (; n < nc - 15; n += 16) {
-        const int8_t* a0_ptr = A;
-
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kc, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kc, 32);
-
-        const int8_t* b_ptr = B;
-        for (int k = 0; k < kg; ++k) {
-            const __m256i v_b0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-            const __m256i v_b1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-            b_ptr += 64;
-
-            const __m256i v_a0 = mma_i8_bcast_group(a0_ptr);
-            v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-            v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-
-            a0_ptr += 4;
-        }
-        if constexpr (!zero_mode) {
-            v_acc0x01234567 = _mm256_add_epi32(
-                v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 0)));
-            v_acc0x89abcdef = _mm256_add_epi32(
-                v_acc0x89abcdef, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr + 8)));
-        }
-        const __m256i v_min = _mm256_set1_epi32(clamp_min);
-        const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-        v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-        v_acc0x89abcdef = _mm256_min_epi32(_mm256_max_epi32(v_acc0x89abcdef, v_min), v_max);
-
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 0), v_acc0x01234567);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr + 8), v_acc0x89abcdef);
-
-        c0_ptr += 16;
-
-        B += ldb_panel;
-    }
-
-    int rem = nc - n;
-    const bool tail_hi = rem > 8;
-
-    if (rem > 0) {
-        const int8_t* a0_ptr = A;
-
-        __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kc, 0);
-        __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kc, 32);
-
-        const int8_t* b_ptr = B;
-        if (rem > 8) {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                const __m256i v_b1 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 32));
-                b_ptr += 64;
-
-                const __m256i v_a0 = mma_i8_bcast_group(a0_ptr);
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, v_a0, v_b0);
-                v_acc0x89abcdef = mma_i8_dp256(v_acc0x89abcdef, v_a0, v_b1);
-
-                a0_ptr += 4;
-            }
-        } else {
-            for (int k = 0; k < kg; ++k) {
-                const __m256i v_b0 =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + 0));
-                b_ptr += 64;
-
-                v_acc0x01234567 = mma_i8_dp256(v_acc0x01234567, mma_i8_bcast_group(a0_ptr), v_b0);
-
-                a0_ptr += 4;
-            }
-        }
-
-        if (rem >= 8) {
-            if constexpr (!zero_mode) {
-                v_acc0x01234567 = _mm256_add_epi32(
-                    v_acc0x01234567, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c0_ptr)));
-            }
-
-            const __m256i v_min = _mm256_set1_epi32(clamp_min);
-            const __m256i v_max = _mm256_set1_epi32(clamp_max);
-
-            v_acc0x01234567 = _mm256_min_epi32(_mm256_max_epi32(v_acc0x01234567, v_min), v_max);
-
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(c0_ptr), v_acc0x01234567);
-
-            c0_ptr += 8;
-
-            rem -= 8;
-        }
-
-        if (rem > 0) {
-            const __m256i v_acc0 = tail_hi ? v_acc0x89abcdef : v_acc0x01234567;
-
-            __m128i v_acc0x0123 = _mm256_castsi256_si128(v_acc0);
-
-            const __m128i v_min = _mm_set1_epi32(clamp_min);
-            const __m128i v_max = _mm_set1_epi32(clamp_max);
-
-            if (rem & 4) {
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadu_si128(reinterpret_cast<const __m128i*>(c0_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-
-                c0_ptr += 4;
-
-                v_acc0x0123 = _mm256_extracti128_si256(v_acc0, 1);
-            }
-
-            if (rem & 2) {
-                const __m128i v_rest0 = v_acc0x0123;
-
-                if constexpr (!zero_mode) {
-                    v_acc0x0123 = _mm_add_epi32(
-                        v_acc0x0123, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(c0_ptr)));
-                }
-
-                v_acc0x0123 = _mm_min_epi32(_mm_max_epi32(v_acc0x0123, v_min), v_max);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(c0_ptr), v_acc0x0123);
-
-                c0_ptr += 2;
-
-                v_acc0x0123 = _mm_srli_si128(v_rest0, 8);
-            }
-
-            if (rem & 1) {
-                int c0 = _mm_cvtsi128_si32(v_acc0x0123);
-                if constexpr (!zero_mode) {
-                    c0 += c0_ptr[0];
-                }
-                c0_ptr[0] = std::min(std::max(c0, clamp_min), clamp_max);
-            }
-        }
-    }
-}
+// ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
+
+/// MR levels {6,4,1} (MR_I8); a remainder panel runs through the level above it.
+template <bool Z>
+inline constexpr auto mma_pack_fns_i8 =
+    std::array{&mma_pack_mr_nr16_mrxncxkc_i8<6, Z>, &mma_pack_mr_nr16_mrxncxkc_i8<4, Z>,
+               &mma_pack_mr_nr16_mrxncxkc_i8<1, Z>};
+
+/// Row-major A (`lda` in int8 elements, kc % 4 == 0), same MR levels.
+template <bool Z>
+inline constexpr auto mma_direct_fns_i8 =
+    std::array{&mma_direct_mr_nr16_mrxncxkc_i8<6, Z>, &mma_direct_mr_nr16_mrxncxkc_i8<4, Z>,
+               &mma_direct_mr_nr16_mrxncxkc_i8<1, Z>};
 
 // =========================================================================
 //  the requantizing variants (packed A + packed B)
@@ -1876,7 +859,7 @@ inline __m256 i8_round_away_ps(__m256 x) noexcept
 /// The per-column scale and bias of one eight-column group, zeroing the dead
 /// lanes of a ragged last group instead of reading past the table.
 template <int NG>
-__attribute__((always_inline)) inline void
+NNOPS_FORCEINLINE void
 i8_col_q_x86(__m256 (&sc)[NG], __m256i (&bi)[NG], __m256 vk, __m256 vreq, const float* s_b,
              const int32_t* col_bias, int live) noexcept
 {
@@ -1910,7 +893,7 @@ i8_col_q_x86(__m256 (&sc)[NG], __m256i (&bi)[NG], __m256 vk, __m256 vreq, const 
 /// Eight columns of one row: bias, Relu, scale, clamp, round, offset, narrow,
 /// store — or the `live` leading bytes of it.
 template <class TOut>
-__attribute__((always_inline)) inline void
+NNOPS_FORCEINLINE void
 i8_storeq_x86(TOut* dst, int live, __m256i v, __m256 vscale, __m256i vbias, __m256i vlo,
               __m256i vzp, __m256 vfmin, __m256 vfmax) noexcept
 {
@@ -1936,7 +919,7 @@ i8_storeq_x86(TOut* dst, int live, __m256i v, __m256 vscale, __m256i vbias, __m2
 
 /// The panel's whole K into `acc`, seeded from the B panel's column sums.
 template <int MR, int NH>
-__attribute__((always_inline)) inline void
+NNOPS_FORCEINLINE void
 i8_x86_mma(const int8_t* A, const int8_t* B, int kbytes, int kg,
            __m256i (&acc)[MR][NH]) noexcept
 {
@@ -1972,7 +955,7 @@ i8_x86_mma(const int8_t* A, const int8_t* B, int kbytes, int kg,
 }
 
 template <int MR, class TOut>
-__attribute__((always_inline)) inline void
+NNOPS_FORCEINLINE void
 mma_pack_mr_nr16_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B, int ldb,
                         const float* s_b, float s_b_scalar, float row_k,
@@ -2040,39 +1023,6 @@ mma_pack_mr_nr16_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t 
     }
 }
 
-template <class TOut>
-__attribute__((always_inline)) inline void
-mma_pack_mr6_nr16_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
-                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                         int ldb, const float* s_b, float s_b_scalar, float row_k,
-                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
-{
-    mma_pack_mr_nr16_epi_i8<6, TOut>(mr, nc, kc, C, ldm, A, B, ldb, s_b, s_b_scalar, row_k,
-                                     col_bias, zp_out, relu);
-}
-
-template <class TOut>
-__attribute__((always_inline)) inline void
-mma_pack_mr4_nr16_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
-                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                         int ldb, const float* s_b, float s_b_scalar, float row_k,
-                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
-{
-    mma_pack_mr_nr16_epi_i8<4, TOut>(mr, nc, kc, C, ldm, A, B, ldb, s_b, s_b_scalar, row_k,
-                                     col_bias, zp_out, relu);
-}
-
-template <class TOut>
-__attribute__((always_inline)) inline void
-mma_pack_mr1_nr16_epi_i8(int mr, int nc, int kc, TOut* NNOPS_RESTRICT C, int64_t ldm,
-                         const int8_t* NNOPS_RESTRICT A, const int8_t* NNOPS_RESTRICT B,
-                         int ldb, const float* s_b, float s_b_scalar, float row_k,
-                         const int32_t* col_bias, int32_t zp_out, bool relu) noexcept
-{
-    mma_pack_mr_nr16_epi_i8<1, TOut>(mr, nc, kc, C, ldm, A, B, ldb, s_b, s_b_scalar, row_k,
-                                     col_bias, zp_out, relu);
-}
-
 /// The kernel signature the requantizing rungs are dispatched through.
 template <class TOut>
 using MmaI8EpiFn = void (*)(int, int, int, TOut*, int64_t, const int8_t*, const int8_t*, int,
@@ -2081,21 +1031,9 @@ using MmaI8EpiFn = void (*)(int, int, int, TOut*, int64_t, const int8_t*, const 
 /// The requantizing rungs, consumed by matmul_helper.cpp; rows are {6,4,1}.
 template <class TOut>
 inline constexpr std::array<MmaI8EpiFn<TOut>, 3> mma_pack_epi_fns_i8 = {
-    &mma_pack_mr6_nr16_epi_i8<TOut>,
-    &mma_pack_mr4_nr16_epi_i8<TOut>,
-    &mma_pack_mr1_nr16_epi_i8<TOut>,
+    &mma_pack_mr_nr16_epi_i8<6, TOut>,
+    &mma_pack_mr_nr16_epi_i8<4, TOut>,
+    &mma_pack_mr_nr16_epi_i8<1, TOut>,
 };
-
-/// MR levels {6,4,1} (MR_I8); a remainder panel runs through the level above it.
-template <bool Z>
-inline constexpr auto mma_pack_fns_i8 =
-    std::array{&mma_pack_mr6_nr16_mrxncxkc_i8<Z>, &mma_pack_mr4_nr16_mrxncxkc_i8<Z>,
-               &mma_pack_mr1_nr16_mrxncxkc_i8<Z>};
-
-/// Row-major A (`lda` in int8 elements, kc % 4 == 0), same MR levels.
-template <bool Z>
-inline constexpr auto mma_direct_fns_i8 =
-    std::array{&mma_direct_mr6_nr16_mrxncxkc_i8<Z>, &mma_direct_mr4_nr16_mrxncxkc_i8<Z>,
-               &mma_direct_mr1_nr16_mrxncxkc_i8<Z>};
 
 } // namespace nnops::backend::cpu::x86_64
