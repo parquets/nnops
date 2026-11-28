@@ -5,6 +5,14 @@ add_executable(nnops_qwen2_llm
     qwen2_model.cpp
 )
 target_link_libraries(nnops_qwen2_llm PRIVATE nnops_cpu)
+# nnops_cpu pulls in nnops_cuda and NNOPS_HAS_CUDA when the backend is on; the
+# demo's own staging copies call the runtime directly.
+if(NNOPS_BUILD_CUDA)
+    # tests/ is the only directory that finds the toolkit, and an imported
+    # target is not visible outside it.
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(nnops_qwen2_llm PRIVATE CUDA::cudart)
+endif()
 target_include_directories(nnops_qwen2_llm PRIVATE ${CMAKE_SOURCE_DIR})
 
 # The demo carries its own prefill-vs-stepwise check, so a tiny run is the

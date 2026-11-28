@@ -12,7 +12,7 @@
 /// whole planes to GroupQueryAttention with kv_seqlens = length, so the
 /// operator's causal row range is the only thing that sees the valid prefix.
 
-#include "llm/qwen2_model.hpp"
+#include "models/llm/qwen2_model.hpp"
 
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/q4.hpp"
@@ -28,6 +28,10 @@
 #include <cmath>
 #include <initializer_list>
 
+#ifdef NNOPS_HAS_CUDA
+#include <cuda_runtime.h>
+#endif
+
 namespace nnops::llm {
 
 using backend::cpu::float_to_half;
@@ -35,6 +39,51 @@ using backend::cpu::half;
 using backend::cpu::half_to_float;
 
 namespace {
+
+// ---- device memory --------------------------------------------------------
+
+bool dev_alloc(void*& p, size_t bytes)
+{
+#ifdef NNOPS_HAS_CUDA
+    return cudaMalloc(&p, bytes > 0 ? bytes : 1) == cudaSuccess;
+#else
+    (void)p;
+    (void)bytes;
+    return false;
+#endif
+}
+
+void dev_free(void* p)
+{
+#ifdef NNOPS_HAS_CUDA
+    if (p != nullptr) {
+        cudaFree(p);
+    }
+#else
+    (void)p;
+#endif
+}
+
+bool dev_copy(void* dst, const void* src, size_t bytes, bool to_device)
+{
+#ifdef NNOPS_HAS_CUDA
+    if (bytes == 0) {
+        return true;
+    }
+    return (to_device ? cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) :
+                        cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost)) == cudaSuccess;
+#else
+    (void)dst;
+    (void)src;
+    (void)bytes;
+    (void)to_device;
+    return false;
+#endif
+}
+
+/// Stream the running forward is using, so a phase timer can wait for its
+/// launches before reading the clock. Null on the CPU.
+void* g_profile_stream = nullptr;
 
 // ---- deterministic random draws -------------------------------------------
 
@@ -166,11 +215,18 @@ struct PhaseTimer {
 
     ~PhaseTimer()
     {
-        if (on) {
-            slot += std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - t0)
-                        .count();
+        if (!on) {
+            return;
         }
+#ifdef NNOPS_HAS_CUDA
+        // The launches are asynchronous; without this the clock would measure
+        // the enqueue, not the kernel.
+        if (g_profile_stream != nullptr) {
+            cudaStreamSynchronize(static_cast<cudaStream_t>(g_profile_stream));
+        }
+#endif
+        slot += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                    .count();
     }
 };
 
@@ -195,10 +251,12 @@ void quantize_row(const T* src, int64_t n, int8_t* dst, float& scale)
 }
 
 struct CacheLayer {
-    std::vector<int8_t> k; ///< [H_kv, capacity, D]
+    std::vector<int8_t> k; ///< [H_kv, capacity, D] host planes (the staging)
     std::vector<int8_t> v;
     std::vector<float> k_scale; ///< [H_kv, capacity]
     std::vector<float> v_scale;
+    DeviceBlock k_dev, v_dev;    ///< device planes the operator reads
+    DeviceBlock ks_dev, vs_dev;
 };
 
 template <typename T>
@@ -229,43 +287,148 @@ struct Scratch {
     Buffer x_a, x_b;
     Buffer last_norm, logits;
 
-    void alloc(const Qwen2Config& cfg, DataType dt, int64_t S)
+    void alloc(const Qwen2Config& cfg, DataType dt, int64_t S, bool device)
     {
         const int64_t H = cfg.num_attention_heads;
         const int64_t Hkv = cfg.num_key_value_heads;
         const int64_t D = cfg.head_dim;
-        xn.alloc({S, cfg.hidden_size}, dt);
-        q_lin.alloc({S, cfg.q_dim()}, dt);
-        k_lin.alloc({S, cfg.kv_dim()}, dt);
-        v_lin.alloc({S, cfg.kv_dim()}, dt);
-        q_bhsd.alloc({1, H, S, D}, dt);
-        k_bhsd.alloc({1, Hkv, S, D}, dt);
-        q_rope.alloc({1, H, S, D}, dt);
-        k_rope.alloc({1, Hkv, S, D}, dt);
-        attn_bhsd.alloc({1, H, S, D}, dt);
-        attn_merged.alloc({S, cfg.q_dim()}, dt);
-        o.alloc({S, cfg.hidden_size}, dt);
-        h.alloc({S, cfg.hidden_size}, dt);
-        gate.alloc({S, cfg.intermediate_size}, dt);
-        up.alloc({S, cfg.intermediate_size}, dt);
-        act.alloc({S, cfg.intermediate_size}, dt);
-        ffn.alloc({S, cfg.hidden_size}, dt);
-        x_a.alloc({S, cfg.hidden_size}, dt);
-        x_b.alloc({S, cfg.hidden_size}, dt);
-        last_norm.alloc({1, cfg.hidden_size}, dt);
-        logits.alloc({1, cfg.vocab_size}, dt);
+        xn.alloc({S, cfg.hidden_size}, dt, device);
+        q_lin.alloc({S, cfg.q_dim()}, dt, device);
+        k_lin.alloc({S, cfg.kv_dim()}, dt, device);
+        v_lin.alloc({S, cfg.kv_dim()}, dt, device);
+        q_bhsd.alloc({1, H, S, D}, dt, device);
+        k_bhsd.alloc({1, Hkv, S, D}, dt, device);
+        q_rope.alloc({1, H, S, D}, dt, device);
+        k_rope.alloc({1, Hkv, S, D}, dt, device);
+        attn_bhsd.alloc({1, H, S, D}, dt, device);
+        attn_merged.alloc({S, cfg.q_dim()}, dt, device);
+        o.alloc({S, cfg.hidden_size}, dt, device);
+        h.alloc({S, cfg.hidden_size}, dt, device);
+        gate.alloc({S, cfg.intermediate_size}, dt, device);
+        up.alloc({S, cfg.intermediate_size}, dt, device);
+        act.alloc({S, cfg.intermediate_size}, dt, device);
+        ffn.alloc({S, cfg.hidden_size}, dt, device);
+        x_a.alloc({S, cfg.hidden_size}, dt, device);
+        x_b.alloc({S, cfg.hidden_size}, dt, device);
+        last_norm.alloc({1, cfg.hidden_size}, dt, device);
+        logits.alloc({1, cfg.vocab_size}, dt, device);
     }
 };
 
 } // anonymous namespace
 
+// ---- device blocks --------------------------------------------------------
+
+DeviceBlock::~DeviceBlock()
+{
+    dev_free(ptr);
+}
+
+DeviceBlock::DeviceBlock(DeviceBlock&& other) noexcept : ptr(other.ptr), bytes(other.bytes)
+{
+    other.ptr = nullptr;
+    other.bytes = 0;
+}
+
+DeviceBlock& DeviceBlock::operator=(DeviceBlock&& other) noexcept
+{
+    if (this != &other) {
+        reset();
+        ptr = other.ptr;
+        bytes = other.bytes;
+        other.ptr = nullptr;
+        other.bytes = 0;
+    }
+    return *this;
+}
+
+void DeviceBlock::reset() noexcept
+{
+    dev_free(ptr);
+    ptr = nullptr;
+    bytes = 0;
+}
+
 // ---- Buffer ---------------------------------------------------------------
 
-void Buffer::alloc(std::vector<int64_t> shape_, DataType dtype_)
+void Buffer::alloc(std::vector<int64_t> shape_, DataType dtype_, bool on_device)
 {
     shape = std::move(shape_);
     dtype = dtype_;
-    bytes.assign(static_cast<size_t>(numel()) * data_type_size(dtype), 0);
+    const size_t nbytes = static_cast<size_t>(numel()) * data_type_size(dtype);
+    dev.reset();
+    if (on_device) {
+        bytes.clear();
+        if (dev_alloc(dev.ptr, nbytes)) {
+            dev.bytes = nbytes;
+        }
+        return;
+    }
+    bytes.assign(nbytes, 0);
+}
+
+size_t Buffer::nbytes() const noexcept
+{
+    return dev.ok() ? dev.bytes : bytes.size();
+}
+
+TensorView Buffer::view() noexcept
+{
+    return TensorView(shape, dtype, data());
+}
+
+TensorView Buffer::view() const noexcept
+{
+    return TensorView(shape, dtype, const_cast<void*>(data()));
+}
+
+bool Buffer::upload(const void* src)
+{
+    return dev.ok() && dev_copy(dev.ptr, src, dev.bytes, true);
+}
+
+bool Buffer::download(void* dst) const
+{
+    return dev.ok() && dev_copy(dst, dev.ptr, dev.bytes, false);
+}
+
+bool Q4Matrix::to_device()
+{
+    if (dev.ok()) {
+        return true;
+    }
+    if (bytes.empty() || !dev_alloc(dev.ptr, bytes.size())) {
+        return false;
+    }
+    dev.bytes = bytes.size();
+    return dev_copy(dev.ptr, bytes.data(), bytes.size(), true);
+}
+
+bool Qwen2Weights::to_device()
+{
+    auto upload = [](Buffer& b) {
+        if (b.bytes.empty() || b.dev.ok()) {
+            return true;
+        }
+        if (!dev_alloc(b.dev.ptr, b.bytes.size())) {
+            return false;
+        }
+        b.dev.bytes = b.bytes.size();
+        return dev_copy(b.dev.ptr, b.bytes.data(), b.dev.bytes, true);
+    };
+
+    bool ok = embed.to_device() && upload(final_norm);
+    if (!cfg.tie_word_embeddings) {
+        ok = ok && lm_head.to_device();
+    }
+    for (auto& l : layers) {
+        ok = ok && l.q_proj.to_device() && l.k_proj.to_device() && l.v_proj.to_device() &&
+             l.o_proj.to_device() && l.gate_proj.to_device() && l.up_proj.to_device() &&
+             l.down_proj.to_device();
+        ok = ok && upload(l.q_bias) && upload(l.k_bias) && upload(l.v_bias) &&
+             upload(l.attn_norm) && upload(l.ffn_norm);
+    }
+    return ok;
 }
 
 int64_t Buffer::numel() const noexcept
@@ -278,16 +441,6 @@ int64_t Buffer::numel() const noexcept
         n *= d;
     }
     return n;
-}
-
-TensorView Buffer::view() noexcept
-{
-    return TensorView(shape, dtype, bytes.data());
-}
-
-TensorView Buffer::view() const noexcept
-{
-    return TensorView(shape, dtype, const_cast<uint8_t*>(bytes.data()));
 }
 
 // ---- fake checkpoint ------------------------------------------------------
@@ -363,11 +516,22 @@ Qwen2Weights make_fake_weights(const Qwen2Config& cfg, DataType act_dtype, uint6
 struct Qwen2State::Impl {
     Qwen2Config cfg;
     DataType dtype = DataType::f32;
+    Backend backend = Backend::CPU;
+    void* stream = nullptr; ///< cudaStream_t for a device run
+    bool cuda = false;
     int64_t capacity = 0;
     int64_t length = 0;
     int64_t chunk = -1; ///< S the scratch was allocated for
     std::vector<CacheLayer> cache;
     Scratch scratch;
+
+    // Host staging at the two boundaries of a device run: the embedding lookup
+    // and the q8 cache quantisation are host code, so their rows cross the bus.
+    std::vector<uint8_t> embed_stage;
+    std::vector<uint8_t> kv_stage;
+    std::vector<uint8_t> logits_stage;
+    DeviceBlock pos_dev; ///< int64 [1]
+    DeviceBlock len_dev; ///< int32 [1]
 
     bool prof_on = false;
     Qwen2Profile prof;
@@ -386,17 +550,21 @@ struct Qwen2State::Impl {
         if (chunk == S) {
             return;
         }
-        scratch.alloc(cfg, dtype, S);
+        scratch.alloc(cfg, dtype, S, cuda);
         chunk = S;
     }
 };
 
-Qwen2State::Qwen2State(const Qwen2Config& cfg, DataType act_dtype, int64_t capacity)
+Qwen2State::Qwen2State(const Qwen2Config& cfg, DataType act_dtype, int64_t capacity,
+                       Backend backend, void* stream)
     : impl_(std::make_unique<Impl>())
 {
     Impl& m = *impl_;
     m.cfg = cfg;
     m.dtype = act_dtype;
+    m.backend = backend;
+    m.stream = stream;
+    m.cuda = backend == Backend::CUDA;
     m.capacity = std::max<int64_t>(capacity, 1);
 
     const int64_t plane = cfg.num_key_value_heads * m.capacity * cfg.head_dim;
@@ -407,45 +575,65 @@ Qwen2State::Qwen2State(const Qwen2Config& cfg, DataType act_dtype, int64_t capac
         c.v.assign(static_cast<size_t>(plane), 0);
         c.k_scale.assign(static_cast<size_t>(scale_plane), 1.0f);
         c.v_scale.assign(static_cast<size_t>(scale_plane), 1.0f);
+        if (m.cuda) {
+            const size_t kbytes = static_cast<size_t>(plane);
+            const size_t sbytes = static_cast<size_t>(scale_plane) * sizeof(float);
+            const bool ok = dev_alloc(c.k_dev.ptr, kbytes) && dev_alloc(c.v_dev.ptr, kbytes) &&
+                            dev_alloc(c.ks_dev.ptr, sbytes) && dev_alloc(c.vs_dev.ptr, sbytes);
+            c.k_dev.bytes = c.v_dev.bytes = kbytes;
+            c.ks_dev.bytes = c.vs_dev.bytes = sbytes;
+            if (!ok) {
+                return;
+            }
+            dev_copy(c.k_dev.ptr, c.k.data(), kbytes, true);
+            dev_copy(c.v_dev.ptr, c.v.data(), kbytes, true);
+            dev_copy(c.ks_dev.ptr, c.k_scale.data(), sbytes, true);
+            dev_copy(c.vs_dev.ptr, c.v_scale.data(), sbytes, true);
+        }
     }
 
     NormAttributes na;
     na.type = NormType::RMSNorm;
     na.axis = -1;
     na.epsilon = cfg.rms_norm_eps;
-    m.norm = Norm::create(na, Backend::CPU);
+    m.norm = Norm::create(na, backend);
 
     LinearAttributes la;
-    m.linear = Linear::create(la, Backend::CPU);
+    m.linear = Linear::create(la, backend);
     LinearAttributes ga;
     ga.epilogue.type = EpilogueActivateType::Silu;
-    m.linear_silu = Linear::create(ga, Backend::CPU);
+    m.linear_silu = Linear::create(ga, backend);
 
     RoPEAttributes ra;
     ra.base = cfg.rope_theta;
     ra.interleaved = false; // Qwen2 rotates the split halves (HF rotate_half)
     ra.rotary_dim = 0;      // the whole head
-    m.rope = RoPE::create(ra, Backend::CPU);
+    m.rope = RoPE::create(ra, backend);
 
     PermuteAttributes pa;
     pa.perm = {0, 2, 1, 3};
-    m.permute = Permute::create(pa, Backend::CPU);
+    m.permute = Permute::create(pa, backend);
 
     EltwiseAttributes add_attrs;
     add_attrs.type = EltwiseType::Add;
-    m.add = Eltwise::create(add_attrs, Backend::CPU);
+    m.add = Eltwise::create(add_attrs, backend);
     EltwiseAttributes mul_attrs;
     mul_attrs.type = EltwiseType::Mul;
-    m.mul = Eltwise::create(mul_attrs, Backend::CPU);
+    m.mul = Eltwise::create(mul_attrs, backend);
 
     GroupQueryAttentionAttributes attn_attrs;
     attn_attrs.num_heads = cfg.num_attention_heads;
     attn_attrs.kv_num_heads = cfg.num_key_value_heads;
     attn_attrs.causal = true; // the KV-cache form
-    m.attn = GroupQueryAttention::create(attn_attrs, Backend::CPU);
+    m.attn = GroupQueryAttention::create(attn_attrs, backend);
 }
 
 Qwen2State::~Qwen2State() = default;
+
+Backend Qwen2State::backend() const noexcept
+{
+    return impl_->backend;
+}
 
 void Qwen2State::reset() noexcept
 {
@@ -491,7 +679,7 @@ Status run_linear(Linear& op, TensorView out, const TensorView& x, const Q4Matri
                   const Buffer* bias, const ComputeContext& ctx)
 {
     TensorView ins[3] = {x, w.view(), TensorView{}};
-    const size_t n = bias != nullptr && !bias->bytes.empty() ? 3 : 2;
+    const size_t n = bias != nullptr && !bias->empty() ? 3 : 2;
     if (n == 3) {
         ins[2] = bias->view();
     }
@@ -517,6 +705,13 @@ Status Qwen2State::run(const Qwen2Weights& w, std::span<const int64_t> tokens,
     if (m.length + S > m.capacity) {
         return Status::invalid_argument;
     }
+    if (m.cuda && (ctx.cuda_stream == nullptr || m.dtype != DataType::f16)) {
+        return Status::unsupported;
+    }
+    struct StreamGuard {
+        ~StreamGuard() { g_profile_stream = nullptr; }
+    } stream_guard;
+    g_profile_stream = m.cuda && m.prof_on ? ctx.cuda_stream : nullptr;
 
     const int64_t start = m.length;
     const int64_t H = cfg.num_attention_heads;
@@ -530,15 +725,41 @@ Status Qwen2State::run(const Qwen2Weights& w, std::span<const int64_t> tokens,
 
     int64_t pos0 = start;
     int32_t seq_len = static_cast<int32_t>(start + S);
-    TensorView pos_view = make_view({1}, DataType::s64, &pos0);
-    TensorView len_view = make_view({1}, DataType::s32, &seq_len);
+    TensorView pos_view;
+    TensorView len_view;
+    if (m.cuda) {
+        if (!m.pos_dev.ok() && !dev_alloc(m.pos_dev.ptr, sizeof(int64_t))) {
+            return Status::out_of_memory;
+        }
+        if (!m.len_dev.ok() && !dev_alloc(m.len_dev.ptr, sizeof(int32_t))) {
+            return Status::out_of_memory;
+        }
+        m.pos_dev.bytes = sizeof(int64_t);
+        m.len_dev.bytes = sizeof(int32_t);
+        dev_copy(m.pos_dev.ptr, &pos0, sizeof(pos0), true);
+        dev_copy(m.len_dev.ptr, &seq_len, sizeof(seq_len), true);
+        pos_view = make_view({1}, DataType::s64, m.pos_dev.ptr);
+        len_view = make_view({1}, DataType::s32, m.len_dev.ptr);
+    } else {
+        pos_view = make_view({1}, DataType::s64, &pos0);
+        len_view = make_view({1}, DataType::s32, &seq_len);
+    }
 
     // ---- embedding --------------------------------------------------------
     Buffer* x_in = &s.x_a;
     Buffer* x_out = &s.x_b;
     {
         PhaseTimer t(m.prof.embed_ms, m.prof_on);
-        embed_rows(w.embed, tokens, x_in->data(), dt);
+        if (m.cuda) {
+            m.embed_stage.resize(static_cast<size_t>(S) * static_cast<size_t>(hidden) *
+                                 data_type_size(dt));
+            embed_rows(w.embed, tokens, m.embed_stage.data(), dt);
+            if (!x_in->upload(m.embed_stage.data())) {
+                return Status::internal;
+            }
+        } else {
+            embed_rows(w.embed, tokens, x_in->data(), dt);
+        }
     }
 
     const int64_t qdim = cfg.q_dim();
@@ -626,23 +847,52 @@ Status Qwen2State::run(const Qwen2Weights& w, std::span<const int64_t> tokens,
             }
 
             // ---- append the step's K/V as q8 ----------------------------
-            const TensorView k_view = s.k_rope.view();
-            const TensorView v_view = s.v_lin.view();
+            // A device run quantizes from a downloaded copy, then uploads the
+            // rows the step wrote into the device planes.
             PhaseTimer t(m.prof.cache_ms, m.prof_on);
+            TensorView k_src = s.k_rope.view();
+            TensorView v_src = s.v_lin.view();
+            if (m.cuda) {
+                const size_t kv_bytes = static_cast<size_t>(S) * static_cast<size_t>(kvdim) *
+                                        data_type_size(dt);
+                m.kv_stage.resize(2 * kv_bytes);
+                s.k_rope.download(m.kv_stage.data());
+                s.v_lin.download(m.kv_stage.data() + kv_bytes);
+                k_src = make_view({1, Hkv, S, D}, dt, m.kv_stage.data());
+                v_src = make_view({S, kvdim}, dt, m.kv_stage.data() + kv_bytes);
+            }
             if (dt == DataType::f32) {
-                append_cache<float>(cfg, cl, k_view, v_view, m.capacity, start, S);
+                append_cache<float>(cfg, cl, k_src, v_src, m.capacity, start, S);
             } else {
-                append_cache<half>(cfg, cl, k_view, v_view, m.capacity, start, S);
+                append_cache<half>(cfg, cl, k_src, v_src, m.capacity, start, S);
+            }
+            if (m.cuda) {
+                for (int64_t h = 0; h < Hkv; ++h) {
+                    const int64_t row = h * m.capacity + start;
+                    const size_t rows = static_cast<size_t>(S * D);
+                    dev_copy(static_cast<int8_t*>(cl.k_dev.ptr) + row * D, cl.k.data() + row * D,
+                             rows, true);
+                    dev_copy(static_cast<int8_t*>(cl.v_dev.ptr) + row * D, cl.v.data() + row * D,
+                             rows, true);
+                    dev_copy(static_cast<float*>(cl.ks_dev.ptr) + row, cl.k_scale.data() + row,
+                             static_cast<size_t>(S) * sizeof(float), true);
+                    dev_copy(static_cast<float*>(cl.vs_dev.ptr) + row, cl.v_scale.data() + row,
+                             static_cast<size_t>(S) * sizeof(float), true);
+                }
             }
         }
 
         // ---- cached causal attention ------------------------------------
         {
             TensorView q = s.q_rope.view();
-            TensorView k_cache = make_view({1, Hkv, m.capacity, D}, DataType::s8, cl.k.data());
-            TensorView v_cache = make_view({1, Hkv, m.capacity, D}, DataType::s8, cl.v.data());
-            TensorView k_scale = make_view({1, Hkv, m.capacity}, DataType::f32, cl.k_scale.data());
-            TensorView v_scale = make_view({1, Hkv, m.capacity}, DataType::f32, cl.v_scale.data());
+            void* kp = m.cuda ? cl.k_dev.ptr : static_cast<void*>(cl.k.data());
+            void* vp = m.cuda ? cl.v_dev.ptr : static_cast<void*>(cl.v.data());
+            void* ksp = m.cuda ? cl.ks_dev.ptr : static_cast<void*>(cl.k_scale.data());
+            void* vsp = m.cuda ? cl.vs_dev.ptr : static_cast<void*>(cl.v_scale.data());
+            TensorView k_cache = make_view({1, Hkv, m.capacity, D}, DataType::s8, kp);
+            TensorView v_cache = make_view({1, Hkv, m.capacity, D}, DataType::s8, vp);
+            TensorView k_scale = make_view({1, Hkv, m.capacity}, DataType::f32, ksp);
+            TensorView v_scale = make_view({1, Hkv, m.capacity}, DataType::f32, vsp);
             TensorView ins[9] = {q, k_cache, v_cache, len_view, pos_view, k_scale, v_scale,
                                  TensorView{}, TensorView{}};
             TensorView out = s.attn_bhsd.view();
@@ -776,8 +1026,15 @@ Status Qwen2State::run(const Qwen2Weights& w, std::span<const int64_t> tokens,
                 return st;
             }
             last_logits.resize(static_cast<size_t>(cfg.vocab_size));
+            if (m.cuda) {
+                m.logits_stage.resize(static_cast<size_t>(cfg.vocab_size) * data_type_size(dt));
+                if (!s.logits.download(m.logits_stage.data())) {
+                    return Status::internal;
+                }
+            }
+            const void* logit_src = m.cuda ? m.logits_stage.data() : s.logits.data();
             for (int64_t i = 0; i < cfg.vocab_size; ++i) {
-                last_logits[static_cast<size_t>(i)] = elem_f32(dt, s.logits.data(), i);
+                last_logits[static_cast<size_t>(i)] = elem_f32(dt, logit_src, i);
             }
         }
     }

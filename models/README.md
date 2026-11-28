@@ -117,6 +117,25 @@ starts and the reported `forward` is the steady state.
 BatchNorm statistics are folded from the exported `running_mean` /
 `running_var`, so the networks run in eval mode exactly as exported.
 
+## The LLM demo (`models/llm/`)
+
+The one runner here that is not a torchvision replay. `qwen2_model.cpp` builds
+a Qwen2/Qwen2.5 decoder out of the operator set — q4_1 projections and
+embedding, a dense q8 KV cache, f32 or f16 activations — from fake weights, so
+it needs no exported artifact. `--selftest` replays the prompt one token at a
+time and compares that against the prefill, which is what CTest runs as
+`llm_qwen2_selftest`; `--bench` measures prefill at 64..512 rows and one
+decoded token, and `--backend cuda` runs the same graph on the device (f16
+only, the q4_1 route there is w4a16).
+
+```bash
+cmake --build build --config Release --target nnops_qwen2_llm
+./build/models/llm/Release/nnops_qwen2_llm.exe --preset qwen2.5-0.5b     --dtype f16 --bench --threads 6
+```
+
+The numbers, the phase breakdown and the CUDA comparison live in
+`models/llm/README.md`.
+
 ## Adding a model
 
 1. Add a builder + checkpoint list to `MODELS` in

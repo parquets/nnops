@@ -27,3 +27,8 @@ foreach(src ${MODEL_SOURCES})
     add_test(NAME model_${name}_f16 COMMAND model_${name} --f16)
     set_tests_properties(model_${name}_f16 PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
+
+# The LLM demo: a fake-weight Qwen2 decoder built from the same operators.
+# Unlike the torchvision runners it needs no exported artifact — it checks
+# itself with --selftest, which CTest runs.
+add_subdirectory(llm)

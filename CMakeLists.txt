@@ -12,7 +12,6 @@ option(NNOPS_BUILD_MODELS     "Build the end-to-end model tests" ON)
 option(NNOPS_BUILD_CUDA       "Build CUDA backend"         OFF)
 option(NNOPS_BUILD_VULKAN     "Build Vulkan backend"       OFF)
 option(NNOPS_BUILD_METAL      "Build Metal backend (Apple only)" OFF)
-option(NNOPS_BUILD_LLM        "Build the LLM inference demos" ON)
 option(NNOPS_OPENMP           "Build the OpenMP CpuBackend adapter" OFF)
 # AArch64 SME kernels (matmul's outer-product route). Header-only like the NEON
 # kernels: each function carries its own target("+sme2") attribute, so no
@@ -140,17 +139,12 @@ if(NNOPS_OPENMP)
 endif()
 
 # ---- Source subdirectories ----
-# Enabled before the subdirectories so a demo that registers its own check
-# (llm/) can add_test() in its directory.
+# Enabled before the subdirectories so a model runner that registers its own
+# check (models/llm) can add_test() in its directory.
 if(NNOPS_BUILD_TESTS)
     enable_testing()
 endif()
 add_subdirectory(src)
-
-# ---- LLM demos (fake-weight model inference composed from the operators) ----
-if(NNOPS_BUILD_LLM)
-    add_subdirectory(llm)
-endif()
 
 # ---- Installation ----
 include(GNUInstallDirs)

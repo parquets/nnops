@@ -26,7 +26,8 @@
 /// table, so a step writes its rows at `length` directly and the attention op
 /// sees the whole plane with `kv_seqlens` bounding the valid prefix.
 
-#include "llm/qwen2_config.hpp"
+#include "models/llm/qwen2_config.hpp"
+#include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/status.hpp"
@@ -40,21 +41,47 @@
 
 namespace nnops::llm {
 
+/// A CUDA allocation owned by a Buffer or a Q4Matrix. Empty in a build without
+/// the CUDA backend (and in the CPU run of a build that has it).
+struct DeviceBlock {
+    void* ptr = nullptr;
+    size_t bytes = 0;
+
+    DeviceBlock() = default;
+    ~DeviceBlock();
+    DeviceBlock(const DeviceBlock&) = delete;
+    DeviceBlock& operator=(const DeviceBlock&) = delete;
+    DeviceBlock(DeviceBlock&& other) noexcept;
+    DeviceBlock& operator=(DeviceBlock&& other) noexcept;
+
+    bool ok() const noexcept { return ptr != nullptr; }
+    void reset() noexcept;
+};
+
 /// One llama.cpp Q4_1 matrix: `rows` rows of `cols` values, each row padded to
 /// whole 32-value blocks, 20 bytes a block.
 struct Q4Matrix {
     int64_t rows = 0;
     int64_t cols = 0;
     int64_t blocks = 0;
-    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> bytes; ///< host copy
+    DeviceBlock dev;            ///< device copy, when uploaded
+
+    void* data() const noexcept { return dev.ok() ? dev.ptr : const_cast<uint8_t*>(bytes.data()); }
 
     TensorView view() const noexcept
     {
         const int64_t shape[2] = {rows, cols};
-        return TensorView(shape, DataType::q4_1, const_cast<uint8_t*>(bytes.data()));
+        return TensorView(shape, DataType::q4_1, data());
     }
 
-    size_t nbytes() const noexcept { return bytes.size(); }
+    size_t nbytes() const noexcept
+    {
+        return dev.ok() ? dev.bytes : bytes.size();
+    }
+
+    /// Copy the block stream to a device allocation; no-op without CUDA.
+    bool to_device();
 };
 
 /// A dense row-major tensor in the activation dtype (f32 or f16) — the
@@ -63,15 +90,25 @@ struct Q4Matrix {
 struct Buffer {
     std::vector<int64_t> shape;
     DataType dtype = DataType::f32;
-    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> bytes; ///< host storage (empty for a device buffer)
+    DeviceBlock dev;            ///< device storage, when allocated on the device
 
-    void alloc(std::vector<int64_t> shape_, DataType dtype_);
+    /// Host allocation, or a device one when @p on_device asks for it.
+    void alloc(std::vector<int64_t> shape_, DataType dtype_, bool on_device = false);
     int64_t numel() const noexcept;
-    size_t nbytes() const noexcept { return bytes.size(); }
-    void* data() noexcept { return bytes.data(); }
-    const void* data() const noexcept { return bytes.data(); }
+    size_t nbytes() const noexcept;
+    bool empty() const noexcept { return numel() == 0; }
+    void* data() noexcept { return dev.ok() ? dev.ptr : bytes.data(); }
+    const void* data() const noexcept
+    {
+        return dev.ok() ? const_cast<const void*>(dev.ptr) : bytes.data();
+    }
     TensorView view() noexcept;
     TensorView view() const noexcept;
+
+    /// Host <-> device copies of the whole buffer (no-op without CUDA).
+    bool upload(const void* src);
+    bool download(void* dst) const;
 };
 
 struct LayerWeights {
@@ -101,6 +138,9 @@ struct Qwen2Weights {
     Buffer final_norm; ///< [hidden]
     std::vector<LayerWeights> layers;
     Q4Matrix lm_head;  ///< [vocab, hidden]; empty when the table is tied
+
+    /// Copy every weight to the device; false when a CUDA call fails.
+    bool to_device();
 
     size_t q4_nbytes() const noexcept;
     size_t dense_nbytes() const noexcept;
@@ -138,7 +178,11 @@ struct Qwen2Profile {
 /// scratch, and the operator instances the forward pass reuses.
 class Qwen2State {
 public:
-    Qwen2State(const Qwen2Config& cfg, DataType act_dtype, int64_t capacity);
+    /// @p backend runs the graph where the operators execute; a device run
+    /// needs @p stream (a cudaStream_t), f16 activations, and weights that went
+    /// through Qwen2Weights::to_device().
+    Qwen2State(const Qwen2Config& cfg, DataType act_dtype, int64_t capacity,
+               Backend backend = Backend::CPU, void* stream = nullptr);
     ~Qwen2State();
 
     Qwen2State(const Qwen2State&) = delete;
@@ -150,6 +194,7 @@ public:
     int64_t length() const noexcept;
     int64_t capacity() const noexcept;
     size_t cache_nbytes() const noexcept;
+    Backend backend() const noexcept;
 
     /// Run @p tokens at the current position, appending their K/V to the cache.
     /// Prefill and decode are the same call: S > 1 is a prefill block, S == 1 a

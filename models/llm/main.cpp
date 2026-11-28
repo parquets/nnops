@@ -10,9 +10,13 @@
 /// There is no tokenizer: the prompt is random token ids drawn from the seeded
 /// generator, which is enough for a shape- and route-level demonstration.
 
-#include "llm/qwen2_model.hpp"
+#include "models/llm/qwen2_model.hpp"
 
 #include "nnops/core/openmp_backend.hpp"
+
+#ifdef NNOPS_HAS_CUDA
+#include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -42,6 +46,7 @@ struct Args {
     bool selftest = false;
     bool bench = false;
     bool profile = false;
+    bool cuda = false;
 };
 
 void usage()
@@ -54,6 +59,7 @@ void usage()
         "  --steps N                              decoded tokens (default 8)\n"
         "  --max-seq N                            KV-cache capacity (default prompt+steps+8)\n"
         "  --threads N                            CPU workers (default OpenMP max)\n"
+        "  --backend cpu|cuda                     where the operators run (default cpu)\n"
         "  --seed N                               fake-weight / prompt seed (default 1234)\n"
         "  --selftest                             stepwise vs prefill logits check\n"
         "  --bench                                prefill 64/128/256/384/512 + 1-token decode\n"
@@ -109,6 +115,15 @@ bool parse_args(int argc, char** argv, Args& a, bool& help)
             const char* v = value("--max-seq");
             if (!v) { return false; }
             a.max_seq = std::atoll(v);
+        } else if (arg == "--backend") {
+            const char* v = value("--backend");
+            if (!v) { return false; }
+            if (std::strcmp(v, "cuda") == 0) {
+                a.cuda = true;
+            } else if (std::strcmp(v, "cpu") != 0) {
+                std::printf("unknown backend: %s\n", v);
+                return false;
+            }
         } else if (arg == "--threads") {
             const char* v = value("--threads");
             if (!v) { return false; }
@@ -195,7 +210,8 @@ bool run_bench(const Qwen2Weights& weights, const ComputeContext& ctx, uint64_t 
     constexpr int kPrefillReps = 5;
     constexpr int kDecodeReps = 9;
 
-    Qwen2State state(cfg, weights.act_dtype, max_len + 32);
+    Qwen2State state(cfg, weights.act_dtype, max_len + 32, ctx.expected_backend,
+                     ctx.cuda_stream);
     std::printf("  kv cache    %.1f MB\n", mb(state.cache_nbytes()));
 
     std::mt19937_64 rng(seed ^ 0xC0FFEE0DDBA11ull);
@@ -377,20 +393,53 @@ int main(int argc, char** argv)
 
     ComputeContext ctx;
     ctx.cpu = openmp_backend(args.threads);
+    void* stream = nullptr;
+    if (args.cuda) {
+#ifdef NNOPS_HAS_CUDA
+        if (act != DataType::f16) {
+            std::printf("  cuda        needs --dtype f16 (the q4_1 device route is w4a16)\n");
+            return 1;
+        }
+        cudaStream_t s = nullptr;
+        if (cudaStreamCreate(&s) != cudaSuccess) {
+            std::printf("  cuda        stream creation failed\n");
+            return 1;
+        }
+        stream = s;
+        ctx.cuda_stream = stream;
+        ctx.expected_backend = Backend::CUDA;
+        cudaDeviceProp prop{};
+        cudaGetDeviceProperties(&prop, 0);
+        std::printf("  cuda        %s, %d SMs, stream %p\n", prop.name, prop.multiProcessorCount,
+                    stream);
+#else
+        std::printf("  cuda        this build has no CUDA backend\n");
+        return 1;
+#endif
+    }
     std::printf("  cpu         %d workers%s\n", ctx.cpu.worker_count(),
                 openmp_available() ? "" : " (built without OpenMP)");
 
     auto t0 = std::chrono::steady_clock::now();
-    const Qwen2Weights weights = make_fake_weights(cfg, act, args.seed);
+    Qwen2Weights weights = make_fake_weights(cfg, act, args.seed);
     const double weight_ms = ms_since(t0);
     std::printf("  weights     %.1f MB q4_1 + %.1f MB dense in %.1f ms\n",
                 mb(weights.q4_nbytes()), mb(weights.dense_nbytes()), weight_ms);
+    if (args.cuda) {
+        const auto tu = std::chrono::steady_clock::now();
+        if (!weights.to_device()) {
+            std::printf("  cuda        weight upload failed\n");
+            return 1;
+        }
+        std::printf("  upload      %.1f MB in %.1f ms\n",
+                    mb(weights.q4_nbytes() + weights.dense_nbytes()), ms_since(tu));
+    }
 
     if (args.bench) {
         return run_bench(weights, ctx, args.seed, args.profile) ? 0 : 1;
     }
 
-    Qwen2State state(cfg, act, capacity);
+    Qwen2State state(cfg, act, capacity, ctx.expected_backend, ctx.cuda_stream);
     std::printf("  kv cache    %.1f MB\n", mb(state.cache_nbytes()));
 
     std::mt19937_64 rng(args.seed ^ 0x51ED270B7F1A3C5Dull);

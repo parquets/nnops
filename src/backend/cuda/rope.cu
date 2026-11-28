@@ -329,44 +329,57 @@ Status rope_entry(const RoPEAttributes& attrs, TensorView& output,
             tbl_stride = half;
         }
     } else {
-        // The per-batch first-row positions, and how many distinct blocks the
-        // table needs. `position_ids` is a device tensor, so the few values are
-        // copied back once; the plans' Dynamic pivot needs their maximum.
+        // The per-batch first-row positions. The table kernel reads them from
+        // the device, so only the Dynamic pivot needs them on the host: a
+        // readback there costs a synchronising copy per call (1.2 ms on
+        // Windows), and every step of a decode pays it twice a layer.
         std::vector<int64_t> starts;
         const bool has_pos = inputs.size() > 5 && !inputs[5].is_empty();
+        const bool need_host_start = attrs.scaling_type == RoPEScalingType::Dynamic;
+        const int64_t* dev_starts = nullptr;
         if (has_pos) {
-            const int64_t n = inputs[5].numel();
-            std::vector<int64_t> host(static_cast<size_t>(n));
-            CUDA_CHECK(cudaMemcpyAsync(host.data(), inputs[5].ptr<int64_t>(),
-                                       size_t(n) * sizeof(int64_t), cudaMemcpyDeviceToHost,
-                                       stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            if (n == 1) {
-                starts.push_back(host[0]);
-            } else {
-                starts = host;
-                bool uniform = true;
-                for (int64_t b = 1; b < batch; ++b) {
-                    uniform = uniform && starts[static_cast<size_t>(b)] == starts[0];
-                }
-                if (uniform) {
-                    starts.resize(1);
+            dev_starts = inputs[5].ptr<int64_t>();
+            if (inputs[5].numel() > 1) {
+                blocks = batch;
+            }
+            if (need_host_start) {
+                const int64_t n = inputs[5].numel();
+                std::vector<int64_t> host(static_cast<size_t>(n));
+                CUDA_CHECK(cudaMemcpyAsync(host.data(), inputs[5].ptr<int64_t>(),
+                                           size_t(n) * sizeof(int64_t), cudaMemcpyDeviceToHost,
+                                           stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                if (n == 1) {
+                    starts.push_back(host[0]);
                 } else {
-                    blocks = batch;
+                    starts = host;
+                    bool uniform = true;
+                    for (int64_t b = 1; b < batch; ++b) {
+                        uniform = uniform && starts[static_cast<size_t>(b)] == starts[0];
+                    }
+                    if (uniform) {
+                        starts.resize(1);
+                        blocks = 1;
+                        dev_starts = nullptr;
+                    }
                 }
             }
         } else {
             starts.push_back(attrs.position_offset);
         }
-        int64_t max_start = starts[0];
-        for (int64_t s : starts) {
-            max_start = std::max(max_start, s);
+        int64_t max_start = 0;
+        if (need_host_start) {
+            max_start = starts.empty() ? 0 : starts[0];
+            for (int64_t s : starts) {
+                max_start = std::max(max_start, s);
+            }
         }
         outer_per_block = blocks > 1 ? outer_count / batch : outer_count;
         const auto sections = plan_rope_sections(attrs, rotary_dim, seq_len, max_start);
         const auto pairs = build_rope_pair_plans(sections, attrs, half);
         const int64_t pair_bytes = half * int64_t(sizeof(float4));
-        const int64_t start_bytes = int64_t(starts.size()) * int64_t(sizeof(int64_t));
+        const int64_t start_bytes =
+            dev_starts == nullptr ? int64_t(starts.size()) * int64_t(sizeof(int64_t)) : 0;
         if (!plan.alloc(pair_bytes + start_bytes, stream)) {
             return Status::out_of_memory;
         }
@@ -382,8 +395,12 @@ Status rope_entry(const RoPEAttributes& attrs, TensorView& output,
         }
         CUDA_CHECK(cudaMemcpyAsync(dpairs, host_pairs.data(), size_t(pair_bytes),
                                    cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(dstarts, starts.data(), size_t(start_bytes),
-                                   cudaMemcpyHostToDevice, stream));
+        if (start_bytes > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(dstarts, starts.data(), size_t(start_bytes),
+                                       cudaMemcpyHostToDevice, stream));
+        } else {
+            dstarts = const_cast<int64_t*>(dev_starts);
+        }
         const int64_t table_elems = blocks * seq_len * half;
         if (!tables.alloc(table_elems * 8, stream)) {
             plan.release(stream);

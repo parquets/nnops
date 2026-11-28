@@ -7,7 +7,7 @@ graph shape; there is no tokenizer and no pretrained checkpoint.
 
 ```sh
 cmake --build build --config Release --target nnops_qwen2_llm
-./build/llm/Release/nnops_qwen2_llm --preset qwen2.5-0.5b --dtype f16 \
+./build/models/llm/Release/nnops_qwen2_llm --preset qwen2.5-0.5b --dtype f16 \
     --prompt 16 --steps 8 --threads 20
 ```
 
@@ -59,7 +59,7 @@ matrix is kept: the q4_1 blocks are the storage, the embedding table included
 biases are dense, in the activation dtype. A tied `lm_head` is the embedding
 table itself.
 
-Presets (`llm/qwen2_config.hpp`):
+Presets (`models/llm/qwen2_config.hpp`):
 
 | preset | layers | hidden | heads / kv | head_dim | FFN | notes |
 |---|---|---|---|---|---|---|
@@ -88,7 +88,7 @@ outside the timed path). The host schedules a 4-thread OpenMP region across a
 estimate of the kernel's own cost.
 
 ```sh
-./build/llm/Release/nnops_qwen2_llm --preset qwen2.5-0.5b --dtype f32 \
+./build/models/llm/Release/nnops_qwen2_llm --preset qwen2.5-0.5b --dtype f32 \
     --bench --threads 4
 ```
 
@@ -219,9 +219,53 @@ selftest  stepwise 423.6 ms; max |diff| 6.693e-04 (4.179e-04 of max 1.601e+00)
 Measured on the qwen2.5-0.5b preset (16-token prompt, i5-13600KF):
 f32 4.2e-4 relative, f16 5.2e-3 (q8 cache + f16 rounding).
 
+## CUDA
+
+`--backend cuda` runs the same graph on the device. Activations must be f16:
+the q4_1 device route is w4a16 and the 16-bit tile is the whole engine
+(`linear_q4_cuda`). The two host boundaries stay host code — the embedding
+lookup decodes q4_1 rows, and the q8 cache is quantized from a per-(head,
+token) amax — so each layer downloads its new K/V rows and uploads the
+quantized ones. Weights upload once: 294 MB in 43 ms.
+
+On an RTX 3060 Ti, qwen2.5-0.5b, f16:
+
+| seq | CUDA prefill ms | CUDA tok/s | CUDA decode ms/token | CPU 6T prefill ms | CPU decode ms/token |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 20.0 | 3208 | 11.92 | 177.9 | 8.27 |
+| 128 | 25.3 | 5057 | 11.77 | 292.8 | 8.21 |
+| 256 | 38.6 | 6641 | 11.94 | 557.6 | 8.29 |
+| 384 | 53.7 | 7155 | 11.85 | 828.4 | 8.41 |
+| 512 | 70.9 | 7225 | 12.00 | 1110.3 | 8.46 |
+
+Prefill is 15.7x the six-thread CPU at 512 rows. Decode is *slower*: a
+0.5B model at batch 1 leaves the device idle between 240 launches, and the
+demo stages the q8 cache through the host — six synchronous copies a layer,
+144 a token. A device-side quantize (the `Quantize`/`Cast` pair over a row
+amax) is the next step there, not a faster GEMM.
+
+Two findings from wiring it up:
+
+- **RoPE was 46% of a prefill.** The op copies `position_ids` back to the host
+  on every call to size its Dynamic-scaling plan; a pageable readback plus a
+  stream sync costs ~1.35 ms on this host, and the graph calls RoPE twice a
+  layer. It now reads the positions on the device unless the scaling is
+  Dynamic, which is the only plan that needs the maximum: 136 -> 70.9 ms at
+  512, decode 73 -> 12.0 ms.
+- **`cudaMallocAsync`/`cudaFreeAsync` cost 0.3 ms a call here** (measured
+  standalone). RoPE still builds its angle table and plan with them every
+  call — about 10 ms of a prefill. A per-stream cached scratch would remove
+  it.
+
+The per-phase `--profile` table is not meaningful on this backend: the timers
+synchronise after each operator so the clock sees the kernel, and the syncs
+change the stream-ordered allocator's behaviour (the profiled run reports
+130.8 ms where the bench reports 70.9).
+
 ## Limits
 
-- CPU backend only; the operators are created with `Backend::CPU`.
+- The CUDA run needs f16 activations and an operator set that has no gated
+  `Linear`; the CPU run has no such limits.
 - Greedy decoding; no sampler, no tokenizer, no chat template.
 - Weights are random. Logits and generated ids are deterministic for a seed
   but meaningless.
